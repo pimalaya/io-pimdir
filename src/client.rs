@@ -14,6 +14,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::BTreeMap,
     fmt, fs,
@@ -161,6 +162,96 @@ impl PimdirBlobs {
             Err(err) => Err(err),
         }
     }
+
+    /// Opens a stored object as a readable stream, or `None` when absent — the
+    /// append side of bounded-memory transfer, so a body is uploaded without
+    /// being read whole into memory. The returned file's metadata gives the
+    /// octet length a protocol that needs it up front (IMAP `APPEND`) requires.
+    pub fn reader(&self, hash: &ReplicaHash) -> io::Result<Option<fs::File>> {
+        match fs::File::open(blob_path(&self.root, &hash.0)) {
+            Ok(file) => Ok(Some(file)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Opens a streaming writer for a new object: bytes are written to a
+    /// temporary file and placed at their content-addressed path only on
+    /// [`commit`](PimdirBlobWriter::commit), once the hash is known. The store
+    /// is hash-agnostic, so the caller hashes the bytes as it writes them.
+    pub fn writer(&self) -> io::Result<PimdirBlobWriter> {
+        fs::create_dir_all(&self.root)?;
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.root.join(format!(".tmp-{}-{seq}", std::process::id()));
+        let file = fs::File::create(&tmp)?;
+        Ok(PimdirBlobWriter {
+            root: self.root.clone(),
+            tmp,
+            file: Some(file),
+            written: 0,
+        })
+    }
+}
+
+/// A unique-per-write temp-file discriminator, so concurrent writers of one
+/// store do not collide on the staging file.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A streaming writer for one new blob (see [`PimdirBlobs::writer`]).
+///
+/// It is a [`Write`] sink over a temporary file; [`commit`](Self::commit) fsyncs
+/// and renames it into the content-addressed path once the caller knows the
+/// hash. Dropped without a commit (an error mid-stream), it removes the temp.
+pub struct PimdirBlobWriter {
+    root: PathBuf,
+    tmp: PathBuf,
+    file: Option<fs::File>,
+    written: u64,
+}
+
+impl PimdirBlobWriter {
+    /// Finalises the object under `hash`: fsync, then atomically rename the temp
+    /// file into its sharded content-addressed path. A body already present
+    /// (dedup) keeps the stored copy and drops the temp. Returns the object's
+    /// byte size.
+    pub fn commit(mut self, hash: &ReplicaHash) -> io::Result<u64> {
+        let file = self.file.take().expect("writer open");
+        file.sync_all()?;
+        drop(file);
+
+        let path = blob_path(&self.root, &hash.0);
+        if path.exists() {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok(self.written);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&self.tmp, &path)?;
+        Ok(self.written)
+    }
+}
+
+impl Write for PimdirBlobWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let file = self.file.as_mut().expect("writer open");
+        let n = file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.as_mut().expect("writer open").flush()
+    }
+}
+
+impl Drop for PimdirBlobWriter {
+    fn drop(&mut self) {
+        // Uncommitted (an error mid-stream): best-effort remove the temp file.
+        if self.file.is_some() {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 impl ReplicaStorage for PimdirStore {
@@ -235,7 +326,12 @@ impl ReplicaStorage for PimdirStore {
         for op in ops {
             match op {
                 ReplicaWriteOp::StoreObject { object, body } => {
-                    write_blob(&blobs, &object.hash.0, &body)?;
+                    // NOTE: a byteless op indexes an object the consumer already
+                    // streamed into the blob store during a fetch (bounded-memory
+                    // transfer); inline bytes are the buffered path.
+                    if let Some(body) = body {
+                        write_blob(&blobs, &object.hash.0, &body)?;
+                    }
                     tx.execute(
                         sql::STORE_OBJECT,
                         named_params! { ":hash": object.hash.0, ":size": object.size as i64 },

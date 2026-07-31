@@ -48,7 +48,7 @@ fn store_object(hash: &str, body: &[u8]) -> ReplicaWriteOp {
             hash: ReplicaHash(hash.into()),
             size: body.len(),
         },
-        body: body.to_vec(),
+        body: Some(body.to_vec()),
     }
 }
 
@@ -191,4 +191,87 @@ fn two_source_copy_and_delete_propagation() {
     assert_eq!(right_view.placements[0].status, ReplicaStatus::Tombstone);
     // Left no longer holds it, so it projects nothing (not a re-copy).
     assert!(left.load(&inbox()).unwrap().placements.is_empty());
+}
+
+#[test]
+fn a_body_streams_in_and_back_out() {
+    use std::io::{Read, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = io_pimdir::PimdirBlobs::open(dir.path());
+
+    // Stream a body in, in chunks, committing under its (caller-computed) hash.
+    let mut w = blobs.writer().unwrap();
+    w.write_all(b"hello ").unwrap();
+    w.write_all(b"world").unwrap();
+    let size = w.commit(&ReplicaHash("aabbccdd".into())).unwrap();
+    assert_eq!(size, 11);
+    assert!(
+        blob_exists(dir.path(), "aabbccdd"),
+        "committed to the shard path"
+    );
+
+    // Read it back as a stream and buffered — both see the same bytes.
+    let mut file = blobs
+        .reader(&ReplicaHash("aabbccdd".into()))
+        .unwrap()
+        .unwrap();
+    let mut streamed = Vec::new();
+    file.read_to_end(&mut streamed).unwrap();
+    assert_eq!(streamed, b"hello world");
+    assert_eq!(
+        blobs.get(&ReplicaHash("aabbccdd".into())).unwrap().unwrap(),
+        b"hello world"
+    );
+
+    // A missing object streams as None.
+    assert!(
+        blobs
+            .reader(&ReplicaHash("00000000".into()))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_byteless_store_object_indexes_a_streamed_blob() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = io_pimdir::PimdirBlobs::open(dir.path());
+    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+
+    // The consumer streams the blob into place during a fetch...
+    let mut w = blobs.writer().unwrap();
+    w.write_all(b"streamed-body").unwrap();
+    let size = w.commit(&ReplicaHash("beef0000".into())).unwrap() as usize;
+
+    // ...then the write batch records the object with NO bytes, plus a
+    // placement pointing at it.
+    store
+        .write(vec![
+            ReplicaWriteOp::StoreObject {
+                object: ReplicaObject {
+                    hash: ReplicaHash("beef0000".into()),
+                    size,
+                },
+                body: None,
+            },
+            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "beef0000", &["\\Seen"])),
+        ])
+        .unwrap();
+
+    // Reopen: the object survived indexing, its blob is the streamed bytes, and
+    // it was not GC'd (a placement references it).
+    drop(store);
+    let store = PimdirStore::open(dir.path(), "local").unwrap();
+    let loaded = store.load(&inbox()).unwrap();
+    assert_eq!(
+        loaded.placements[0].object,
+        Some(ReplicaHash("beef0000".into()))
+    );
+    assert_eq!(
+        blobs.get(&ReplicaHash("beef0000".into())).unwrap().unwrap(),
+        b"streamed-body"
+    );
 }

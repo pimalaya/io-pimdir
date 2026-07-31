@@ -30,4 +30,4 @@ pub mod sql;
 pub mod client;
 
 #[cfg(feature = "client")]
-pub use client::{PimdirBlobs, PimdirError, PimdirStore};
+pub use client::{PimdirBlobWriter, PimdirBlobs, PimdirError, PimdirStore};
