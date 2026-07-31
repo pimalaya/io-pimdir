@@ -1,0 +1,25 @@
+[package]
+name = "io-pimdir"
+description = "pimdir store: an io-replica ReplicaStorage over SQLite + content-addressed blobs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+homepage = "https://pimalaya.org/"
+repository = "https://github.com/pimalaya/io-pimdir"
+categories = ["api-bindings", "database"]
+keywords = ["pimdir", "sqlite", "storage", "offline", "no-std"]
+
+[features]
+default = ["client"]
+# The std store: executes the canonical pimdir statements against SQLite and the
+# blob files. Gated so the codec/sql core stays I/O-free and reusable.
+client = ["dep:rusqlite", "io-replica/client"]
+
+[dependencies]
+io-replica = { path = "../io-replica", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
