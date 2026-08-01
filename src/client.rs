@@ -16,7 +16,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fmt, fs,
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
@@ -530,14 +530,19 @@ impl ReplicaStorage for PimdirStore {
             }
         }
 
-        // Absorb each collection's placement writes into its hub and save it.
+        // Absorb each collection's placement writes into its hub, then persist
+        // only what changed: diff the loaded hub against the absorbed one (touch
+        // just the changed items/bindings), and adjust object refcounts by only
+        // the per-hash change in references — never a whole-collection rewrite or
+        // a global refcount recompute (both were O(N²) at scale).
         for (collection, ops) in hub_ops {
-            let mut hub = load_hub(&tx, &collection)?;
-            hub.absorb(&source, &ops);
-            save_hub(&tx, &collection, &hub)?;
+            let old_hub = load_hub(&tx, &collection)?;
+            let mut new_hub = old_hub.clone();
+            new_hub.absorb(&source, &ops);
+            save_hub_diff(&tx, &collection, &old_hub, &new_hub)?;
+            adjust_refcounts(&tx, &object_refs(&old_hub), &object_refs(&new_hub))?;
         }
 
-        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
         let garbage: Vec<String> = {
             let mut stmt = tx.prepare(sql::LIST_GARBAGE_OBJECTS)?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -603,59 +608,236 @@ fn load_hub(conn: &Connection, collection: &str) -> rusqlite::Result<ReplicaHub>
     Ok(hub)
 }
 
-/// Replaces a collection's persisted hub with `hub` (delete-all then re-insert;
-/// bindings cascade). Objects are indexed by the write batch's `StoreObject`s
-/// and refcounted afterwards.
-fn save_hub(conn: &Connection, collection: &str, hub: &ReplicaHub) -> rusqlite::Result<()> {
+/// Persists the change from `old` to `new` for a collection's hub by diffing the
+/// two in memory and issuing only the item/binding inserts, updates and deletes
+/// that actually differ — never a whole-collection delete-and-reinsert. So a
+/// write touches O(changed rows), not O(collection size). Item deletes cascade to
+/// their bindings (`PRAGMA foreign_keys = ON`).
+fn save_hub_diff(
+    conn: &Connection,
+    collection: &str,
+    old: &ReplicaHub,
+    new: &ReplicaHub,
+) -> rusqlite::Result<()> {
     conn.execute(
         sql::ENSURE_COLLECTION,
         named_params! { ":collection": collection },
     )?;
-    conn.execute(
-        sql::SET_CONFLICT,
-        named_params! { ":collection": collection, ":conflict": conflict_to_str(hub.conflict) },
-    )?;
-    conn.execute(
-        sql::DELETE_ITEMS,
-        named_params! { ":collection": collection },
-    )?;
-
-    for (link, item) in &hub.items {
+    if old.conflict != new.conflict {
         conn.execute(
-            sql::INSERT_ITEM,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link.0,
-                ":flags": codec::flags_to_json(&item.flags),
-                ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
-                ":meta": item.meta.as_ref().map(|m| m.0.as_str()),
-                ":level": codec::level_to_int(item.level),
-                ":deleted": item.deleted as i64,
-                ":conflicted": item.conflicted as i64,
-                ":conflict_object": item.conflict_object.as_ref().map(|o| o.0.as_str()),
-            },
+            sql::SET_CONFLICT,
+            named_params! { ":collection": collection, ":conflict": conflict_to_str(new.conflict) },
         )?;
+    }
 
-        for (source, binding) in &item.sources {
-            let base_flags = binding
-                .base
-                .as_ref()
-                .map(|b| codec::flags_to_json(&b.flags));
+    // Items gone in `new`: delete (bindings cascade).
+    for link in old.items.keys() {
+        if !new.items.contains_key(link) {
             conn.execute(
-                sql::INSERT_BINDING,
-                named_params! {
-                    ":collection": collection,
-                    ":link_id": link.0,
-                    ":source": source.0,
-                    ":handle": binding.handle.0,
-                    ":base_flags": base_flags,
-                    ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
-                    ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
-                },
+                sql::DELETE_ITEM,
+                named_params! { ":collection": collection, ":link_id": link.0 },
             )?;
         }
     }
 
+    // Items added or changed in `new`.
+    for (link, item) in &new.items {
+        match old.items.get(link) {
+            None => insert_item(conn, collection, link, item)?,
+            Some(prev) => {
+                if !item_columns_eq(prev, item) {
+                    update_item(conn, collection, link, item)?;
+                }
+                save_bindings_diff(conn, collection, link, prev, item)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether two items' persisted columns (everything but their bindings) match.
+fn item_columns_eq(a: &ReplicaHubItem, b: &ReplicaHubItem) -> bool {
+    a.flags == b.flags
+        && a.object == b.object
+        && a.meta == b.meta
+        && a.level == b.level
+        && a.deleted == b.deleted
+        && a.conflicted == b.conflicted
+        && a.conflict_object == b.conflict_object
+}
+
+fn insert_item(
+    conn: &Connection,
+    collection: &str,
+    link: &ReplicaLinkId,
+    item: &ReplicaHubItem,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        sql::INSERT_ITEM,
+        named_params! {
+            ":collection": collection,
+            ":link_id": link.0,
+            ":flags": codec::flags_to_json(&item.flags),
+            ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
+            ":meta": item.meta.as_ref().map(|m| m.0.as_str()),
+            ":level": codec::level_to_int(item.level),
+            ":deleted": item.deleted as i64,
+            ":conflicted": item.conflicted as i64,
+            ":conflict_object": item.conflict_object.as_ref().map(|o| o.0.as_str()),
+        },
+    )?;
+    for (source, binding) in &item.sources {
+        insert_binding(conn, collection, link, source, binding)?;
+    }
+    Ok(())
+}
+
+fn update_item(
+    conn: &Connection,
+    collection: &str,
+    link: &ReplicaLinkId,
+    item: &ReplicaHubItem,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        sql::UPDATE_ITEM,
+        named_params! {
+            ":collection": collection,
+            ":link_id": link.0,
+            ":flags": codec::flags_to_json(&item.flags),
+            ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
+            ":meta": item.meta.as_ref().map(|m| m.0.as_str()),
+            ":level": codec::level_to_int(item.level),
+            ":deleted": item.deleted as i64,
+            ":conflicted": item.conflicted as i64,
+            ":conflict_object": item.conflict_object.as_ref().map(|o| o.0.as_str()),
+        },
+    )?;
+    Ok(())
+}
+
+/// Diffs one item's per-source bindings between `old` and `new`, issuing only the
+/// binding inserts/updates/deletes that changed.
+fn save_bindings_diff(
+    conn: &Connection,
+    collection: &str,
+    link: &ReplicaLinkId,
+    old: &ReplicaHubItem,
+    new: &ReplicaHubItem,
+) -> rusqlite::Result<()> {
+    for source in old.sources.keys() {
+        if !new.sources.contains_key(source) {
+            conn.execute(
+                sql::DELETE_BINDING,
+                named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
+            )?;
+        }
+    }
+    for (source, binding) in &new.sources {
+        match old.sources.get(source) {
+            None => insert_binding(conn, collection, link, source, binding)?,
+            Some(prev) if prev != binding => {
+                update_binding(conn, collection, link, source, binding)?
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn insert_binding(
+    conn: &Connection,
+    collection: &str,
+    link: &ReplicaLinkId,
+    source: &ReplicaSourceId,
+    binding: &ReplicaSourceBinding,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        sql::INSERT_BINDING,
+        named_params! {
+            ":collection": collection,
+            ":link_id": link.0,
+            ":source": source.0,
+            ":handle": binding.handle.0,
+            ":base_flags": binding.base.as_ref().map(|b| codec::flags_to_json(&b.flags)),
+            ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
+            ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
+        },
+    )?;
+    Ok(())
+}
+
+fn update_binding(
+    conn: &Connection,
+    collection: &str,
+    link: &ReplicaLinkId,
+    source: &ReplicaSourceId,
+    binding: &ReplicaSourceBinding,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        sql::UPDATE_BINDING,
+        named_params! {
+            ":collection": collection,
+            ":link_id": link.0,
+            ":source": source.0,
+            ":handle": binding.handle.0,
+            ":base_flags": binding.base.as_ref().map(|b| codec::flags_to_json(&b.flags)),
+            ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
+            ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
+        },
+    )?;
+    Ok(())
+}
+
+/// The multiset of object references a hub holds — every item's `object` and
+/// `conflict_object` plus every binding's `base.object` — keyed by hash. This is
+/// exactly what the old global recompute counted, computed in memory so refcount
+/// maintenance is a per-hash delta rather than a full-table rescan.
+fn object_refs(hub: &ReplicaHub) -> HashMap<String, i64> {
+    let mut refs: HashMap<String, i64> = HashMap::new();
+    let mut bump = |hash: &ReplicaHash| *refs.entry(hash.0.clone()).or_insert(0) += 1;
+    for item in hub.items.values() {
+        if let Some(object) = &item.object {
+            bump(object);
+        }
+        if let Some(conflict) = &item.conflict_object {
+            bump(conflict);
+        }
+        for binding in item.sources.values() {
+            if let Some(object) = binding.base.as_ref().and_then(|b| b.object.as_ref()) {
+                bump(object);
+            }
+        }
+    }
+    refs
+}
+
+/// Applies the change in object references between two reference multisets as
+/// per-hash refcount deltas (`refcount += new - old`), touching only hashes whose
+/// count moved. A hash referenced by other collections keeps their share: the
+/// delta reflects this collection's change alone.
+fn adjust_refcounts(
+    conn: &Connection,
+    old: &HashMap<String, i64>,
+    new: &HashMap<String, i64>,
+) -> rusqlite::Result<()> {
+    for (hash, new_count) in new {
+        let delta = new_count - old.get(hash).copied().unwrap_or(0);
+        if delta != 0 {
+            conn.execute(
+                sql::ADJUST_REFCOUNT,
+                named_params! { ":delta": delta, ":hash": hash },
+            )?;
+        }
+    }
+    for (hash, old_count) in old {
+        if !new.contains_key(hash) {
+            conn.execute(
+                sql::ADJUST_REFCOUNT,
+                named_params! { ":delta": -old_count, ":hash": hash },
+            )?;
+        }
+    }
     Ok(())
 }
 

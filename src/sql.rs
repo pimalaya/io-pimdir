@@ -133,15 +133,39 @@ FROM bindings WHERE collection = :collection";
 pub const LOAD_CHECKPOINT: &str =
     "SELECT checkpoint FROM sources WHERE collection = :collection AND source = :source";
 
-pub const DELETE_ITEMS: &str = "DELETE FROM items WHERE collection = :collection";
-
 pub const INSERT_ITEM: &str = "\
 INSERT INTO items(collection, link_id, flags, object_hash, meta, level, deleted, conflicted, conflict_object) \
 VALUES(:collection, :link_id, :flags, :object_hash, :meta, :level, :deleted, :conflicted, :conflict_object)";
 
+/// Updates one existing item's columns in place (the diffed-save path; the
+/// primary key `(collection, link_id)` is unchanged).
+pub const UPDATE_ITEM: &str = "\
+UPDATE items SET flags = :flags, object_hash = :object_hash, meta = :meta, \
+level = :level, deleted = :deleted, conflicted = :conflicted, conflict_object = :conflict_object \
+WHERE collection = :collection AND link_id = :link_id";
+
+/// Deletes one item; its bindings cascade (`PRAGMA foreign_keys = ON`).
+pub const DELETE_ITEM: &str =
+    "DELETE FROM items WHERE collection = :collection AND link_id = :link_id";
+
 pub const INSERT_BINDING: &str = "\
 INSERT INTO bindings(collection, link_id, source, handle, base_flags, base_object, base_revision) \
 VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, :base_revision)";
+
+/// Updates one existing binding's columns in place (its primary key
+/// `(collection, link_id, source)` is unchanged).
+pub const UPDATE_BINDING: &str = "\
+UPDATE bindings SET handle = :handle, base_flags = :base_flags, \
+base_object = :base_object, base_revision = :base_revision \
+WHERE collection = :collection AND link_id = :link_id AND source = :source";
+
+/// Deletes one source's binding of an item.
+pub const DELETE_BINDING: &str = "DELETE FROM bindings WHERE collection = :collection AND link_id = :link_id AND source = :source";
+
+/// Adjusts one object's refcount by a signed delta (the incremental-refcount
+/// path); the hash's primary key makes this an indexed point update.
+pub const ADJUST_REFCOUNT: &str =
+    "UPDATE objects SET refcount = refcount + :delta WHERE hash = :hash";
 
 pub const UPSERT_CHECKPOINT: &str = "\
 INSERT INTO sources(collection, source, checkpoint) VALUES(:collection, :source, :checkpoint) \
@@ -155,12 +179,6 @@ pub const LOOKUP_OBJECTS: &str = "\
 SELECT link_id, object_hash FROM items \
 WHERE object_hash IS NOT NULL \
   AND link_id IN (SELECT value FROM json_each(:links))";
-
-pub const RECOMPUTE_REFCOUNTS: &str = "\
-UPDATE objects SET refcount = \
-    (SELECT count(*) FROM items i \
-     WHERE i.object_hash = objects.hash OR i.conflict_object = objects.hash) \
-  + (SELECT count(*) FROM bindings b WHERE b.base_object = objects.hash)";
 
 pub const LIST_GARBAGE_OBJECTS: &str = "SELECT hash FROM objects WHERE refcount = 0";
 

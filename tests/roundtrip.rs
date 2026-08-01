@@ -421,3 +421,90 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
         b"streamed-body"
     );
 }
+
+#[test]
+fn a_shared_blob_survives_until_its_last_referrer_is_dropped() {
+    // Incremental refcounts must dedup: two items pointing at one content hash
+    // hold it with a refcount > 1, so dropping one keeps the blob and only the
+    // last drop GCs it. A naive per-batch delta would double-count or GC early.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+
+    store
+        .write(vec![
+            store_object("cafebabe", b"shared body"),
+            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            ReplicaWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabe", &["\\Seen"])),
+        ])
+        .unwrap();
+    assert!(blob_exists(dir.path(), "cafebabe"), "shared blob written");
+
+    // Drop the first referrer: the item goes, but the blob stays for the second.
+    store
+        .write(vec![ReplicaWriteOp::DropPlacement {
+            collection: inbox(),
+            handle: ReplicaHandle("1".into()),
+        }])
+        .unwrap();
+    assert_eq!(store.load(&inbox()).unwrap().placements.len(), 1);
+    assert!(
+        blob_exists(dir.path(), "cafebabe"),
+        "blob kept while a second item still references it"
+    );
+
+    // Drop the last referrer: now the blob is orphaned and GC'd.
+    store
+        .write(vec![ReplicaWriteOp::DropPlacement {
+            collection: inbox(),
+            handle: ReplicaHandle("2".into()),
+        }])
+        .unwrap();
+    assert!(store.load(&inbox()).unwrap().placements.is_empty());
+    assert!(
+        !blob_exists(dir.path(), "cafebabe"),
+        "blob GC'd once its last referrer is dropped"
+    );
+}
+
+#[test]
+fn a_flag_only_update_keeps_the_body() {
+    // A flag change updates the item row in place (diffed save) and must not
+    // disturb the object refcount, so the body stays put.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+
+    store
+        .write(vec![
+            store_object("cafebabe", b"abc"),
+            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+        ])
+        .unwrap();
+
+    // Re-upsert the same item with a different flag set: same object, new flags.
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+            "1",
+            "mid:a",
+            "cafebabe",
+            &["\\Seen", "\\Flagged"],
+        ))])
+        .unwrap();
+
+    let loaded = store.load(&inbox()).unwrap();
+    assert_eq!(loaded.placements.len(), 1);
+    assert!(
+        loaded.placements[0]
+            .flags
+            .0
+            .iter()
+            .any(|f| f == "\\Flagged")
+    );
+    assert_eq!(
+        loaded.placements[0].object,
+        Some(ReplicaHash("cafebabe".into()))
+    );
+    assert!(
+        blob_exists(dir.path(), "cafebabe"),
+        "a flag-only change leaves the body intact"
+    );
+}
