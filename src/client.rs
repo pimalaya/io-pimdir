@@ -29,10 +29,15 @@ use io_replica::{
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     hub::{ReplicaHub, ReplicaHubConflict, ReplicaHubItem, ReplicaSourceBinding, ReplicaSourceId},
     object::ReplicaHash,
-    placement::{ReplicaBase, ReplicaHandle, ReplicaLinkId, ReplicaMeta, ReplicaPlacement},
+    placement::{
+        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
+        ReplicaPlacement,
+    },
     storage::ReplicaLoaded,
 };
-use rusqlite::{Connection, OptionalExtension, Row, named_params, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Row, TransactionBehavior, named_params, params,
+};
 
 use crate::{codec, sql};
 
@@ -46,6 +51,47 @@ pub struct PimdirStore {
     /// Unlinked probed placements, awaiting the `Meta` upgrade that gives them a
     /// link id; kept in memory (empty at rest between syncs).
     residual: Vec<ReplicaPlacement>,
+}
+
+/// A collection as seen by a client read (`list_collections`): its identity and
+/// presentation, kind-agnostic. The sync bindings and per-source state are not
+/// exposed here — a reader observes the shared truth only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirCollection {
+    /// The stable collection id (the mailbox name for a mail store).
+    pub id: String,
+    /// The declared IANA media type (`message/rfc822`, `text/vcard`, …), or the
+    /// empty string when a sync created the collection before a kind was set.
+    pub kind: String,
+    /// The display name.
+    pub name: String,
+    /// The parent collection id, for a hierarchy.
+    pub parent: Option<String>,
+    /// A presentation colour hint.
+    pub color: Option<String>,
+    /// A free-text description.
+    pub description: Option<String>,
+    /// An explicit sort key; `None` sorts after the ordered ones.
+    pub sort_order: Option<i64>,
+}
+
+/// One live item as seen by a client read (`list_items`/`get_item`): the shared
+/// truth a domain projects (an envelope, a vCard, an event), kind-agnostic. The
+/// `meta` is the raw stored summary — the reader parses it against its domain
+/// schema. The `level` makes the read availability-aware: `level < Full` (and an
+/// absent `object`) means the body is not local and a hydrate is needed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirItem {
+    /// The cross-source link id (`Message-ID` for mail, UID for a vCard, …).
+    pub link_id: ReplicaLinkId,
+    /// The item's flag set.
+    pub flags: ReplicaFlags,
+    /// The raw per-domain summary blob, verbatim; `None` when never projected.
+    pub meta: Option<ReplicaMeta>,
+    /// The content-addressed body hash; `None` until a `Full` hydrate.
+    pub object: Option<ReplicaHash>,
+    /// The detail tier the item is hydrated to.
+    pub level: ReplicaLevel,
 }
 
 impl PimdirStore {
@@ -131,6 +177,101 @@ impl PimdirStore {
                 |r| r.get::<_, String>(0),
             )
             .optional()?)
+    }
+
+    /// Lists every collection in the store (client read surface).
+    ///
+    /// Ordered by `sort_order` then `id`, unordered collections last. This is a
+    /// direct getter — it observes the shared truth and never mutates; writes go
+    /// through io-replica's [`write`](ReplicaStorage::write) seam.
+    pub fn list_collections(&self) -> Result<Vec<PimdirCollection>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_COLLECTIONS)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PimdirCollection {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                name: r.get(2)?,
+                parent: r.get(3)?,
+                color: r.get(4)?,
+                description: r.get(5)?,
+                sort_order: r.get(6)?,
+            })
+        })?;
+        let mut collections = Vec::new();
+        for row in rows {
+            collections.push(row?);
+        }
+        Ok(collections)
+    }
+
+    /// A keyset page of a collection's live items (client read surface).
+    ///
+    /// `after` is the exclusive lower bound on `link_id` (`None` starts from the
+    /// beginning); at most `limit` items are returned, ordered by `link_id`, so
+    /// the last item's [`link_id`](PimdirItem::link_id) is the cursor for the
+    /// next page. Tombstones (`deleted`) are excluded. Each item carries its
+    /// `level`, so the caller sees a body's absence without probing the blobs.
+    pub fn list_items(
+        &self,
+        collection: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_ITEMS_PAGE)?;
+        let rows = stmt.query_map(
+            named_params! {
+                ":collection": collection,
+                ":after": after.unwrap_or(""),
+                ":limit": limit as i64,
+            },
+            read_item_from_row,
+        )?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// One live item by `(collection, link_id)`, or `None` (client read
+    /// surface). A tombstoned item reads as `None`.
+    pub fn get_item(
+        &self,
+        collection: &str,
+        link_id: &str,
+    ) -> Result<Option<PimdirItem>, PimdirError> {
+        Ok(self
+            .conn
+            .query_row(
+                sql::GET_ITEM,
+                named_params! { ":collection": collection, ":link_id": link_id },
+                read_item_from_row,
+            )
+            .optional()?)
+    }
+
+    /// The distinct source names the store has synced against (across all
+    /// collections). A client uses this to attribute its writes: a store synced
+    /// as a single source (the local-sync case) has exactly one, so the app
+    /// writes as it without configuration.
+    pub fn distinct_sources(&self) -> Result<Vec<String>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_SOURCES)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(row?);
+        }
+        Ok(sources)
+    }
+
+    /// A collection's live (non-tombstone) item count (client read surface).
+    pub fn count_items(&self, collection: &str) -> Result<u64, PimdirError> {
+        let count: i64 = self.conn.query_row(
+            sql::COUNT_ITEMS,
+            named_params! { ":collection": collection },
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 }
 
@@ -322,7 +463,14 @@ impl ReplicaStorage for PimdirStore {
         // Placement/drop ops routed to the hub, grouped by collection.
         let mut hub_ops: BTreeMap<String, Vec<ReplicaWriteOp>> = BTreeMap::new();
 
-        let tx = self.conn.transaction()?;
+        // BEGIN IMMEDIATE takes the single writer lock up front (§7): under WAL
+        // reads never block, but two writers serialise here, and a writer that
+        // cannot get the lock within `busy_timeout` fails fast and loud (`Busy`)
+        // rather than deep inside the batch on a deferred lock upgrade.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
         for op in ops {
             match op {
                 ReplicaWriteOp::StoreObject { object, body } => {
@@ -400,7 +548,7 @@ impl ReplicaStorage for PimdirStore {
             hashes
         };
         tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
-        tx.commit()?;
+        tx.commit().map_err(busy_or_sql)?;
 
         for hash in garbage {
             remove_blob(&blobs, &hash)?;
@@ -509,6 +657,24 @@ fn save_hub(conn: &Connection, collection: &str, hub: &ReplicaHub) -> rusqlite::
     }
 
     Ok(())
+}
+
+/// Maps a client-read row (`link_id, flags, object_hash, meta, level`) to a
+/// [`PimdirItem`]. Shared by `list_items` and `get_item`.
+fn read_item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
+    let link: String = row.get(0)?;
+    let flags: Option<String> = row.get(1)?;
+    let object: Option<String> = row.get(2)?;
+    let meta: Option<String> = row.get(3)?;
+    let level: i64 = row.get(4)?;
+
+    Ok(PimdirItem {
+        link_id: ReplicaLinkId(link),
+        flags: codec::flags_from_json(flags.as_deref()),
+        meta: meta.map(ReplicaMeta),
+        object: object.map(ReplicaHash),
+        level: codec::level_from_int(level),
+    })
 }
 
 fn item_from_row(row: &Row) -> rusqlite::Result<(ReplicaLinkId, ReplicaHubItem)> {
@@ -625,6 +791,9 @@ pub enum PimdirError {
     Sql(rusqlite::Error),
     Io(io::Error),
     Json(serde_json::Error),
+    /// Another writer holds the store's single write lock (§7); the caller
+    /// should retry once the other writer (a sync, another client) is done.
+    Busy,
 }
 
 impl fmt::Display for PimdirError {
@@ -633,7 +802,24 @@ impl fmt::Display for PimdirError {
             PimdirError::Sql(err) => write!(f, "pimdir SQL error: {err}"),
             PimdirError::Io(err) => write!(f, "pimdir I/O error: {err}"),
             PimdirError::Json(err) => write!(f, "pimdir JSON error: {err}"),
+            PimdirError::Busy => write!(
+                f,
+                "pimdir store is busy: another writer holds the write lock; retry once it releases"
+            ),
         }
+    }
+}
+
+/// Maps a SQLite busy/locked failure to the clear [`PimdirError::Busy`], leaving
+/// any other error as a plain SQL error.
+fn busy_or_sql(err: rusqlite::Error) -> PimdirError {
+    match &err {
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(e.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) =>
+        {
+            PimdirError::Busy
+        }
+        _ => PimdirError::Sql(err),
     }
 }
 

@@ -100,6 +100,32 @@ pub const LOAD_ITEMS: &str = "\
 SELECT link_id, flags, object_hash, meta, level, deleted, conflicted, conflict_object \
 FROM items WHERE collection = :collection";
 
+// Client read surface (kind-agnostic, indexed getters over the same store the
+// sync seam writes). Distinct from `LOAD_ITEMS`: paginated, live-only, ordered.
+
+pub const LIST_COLLECTIONS: &str = "\
+SELECT id, kind, name, parent, color, description, sort_order \
+FROM collections ORDER BY sort_order IS NULL, sort_order, id";
+
+/// A keyset page of a collection's live items. `:after` is the exclusive lower
+/// bound on `link_id` (the empty string starts from the beginning, since a
+/// `link_id` is never empty); rides the `items` primary key, no extra index.
+pub const LIST_ITEMS_PAGE: &str = "\
+SELECT link_id, flags, object_hash, meta, level FROM items \
+WHERE collection = :collection AND deleted = 0 AND link_id > :after \
+ORDER BY link_id LIMIT :limit";
+
+pub const GET_ITEM: &str = "\
+SELECT link_id, flags, object_hash, meta, level FROM items \
+WHERE collection = :collection AND link_id = :link_id AND deleted = 0";
+
+pub const COUNT_ITEMS: &str =
+    "SELECT count(*) FROM items WHERE collection = :collection AND deleted = 0";
+
+/// The distinct source names the store has synced (across all collections), so a
+/// client can discover which source to attribute its writes to.
+pub const LIST_SOURCES: &str = "SELECT DISTINCT source FROM bindings ORDER BY source";
+
 pub const LOAD_BINDINGS: &str = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision \
 FROM bindings WHERE collection = :collection";

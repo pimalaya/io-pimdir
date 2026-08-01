@@ -11,8 +11,8 @@ use io_replica::{
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     object::{ReplicaHash, ReplicaObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement,
-        ReplicaStatus,
+        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
+        ReplicaPlacement, ReplicaStatus,
     },
 };
 
@@ -37,6 +37,28 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPla
             flags,
             revision: None,
             object: Some(ReplicaHash(hash.into())),
+        }),
+        origin: None,
+    }
+}
+
+/// A `Meta`-tier linked placement with no body (the availability-aware case: a
+/// summary is known, the object is not local yet).
+fn meta_placement(handle: &str, link: &str, meta: &str) -> ReplicaPlacement {
+    ReplicaPlacement {
+        collection: inbox(),
+        handle: ReplicaHandle(handle.into()),
+        link_id: Some(ReplicaLinkId(link.into())),
+        object: None,
+        level: ReplicaLevel::Meta,
+        meta: Some(ReplicaMeta(meta.into())),
+        flags: ReplicaFlags::default(),
+        status: ReplicaStatus::Clean,
+        conflict_revision: None,
+        base: Some(ReplicaBase {
+            flags: ReplicaFlags::default(),
+            revision: None,
+            object: None,
         }),
         origin: None,
     }
@@ -191,6 +213,130 @@ fn two_source_copy_and_delete_propagation() {
     assert_eq!(right_view.placements[0].status, ReplicaStatus::Tombstone);
     // Left no longer holds it, so it projects nothing (not a re-copy).
     assert!(left.load(&inbox()).unwrap().placements.is_empty());
+}
+
+#[test]
+fn client_reads_collections_items_page_and_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+
+    // Three live items, out of link-id order on write.
+    store
+        .write(vec![
+            store_object("cafebabe", b"a"),
+            store_object("cafebabf", b"b"),
+            store_object("cafebac0", b"c"),
+            ReplicaWriteOp::UpsertPlacement(placement("3", "mid:c", "cafebac0", &[])),
+            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            ReplicaWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabf", &[])),
+        ])
+        .unwrap();
+
+    // list_collections surfaces the declared kind.
+    let collections = store.list_collections().unwrap();
+    assert_eq!(collections.len(), 1);
+    assert_eq!(collections[0].id, "INBOX");
+    assert_eq!(collections[0].kind, "message/rfc822");
+
+    // Keyset pagination: ordered by link_id, `after` is exclusive.
+    let page1 = store.list_items("INBOX", None, 2).unwrap();
+    assert_eq!(
+        page1
+            .iter()
+            .map(|i| i.link_id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["mid:a", "mid:b"]
+    );
+    let cursor = page1.last().unwrap().link_id.0.clone();
+    let page2 = store.list_items("INBOX", Some(&cursor), 2).unwrap();
+    assert_eq!(
+        page2
+            .iter()
+            .map(|i| i.link_id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["mid:c"]
+    );
+
+    // Full items carry their object and level; flags round-trip.
+    assert_eq!(page1[0].level, ReplicaLevel::Full);
+    assert_eq!(page1[0].object, Some(ReplicaHash("cafebabe".into())));
+    assert!(page1[0].flags.0.iter().any(|f| f == "\\Seen"));
+
+    // get_item: hit and miss.
+    assert_eq!(
+        store.get_item("INBOX", "mid:b").unwrap().unwrap().link_id.0,
+        "mid:b"
+    );
+    assert!(store.get_item("INBOX", "mid:zzz").unwrap().is_none());
+
+    assert_eq!(store.count_items("INBOX").unwrap(), 3);
+}
+
+#[test]
+fn client_read_surfaces_level_for_a_meta_only_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(meta_placement(
+            "1",
+            "mid:a",
+            "{\"v\":1,\"subject\":\"hi\"}",
+        ))])
+        .unwrap();
+
+    let item = store.get_item("INBOX", "mid:a").unwrap().unwrap();
+    // Availability-aware: a hydrate is needed (level < Full, no local body), and
+    // the caller can tell without touching the blob store.
+    assert_eq!(item.level, ReplicaLevel::Meta);
+    assert!(item.object.is_none());
+    assert_eq!(item.meta.unwrap().0, "{\"v\":1,\"subject\":\"hi\"}");
+}
+
+#[test]
+fn client_read_excludes_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut left = PimdirStore::open(dir.path(), "left").unwrap();
+    let mut right = PimdirStore::open(dir.path(), "right").unwrap();
+
+    // Two items on left; only `mid:a` also gets bound on right.
+    left.write(vec![
+        store_object("cafebabe", b"a"),
+        store_object("cafebabf", b"b"),
+        ReplicaWriteOp::UpsertPlacement(placement("LA", "mid:a", "cafebabe", &[])),
+        ReplicaWriteOp::UpsertPlacement(placement("LB", "mid:b", "cafebabf", &[])),
+    ])
+    .unwrap();
+    right.load(&inbox()).unwrap();
+    right
+        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+            "RA",
+            "mid:a",
+            "cafebabe",
+            &[],
+        ))])
+        .unwrap();
+
+    // Left drops `mid:a`; right still holds it, so it lingers as a tombstone
+    // (deleted), while `mid:b` stays live.
+    left.write(vec![ReplicaWriteOp::DropPlacement {
+        collection: inbox(),
+        handle: ReplicaHandle("LA".into()),
+    }])
+    .unwrap();
+
+    // The client read excludes the tombstone selectively — `mid:b` remains.
+    let items = left.list_items("INBOX", None, 10).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .map(|i| i.link_id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["mid:b"]
+    );
+    assert_eq!(left.count_items("INBOX").unwrap(), 1);
+    assert!(left.get_item("INBOX", "mid:a").unwrap().is_none());
 }
 
 #[test]

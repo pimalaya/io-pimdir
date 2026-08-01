@@ -18,6 +18,12 @@ that references them; placement upserts/drops fold into the collection's hub and
 are saved; refcounts are recomputed; zero-refcount objects are collected, their
 rows dropped inside the transaction and their blob files unlinked only after
 commit. A crash SHALL leave at worst an orphan blob, never a row without its body.
+The transaction SHALL begin with `BEGIN IMMEDIATE`, taking the store's single
+writer lock (SPEC §7) up front: under WAL readers never block, two concurrent
+writers serialise on the busy timeout, and a writer that cannot acquire the lock
+SHALL fail with a clear `PimdirError::Busy` rather than a raw SQL error or a
+failure deep inside the batch. Coordinating who writes (one owning process, or a
+front daemon fronting a UI and a sync) is a platform decision, not enforced here.
 
 ### Requirement: Blobs are content-addressed and sharded
 An object's bytes SHALL live at `objects/<hash[0:2]>/<hash[2:4]>/<hash>`,
@@ -47,6 +53,35 @@ expose a stored object as a readable stream for the same reason on the read side
 A `StoreObject` carrying no bytes — its blob already persisted by a streaming
 fetch under its content-addressed path — SHALL record the object row and refcount
 without writing bytes. Refcounting and garbage collection are unchanged.
+
+### Requirement: A client reads the store by indexed, paginated getters
+The store SHALL expose a read-only query surface for a client projecting the
+store as a local backend, distinct from the sync seam's load-all:
+
+- `list_collections` SHALL return every collection's `id`, `kind`, `name`,
+  `parent`, `color`, `description` and `sort_order`.
+- `list_items` SHALL return a page of a collection's **live** items (`deleted =
+  0`), keyset-paginated by `link_id` (`link_id > after`, ordered by `link_id`,
+  at most `limit`), each carrying its `link_id`, flags, raw `meta`, object hash
+  and detail `level`.
+- `get_item` SHALL return one live item by `(collection, link_id)`, or nothing.
+- `count_items` SHALL return a collection's live item count.
+
+These reads are kind-agnostic (raw `meta`, string flags, opaque object hash) and
+observe only — they never mutate; all writes remain io-replica `ReplicaWriteOp`s
+through `write`.
+
+### Requirement: A client can discover the store's sources
+The store SHALL expose the distinct source names it has synced against (across all
+collections) via `distinct_sources`, so a client can attribute its writes to a
+source without configuration — a store synced as a single source returns exactly
+one. This is a kind-agnostic read; it never mutates.
+
+### Requirement: Reads are availability-aware
+A read result SHALL carry each item's detail `level` (`Probed`/`Meta`/`Full`), so
+a caller knows a body is not local (`level < Full`, `object` absent) without
+probing the blob store, and can trigger a hydrate through the sync engine rather
+than treating the absence as data loss.
 
 > Initial seed spec (Cairn adopted 2026-07-31): captures the store's core
 > guarantees; further capabilities may be spelled out as they are touched.
