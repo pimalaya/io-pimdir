@@ -82,7 +82,12 @@ pub struct PimdirCollection {
 /// absent `object`) means the body is not local and a hydrate is needed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirItem {
+    /// The message's public id (`items.seq`): a small, stable, store-global
+    /// integer — the same across every mailbox the message is filed in — a
+    /// consumer shows and passes back, instead of the long internal `link_id`.
+    pub seq: i64,
     /// The cross-source link id (`Message-ID` for mail, UID for a vCard, …).
+    /// Internal: a consumer keys reads and edits by `seq`, not this.
     pub link_id: ReplicaLinkId,
     /// The item's flag set.
     pub flags: ReplicaFlags,
@@ -103,12 +108,14 @@ impl PimdirStore {
         fs::create_dir_all(&blobs)?;
 
         let conn = Connection::open(dir.join("pimdir.db"))?;
-        // NOTE: `busy_timeout` lets several source handles of one store (§7's
-        // single-owner process opening `"left"` and `"right"` over the same
-        // files) briefly wait out each other's write transaction instead of
-        // failing with `SQLITE_BUSY`.
+        // NOTE: `busy_timeout` lets several handles of one store wait out each
+        // other's write transaction instead of failing with `SQLITE_BUSY` — §7's
+        // single-owner process opening `"left"` and `"right"`, and a sync that
+        // fans work across several same-source handles (one per worker) to overlap
+        // network while the writes serialise. 30s absorbs a burst of large writes
+        // (a first sync's per-mailbox meta insert) contending on the write lock.
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
         )?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -233,19 +240,34 @@ impl PimdirStore {
         Ok(items)
     }
 
-    /// One live item by `(collection, link_id)`, or `None` (client read
-    /// surface). A tombstoned item reads as `None`.
-    pub fn get_item(
-        &self,
-        collection: &str,
-        link_id: &str,
-    ) -> Result<Option<PimdirItem>, PimdirError> {
+    /// One live item by its public id `(collection, seq)`, or `None` (client read
+    /// surface). A tombstoned item reads as `None`. The returned item carries its
+    /// internal `link_id` for the caller to edit by.
+    pub fn get_item(&self, collection: &str, seq: i64) -> Result<Option<PimdirItem>, PimdirError> {
         Ok(self
             .conn
             .query_row(
                 sql::GET_ITEM,
-                named_params! { ":collection": collection, ":link_id": link_id },
+                named_params! { ":collection": collection, ":seq": seq },
                 read_item_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Resolves an item's public id (`seq`) from its internal `link_id` — the
+    /// inverse of [`get_item`](Self::get_item), for a consumer that just staged an
+    /// add and wants the id the item now shows under.
+    pub fn seq_for_link(
+        &self,
+        collection: &str,
+        link_id: &str,
+    ) -> Result<Option<i64>, PimdirError> {
+        Ok(self
+            .conn
+            .query_row(
+                sql::SEQ_BY_LINK,
+                named_params! { ":collection": collection, ":link_id": link_id },
+                |row| row.get(0),
             )
             .optional()?)
     }
@@ -673,11 +695,27 @@ fn insert_item(
     link: &ReplicaLinkId,
     item: &ReplicaHubItem,
 ) -> rusqlite::Result<()> {
+    // The public id is a property of the message: if this link id already has a
+    // seq in any collection (the message is filed in another mailbox too), reuse
+    // it, so all its placements share one id; otherwise draw a fresh store-global
+    // id (never reused). A consumer keys on this small integer, not the link id.
+    let seq: i64 = match conn
+        .query_row(
+            sql::SEQ_FOR_LINK_ANY,
+            named_params! { ":link_id": link.0 },
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        Some(existing) => existing,
+        None => conn.query_row(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
+    };
     conn.execute(
         sql::INSERT_ITEM,
         named_params! {
             ":collection": collection,
             ":link_id": link.0,
+            ":seq": seq,
             ":flags": codec::flags_to_json(&item.flags),
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":meta": item.meta.as_ref().map(|m| m.0.as_str()),
@@ -841,16 +879,18 @@ fn adjust_refcounts(
     Ok(())
 }
 
-/// Maps a client-read row (`link_id, flags, object_hash, meta, level`) to a
+/// Maps a client-read row (`seq, link_id, flags, object_hash, meta, level`) to a
 /// [`PimdirItem`]. Shared by `list_items` and `get_item`.
 fn read_item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
-    let link: String = row.get(0)?;
-    let flags: Option<String> = row.get(1)?;
-    let object: Option<String> = row.get(2)?;
-    let meta: Option<String> = row.get(3)?;
-    let level: i64 = row.get(4)?;
+    let seq: i64 = row.get(0)?;
+    let link: String = row.get(1)?;
+    let flags: Option<String> = row.get(2)?;
+    let object: Option<String> = row.get(3)?;
+    let meta: Option<String> = row.get(4)?;
+    let level: i64 = row.get(5)?;
 
     Ok(PimdirItem {
+        seq,
         link_id: ReplicaLinkId(link),
         flags: codec::flags_from_json(flags.as_deref()),
         meta: meta.map(ReplicaMeta),

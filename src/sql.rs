@@ -15,7 +15,10 @@ CREATE TABLE store_meta (
     format     TEXT    NOT NULL DEFAULT 'pimdir',
     version    INTEGER NOT NULL,
     hash_algo  TEXT    NOT NULL,
-    created_at TEXT    NOT NULL
+    created_at TEXT    NOT NULL,
+    -- Store-global monotonic counter handing out the next item `seq`; only ever
+    -- increases, so a public id is never reused across the whole store.
+    next_seq   INTEGER NOT NULL DEFAULT 1
 ) STRICT;
 
 CREATE TABLE collections (
@@ -51,6 +54,10 @@ CREATE TABLE objects (
 CREATE TABLE items (
     collection      TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
     link_id         TEXT NOT NULL,
+    -- The message's public id: store-global, one per link_id (shared by its
+    -- placements across mailboxes), never reused. A client shows it and resolves
+    -- it back to `link_id`.
+    seq             INTEGER NOT NULL,
     flags           TEXT,
     object_hash     TEXT REFERENCES objects(hash),
     meta            TEXT,
@@ -77,6 +84,11 @@ CREATE TABLE bindings (
 
 CREATE INDEX items_by_object ON items(object_hash);
 CREATE INDEX bindings_by_object ON bindings(base_object);
+-- A message's public id is shared by its placements, so it is unique per
+-- (collection, seq) — the key a client resolves.
+CREATE UNIQUE INDEX items_by_seq ON items(collection, seq);
+-- Indexes the cross-collection "does this message already have a seq?" lookup.
+CREATE INDEX items_by_link ON items(link_id);
 "#;
 
 /// The current schema version.
@@ -111,13 +123,19 @@ FROM collections ORDER BY sort_order IS NULL, sort_order, id";
 /// bound on `link_id` (the empty string starts from the beginning, since a
 /// `link_id` is never empty); rides the `items` primary key, no extra index.
 pub const LIST_ITEMS_PAGE: &str = "\
-SELECT link_id, flags, object_hash, meta, level FROM items \
+SELECT seq, link_id, flags, object_hash, meta, level FROM items \
 WHERE collection = :collection AND deleted = 0 AND link_id > :after \
 ORDER BY link_id LIMIT :limit";
 
+/// Fetches one live item by its public id (`seq`) — the client-facing key.
 pub const GET_ITEM: &str = "\
-SELECT link_id, flags, object_hash, meta, level FROM items \
-WHERE collection = :collection AND link_id = :link_id AND deleted = 0";
+SELECT seq, link_id, flags, object_hash, meta, level FROM items \
+WHERE collection = :collection AND seq = :seq AND deleted = 0";
+
+/// Resolves an item's public id (`seq`) from its internal `link_id` — the inverse
+/// of `GET_ITEM`, for a consumer that just staged an add and wants the new id.
+pub const SEQ_BY_LINK: &str =
+    "SELECT seq FROM items WHERE collection = :collection AND link_id = :link_id";
 
 pub const COUNT_ITEMS: &str =
     "SELECT count(*) FROM items WHERE collection = :collection AND deleted = 0";
@@ -133,9 +151,19 @@ FROM bindings WHERE collection = :collection";
 pub const LOAD_CHECKPOINT: &str =
     "SELECT checkpoint FROM sources WHERE collection = :collection AND source = :source";
 
+/// The message's existing public id, if any placement of this `link_id` already
+/// has one (in any collection), so all placements of a message share one id.
+pub const SEQ_FOR_LINK_ANY: &str = "SELECT seq FROM items WHERE link_id = :link_id LIMIT 1";
+
+/// Hands out (and advances) the store-global next public id via `RETURNING`. The
+/// counter only ever increases, so a `seq` is never reused. Run only when the
+/// message has no id yet.
+pub const BUMP_NEXT_SEQ: &str =
+    "UPDATE store_meta SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1";
+
 pub const INSERT_ITEM: &str = "\
-INSERT INTO items(collection, link_id, flags, object_hash, meta, level, deleted, conflicted, conflict_object) \
-VALUES(:collection, :link_id, :flags, :object_hash, :meta, :level, :deleted, :conflicted, :conflict_object)";
+INSERT INTO items(collection, link_id, seq, flags, object_hash, meta, level, deleted, conflicted, conflict_object) \
+VALUES(:collection, :link_id, :seq, :flags, :object_hash, :meta, :level, :deleted, :conflicted, :conflict_object)";
 
 /// Updates one existing item's columns in place (the diffed-save path; the
 /// primary key `(collection, link_id)` is unchanged).

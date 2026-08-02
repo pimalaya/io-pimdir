@@ -9,12 +9,38 @@ use io_replica::{
     change::ReplicaWriteOp,
     client::ReplicaStorage,
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
+    coroutine::{ReplicaArg, ReplicaCoroutine, ReplicaCoroutineState, ReplicaYield},
+    mutate::{ReplicaMutate, ReplicaMutation},
     object::{ReplicaHash, ReplicaObject},
     placement::{
         ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
         ReplicaPlacement, ReplicaStatus,
     },
 };
+
+/// Drives a `ReplicaMutate` against the store to completion — the same load /
+/// write pump a client (himalaya) runs, so a test exercises the real staged
+/// mutation path end to end.
+fn run_mutation(store: &mut PimdirStore, collection: &str, mutation: ReplicaMutation) {
+    let mut coroutine = ReplicaMutate::new(collection.to_string(), mutation);
+    let mut arg: Option<ReplicaArg> = None;
+    loop {
+        match coroutine.resume(arg.take()) {
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsLoad(collection)) => {
+                arg = Some(ReplicaArg::Load(store.load(&collection).unwrap()));
+            }
+            ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => {
+                store.write(ops).unwrap();
+                arg = Some(ReplicaArg::Write);
+            }
+            ReplicaCoroutineState::Yielded(other) => panic!("unexpected yield: {other:?}"),
+            ReplicaCoroutineState::Complete(result) => {
+                result.unwrap();
+                return;
+            }
+        }
+    }
+}
 
 fn inbox() -> ReplicaCollectionId {
     ReplicaCollectionId("INBOX".into())
@@ -263,12 +289,19 @@ fn client_reads_collections_items_page_and_one() {
     assert_eq!(page1[0].object, Some(ReplicaHash("cafebabe".into())));
     assert!(page1[0].flags.0.iter().any(|f| f == "\\Seen"));
 
-    // get_item: hit and miss.
+    // Every item carries a per-collection public id, monotonic in insert order.
     assert_eq!(
-        store.get_item("INBOX", "mid:b").unwrap().unwrap().link_id.0,
+        store.get_item("INBOX", page1[0].seq).unwrap().unwrap().seq,
+        page1[0].seq
+    );
+
+    // get_item keys on the public seq: hit resolves to the link id, miss is None.
+    let seq_b = page1[1].seq; // mid:b
+    assert_eq!(
+        store.get_item("INBOX", seq_b).unwrap().unwrap().link_id.0,
         "mid:b"
     );
-    assert!(store.get_item("INBOX", "mid:zzz").unwrap().is_none());
+    assert!(store.get_item("INBOX", 9999).unwrap().is_none());
 
     assert_eq!(store.count_items("INBOX").unwrap(), 3);
 }
@@ -286,12 +319,91 @@ fn client_read_surfaces_level_for_a_meta_only_item() {
         ))])
         .unwrap();
 
-    let item = store.get_item("INBOX", "mid:a").unwrap().unwrap();
+    // First (and only) item in a fresh collection gets public seq 1.
+    let item = store.get_item("INBOX", 1).unwrap().unwrap();
     // Availability-aware: a hydrate is needed (level < Full, no local body), and
     // the caller can tell without touching the blob store.
     assert_eq!(item.level, ReplicaLevel::Meta);
     assert!(item.object.is_none());
     assert_eq!(item.meta.unwrap().0, "{\"v\":1,\"subject\":\"hi\"}");
+}
+
+#[test]
+fn public_seq_is_message_scoped_global_and_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    for collection in ["INBOX", "Archives", "Sent"] {
+        store
+            .ensure_collection(collection, "message/rfc822")
+            .unwrap();
+    }
+
+    // Two messages in INBOX.
+    store
+        .write(vec![
+            ReplicaWriteOp::UpsertPlacement(meta_placement("1", "mid:a", "{\"v\":1}")),
+            ReplicaWriteOp::UpsertPlacement(meta_placement("2", "mid:b", "{\"v\":1}")),
+        ])
+        .unwrap();
+    let seq = |store: &PimdirStore, coll: &str, link: &str| {
+        store
+            .list_items(coll, None, 100)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.link_id.0 == link)
+            .map(|i| i.seq)
+    };
+    let a = seq(&store, "INBOX", "mid:a").unwrap();
+    let b = seq(&store, "INBOX", "mid:b").unwrap();
+    assert!(b > a, "store-global and monotonic: {a} then {b}");
+
+    // The SAME message (link id) filed in another mailbox keeps the SAME id — the
+    // id belongs to the message, not the placement (dedup / merged view).
+    let mut a_in_arch = meta_placement("A1", "mid:a", "{\"v\":1}");
+    a_in_arch.collection = ReplicaCollectionId("Archives".into());
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(a_in_arch)])
+        .unwrap();
+    assert_eq!(
+        seq(&store, "Archives", "mid:a"),
+        Some(a),
+        "a message keeps one id across every mailbox it is filed in"
+    );
+    // …and `seq_for_link` agrees from either collection.
+    assert_eq!(store.seq_for_link("Archives", "mid:a").unwrap(), Some(a));
+
+    // A DIFFERENT message draws the next store-global id — ids do NOT restart per
+    // mailbox, so they never clash across mailboxes.
+    let mut s = meta_placement("S1", "mid:s", "{\"v\":1}");
+    s.collection = ReplicaCollectionId("Sent".into());
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(s)])
+        .unwrap();
+    let s_seq = seq(&store, "Sent", "mid:s").unwrap();
+    assert!(
+        s_seq > b,
+        "a new message takes the next global id: {s_seq} > {b}"
+    );
+
+    // Drop `mid:b`, then add a new message: b's id is never reused.
+    store
+        .write(vec![ReplicaWriteOp::DropPlacement {
+            collection: inbox(),
+            handle: ReplicaHandle("2".into()),
+        }])
+        .unwrap();
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(meta_placement(
+            "3",
+            "mid:c",
+            "{\"v\":1}",
+        ))])
+        .unwrap();
+    let c = seq(&store, "INBOX", "mid:c").unwrap();
+    assert!(
+        c > s_seq,
+        "a dropped message's id is never reused: next is {c}"
+    );
 }
 
 #[test]
@@ -336,7 +448,8 @@ fn client_read_excludes_tombstones() {
         ["mid:b"]
     );
     assert_eq!(left.count_items("INBOX").unwrap(), 1);
-    assert!(left.get_item("INBOX", "mid:a").unwrap().is_none());
+    // `mid:a` (public seq 1) is a tombstone → excluded from the client read.
+    assert!(left.get_item("INBOX", 1).unwrap().is_none());
 }
 
 #[test]
@@ -506,5 +619,99 @@ fn a_flag_only_update_keeps_the_body() {
     assert!(
         blob_exists(dir.path(), "cafebabe"),
         "a flag-only change leaves the body intact"
+    );
+}
+
+#[test]
+fn a_staged_remove_hides_the_item_but_keeps_it_pending_a_sync() {
+    // A client-staged Remove must drop the item from the read surface yet keep
+    // the binding, so the next sync still pushes the expunge (the bug was a
+    // silent no-op: the item stayed live and nothing synced).
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "right").unwrap();
+    store
+        .write(vec![
+            store_object("cafebabe", b"abc"),
+            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+        ])
+        .unwrap();
+    assert_eq!(store.count_items("INBOX").unwrap(), 1);
+
+    run_mutation(
+        &mut store,
+        "INBOX",
+        ReplicaMutation::Remove(ReplicaHandle("1".into())),
+    );
+
+    // Gone from the client read surface (live-only).
+    assert_eq!(store.count_items("INBOX").unwrap(), 0);
+    assert!(store.list_items("INBOX", None, 100).unwrap().is_empty());
+
+    // But still projected as a Tombstone on reopen, so the next sync pushes the
+    // remove against the kept remote handle.
+    let reopened = PimdirStore::open(dir.path(), "right").unwrap();
+    let projected = reopened.load(&inbox()).unwrap().placements;
+    assert_eq!(projected.len(), 1, "the binding is kept for the sync");
+    assert_eq!(projected[0].status, ReplicaStatus::Tombstone);
+    assert!(
+        projected[0].base.is_some(),
+        "based, so the sync pushes a remove"
+    );
+}
+
+#[test]
+fn a_staged_move_empties_the_source_and_fills_the_target() {
+    // A move stages a target create and a source tombstone: the source empties,
+    // the target gains the item under the same message-scoped seq, and each side
+    // projects the push its next sync derives.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "right").unwrap();
+    store
+        .write(vec![
+            store_object("cafebabe", b"abc"),
+            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+        ])
+        .unwrap();
+    let seq = store.list_items("INBOX", None, 100).unwrap()[0].seq;
+
+    run_mutation(
+        &mut store,
+        "INBOX",
+        ReplicaMutation::Move {
+            handle: ReplicaHandle("1".into()),
+            target: ReplicaCollectionId("Archive".into()),
+            placeholder: ReplicaHandle("tmp-1".into()),
+        },
+    );
+
+    // Source empties; target gains it, sharing the message's seq.
+    assert_eq!(store.count_items("INBOX").unwrap(), 0);
+    let archived = store.list_items("Archive", None, 100).unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].link_id.0, "mid:a");
+    assert_eq!(
+        archived[0].seq, seq,
+        "the moved message keeps its public id"
+    );
+
+    // The source projects a Tombstone (push the remove); the target a based-less
+    // pending push (the copy the sync appends, like an offline copy) — both
+    // derived on the next sync.
+    let inbox_proj = store.load(&inbox()).unwrap().placements;
+    assert_eq!(inbox_proj.len(), 1);
+    assert_eq!(inbox_proj[0].status, ReplicaStatus::Tombstone);
+    let archive_proj = store
+        .load(&ReplicaCollectionId("Archive".into()))
+        .unwrap()
+        .placements;
+    assert_eq!(archive_proj.len(), 1);
+    assert_ne!(
+        archive_proj[0].status,
+        ReplicaStatus::Clean,
+        "a pending push"
+    );
+    assert!(
+        archive_proj[0].base.is_none(),
+        "no base yet: the sync appends it"
     );
 }

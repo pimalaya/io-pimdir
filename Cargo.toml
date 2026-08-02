@@ -12,8 +12,6 @@ keywords = ["pimdir", "sqlite", "storage", "offline", "no-std"]
 
 [features]
 default = ["client"]
-# The std store: executes the canonical pimdir statements against SQLite and the
-# blob files. Gated so the codec/sql core stays I/O-free and reusable.
 client = ["dep:rusqlite", "io-replica/client"]
 
 [dependencies]

@@ -27,11 +27,14 @@ The write SHALL be O(changed rows), not O(collection size), so an incremental
 sync that changed a handful of items does not rewrite the whole mailbox.
 A crash SHALL leave at worst an orphan blob, never a row without its body.
 The transaction SHALL begin with `BEGIN IMMEDIATE`, taking the store's single
-writer lock (SPEC §7) up front: under WAL readers never block, two concurrent
-writers serialise on the busy timeout, and a writer that cannot acquire the lock
+writer lock (SPEC §7) up front: under WAL readers never block, concurrent writers
+serialise on the busy timeout, and a writer that cannot acquire the lock within it
 SHALL fail with a clear `PimdirError::Busy` rather than a raw SQL error or a
-failure deep inside the batch. Coordinating who writes (one owning process, or a
-front daemon fronting a UI and a sync) is a platform decision, not enforced here.
+failure deep inside the batch. The busy timeout SHALL be generous enough (30s) to
+let a single process fan work across several same-source handles — one per worker,
+to overlap network while the writes serialise — without a burst of large writes
+tripping `Busy`. Coordinating who writes (one owning process, or a front daemon
+fronting a UI and a sync) is a platform decision, not enforced here.
 
 ### Requirement: Blobs are content-addressed and sharded
 An object's bytes SHALL live at `objects/<hash[0:2]>/<hash[2:4]>/<hash>`,
@@ -70,14 +73,29 @@ store as a local backend, distinct from the sync seam's load-all:
   `parent`, `color`, `description` and `sort_order`.
 - `list_items` SHALL return a page of a collection's **live** items (`deleted =
   0`), keyset-paginated by `link_id` (`link_id > after`, ordered by `link_id`,
-  at most `limit`), each carrying its `link_id`, flags, raw `meta`, object hash
-  and detail `level`.
-- `get_item` SHALL return one live item by `(collection, link_id)`, or nothing.
+  at most `limit`), each carrying its public `seq`, its `link_id`, flags, raw
+  `meta`, object hash and detail `level`.
+- `get_item` SHALL return one live item by its public id `(collection, seq)`, or
+  nothing; `seq_for_link` SHALL resolve the inverse (`link_id` → `seq`).
 - `count_items` SHALL return a collection's live item count.
 
 These reads are kind-agnostic (raw `meta`, string flags, opaque object hash) and
 observe only — they never mutate; all writes remain io-replica `ReplicaWriteOp`s
 through `write`.
+
+### Requirement: Items carry a message-scoped public id
+Each item SHALL carry a `seq`: an integer id a consumer shows and accepts in place
+of the internal `link_id`. It is a property of the **message**, not the placement:
+a message filed in several mailboxes (the same `link_id`) SHALL keep the **same**
+`seq` in every one, so a merged / cross-mailbox view shows it once and ids never
+clash between mailboxes. The store SHALL assign a message's `seq` the first time it
+inserts an item with that `link_id` (in any collection) — drawing from the
+**store-global** `store_meta.next_seq` counter — and reuse it for every later
+placement of the same `link_id`. The counter only ever increases, so a `seq` is
+**never reused** even after the message is deleted everywhere. `(collection, seq)`
+SHALL be unique (one placement per message per collection). The sync seam still
+keys on `link_id`; `seq` is assigned transparently on insert and is never a sync
+key.
 
 ### Requirement: A client can discover the store's sources
 The store SHALL expose the distinct source names it has synced against (across all
