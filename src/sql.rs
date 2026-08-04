@@ -1,6 +1,6 @@
 //! The canonical pimdir SQL, inlined verbatim from the spec so the crate is
 //! self-contained. Kept in sync with `pimdir/migrations/0001_init.sql` and
-//! `pimdir/queries.sql`; the spec is the source of truth.
+//! `pimdir/queries/`; the spec is the source of truth.
 //!
 //! A store keeps one shared **item** per logical thing (its truth: flags, body,
 //! summary), and one **binding** per source that syncs it (that source's last

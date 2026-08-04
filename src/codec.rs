@@ -1,10 +1,10 @@
 //! Pure, I/O-free encodings between the [`io_replica`] model and the pimdir
-//! columns (spec §12). No SQLite, no filesystem: this is the part an Android or
+//! columns (spec §11). No SQLite, no filesystem: this is the part an Android or
 //! any other implementation reuses.
 
 use alloc::{string::String, vec::Vec};
 
-use io_replica::placement::{ReplicaFlags, ReplicaLevel, ReplicaStatus};
+use io_replica::placement::{ReplicaFlags, ReplicaLevel};
 
 /// A flag set to its canonical JSON array (sorted; the model's set is already
 /// ordered). An empty set encodes as `"[]"`, never `NULL`.
@@ -24,7 +24,7 @@ pub fn flags_from_json(json: Option<&str>) -> ReplicaFlags {
     ReplicaFlags(items.into_iter().collect())
 }
 
-/// The detail ladder as its column integer (spec §12).
+/// The detail ladder as its column integer (spec §11).
 pub fn level_to_int(level: ReplicaLevel) -> i64 {
     match level {
         ReplicaLevel::Probed => 0,
@@ -39,28 +39,6 @@ pub fn level_from_int(value: i64) -> ReplicaLevel {
         1 => ReplicaLevel::Meta,
         2 => ReplicaLevel::Full,
         _ => ReplicaLevel::Probed,
-    }
-}
-
-/// The reconcile status as its column integer (spec §12).
-pub fn status_to_int(status: ReplicaStatus) -> i64 {
-    match status {
-        ReplicaStatus::Clean => 0,
-        ReplicaStatus::Dirty => 1,
-        ReplicaStatus::Tombstone => 2,
-        ReplicaStatus::Conflict => 3,
-        ReplicaStatus::Created => 4,
-    }
-}
-
-/// The inverse of [`status_to_int`]; unknown integers clamp to `Clean`.
-pub fn status_from_int(value: i64) -> ReplicaStatus {
-    match value {
-        1 => ReplicaStatus::Dirty,
-        2 => ReplicaStatus::Tombstone,
-        3 => ReplicaStatus::Conflict,
-        4 => ReplicaStatus::Created,
-        _ => ReplicaStatus::Clean,
     }
 }
 
@@ -86,18 +64,9 @@ mod tests {
     }
 
     #[test]
-    fn level_and_status_maps_round_trip() {
+    fn level_map_round_trips() {
         for l in [ReplicaLevel::Probed, ReplicaLevel::Meta, ReplicaLevel::Full] {
             assert_eq!(level_from_int(level_to_int(l)), l);
-        }
-        for s in [
-            ReplicaStatus::Clean,
-            ReplicaStatus::Dirty,
-            ReplicaStatus::Tombstone,
-            ReplicaStatus::Conflict,
-            ReplicaStatus::Created,
-        ] {
-            assert_eq!(status_from_int(status_to_int(s)), s);
         }
     }
 }
