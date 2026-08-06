@@ -25,9 +25,6 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled"] 
 tempfile = { version = "3", default-features = false }
 
 [dependencies]
-io-replica = { version = "0.1", default-features = false }
+io-replica = "0.2"
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
-
-[patch.crates-io]
-io-replica.git = "https://github.com/pimalaya/io-replica"

@@ -117,20 +117,29 @@ CREATE INDEX items_by_link ON items(link_id);
 /// The current schema version.
 pub const VERSION: i64 = 1;
 
+/// Creates a collection row if it does not exist yet, leaving an existing one
+/// untouched (the kind is declared separately by `SET_COLLECTION_KIND`).
 pub const ENSURE_COLLECTION: &str = "\
 INSERT INTO collections(id, kind, name) VALUES(:collection, '', :collection) \
 ON CONFLICT(id) DO NOTHING";
 
+/// Declares (or re-declares) a collection's kind, creating the row if the
+/// collection is not known yet.
 pub const SET_COLLECTION_KIND: &str = "\
 INSERT INTO collections(id, kind, name) VALUES(:collection, :kind, :collection) \
 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind";
 
+/// Reads a collection's declared kind.
 pub const LOAD_KIND: &str = "SELECT kind FROM collections WHERE id = :collection";
 
+/// Stores a collection's conflict policy.
 pub const SET_CONFLICT: &str = "UPDATE collections SET conflict = :conflict WHERE id = :collection";
 
+/// Reads a collection's conflict policy.
 pub const LOAD_CONFLICT: &str = "SELECT conflict FROM collections WHERE id = :collection";
 
+/// Loads a whole collection for the sync seam: every item, tombstones
+/// included, unpaginated and unordered.
 pub const LOAD_ITEMS: &str = "\
 SELECT link_id, flags, object_hash, meta, level, deleted, conflicted, conflict_object \
 FROM items WHERE collection = :collection";
@@ -138,6 +147,8 @@ FROM items WHERE collection = :collection";
 // Client read surface (kind-agnostic, indexed getters over the same store the
 // sync seam writes). Distinct from `LOAD_ITEMS`: paginated, live-only, ordered.
 
+/// Lists every collection with its display metadata and generation, ordered by
+/// `sort_order` then id, the ones carrying no sort order coming last.
 pub const LIST_COLLECTIONS: &str = "\
 SELECT id, kind, name, parent, color, description, sort_order, generation \
 FROM collections ORDER BY sort_order IS NULL, sort_order, id";
@@ -160,6 +171,7 @@ WHERE collection = :collection AND seq = :seq AND deleted = 0";
 pub const SEQ_BY_LINK: &str =
     "SELECT seq FROM items WHERE collection = :collection AND link_id = :link_id";
 
+/// Counts a collection's live items (tombstones excluded).
 pub const COUNT_ITEMS: &str =
     "SELECT count(*) FROM items WHERE collection = :collection AND deleted = 0";
 
@@ -167,10 +179,13 @@ pub const COUNT_ITEMS: &str =
 /// client can discover which source to attribute its writes to.
 pub const LIST_SOURCES: &str = "SELECT DISTINCT source FROM bindings ORDER BY source";
 
+/// Loads every per-source binding of a collection: the stored base (handle,
+/// flags, object, revision) each sync merges against.
 pub const LOAD_BINDINGS: &str = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision \
 FROM bindings WHERE collection = :collection";
 
+/// Reads one source's sync checkpoint for a collection.
 pub const LOAD_CHECKPOINT: &str =
     "SELECT checkpoint FROM sources WHERE collection = :collection AND source = :source";
 
@@ -184,6 +199,8 @@ pub const SEQ_FOR_LINK_ANY: &str = "SELECT seq FROM items WHERE link_id = :link_
 pub const BUMP_NEXT_SEQ: &str =
     "UPDATE store_meta SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1";
 
+/// Inserts one item row (the new-placement path; `UPDATE_ITEM` handles an
+/// existing one).
 pub const INSERT_ITEM: &str = "\
 INSERT INTO items(collection, link_id, seq, flags, object_hash, meta, level, deleted, conflicted, conflict_object) \
 VALUES(:collection, :link_id, :seq, :flags, :object_hash, :meta, :level, :deleted, :conflicted, :conflict_object)";
@@ -199,6 +216,8 @@ WHERE collection = :collection AND link_id = :link_id";
 pub const DELETE_ITEM: &str =
     "DELETE FROM items WHERE collection = :collection AND link_id = :link_id";
 
+/// Inserts one item's binding for one source (the new-binding path;
+/// `UPDATE_BINDING` handles an existing one).
 pub const INSERT_BINDING: &str = "\
 INSERT INTO bindings(collection, link_id, source, handle, base_flags, base_object, base_revision) \
 VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, :base_revision)";
@@ -218,21 +237,33 @@ pub const DELETE_BINDING: &str = "DELETE FROM bindings WHERE collection = :colle
 pub const ADJUST_REFCOUNT: &str =
     "UPDATE objects SET refcount = refcount + :delta WHERE hash = :hash";
 
+/// Writes one source's sync checkpoint for a collection, replacing the
+/// previous one.
 pub const UPSERT_CHECKPOINT: &str = "\
 INSERT INTO sources(collection, source, checkpoint) VALUES(:collection, :source, :checkpoint) \
 ON CONFLICT(collection, source) DO UPDATE SET checkpoint = excluded.checkpoint";
 
+/// Indexes an object by its content hash at refcount 0; re-storing a known
+/// hash only refreshes its size, since the count belongs to
+/// `ADJUST_REFCOUNT`.
 pub const STORE_OBJECT: &str = "\
 INSERT INTO objects(hash, size, refcount) VALUES(:hash, :size, 0) \
 ON CONFLICT(hash) DO UPDATE SET size = excluded.size";
 
+/// Resolves the object hash currently bound to each of the given link ids
+/// (passed as a JSON array), skipping the ones carrying no body.
 pub const LOOKUP_OBJECTS: &str = "\
 SELECT link_id, object_hash FROM items \
 WHERE object_hash IS NOT NULL \
   AND link_id IN (SELECT value FROM json_each(:links))";
 
+/// Lists the objects no placement references any more: the blobs the write
+/// transaction is about to collect.
 pub const LIST_GARBAGE_OBJECTS: &str = "SELECT hash FROM objects WHERE refcount = 0";
 
+/// Drops the unreferenced object rows inside the write transaction; their
+/// blobs are unlinked after the commit, so a crash leaves at worst an orphan
+/// blob.
 pub const DELETE_GARBAGE_OBJECTS: &str = "DELETE FROM objects WHERE refcount = 0";
 
 // The action queue (spec §14, `queries/queue.sql`): the write door for every

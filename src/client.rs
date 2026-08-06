@@ -1680,8 +1680,12 @@ fn remove_blob(blobs: &Path, hash: &str) -> io::Result<()> {
 /// Everything that can go wrong servicing the seam.
 #[derive(Debug)]
 pub enum PimdirError {
+    /// The SQLite index refused a statement, or the connection itself failed.
     Sql(rusqlite::Error),
+    /// The blob directory refused a read, a write or a rename.
     Io(io::Error),
+    /// JSON encoding failed at the storage seam (the link id array a lookup
+    /// hands to SQLite); a malformed queue payload reports as `Action`.
     Json(serde_json::Error),
     /// A queue action payload is malformed or unsupported (spec §14.3).
     Action(PimdirActionError),

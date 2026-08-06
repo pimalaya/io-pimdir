@@ -64,8 +64,9 @@ dependencies = [
 
 [[package]]
 name = "io-replica"
-version = "0.1.0"
-source = "git+https://github.com/pimalaya/io-replica#3e1a43962b4a655559d6cfa4535aadac40efe561"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c97565b066942acf058e1276ceb4785dad4d073e4e4e517ff03ed9cedb4cdb1e"
 dependencies = [
  "log",
  "thiserror",
