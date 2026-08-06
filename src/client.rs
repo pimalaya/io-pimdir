@@ -12,6 +12,7 @@
 use alloc::{
     format,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -27,19 +28,25 @@ use io_replica::{
     change::ReplicaWriteOp,
     client::ReplicaStorage,
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
+    coroutine::{ReplicaArg, ReplicaCoroutine, ReplicaCoroutineState, ReplicaYield},
     hub::{ReplicaHub, ReplicaHubConflict, ReplicaHubItem, ReplicaSourceBinding, ReplicaSourceId},
-    object::ReplicaHash,
+    mutate::{ReplicaMutate, ReplicaMutation},
+    object::{ReplicaHash, ReplicaObject},
     placement::{
         ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement,
+        ReplicaPlacement, ReplicaStatus,
     },
     storage::ReplicaLoaded,
 };
 use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Row, TransactionBehavior, named_params, params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Row, TransactionBehavior, named_params,
+    params,
 };
 
-use crate::{codec, sql};
+use crate::{
+    codec::{self, PimdirAction, PimdirActionError},
+    sql,
+};
 
 /// A pimdir store opened as one source (`"left"`, `"right"`, `"phone"`, …). The
 /// underlying database and blobs are shared; several sources of one store are
@@ -73,6 +80,10 @@ pub struct PimdirCollection {
     pub description: Option<String>,
     /// An explicit sort key; `None` sorts after the ordered ones.
     pub sort_order: Option<i64>,
+    /// The handle-space epoch (spec §15): starts at 1, bumped by the owner only
+    /// on a handle-space rebuild (rekey), so a frontend derives epoch-dependent
+    /// protocol values (an IMAP UIDVALIDITY) from the store alone.
+    pub generation: i64,
 }
 
 /// One live item as seen by a client read (`list_items`/`get_item`): the shared
@@ -99,15 +110,70 @@ pub struct PimdirItem {
     pub level: ReplicaLevel,
 }
 
+/// One pending (non-parked) queue row, in append order (spec §14.4): what a
+/// frontend overlays on its item projection for read-your-writes, and what the
+/// owner's drain applies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirPendingAction {
+    /// The row's global append id (`queue.id`).
+    pub id: i64,
+    /// The producer-supplied RFC 3339 enqueue timestamp.
+    pub created_at: String,
+    /// The enqueuing process, diagnostic only.
+    pub producer: String,
+    /// The decoded action.
+    pub action: PimdirAction,
+    /// Apply attempts so far.
+    pub attempts: i64,
+}
+
+/// One parked queue row: an action the owner judged permanently unappliable,
+/// recorded and skipped instead of blocking its collection's queue. Left for
+/// operators and status surfaces, never silently deleted (spec §14.2). The
+/// payload stays raw, since being undecodable may be why the row parked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirParkedAction {
+    /// The row's global append id (`queue.id`).
+    pub id: i64,
+    /// The producer-supplied RFC 3339 enqueue timestamp.
+    pub created_at: String,
+    /// The enqueuing process, diagnostic only.
+    pub producer: String,
+    /// The target collection.
+    pub collection: String,
+    /// The raw action kind.
+    pub action: String,
+    /// The raw versioned JSON payload.
+    pub payload: String,
+    /// Apply attempts before parking.
+    pub attempts: i64,
+    /// The failure that parked the row.
+    pub error: String,
+}
+
+/// What a [`drain_collection`](PimdirStore::drain_collection) pass did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirDrainReport {
+    /// Actions applied to the store and deleted from the queue.
+    pub applied: usize,
+    /// Actions parked with an error, left queryable.
+    pub parked: usize,
+}
+
 impl PimdirStore {
     /// Opens (creating if absent) the store rooted at `dir` as source `source`.
+    ///
+    /// A fresh database is created at the current schema version. A store
+    /// stamped with a *higher* `user_version` than this crate services is
+    /// refused with [`PimdirError::Version`] rather than half-read; the spec
+    /// is a draft, so such a store is recreated, never migrated.
     pub fn open(dir: impl AsRef<Path>, source: impl Into<String>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         let blobs = dir.join("objects");
         fs::create_dir_all(&blobs)?;
 
-        let conn = Connection::open(dir.join("pimdir.db"))?;
+        let mut conn = Connection::open(dir.join("pimdir.db"))?;
         // NOTE: `busy_timeout` lets several handles of one store wait out each
         // other's write transaction instead of failing with `SQLITE_BUSY` — §7's
         // single-owner process opening `"left"` and `"right"`, and a sync that
@@ -117,25 +183,45 @@ impl PimdirStore {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
         )?;
-
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version < sql::VERSION {
-            conn.execute_batch(sql::MIGRATION_0001)?;
-            conn.pragma_update(None, "user_version", sql::VERSION)?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis().to_string())
-                .unwrap_or_default();
-            conn.execute(
-                "INSERT OR IGNORE INTO store_meta(id, version, hash_algo, created_at) \
-                 VALUES(1, ?1, ?2, ?3)",
-                params![sql::VERSION, "blake3", now],
-            )?;
-        }
+        init_schema(&mut conn)?;
 
         Ok(Self {
             conn,
             blobs,
+            source: ReplicaSourceId(source.into()),
+            residual: Vec::new(),
+        })
+    }
+
+    /// Opens an **existing** store rooted at `dir` read-only, as source
+    /// `source`.
+    ///
+    /// The database is opened with `SQLITE_OPEN_READ_ONLY`: nothing is
+    /// created, so a missing database errors and a schema version other than
+    /// the current one is refused with [`PimdirError::Version`] (a reader's
+    /// SQL requires the current columns and never creates the schema; that is
+    /// the owner's opening write). The returned
+    /// handle exposes the full read surface; any write through it fails at the
+    /// SQLite layer.
+    pub fn open_read_only(
+        dir: impl AsRef<Path>,
+        source: impl Into<String>,
+    ) -> Result<Self, PimdirError> {
+        let dir = dir.as_ref();
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
+
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != sql::VERSION {
+            return Err(PimdirError::Version { found: version });
+        }
+
+        Ok(Self {
+            conn,
+            blobs: dir.join("objects"),
             source: ReplicaSourceId(source.into()),
             residual: Vec::new(),
         })
@@ -202,6 +288,7 @@ impl PimdirStore {
                 color: r.get(4)?,
                 description: r.get(5)?,
                 sort_order: r.get(6)?,
+                generation: r.get(7)?,
             })
         })?;
         let mut collections = Vec::new();
@@ -294,6 +381,530 @@ impl PimdirStore {
             |r| r.get(0),
         )?;
         Ok(count.max(0) as u64)
+    }
+}
+
+/// The action-queue owner surface (spec §14) and collection generations (spec
+/// §15): the single owning process drains producer-requested mutations into the
+/// store, and marks a handle-space rebuild for readers.
+impl PimdirStore {
+    /// A collection's handle-space epoch (spec §15), or `None` when the store
+    /// has never seen the collection. Starts at 1; bumped only by
+    /// [`write_rekeyed`](Self::write_rekeyed), so a frontend derives
+    /// epoch-dependent protocol values (an IMAP UIDVALIDITY) from it alone.
+    pub fn generation(&self, collection: &str) -> Result<Option<i64>, PimdirError> {
+        Ok(self
+            .conn
+            .query_row(
+                sql::LOAD_GENERATION,
+                named_params! { ":collection": collection },
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Applies a handle-space rebuild's write batch and bumps the collection's
+    /// generation **in the same transaction**, returning the new generation.
+    ///
+    /// The owner drives io-replica's rekey coroutine and routes its rebuild
+    /// writes here instead of [`write`](ReplicaStorage::write), so "the ids you
+    /// cached are void" commits atomically with the rebuild that voided them.
+    /// Ordinary syncs, full resyncs from an expired checkpoint, and content
+    /// changes never bump; they keep using `write`.
+    pub fn write_rekeyed(
+        &mut self,
+        collection: &str,
+        ops: Vec<ReplicaWriteOp>,
+    ) -> Result<i64, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        apply_ops(&tx, &self.blobs, &self.source, &mut self.residual, ops)?;
+        tx.execute(
+            sql::ENSURE_COLLECTION,
+            named_params! { ":collection": collection },
+        )?;
+        let generation: i64 = tx.query_row(
+            sql::BUMP_GENERATION,
+            named_params! { ":collection": collection },
+            |r| r.get(0),
+        )?;
+        let garbage = collect_garbage(&tx)?;
+        tx.commit().map_err(busy_or_sql)?;
+
+        for hash in garbage {
+            remove_blob(&self.blobs, &hash)?;
+        }
+        Ok(generation)
+    }
+
+    /// The collections with pending (non-parked) queue work, for the owner's
+    /// drain loop.
+    pub fn queued_collections(&self) -> Result<Vec<String>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_QUEUED_COLLECTIONS)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut collections = Vec::new();
+        for row in rows {
+            collections.push(row?);
+        }
+        Ok(collections)
+    }
+
+    /// A collection's pending (non-parked) actions in append order, decoded
+    /// (read surface, spec §14.4): a frontend overlays them on its item
+    /// projection for read-your-writes. An undecodable payload errors; the
+    /// owner's next drain parks such a row.
+    pub fn pending_actions(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+        load_pending_actions(&self.conn, collection)
+    }
+
+    /// Every parked action across the store, in append order, for status
+    /// surfaces and operator repair. Parked rows are skipped by the drain and
+    /// never silently deleted.
+    pub fn parked_actions(&self) -> Result<Vec<PimdirParkedAction>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LOAD_PARKED_ACTIONS)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PimdirParkedAction {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                producer: r.get(2)?,
+                collection: r.get(3)?,
+                action: r.get(4)?,
+                payload: r.get(5)?,
+                attempts: r.get(6)?,
+                error: r.get(7)?,
+            })
+        })?;
+        let mut actions = Vec::new();
+        for row in rows {
+            actions.push(row?);
+        }
+        Ok(actions)
+    }
+
+    /// Drains a collection's pending actions in append order (spec §14.2).
+    ///
+    /// Each action is applied as the store mutation it names — resolving its
+    /// public `seq` to the internal link id, staging the corresponding
+    /// io-replica mutation and folding its writes through the store's own write
+    /// machinery — and its row is deleted **in the same transaction**, so
+    /// application is exactly-once and never partially visible. An action the
+    /// owner judges permanently unappliable (malformed payload, unknown `seq`,
+    /// duplicate `add` link id) is parked with its error and skipped without
+    /// blocking later actions. A transient failure increments the row's
+    /// `attempts` and stops the pass with the error, preserving apply order for
+    /// the retry.
+    pub fn drain_collection(&mut self, collection: &str) -> Result<PimdirDrainReport, PimdirError> {
+        let rows: Vec<QueueRow> = {
+            let mut stmt = self.conn.prepare(sql::LOAD_PENDING_ACTIONS)?;
+            let rows = stmt.query_map(named_params! { ":collection": collection }, |r| {
+                Ok(QueueRow {
+                    id: r.get(0)?,
+                    action: r.get(3)?,
+                    payload: r.get(4)?,
+                    object_hash: r.get(5)?,
+                    attempts: r.get(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+
+        let mut report = PimdirDrainReport::default();
+        for row in rows {
+            let action = match codec::action_from_payload(&row.action, &row.payload) {
+                Ok(action) => action,
+                Err(err) => {
+                    self.park(&row, &err.to_string())?;
+                    report.parked += 1;
+                    continue;
+                }
+            };
+            match self.apply_queued(collection, &row, &action) {
+                Ok(None) => report.applied += 1,
+                Ok(Some(reason)) => {
+                    self.park(&row, &reason)?;
+                    report.parked += 1;
+                }
+                Err(err) => {
+                    self.conn
+                        .execute(sql::BUMP_ATTEMPTS, named_params! { ":id": row.id })?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Applies one queued action and deletes its row in one transaction,
+    /// releasing the row's object pin as the applied item takes its own
+    /// reference. Returns `Some(reason)` when the action must be parked (the
+    /// transaction is rolled back), `None` when applied.
+    fn apply_queued(
+        &mut self,
+        collection: &str,
+        row: &QueueRow,
+        action: &PimdirAction,
+    ) -> Result<Option<String>, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let ops = match stage_action(&tx, &self.source, collection, row.id, action)? {
+            Ok(ops) => ops,
+            // NOTE: dropping the transaction rolls the attempt back.
+            Err(reason) => return Ok(Some(reason)),
+        };
+        apply_ops(&tx, &self.blobs, &self.source, &mut self.residual, ops)?;
+        // NOTE: the incremental pin hand-over: the queue row's reference
+        // (taken at enqueue) is released as the row goes, while the applied
+        // item's own reference was just taken by `apply_ops`, all in this
+        // transaction, so a queued body is never sweepable in between.
+        if let Some(hash) = &row.object_hash {
+            tx.execute(
+                sql::ADJUST_REFCOUNT,
+                named_params! { ":delta": -1, ":hash": hash },
+            )?;
+        }
+        tx.execute(sql::DELETE_ACTION, named_params! { ":id": row.id })?;
+        let garbage = collect_garbage(&tx)?;
+        tx.commit().map_err(busy_or_sql)?;
+
+        for hash in garbage {
+            remove_blob(&self.blobs, &hash)?;
+        }
+        Ok(None)
+    }
+
+    /// Parks one queue row: records the failure and the spent attempt, leaving
+    /// the row queryable and the rest of the queue flowing.
+    fn park(&self, row: &QueueRow, error: &str) -> Result<(), PimdirError> {
+        self.conn.execute(
+            sql::PARK_ACTION,
+            named_params! { ":id": row.id, ":attempts": row.attempts + 1, ":error": error },
+        )?;
+        Ok(())
+    }
+}
+
+/// One raw pending queue row, as the drain loads it (the payload undecoded, so
+/// a malformed one can be parked instead of failing the pass).
+struct QueueRow {
+    id: i64,
+    action: String,
+    payload: String,
+    object_hash: Option<String>,
+    attempts: i64,
+}
+
+/// Loads a collection's pending actions in append order, decoding each payload
+/// strictly. Shared by [`PimdirStore::pending_actions`] and
+/// [`PimdirProducer::pending_actions`].
+fn load_pending_actions(
+    conn: &Connection,
+    collection: &str,
+) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+    let mut stmt = conn.prepare(sql::LOAD_PENDING_ACTIONS)?;
+    let rows = stmt.query_map(named_params! { ":collection": collection }, |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, i64>(6)?,
+        ))
+    })?;
+
+    let mut actions = Vec::new();
+    for row in rows {
+        let (id, created_at, producer, kind, payload, attempts) = row?;
+        actions.push(PimdirPendingAction {
+            id,
+            created_at,
+            producer,
+            action: codec::action_from_payload(&kind, &payload)?,
+            attempts,
+        });
+    }
+    Ok(actions)
+}
+
+/// Stages the io-replica write ops one queued action folds into the store
+/// (spec §14.3), inside the drain transaction. The inner `Err` is a park
+/// reason (the action is permanently unappliable); an empty op list is a
+/// no-op success (a `remove` of an already-absent item).
+///
+/// Existing items are addressed by `seq`, resolved to their link id and then
+/// to this source's projected placement; the matching [`ReplicaMutation`] is
+/// then pumped through the real [`ReplicaMutate`] coroutine, so the staging
+/// semantics (dirty/tombstone/created marking, conflict handling) stay the
+/// engine's, not a re-implementation. An `add` is staged directly as the same
+/// `Created` placement the engine's `Add` mutation stages, minus the body
+/// bytes: the producer already wrote the blob and indexed the object at
+/// enqueue.
+fn stage_action(
+    tx: &Connection,
+    source: &ReplicaSourceId,
+    collection: &str,
+    row_id: i64,
+    action: &PimdirAction,
+) -> Result<Result<Vec<ReplicaWriteOp>, String>, PimdirError> {
+    let collection_id = ReplicaCollectionId(collection.to_string());
+
+    if let PimdirAction::Add {
+        link_id,
+        flags,
+        object,
+        meta,
+        handle,
+    } = action
+    {
+        let link = link_id
+            .clone()
+            .or_else(|| object.as_ref().map(|hash| ReplicaLinkId(hash.0.clone())));
+        let Some(link) = link else {
+            return Ok(Err("add carries neither link_id nor object".to_string()));
+        };
+        let hub = load_hub(tx, collection)?;
+        // NOTE: the same collision rule as the engine's Add mutation — a live
+        // item blocks the create, a tombstone does not (the delete is in
+        // flight; the new item supersedes it).
+        if hub.items.get(&link).is_some_and(|item| !item.deleted) {
+            return Ok(Err(format!("link id already present: {}", link.0)));
+        }
+        let level = match (object, meta) {
+            (Some(_), _) => ReplicaLevel::Full,
+            (None, Some(_)) => ReplicaLevel::Meta,
+            (None, None) => ReplicaLevel::Probed,
+        };
+        let create = ReplicaPlacement {
+            collection: collection_id,
+            handle: handle
+                .clone()
+                .unwrap_or_else(|| ReplicaHandle(format!("queue-{row_id}"))),
+            link_id: Some(link),
+            object: object.clone(),
+            level,
+            meta: meta.clone(),
+            flags: flags.clone(),
+            status: ReplicaStatus::Created,
+            conflict_revision: None,
+            base: None,
+            origin: None,
+        };
+        return Ok(Ok(vec![ReplicaWriteOp::UpsertPlacement(create)]));
+    }
+
+    // Every other kind reads an existing item, addressed by `seq`.
+    let (seq, removes) = match action {
+        PimdirAction::SetFlags { seq, .. }
+        | PimdirAction::Move { seq, .. }
+        | PimdirAction::Copy { seq, .. }
+        | PimdirAction::Update { seq, .. } => (*seq, false),
+        PimdirAction::Remove { seq } => (*seq, true),
+        PimdirAction::Add { .. } => unreachable!("add staged above"),
+    };
+    let item = tx
+        .query_row(
+            sql::GET_ITEM,
+            named_params! { ":collection": collection, ":seq": seq },
+            read_item_from_row,
+        )
+        .optional()?;
+    let Some(item) = item else {
+        // NOTE: a remove of an already-absent item is success, not an error
+        // (spec §14.3); anything else addressing a gone item parks.
+        return if removes {
+            Ok(Ok(Vec::new()))
+        } else {
+            Ok(Err(format!("unknown seq: {seq}")))
+        };
+    };
+
+    let placements = load_hub(tx, collection)?.project(&collection_id, source);
+    let handle = match placements
+        .iter()
+        .find(|p| p.link_id.as_ref() == Some(&item.link_id))
+    {
+        Some(placement) => placement.handle.clone(),
+        None if removes => return Ok(Ok(Vec::new())),
+        None => return Ok(Err(format!("seq {seq} projects no placement"))),
+    };
+
+    let mutation = match action {
+        PimdirAction::SetFlags { flags, .. } => ReplicaMutation::SetFlags {
+            handle,
+            flags: flags.clone(),
+        },
+        PimdirAction::Remove { .. } => ReplicaMutation::Remove(handle),
+        PimdirAction::Move { to, .. } => ReplicaMutation::Move {
+            handle,
+            target: to.clone(),
+            placeholder: ReplicaHandle(format!("queue-{row_id}")),
+        },
+        PimdirAction::Copy { to, .. } => ReplicaMutation::Copy {
+            handle,
+            target: to.clone(),
+            placeholder: ReplicaHandle(format!("queue-{row_id}")),
+        },
+        PimdirAction::Update { object, meta, .. } => ReplicaMutation::Edit {
+            handle,
+            // NOTE: the size only rides the StoreObject op, stripped below;
+            // the object row was indexed with its real size at enqueue.
+            object: ReplicaObject {
+                hash: object.clone(),
+                size: 0,
+            },
+            body: Vec::new(),
+            meta: meta.clone(),
+        },
+        PimdirAction::Add { .. } => unreachable!("add staged above"),
+    };
+
+    let mut mutate = ReplicaMutate::new(collection_id, mutation);
+    let _ = mutate.resume(None);
+    let loaded = ReplicaLoaded {
+        placements,
+        checkpoint: None,
+    };
+    match mutate.resume(Some(ReplicaArg::Load(loaded))) {
+        ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => {
+            // NOTE: the body already sits in the blob store and its object row
+            // was upserted (and pinned) at enqueue; re-storing here would
+            // clobber the recorded size with the placeholder.
+            let ops = ops
+                .into_iter()
+                .filter(|op| !matches!(op, ReplicaWriteOp::StoreObject { .. }))
+                .collect();
+            Ok(Ok(ops))
+        }
+        ReplicaCoroutineState::Complete(Err(err)) => Ok(Err(err.to_string())),
+        state => Ok(Err(format!("unexpected mutate state: {state:?}"))),
+    }
+}
+
+/// A pimdir store opened as a **producer** (spec §7): a process that is not
+/// the owner but legitimately originates mutations (a submission daemon, a
+/// server frontend). Its only write is the single enqueue transaction of spec
+/// §14.1 — `ensure_collection`, at most one object upsert pinning a body it
+/// already wrote durably to the blob directory ([`PimdirBlobs::writer`]), and
+/// one queue insert. It never touches items, bindings, sources or the other
+/// collections columns, and never creates the schema: it requires a store the
+/// owner has already opened at the current schema version.
+///
+/// This coexists with the store's single-writer serialisation: the guard is
+/// the per-transaction `BEGIN IMMEDIATE` plus the busy timeout, and the spec
+/// explicitly sanctions the producer's short append transaction beside the
+/// owner's batches — the two serialise on the write lock, never interleave.
+pub struct PimdirProducer {
+    conn: Connection,
+    producer: String,
+}
+
+impl PimdirProducer {
+    /// Opens the store rooted at `dir` as producer `producer` (a diagnostic
+    /// process name recorded on each row).
+    ///
+    /// The database must exist at the current schema version: a producer never
+    /// creates a store (that is the owner's opening write), so a missing
+    /// database errors and a version mismatch is [`PimdirError::Version`].
+    pub fn open(dir: impl AsRef<Path>, producer: impl Into<String>) -> Result<Self, PimdirError> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(dir.as_ref().join("pimdir.db"), flags)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
+        )?;
+
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != sql::VERSION {
+            return Err(PimdirError::Version { found: version });
+        }
+
+        Ok(Self {
+            conn,
+            producer: producer.into(),
+        })
+    }
+
+    /// Appends one action to a collection's queue (spec §14.1), returning the
+    /// row's append id.
+    ///
+    /// Runs exactly the producer transaction, `BEGIN IMMEDIATE` and short:
+    /// `ensure_collection`, at most one object upsert when the action's
+    /// payload references a body, and one queue insert pinning that body's
+    /// hash against garbage collection. When the action carries an object, the
+    /// caller has **already written its blob durably** through
+    /// [`PimdirBlobs::writer`] (temp → fsync → rename needs no coordination)
+    /// and passes the byte size the writer's commit returned; `None` reuses an
+    /// object the store already indexes. `created_at` is the caller's RFC 3339
+    /// timestamp. When the owner applies the action is the owner's business;
+    /// nudging it to run (a signal, a socket) is out of scope.
+    pub fn enqueue(
+        &mut self,
+        collection: &str,
+        action: &PimdirAction,
+        object_size: Option<u64>,
+        created_at: &str,
+    ) -> Result<i64, PimdirError> {
+        let hash = action.object_hash().cloned();
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        tx.execute(
+            sql::ENSURE_COLLECTION,
+            named_params! { ":collection": collection },
+        )?;
+        if let (Some(hash), Some(size)) = (&hash, object_size) {
+            tx.execute(
+                sql::STORE_OBJECT,
+                named_params! { ":hash": hash.0, ":size": size as i64 },
+            )?;
+        }
+        tx.execute(
+            sql::ENQUEUE_ACTION,
+            named_params! {
+                ":created_at": created_at,
+                ":producer": self.producer,
+                ":collection": collection,
+                ":action": action.kind(),
+                ":payload": codec::action_to_payload(action),
+                ":object_hash": hash.as_ref().map(|h| h.0.as_str()),
+            },
+        )?;
+        // NOTE: the incremental pin (+1): the queue row now references the
+        // body, so garbage collection never sweeps it between enqueue and
+        // apply; the drain releases it as the row is deleted.
+        if let Some(hash) = &hash {
+            tx.execute(
+                sql::ADJUST_REFCOUNT,
+                named_params! { ":delta": 1, ":hash": hash.0 },
+            )?;
+        }
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(id)
+    }
+
+    /// The collection's pending (non-parked) actions in append order — the
+    /// producer's read-your-writes overlay (spec §14.4): a just-enqueued
+    /// action shows here before the owner has applied it.
+    pub fn pending_actions(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+        load_pending_actions(&self.conn, collection)
     }
 }
 
@@ -480,11 +1091,6 @@ impl ReplicaStorage for PimdirStore {
     }
 
     fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Self::Error> {
-        let blobs = self.blobs.clone();
-        let source = self.source.clone();
-        // Placement/drop ops routed to the hub, grouped by collection.
-        let mut hub_ops: BTreeMap<String, Vec<ReplicaWriteOp>> = BTreeMap::new();
-
         // BEGIN IMMEDIATE takes the single writer lock up front (§7): under WAL
         // reads never block, but two writers serialise here, and a writer that
         // cannot get the lock within `busy_timeout` fails fast and loud (`Busy`)
@@ -493,95 +1099,159 @@ impl ReplicaStorage for PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        for op in ops {
-            match op {
-                ReplicaWriteOp::StoreObject { object, body } => {
-                    // NOTE: a byteless op indexes an object the consumer already
-                    // streamed into the blob store during a fetch (bounded-memory
-                    // transfer); inline bytes are the buffered path.
-                    if let Some(body) = body {
-                        write_blob(&blobs, &object.hash.0, &body)?;
-                    }
-                    tx.execute(
-                        sql::STORE_OBJECT,
-                        named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
-                    )?;
-                }
-                ReplicaWriteOp::SetCheckpoint {
-                    collection,
-                    checkpoint,
-                } => {
-                    tx.execute(
-                        sql::ENSURE_COLLECTION,
-                        named_params! { ":collection": collection.0 },
-                    )?;
-                    tx.execute(
-                        sql::UPSERT_CHECKPOINT,
-                        named_params! {
-                            ":collection": collection.0,
-                            ":source": source.0,
-                            ":checkpoint": checkpoint.0,
-                        },
-                    )?;
-                }
-                ReplicaWriteOp::UpsertPlacement(placement) => {
-                    if placement.link_id.is_some() {
-                        drop_residual(&mut self.residual, &placement.collection, &placement.handle);
-                        hub_ops
-                            .entry(placement.collection.0.clone())
-                            .or_default()
-                            .push(ReplicaWriteOp::UpsertPlacement(placement));
-                    } else {
-                        // NOTE: not yet linked — stage in the residual until a
-                        // Meta upgrade resolves its link id.
-                        match self.residual.iter().position(|r| {
-                            r.collection == placement.collection && r.handle == placement.handle
-                        }) {
-                            Some(index) => self.residual[index] = placement,
-                            None => self.residual.push(placement),
-                        }
-                    }
-                }
-                ReplicaWriteOp::DropPlacement { collection, handle } => {
-                    drop_residual(&mut self.residual, &collection, &handle);
-                    hub_ops
-                        .entry(collection.0.clone())
-                        .or_default()
-                        .push(ReplicaWriteOp::DropPlacement { collection, handle });
-                }
-            }
-        }
-
-        // Absorb each collection's placement writes into its hub, then persist
-        // only what changed: diff the loaded hub against the absorbed one (touch
-        // just the changed items/bindings), and adjust object refcounts by only
-        // the per-hash change in references — never a whole-collection rewrite or
-        // a global refcount recompute (both were O(N²) at scale).
-        for (collection, ops) in hub_ops {
-            let old_hub = load_hub(&tx, &collection)?;
-            let mut new_hub = old_hub.clone();
-            new_hub.absorb(&source, &ops);
-            save_hub_diff(&tx, &collection, &old_hub, &new_hub)?;
-            adjust_refcounts(&tx, &object_refs(&old_hub), &object_refs(&new_hub))?;
-        }
-
-        let garbage: Vec<String> = {
-            let mut stmt = tx.prepare(sql::LIST_GARBAGE_OBJECTS)?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            let mut hashes = Vec::new();
-            for row in rows {
-                hashes.push(row?);
-            }
-            hashes
-        };
-        tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
+        apply_ops(&tx, &self.blobs, &self.source, &mut self.residual, ops)?;
+        let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
 
         for hash in garbage {
-            remove_blob(&blobs, &hash)?;
+            remove_blob(&self.blobs, &hash)?;
         }
         Ok(())
     }
+}
+
+/// Applies a write batch's ops inside the caller's transaction: blob and object
+/// writes, checkpoint upserts, and placement ops folded per collection through
+/// the hub (absorb, then persist only what changed: diff the loaded hub against
+/// the absorbed one — touch just the changed items/bindings — and adjust object
+/// refcounts by only the per-hash change in references, never a
+/// whole-collection rewrite or a global refcount recompute).
+///
+/// Shared by the seam's [`write`](ReplicaStorage::write), the rekey write
+/// ([`PimdirStore::write_rekeyed`]) and the queue drain
+/// ([`PimdirStore::drain_collection`]), so each wraps the same folding in its
+/// own transaction shape.
+fn apply_ops(
+    tx: &Connection,
+    blobs: &Path,
+    source: &ReplicaSourceId,
+    residual: &mut Vec<ReplicaPlacement>,
+    ops: Vec<ReplicaWriteOp>,
+) -> Result<(), PimdirError> {
+    // Placement/drop ops routed to the hub, grouped by collection.
+    let mut hub_ops: BTreeMap<String, Vec<ReplicaWriteOp>> = BTreeMap::new();
+
+    for op in ops {
+        match op {
+            ReplicaWriteOp::StoreObject { object, body } => {
+                // NOTE: a byteless op indexes an object the consumer already
+                // streamed into the blob store during a fetch (bounded-memory
+                // transfer); inline bytes are the buffered path.
+                if let Some(body) = body {
+                    write_blob(blobs, &object.hash.0, &body)?;
+                }
+                tx.execute(
+                    sql::STORE_OBJECT,
+                    named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
+                )?;
+            }
+            ReplicaWriteOp::SetCheckpoint {
+                collection,
+                checkpoint,
+            } => {
+                tx.execute(
+                    sql::ENSURE_COLLECTION,
+                    named_params! { ":collection": collection.0 },
+                )?;
+                tx.execute(
+                    sql::UPSERT_CHECKPOINT,
+                    named_params! {
+                        ":collection": collection.0,
+                        ":source": source.0,
+                        ":checkpoint": checkpoint.0,
+                    },
+                )?;
+            }
+            ReplicaWriteOp::UpsertPlacement(placement) => {
+                if placement.link_id.is_some() {
+                    drop_residual(residual, &placement.collection, &placement.handle);
+                    hub_ops
+                        .entry(placement.collection.0.clone())
+                        .or_default()
+                        .push(ReplicaWriteOp::UpsertPlacement(placement));
+                } else {
+                    // NOTE: not yet linked — stage in the residual until a
+                    // Meta upgrade resolves its link id.
+                    match residual.iter().position(|r| {
+                        r.collection == placement.collection && r.handle == placement.handle
+                    }) {
+                        Some(index) => residual[index] = placement,
+                        None => residual.push(placement),
+                    }
+                }
+            }
+            ReplicaWriteOp::DropPlacement { collection, handle } => {
+                drop_residual(residual, &collection, &handle);
+                hub_ops
+                    .entry(collection.0.clone())
+                    .or_default()
+                    .push(ReplicaWriteOp::DropPlacement { collection, handle });
+            }
+        }
+    }
+
+    for (collection, ops) in hub_ops {
+        let old_hub = load_hub(tx, &collection)?;
+        let mut new_hub = old_hub.clone();
+        new_hub.absorb(source, &ops);
+        save_hub_diff(tx, &collection, &old_hub, &new_hub)?;
+        adjust_refcounts(tx, &object_refs(&old_hub), &object_refs(&new_hub))?;
+    }
+
+    Ok(())
+}
+
+/// Deletes the zero-refcount object rows inside the caller's transaction and
+/// returns their hashes; the caller unlinks the blob files **after** the
+/// commit, so a crash leaves at worst an orphan blob, never a row without its
+/// body.
+fn collect_garbage(tx: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let garbage: Vec<String> = {
+        let mut stmt = tx.prepare(sql::LIST_GARBAGE_OBJECTS)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut hashes = Vec::new();
+        for row in rows {
+            hashes.push(row?);
+        }
+        hashes
+    };
+    tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
+    Ok(garbage)
+}
+
+/// Creates the schema in a fresh database (spec §6), advancing `user_version`
+/// and seeding `store_meta.version` in agreement (spec §4.2) inside one
+/// transaction. A store stamped with a `user_version` higher than
+/// [`sql::VERSION`] is refused: the spec is a draft with a single schema
+/// version, so such a store is recreated, never migrated.
+fn init_schema(conn: &mut Connection) -> Result<(), PimdirError> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version > sql::VERSION {
+        return Err(PimdirError::Version { found: version });
+    }
+    if version == sql::VERSION {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(busy_or_sql)?;
+    tx.execute_batch(sql::MIGRATION_0001)?;
+    // NOTE: the script creates `store_meta`; seed its one row here, since the
+    // canonical script is pure DDL.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_default();
+    tx.execute(
+        "INSERT OR IGNORE INTO store_meta(id, version, hash_algo, created_at) \
+         VALUES(1, ?1, ?2, ?3)",
+        params![sql::VERSION, "blake3", now],
+    )?;
+    tx.pragma_update(None, "user_version", sql::VERSION)?;
+    tx.commit().map_err(busy_or_sql)?;
+
+    Ok(())
 }
 
 /// Removes any residual placement matching `(collection, handle)`.
@@ -1013,6 +1683,15 @@ pub enum PimdirError {
     Sql(rusqlite::Error),
     Io(io::Error),
     Json(serde_json::Error),
+    /// A queue action payload is malformed or unsupported (spec §14.3).
+    Action(PimdirActionError),
+    /// The store's schema version is not one this opener can service: newer
+    /// than the crate for an owner, or not yet created for a producer (which
+    /// never creates the schema; the owner must open first).
+    Version {
+        /// The store's `user_version`.
+        found: i64,
+    },
     /// Another writer holds the store's single write lock (§7); the caller
     /// should retry once the other writer (a sync, another client) is done.
     Busy,
@@ -1024,6 +1703,12 @@ impl fmt::Display for PimdirError {
             PimdirError::Sql(err) => write!(f, "pimdir SQL error: {err}"),
             PimdirError::Io(err) => write!(f, "pimdir I/O error: {err}"),
             PimdirError::Json(err) => write!(f, "pimdir JSON error: {err}"),
+            PimdirError::Action(err) => write!(f, "pimdir action error: {err}"),
+            PimdirError::Version { found } => write!(
+                f,
+                "pimdir store schema version {found} is unsupported (this crate services version {})",
+                sql::VERSION
+            ),
             PimdirError::Busy => write!(
                 f,
                 "pimdir store is busy: another writer holds the write lock; retry once it releases"
@@ -1062,5 +1747,11 @@ impl From<io::Error> for PimdirError {
 impl From<serde_json::Error> for PimdirError {
     fn from(err: serde_json::Error) -> Self {
         PimdirError::Json(err)
+    }
+}
+
+impl From<PimdirActionError> for PimdirError {
+    fn from(err: PimdirActionError) -> Self {
+        PimdirError::Action(err)
     }
 }

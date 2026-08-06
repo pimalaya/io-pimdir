@@ -1,5 +1,5 @@
 //! The canonical pimdir SQL, inlined verbatim from the spec so the crate is
-//! self-contained. Kept in sync with `pimdir/migrations/0001_init.sql` and
+//! self-contained. Kept in sync with `pimdir/migrations/` and
 //! `pimdir/queries/`; the spec is the source of truth.
 //!
 //! A store keeps one shared **item** per logical thing (its truth: flags, body,
@@ -7,8 +7,9 @@
 //! agreed base). A single-source store is the degenerate case of one binding per
 //! item; a two-source store (two servers, or a server and a phone) keeps two.
 
-/// Schema version 1 (`migrations/0001_init.sql`). Applied to a fresh database;
-/// the caller sets `PRAGMA user_version = 1` on success.
+/// Schema version 1 (`migrations/0001_init.sql`), the whole draft schema
+/// including the action queue and collection generations. Applied to a fresh
+/// database; the caller sets `PRAGMA user_version = 1` on success.
 pub const MIGRATION_0001: &str = r#"
 CREATE TABLE store_meta (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -30,7 +31,12 @@ CREATE TABLE collections (
     description TEXT,
     sort_order  INTEGER,
     -- Cross-source content-conflict policy: 'manual' | 'prefer-incoming' | 'prefer-existing'.
-    conflict    TEXT NOT NULL DEFAULT 'manual'
+    conflict    TEXT NOT NULL DEFAULT 'manual',
+    -- Collection generation: bumped by the owner whenever it rebuilds the
+    -- collection's handle space (a backend identity reset), so a reader can derive
+    -- epoch-dependent protocol values (an IMAP UIDVALIDITY) from the store alone
+    -- (SPEC.md §15).
+    generation  INTEGER NOT NULL DEFAULT 1
 ) STRICT;
 
 -- One row per source that syncs a collection (a server, a phone). A
@@ -82,6 +88,23 @@ CREATE TABLE bindings (
     FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON DELETE CASCADE
 ) STRICT;
 
+-- The action queue (SPEC.md §14): mutations requested by processes that are not
+-- the store owner, applied by the owner in append order.
+CREATE TABLE queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- global append order
+    created_at  TEXT    NOT NULL,                   -- RFC 3339 timestamp
+    producer    TEXT    NOT NULL,                   -- enqueuing process, diagnostic only
+    collection  TEXT    NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    action      TEXT    NOT NULL,                   -- 'add' | 'set-flags' | 'remove' | 'move' | 'copy' | 'update'
+    payload     TEXT    NOT NULL,                   -- versioned JSON, shape per action (SPEC.md §14)
+    object_hash TEXT    REFERENCES objects(hash),   -- pins the payload's body against GC, or NULL
+    attempts    INTEGER NOT NULL DEFAULT 0,         -- apply attempts so far
+    error       TEXT                                -- last failure; non-NULL means parked
+) STRICT;
+
+-- The owner drains a collection's pending actions in append order.
+CREATE INDEX queue_by_collection ON queue(collection, id);
+
 CREATE INDEX items_by_object ON items(object_hash);
 CREATE INDEX bindings_by_object ON bindings(base_object);
 -- A message's public id is shared by its placements, so it is unique per
@@ -116,7 +139,7 @@ FROM items WHERE collection = :collection";
 // sync seam writes). Distinct from `LOAD_ITEMS`: paginated, live-only, ordered.
 
 pub const LIST_COLLECTIONS: &str = "\
-SELECT id, kind, name, parent, color, description, sort_order \
+SELECT id, kind, name, parent, color, description, sort_order, generation \
 FROM collections ORDER BY sort_order IS NULL, sort_order, id";
 
 /// A keyset page of a collection's live items. `:after` is the exclusive lower
@@ -211,3 +234,53 @@ WHERE object_hash IS NOT NULL \
 pub const LIST_GARBAGE_OBJECTS: &str = "SELECT hash FROM objects WHERE refcount = 0";
 
 pub const DELETE_GARBAGE_OBJECTS: &str = "DELETE FROM objects WHERE refcount = 0";
+
+// The action queue (spec §14, `queries/queue.sql`): the write door for every
+// process that is not the store owner. A producer appends; the owner applies
+// pending actions in append order and deletes each in the same transaction as
+// its effects.
+
+/// A producer's append. Runs after `ENSURE_COLLECTION`, in one transaction with
+/// the `STORE_OBJECT` upsert when the payload references a body (spec §14.1).
+pub const ENQUEUE_ACTION: &str = "\
+INSERT INTO queue(created_at, producer, collection, action, payload, object_hash) \
+VALUES(:created_at, :producer, :collection, :action, :payload, :object_hash)";
+
+/// The collections with pending work, for the owner's drain loop.
+pub const LIST_QUEUED_COLLECTIONS: &str =
+    "SELECT DISTINCT collection FROM queue WHERE error IS NULL";
+
+/// The owner's drain: a collection's pending (non-parked) actions, in append
+/// order. A reader runs the same statement to overlay pending actions on its
+/// item projection (read-your-writes, spec §14.4).
+pub const LOAD_PENDING_ACTIONS: &str = "\
+SELECT id, created_at, producer, action, payload, object_hash, attempts \
+FROM queue WHERE collection = :collection AND error IS NULL ORDER BY id";
+
+/// An applied action: deleted in the same transaction as its item and binding
+/// writes, so applying is exactly-once.
+pub const DELETE_ACTION: &str = "DELETE FROM queue WHERE id = :id";
+
+/// A permanently failing action: recorded and skipped, visible to operators and
+/// frontends instead of blocking the collection's queue forever.
+pub const PARK_ACTION: &str =
+    "UPDATE queue SET attempts = :attempts, error = :error WHERE id = :id";
+
+/// Records a failed apply attempt without parking (the retry path; equivalent
+/// substitution of the reference `park_action` with a `NULL` error).
+pub const BUMP_ATTEMPTS: &str = "UPDATE queue SET attempts = attempts + 1 WHERE id = :id";
+
+/// The parked actions, for status surfaces and operator repair.
+pub const LOAD_PARKED_ACTIONS: &str = "\
+SELECT id, created_at, producer, collection, action, payload, attempts, error \
+FROM queue WHERE error IS NOT NULL ORDER BY id";
+
+/// The owner's handle-space reset marker (spec §15): run in the same
+/// transaction as the rebuild it records.
+pub const BUMP_GENERATION: &str = "\
+UPDATE collections SET generation = generation + 1 WHERE id = :collection \
+RETURNING generation";
+
+/// A collection's handle-space epoch, so a reader derives epoch-dependent
+/// protocol values (an IMAP UIDVALIDITY) from the store alone.
+pub const LOAD_GENERATION: &str = "SELECT generation FROM collections WHERE id = :collection";

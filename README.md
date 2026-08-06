@@ -26,6 +26,7 @@ This library is composed of 2 feature-gated layers:
 - **Offline-first**: keeps the shared item and a per-source base, the raw material a sync engine reconciles against.
 - **Short public ids**: one small, store-global id per message, shared across every collection and never reused.
 - **Crash-safe writes**: one transaction per batch, bodies durable before the rows that reference them, and blobs garbage collected inside it.
+- **Action queue**: processes that do not own the store request mutations by appending actions the owner applies exactly once, with parked failures queryable and collection generations carrying the handle-space epoch to readers.
 - **no_std core**: the schema, statements and encodings need no allocator beyond `alloc` and pull SQLite in only behind the `client` feature.
 
 ## Specification

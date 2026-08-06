@@ -1,10 +1,23 @@
 //! Pure, I/O-free encodings between the [`io_replica`] model and the pimdir
 //! columns (spec §11). No SQLite, no filesystem: this is the part an Android or
 //! any other implementation reuses.
+//!
+//! Beside the column encodings, this module holds the action-queue payload
+//! codec (spec §14.3): the six v1 action kinds as [`PimdirAction`], encoded to
+//! and from the versioned JSON `queue.payload` column.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::fmt;
 
-use io_replica::placement::{ReplicaFlags, ReplicaLevel};
+use io_replica::{
+    collection::ReplicaCollectionId,
+    object::ReplicaHash,
+    placement::{ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta},
+};
+use serde_json::{Map, Value, json};
 
 /// A flag set to its canonical JSON array (sorted; the model's set is already
 /// ordered). An empty set encodes as `"[]"`, never `NULL`.
@@ -42,6 +55,291 @@ pub fn level_from_int(value: i64) -> ReplicaLevel {
     }
 }
 
+/// A queued mutation request (spec §14.3): what a producer appends to the
+/// `queue` table and the owner applies to the store.
+///
+/// The kinds mirror io-replica's mutation vocabulary on purpose: the queue is
+/// the cross-process projection of the engine's mutate verb. Existing items are
+/// addressed by their public `seq` (spec §9.1), the same identifier a reading
+/// client already holds; the owner resolves it back to the internal link id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PimdirAction {
+    /// Create an item in the collection, staged as a local creation for the
+    /// sync layer to push. A duplicate live `link_id` in the collection parks
+    /// the action (the item already exists).
+    Add {
+        /// The item's cross-source link id; `None` derives it from `object`.
+        link_id: Option<ReplicaLinkId>,
+        /// The initial flag set.
+        flags: ReplicaFlags,
+        /// The body's content hash, matching the row's `object_hash`; the
+        /// producer wrote the blob durably before enqueueing.
+        object: Option<ReplicaHash>,
+        /// The item's summary (spec §13), or `None` when not projected.
+        meta: Option<ReplicaMeta>,
+        /// The provisional handle the create is staged under; `None` lets the
+        /// owner derive one.
+        handle: Option<ReplicaHandle>,
+    },
+    /// Replace the item's flag set (absolute, never a delta, so reapplication
+    /// is idempotent).
+    SetFlags {
+        /// The item's public id.
+        seq: i64,
+        /// The new flag set.
+        flags: ReplicaFlags,
+    },
+    /// Remove the item from the collection; already-absent is success, not an
+    /// error.
+    Remove {
+        /// The item's public id.
+        seq: i64,
+    },
+    /// Refile the item into another collection (target create plus source
+    /// removal).
+    Move {
+        /// The item's public id.
+        seq: i64,
+        /// The collection to move it into.
+        to: ReplicaCollectionId,
+    },
+    /// Copy the item into another collection (same as a move, without the
+    /// removal).
+    Copy {
+        /// The item's public id.
+        seq: i64,
+        /// The collection to copy it into.
+        to: ReplicaCollectionId,
+    },
+    /// Repoint a mutable-content item's body (a contact or event edit).
+    Update {
+        /// The item's public id.
+        seq: i64,
+        /// The new body's content hash; the producer wrote the blob durably
+        /// before enqueueing.
+        object: ReplicaHash,
+        /// The refreshed summary, or `None` to keep the cached one.
+        meta: Option<ReplicaMeta>,
+    },
+}
+
+impl PimdirAction {
+    /// The action kind as its `queue.action` column value (spec §11).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Add { .. } => "add",
+            Self::SetFlags { .. } => "set-flags",
+            Self::Remove { .. } => "remove",
+            Self::Move { .. } => "move",
+            Self::Copy { .. } => "copy",
+            Self::Update { .. } => "update",
+        }
+    }
+
+    /// The body hash the payload references, if any: the value the enqueue
+    /// carries in `queue.object_hash` so the pending body is pinned against
+    /// garbage collection (spec §14.1).
+    pub fn object_hash(&self) -> Option<&ReplicaHash> {
+        match self {
+            Self::Add { object, .. } => object.as_ref(),
+            Self::Update { object, .. } => Some(object),
+            Self::SetFlags { .. } | Self::Remove { .. } | Self::Move { .. } | Self::Copy { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// A malformed or unsupported action payload; the owner parks the row instead
+/// of applying it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PimdirActionError {
+    /// The payload is not a JSON object.
+    Json,
+    /// The `queue.action` column names no known v1 kind.
+    UnknownKind(String),
+    /// The payload's leading `v` is missing or not a supported version.
+    UnknownVersion(Option<i64>),
+    /// A required payload field is missing or has the wrong shape.
+    MissingField(&'static str),
+}
+
+impl fmt::Display for PimdirActionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json => write!(f, "pimdir action payload is not a JSON object"),
+            Self::UnknownKind(kind) => write!(f, "unknown pimdir action kind: {kind}"),
+            Self::UnknownVersion(Some(v)) => write!(f, "unknown pimdir action version: {v}"),
+            Self::UnknownVersion(None) => write!(f, "pimdir action payload misses its version"),
+            Self::MissingField(field) => write!(f, "pimdir action payload misses field: {field}"),
+        }
+    }
+}
+
+impl core::error::Error for PimdirActionError {}
+
+/// Encodes an action to its versioned JSON `queue.payload` column (spec §14.3,
+/// `v: 1`). Absent optional fields are omitted; `meta` embeds as parsed JSON
+/// when it is valid JSON, else as a JSON string.
+pub fn action_to_payload(action: &PimdirAction) -> String {
+    let mut map = Map::new();
+    map.insert("v".into(), json!(1));
+
+    match action {
+        PimdirAction::Add {
+            link_id,
+            flags,
+            object,
+            meta,
+            handle,
+        } => {
+            if let Some(link) = link_id {
+                map.insert("link_id".into(), json!(link.0));
+            }
+            map.insert("flags".into(), flags_to_value(flags));
+            if let Some(object) = object {
+                map.insert("object".into(), json!(object.0));
+            }
+            if let Some(meta) = meta {
+                map.insert("meta".into(), meta_to_value(meta));
+            }
+            if let Some(handle) = handle {
+                map.insert("handle".into(), json!(handle.0));
+            }
+        }
+        PimdirAction::SetFlags { seq, flags } => {
+            map.insert("seq".into(), json!(seq));
+            map.insert("flags".into(), flags_to_value(flags));
+        }
+        PimdirAction::Remove { seq } => {
+            map.insert("seq".into(), json!(seq));
+        }
+        PimdirAction::Move { seq, to } | PimdirAction::Copy { seq, to } => {
+            map.insert("seq".into(), json!(seq));
+            map.insert("to".into(), json!(to.0));
+        }
+        PimdirAction::Update { seq, object, meta } => {
+            map.insert("seq".into(), json!(seq));
+            map.insert("object".into(), json!(object.0));
+            if let Some(meta) = meta {
+                map.insert("meta".into(), meta_to_value(meta));
+            }
+        }
+    }
+
+    Value::Object(map).to_string()
+}
+
+/// Decodes a `queue.action` kind plus its `queue.payload` JSON back to a
+/// [`PimdirAction`] — the inverse of [`action_to_payload`]. Strict, unlike the
+/// lenient column decoders: a malformed payload is an error the owner parks
+/// the row with, never a silently-empty action.
+pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, PimdirActionError> {
+    let value: Value = serde_json::from_str(payload).map_err(|_| PimdirActionError::Json)?;
+    let map = value.as_object().ok_or(PimdirActionError::Json)?;
+
+    let version = map.get("v").and_then(Value::as_i64);
+    if version != Some(1) {
+        return Err(PimdirActionError::UnknownVersion(version));
+    }
+
+    match kind {
+        "add" => Ok(PimdirAction::Add {
+            link_id: get_string(map, "link_id")?.map(ReplicaLinkId),
+            flags: flags_from_value(map.get("flags")),
+            object: get_string(map, "object")?.map(ReplicaHash),
+            meta: map.get("meta").map(meta_from_value),
+            handle: get_string(map, "handle")?.map(ReplicaHandle),
+        }),
+        "set-flags" => Ok(PimdirAction::SetFlags {
+            seq: require_seq(map)?,
+            flags: flags_from_value(map.get("flags")),
+        }),
+        "remove" => Ok(PimdirAction::Remove {
+            seq: require_seq(map)?,
+        }),
+        "move" => Ok(PimdirAction::Move {
+            seq: require_seq(map)?,
+            to: ReplicaCollectionId(require_string(map, "to")?),
+        }),
+        "copy" => Ok(PimdirAction::Copy {
+            seq: require_seq(map)?,
+            to: ReplicaCollectionId(require_string(map, "to")?),
+        }),
+        "update" => Ok(PimdirAction::Update {
+            seq: require_seq(map)?,
+            object: ReplicaHash(require_string(map, "object")?),
+            meta: map.get("meta").map(meta_from_value),
+        }),
+        other => Err(PimdirActionError::UnknownKind(other.to_string())),
+    }
+}
+
+/// A flag set as a JSON array value (the model's set is already sorted).
+fn flags_to_value(flags: &ReplicaFlags) -> Value {
+    Value::Array(flags.0.iter().map(|f| json!(f)).collect())
+}
+
+/// The inverse of [`flags_to_value`]; an absent or malformed array decodes to
+/// the empty set, matching [`flags_from_json`].
+fn flags_from_value(value: Option<&Value>) -> ReplicaFlags {
+    let items = value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    ReplicaFlags(items)
+}
+
+/// A stored summary embedded in a payload: parsed JSON when the opaque meta is
+/// valid JSON (the spec §13 conventions), a JSON string otherwise.
+fn meta_to_value(meta: &ReplicaMeta) -> Value {
+    serde_json::from_str(&meta.0).unwrap_or_else(|_| json!(meta.0))
+}
+
+/// The inverse of [`meta_to_value`]: a JSON string is taken verbatim, any other
+/// value is re-serialised to the stored opaque form.
+fn meta_from_value(value: &Value) -> ReplicaMeta {
+    match value.as_str() {
+        Some(text) => ReplicaMeta(text.to_string()),
+        None => ReplicaMeta(value.to_string()),
+    }
+}
+
+/// An optional string payload field; present with a non-string shape errors.
+fn get_string(
+    map: &Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<String>, PimdirActionError> {
+    match map.get(field) {
+        None => Ok(None),
+        Some(value) => match value.as_str() {
+            Some(text) => Ok(Some(text.to_string())),
+            None => Err(PimdirActionError::MissingField(field)),
+        },
+    }
+}
+
+/// A required string payload field.
+fn require_string(
+    map: &Map<String, Value>,
+    field: &'static str,
+) -> Result<String, PimdirActionError> {
+    get_string(map, field)?.ok_or(PimdirActionError::MissingField(field))
+}
+
+/// The required `seq` payload field (an integer public id).
+fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
+    map.get("seq")
+        .and_then(Value::as_i64)
+        .ok_or(PimdirActionError::MissingField("seq"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +366,99 @@ mod tests {
         for l in [ReplicaLevel::Probed, ReplicaLevel::Meta, ReplicaLevel::Full] {
             assert_eq!(level_from_int(level_to_int(l)), l);
         }
+    }
+
+    #[test]
+    fn every_action_kind_round_trips_through_its_payload() {
+        let actions = [
+            PimdirAction::Add {
+                link_id: Some(ReplicaLinkId("mid:new".into())),
+                flags: ReplicaFlags::from_iter(["\\Draft"]),
+                object: Some(ReplicaHash("cafebabe".into())),
+                meta: Some(ReplicaMeta("{\"subject\":\"hi\",\"v\":1}".into())),
+                handle: Some(ReplicaHandle("draft-1".into())),
+            },
+            PimdirAction::Add {
+                link_id: None,
+                flags: ReplicaFlags::default(),
+                object: None,
+                meta: None,
+                handle: None,
+            },
+            PimdirAction::SetFlags {
+                seq: 4,
+                flags: ReplicaFlags::from_iter(["\\Seen", "$flagged"]),
+            },
+            PimdirAction::Remove { seq: 5 },
+            PimdirAction::Move {
+                seq: 6,
+                to: ReplicaCollectionId("Archive".into()),
+            },
+            PimdirAction::Copy {
+                seq: 7,
+                to: ReplicaCollectionId("Backup".into()),
+            },
+            PimdirAction::Update {
+                seq: 8,
+                object: ReplicaHash("beef0000".into()),
+                meta: None,
+            },
+        ];
+        for action in actions {
+            let payload = action_to_payload(&action);
+            // NOTE: versioned with a leading `v` (spec §14.3).
+            assert!(payload.contains("\"v\":1"), "versioned: {payload}");
+            let decoded = action_from_payload(action.kind(), &payload).unwrap();
+            assert_eq!(decoded, action, "round-trip of {payload}");
+        }
+    }
+
+    #[test]
+    fn a_non_json_meta_survives_the_payload_embedding() {
+        let action = PimdirAction::Update {
+            seq: 1,
+            object: ReplicaHash("cafebabe".into()),
+            meta: Some(ReplicaMeta("not json".into())),
+        };
+        let payload = action_to_payload(&action);
+        assert_eq!(action_from_payload("update", &payload).unwrap(), action);
+    }
+
+    #[test]
+    fn malformed_action_payloads_error_instead_of_decaying() {
+        // NOTE: strict, unlike the column decoders: the owner parks these.
+        assert_eq!(
+            action_from_payload("remove", "not json"),
+            Err(PimdirActionError::Json)
+        );
+        assert_eq!(
+            action_from_payload("remove", "{\"seq\":1}"),
+            Err(PimdirActionError::UnknownVersion(None))
+        );
+        assert_eq!(
+            action_from_payload("remove", "{\"v\":2,\"seq\":1}"),
+            Err(PimdirActionError::UnknownVersion(Some(2)))
+        );
+        assert_eq!(
+            action_from_payload("remove", "{\"v\":1}"),
+            Err(PimdirActionError::MissingField("seq"))
+        );
+        assert_eq!(
+            action_from_payload("purge", "{\"v\":1}"),
+            Err(PimdirActionError::UnknownKind("purge".into()))
+        );
+    }
+
+    #[test]
+    fn the_pinned_hash_follows_the_payload_body() {
+        let add = PimdirAction::Add {
+            link_id: None,
+            flags: ReplicaFlags::default(),
+            object: Some(ReplicaHash("cafebabe".into())),
+            meta: None,
+            handle: None,
+        };
+        assert_eq!(add.object_hash(), Some(&ReplicaHash("cafebabe".into())));
+        assert_eq!(PimdirAction::Remove { seq: 1 }.object_hash(), None);
     }
 }

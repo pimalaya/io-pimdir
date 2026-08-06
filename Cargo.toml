@@ -21,6 +21,7 @@ default = ["client"]
 client = ["dep:rusqlite"]
 
 [dev-dependencies]
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 tempfile = { version = "3", default-features = false }
 
 [dependencies]
