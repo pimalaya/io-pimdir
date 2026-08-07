@@ -110,6 +110,47 @@ pub struct PimdirItem {
     pub level: ReplicaLevel,
 }
 
+/// One retained (soft-deleted) item, as the trash view reads it
+/// (`list_retained`): the whole row retention kept, body pointer and size
+/// included, so a caller can show it, restore it or price a purge without a
+/// second query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirRetainedItem {
+    /// The message's public id, the same it held while live: a restore keeps
+    /// it, and it is what `purge` addresses.
+    pub seq: i64,
+    /// The cross-source link id the retained row still holds.
+    pub link_id: String,
+    /// The flag set as of the moment the last binding vanished.
+    pub flags: ReplicaFlags,
+    /// The detail tier the item was hydrated to.
+    pub level: ReplicaLevel,
+    /// The raw per-domain summary blob, verbatim.
+    pub meta: Option<String>,
+    /// The body hash the row still pins; `None` when the item was never
+    /// hydrated (nothing to reclaim, nothing to restore locally).
+    pub object_hash: Option<String>,
+    /// The body's size in bytes; `None` alongside an absent `object_hash`.
+    pub size: Option<u64>,
+    /// The RFC 3339 instant the **last binding vanished** (not when a server
+    /// deleted the item, which is unknowable). A revive clears it, so
+    /// restore-then-redelete restarts the purge clock.
+    pub retained_at: String,
+    /// The source whose removal retired the item; diagnostic, nothing keys on
+    /// it.
+    pub retained_by: Option<String>,
+}
+
+/// What a purge reclaimed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirPurgeReport {
+    /// Retained items deleted.
+    pub items: usize,
+    /// Blob bytes actually unlinked; a body another item still references is
+    /// not counted, since it was not reclaimed.
+    pub bytes: u64,
+}
+
 /// One pending (non-parked) queue row, in append order (spec §14.4): what a
 /// frontend overlays on its item projection for read-your-writes, and what the
 /// owner's drain applies.
@@ -158,6 +199,10 @@ pub struct PimdirDrainReport {
     pub applied: usize,
     /// Actions parked with an error, left queryable.
     pub parked: usize,
+    /// Actions this owner could not perform, left **pending** for one that can
+    /// (spec §14.2). Not a failure: parking would claim the action is
+    /// permanently unappliable, which is a different and wrong statement.
+    pub skipped: usize,
 }
 
 impl PimdirStore {
@@ -384,6 +429,193 @@ impl PimdirStore {
     }
 }
 
+/// The retention surface (spec §16): the trash a store keeps instead of losing
+/// items, and the only operations that truly destroy one.
+///
+/// An item whose last source binding vanished is retained, not deleted: hidden
+/// from the sync seam (so no sync ever re-derives it) and from the live client
+/// reads, but kept whole, body included. It comes back either by revival (its
+/// link id reappears, whether from a source or from a client `add`) or not at
+/// all, until a purge reclaims it. Retention is unconditional; *when* to
+/// reclaim is the owner's schedule, which is why every purge takes its
+/// boundary from the caller.
+impl PimdirStore {
+    /// A keyset page of a collection's retained items.
+    ///
+    /// `after` is the exclusive lower bound on the public `seq` (`None` starts
+    /// from the beginning); at most `limit` items are returned, ordered by
+    /// `seq`, so the last item's [`seq`](PimdirRetainedItem::seq) is the cursor
+    /// for the next page. This is the only read that returns retained items: a
+    /// caller presents them as a trash view, never merged into the live listing.
+    pub fn list_retained(
+        &self,
+        collection: &ReplicaCollectionId,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PimdirRetainedItem>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_RETAINED_PAGE)?;
+        let rows = stmt.query_map(
+            named_params! {
+                ":collection": collection.0,
+                ":after": after.unwrap_or(0),
+                ":limit": limit as i64,
+            },
+            |row| {
+                let size: Option<i64> = row.get(8)?;
+                Ok(PimdirRetainedItem {
+                    seq: row.get(0)?,
+                    link_id: row.get(1)?,
+                    flags: codec::flags_from_json(row.get::<_, Option<String>>(2)?.as_deref()),
+                    object_hash: row.get(3)?,
+                    meta: row.get(4)?,
+                    level: codec::level_from_int(row.get(5)?),
+                    retained_at: row.get(6)?,
+                    retained_by: row.get(7)?,
+                    size: size.map(|size| size.max(0) as u64),
+                })
+            },
+        )?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// A collection's retained item count, the counterpart of
+    /// [`count_items`](Self::count_items).
+    pub fn count_retained(&self, collection: &ReplicaCollectionId) -> Result<i64, PimdirError> {
+        Ok(self.conn.query_row(
+            sql::COUNT_RETAINED,
+            named_params! { ":collection": collection.0 },
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The bytes retention is holding across the whole store, each distinct body
+    /// counted once.
+    ///
+    /// An **upper bound** on what a purge would reclaim: a body a live item also
+    /// points at keeps that reference and survives the sweep. Reported so an
+    /// operator can price a retention duration before choosing one.
+    pub fn retained_bytes(&self) -> Result<u64, PimdirError> {
+        let bytes: i64 = self.conn.query_row(sql::RETAINED_BYTES, [], |r| r.get(0))?;
+        Ok(bytes.max(0) as u64)
+    }
+
+    /// Purges one retained item by its public id, returning whether there was
+    /// one to purge.
+    ///
+    /// The row goes, its bindings cascade, and the body it released is unlinked
+    /// by the ordinary refcount sweep once nothing else references it: a purge
+    /// runs no garbage collection of its own. A **live** item is never reached
+    /// by this (the statement is guarded on the retention stamp), so an
+    /// operator emptying the trash cannot destroy synced data.
+    pub fn purge(
+        &mut self,
+        collection: &ReplicaCollectionId,
+        seq: i64,
+    ) -> Result<bool, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+
+        let pinned: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                sql::RETAINED_ITEM_BY_SEQ,
+                named_params! { ":collection": collection.0, ":seq": seq },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((object, conflict_object)) = pinned else {
+            return Ok(false);
+        };
+
+        tx.execute(
+            sql::PURGE_ITEM,
+            named_params! { ":collection": collection.0, ":seq": seq },
+        )?;
+        release_pins(&tx, [object, conflict_object].into_iter().flatten())?;
+        let garbage = collect_garbage(&tx)?;
+        tx.commit().map_err(busy_or_sql)?;
+
+        for (hash, _) in garbage {
+            remove_blob(&self.blobs, &hash)?;
+        }
+        Ok(true)
+    }
+
+    /// The scheduled sweep: purges every item retired **strictly before**
+    /// `cutoff` (RFC 3339), store-wide, reporting what it reclaimed.
+    ///
+    /// The boundary is the caller's, not the store's clock: an owner computes it
+    /// from its own retention duration, so the store holds no policy and the
+    /// sweep stays deterministic even though the stamps are SQLite's. An item
+    /// retained exactly at `cutoff` is kept. A cutoff of *now* reproduces the
+    /// terminal-delete behaviour of a store that never retained, which is why
+    /// there is no on/off switch.
+    pub fn purge_retained_before(
+        &mut self,
+        cutoff: &str,
+    ) -> Result<PimdirPurgeReport, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+
+        let pinned: Vec<(Option<String>, Option<String>)> = {
+            let mut stmt = tx.prepare(sql::RETAINED_BEFORE)?;
+            let rows = stmt.query_map(named_params! { ":cutoff": cutoff }, |row| {
+                Ok((row.get(2)?, row.get(3)?))
+            })?;
+            let mut pinned = Vec::new();
+            for row in rows {
+                pinned.push(row?);
+            }
+            pinned
+        };
+        let items = pinned.len();
+        tx.execute(
+            sql::PURGE_RETAINED_BEFORE,
+            named_params! { ":cutoff": cutoff },
+        )?;
+        release_pins(
+            &tx,
+            pinned
+                .into_iter()
+                .flat_map(|(object, conflict)| [object, conflict])
+                .flatten(),
+        )?;
+        let garbage = collect_garbage(&tx)?;
+        tx.commit().map_err(busy_or_sql)?;
+
+        // NOTE: the bytes are the blobs actually unlinked, so a body another
+        // item still references is not claimed as reclaimed.
+        let mut bytes = 0;
+        for (hash, size) in garbage {
+            remove_blob(&self.blobs, &hash)?;
+            bytes += size;
+        }
+        Ok(PimdirPurgeReport { items, bytes })
+    }
+}
+
+/// Releases the object references a retained row (or a queue row) held, so the
+/// ordinary sweep can reclaim a body nothing points at any more.
+fn release_pins(
+    conn: &Connection,
+    hashes: impl Iterator<Item = String>,
+) -> Result<(), PimdirError> {
+    for hash in hashes {
+        conn.execute(
+            sql::ADJUST_REFCOUNT,
+            named_params! { ":delta": -1, ":hash": hash },
+        )?;
+    }
+    Ok(())
+}
+
 /// The action-queue owner surface (spec §14) and collection generations (spec
 /// §15): the single owning process drains producer-requested mutations into the
 /// store, and marks a handle-space rebuild for readers.
@@ -433,7 +665,7 @@ impl PimdirStore {
         let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
 
-        for hash in garbage {
+        for (hash, _) in garbage {
             remove_blob(&self.blobs, &hash)?;
         }
         Ok(generation)
@@ -498,6 +730,14 @@ impl PimdirStore {
     /// blocking later actions. A transient failure increments the row's
     /// `attempts` and stops the pass with the error, preserving apply order for
     /// the retry.
+    ///
+    /// An action whose kind this store defines no semantics for is **skipped**:
+    /// left pending, never parked, never blocking the actions behind it. That
+    /// is what lets one queue carry store mutations any owner applies beside
+    /// capability-bound intents (a mail submission) only a specific owner can
+    /// perform; that owner reads the row through
+    /// [`pending_actions`](Self::pending_actions), performs it, and
+    /// acknowledges it with [`drop_action`](Self::drop_action).
     pub fn drain_collection(&mut self, collection: &str) -> Result<PimdirDrainReport, PimdirError> {
         let rows: Vec<QueueRow> = {
             let mut stmt = self.conn.prepare(sql::LOAD_PENDING_ACTIONS)?;
@@ -527,6 +767,10 @@ impl PimdirStore {
                     continue;
                 }
             };
+            if matches!(action, PimdirAction::Unknown { .. }) {
+                report.skipped += 1;
+                continue;
+            }
             match self.apply_queued(collection, &row, &action) {
                 Ok(None) => report.applied += 1,
                 Ok(Some(reason)) => {
@@ -577,10 +821,73 @@ impl PimdirStore {
         let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
 
-        for hash in garbage {
+        for (hash, _) in garbage {
             remove_blob(&self.blobs, &hash)?;
         }
         Ok(None)
+    }
+
+    /// Removes one queue row by request rather than by application, pending or
+    /// parked, returning whether there was a row to remove (spec §14.5).
+    ///
+    /// One verb for the two ways a row leaves the queue unapplied: a producer
+    /// (or an operator) **cancelling** a queued action, and an owner
+    /// **acknowledging** an intent it performed out of band, which the drain
+    /// could only skip. The row's body pin is released in the same transaction,
+    /// so a blob nothing else references falls to the ordinary sweep.
+    pub fn drop_action(&mut self, id: i64) -> Result<bool, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+
+        let hash: Option<Option<String>> = tx
+            .query_row(sql::LOAD_ACTION_ROW, named_params! { ":id": id }, |r| {
+                r.get(1)
+            })
+            .optional()?;
+        let Some(hash) = hash else {
+            return Ok(false);
+        };
+
+        tx.execute(sql::CANCEL_ACTION, named_params! { ":id": id })?;
+        release_pins(&tx, hash.into_iter())?;
+        let garbage = collect_garbage(&tx)?;
+        tx.commit().map_err(busy_or_sql)?;
+
+        for (hash, _) in garbage {
+            remove_blob(&self.blobs, &hash)?;
+        }
+        Ok(true)
+    }
+
+    /// Records a failed apply an owner performed itself (spec §14.2).
+    ///
+    /// `None` is the transient case: the attempt counter advances and the row
+    /// stays pending, so the next drain picks it up again. `Some(error)` is the
+    /// permanent one: the row parks with the failure, visible to operators
+    /// instead of blocking its collection forever. An unknown id is a no-op,
+    /// since the row may have been applied or cancelled in between.
+    pub fn fail_action(&mut self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
+        let Some(error) = error else {
+            self.conn
+                .execute(sql::BUMP_ATTEMPTS, named_params! { ":id": id })?;
+            return Ok(());
+        };
+
+        let attempts: Option<i64> = self
+            .conn
+            .query_row(sql::LOAD_ACTION_ROW, named_params! { ":id": id }, |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(attempts) = attempts {
+            self.conn.execute(
+                sql::PARK_ACTION,
+                named_params! { ":id": id, ":attempts": attempts + 1, ":error": error },
+            )?;
+        }
+        Ok(())
     }
 
     /// Parks one queue row: records the failure and the spent attempt, leaving
@@ -711,6 +1018,7 @@ fn stage_action(
         | PimdirAction::Update { seq, .. } => (*seq, false),
         PimdirAction::Remove { seq } => (*seq, true),
         PimdirAction::Add { .. } => unreachable!("add staged above"),
+        PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
     let item = tx
         .query_row(
@@ -767,6 +1075,7 @@ fn stage_action(
             meta: meta.clone(),
         },
         PimdirAction::Add { .. } => unreachable!("add staged above"),
+        PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
 
     let mut mutate = ReplicaMutate::new(collection_id, mutation);
@@ -1103,7 +1412,7 @@ impl ReplicaStorage for PimdirStore {
         let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
 
-        for hash in garbage {
+        for (hash, _) in garbage {
             remove_blob(&self.blobs, &hash)?;
         }
         Ok(())
@@ -1194,7 +1503,7 @@ fn apply_ops(
         let old_hub = load_hub(tx, &collection)?;
         let mut new_hub = old_hub.clone();
         new_hub.absorb(source, &ops);
-        save_hub_diff(tx, &collection, &old_hub, &new_hub)?;
+        save_hub_diff(tx, &collection, source, &old_hub, &new_hub)?;
         adjust_refcounts(tx, &object_refs(&old_hub), &object_refs(&new_hub))?;
     }
 
@@ -1202,18 +1511,20 @@ fn apply_ops(
 }
 
 /// Deletes the zero-refcount object rows inside the caller's transaction and
-/// returns their hashes; the caller unlinks the blob files **after** the
-/// commit, so a crash leaves at worst an orphan blob, never a row without its
-/// body.
-fn collect_garbage(tx: &Connection) -> Result<Vec<String>, rusqlite::Error> {
-    let garbage: Vec<String> = {
-        let mut stmt = tx.prepare(sql::LIST_GARBAGE_OBJECTS)?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut hashes = Vec::new();
+/// returns their hashes and sizes; the caller unlinks the blob files **after**
+/// the commit, so a crash leaves at worst an orphan blob, never a row without
+/// its body. The sizes are what a purge reports as bytes reclaimed.
+fn collect_garbage(tx: &Connection) -> Result<Vec<(String, u64)>, rusqlite::Error> {
+    let garbage: Vec<(String, u64)> = {
+        let mut stmt = tx.prepare(sql::LIST_GARBAGE_SIZED)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+        })?;
+        let mut objects = Vec::new();
         for row in rows {
-            hashes.push(row?);
+            objects.push(row?);
         }
-        hashes
+        objects
     };
     tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
     Ok(garbage)
@@ -1276,9 +1587,11 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     /// Columns folded into version 1 after it was first published, as
     /// `(table, column, declaration)`. Each must be nullable or carry a
     /// constant default, or it could not be added to a populated table.
-    const FOLDED_IN: [(&str, &str, &str); 2] = [
+    const FOLDED_IN: [(&str, &str, &str); 4] = [
         ("bindings", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
         ("bindings", "conflict_revision", "TEXT"),
+        ("items", "retained_at", "TEXT"),
+        ("items", "retained_by", "TEXT"),
     ];
 
     let mut missing = Vec::new();
@@ -1297,6 +1610,9 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     for (table, column, decl) in missing {
         tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     }
+    // NOTE: an index over a folded-in column has to be created with it; the
+    // schema script builds it on a fresh database, where nothing is missing.
+    tx.execute_batch(sql::ENSURE_RETAINED_INDEX)?;
     tx.commit().map_err(busy_or_sql)?;
     Ok(())
 }
@@ -1363,11 +1679,13 @@ fn load_hub(conn: &Connection, collection: &str) -> rusqlite::Result<ReplicaHub>
 /// Persists the change from `old` to `new` for a collection's hub by diffing the
 /// two in memory and issuing only the item/binding inserts, updates and deletes
 /// that actually differ — never a whole-collection delete-and-reinsert. So a
-/// write touches O(changed rows), not O(collection size). Item deletes cascade to
-/// their bindings (`PRAGMA foreign_keys = ON`).
+/// write touches O(changed rows), not O(collection size). An item no source
+/// holds any more is retained rather than deleted, `source` naming the side
+/// whose removal retired it.
 fn save_hub_diff(
     conn: &Connection,
     collection: &str,
+    source: &ReplicaSourceId,
     old: &ReplicaHub,
     new: &ReplicaHub,
 ) -> rusqlite::Result<()> {
@@ -1382,12 +1700,34 @@ fn save_hub_diff(
         )?;
     }
 
-    // Items gone in `new`: delete (bindings cascade).
-    for link in old.items.keys() {
-        if !new.items.contains_key(link) {
+    // Items gone in `new`: no source holds them any more, so they are retained
+    // (soft-deleted), never deleted: a store loses an item only to a purge.
+    // The bindings go with the sources that held them; the row stays, hidden
+    // from `LOAD_ITEMS` so no later sync, delta or full, re-derives against it.
+    for (link, item) in &old.items {
+        if new.items.contains_key(link) {
+            continue;
+        }
+        conn.execute(
+            sql::RETAIN_ITEM,
+            named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
+        )?;
+        conn.execute(
+            sql::DELETE_ITEM_BINDINGS,
+            named_params! { ":collection": collection, ":link_id": link.0 },
+        )?;
+        // NOTE: the caller's refcount diff is about to release this item's
+        // object references as it leaves the hub, but the row survives and
+        // still points at them. Pin them back, exactly as a queue row pins a
+        // queued body, so garbage collection cannot sweep a retained body.
+        // Revive and purge release the pin.
+        for hash in [item.object.as_ref(), item.conflict_object.as_ref()]
+            .into_iter()
+            .flatten()
+        {
             conn.execute(
-                sql::DELETE_ITEM,
-                named_params! { ":collection": collection, ":link_id": link.0 },
+                sql::ADJUST_REFCOUNT,
+                named_params! { ":delta": 1, ":hash": hash.0 },
             )?;
         }
     }
@@ -1425,6 +1765,14 @@ fn insert_item(
     link: &ReplicaLinkId,
     item: &ReplicaHubItem,
 ) -> rusqlite::Result<()> {
+    // A retained row may still hold this primary key: the item is back, either
+    // resurrected on a source or restored by a client `add` over the values the
+    // row still carries. Revive it in place instead of colliding, keeping its
+    // `seq` (a message keeps one public id for life, and ids are never reused).
+    if revive_item(conn, collection, link, item)? {
+        return Ok(());
+    }
+
     // The public id is a property of the message: if this link id already has a
     // seq in any collection (the message is filed in another mailbox too), reuse
     // it, so all its placements share one id; otherwise draw a fresh store-global
@@ -1459,6 +1807,49 @@ fn insert_item(
         insert_binding(conn, collection, link, source, binding)?;
     }
     Ok(())
+}
+
+/// Revives the retained row holding `(collection, link)`, if there is one: it
+/// stops being retained (spec §16), adopts the incoming content through the
+/// ordinary item update and binds the sources. Returns whether a row was
+/// revived.
+///
+/// The retention pin the retire took is released here; the caller's refcount
+/// diff takes the live reference for the adopted content in the same
+/// transaction, so a body kept only by the retained row is never sweepable in
+/// between.
+fn revive_item(
+    conn: &Connection,
+    collection: &str,
+    link: &ReplicaLinkId,
+    item: &ReplicaHubItem,
+) -> rusqlite::Result<bool> {
+    let pinned: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            sql::RETAINED_ITEM,
+            named_params! { ":collection": collection, ":link_id": link.0 },
+            |row| Ok((row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((object, conflict_object)) = pinned else {
+        return Ok(false);
+    };
+
+    conn.execute(
+        sql::REVIVE_ITEM,
+        named_params! { ":collection": collection, ":link_id": link.0 },
+    )?;
+    update_item(conn, collection, link, item)?;
+    for hash in [object, conflict_object].into_iter().flatten() {
+        conn.execute(
+            sql::ADJUST_REFCOUNT,
+            named_params! { ":delta": -1, ":hash": hash },
+        )?;
+    }
+    for (source, binding) in &item.sources {
+        insert_binding(conn, collection, link, source, binding)?;
+    }
+    Ok(true)
 }
 
 fn update_item(

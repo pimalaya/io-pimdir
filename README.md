@@ -1,16 +1,18 @@
-# I/O Pimdir [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
+# I/O Pimdir [![Documentation](https://img.shields.io/docsrs/io-pimdir?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-pimdir/latest/io_pimdir) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya)
 
-pimdir store for Rust: a SQLite and content-addressed blob storage backend for io-replica
+pimdir store and operator CLI for Rust: a SQLite and content-addressed blob storage backend for io-replica
 
-This library is composed of 2 feature-gated layers:
+This project is composed of 3 feature-gated layers:
 
 - Low-level **I/O-free** core: no_std-compatible schema, statements and model-to-column encodings, reusable by any implementation
 - Mid-level **std client**: `PimdirStore`, which runs the statements against SQLite and the blob files, servicing the io-replica storage seam
+- High-level **CLI**: the `pimdir` binary, the operator front-end over a store (requires the `cli` feature)
 
 ## Table of contents
 
 - [Features](#features)
 - [Specification](#specification)
+- [Installation](#installation)
 - [Usage](#usage)
 - [Examples](#examples)
 - [AI disclosure](#ai-disclosure)
@@ -26,16 +28,43 @@ This library is composed of 2 feature-gated layers:
 - **Offline-first**: keeps the shared item and a per-source base, the raw material a sync engine reconciles against.
 - **Short public ids**: one small, store-global id per message, shared across every collection and never reused.
 - **Crash-safe writes**: one transaction per batch, bodies durable before the rows that reference them, and blobs garbage collected inside it.
+- **Retention**: a removal retires an item instead of destroying it, hidden from every read and from the sync, until an explicit purge reclaims it.
 - **Action queue**: processes that do not own the store request mutations by appending actions the owner applies exactly once, with parked failures queryable and collection generations carrying the handle-space epoch to readers.
+- **Operator CLI**: inspect a store while a sync is running, read the trash, restore or purge an item, prune the queue, check for orphan blobs and dump the whole store (requires the `cli` feature).
 - **no_std core**: the schema, statements and encodings need no allocator beyond `alloc` and pull SQLite in only behind the `client` feature.
+
+> [!TIP]
+> io-pimdir is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate each layer. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-pimdir/latest/features).
 
 ## Specification
 
 io-pimdir implements the [pimdir](https://github.com/pimalaya/pimdir) on-disk store specification: a SQLite database plus a content-addressed blob directory, with a canonical schema and forward-only migrations. The spec is the cross-implementation contract, so a store written here is readable by any other conformant implementation (a native Android SQLite store, for example). The sync model it services (a shared item, a per-source base, detail levels, conflicts) lives in [io-replica](https://github.com/pimalaya/io-replica).
 
+## Installation
+
+The CLI binary pimdir has not been officially released yet. Install it from [crates.io](https://crates.io/crates/io-pimdir) with cargo:
+
+```sh
+cargo install io-pimdir --locked --features cli
+```
+
+To use io-pimdir as a library, add it to your Cargo.toml: the `cli` feature is not part of the defaults, so a library consumer never compiles the binary or its terminal dependencies.
+
 ## Usage
 
-The whole API is documented on [docs.rs](https://docs.rs/io-pimdir/latest/io_pimdir).
+The `pimdir` binary is to a store what `sqlite3` is to a database: an operator and debugging tool, not an end-user client. It is kind-agnostic and never interprets item content, so it prints ids, flags, levels and the raw meta, and exports raw bytes; rendering a message or a contact belongs to [himalaya](https://github.com/pimalaya/himalaya) and [cardamum](https://github.com/pimalaya/cardamum). Reads open the store read-only, so inspecting a store mid-sync is always safe. A few real-world invocations:
+
+```sh
+pimdir -s ~/mail store info
+pimdir -s ~/mail collection list
+pimdir -s ~/mail item list INBOX --retained
+pimdir -s ~/mail item restore 42
+pimdir -s ~/mail item purge --older-than 90d
+pimdir -s ~/mail queue list --parked
+pimdir -s ~/mail check
+```
+
+Run pimdir --help for the full command tree and flags, and add --json to any command for machine-readable output. The library API is documented on [docs.rs](https://docs.rs/io-pimdir/latest/io_pimdir), and the CLI's own contract (the roles it opens a store with, its verb surface, its confirmation rules) lives in [cairn/spec/cli.md](./cairn/spec/cli.md).
 
 ## Examples
 
@@ -50,7 +79,7 @@ This project is developed with AI assistance. This section documents how, so use
 - **Not used for**: Engineering, critical code, git manipulation (commit, merge, rebase…), real-world tests.
 - **Verification**: Every AI-assisted change is read, compiled, tested, and formatted before commit. Behavioural correctness is verified against the relevant spec, not assumed from the model output. Tests are never adjusted to fit AI-generated code; the code is adjusted to fit correct behaviour.
 - **Limitations**: AI models occasionally produce code that compiles and passes tests but is subtly wrong. The verification workflow catches most of this; it does not catch all of it. Bug reports are welcome and taken seriously.
-- **Last reviewed**: 02/08/2026
+- **Last reviewed**: 07/08/2026
 
 ## License
 

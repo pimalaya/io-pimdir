@@ -121,11 +121,33 @@ pub enum PimdirAction {
         /// The refreshed summary, or `None` to keep the cached one.
         meta: Option<ReplicaMeta>,
     },
+    /// An action this crate defines no semantics for: an owner-defined intent
+    /// (a mail submission) carried by the same queue as the store mutations
+    /// above.
+    ///
+    /// The store cannot apply it, so its drain **skips** the row rather than
+    /// parking it: the action is not unappliable, only unappliable *here*. An
+    /// owner that recognises the kind inspects it, performs it out of band and
+    /// acknowledges it with [`drop_action`]. Only a genuinely malformed payload
+    /// (not JSON, no supported `v`) parks.
+    ///
+    /// [`drop_action`]: ../client/struct.PimdirStore.html#method.drop_action
+    Unknown {
+        /// The raw `queue.action` kind.
+        kind: String,
+        /// The raw versioned JSON payload, verbatim: only its owner knows the
+        /// shape, so nothing here re-encodes it.
+        payload: String,
+        /// The body hash the payload's `object` field names, by the same
+        /// convention as the known kinds, so an intent carrying a body pins it
+        /// against garbage collection like any other queued body.
+        object_hash: Option<ReplicaHash>,
+    },
 }
 
 impl PimdirAction {
     /// The action kind as its `queue.action` column value (spec §11).
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &str {
         match self {
             Self::Add { .. } => "add",
             Self::SetFlags { .. } => "set-flags",
@@ -133,6 +155,7 @@ impl PimdirAction {
             Self::Move { .. } => "move",
             Self::Copy { .. } => "copy",
             Self::Update { .. } => "update",
+            Self::Unknown { kind, .. } => kind,
         }
     }
 
@@ -143,6 +166,7 @@ impl PimdirAction {
         match self {
             Self::Add { object, .. } => object.as_ref(),
             Self::Update { object, .. } => Some(object),
+            Self::Unknown { object_hash, .. } => object_hash.as_ref(),
             Self::SetFlags { .. } | Self::Remove { .. } | Self::Move { .. } | Self::Copy { .. } => {
                 None
             }
@@ -150,14 +174,15 @@ impl PimdirAction {
     }
 }
 
-/// A malformed or unsupported action payload; the owner parks the row instead
-/// of applying it.
+/// A malformed action payload; the owner parks the row instead of applying it.
+///
+/// An unrecognised *kind* is not one of these: it decodes as
+/// [`PimdirAction::Unknown`] and is skipped, since another owner may be able to
+/// perform it. Only a payload no owner could act on lands here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirActionError {
     /// The payload is not a JSON object.
     Json,
-    /// The `queue.action` column names no known v1 kind.
-    UnknownKind(String),
     /// The payload's leading `v` is missing or not a supported version.
     UnknownVersion(Option<i64>),
     /// A required payload field is missing or has the wrong shape.
@@ -168,7 +193,6 @@ impl fmt::Display for PimdirActionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Json => write!(f, "pimdir action payload is not a JSON object"),
-            Self::UnknownKind(kind) => write!(f, "unknown pimdir action kind: {kind}"),
             Self::UnknownVersion(Some(v)) => write!(f, "unknown pimdir action version: {v}"),
             Self::UnknownVersion(None) => write!(f, "pimdir action payload misses its version"),
             Self::MissingField(field) => write!(f, "pimdir action payload misses field: {field}"),
@@ -182,6 +206,12 @@ impl core::error::Error for PimdirActionError {}
 /// `v: 1`). Absent optional fields are omitted; `meta` embeds as parsed JSON
 /// when it is valid JSON, else as a JSON string.
 pub fn action_to_payload(action: &PimdirAction) -> String {
+    // NOTE: an owner-defined intent round-trips byte for byte; this crate knows
+    // no more of its shape than the `object` field it pins.
+    if let PimdirAction::Unknown { payload, .. } = action {
+        return payload.clone();
+    }
+
     let mut map = Map::new();
     map.insert("v".into(), json!(1));
 
@@ -225,6 +255,8 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
                 map.insert("meta".into(), meta_to_value(meta));
             }
         }
+        // NOTE: returned verbatim above.
+        PimdirAction::Unknown { .. } => {}
     }
 
     Value::Object(map).to_string()
@@ -271,7 +303,15 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
             object: ReplicaHash(require_string(map, "object")?),
             meta: map.get("meta").map(meta_from_value),
         }),
-        other => Err(PimdirActionError::UnknownKind(other.to_string())),
+        // NOTE: an owner-defined intent, not a malformed row: the payload is
+        // well-formed and versioned, this crate simply defines no semantics for
+        // the kind. Kept whole for the owner that does, which is what lets one
+        // queue carry store mutations beside capability-bound intents.
+        other => Ok(PimdirAction::Unknown {
+            kind: other.to_string(),
+            payload: payload.to_string(),
+            object_hash: get_string(map, "object")?.map(ReplicaHash),
+        }),
     }
 }
 
@@ -443,9 +483,37 @@ mod tests {
             action_from_payload("remove", "{\"v\":1}"),
             Err(PimdirActionError::MissingField("seq"))
         );
+    }
+
+    #[test]
+    fn an_owner_defined_kind_survives_whole_instead_of_erroring() {
+        // An intent only its owner can perform (a mail submission): this crate
+        // keeps it verbatim rather than parking the row, and still pins the body
+        // the payload references.
+        let payload = "{\"v\":1,\"object\":\"cafebabe\",\"to\":[\"a@b.c\"]}";
+        let decoded = action_from_payload("submit", payload).unwrap();
         assert_eq!(
-            action_from_payload("purge", "{\"v\":1}"),
-            Err(PimdirActionError::UnknownKind("purge".into()))
+            decoded,
+            PimdirAction::Unknown {
+                kind: "submit".into(),
+                payload: payload.into(),
+                object_hash: Some(ReplicaHash("cafebabe".into())),
+            }
+        );
+        assert_eq!(decoded.kind(), "submit");
+        assert_eq!(decoded.object_hash(), Some(&ReplicaHash("cafebabe".into())));
+        // Byte-for-byte: nothing here understands the shape well enough to
+        // re-encode it.
+        assert_eq!(action_to_payload(&decoded), payload);
+
+        // A malformed payload still parks, whatever its kind.
+        assert_eq!(
+            action_from_payload("submit", "{\"to\":[]}"),
+            Err(PimdirActionError::UnknownVersion(None))
+        );
+        assert_eq!(
+            action_from_payload("submit", "nope"),
+            Err(PimdirActionError::Json)
         );
     }
 

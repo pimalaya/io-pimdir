@@ -56,7 +56,8 @@ CREATE TABLE objects (
 
 -- The shared truth of one logical item, keyed by its cross-source link id.
 -- `deleted` lingers after a source removes it, until every source has dropped
--- it too (the cross-source delete memory).
+-- it too (the cross-source delete memory). Once no source holds it, the row is
+-- RETAINED rather than deleted: a store never loses an item, purge does.
 CREATE TABLE items (
     collection      TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
     link_id         TEXT NOT NULL,
@@ -69,6 +70,11 @@ CREATE TABLE items (
     meta            TEXT,
     level           INTEGER NOT NULL,
     deleted         INTEGER NOT NULL DEFAULT 0,
+    -- RFC 3339 instant the last binding vanished; non-NULL means retained
+    -- (soft-deleted). One column carries both the flag and the purge clock.
+    retained_at     TEXT,
+    -- The source whose removal retired the item, diagnostic only.
+    retained_by     TEXT,
     conflicted      INTEGER NOT NULL DEFAULT 0,
     conflict_object TEXT REFERENCES objects(hash),
     PRIMARY KEY (collection, link_id)
@@ -100,7 +106,7 @@ CREATE TABLE queue (
     created_at  TEXT    NOT NULL,                   -- RFC 3339 timestamp
     producer    TEXT    NOT NULL,                   -- enqueuing process, diagnostic only
     collection  TEXT    NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-    action      TEXT    NOT NULL,                   -- 'add' | 'set-flags' | 'remove' | 'move' | 'copy' | 'update'
+    action      TEXT    NOT NULL,                   -- 'add' | 'set-flags' | 'remove' | 'move' | 'copy' | 'update', or an owner-defined intent
     payload     TEXT    NOT NULL,                   -- versioned JSON, shape per action (SPEC.md §14)
     object_hash TEXT    REFERENCES objects(hash),   -- pins the payload's body against GC, or NULL
     attempts    INTEGER NOT NULL DEFAULT 0,         -- apply attempts so far
@@ -117,6 +123,9 @@ CREATE INDEX bindings_by_object ON bindings(base_object);
 CREATE UNIQUE INDEX items_by_seq ON items(collection, seq);
 -- Indexes the cross-collection "does this message already have a seq?" lookup.
 CREATE INDEX items_by_link ON items(link_id);
+-- Partial: the trash view and the purge sweep scan the retained set without
+-- ever touching the live rows, which are the overwhelming majority.
+CREATE INDEX items_retained ON items(collection, retained_at) WHERE retained_at IS NOT NULL;
 "#;
 
 /// The current schema version.
@@ -145,9 +154,13 @@ pub const LOAD_CONFLICT: &str = "SELECT conflict FROM collections WHERE id = :co
 
 /// Loads a whole collection for the sync seam: every item, tombstones
 /// included, unpaginated and unordered.
+///
+/// Retained (soft-deleted) rows are excluded. That is what makes retention safe
+/// under io-replica's contract: the merge reconciles only what `load` returns,
+/// so a hidden row is never re-derived, on a delta or a full resync.
 pub const LOAD_ITEMS: &str = "\
 SELECT link_id, flags, object_hash, meta, level, deleted, conflicted, conflict_object \
-FROM items WHERE collection = :collection";
+FROM items WHERE collection = :collection AND retained_at IS NULL";
 
 // Client read surface (kind-agnostic, indexed getters over the same store the
 // sync seam writes). Distinct from `LOAD_ITEMS`: paginated, live-only, ordered.
@@ -218,9 +231,104 @@ UPDATE items SET flags = :flags, object_hash = :object_hash, meta = :meta, \
 level = :level, deleted = :deleted, conflicted = :conflicted, conflict_object = :conflict_object \
 WHERE collection = :collection AND link_id = :link_id";
 
-/// Deletes one item; its bindings cascade (`PRAGMA foreign_keys = ON`).
-pub const DELETE_ITEM: &str =
-    "DELETE FROM items WHERE collection = :collection AND link_id = :link_id";
+// Retention (spec §16): the last binding vanishing retires the row instead of
+// deleting it, a reappearing link id revives it, and purge is the only true
+// delete.
+
+/// Retires one item: it stands exactly where a hard-deleting store would have
+/// issued its delete. The row keeps its `object_hash`, so the body keeps its
+/// reference and its blob survives the sweep. SQLite stamps the instant itself,
+/// so no clock is plumbed through the crate to reach this statement; a purge's
+/// *cutoff* is by contrast the caller's parameter, which keeps the tests
+/// deterministic.
+pub const RETAIN_ITEM: &str = "\
+UPDATE items SET deleted = 1, \
+retained_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), retained_by = :source \
+WHERE collection = :collection AND link_id = :link_id";
+
+/// Deletes every binding of one item, for the retire path: the row survives, but
+/// no source holds it, so no base does either (a delete would have cascaded).
+/// A retained row carrying no binding at all is the persisted form of "the
+/// removal has finished propagating" (spec §16).
+pub const DELETE_ITEM_BINDINGS: &str =
+    "DELETE FROM bindings WHERE collection = :collection AND link_id = :link_id";
+
+/// The retained row holding a link id, if any: its public id and the objects it
+/// pins, which revive releases and purge reclaims.
+pub const RETAINED_ITEM: &str = "\
+SELECT seq, object_hash, conflict_object FROM items \
+WHERE collection = :collection AND link_id = :link_id AND retained_at IS NOT NULL";
+
+/// Revives a retained row: the link id is back (a source-side resurrection, or a
+/// client `add`), so it stops being retained instead of conflicting on the
+/// primary key. The caller adopts the new content with `UPDATE_ITEM` in the same
+/// transaction. The row keeps its `seq`, so a restored item keeps the public id
+/// it always had.
+pub const REVIVE_ITEM: &str = "\
+UPDATE items SET deleted = 0, retained_at = NULL, retained_by = NULL \
+WHERE collection = :collection AND link_id = :link_id";
+
+/// A keyset page of a collection's retained items, joined to the body size the
+/// row still pins (`NULL` when unhydrated): the trash listing beside
+/// `LIST_ITEMS_PAGE`, and the only read that returns them.
+///
+/// `:after` is the exclusive lower bound on the public `seq` (0 starts from the
+/// beginning), an equivalent substitution for the reference statement's
+/// `link_id` cursor (spec §8): a caller pages the trash by the same small
+/// integer it purges and restores by.
+pub const LIST_RETAINED_PAGE: &str = "\
+SELECT i.seq, i.link_id, i.flags, i.object_hash, i.meta, i.level, \
+i.retained_at, i.retained_by, o.size \
+FROM items i LEFT JOIN objects o ON o.hash = i.object_hash \
+WHERE i.collection = :collection AND i.retained_at IS NOT NULL AND i.seq > :after \
+ORDER BY i.seq LIMIT :limit";
+
+/// The partial retained index as an idempotent statement, for reconciling a
+/// store written by an earlier draft of version 1 (the schema script above
+/// creates it unconditionally, on a database that has no index yet).
+pub const ENSURE_RETAINED_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS items_retained ON items(collection, retained_at) \
+WHERE retained_at IS NOT NULL";
+
+/// Counts a collection's retained items, the counterpart of `COUNT_ITEMS`;
+/// rides the `items_retained` partial index.
+pub const COUNT_RETAINED: &str =
+    "SELECT count(*) FROM items WHERE collection = :collection AND retained_at IS NOT NULL";
+
+/// The store-wide size of the bodies retention is holding, each distinct object
+/// counted once (two retained placements of one message share it). An upper
+/// bound on what a purge reclaims: an object a live item also points at keeps a
+/// reference and survives the sweep.
+pub const RETAINED_BYTES: &str = "\
+SELECT coalesce(sum(o.size), 0) FROM objects o WHERE o.hash IN \
+(SELECT object_hash FROM items WHERE retained_at IS NOT NULL AND object_hash IS NOT NULL)";
+
+/// The objects one retained item pins, addressed by its public id: what the
+/// targeted purge releases before deleting the row. A live item matches nothing,
+/// so a purge can never reach one.
+pub const RETAINED_ITEM_BY_SEQ: &str = "\
+SELECT object_hash, conflict_object FROM items \
+WHERE collection = :collection AND seq = :seq AND retained_at IS NOT NULL";
+
+/// Purges one retained item by its public id: the only true delete. Its bindings
+/// cascade, and the body it released is unlinked by the ordinary refcount sweep.
+/// Guarded on `retained_at`, so a purge can never take a live item.
+pub const PURGE_ITEM: &str = "\
+DELETE FROM items WHERE collection = :collection AND seq = :seq AND retained_at IS NOT NULL";
+
+/// The objects the time-based sweep is about to release, with the rows'
+/// collections and link ids. Strictly before the cutoff, so an item retained
+/// exactly at that instant is kept.
+pub const RETAINED_BEFORE: &str = "\
+SELECT collection, link_id, object_hash, conflict_object FROM items \
+WHERE retained_at IS NOT NULL AND retained_at < :cutoff";
+
+/// The time-based sweep: every item retired before `:cutoff` (RFC 3339),
+/// store-wide, since how long to keep is the owner's policy rather than a
+/// collection's. The cutoff is the caller's parameter, not the store's clock, so
+/// the boundary is deterministic even though the stamp is SQLite's.
+pub const PURGE_RETAINED_BEFORE: &str =
+    "DELETE FROM items WHERE retained_at IS NOT NULL AND retained_at < :cutoff";
 
 /// Inserts one item's binding for one source (the new-binding path;
 /// `UPDATE_BINDING` handles an existing one).
@@ -270,6 +378,10 @@ WHERE object_hash IS NOT NULL \
 /// transaction is about to collect.
 pub const LIST_GARBAGE_OBJECTS: &str = "SELECT hash FROM objects WHERE refcount = 0";
 
+/// The same set with each object's size, for a purge that reports how many
+/// bytes it actually reclaimed.
+pub const LIST_GARBAGE_SIZED: &str = "SELECT hash, size FROM objects WHERE refcount = 0";
+
 /// Drops the unreferenced object rows inside the write transaction; their
 /// blobs are unlinked after the commit, so a crash leaves at worst an orphan
 /// blob.
@@ -300,6 +412,19 @@ FROM queue WHERE collection = :collection AND error IS NULL ORDER BY id";
 /// An applied action: deleted in the same transaction as its item and binding
 /// writes, so applying is exactly-once.
 pub const DELETE_ACTION: &str = "DELETE FROM queue WHERE id = :id";
+
+/// One queue row's spent attempts and pinned body, for a caller acting on a row
+/// by id: cancelling it, acknowledging an intent it performed out of band, or
+/// recording a failure.
+pub const LOAD_ACTION_ROW: &str = "SELECT attempts, object_hash FROM queue WHERE id = :id";
+
+/// One queue row removed by request rather than by application, pending or
+/// parked (spec §14.5): a queued item withdrawn, or a performed intent
+/// acknowledged by the process that could carry it out. The same delete as
+/// `DELETE_ACTION`, named apart because the trigger is a request, not an apply.
+/// It releases the row's `object_hash` pin, so it runs in one transaction with
+/// the refcount settle.
+pub const CANCEL_ACTION: &str = "DELETE FROM queue WHERE id = :id";
 
 /// A permanently failing action: recorded and skipped, visible to operators and
 /// frontends instead of blocking the collection's queue forever.

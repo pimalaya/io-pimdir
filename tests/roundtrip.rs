@@ -145,7 +145,8 @@ fn single_source_write_reopen_lookup_and_gc() {
         Some(&ReplicaHash("cafebabe".into()))
     );
 
-    // Dropping the only binding removes the item and GCs its orphan blob.
+    // Dropping the only binding retires the item: gone from the seam, kept in
+    // the trash with its body (retention, `tests/retention.rs`).
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -153,6 +154,12 @@ fn single_source_write_reopen_lookup_and_gc() {
         }])
         .unwrap();
     assert!(store.load(&inbox()).unwrap().placements.is_empty());
+    let retained = store.list_retained(&inbox(), None, 10).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert!(blob_exists(dir.path(), "cafebabe"), "the body is kept");
+
+    // Purging is what orphans the blob, and the sweep then unlinks it.
+    assert!(store.purge(&inbox(), retained[0].seq).unwrap());
     assert!(!blob_exists(dir.path(), "cafebabe"), "orphan blob GC'd");
 }
 
@@ -385,7 +392,8 @@ fn public_seq_is_message_scoped_global_and_never_reused() {
         "a new message takes the next global id: {s_seq} > {b}"
     );
 
-    // Drop `mid:b`, then add a new message: b's id is never reused.
+    // Retire `mid:b`, then add a new message: b's id is never reused (nor is it
+    // handed back by a revive, which keeps the id it retired with).
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -536,10 +544,12 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
 }
 
 #[test]
-fn a_shared_blob_survives_until_its_last_referrer_is_dropped() {
+fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
     // Incremental refcounts must dedup: two items pointing at one content hash
-    // hold it with a refcount > 1, so dropping one keeps the blob and only the
-    // last drop GCs it. A naive per-batch delta would double-count or GC early.
+    // hold it with a refcount > 1, so losing one keeps the blob and only the
+    // last release GCs it. A naive per-batch delta would double-count or GC
+    // early. Retention adds a second holder of that reference: a retired row
+    // pins its body exactly as a live one does, so both must be purged.
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path(), "local").unwrap();
 
@@ -552,7 +562,8 @@ fn a_shared_blob_survives_until_its_last_referrer_is_dropped() {
         .unwrap();
     assert!(blob_exists(dir.path(), "cafebabe"), "shared blob written");
 
-    // Drop the first referrer: the item goes, but the blob stays for the second.
+    // Drop the first referrer: it is retired, and the blob stays for both the
+    // second item and the retained row.
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -565,7 +576,8 @@ fn a_shared_blob_survives_until_its_last_referrer_is_dropped() {
         "blob kept while a second item still references it"
     );
 
-    // Drop the last referrer: now the blob is orphaned and GC'd.
+    // Drop the last live referrer: nothing is live any more, yet both retained
+    // rows still pin the body.
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -573,9 +585,23 @@ fn a_shared_blob_survives_until_its_last_referrer_is_dropped() {
         }])
         .unwrap();
     assert!(store.load(&inbox()).unwrap().placements.is_empty());
+    let retained = store.list_retained(&inbox(), None, 10).unwrap();
+    assert_eq!(retained.len(), 2);
+    assert!(blob_exists(dir.path(), "cafebabe"), "both rows pin it");
+
+    // Purging the first releases one reference; the blob outlives it.
+    assert!(store.purge(&inbox(), retained[0].seq).unwrap());
+    assert!(
+        blob_exists(dir.path(), "cafebabe"),
+        "blob kept while the second retained row still references it"
+    );
+
+    // Purging the last orphans it, and the sweep unlinks it.
+    let report = store.purge(&inbox(), retained[1].seq).unwrap();
+    assert!(report);
     assert!(
         !blob_exists(dir.path(), "cafebabe"),
-        "blob GC'd once its last referrer is dropped"
+        "blob GC'd once its last referrer is purged"
     );
 }
 

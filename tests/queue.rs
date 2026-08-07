@@ -371,7 +371,7 @@ fn a_parked_action_does_not_block_later_actions() {
 #[test]
 fn gc_never_sweeps_a_queued_body() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut store, _) = seeded(dir.path());
+    let (mut store, seeded_seq) = seeded(dir.path());
 
     // A producer stages a body and enqueues the add that references it.
     let size = write_blob(dir.path(), "beef0000", b"queued body");
@@ -392,13 +392,15 @@ fn gc_never_sweeps_a_queued_body() {
         .unwrap();
 
     // The owner runs a write batch whose GC sweeps a genuinely orphaned body
-    // (the seeded item's): the queued body must survive it, pinned by its row.
+    // (the seeded item's, retired then purged out of retention): the queued
+    // body must survive it, pinned by its row.
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
             handle: ReplicaHandle("1".into()),
         }])
         .unwrap();
+    assert!(store.purge(&inbox(), seeded_seq).unwrap());
     assert!(!blob_exists(dir.path(), "cafebabe"), "the orphan is GC'd");
     assert!(
         blob_exists(dir.path(), "beef0000"),
@@ -410,15 +412,139 @@ fn gc_never_sweeps_a_queued_body() {
     assert_eq!((report.applied, report.parked), (1, 0));
     assert!(blob_exists(dir.path(), "beef0000"), "now the item pins it");
 
-    // The hand-over was exact (+1 item, -1 queue): dropping the item's only
-    // placement orphans the body, so it is swept — no leaked queue pin.
+    // The hand-over was exact (+1 item, -1 queue): retiring and purging the
+    // item's only placement orphans the body, so it is swept, with no
+    // leaked queue pin.
+    let seq = store.seq_for_link("INBOX", "mid:new").unwrap().unwrap();
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
             handle: ReplicaHandle("draft-1".into()),
         }])
         .unwrap();
+    assert!(store.purge(&inbox(), seq).unwrap());
     assert!(!blob_exists(dir.path(), "beef0000"), "no refcount leak");
+}
+
+#[test]
+fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
+    // The store defines no semantics for a `submit` intent, but another owner
+    // does: skipping leaves it pending for that owner, where parking would
+    // claim it can never be applied by anyone.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
+
+    let size = write_blob(dir.path(), "beef0000", b"a message to send");
+    let submit = PimdirAction::Unknown {
+        kind: "submit".into(),
+        payload: "{\"v\":1,\"object\":\"beef0000\",\"to\":[\"a@b.c\"]}".into(),
+        object_hash: Some(ReplicaHash("beef0000".into())),
+    };
+    let id = producer.enqueue("INBOX", &submit, Some(size), NOW).unwrap();
+    producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::SetFlags {
+                seq,
+                flags: ReplicaFlags::from_iter(["\\Answered"]),
+            },
+            None,
+            NOW,
+        )
+        .unwrap();
+
+    let report = store.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (1, 0, 1));
+
+    // The action behind it applied all the same.
+    assert!(
+        store
+            .get_item("INBOX", seq)
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains("\\Answered")
+    );
+
+    // The intent is still pending, never parked, and still readable whole by
+    // the owner that can perform it; its body is still pinned.
+    assert!(store.parked_actions().unwrap().is_empty());
+    let pending = store.pending_actions("INBOX").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, id);
+    assert_eq!(pending[0].action, submit);
+    assert!(blob_exists(dir.path(), "beef0000"));
+
+    // A second pass skips it again rather than accumulating attempts.
+    let report = store.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 1));
+    assert_eq!(store.pending_actions("INBOX").unwrap()[0].attempts, 0);
+}
+
+#[test]
+fn an_acknowledged_action_releases_its_queued_body() {
+    // The other half of skip-not-park: the owner that performed the intent out
+    // of band takes the row away, and with it the pin on the body it carried.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
+
+    let size = write_blob(dir.path(), "beef0000", b"sent already");
+    let id = producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Unknown {
+                kind: "submit".into(),
+                payload: "{\"v\":1,\"object\":\"beef0000\"}".into(),
+                object_hash: Some(ReplicaHash("beef0000".into())),
+            },
+            Some(size),
+            NOW,
+        )
+        .unwrap();
+    assert!(blob_exists(dir.path(), "beef0000"));
+
+    assert!(store.drop_action(id).unwrap());
+    assert!(store.pending_actions("INBOX").unwrap().is_empty());
+    assert!(
+        !blob_exists(dir.path(), "beef0000"),
+        "the pin went with the row"
+    );
+
+    // Acknowledging a row that is already gone reports nothing to drop.
+    assert!(!store.drop_action(id).unwrap());
+}
+
+#[test]
+fn a_failed_action_retries_until_it_is_parked() {
+    // The two failure shapes an owner reports itself: transient (still
+    // pending, attempts advancing) and permanent (parked with the reason).
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let id = producer
+        .enqueue("INBOX", &PimdirAction::Remove { seq }, None, NOW)
+        .unwrap();
+
+    store.fail_action(id, None).unwrap();
+    store.fail_action(id, None).unwrap();
+    let pending = store.pending_actions("INBOX").unwrap();
+    assert_eq!(pending.len(), 1, "a transient failure stays pending");
+    assert_eq!(pending[0].attempts, 2);
+
+    store.fail_action(id, Some("the channel is gone")).unwrap();
+    assert!(store.pending_actions("INBOX").unwrap().is_empty());
+    let parked = store.parked_actions().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].id, id);
+    assert_eq!(parked[0].attempts, 3, "the parking attempt counts too");
+    assert_eq!(parked[0].error, "the channel is gone");
+
+    // A parked row is still cancellable, and an unknown id is a no-op.
+    assert!(store.drop_action(id).unwrap());
+    assert!(store.parked_actions().unwrap().is_empty());
+    store.fail_action(id, Some("gone")).unwrap();
 }
 
 #[test]

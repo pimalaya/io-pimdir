@@ -1,12 +1,12 @@
 [package]
 name = "io-pimdir"
-description = "pimdir store for Rust: a SQLite and content-addressed blob storage backend for io-replica"
+description = "pimdir store and operator CLI for Rust: a SQLite and content-addressed blob storage backend for io-replica"
 version = "0.1.0"
-authors = ["soywod <pimalaya.org@posteo.net>"]
+authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
 rust-version = "1.87"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-categories = ["api-bindings", "database", "no-std"]
+categories = ["api-bindings", "command-line-utilities", "database", "no-std"]
 keywords = ["pimdir", "sqlite", "storage", "no-std", "io-free"]
 homepage = "https://pimalaya.org"
 documentation = "https://docs.rs/io-pimdir/latest/io_pimdir"
@@ -19,12 +19,33 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["client"]
 client = ["dep:rusqlite"]
+cli = ["client", "dep:anyhow", "dep:clap", "dep:humantime", "dep:log", "dep:serde", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[[bin]]
+name = "pimdir"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[build-dependencies]
+pimalaya-cli = { version = "0.2", default-features = false, features = ["build"], optional = true }
 
 [dev-dependencies]
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 tempfile = { version = "3", default-features = false }
 
 [dependencies]
-io-replica = "0.2"
+anyhow = { version = "1", default-features = false, features = ["std"], optional = true }
+clap = { version = "4.4", features = ["derive", "wrap_help"], optional = true }
+humantime = { version = "2.2", optional = true }
+io-replica = "0.3"
+log = { version = "0.4", default-features = false, optional = true }
+pimalaya-cli = { version = "0.2", default-features = false, optional = true }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"], optional = true }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
