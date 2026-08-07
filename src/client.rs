@@ -1230,7 +1230,7 @@ fn init_schema(conn: &mut Connection) -> Result<(), PimdirError> {
         return Err(PimdirError::Version { found: version });
     }
     if version == sql::VERSION {
-        return Ok(());
+        return reconcile_draft_shape(conn);
     }
 
     let tx = conn
@@ -1252,6 +1252,66 @@ fn init_schema(conn: &mut Connection) -> Result<(), PimdirError> {
     tx.commit().map_err(busy_or_sql)?;
 
     Ok(())
+}
+
+/// Adds columns folded into version 1 after a store was already created at
+/// version 1 (spec §6, the `draft` allowance).
+///
+/// While the spec is a draft, version 1 is not frozen: a schema change may be
+/// folded into `0001_init.sql` rather than added as version 2. The cost is that
+/// a store written by an earlier draft is not *detectably* out of date — its
+/// `user_version` already matches, so the runner would do nothing and the
+/// missing column would surface much later as a query error. §6 requires an
+/// implementation to reconcile the shape on open or refuse the store outright;
+/// this reconciles.
+///
+/// `ALTER TABLE … ADD COLUMN` is cheap (a metadata-only rewrite for a column
+/// with a constant default), and guarding on `PRAGMA table_info` makes it a
+/// no-op for a current store, which is every store after the first open. Only
+/// columns that are nullable or carry a default can be folded in this way.
+///
+/// This disappears when the spec leaves `draft`; from the first frozen version
+/// onwards, a shape change is an ordinary numbered migration.
+fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
+    /// Columns folded into version 1 after it was first published, as
+    /// `(table, column, declaration)`. Each must be nullable or carry a
+    /// constant default, or it could not be added to a populated table.
+    const FOLDED_IN: [(&str, &str, &str); 2] = [
+        ("bindings", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
+        ("bindings", "conflict_revision", "TEXT"),
+    ];
+
+    let mut missing = Vec::new();
+    for (table, column, decl) in FOLDED_IN {
+        if !has_column(conn, table, column)? {
+            missing.push((table, column, decl));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(busy_or_sql)?;
+    for (table, column, decl) in missing {
+        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    tx.commit().map_err(busy_or_sql)?;
+    Ok(())
+}
+
+/// Whether `table` already has `column`, via `PRAGMA table_info`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Removes any residual placement matching `(collection, handle)`.
@@ -1470,6 +1530,8 @@ fn insert_binding(
             ":base_flags": binding.base.as_ref().map(|b| codec::flags_to_json(&b.flags)),
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
+            ":conflicted": binding.conflicted as i64,
+            ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
         },
     )?;
     Ok(())
@@ -1492,6 +1554,8 @@ fn update_binding(
             ":base_flags": binding.base.as_ref().map(|b| codec::flags_to_json(&b.flags)),
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
+            ":conflicted": binding.conflicted as i64,
+            ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
         },
     )?;
     Ok(())
@@ -1603,6 +1667,8 @@ fn binding_from_row(
     let base_flags: Option<String> = row.get(3)?;
     let base_object: Option<String> = row.get(4)?;
     let base_revision: Option<String> = row.get(5)?;
+    let conflicted: i64 = row.get(6)?;
+    let conflict_revision: Option<String> = row.get(7)?;
 
     let base = if base_flags.is_some() || base_object.is_some() || base_revision.is_some() {
         Some(ReplicaBase {
@@ -1614,12 +1680,18 @@ fn binding_from_row(
         None
     };
 
+    let conflicted = conflicted != 0;
     Ok((
         ReplicaLinkId(link),
         ReplicaSourceId(source),
         ReplicaSourceBinding {
             handle: ReplicaHandle(handle),
             base,
+            conflicted,
+            // Spec §11: the revision is meaningful only while conflicted, so a
+            // resolved binding cannot hand a stale one to the next sync even if
+            // the column somehow still holds one.
+            conflict_revision: conflicted.then_some(conflict_revision).flatten(),
         },
     ))
 }

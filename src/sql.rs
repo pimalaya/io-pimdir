@@ -74,8 +74,9 @@ CREATE TABLE items (
     PRIMARY KEY (collection, link_id)
 ) STRICT;
 
--- One source's binding of an item: its handle there and the base last synced
--- with it (the 3-way-merge baseline).
+-- One source's binding of an item: its handle there, the base last synced with
+-- it (the 3-way-merge baseline), and whether that source's own sync is stuck on
+-- an unresolved content conflict.
 CREATE TABLE bindings (
     collection    TEXT NOT NULL,
     link_id       TEXT NOT NULL,
@@ -84,6 +85,10 @@ CREATE TABLE bindings (
     base_flags    TEXT,
     base_object   TEXT REFERENCES objects(hash),
     base_revision TEXT,
+    -- This source and its OWN remote diverged. Distinct from
+    -- items.conflicted, which is the cross-source divergence.
+    conflicted        INTEGER NOT NULL DEFAULT 0,
+    conflict_revision TEXT,
     PRIMARY KEY (collection, link_id, source),
     FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON DELETE CASCADE
 ) STRICT;
@@ -182,7 +187,8 @@ pub const LIST_SOURCES: &str = "SELECT DISTINCT source FROM bindings ORDER BY so
 /// Loads every per-source binding of a collection: the stored base (handle,
 /// flags, object, revision) each sync merges against.
 pub const LOAD_BINDINGS: &str = "\
-SELECT link_id, source, handle, base_flags, base_object, base_revision \
+SELECT link_id, source, handle, base_flags, base_object, base_revision, \
+conflicted, conflict_revision \
 FROM bindings WHERE collection = :collection";
 
 /// Reads one source's sync checkpoint for a collection.
@@ -219,14 +225,17 @@ pub const DELETE_ITEM: &str =
 /// Inserts one item's binding for one source (the new-binding path;
 /// `UPDATE_BINDING` handles an existing one).
 pub const INSERT_BINDING: &str = "\
-INSERT INTO bindings(collection, link_id, source, handle, base_flags, base_object, base_revision) \
-VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, :base_revision)";
+INSERT INTO bindings(collection, link_id, source, handle, base_flags, base_object, \
+base_revision, conflicted, conflict_revision) \
+VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, \
+:base_revision, :conflicted, :conflict_revision)";
 
 /// Updates one existing binding's columns in place (its primary key
 /// `(collection, link_id, source)` is unchanged).
 pub const UPDATE_BINDING: &str = "\
 UPDATE bindings SET handle = :handle, base_flags = :base_flags, \
-base_object = :base_object, base_revision = :base_revision \
+base_object = :base_object, base_revision = :base_revision, \
+conflicted = :conflicted, conflict_revision = :conflict_revision \
 WHERE collection = :collection AND link_id = :link_id AND source = :source";
 
 /// Deletes one source's binding of an item.
