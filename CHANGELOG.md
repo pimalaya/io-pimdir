@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-07
+
 ### Added
 
 - **A `pimdir` operator CLI**, shipped from this crate behind the `cli` feature (a `[[bin]]` with `required-features`, so a library consumer never compiles clap or any terminal dependency). It is to a store what `sqlite3` is to a database: `collection list`, `item list` (live or `--retained`, keyset-paged), `item show`, `item export`, `item restore`, `item purge` (one `seq`, `--older-than <DURATION>` or `--all`), `queue list [--parked]`, `queue cancel`, `store info`, `check [--fix]` and `export`, plus `completions` and `manuals`, each rendering as JSON under `--json` with logs on stderr.
@@ -26,7 +28,7 @@ All notable changes to this project are documented in this file. The format is b
 
 - `drop_action(id)` removes one queue row, pending or parked, releasing its object pin in the same transaction: one verb for cancelling a queued action and for acknowledging an intent performed out of band. `fail_action(id, error)` records a failed attempt, bumping `attempts` for a transient failure or parking with the reason for a permanent one.
 
-- **The store persists a per-source content conflict.** `bindings` gained `conflicted` and `conflict_revision`, round-tripped through `ReplicaSourceBinding`, so the sync layer's memory of "this source and its own remote diverged, unresolved" survives a restart. Without it the merge re-derived the push its remote had already rejected on every run, never converging, and a client could not tell which items needed a human. Distinct from the item-level `conflicted` / `conflict_object`, which is the cross-source divergence; the two are persisted independently. Requires the matching io-replica fix.
+- **The store persists a per-source content conflict.** `bindings` gained `conflicted` and `conflict_revision`, round-tripped through `ReplicaSourceBinding`, so the sync layer's memory of "this source and its own remote diverged, unresolved" survives a restart. Without it the merge re-derived the push its remote had already rejected on every run, never converging, and a client could not tell which items needed a human. Distinct from the item-level `conflicted` / `conflict_object`, which is the cross-source divergence; the two are persisted independently. Carried on `ReplicaSourceBinding` as of io-replica 0.3.0.
 
   The revision is meaningful only while conflicted (spec §11), so a resolved binding cannot hand a stale one to the next sync.
 
@@ -34,6 +36,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **BREAKING**: bumped io-replica to `0.3`, whose `ReplicaSourceBinding` carries the per-source conflict this release persists.
 - `PimdirAction::kind()` returns `&str` rather than `&'static str`, since an owner-defined kind is carried as data.
 
 ### Removed
@@ -59,5 +62,6 @@ All notable changes to this project are documented in this file. The format is b
 - Collection generations (spec §15): the handle-space epoch on PimdirCollection and generation(), bumped atomically with a rebuild batch by write_rekeyed().
 - Read-only store open (open_read_only): opens an existing store with SQLITE_OPEN_READ_ONLY, never creates anything, refuses any other schema version, and exposes the full read surface for frontend processes that must be unable to write.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.1.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.2.0..HEAD
+[0.2.0]: https://github.com/pimalaya/io-pimdir/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-pimdir/compare/root..v0.1.0
