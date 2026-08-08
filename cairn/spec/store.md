@@ -141,9 +141,58 @@ store as a local backend, distinct from the sync seam's load-all:
   nothing; `seq_for_link` SHALL resolve the inverse (`link_id` → `seq`).
 - `count_items` SHALL return a collection's live item count.
 
+Every item a read returns SHALL carry its `sort_key` alongside the columns above.
+
 These reads are kind-agnostic (raw `meta`, string flags, opaque object hash) and
 observe only — they never mutate; all writes remain io-replica `ReplicaWriteOp`s
 through `write`.
+
+### Requirement: A collection pages in its kind's own order
+`list_items_page_asc` and `list_items_page_desc` SHALL return a keyset page
+ordered by `(sort_key, seq)` (spec §9.3): ascending is A to Z for contacts and
+earliest first for mail and calendars, descending is the reverse. `list_items`
+keeps its `link_id` ordering and is the sweep page, for a pass that must see
+every item exactly once.
+
+The cursor SHALL be the `(sort_key, seq)` pair, since a sort key is not unique
+and `seq`, unique per collection, is what makes the page total: no item skipped
+or repeated across a boundary. The first page SHALL be requestable with no
+cursor, so a caller never invents a sentinel above every representable key.
+
+#### Scenario: A limit splits a tie
+- GIVEN three items sharing one sort key and a page limit of two
+- WHEN the collection is paged to exhaustion in either direction
+- THEN each item is returned exactly once
+
+### Requirement: An ordinary write preserves an item's ordering key
+A `write` SHALL leave an existing item's `sort_key` alone. The save is diffed
+rather than replace-all, and the update statement names no `sort_key`, so a key
+survives every sync that does not deliberately restate it. Were it otherwise,
+ordering would be reset on every pass and a consumer restating keys afterwards
+would race its own sync indefinitely.
+
+`set_sort_key(collection, link_id, sort_key)` SHALL restate one item's key, for a
+store written before its kind had a convention, one whose convention changed, or
+a consumer whose sync engine does not carry the key inline and derives it from
+the `meta` it wrote itself.
+
+### Requirement: A collection can be renamed without losing its contents
+`rename_collection(collection, new_id)` SHALL give a collection a new id and
+carry its items, bindings, sources, queue rows and child collections with it, by
+way of `ON UPDATE CASCADE` on every foreign key onto `collections(id)` **and** on
+`bindings(collection, link_id)`, which is a parent one level down and refuses the
+cascade without it.
+
+This SHALL be the only id change offered. Deleting a collection and recreating it
+under a new id destroys the cache, since `ON DELETE CASCADE` takes every item and
+binding with it, turning a rename into a full re-download and discarding staged
+local changes.
+
+#### Scenario: A server renames a folder
+- GIVEN a synced collection holding items and a binding per item
+- WHEN it is renamed
+- THEN the items and their bindings follow, so the next sync is a delta rather
+  than a re-download
 
 ### Requirement: Items carry a message-scoped public id
 Each item SHALL carry a `seq`: an integer id a consumer shows and accepts in place
@@ -329,3 +378,15 @@ performed out of band. `fail_action(id, error)` SHALL record a failed attempt:
 `None` bumps `attempts` and leaves the row pending (transient), `Some(error)`
 parks it (permanent). A collection's pending actions SHALL expose each row's
 `id`, since callers act on rows by id.
+
+### Requirement: The canonical SQL is reachable by name
+`sql` SHALL expose `ALL`, a `&[(&str, &str)]` pairing every statement constant's
+name with its text, `MIGRATION_0001` included and `VERSION` excluded. A consumer
+without the `client` feature, holding its own SQLite driver, SHALL be able to
+recover any statement from it by name without a per-statement accessor.
+
+The index SHALL be covered by tests derived from the module's own source: one
+asserting every declared constant is indexed, one asserting the index follows the
+declaration order. Two statements MAY legitimately carry identical text under
+different names (`DELETE_ACTION` and `CANCEL_ACTION` are one delete under two
+intents), so text uniqueness SHALL NOT be asserted.

@@ -32,7 +32,7 @@ CREATE TABLE collections (
     account     TEXT,
     kind        TEXT NOT NULL,
     name        TEXT NOT NULL,
-    parent      TEXT REFERENCES collections(id) ON DELETE SET NULL,
+    parent      TEXT REFERENCES collections(id) ON UPDATE CASCADE ON DELETE SET NULL,
     color       TEXT,
     description TEXT,
     sort_order  INTEGER,
@@ -52,7 +52,7 @@ CREATE INDEX collections_by_account ON collections(account) WHERE account IS NOT
 -- One row per source that syncs a collection (a server, a phone). A
 -- single-source collection has one row here.
 CREATE TABLE sources (
-    collection TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    collection TEXT NOT NULL REFERENCES collections(id) ON UPDATE CASCADE ON DELETE CASCADE,
     source     TEXT NOT NULL,
     checkpoint BLOB,
     PRIMARY KEY (collection, source)
@@ -69,7 +69,7 @@ CREATE TABLE objects (
 -- it too (the cross-source delete memory). Once no source holds it, the row is
 -- RETAINED rather than deleted: a store never loses an item, purge does.
 CREATE TABLE items (
-    collection      TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    collection      TEXT NOT NULL REFERENCES collections(id) ON UPDATE CASCADE ON DELETE CASCADE,
     link_id         TEXT NOT NULL,
     -- The message's public id: store-global, one per link_id (shared by its
     -- placements across mailboxes), never reused. A client shows it and resolves
@@ -78,6 +78,8 @@ CREATE TABLE items (
     flags           TEXT,
     object_hash     TEXT REFERENCES objects(hash),
     meta            TEXT,
+    -- The kind's ordering key, written beside `meta`; '' means unknown.
+    sort_key        TEXT NOT NULL DEFAULT '',
     level           INTEGER NOT NULL,
     deleted         INTEGER NOT NULL DEFAULT 0,
     -- RFC 3339 instant the last binding vanished; non-NULL means retained
@@ -106,7 +108,7 @@ CREATE TABLE bindings (
     conflicted        INTEGER NOT NULL DEFAULT 0,
     conflict_revision TEXT,
     PRIMARY KEY (collection, link_id, source),
-    FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON DELETE CASCADE
+    FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT;
 
 -- The action queue (SPEC.md §14): mutations requested by processes that are not
@@ -115,7 +117,7 @@ CREATE TABLE queue (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- global append order
     created_at  TEXT    NOT NULL,                   -- RFC 3339 timestamp
     producer    TEXT    NOT NULL,                   -- enqueuing process, diagnostic only
-    collection  TEXT    NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    collection  TEXT    NOT NULL REFERENCES collections(id) ON UPDATE CASCADE ON DELETE CASCADE,
     action      TEXT    NOT NULL,                   -- 'add' | 'set-flags' | 'remove' | 'move' | 'copy' | 'update', or an owner-defined intent
     payload     TEXT    NOT NULL,                   -- versioned JSON, shape per action (SPEC.md §14)
     object_hash TEXT    REFERENCES objects(hash),   -- pins the payload's body against GC, or NULL
@@ -136,6 +138,9 @@ CREATE INDEX items_by_link ON items(link_id);
 -- Partial: the trash view and the purge sweep scan the retained set without
 -- ever touching the live rows, which are the overwhelming majority.
 CREATE INDEX items_retained ON items(collection, retained_at) WHERE retained_at IS NOT NULL;
+-- Orders a collection by the kind's own sort key, with `seq` as the tiebreaker
+-- that makes a keyset page over a non-unique key well defined.
+CREATE INDEX items_by_sort ON items(collection, sort_key, seq);
 "#;
 
 /// The current schema version.
@@ -160,6 +165,17 @@ ON CONFLICT(id) DO UPDATE SET kind = excluded.kind";
 pub const SET_COLLECTION_ACCOUNT: &str =
     "UPDATE collections SET account = :account WHERE id = :collection";
 
+/// Gives a collection a new id, carrying its whole contents with it: every
+/// foreign key onto `collections(id)` is `ON UPDATE CASCADE`, so the items,
+/// bindings, sources, queue rows and child collections follow in the same
+/// statement (spec §12).
+///
+/// The only safe way to change an id. Deleting and recreating the collection
+/// instead destroys the cache: the `ON DELETE CASCADE` takes every item and
+/// binding with it, so a rename silently becomes a full re-download and drops
+/// any staged local change not yet pushed.
+pub const RENAME_COLLECTION: &str = "UPDATE collections SET id = :new_id WHERE id = :collection";
+
 /// Reads a collection's owning account.
 pub const LOAD_ACCOUNT: &str = "SELECT account FROM collections WHERE id = :collection";
 
@@ -178,6 +194,13 @@ pub const LOAD_CONFLICT: &str = "SELECT conflict FROM collections WHERE id = :co
 /// Retained (soft-deleted) rows are excluded. That is what makes retention safe
 /// under io-replica's contract: the merge reconciles only what `load` returns,
 /// so a hidden row is never re-derived, on a delta or a full resync.
+///
+/// Does not select `sort_key`, where the reference statement does (spec §8's
+/// permitted substitution). The reference save is a replace-all, so it has to
+/// carry the key back out through `load` or lose it; this implementation saves
+/// by diff instead, inserting only new items and updating existing ones in
+/// place, and `UPDATE_ITEM` names no `sort_key`, so an existing key is preserved
+/// by never being touched. The §9.3 invariant holds either way.
 pub const LOAD_ITEMS: &str = "\
 SELECT link_id, flags, object_hash, meta, level, deleted, conflicted, conflict_object \
 FROM items WHERE collection = :collection AND retained_at IS NULL";
@@ -202,17 +225,55 @@ FROM collections WHERE account IS :account ORDER BY sort_order IS NULL, sort_ord
 pub const LIST_ACCOUNTS: &str = "\
 SELECT DISTINCT account FROM collections WHERE account IS NOT NULL ORDER BY account";
 
-/// A keyset page of a collection's live items. `:after` is the exclusive lower
-/// bound on `link_id` (the empty string starts from the beginning, since a
-/// `link_id` is never empty); rides the `items` primary key, no extra index.
+/// A keyset page of a collection's live items in **link-id order**. `:after` is
+/// the exclusive lower bound on `link_id` (the empty string starts from the
+/// beginning, since a `link_id` is never empty); rides the `items` primary key,
+/// no extra index.
+///
+/// Link-id order means nothing to a reader: this is the page for a sweep that
+/// must see every item exactly once (an export, a re-projection). A reader
+/// presenting a list wants one of the two ordered pages below.
 pub const LIST_ITEMS_PAGE: &str = "\
-SELECT seq, link_id, flags, object_hash, meta, level FROM items \
+SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
 WHERE collection = :collection AND deleted = 0 AND link_id > :after \
 ORDER BY link_id LIMIT :limit";
 
+/// A keyset page of a collection's live items in the kind's own **ascending**
+/// order (spec §9.3): A to Z for contacts, earliest first for mail and
+/// calendars.
+///
+/// The cursor is the pair `(:after_key, :after_seq)`, because a sort key is not
+/// unique: two messages share a timestamp, two contacts share a name. `seq`
+/// breaks the tie, and being unique per collection it makes the page total. The
+/// empty string with seq 0 starts from the beginning, since no real key sorts
+/// before an unknown one ascending.
+pub const LIST_ITEMS_PAGE_ASC: &str = "\
+SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
+WHERE collection = :collection AND deleted = 0 \
+AND (sort_key, seq) > (:after_key, :after_seq) \
+ORDER BY sort_key, seq LIMIT :limit";
+
+/// The same page **descending**: newest first for mail and calendars, Z to A for
+/// contacts. The first page binds the largest key the store can hold, which
+/// [`PimdirStore`](crate::PimdirStore) hides behind an `Option` cursor rather
+/// than making a caller invent a sentinel.
+pub const LIST_ITEMS_PAGE_DESC: &str = "\
+SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
+WHERE collection = :collection AND deleted = 0 \
+AND (sort_key, seq) < (:after_key, :after_seq) \
+ORDER BY sort_key DESC, seq DESC LIMIT :limit";
+
+/// Restates one item's ordering key, for a re-projection that derives sort keys
+/// for items already stored: a store written before its kind had a convention,
+/// one whose convention changed, or a consumer whose sync engine does not carry
+/// the key inline yet (spec §9.3). Not part of the ordinary write path.
+pub const SET_SORT_KEY: &str = "\
+UPDATE items SET sort_key = :sort_key \
+WHERE collection = :collection AND link_id = :link_id";
+
 /// Fetches one live item by its public id (`seq`) — the client-facing key.
 pub const GET_ITEM: &str = "\
-SELECT seq, link_id, flags, object_hash, meta, level FROM items \
+SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
 WHERE collection = :collection AND seq = :seq AND deleted = 0";
 
 /// Resolves an item's public id (`seq`) from its internal `link_id` — the inverse
@@ -326,7 +387,7 @@ WHERE collection = :collection AND link_id = :link_id";
 /// `link_id` cursor (spec §8): a caller pages the trash by the same small
 /// integer it purges and restores by.
 pub const LIST_RETAINED_PAGE: &str = "\
-SELECT i.seq, i.link_id, i.flags, i.object_hash, i.meta, i.level, \
+SELECT i.seq, i.link_id, i.flags, i.object_hash, i.meta, i.sort_key, i.level, \
 i.retained_at, i.retained_by, o.size \
 FROM items i LEFT JOIN objects o ON o.hash = i.object_hash \
 WHERE i.collection = :collection AND i.retained_at IS NOT NULL AND i.seq > :after \
@@ -503,3 +564,149 @@ RETURNING generation";
 /// A collection's handle-space epoch, so a reader derives epoch-dependent
 /// protocol values (an IMAP UIDVALIDITY) from the store alone.
 pub const LOAD_GENERATION: &str = "SELECT generation FROM collections WHERE id = :collection";
+
+/// Every statement in this module, paired with its constant name.
+///
+/// The way a consumer without the `client` feature reaches the canonical SQL:
+/// it holds its own SQLite driver (an Android app runs the platform's), so it
+/// needs the statements by name rather than a Rust accessor per statement.
+/// [`MIGRATION_0001`] is included, since creating the database is as much a
+/// consumer's job as querying it; [`VERSION`] is not, being an integer.
+///
+/// Hand-written, and guarded: the test below derives the expected set from this
+/// module's own source, so a statement added without being indexed fails the
+/// suite instead of shipping a silent gap.
+pub const ALL: &[(&str, &str)] = &[
+    ("MIGRATION_0001", MIGRATION_0001),
+    ("ENSURE_COLLECTION", ENSURE_COLLECTION),
+    ("SET_COLLECTION_KIND", SET_COLLECTION_KIND),
+    ("SET_COLLECTION_ACCOUNT", SET_COLLECTION_ACCOUNT),
+    ("RENAME_COLLECTION", RENAME_COLLECTION),
+    ("LOAD_ACCOUNT", LOAD_ACCOUNT),
+    ("LOAD_KIND", LOAD_KIND),
+    ("SET_CONFLICT", SET_CONFLICT),
+    ("LOAD_CONFLICT", LOAD_CONFLICT),
+    ("LOAD_ITEMS", LOAD_ITEMS),
+    ("LIST_COLLECTIONS", LIST_COLLECTIONS),
+    ("LIST_COLLECTIONS_BY_ACCOUNT", LIST_COLLECTIONS_BY_ACCOUNT),
+    ("LIST_ACCOUNTS", LIST_ACCOUNTS),
+    ("LIST_ITEMS_PAGE", LIST_ITEMS_PAGE),
+    ("LIST_ITEMS_PAGE_ASC", LIST_ITEMS_PAGE_ASC),
+    ("LIST_ITEMS_PAGE_DESC", LIST_ITEMS_PAGE_DESC),
+    ("SET_SORT_KEY", SET_SORT_KEY),
+    ("GET_ITEM", GET_ITEM),
+    ("SEQ_BY_LINK", SEQ_BY_LINK),
+    ("COUNT_ITEMS", COUNT_ITEMS),
+    ("LIST_LINK_PLACEMENTS", LIST_LINK_PLACEMENTS),
+    ("LIST_OBJECT_PLACEMENTS", LIST_OBJECT_PLACEMENTS),
+    ("LIST_SOURCES", LIST_SOURCES),
+    ("LOAD_BINDINGS", LOAD_BINDINGS),
+    ("LOAD_CHECKPOINT", LOAD_CHECKPOINT),
+    ("SEQ_FOR_LINK_ANY", SEQ_FOR_LINK_ANY),
+    ("BUMP_NEXT_SEQ", BUMP_NEXT_SEQ),
+    ("INSERT_ITEM", INSERT_ITEM),
+    ("UPDATE_ITEM", UPDATE_ITEM),
+    ("RETAIN_ITEM", RETAIN_ITEM),
+    ("DELETE_ITEM_BINDINGS", DELETE_ITEM_BINDINGS),
+    ("RETAINED_ITEM", RETAINED_ITEM),
+    ("REVIVE_ITEM", REVIVE_ITEM),
+    ("LIST_RETAINED_PAGE", LIST_RETAINED_PAGE),
+    ("ENSURE_RETAINED_INDEX", ENSURE_RETAINED_INDEX),
+    ("ENSURE_ACCOUNT_INDEX", ENSURE_ACCOUNT_INDEX),
+    ("COUNT_RETAINED", COUNT_RETAINED),
+    ("RETAINED_BYTES", RETAINED_BYTES),
+    ("RETAINED_ITEM_BY_SEQ", RETAINED_ITEM_BY_SEQ),
+    ("PURGE_ITEM", PURGE_ITEM),
+    ("RETAINED_BEFORE", RETAINED_BEFORE),
+    ("PURGE_RETAINED_BEFORE", PURGE_RETAINED_BEFORE),
+    ("INSERT_BINDING", INSERT_BINDING),
+    ("UPDATE_BINDING", UPDATE_BINDING),
+    ("DELETE_BINDING", DELETE_BINDING),
+    ("ADJUST_REFCOUNT", ADJUST_REFCOUNT),
+    ("UPSERT_CHECKPOINT", UPSERT_CHECKPOINT),
+    ("STORE_OBJECT", STORE_OBJECT),
+    ("LOOKUP_OBJECTS", LOOKUP_OBJECTS),
+    ("LIST_GARBAGE_OBJECTS", LIST_GARBAGE_OBJECTS),
+    ("LIST_GARBAGE_SIZED", LIST_GARBAGE_SIZED),
+    ("DELETE_GARBAGE_OBJECTS", DELETE_GARBAGE_OBJECTS),
+    ("ENQUEUE_ACTION", ENQUEUE_ACTION),
+    ("LIST_QUEUED_COLLECTIONS", LIST_QUEUED_COLLECTIONS),
+    ("LOAD_PENDING_ACTIONS", LOAD_PENDING_ACTIONS),
+    ("DELETE_ACTION", DELETE_ACTION),
+    ("LOAD_ACTION_ROW", LOAD_ACTION_ROW),
+    ("CANCEL_ACTION", CANCEL_ACTION),
+    ("PARK_ACTION", PARK_ACTION),
+    ("BUMP_ATTEMPTS", BUMP_ATTEMPTS),
+    ("LOAD_PARKED_ACTIONS", LOAD_PARKED_ACTIONS),
+    ("BUMP_GENERATION", BUMP_GENERATION),
+    ("LOAD_GENERATION", LOAD_GENERATION),
+];
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::ALL;
+
+    /// Every `pub const` this module declares, read from its own source.
+    fn declared() -> Vec<&'static str> {
+        include_str!("sql.rs")
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub const "))
+            .filter_map(|rest| rest.split(':').next())
+            .map(str::trim)
+            .collect()
+    }
+
+    #[test]
+    fn the_index_covers_every_statement() {
+        // NOTE: VERSION is an integer, not SQL, and ALL is itself a const in
+        // the same shape; neither belongs in an index of statements.
+        let expected: Vec<_> = declared()
+            .into_iter()
+            .filter(|name| *name != "VERSION" && *name != "ALL")
+            .collect();
+
+        assert!(!expected.is_empty(), "source scan found no constants");
+
+        for name in &expected {
+            assert!(
+                ALL.iter().any(|(indexed, _)| indexed == name),
+                "{name} is declared but missing from sql::ALL"
+            );
+        }
+        assert_eq!(
+            ALL.len(),
+            expected.len(),
+            "sql::ALL has entries the module does not declare"
+        );
+    }
+
+    #[test]
+    fn the_index_follows_the_declaration_order() {
+        // Coverage alone would not catch an entry pairing one name with another
+        // constant. Order does not prove the pairing either, but it keeps the
+        // index a line-for-line mirror of the module, which is what makes a
+        // wrong pairing visible on review rather than buried in an arbitrary
+        // sequence. Two statements may legitimately share text (DELETE_ACTION
+        // and CANCEL_ACTION are one delete under two intents), so comparing
+        // texts proves nothing.
+        let declared: Vec<_> = declared()
+            .into_iter()
+            .filter(|name| *name != "VERSION" && *name != "ALL")
+            .collect();
+        let indexed: Vec<_> = ALL.iter().map(|(name, _)| *name).collect();
+
+        assert_eq!(
+            indexed, declared,
+            "sql::ALL drifted from the declaration order"
+        );
+    }
+
+    #[test]
+    fn no_statement_is_empty() {
+        for (name, sql) in ALL {
+            assert!(!sql.trim().is_empty(), "{name} is empty");
+        }
+    }
+}

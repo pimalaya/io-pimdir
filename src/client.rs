@@ -152,6 +152,11 @@ pub struct PimdirItem {
     pub flags: ReplicaFlags,
     /// The raw per-domain summary blob, verbatim; `None` when never projected.
     pub meta: Option<ReplicaMeta>,
+    /// The kind's ordering key (spec §9.3): a normalised RFC 3339 instant for
+    /// mail and calendars, a normalised display name for contacts. Empty means
+    /// unknown, which sorts before every real key ascending and after every one
+    /// descending.
+    pub sort_key: String,
     /// The content-addressed body hash; `None` until a `Full` hydrate.
     pub object: Option<ReplicaHash>,
     /// The detail tier the item is hydrated to.
@@ -175,6 +180,9 @@ pub struct PimdirRetainedItem {
     pub level: ReplicaLevel,
     /// The raw per-domain summary blob, verbatim.
     pub meta: Option<String>,
+    /// The kind's ordering key as of retirement, so a trash view can present
+    /// its rows in the same order the live listing uses.
+    pub sort_key: String,
     /// The body hash the row still pins; `None` when the item was never
     /// hydrated (nothing to reclaim, nothing to restore locally).
     pub object_hash: Option<String>,
@@ -239,6 +247,13 @@ pub struct PimdirParkedAction {
     /// The failure that parked the row.
     pub error: String,
 }
+
+/// The cursor a descending first page starts from: a key no real one sorts
+/// above, so the page begins at the collection's largest.
+///
+/// `\u{10FFFF}` is the highest scalar value a Rust `str` can hold, and SQLite
+/// compares TEXT by its UTF-8 bytes, so nothing storable outranks it.
+const TOP_SORT_KEY: &str = "\u{10FFFF}";
 
 /// What a [`drain_collection`](PimdirStore::drain_collection) pass did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -563,6 +578,115 @@ impl PimdirStore {
         Ok(items)
     }
 
+    /// A keyset page of a collection's live items in the kind's own **ascending**
+    /// order (spec §9.3): A to Z for contacts, earliest first for mail and
+    /// calendars.
+    ///
+    /// `after` is the previous page's last `(sort_key, seq)`; `None` starts from
+    /// the beginning. The pair is the cursor because a sort key is not unique
+    /// (two messages share a timestamp, two contacts share a name) and `seq`,
+    /// unique per collection, is what makes the page total: no item is skipped
+    /// or repeated across a boundary.
+    pub fn list_items_page_asc(
+        &self,
+        collection: &str,
+        after: Option<(&str, i64)>,
+        limit: usize,
+    ) -> Result<Vec<PimdirItem>, PimdirError> {
+        // No real key sorts before an unknown one ascending, so the empty
+        // string with seq 0 is the true beginning rather than a sentinel.
+        let (key, seq) = after.unwrap_or(("", 0));
+        self.sorted_page(sql::LIST_ITEMS_PAGE_ASC, collection, key, seq, limit)
+    }
+
+    /// The same page **descending**: newest first for mail and calendars, Z to A
+    /// for contacts.
+    ///
+    /// `None` starts from the end, which the statement expresses by binding a
+    /// key above every representable one; a caller never has to invent that
+    /// sentinel itself.
+    pub fn list_items_page_desc(
+        &self,
+        collection: &str,
+        after: Option<(&str, i64)>,
+        limit: usize,
+    ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let (key, seq) = after.unwrap_or((TOP_SORT_KEY, i64::MAX));
+        self.sorted_page(sql::LIST_ITEMS_PAGE_DESC, collection, key, seq, limit)
+    }
+
+    fn sorted_page(
+        &self,
+        statement: &str,
+        collection: &str,
+        key: &str,
+        seq: i64,
+        limit: usize,
+    ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let mut stmt = self.conn.prepare(statement)?;
+        let rows = stmt.query_map(
+            named_params! {
+                ":collection": collection,
+                ":after_key": key,
+                ":after_seq": seq,
+                ":limit": limit as i64,
+            },
+            read_item_from_row,
+        )?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// Restates one item's ordering key (spec §9.3).
+    ///
+    /// For a re-projection: a store written before its kind had a sort-key
+    /// convention, one whose convention changed, or a consumer whose sync engine
+    /// does not carry the key inline yet and derives it from the `meta` it wrote
+    /// itself. Not part of the ordinary write path, which preserves an existing
+    /// key by never naming it.
+    pub fn set_sort_key(
+        &self,
+        collection: &str,
+        link_id: &str,
+        sort_key: &str,
+    ) -> Result<(), PimdirError> {
+        self.conn.execute(
+            sql::SET_SORT_KEY,
+            named_params! {
+                ":collection": collection,
+                ":link_id": link_id,
+                ":sort_key": sort_key,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Gives a collection a new id, carrying its whole contents with it.
+    ///
+    /// Every foreign key onto `collections(id)` is `ON UPDATE CASCADE`, so the
+    /// items, bindings, sources, queue rows and child collections follow in the
+    /// same statement (spec §12). This is the **only** safe way to change an id:
+    /// deleting the collection and recreating it under the new one destroys the
+    /// cache, because `ON DELETE CASCADE` takes every item and binding with it,
+    /// turning a rename into a full re-download and discarding any staged local
+    /// change not yet pushed.
+    ///
+    /// Two things make an id change: a server renaming the collection (an IMAP
+    /// `RENAME`, a DAV move), and an owner renaming an account whose id it
+    /// namespaced its collection ids with. An account rename is one call per
+    /// collection of that account; run them in one transaction and the account
+    /// moves atomically or not at all.
+    pub fn rename_collection(&self, collection: &str, new_id: &str) -> Result<(), PimdirError> {
+        self.conn.execute(
+            sql::RENAME_COLLECTION,
+            named_params! { ":collection": collection, ":new_id": new_id },
+        )?;
+        Ok(())
+    }
+
     /// One live item by its public id `(collection, seq)`, or `None` (client read
     /// surface). A tombstoned item reads as `None`. The returned item carries its
     /// internal `link_id` for the caller to edit by.
@@ -652,16 +776,17 @@ impl PimdirStore {
                 ":limit": limit as i64,
             },
             |row| {
-                let size: Option<i64> = row.get(8)?;
+                let size: Option<i64> = row.get(9)?;
                 Ok(PimdirRetainedItem {
                     seq: row.get(0)?,
                     link_id: row.get(1)?,
                     flags: codec::flags_from_json(row.get::<_, Option<String>>(2)?.as_deref()),
                     object_hash: row.get(3)?,
                     meta: row.get(4)?,
-                    level: codec::level_from_int(row.get(5)?),
-                    retained_at: row.get(6)?,
-                    retained_by: row.get(7)?,
+                    sort_key: row.get(5)?,
+                    level: codec::level_from_int(row.get(6)?),
+                    retained_at: row.get(7)?,
+                    retained_by: row.get(8)?,
                     size: size.map(|size| size.max(0) as u64),
                 })
             },
@@ -2240,13 +2365,15 @@ fn read_item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
     let flags: Option<String> = row.get(2)?;
     let object: Option<String> = row.get(3)?;
     let meta: Option<String> = row.get(4)?;
-    let level: i64 = row.get(5)?;
+    let sort_key: String = row.get(5)?;
+    let level: i64 = row.get(6)?;
 
     Ok(PimdirItem {
         seq,
         link_id: ReplicaLinkId(link),
         flags: codec::flags_from_json(flags.as_deref()),
         meta: meta.map(ReplicaMeta),
+        sort_key,
         object: object.map(ReplicaHash),
         level: codec::level_from_int(level),
     })

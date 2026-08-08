@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A collection can be paged in its kind's own order.** `items` gained a `sort_key` column and an `items_by_sort` index, and `list_items_page_asc` / `list_items_page_desc` return a keyset page ordered by it: newest first for mail, A to Z for contacts, a date range for calendars. Until now the only orderings a store could serve were by `link_id` or `seq`, neither of which means anything to a reader, so every consumer had to scan a whole collection into memory to show fifty rows.
+
+  The cursor is the `(sort_key, seq)` pair rather than the key alone, because a key is not unique: two messages share a timestamp, two contacts share a name. `seq` breaks the tie, which is what stops a page boundary that lands inside a tie from skipping an item or serving it twice. The first page takes no cursor.
+
+  An empty key means unknown and is the default, so an item is orderable before it has been summarised: it sorts to the end of a newest-first listing and to the head of an A-to-Z one.
+
+  `set_sort_key` restates one item's key, for a store written before its kind had a convention or a consumer whose sync engine does not carry the key inline yet. An ordinary write never resets a key it does not carry.
+
+- **`rename_collection`**, which gives a collection a new id and carries its items, bindings, sources, queue rows and child collections with it. Every foreign key onto `collections(id)` is now `ON UPDATE CASCADE`, as is `bindings(collection, link_id)`, which is a parent one level down and refuses the cascade without it.
+
+  This is the only safe way to change an id, and it matters because the obvious alternative is destructive: deleting a collection and recreating it under a new id cascades every item and binding away, turning a rename into a full re-download and discarding staged local changes. A server renaming a folder and an owner renaming an account both land here.
+
+- **A spec-fidelity test suite** comparing the inlined `sql` module against the canonical pimdir specification checked out beside it: the schema semantically (columns, defaults, foreign-key actions and indexes, through SQLite's pragmas rather than by text), the presence of every canonical statement by name, and that every inlined statement prepares against the inlined schema. Statement *text* is deliberately not compared, since the specification permits an equivalent substitution; the three this crate uses are listed explicitly instead. Skips when the specification is not checked out beside this crate.
+
+### Fixed
+
+- **The inlined schema had drifted from the specification.** `sql::MIGRATION_0001` carried neither the `sort_key` column nor any `ON UPDATE CASCADE`, so this crate was creating stores that did not match the format it implements, and nothing detected it. The point of `sql` is to be the canonical copy a consumer runs on its own SQLite driver, so a silent disagreement is the worst failure it has; the fidelity test above exists so it cannot recur.
+
+### Changed
+
+- **`PimdirItem` and `PimdirRetainedItem` gained a `sort_key` field.** Breaking for anyone constructing them.
+
 ## [0.2.0] - 2026-08-07
 
 ### Added
