@@ -37,6 +37,7 @@ fn read_only_open_reads_but_never_writes_or_creates() {
                 body: Some(b"body".to_vec()),
             },
             ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
+                sort_key: Default::default(),
                 collection: ReplicaCollectionId("INBOX".into()),
                 handle: ReplicaHandle("1".into()),
                 link_id: Some(ReplicaLinkId("mid:a".into())),

@@ -43,9 +43,12 @@ tempfile = { version = "3", default-features = false }
 anyhow = { version = "1", default-features = false, features = ["std"], optional = true }
 clap = { version = "4.4", features = ["derive", "wrap_help"], optional = true }
 humantime = { version = "2.2", optional = true }
-io-replica = "0.3"
+io-replica = { version = "0.3" }
 log = { version = "0.4", default-features = false, optional = true }
 pimalaya-cli = { version = "0.2", default-features = false, optional = true }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[patch.crates-io]
+io-replica.git = "https://github.com/pimalaya/io-replica"

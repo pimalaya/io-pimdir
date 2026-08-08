@@ -22,6 +22,7 @@ use io_replica::{
 /// One placement of `link_id` in `collection`, pointing at `hash`.
 fn placement(collection: &str, handle: &str, link_id: &str, hash: &str) -> ReplicaPlacement {
     ReplicaPlacement {
+        sort_key: Default::default(),
         collection: ReplicaCollectionId(collection.into()),
         handle: ReplicaHandle(handle.into()),
         link_id: Some(ReplicaLinkId(link_id.into())),

@@ -27,6 +27,7 @@ fn inbox() -> ReplicaCollectionId {
 fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPlacement {
     let flags = ReplicaFlags::from_iter(flags.iter().copied());
     ReplicaPlacement {
+        sort_key: Default::default(),
         collection: inbox(),
         handle: ReplicaHandle(handle.into()),
         link_id: Some(ReplicaLinkId(link.into())),

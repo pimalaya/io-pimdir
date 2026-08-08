@@ -195,14 +195,12 @@ pub const LOAD_CONFLICT: &str = "SELECT conflict FROM collections WHERE id = :co
 /// under io-replica's contract: the merge reconciles only what `load` returns,
 /// so a hidden row is never re-derived, on a delta or a full resync.
 ///
-/// Does not select `sort_key`, where the reference statement does (spec §8's
-/// permitted substitution). The reference save is a replace-all, so it has to
-/// carry the key back out through `load` or lose it; this implementation saves
-/// by diff instead, inserting only new items and updating existing ones in
-/// place, and `UPDATE_ITEM` names no `sort_key`, so an existing key is preserved
-/// by never being touched. The §9.3 invariant holds either way.
+/// `sort_key` rides along so the round trip preserves it: the engine now
+/// carries the key on a placement, so a load that dropped it would hand every
+/// save an unknown key and the update below would write that back, erasing on
+/// every sync what the last one derived (spec §9.3).
 pub const LOAD_ITEMS: &str = "\
-SELECT link_id, flags, object_hash, meta, level, deleted, conflicted, conflict_object \
+SELECT link_id, flags, object_hash, meta, sort_key, level, deleted, conflicted, conflict_object \
 FROM items WHERE collection = :collection AND retained_at IS NULL";
 
 // Client read surface (kind-agnostic, indexed getters over the same store the
@@ -331,13 +329,13 @@ pub const BUMP_NEXT_SEQ: &str =
 /// Inserts one item row (the new-placement path; `UPDATE_ITEM` handles an
 /// existing one).
 pub const INSERT_ITEM: &str = "\
-INSERT INTO items(collection, link_id, seq, flags, object_hash, meta, level, deleted, conflicted, conflict_object) \
-VALUES(:collection, :link_id, :seq, :flags, :object_hash, :meta, :level, :deleted, :conflicted, :conflict_object)";
+INSERT INTO items(collection, link_id, seq, flags, object_hash, meta, sort_key, level, deleted, conflicted, conflict_object) \
+VALUES(:collection, :link_id, :seq, :flags, :object_hash, :meta, :sort_key, :level, :deleted, :conflicted, :conflict_object)";
 
 /// Updates one existing item's columns in place (the diffed-save path; the
 /// primary key `(collection, link_id)` is unchanged).
 pub const UPDATE_ITEM: &str = "\
-UPDATE items SET flags = :flags, object_hash = :object_hash, meta = :meta, \
+UPDATE items SET flags = :flags, object_hash = :object_hash, meta = :meta, sort_key = :sort_key, \
 level = :level, deleted = :deleted, conflicted = :conflicted, conflict_object = :conflict_object \
 WHERE collection = :collection AND link_id = :link_id";
 

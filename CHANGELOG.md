@@ -28,6 +28,10 @@ All notable changes to this project are documented in this file. The format is b
 
 - **`PimdirItem` and `PimdirRetainedItem` gained a `sort_key` field.** Breaking for anyone constructing them.
 
+- **The sort key io-replica now carries on a placement is bound on write.** `load` returns it, insert and update write it. This reverses the arrangement above, where the key was preserved by the update never naming it: that held only while nothing upstream carried a key, and a `load` that drops it now hands every save an unknown key, which the update would write back, blanking on every sync what the previous one derived. Both halves have to carry the key or neither can.
+
+  io-replica is a path dependency until the field is released.
+
 ## [0.2.0] - 2026-08-07
 
 ### Added

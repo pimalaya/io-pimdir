@@ -13,13 +13,14 @@ use io_replica::{
     collection::ReplicaCollectionId,
     placement::{
         ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaPlacement,
-        ReplicaStatus,
+        ReplicaSortKey, ReplicaStatus,
     },
 };
 use tempfile::tempdir;
 
 fn placement(collection: &str, handle: &str, link_id: &str) -> ReplicaPlacement {
     ReplicaPlacement {
+        sort_key: Default::default(),
         collection: ReplicaCollectionId(collection.into()),
         handle: ReplicaHandle(handle.into()),
         link_id: Some(ReplicaLinkId(link_id.into())),
@@ -210,4 +211,46 @@ fn renaming_a_collection_carries_its_contents() {
         .expect("load the renamed collection");
     assert_eq!(loaded.placements.len(), 1);
     assert_eq!(loaded.placements[0].handle.0, "1");
+}
+
+#[test]
+fn a_key_written_by_a_placement_survives_a_later_write() {
+    // The end of the chain the sort key travels: a connector derives it,
+    // io-replica carries it on the placement, and the store binds it. If
+    // any link drops it the item lands unsorted, and the failure is
+    // invisible until a list comes back in the wrong order.
+    let dir = tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+
+    let mut placed = placement("INBOX", "1", "a");
+    placed.sort_key = ReplicaSortKey::from("2026-08-01T10:00:00Z");
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(placed.clone())])
+        .expect("stage the placement");
+
+    let stored = store.list_items_page_desc("INBOX", None, 10).unwrap();
+    assert_eq!(stored[0].sort_key, "2026-08-01T10:00:00Z");
+
+    // A second write of the same placement, as a re-sync produces: the
+    // key round-trips through `load`, so the update rewrites what was
+    // already there rather than blanking it.
+    let loaded = store
+        .load(&ReplicaCollectionId("INBOX".into()))
+        .expect("load the collection");
+    store
+        .write(
+            loaded
+                .placements
+                .into_iter()
+                .map(ReplicaWriteOp::UpsertPlacement)
+                .collect(),
+        )
+        .expect("re-write what was loaded");
+
+    let stored = store.list_items_page_desc("INBOX", None, 10).unwrap();
+    assert_eq!(
+        stored[0].sort_key, "2026-08-01T10:00:00Z",
+        "a load-then-write cycle must not blank the key"
+    );
 }

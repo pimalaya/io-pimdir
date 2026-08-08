@@ -34,7 +34,7 @@ use io_replica::{
     object::{ReplicaHash, ReplicaObject},
     placement::{
         ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
     },
     storage::ReplicaLoaded,
 };
@@ -1331,6 +1331,9 @@ fn stage_action(
             object: object.clone(),
             level,
             meta: meta.clone(),
+            // NOTE: a queue producer is not a connector, so it derives no
+            // sort key; the sync that pushes this create resolves one.
+            sort_key: ReplicaSortKey::default(),
             flags: flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
@@ -1403,6 +1406,8 @@ fn stage_action(
             },
             body: Vec::new(),
             meta: meta.clone(),
+            // NOTE: as above, a queued update carries no key.
+            sort_key: None,
         },
         PimdirAction::Add { .. } => unreachable!("add staged above"),
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
@@ -2150,6 +2155,7 @@ fn insert_item(
             ":flags": codec::flags_to_json(&item.flags),
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":meta": item.meta.as_ref().map(|m| m.0.as_str()),
+            ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
             ":deleted": item.deleted as i64,
             ":conflicted": item.conflicted as i64,
@@ -2219,6 +2225,7 @@ fn update_item(
             ":flags": codec::flags_to_json(&item.flags),
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":meta": item.meta.as_ref().map(|m| m.0.as_str()),
+            ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
             ":deleted": item.deleted as i64,
             ":conflicted": item.conflicted as i64,
@@ -2384,10 +2391,11 @@ fn item_from_row(row: &Row) -> rusqlite::Result<(ReplicaLinkId, ReplicaHubItem)>
     let flags: Option<String> = row.get(1)?;
     let object: Option<String> = row.get(2)?;
     let meta: Option<String> = row.get(3)?;
-    let level: i64 = row.get(4)?;
-    let deleted: i64 = row.get(5)?;
-    let conflicted: i64 = row.get(6)?;
-    let conflict_object: Option<String> = row.get(7)?;
+    let sort_key: String = row.get(4)?;
+    let level: i64 = row.get(5)?;
+    let deleted: i64 = row.get(6)?;
+    let conflicted: i64 = row.get(7)?;
+    let conflict_object: Option<String> = row.get(8)?;
 
     Ok((
         ReplicaLinkId(link),
@@ -2395,6 +2403,7 @@ fn item_from_row(row: &Row) -> rusqlite::Result<(ReplicaLinkId, ReplicaHubItem)>
             flags: codec::flags_from_json(flags.as_deref()),
             object: object.map(ReplicaHash),
             meta: meta.map(ReplicaMeta),
+            sort_key: ReplicaSortKey(sort_key),
             level: codec::level_from_int(level),
             deleted: deleted != 0,
             conflicted: conflicted != 0,

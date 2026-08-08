@@ -390,3 +390,13 @@ asserting every declared constant is indexed, one asserting the index follows th
 declaration order. Two statements MAY legitimately carry identical text under
 different names (`DELETE_ACTION` and `CANCEL_ACTION` are one delete under two
 intents), so text uniqueness SHALL NOT be asserted.
+
+### Requirement: The carried sort key is bound on write
+A placement's sort key SHALL be written on insert and on update, and SHALL be
+returned by `load`, so it survives the load-merge-save cycle. Dropping it from
+`load` while binding it on update would blank on every sync what the last one
+derived.
+
+This supersedes the earlier arrangement, where the key was preserved by the
+update never naming it: that held only while nothing upstream carried a key, and
+stopped holding the moment io-replica put one on the placement.

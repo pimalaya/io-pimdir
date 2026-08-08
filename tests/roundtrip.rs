@@ -50,6 +50,7 @@ fn inbox() -> ReplicaCollectionId {
 fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPlacement {
     let flags = ReplicaFlags::from_iter(flags.iter().copied());
     ReplicaPlacement {
+        sort_key: Default::default(),
         collection: inbox(),
         handle: ReplicaHandle(handle.into()),
         link_id: Some(ReplicaLinkId(link.into())),
@@ -72,6 +73,7 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPla
 /// summary is known, the object is not local yet).
 fn meta_placement(handle: &str, link: &str, meta: &str) -> ReplicaPlacement {
     ReplicaPlacement {
+        sort_key: Default::default(),
         collection: inbox(),
         handle: ReplicaHandle(handle.into()),
         link_id: Some(ReplicaLinkId(link.into())),

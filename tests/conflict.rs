@@ -25,6 +25,7 @@ fn contacts() -> ReplicaCollectionId {
 /// A placement of the one card, at `status`, with `conflict_revision`.
 fn card(status: ReplicaStatus, conflict_revision: Option<&str>) -> ReplicaPlacement {
     ReplicaPlacement {
+        sort_key: Default::default(),
         collection: contacts(),
         handle: ReplicaHandle("card1.vcf".into()),
         link_id: Some(ReplicaLinkId("uid:a".into())),
