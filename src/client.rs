@@ -55,6 +55,10 @@ pub struct PimdirStore {
     conn: Connection,
     blobs: PathBuf,
     source: ReplicaSourceId,
+    /// The account every collection this handle creates belongs to (spec §9.2);
+    /// `None` in a single-account store. Set with
+    /// [`for_account`](PimdirStore::for_account).
+    account: Option<String>,
     /// Unlinked probed placements, awaiting the `Meta` upgrade that gives them a
     /// link id; kept in memory (empty at rest between syncs).
     residual: Vec<ReplicaPlacement>,
@@ -67,6 +71,10 @@ pub struct PimdirStore {
 pub struct PimdirCollection {
     /// The stable collection id (the mailbox name for a mail store).
     pub id: String,
+    /// The account this collection is grouped under (spec §9.2), `None` in a
+    /// single-account store. It groups and nothing more: no identifier is
+    /// scoped by it.
+    pub account: Option<String>,
     /// The declared IANA media type (`message/rfc822`, `text/vcard`, …), or the
     /// empty string when a sync created the collection before a kind was set.
     pub kind: String,
@@ -84,6 +92,46 @@ pub struct PimdirCollection {
     /// on a handle-space rebuild (rekey), so a frontend derives epoch-dependent
     /// protocol values (an IMAP UIDVALIDITY) from the store alone.
     pub generation: i64,
+}
+
+/// Where one identity or one body sits, as the multiplicity reads report it
+/// (spec §9.2): one row per live placement, carrying the collection and account
+/// it occurs in.
+///
+/// A fact, not a verdict. The same vCard `UID` in two accounts' address books
+/// is two of these; whether that is one person shown twice or two people is the
+/// consumer's call, and the store never makes it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirPlacement {
+    /// The collection the placement sits in.
+    pub collection: String,
+    /// The account that collection is grouped under, `None` when ungrouped.
+    pub account: Option<String>,
+    /// The item's public id, shared by every placement of one link id.
+    pub seq: i64,
+    /// The cross-collection identity.
+    pub link_id: String,
+    /// The body this placement points at, absent until hydrated.
+    pub object: Option<ReplicaHash>,
+    /// The placement's flags, as the stored JSON array.
+    pub flags: Option<String>,
+    /// The detail level: 0 probed, 1 meta, 2 full.
+    pub level: i64,
+}
+
+/// Maps a `LIST_COLLECTIONS`-shaped row.
+fn collection_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PimdirCollection> {
+    Ok(PimdirCollection {
+        id: r.get(0)?,
+        account: r.get(1)?,
+        kind: r.get(2)?,
+        name: r.get(3)?,
+        parent: r.get(4)?,
+        color: r.get(5)?,
+        description: r.get(6)?,
+        sort_order: r.get(7)?,
+        generation: r.get(8)?,
+    })
 }
 
 /// One live item as seen by a client read (`list_items`/`get_item`): the shared
@@ -234,6 +282,7 @@ impl PimdirStore {
             conn,
             blobs,
             source: ReplicaSourceId(source.into()),
+            account: None,
             residual: Vec::new(),
         })
     }
@@ -268,8 +317,34 @@ impl PimdirStore {
             conn,
             blobs: dir.join("objects"),
             source: ReplicaSourceId(source.into()),
+            account: None,
             residual: Vec::new(),
         })
+    }
+
+    /// Binds this handle to an account, so every collection it creates is
+    /// grouped under it (spec §9.2).
+    ///
+    /// A single-account store never calls this and its collections carry a
+    /// `NULL` account, which is what every by-account read matches when given
+    /// `None`. A multi-account owner opens one handle per account, the same way
+    /// it already opens one per source; handles are a SQLite connection each,
+    /// and §7's single-owner rule is unchanged by how many a process holds.
+    ///
+    /// The account groups and nothing more: it partitions no identifier, so two
+    /// accounts holding one link id still share a `seq`, and one body reaching
+    /// both is still stored once. Where an identity or a body occurs is
+    /// reported by [`link_placements`](Self::link_placements) and
+    /// [`object_placements`](Self::object_placements), for the consumer to
+    /// interpret.
+    pub fn for_account(mut self, account: impl Into<String>) -> Self {
+        self.account = Some(account.into());
+        self
+    }
+
+    /// The account this handle writes under, `None` in a single-account store.
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
     }
 
     /// Loads a collection's full [`ReplicaHub`] — every source's items and
@@ -294,12 +369,54 @@ impl PimdirStore {
     /// kinds. The lazy collection creation inside [`write`](ReplicaStorage::write)
     /// uses `ON CONFLICT DO NOTHING`, so it never clobbers a kind set here,
     /// whichever runs first.
+    /// The collection is grouped under this handle's account
+    /// ([`for_account`](Self::for_account)), and an existing row keeps the
+    /// account it already had: only the kind is updated.
     pub fn ensure_collection(&self, collection: &str, kind: &str) -> Result<(), PimdirError> {
         self.conn.execute(
             sql::SET_COLLECTION_KIND,
-            named_params! { ":collection": collection, ":kind": kind },
+            named_params! {
+                ":collection": collection,
+                ":account": self.account.as_deref(),
+                ":kind": kind,
+            },
         )?;
         Ok(())
+    }
+
+    /// Regroups a collection under `account`, or out of one with `None`.
+    ///
+    /// Safe at any time: the account partitions no identifier (spec §9.2), so
+    /// the move leaves the collection's `seq`s, link ids and objects alone.
+    pub fn set_collection_account(
+        &self,
+        collection: &str,
+        account: Option<&str>,
+    ) -> Result<(), PimdirError> {
+        self.conn.execute(
+            sql::SET_COLLECTION_ACCOUNT,
+            named_params! { ":collection": collection, ":account": account },
+        )?;
+        Ok(())
+    }
+
+    /// The account a collection is grouped under.
+    ///
+    /// The outer `Option` is "does the collection exist", the inner one "is it
+    /// grouped": `Ok(None)` for an unknown collection, `Ok(Some(None))` for one
+    /// in a single-account store.
+    pub fn collection_account(
+        &self,
+        collection: &str,
+    ) -> Result<Option<Option<String>>, PimdirError> {
+        Ok(self
+            .conn
+            .query_row(
+                sql::LOAD_ACCOUNT,
+                named_params! { ":collection": collection },
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?)
     }
 
     /// The declared media type of a collection, or `None` if the store has
@@ -324,23 +441,97 @@ impl PimdirStore {
     /// through io-replica's [`write`](ReplicaStorage::write) seam.
     pub fn list_collections(&self) -> Result<Vec<PimdirCollection>, PimdirError> {
         let mut stmt = self.conn.prepare(sql::LIST_COLLECTIONS)?;
-        let rows = stmt.query_map([], |r| {
-            Ok(PimdirCollection {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                name: r.get(2)?,
-                parent: r.get(3)?,
-                color: r.get(4)?,
-                description: r.get(5)?,
-                sort_order: r.get(6)?,
-                generation: r.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map([], collection_row)?;
         let mut collections = Vec::new();
         for row in rows {
             collections.push(row?);
         }
         Ok(collections)
+    }
+
+    /// Lists one account's collections, the filter axis of a merged view
+    /// (spec §9.2).
+    ///
+    /// `None` selects the collections of a single-account store, matching on
+    /// `IS` so a `NULL` account matches itself; `=` would match nothing.
+    pub fn list_collections_by_account(
+        &self,
+        account: Option<&str>,
+    ) -> Result<Vec<PimdirCollection>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_COLLECTIONS_BY_ACCOUNT)?;
+        let rows = stmt.query_map(named_params! { ":account": account }, collection_row)?;
+        let mut collections = Vec::new();
+        for row in rows {
+            collections.push(row?);
+        }
+        Ok(collections)
+    }
+
+    /// The accounts owning at least one collection.
+    ///
+    /// Not a configured roster: a store learns an account only through its
+    /// collections (spec §9.2), so an account with none yet does not appear
+    /// here and a consumer holding the real roster reads it from its own
+    /// configuration.
+    pub fn list_accounts(&self) -> Result<Vec<String>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_ACCOUNTS)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            accounts.push(row?);
+        }
+        Ok(accounts)
+    }
+
+    /// Every live placement of one identity, with the collection and account it
+    /// sits in (spec §9.2).
+    ///
+    /// The store reports where a link id occurs and takes no position on
+    /// whether the placements are one thing. A mail view lists them, because
+    /// two receipts of a newsletter have two read states and two servers; a
+    /// contact view may offer to merge them, because one person in two address
+    /// books is usually one person. Both read these rows.
+    pub fn link_placements(&self, link_id: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_LINK_PLACEMENTS)?;
+        let rows = stmt.query_map(named_params! { ":link_id": link_id }, |r| {
+            Ok(PimdirPlacement {
+                collection: r.get(0)?,
+                account: r.get(1)?,
+                seq: r.get(2)?,
+                link_id: link_id.to_string(),
+                object: r.get::<_, Option<String>>(3)?.map(ReplicaHash),
+                flags: r.get(4)?,
+                level: r.get(5)?,
+            })
+        })?;
+        let mut placements = Vec::new();
+        for row in rows {
+            placements.push(row?);
+        }
+        Ok(placements)
+    }
+
+    /// Every live placement of one body, by content hash: the dedup axis rather
+    /// than the identity one, so it pairs placements two servers gave different
+    /// link ids.
+    pub fn object_placements(&self, hash: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
+        let mut stmt = self.conn.prepare(sql::LIST_OBJECT_PLACEMENTS)?;
+        let rows = stmt.query_map(named_params! { ":hash": hash }, |r| {
+            Ok(PimdirPlacement {
+                collection: r.get(0)?,
+                account: r.get(1)?,
+                seq: r.get(2)?,
+                link_id: r.get(3)?,
+                object: Some(ReplicaHash(hash.to_string())),
+                flags: r.get(4)?,
+                level: r.get(5)?,
+            })
+        })?;
+        let mut placements = Vec::new();
+        for row in rows {
+            placements.push(row?);
+        }
+        Ok(placements)
     }
 
     /// A keyset page of a collection's live items (client read surface).
@@ -652,10 +843,17 @@ impl PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        apply_ops(&tx, &self.blobs, &self.source, &mut self.residual, ops)?;
+        apply_ops(
+            &tx,
+            &self.blobs,
+            &self.source,
+            self.account.as_deref(),
+            &mut self.residual,
+            ops,
+        )?;
         tx.execute(
             sql::ENSURE_COLLECTION,
-            named_params! { ":collection": collection },
+            named_params! { ":collection": collection, ":account": self.account.as_deref() },
         )?;
         let generation: i64 = tx.query_row(
             sql::BUMP_GENERATION,
@@ -806,7 +1004,14 @@ impl PimdirStore {
             // NOTE: dropping the transaction rolls the attempt back.
             Err(reason) => return Ok(Some(reason)),
         };
-        apply_ops(&tx, &self.blobs, &self.source, &mut self.residual, ops)?;
+        apply_ops(
+            &tx,
+            &self.blobs,
+            &self.source,
+            self.account.as_deref(),
+            &mut self.residual,
+            ops,
+        )?;
         // NOTE: the incremental pin hand-over: the queue row's reference
         // (taken at enqueue) is released as the row goes, while the applied
         // item's own reference was just taken by `apply_ops`, all in this
@@ -1116,6 +1321,9 @@ fn stage_action(
 pub struct PimdirProducer {
     conn: Connection,
     producer: String,
+    /// The account collections this producer creates are grouped under
+    /// (spec §9.2); `None` in a single-account store.
+    account: Option<String>,
 }
 
 impl PimdirProducer {
@@ -1142,7 +1350,16 @@ impl PimdirProducer {
         Ok(Self {
             conn,
             producer: producer.into(),
+            account: None,
         })
+    }
+
+    /// Binds this producer to an account, so a collection its enqueue creates
+    /// is grouped under it (spec §9.2). Mirrors
+    /// [`PimdirStore::for_account`].
+    pub fn for_account(mut self, account: impl Into<String>) -> Self {
+        self.account = Some(account.into());
+        self
     }
 
     /// Appends one action to a collection's queue (spec §14.1), returning the
@@ -1173,7 +1390,7 @@ impl PimdirProducer {
             .map_err(busy_or_sql)?;
         tx.execute(
             sql::ENSURE_COLLECTION,
-            named_params! { ":collection": collection },
+            named_params! { ":collection": collection, ":account": self.account.as_deref() },
         )?;
         if let (Some(hash), Some(size)) = (&hash, object_size) {
             tx.execute(
@@ -1408,7 +1625,14 @@ impl ReplicaStorage for PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        apply_ops(&tx, &self.blobs, &self.source, &mut self.residual, ops)?;
+        apply_ops(
+            &tx,
+            &self.blobs,
+            &self.source,
+            self.account.as_deref(),
+            &mut self.residual,
+            ops,
+        )?;
         let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
 
@@ -1434,6 +1658,7 @@ fn apply_ops(
     tx: &Connection,
     blobs: &Path,
     source: &ReplicaSourceId,
+    account: Option<&str>,
     residual: &mut Vec<ReplicaPlacement>,
     ops: Vec<ReplicaWriteOp>,
 ) -> Result<(), PimdirError> {
@@ -1460,7 +1685,7 @@ fn apply_ops(
             } => {
                 tx.execute(
                     sql::ENSURE_COLLECTION,
-                    named_params! { ":collection": collection.0 },
+                    named_params! { ":collection": collection.0, ":account": account },
                 )?;
                 tx.execute(
                     sql::UPSERT_CHECKPOINT,
@@ -1503,7 +1728,7 @@ fn apply_ops(
         let old_hub = load_hub(tx, &collection)?;
         let mut new_hub = old_hub.clone();
         new_hub.absorb(source, &ops);
-        save_hub_diff(tx, &collection, source, &old_hub, &new_hub)?;
+        save_hub_diff(tx, &collection, source, account, &old_hub, &new_hub)?;
         adjust_refcounts(tx, &object_refs(&old_hub), &object_refs(&new_hub))?;
     }
 
@@ -1587,11 +1812,12 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     /// Columns folded into version 1 after it was first published, as
     /// `(table, column, declaration)`. Each must be nullable or carry a
     /// constant default, or it could not be added to a populated table.
-    const FOLDED_IN: [(&str, &str, &str); 4] = [
+    const FOLDED_IN: [(&str, &str, &str); 5] = [
         ("bindings", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
         ("bindings", "conflict_revision", "TEXT"),
         ("items", "retained_at", "TEXT"),
         ("items", "retained_by", "TEXT"),
+        ("collections", "account", "TEXT"),
     ];
 
     let mut missing = Vec::new();
@@ -1613,6 +1839,7 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     // NOTE: an index over a folded-in column has to be created with it; the
     // schema script builds it on a fresh database, where nothing is missing.
     tx.execute_batch(sql::ENSURE_RETAINED_INDEX)?;
+    tx.execute_batch(sql::ENSURE_ACCOUNT_INDEX)?;
     tx.commit().map_err(busy_or_sql)?;
     Ok(())
 }
@@ -1686,12 +1913,13 @@ fn save_hub_diff(
     conn: &Connection,
     collection: &str,
     source: &ReplicaSourceId,
+    account: Option<&str>,
     old: &ReplicaHub,
     new: &ReplicaHub,
 ) -> rusqlite::Result<()> {
     conn.execute(
         sql::ENSURE_COLLECTION,
-        named_params! { ":collection": collection },
+        named_params! { ":collection": collection, ":account": account },
     )?;
     if old.conflict != new.conflict {
         conn.execute(

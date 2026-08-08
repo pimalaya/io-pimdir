@@ -22,8 +22,14 @@ CREATE TABLE store_meta (
     next_seq   INTEGER NOT NULL DEFAULT 1
 ) STRICT;
 
+-- `account` is the multi-account axis (SPEC.md §9.2): NULL in a single-account
+-- store, an opaque owner-chosen id when one store holds several. It groups; it
+-- neither keys nor partitions. No identifier is scoped by it: an identity or a
+-- body occurring in two accounts is a fact the store reports
+-- (LIST_LINK_PLACEMENTS, LIST_OBJECT_PLACEMENTS) and an interface interprets.
 CREATE TABLE collections (
     id          TEXT PRIMARY KEY,
+    account     TEXT,
     kind        TEXT NOT NULL,
     name        TEXT NOT NULL,
     parent      TEXT REFERENCES collections(id) ON DELETE SET NULL,
@@ -38,6 +44,10 @@ CREATE TABLE collections (
     -- (SPEC.md §15).
     generation  INTEGER NOT NULL DEFAULT 1
 ) STRICT;
+
+-- "Every collection of this account", the merged view's filter axis. Partial: a
+-- single-account store writes no account and pays for no index.
+CREATE INDEX collections_by_account ON collections(account) WHERE account IS NOT NULL;
 
 -- One row per source that syncs a collection (a server, a phone). A
 -- single-source collection has one row here.
@@ -134,14 +144,24 @@ pub const VERSION: i64 = 1;
 /// Creates a collection row if it does not exist yet, leaving an existing one
 /// untouched (the kind is declared separately by `SET_COLLECTION_KIND`).
 pub const ENSURE_COLLECTION: &str = "\
-INSERT INTO collections(id, kind, name) VALUES(:collection, '', :collection) \
+INSERT INTO collections(id, account, kind, name) VALUES(:collection, :account, '', :collection) \
 ON CONFLICT(id) DO NOTHING";
 
 /// Declares (or re-declares) a collection's kind, creating the row if the
-/// collection is not known yet.
+/// collection is not known yet. Updates the kind alone, so a collection never
+/// changes account as a side effect of a sync declaring its media type.
 pub const SET_COLLECTION_KIND: &str = "\
-INSERT INTO collections(id, kind, name) VALUES(:collection, :kind, :collection) \
+INSERT INTO collections(id, account, kind, name) VALUES(:collection, :account, :kind, :collection) \
 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind";
+
+/// Regroups a collection under another account, or out of one with `NULL`. Safe
+/// at any time: the account partitions no identifier (spec §9.2), so the move
+/// leaves seqs, link ids and objects alone.
+pub const SET_COLLECTION_ACCOUNT: &str =
+    "UPDATE collections SET account = :account WHERE id = :collection";
+
+/// Reads a collection's owning account.
+pub const LOAD_ACCOUNT: &str = "SELECT account FROM collections WHERE id = :collection";
 
 /// Reads a collection's declared kind.
 pub const LOAD_KIND: &str = "SELECT kind FROM collections WHERE id = :collection";
@@ -168,8 +188,19 @@ FROM items WHERE collection = :collection AND retained_at IS NULL";
 /// Lists every collection with its display metadata and generation, ordered by
 /// `sort_order` then id, the ones carrying no sort order coming last.
 pub const LIST_COLLECTIONS: &str = "\
-SELECT id, kind, name, parent, color, description, sort_order, generation \
+SELECT id, account, kind, name, parent, color, description, sort_order, generation \
 FROM collections ORDER BY sort_order IS NULL, sort_order, id";
+
+/// One account's collections, the filter axis of a merged view. `IS` so binding
+/// `NULL` selects the collections of a single-account store.
+pub const LIST_COLLECTIONS_BY_ACCOUNT: &str = "\
+SELECT id, account, kind, name, parent, color, description, sort_order, generation \
+FROM collections WHERE account IS :account ORDER BY sort_order IS NULL, sort_order, id";
+
+/// The accounts owning at least one collection. A store knows an account only
+/// through its collections (spec §9.2), so this is not a configured roster.
+pub const LIST_ACCOUNTS: &str = "\
+SELECT DISTINCT account FROM collections WHERE account IS NOT NULL ORDER BY account";
 
 /// A keyset page of a collection's live items. `:after` is the exclusive lower
 /// bound on `link_id` (the empty string starts from the beginning, since a
@@ -192,6 +223,24 @@ pub const SEQ_BY_LINK: &str =
 /// Counts a collection's live items (tombstones excluded).
 pub const COUNT_ITEMS: &str =
     "SELECT count(*) FROM items WHERE collection = :collection AND deleted = 0";
+
+/// Every live placement of one identity, with the collection and account it
+/// sits in (spec §9.2). The store reports where a link id occurs and takes no
+/// position on whether the placements are one thing: a mail view lists them, a
+/// contact view may offer to merge them, off the same rows.
+pub const LIST_LINK_PLACEMENTS: &str = "\
+SELECT i.collection, c.account, i.seq, i.object_hash, i.flags, i.level \
+FROM items i JOIN collections c ON c.id = i.collection \
+WHERE i.link_id = :link_id AND i.deleted = 0 AND i.retained_at IS NULL \
+ORDER BY c.account IS NULL, c.account, i.collection";
+
+/// The same on the dedup axis, by body rather than identity, so it pairs
+/// placements two servers gave different link ids.
+pub const LIST_OBJECT_PLACEMENTS: &str = "\
+SELECT i.collection, c.account, i.seq, i.link_id, i.flags, i.level \
+FROM items i JOIN collections c ON c.id = i.collection \
+WHERE i.object_hash = :hash AND i.deleted = 0 AND i.retained_at IS NULL \
+ORDER BY c.account IS NULL, c.account, i.collection";
 
 /// The distinct source names the store has synced (across all collections), so a
 /// client can discover which source to attribute its writes to.
@@ -289,6 +338,11 @@ ORDER BY i.seq LIMIT :limit";
 pub const ENSURE_RETAINED_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS items_retained ON items(collection, retained_at) \
 WHERE retained_at IS NOT NULL";
+
+/// The partial by-account index, idempotent, for the same reconciliation.
+pub const ENSURE_ACCOUNT_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS collections_by_account ON collections(account) \
+WHERE account IS NOT NULL";
 
 /// Counts a collection's retained items, the counterpart of `COUNT_ITEMS`;
 /// rides the `items_retained` partial index.

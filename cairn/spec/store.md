@@ -56,6 +56,53 @@ it; the lazy collection creation inside `write` uses `ON CONFLICT DO NOTHING` an
 never clobbers a declared kind. This makes the store self-describing and lets one
 store hold several item kinds.
 
+### Requirement: A collection records the account it belongs to
+`collections` SHALL carry `account` (TEXT, nullable): an opaque owner-chosen id,
+`NULL` in a single-account store. A partial index `collections_by_account ON
+collections(account) WHERE account IS NOT NULL` SHALL back the by-account reads,
+so a single-account store writes no account and pays for no index.
+
+`collections.id` SHALL remain unique store-wide. An owner filing several
+accounts in one store namespaces their collection ids; the column makes that
+grouping queryable rather than replacing it. The store SHALL NOT interpret the
+value: it is neither parsed, nor validated, nor matched against configuration.
+
+`PimdirStore` and `PimdirProducer` SHALL each carry an optional account, `None`
+by default and set by `for_account`, and SHALL bind it on every collection they
+create, including the lazy `ENSURE_COLLECTION` inside the write seam and the
+producer's enqueue transaction. A multi-account owner opens one handle per
+account. This SHALL NOT change the single-owner rule: how many handles a process
+holds is unrelated to how many processes may own a store.
+
+`ENSURE_COLLECTION` and `SET_COLLECTION_KIND` SHALL bind `:account`, and neither
+SHALL overwrite an existing one, so a collection cannot change account as a side
+effect of a sync declaring its media type. Regrouping is the deliberate
+`set_collection_account`, safe at any time because the account partitions no
+identifier.
+
+### Requirement: The account partitions no identifier
+Link ids, hashes and `seq`s SHALL keep their store-wide meaning whatever account
+a collection belongs to. The `seq` lookup SHALL remain unscoped: two placements
+sharing a `link_id` share a `seq` whether or not they sit in the same account,
+because the `seq` is the short form of the link id and the link id is equal.
+Object deduplication SHALL likewise stay store-wide: one body reaching two
+accounts is one object, refcounted per placement.
+
+### Requirement: Multiplicity is reported, never resolved
+The store SHALL expose where one identity or one body occurs across every
+collection and account, and SHALL take no position on what that means:
+
+- `link_placements(link_id)` returns each live placement of one link id with its
+  collection, account, `seq`, object, flags and level.
+- `object_placements(hash)` returns the same by body, with `link_id` in place of
+  the object, pairing placements two servers gave different link ids.
+
+Both SHALL exclude tombstones and retained rows, and SHALL order by account then
+collection with the `NULL` account first. Merging, hiding or pairing placements
+is the consumer's decision, and the store SHALL implement none of them: a mail
+view lists every placement, a contact view may offer to merge them, and both
+read the same rows.
+
 ### Requirement: A body may be ingested and emitted by streaming
 The store SHALL be able to persist an object from a byte stream (`Read`),
 computing its content hash incrementally, with the same temp → fsync → rename
@@ -66,6 +113,19 @@ expose a stored object as a readable stream for the same reason on the read side
 A `StoreObject` carrying no bytes — its blob already persisted by a streaming
 fetch under its content-addressed path — SHALL record the object row and refcount
 without writing bytes. Refcounting and garbage collection are unchanged.
+
+### Requirement: The client read surface exposes accounts
+`list_collections` SHALL return `account` alongside the existing columns.
+`list_collections_by_account(account)` SHALL return one account's collections in
+the same shape, matching with `IS` so binding `None` selects the collections of
+a single-account store. `list_accounts` SHALL return the accounts owning at
+least one collection.
+
+Because the store learns an account only through its collections, `list_accounts`
+is not a configured roster: an account with no collection does not appear, and a
+consumer needing the full roster reads it from its own configuration. The store
+records which account a collection belongs to and nothing else about it: no
+credentials, no endpoints, no display name.
 
 ### Requirement: A client reads the store by indexed, paginated getters
 The store SHALL expose a read-only query surface for a client projecting the
@@ -97,7 +157,9 @@ placement of the same `link_id`. The counter only ever increases, so a `seq` is
 **never reused** even after the message is deleted everywhere. `(collection, seq)`
 SHALL be unique (one placement per message per collection). The sync seam still
 keys on `link_id`; `seq` is assigned transparently on insert and is never a sync
-key.
+key. This holds across accounts too: equal link ids share a `seq` wherever they
+sit, which reports their equality without asserting the placements are one
+thing.
 
 ### Requirement: A client can discover the store's sources
 The store SHALL expose the distinct source names it has synced against (across all
