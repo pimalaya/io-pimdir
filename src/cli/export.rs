@@ -67,7 +67,7 @@ impl ExportCommand {
     /// Writes the dump.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         let read = store.read()?;
-        let blobs = store.blobs();
+        let blobs = store.blobs()?;
 
         let manifest_path = self.dir.join("manifest.json");
         if manifest_path.exists() && !self.force {
@@ -178,7 +178,7 @@ impl ExportCommand {
                     "collection": collection,
                     "seq": item.seq,
                     "link_id": item.link_id.0,
-                    "flags": item.flags.0,
+                    "flags": item.flags.known(),
                     "level": level(item.level),
                     "object": item.object.as_ref().map(|hash| hash.0.clone()),
                     "meta": item.meta.as_ref().map(|meta| meta.0.clone()),
@@ -221,7 +221,7 @@ impl ExportCommand {
                     "collection": collection,
                     "seq": item.seq,
                     "link_id": item.link_id,
-                    "flags": item.flags.0,
+                    "flags": item.flags.known(),
                     "level": level(item.level),
                     "object": item.object_hash,
                     "meta": item.meta,

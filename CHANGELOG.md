@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The store owns the content hash its objects are named by.** `PimdirHashAlgo` implements both algorithms the format admits (`blake3`, recommended, and `sha256-128`) with the encoding spec §5 fixes, lowercase base32 (RFC 4648, no padding), and a store, a producer and the algorithm itself hand it out whole (`hash`) or incremental (`hasher`, for a body streamed into the blob store).
+
+  Until now this crate stamped `store_meta.hash_algo` with `blake3` and hashed nothing, while every Rust consumer carried its own 128-bit FNV-1a rendered as hex and the Android app computed `sha256-128` as base32. The recorded algorithm was therefore false, the digest was not cryptographic (spec §2), the encoding was not the one a blob path is specified to use, and the two implementations of one store named the same body differently: no dedup, no blob found, and nothing erroring while it happened.
+
+  `open_with_hash` declares the algorithm a store is created with, `open` adopts whatever an existing store records, and an open declaring a different one is refused with `PimdirError::HashAlgo`.
+
+  **Breaking**: `PimdirBlobs::open` takes the algorithm too, since the blob directory is what names files by it; `PimdirStore::blobs` hands out a handle already bound to its store, which is how a consumer avoids picking one.
+
+- **A store created before the rename cascades is refused on open**, with `PimdirError::Unreconcilable` naming the table. Every foreign key onto a renamable parent carries `ON UPDATE CASCADE` (spec §14), and no `ALTER TABLE` can add one, so the draft reconciliation cannot reach it; spec §6's other branch is to refuse the store and have the operator recreate it, which costs a resync of what the format calls a derived cache.
+
+  Opened anyway, such a store works until something renames a collection, and then SQLite refuses the rename one dependent row down: a server-side rename or an account rename could never be applied, and nothing said so until one was attempted. Every store created by 0.2.0 is in this state.
+
+- **An unknown flag set is written as `NULL`.** Spec §13 keeps two absences apart: `NULL` means nothing has read an item's markers, `'[]'` means it is known to carry none. io-replica had no unknown state, so this crate wrote at least `'[]'` and a probed placement claimed to carry no markers. `flags_to_json` now returns `None` for `ReplicaFlags::Unknown` and `flags_from_json` decodes a `NULL` column back to it, so the column means what the specification says it means.
+
+  In a queue payload (§15.3) an unknown set encodes as `null` rather than `[]`: an action states an intent, so its set is known in every payload the format defines, and a nonsensical one stays legible instead of reading as a deliberate clearing of every flag.
+
+- **The two schema stamps are checked against each other on open.** Spec §4.2 has `PRAGMA user_version` and `store_meta.version` mirror one another and calls a store where they disagree corrupt; this crate read only the pragma, so a half-applied schema change opened as a store at whichever version the pragma happened to hold. Both the owner and the read-only open now refuse it with `PimdirError::VersionMismatch`. A store whose `store_meta` row is absent is left alone, since refusing there would make a missing stamp unrepairable.
+
 - **A collection can be paged in its kind's own order.** `items` gained a `sort_key` column and an `items_by_sort` index, and `list_items_page_asc` / `list_items_page_desc` return a keyset page ordered by it: newest first for mail, A to Z for contacts, a date range for calendars. Until now the only orderings a store could serve were by `link_id` or `seq`, neither of which means anything to a reader, so every consumer had to scan a whole collection into memory to show fifty rows.
 
   The cursor is the `(sort_key, seq)` pair rather than the key alone, because a key is not unique: two messages share a timestamp, two contacts share a name. `seq` breaks the tie, which is what stops a page boundary that lands inside a tie from skipping an item or serving it twice. The first page takes no cursor.
@@ -22,9 +40,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A store created by 0.2.0 was unreadable.** The draft-shape reconciliation on open (spec §6) did not carry `items.sort_key` or the `items_by_sort` index, although both were folded into version 1 after 0.2.0 shipped, so every paged read of such a store failed with `no such column: sort_key`. The column and the index are now reconciled with the rest, and a regression test derives an earlier-draft store from the current schema by dropping each folded-in column, so the next fold is covered without rewriting it.
+
+  Still not reconcilable: a 0.2.0 store carries no `ON UPDATE CASCADE`, which `ALTER TABLE` cannot add, so `rename_collection` on one is refused by SQLite rather than silently orphaning its rows.
+
 - **The inlined schema had drifted from the specification.** `sql::MIGRATION_0001` carried neither the `sort_key` column nor any `ON UPDATE CASCADE`, so this crate was creating stores that did not match the format it implements, and nothing detected it. The point of `sql` is to be the canonical copy a consumer runs on its own SQLite driver, so a silent disagreement is the worst failure it has; the fidelity test above exists so it cannot recur.
 
 ### Changed
+
+- **`ItemRow.flags` is `Option<Vec<String>>`**, `null` in the JSON output while nothing has read the markers. Breaking for anything parsing `pimdir item list --output json`.
 
 - **`PimdirItem` and `PimdirRetainedItem` gained a `sort_key` field.** Breaking for anyone constructing them.
 

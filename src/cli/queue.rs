@@ -162,7 +162,12 @@ fn summary(action: &PimdirAction) -> String {
             }
         }
         PimdirAction::SetFlags { seq, flags } => {
-            let flags: Vec<&str> = flags.0.iter().map(String::as_str).collect();
+            let flags: Vec<&str> = flags
+                .known()
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
             format!("seq {seq} -> [{}]", flags.join(" "))
         }
         PimdirAction::Remove { seq } => format!("seq {seq}"),

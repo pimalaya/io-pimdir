@@ -211,7 +211,7 @@ fn every_canonical_statement_is_inlined() {
 }
 
 /// Canonical statements this crate deliberately does not inline, each replaced
-/// by an equivalent that preserves the same invariant (SPEC §4.4, §8).
+/// by an equivalent that preserves the same invariant (SPEC §4.4, §7).
 ///
 /// The list is short on purpose. Every entry is a place where reading the spec
 /// and reading this crate will not line up, so each one names what it swapped
@@ -225,7 +225,7 @@ const SUBSTITUTED: &[&str] = &[
     "DELETE_ITEMS",
     // The reference refcount repair, a full O(items+bindings+queue) recompute
     // from the pointer tables. This crate uses `ADJUST_REFCOUNT`, the per-hash
-    // net-change form the spec offers alongside it, which is O(changes). §8's
+    // net-change form the spec offers alongside it, which is O(changes). §7's
     // invariant binds, not the form.
     "RECOMPUTE_REFCOUNTS",
 ];

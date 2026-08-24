@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use io_pimdir::PimdirStore;
+use io_pimdir::{PimdirError, PimdirStore, hash::PimdirHashAlgo};
 use io_replica::{
     change::ReplicaWriteOp,
     client::ReplicaStorage,
@@ -136,7 +136,7 @@ fn single_source_write_reopen_lookup_and_gc() {
         loaded.placements[0].object,
         Some(ReplicaHash("cafebabe".into()))
     );
-    assert!(loaded.placements[0].flags.0.iter().any(|f| f == "\\Seen"));
+    assert!(loaded.placements[0].flags.contains("\\Seen"));
     assert_eq!(loaded.checkpoint, Some(ReplicaCheckpoint(vec![1, 2, 3])));
 
     let known = store
@@ -296,7 +296,7 @@ fn client_reads_collections_items_page_and_one() {
     // Full items carry their object and level; flags round-trip.
     assert_eq!(page1[0].level, ReplicaLevel::Full);
     assert_eq!(page1[0].object, Some(ReplicaHash("cafebabe".into())));
-    assert!(page1[0].flags.0.iter().any(|f| f == "\\Seen"));
+    assert!(page1[0].flags.contains("\\Seen"));
 
     // Every item carries a per-collection public id, monotonic in insert order.
     assert_eq!(
@@ -467,7 +467,7 @@ fn a_body_streams_in_and_back_out() {
     use std::io::{Read, Write};
 
     let dir = tempfile::tempdir().unwrap();
-    let blobs = io_pimdir::PimdirBlobs::open(dir.path());
+    let blobs = io_pimdir::PimdirBlobs::open(dir.path(), PimdirHashAlgo::default());
 
     // Stream a body in, in chunks, committing under its (caller-computed) hash.
     let mut w = blobs.writer().unwrap();
@@ -507,7 +507,7 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
     use std::io::Write;
 
     let dir = tempfile::tempdir().unwrap();
-    let blobs = io_pimdir::PimdirBlobs::open(dir.path());
+    let blobs = io_pimdir::PimdirBlobs::open(dir.path(), PimdirHashAlgo::default());
     let mut store = PimdirStore::open(dir.path(), "local").unwrap();
 
     // The consumer streams the blob into place during a fetch...
@@ -633,13 +633,7 @@ fn a_flag_only_update_keeps_the_body() {
 
     let loaded = store.load(&inbox()).unwrap();
     assert_eq!(loaded.placements.len(), 1);
-    assert!(
-        loaded.placements[0]
-            .flags
-            .0
-            .iter()
-            .any(|f| f == "\\Flagged")
-    );
+    assert!(loaded.placements[0].flags.contains("\\Flagged"));
     assert_eq!(
         loaded.placements[0].object,
         Some(ReplicaHash("cafebabe".into()))
@@ -742,4 +736,78 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
         archive_proj[0].base.is_none(),
         "no base yet: the sync appends it"
     );
+}
+
+#[test]
+fn an_unknown_flag_set_stores_as_null_and_loads_back_unknown() {
+    // Spec §13 keeps the two absences apart: NULL means nothing has read the
+    // markers, '[]' means the item is known to carry none. A probed placement
+    // that stored '[]' would claim the second while only the first is true.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+
+    let mut probed = placement("1", "mid:a", "cafebabe", &[]);
+    probed.flags = ReplicaFlags::Unknown;
+    probed.base = None;
+    let known_empty = placement("2", "mid:b", "cafebabe", &[]);
+
+    store
+        .write(vec![
+            store_object("cafebabe", b"abc"),
+            ReplicaWriteOp::UpsertPlacement(probed),
+            ReplicaWriteOp::UpsertPlacement(known_empty),
+        ])
+        .unwrap();
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    let stored: Vec<Option<String>> = conn
+        .prepare("SELECT flags FROM items ORDER BY link_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(stored, vec![None, Some(String::from("[]"))]);
+    drop(conn);
+
+    let loaded = store.load(&inbox()).unwrap();
+    let mut placements = loaded.placements;
+    placements.sort_by_key(|p| p.handle.0.clone());
+    assert!(placements[0].flags.is_unknown());
+    assert_eq!(placements[1].flags, ReplicaFlags::default());
+}
+
+#[test]
+fn the_store_declares_the_hash_it_names_objects_by() {
+    // A store records its algorithm once, at creation (spec §4.3), and every
+    // process touching it hashes through the store rather than picking one:
+    // a handle computing a different name writes blobs no other reader finds,
+    // and it fails as a dedup that silently never dedups.
+    let dir = tempfile::tempdir().unwrap();
+
+    let store =
+        PimdirStore::open_with_hash(dir.path(), "local", Some(PimdirHashAlgo::Sha256_128)).unwrap();
+    assert_eq!(store.hash_algo(), PimdirHashAlgo::Sha256_128);
+    assert_eq!(store.hash(b"body").0.len(), 26);
+    drop(store);
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    let stored: String = conn
+        .query_row("SELECT hash_algo FROM store_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, "sha256-128");
+    drop(conn);
+
+    // Reopening adopts what the store records, and declaring another is
+    // refused rather than silently renaming every body written from now on.
+    let reopened = PimdirStore::open(dir.path(), "local").unwrap();
+    assert_eq!(reopened.hash_algo(), PimdirHashAlgo::Sha256_128);
+    drop(reopened);
+
+    assert!(matches!(
+        PimdirStore::open_with_hash(dir.path(), "local", Some(PimdirHashAlgo::Blake3)),
+        Err(PimdirError::HashAlgo { .. })
+    ));
 }

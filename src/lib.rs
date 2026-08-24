@@ -27,6 +27,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod codec;
+pub mod hash;
 pub mod sql;
 
 #[cfg(feature = "client")]

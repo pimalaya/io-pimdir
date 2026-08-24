@@ -1,5 +1,5 @@
 //! Ordering a collection by its kind's own key (spec §9.3), and renaming a
-//! collection without losing it (spec §12).
+//! collection without losing it (spec §14).
 //!
 //! The two share a file because they share a purpose: both exist so that what a
 //! reader sees survives what the store does underneath it. An unordered store

@@ -5,7 +5,10 @@
 
 use std::{io::Write, path::Path};
 
-use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirStore, codec::PimdirAction, sql};
+use io_pimdir::{
+    PimdirBlobs, PimdirError, PimdirProducer, PimdirStore, codec::PimdirAction,
+    hash::PimdirHashAlgo, sql,
+};
 use io_replica::{
     change::ReplicaWriteOp,
     client::ReplicaStorage,
@@ -80,7 +83,7 @@ fn seeded(dir: &Path) -> (PimdirStore, i64) {
 /// Streams `body` into the blob store under `hash` (the producer's blob-first
 /// step) and returns its size.
 fn write_blob(dir: &Path, hash: &str, body: &[u8]) -> u64 {
-    let blobs = PimdirBlobs::open(dir);
+    let blobs = PimdirBlobs::open(dir, PimdirHashAlgo::default());
     let mut writer = blobs.writer().unwrap();
     writer.write_all(body).unwrap();
     writer.commit(&ReplicaHash(hash.into())).unwrap()

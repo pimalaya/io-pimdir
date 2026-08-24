@@ -1,9 +1,9 @@
 //! Pure, I/O-free encodings between the [`io_replica`] model and the pimdir
-//! columns (spec §11). No SQLite, no filesystem: this is the part an Android or
+//! columns (spec §13). No SQLite, no filesystem: this is the part an Android or
 //! any other implementation reuses.
 //!
 //! Beside the column encodings, this module holds the action-queue payload
-//! codec (spec §14.3): the six v1 action kinds as [`PimdirAction`], encoded to
+//! codec (spec §15.3): the six v1 action kinds as [`PimdirAction`], encoded to
 //! and from the versioned JSON `queue.payload` column.
 
 use alloc::{
@@ -20,24 +20,28 @@ use io_replica::{
 use serde_json::{Map, Value, json};
 
 /// A flag set to its canonical JSON array (sorted; the model's set is already
-/// ordered). An empty set encodes as `"[]"`, never `NULL`.
-pub fn flags_to_json(flags: &ReplicaFlags) -> String {
-    let items: Vec<&String> = flags.0.iter().collect();
-    serde_json::to_string(&items).unwrap_or_else(|_| String::from("[]"))
+/// ordered), or `None` for the column's `NULL`.
+///
+/// The two absences the spec (§13) keeps apart: a known-empty set encodes as
+/// `"[]"`, and a set nobody has read encodes as `NULL`. Collapsing them would
+/// have a probed item claim to carry no markers.
+pub fn flags_to_json(flags: &ReplicaFlags) -> Option<String> {
+    let items: Vec<&String> = flags.known()?.iter().collect();
+    Some(serde_json::to_string(&items).unwrap_or_else(|_| String::from("[]")))
 }
 
-/// The inverse of [`flags_to_json`]. A `NULL`/absent column (passed as `None`)
-/// or malformed JSON decodes to the empty set — the model has no "unknown flags"
-/// state.
+/// The inverse of [`flags_to_json`]: a `NULL` column (passed as `None`) decodes
+/// to the unknown set, and malformed JSON to a known-empty one, since the
+/// column was written by something that had read the markers.
 pub fn flags_from_json(json: Option<&str>) -> ReplicaFlags {
     let Some(json) = json else {
-        return ReplicaFlags::default();
+        return ReplicaFlags::Unknown;
     };
     let items: Vec<String> = serde_json::from_str(json).unwrap_or_default();
-    ReplicaFlags(items.into_iter().collect())
+    ReplicaFlags::Known(items.into_iter().collect())
 }
 
-/// The detail ladder as its column integer (spec §11).
+/// The detail ladder as its column integer (spec §13).
 pub fn level_to_int(level: ReplicaLevel) -> i64 {
     match level {
         ReplicaLevel::Probed => 0,
@@ -55,7 +59,7 @@ pub fn level_from_int(value: i64) -> ReplicaLevel {
     }
 }
 
-/// A queued mutation request (spec §14.3): what a producer appends to the
+/// A queued mutation request (spec §15.3): what a producer appends to the
 /// `queue` table and the owner applies to the store.
 ///
 /// The kinds mirror io-replica's mutation vocabulary on purpose: the queue is
@@ -75,7 +79,7 @@ pub enum PimdirAction {
         /// The body's content hash, matching the row's `object_hash`; the
         /// producer wrote the blob durably before enqueueing.
         object: Option<ReplicaHash>,
-        /// The item's summary (spec §13), or `None` when not projected.
+        /// The item's summary (spec Annex A), or `None` when not projected.
         meta: Option<ReplicaMeta>,
         /// The provisional handle the create is staged under; `None` lets the
         /// owner derive one.
@@ -146,7 +150,7 @@ pub enum PimdirAction {
 }
 
 impl PimdirAction {
-    /// The action kind as its `queue.action` column value (spec §11).
+    /// The action kind as its `queue.action` column value (spec §13).
     pub fn kind(&self) -> &str {
         match self {
             Self::Add { .. } => "add",
@@ -161,7 +165,7 @@ impl PimdirAction {
 
     /// The body hash the payload references, if any: the value the enqueue
     /// carries in `queue.object_hash` so the pending body is pinned against
-    /// garbage collection (spec §14.1).
+    /// garbage collection (spec §15.1).
     pub fn object_hash(&self) -> Option<&ReplicaHash> {
         match self {
             Self::Add { object, .. } => object.as_ref(),
@@ -202,7 +206,7 @@ impl fmt::Display for PimdirActionError {
 
 impl core::error::Error for PimdirActionError {}
 
-/// Encodes an action to its versioned JSON `queue.payload` column (spec §14.3,
+/// Encodes an action to its versioned JSON `queue.payload` column (spec §15.3,
 /// `v: 1`). Absent optional fields are omitted; `meta` embeds as parsed JSON
 /// when it is valid JSON, else as a JSON string.
 pub fn action_to_payload(action: &PimdirAction) -> String {
@@ -315,29 +319,43 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
     }
 }
 
-/// A flag set as a JSON array value (the model's set is already sorted).
+/// A flag set as a JSON array value (the model's set is already sorted), or
+/// `null` for an unknown one.
+///
+/// An action states an intent, so its set is known in every payload the spec
+/// defines (§15.3). Encoding an unknown one as `null` rather than as `[]` keeps
+/// a nonsensical action legible instead of turning it into a deliberate
+/// clearing of every flag.
 fn flags_to_value(flags: &ReplicaFlags) -> Value {
-    Value::Array(flags.0.iter().map(|f| json!(f)).collect())
+    match flags.known() {
+        None => Value::Null,
+        Some(flags) => Value::Array(flags.iter().map(|f| json!(f)).collect()),
+    }
 }
 
-/// The inverse of [`flags_to_value`]; an absent or malformed array decodes to
-/// the empty set, matching [`flags_from_json`].
+/// The inverse of [`flags_to_value`]; an absent or `null` value decodes to the
+/// unknown set and a malformed array to a known-empty one, matching
+/// [`flags_from_json`].
 fn flags_from_value(value: Option<&Value>) -> ReplicaFlags {
-    let items = value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    ReplicaFlags(items)
+    match value {
+        None | Some(Value::Null) => ReplicaFlags::Unknown,
+        Some(value) => ReplicaFlags::Known(
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+    }
 }
 
 /// A stored summary embedded in a payload: parsed JSON when the opaque meta is
-/// valid JSON (the spec §13 conventions), a JSON string otherwise.
+/// valid JSON (the spec Annex A conventions), a JSON string otherwise.
 fn meta_to_value(meta: &ReplicaMeta) -> Value {
     serde_json::from_str(&meta.0).unwrap_or_else(|_| json!(meta.0))
 }
@@ -387,7 +405,7 @@ mod tests {
     #[test]
     fn flags_round_trip_and_escape() {
         let flags = ReplicaFlags::from_iter(["\\Seen", "$flagged", "a\"b"]);
-        let json = flags_to_json(&flags);
+        let json = flags_to_json(&flags).expect("a known set encodes");
         assert_eq!(flags_from_json(Some(&json)), flags);
         // NOTE: canonical (sorted) and JSON-escaped.
         assert!(json.starts_with('['));
@@ -395,9 +413,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_null_flags_are_empty() {
-        assert_eq!(flags_to_json(&ReplicaFlags::default()), "[]");
-        assert_eq!(flags_from_json(None), ReplicaFlags::default());
+    fn an_unknown_set_is_null_and_a_known_empty_one_is_a_list() {
+        // The two absences the store keeps apart (spec §13): NULL means the
+        // markers were never read, '[]' means the item carries none.
+        assert_eq!(flags_to_json(&ReplicaFlags::Unknown), None);
+        assert_eq!(flags_from_json(None), ReplicaFlags::Unknown);
+
+        assert_eq!(
+            flags_to_json(&ReplicaFlags::default()).as_deref(),
+            Some("[]")
+        );
         assert_eq!(flags_from_json(Some("[]")), ReplicaFlags::default());
     }
 
@@ -446,7 +471,7 @@ mod tests {
         ];
         for action in actions {
             let payload = action_to_payload(&action);
-            // NOTE: versioned with a leading `v` (spec §14.3).
+            // NOTE: versioned with a leading `v` (spec §15.3).
             assert!(payload.contains("\"v\":1"), "versioned: {payload}");
             let decoded = action_from_payload(action.kind(), &payload).unwrap();
             assert_eq!(decoded, action, "round-trip of {payload}");

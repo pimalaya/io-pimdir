@@ -41,7 +41,7 @@ CREATE TABLE collections (
     -- Collection generation: bumped by the owner whenever it rebuilds the
     -- collection's handle space (a backend identity reset), so a reader can derive
     -- epoch-dependent protocol values (an IMAP UIDVALIDITY) from the store alone
-    -- (SPEC.md §15).
+    -- (SPEC.md §12).
     generation  INTEGER NOT NULL DEFAULT 1
 ) STRICT;
 
@@ -111,7 +111,7 @@ CREATE TABLE bindings (
     FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT;
 
--- The action queue (SPEC.md §14): mutations requested by processes that are not
+-- The action queue (SPEC.md §15): mutations requested by processes that are not
 -- the store owner, applied by the owner in append order.
 CREATE TABLE queue (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- global append order
@@ -119,7 +119,7 @@ CREATE TABLE queue (
     producer    TEXT    NOT NULL,                   -- enqueuing process, diagnostic only
     collection  TEXT    NOT NULL REFERENCES collections(id) ON UPDATE CASCADE ON DELETE CASCADE,
     action      TEXT    NOT NULL,                   -- 'add' | 'set-flags' | 'remove' | 'move' | 'copy' | 'update', or an owner-defined intent
-    payload     TEXT    NOT NULL,                   -- versioned JSON, shape per action (SPEC.md §14)
+    payload     TEXT    NOT NULL,                   -- versioned JSON, shape per action (SPEC.md §15)
     object_hash TEXT    REFERENCES objects(hash),   -- pins the payload's body against GC, or NULL
     attempts    INTEGER NOT NULL DEFAULT 0,         -- apply attempts so far
     error       TEXT                                -- last failure; non-NULL means parked
@@ -168,7 +168,7 @@ pub const SET_COLLECTION_ACCOUNT: &str =
 /// Gives a collection a new id, carrying its whole contents with it: every
 /// foreign key onto `collections(id)` is `ON UPDATE CASCADE`, so the items,
 /// bindings, sources, queue rows and child collections follow in the same
-/// statement (spec §12).
+/// statement (spec §14).
 ///
 /// The only safe way to change an id. Deleting and recreating the collection
 /// instead destroys the cache: the `ON DELETE CASCADE` takes every item and
@@ -339,7 +339,7 @@ UPDATE items SET flags = :flags, object_hash = :object_hash, meta = :meta, sort_
 level = :level, deleted = :deleted, conflicted = :conflicted, conflict_object = :conflict_object \
 WHERE collection = :collection AND link_id = :link_id";
 
-// Retention (spec §16): the last binding vanishing retires the row instead of
+// Retention (spec §11): the last binding vanishing retires the row instead of
 // deleting it, a reappearing link id revives it, and purge is the only true
 // delete.
 
@@ -357,7 +357,7 @@ WHERE collection = :collection AND link_id = :link_id";
 /// Deletes every binding of one item, for the retire path: the row survives, but
 /// no source holds it, so no base does either (a delete would have cascaded).
 /// A retained row carrying no binding at all is the persisted form of "the
-/// removal has finished propagating" (spec §16).
+/// removal has finished propagating" (spec §11).
 pub const DELETE_ITEM_BINDINGS: &str =
     "DELETE FROM bindings WHERE collection = :collection AND link_id = :link_id";
 
@@ -382,7 +382,7 @@ WHERE collection = :collection AND link_id = :link_id";
 ///
 /// `:after` is the exclusive lower bound on the public `seq` (0 starts from the
 /// beginning), an equivalent substitution for the reference statement's
-/// `link_id` cursor (spec §8): a caller pages the trash by the same small
+/// `link_id` cursor (spec §7): a caller pages the trash by the same small
 /// integer it purges and restores by.
 pub const LIST_RETAINED_PAGE: &str = "\
 SELECT i.seq, i.link_id, i.flags, i.object_hash, i.meta, i.sort_key, i.level, \
@@ -402,6 +402,12 @@ WHERE retained_at IS NOT NULL";
 pub const ENSURE_ACCOUNT_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS collections_by_account ON collections(account) \
 WHERE account IS NOT NULL";
+
+/// The by-sort-key index, idempotent, for the same reconciliation. A store
+/// written before the `sort_key` column existed has neither the column nor
+/// this index, and every paged read names both.
+pub const ENSURE_SORT_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS items_by_sort ON items(collection, sort_key, seq)";
 
 /// Counts a collection's retained items, the counterpart of `COUNT_ITEMS`;
 /// rides the `items_retained` partial index.
@@ -500,13 +506,13 @@ pub const LIST_GARBAGE_SIZED: &str = "SELECT hash, size FROM objects WHERE refco
 /// blob.
 pub const DELETE_GARBAGE_OBJECTS: &str = "DELETE FROM objects WHERE refcount = 0";
 
-// The action queue (spec §14, `queries/queue.sql`): the write door for every
+// The action queue (spec §15, `queries/queue.sql`): the write door for every
 // process that is not the store owner. A producer appends; the owner applies
 // pending actions in append order and deletes each in the same transaction as
 // its effects.
 
 /// A producer's append. Runs after `ENSURE_COLLECTION`, in one transaction with
-/// the `STORE_OBJECT` upsert when the payload references a body (spec §14.1).
+/// the `STORE_OBJECT` upsert when the payload references a body (spec §15.1).
 pub const ENQUEUE_ACTION: &str = "\
 INSERT INTO queue(created_at, producer, collection, action, payload, object_hash) \
 VALUES(:created_at, :producer, :collection, :action, :payload, :object_hash)";
@@ -517,7 +523,7 @@ pub const LIST_QUEUED_COLLECTIONS: &str =
 
 /// The owner's drain: a collection's pending (non-parked) actions, in append
 /// order. A reader runs the same statement to overlay pending actions on its
-/// item projection (read-your-writes, spec §14.4).
+/// item projection (read-your-writes, spec §15.4).
 pub const LOAD_PENDING_ACTIONS: &str = "\
 SELECT id, created_at, producer, action, payload, object_hash, attempts \
 FROM queue WHERE collection = :collection AND error IS NULL ORDER BY id";
@@ -532,7 +538,7 @@ pub const DELETE_ACTION: &str = "DELETE FROM queue WHERE id = :id";
 pub const LOAD_ACTION_ROW: &str = "SELECT attempts, object_hash FROM queue WHERE id = :id";
 
 /// One queue row removed by request rather than by application, pending or
-/// parked (spec §14.5): a queued item withdrawn, or a performed intent
+/// parked (spec §15.5): a queued item withdrawn, or a performed intent
 /// acknowledged by the process that could carry it out. The same delete as
 /// `DELETE_ACTION`, named apart because the trigger is a request, not an apply.
 /// It releases the row's `object_hash` pin, so it runs in one transaction with
@@ -553,7 +559,7 @@ pub const LOAD_PARKED_ACTIONS: &str = "\
 SELECT id, created_at, producer, collection, action, payload, attempts, error \
 FROM queue WHERE error IS NOT NULL ORDER BY id";
 
-/// The owner's handle-space reset marker (spec §15): run in the same
+/// The owner's handle-space reset marker (spec §12): run in the same
 /// transaction as the rebuild it records.
 pub const BUMP_GENERATION: &str = "\
 UPDATE collections SET generation = generation + 1 WHERE id = :collection \
@@ -611,6 +617,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("LIST_RETAINED_PAGE", LIST_RETAINED_PAGE),
     ("ENSURE_RETAINED_INDEX", ENSURE_RETAINED_INDEX),
     ("ENSURE_ACCOUNT_INDEX", ENSURE_ACCOUNT_INDEX),
+    ("ENSURE_SORT_INDEX", ENSURE_SORT_INDEX),
     ("COUNT_RETAINED", COUNT_RETAINED),
     ("RETAINED_BYTES", RETAINED_BYTES),
     ("RETAINED_ITEM_BY_SEQ", RETAINED_ITEM_BY_SEQ),

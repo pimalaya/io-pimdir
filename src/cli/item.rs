@@ -224,7 +224,7 @@ impl ItemExportCommand {
             );
         };
 
-        let blobs = store.blobs();
+        let blobs = store.blobs()?;
         let Some(mut reader) = blobs.reader(&ReplicaHash(hash.clone()))? else {
             bail!(
                 "the body of seq {} is missing from the blob store (hash {hash}); run `pimdir check`",
@@ -560,9 +560,10 @@ fn level_name(level: ReplicaLevel) -> &'static str {
     }
 }
 
-/// The flag set as a sorted list of raw strings, never interpreted.
-fn flag_list(flags: &ReplicaFlags) -> Vec<String> {
-    flags.0.iter().cloned().collect()
+/// The flag set as a sorted list of raw strings, never interpreted, or
+/// `None` while nothing has read them (spec §13, a `NULL` flags column).
+fn flag_list(flags: &ReplicaFlags) -> Option<Vec<String>> {
+    Some(flags.known()?.iter().cloned().collect())
 }
 
 /// One item as every listing prints it.
@@ -574,8 +575,8 @@ pub struct ItemRow {
     pub seq: i64,
     /// The cross-source link id.
     pub link_id: String,
-    /// The raw flag strings.
-    pub flags: Vec<String>,
+    /// The raw flag strings, `null` while nothing has read them.
+    pub flags: Option<Vec<String>>,
     /// The detail level (`probed`, `meta`, `full`).
     pub level: &'static str,
     /// The body's content hash, when hydrated.
@@ -676,7 +677,9 @@ impl fmt::Display for ItemsOutput {
                 Cell::new(item.seq),
                 Cell::new(&item.link_id),
                 Cell::new(or_dash(
-                    Some(item.flags.join(" "))
+                    item.flags
+                        .as_ref()
+                        .map(|flags| flags.join(" "))
                         .filter(|f| !f.is_empty())
                         .as_deref(),
                 )),
@@ -723,7 +726,9 @@ impl fmt::Display for ItemShowOutput {
                 f,
                 " - flags: {}",
                 or_dash(
-                    Some(item.flags.join(" "))
+                    item.flags
+                        .as_ref()
+                        .map(|flags| flags.join(" "))
                         .filter(|flags| !flags.is_empty())
                         .as_deref()
                 )

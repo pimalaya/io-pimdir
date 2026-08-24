@@ -45,6 +45,7 @@ use rusqlite::{
 
 use crate::{
     codec::{self, PimdirAction, PimdirActionError},
+    hash::{PimdirHashAlgo, PimdirHasher},
     sql,
 };
 
@@ -55,6 +56,10 @@ pub struct PimdirStore {
     conn: Connection,
     blobs: PathBuf,
     source: ReplicaSourceId,
+    /// The hash this store names its objects by (spec §5), read back from
+    /// `store_meta.hash_algo` so every body a consumer hashes lands under the
+    /// name the store already uses.
+    hash: PimdirHashAlgo,
     /// The account every collection this handle creates belongs to (spec §9.2);
     /// `None` in a single-account store. Set with
     /// [`for_account`](PimdirStore::for_account).
@@ -88,7 +93,7 @@ pub struct PimdirCollection {
     pub description: Option<String>,
     /// An explicit sort key; `None` sorts after the ordered ones.
     pub sort_order: Option<i64>,
-    /// The handle-space epoch (spec §15): starts at 1, bumped by the owner only
+    /// The handle-space epoch (spec §12): starts at 1, bumped by the owner only
     /// on a handle-space rebuild (rekey), so a frontend derives epoch-dependent
     /// protocol values (an IMAP UIDVALIDITY) from the store alone.
     pub generation: i64,
@@ -207,7 +212,7 @@ pub struct PimdirPurgeReport {
     pub bytes: u64,
 }
 
-/// One pending (non-parked) queue row, in append order (spec §14.4): what a
+/// One pending (non-parked) queue row, in append order (spec §15.4): what a
 /// frontend overlays on its item projection for read-your-writes, and what the
 /// owner's drain applies.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,7 +231,7 @@ pub struct PimdirPendingAction {
 
 /// One parked queue row: an action the owner judged permanently unappliable,
 /// recorded and skipped instead of blocking its collection's queue. Left for
-/// operators and status surfaces, never silently deleted (spec §14.2). The
+/// operators and status surfaces, never silently deleted (spec §15.2). The
 /// payload stays raw, since being undecodable may be why the row parked.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirParkedAction {
@@ -263,7 +268,7 @@ pub struct PimdirDrainReport {
     /// Actions parked with an error, left queryable.
     pub parked: usize,
     /// Actions this owner could not perform, left **pending** for one that can
-    /// (spec §14.2). Not a failure: parking would claim the action is
+    /// (spec §15.2). Not a failure: parking would claim the action is
     /// permanently unappliable, which is a different and wrong statement.
     pub skipped: usize,
 }
@@ -276,6 +281,29 @@ impl PimdirStore {
     /// refused with [`PimdirError::Version`] rather than half-read; the spec
     /// is a draft, so such a store is recreated, never migrated.
     pub fn open(dir: impl AsRef<Path>, source: impl Into<String>) -> Result<Self, PimdirError> {
+        Self::open_with_hash(dir, source, None)
+    }
+
+    /// Opens (creating if absent) the store rooted at `dir` as source `source`,
+    /// declaring the hash its objects are named by (spec §5).
+    ///
+    /// A store records its algorithm once, at creation, in
+    /// `store_meta.hash_algo`: every blob is a file named by it, so it cannot
+    /// change afterwards. `hash` therefore applies to a store this call
+    /// creates, and an existing store whose algorithm differs is refused with
+    /// [`PimdirError::HashAlgo`] rather than opened into a handle that would
+    /// hash bodies to names it does not use. Passing `None` adopts whatever the
+    /// store records, and creates with [`PimdirHashAlgo::default`].
+    ///
+    /// A consumer hashes through [`hash`](Self::hash) or
+    /// [`hasher`](Self::hasher) rather than choosing an algorithm of its own,
+    /// which is what keeps two implementations of one store (this crate and the
+    /// Android app's SQLite driver) naming the same body the same way.
+    pub fn open_with_hash(
+        dir: impl AsRef<Path>,
+        source: impl Into<String>,
+        hash: Option<PimdirHashAlgo>,
+    ) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         let blobs = dir.join("objects");
@@ -283,7 +311,7 @@ impl PimdirStore {
 
         let mut conn = Connection::open(dir.join("pimdir.db"))?;
         // NOTE: `busy_timeout` lets several handles of one store wait out each
-        // other's write transaction instead of failing with `SQLITE_BUSY` — §7's
+        // other's write transaction instead of failing with `SQLITE_BUSY` — §8's
         // single-owner process opening `"left"` and `"right"`, and a sync that
         // fans work across several same-source handles (one per worker) to overlap
         // network while the writes serialise. 30s absorbs a burst of large writes
@@ -291,12 +319,14 @@ impl PimdirStore {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
         )?;
-        init_schema(&mut conn)?;
+        init_schema(&mut conn, hash.unwrap_or_default())?;
+        let hash = read_hash_algo(&conn, hash)?;
 
         Ok(Self {
             conn,
             blobs,
             source: ReplicaSourceId(source.into()),
+            hash,
             account: None,
             residual: Vec::new(),
         })
@@ -327,14 +357,46 @@ impl PimdirStore {
         if version != sql::VERSION {
             return Err(PimdirError::Version { found: version });
         }
+        check_version_agreement(&conn, version)?;
+        check_rename_cascades(&conn)?;
+        let hash = read_hash_algo(&conn, None)?;
 
         Ok(Self {
             conn,
             blobs: dir.join("objects"),
             source: ReplicaSourceId(source.into()),
+            hash,
             account: None,
             residual: Vec::new(),
         })
+    }
+
+    /// The hash this store names its objects by (spec §5).
+    pub fn hash_algo(&self) -> PimdirHashAlgo {
+        self.hash
+    }
+
+    /// A blob handle over this store's object directory, bound to the hash the
+    /// store names its bodies by.
+    ///
+    /// Independent of the SQLite connection, so a body can be read while the
+    /// store is mutably borrowed servicing a sync.
+    pub fn blobs(&self) -> PimdirBlobs {
+        PimdirBlobs {
+            root: self.blobs.clone(),
+            hash: self.hash,
+        }
+    }
+
+    /// The content hash of a whole body, under this store's algorithm.
+    pub fn hash(&self, bytes: &[u8]) -> ReplicaHash {
+        self.hash.hash(bytes)
+    }
+
+    /// An incremental hasher for a body streamed into the blob store rather
+    /// than held whole in memory, paired with [`PimdirBlobs::writer`].
+    pub fn hasher(&self) -> PimdirHasher {
+        self.hash.hasher()
     }
 
     /// Binds this handle to an account, so every collection it creates is
@@ -344,7 +406,7 @@ impl PimdirStore {
     /// `NULL` account, which is what every by-account read matches when given
     /// `None`. A multi-account owner opens one handle per account, the same way
     /// it already opens one per source; handles are a SQLite connection each,
-    /// and §7's single-owner rule is unchanged by how many a process holds.
+    /// and §8's single-owner rule is unchanged by how many a process holds.
     ///
     /// The account groups and nothing more: it partitions no identifier, so two
     /// accounts holding one link id still share a `seq`, and one body reaching
@@ -668,7 +730,7 @@ impl PimdirStore {
     ///
     /// Every foreign key onto `collections(id)` is `ON UPDATE CASCADE`, so the
     /// items, bindings, sources, queue rows and child collections follow in the
-    /// same statement (spec §12). This is the **only** safe way to change an id:
+    /// same statement (spec §14). This is the **only** safe way to change an id:
     /// deleting the collection and recreating it under the new one destroys the
     /// cache, because `ON DELETE CASCADE` takes every item and binding with it,
     /// turning a rename into a full re-download and discarding any staged local
@@ -744,7 +806,7 @@ impl PimdirStore {
     }
 }
 
-/// The retention surface (spec §16): the trash a store keeps instead of losing
+/// The retention surface (spec §11): the trash a store keeps instead of losing
 /// items, and the only operations that truly destroy one.
 ///
 /// An item whose last source binding vanished is retained, not deleted: hidden
@@ -932,11 +994,11 @@ fn release_pins(
     Ok(())
 }
 
-/// The action-queue owner surface (spec §14) and collection generations (spec
-/// §15): the single owning process drains producer-requested mutations into the
+/// The action-queue owner surface (spec §15) and collection generations (spec
+/// §12): the single owning process drains producer-requested mutations into the
 /// store, and marks a handle-space rebuild for readers.
 impl PimdirStore {
-    /// A collection's handle-space epoch (spec §15), or `None` when the store
+    /// A collection's handle-space epoch (spec §12), or `None` when the store
     /// has never seen the collection. Starts at 1; bumped only by
     /// [`write_rekeyed`](Self::write_rekeyed), so a frontend derives
     /// epoch-dependent protocol values (an IMAP UIDVALIDITY) from it alone.
@@ -1007,7 +1069,7 @@ impl PimdirStore {
     }
 
     /// A collection's pending (non-parked) actions in append order, decoded
-    /// (read surface, spec §14.4): a frontend overlays them on its item
+    /// (read surface, spec §15.4): a frontend overlays them on its item
     /// projection for read-your-writes. An undecodable payload errors; the
     /// owner's next drain parks such a row.
     pub fn pending_actions(
@@ -1041,7 +1103,7 @@ impl PimdirStore {
         Ok(actions)
     }
 
-    /// Drains a collection's pending actions in append order (spec §14.2).
+    /// Drains a collection's pending actions in append order (spec §15.2).
     ///
     /// Each action is applied as the store mutation it names — resolving its
     /// public `seq` to the internal link id, staging the corresponding
@@ -1158,7 +1220,7 @@ impl PimdirStore {
     }
 
     /// Removes one queue row by request rather than by application, pending or
-    /// parked, returning whether there was a row to remove (spec §14.5).
+    /// parked, returning whether there was a row to remove (spec §15.5).
     ///
     /// One verb for the two ways a row leaves the queue unapplied: a producer
     /// (or an operator) **cancelling** a queued action, and an owner
@@ -1191,7 +1253,7 @@ impl PimdirStore {
         Ok(true)
     }
 
-    /// Records a failed apply an owner performed itself (spec §14.2).
+    /// Records a failed apply an owner performed itself (spec §15.2).
     ///
     /// `None` is the transient case: the attempt counter advances and the row
     /// stays pending, so the next drain picks it up again. `Some(error)` is the
@@ -1275,7 +1337,7 @@ fn load_pending_actions(
 }
 
 /// Stages the io-replica write ops one queued action folds into the store
-/// (spec §14.3), inside the drain transaction. The inner `Err` is a park
+/// (spec §15.3), inside the drain transaction. The inner `Err` is a park
 /// reason (the action is permanently unappliable); an empty op list is a
 /// no-op success (a `remove` of an already-absent item).
 ///
@@ -1362,7 +1424,7 @@ fn stage_action(
         .optional()?;
     let Some(item) = item else {
         // NOTE: a remove of an already-absent item is success, not an error
-        // (spec §14.3); anything else addressing a gone item parks.
+        // (spec §15.3); anything else addressing a gone item parks.
         return if removes {
             Ok(Ok(Vec::new()))
         } else {
@@ -1435,10 +1497,10 @@ fn stage_action(
     }
 }
 
-/// A pimdir store opened as a **producer** (spec §7): a process that is not
+/// A pimdir store opened as a **producer** (spec §8): a process that is not
 /// the owner but legitimately originates mutations (a submission daemon, a
 /// server frontend). Its only write is the single enqueue transaction of spec
-/// §14.1 — `ensure_collection`, at most one object upsert pinning a body it
+/// §15.1 — `ensure_collection`, at most one object upsert pinning a body it
 /// already wrote durably to the blob directory ([`PimdirBlobs::writer`]), and
 /// one queue insert. It never touches items, bindings, sources or the other
 /// collections columns, and never creates the schema: it requires a store the
@@ -1451,6 +1513,9 @@ fn stage_action(
 pub struct PimdirProducer {
     conn: Connection,
     producer: String,
+    /// The hash the store names its objects by (spec §5), so a producer
+    /// staging a body names it the way the owner will look it up.
+    hash: PimdirHashAlgo,
     /// The account collections this producer creates are grouped under
     /// (spec §9.2); `None` in a single-account store.
     account: Option<String>,
@@ -1476,12 +1541,33 @@ impl PimdirProducer {
         if version != sql::VERSION {
             return Err(PimdirError::Version { found: version });
         }
+        check_version_agreement(&conn, version)?;
+        check_rename_cascades(&conn)?;
+        let hash = read_hash_algo(&conn, None)?;
 
         Ok(Self {
             conn,
             producer: producer.into(),
+            hash,
             account: None,
         })
+    }
+
+    /// The hash this store names its objects by (spec §5).
+    pub fn hash_algo(&self) -> PimdirHashAlgo {
+        self.hash
+    }
+
+    /// The content hash of a whole body, under this store's algorithm: what a
+    /// producer names the blob it writes before enqueueing the action that
+    /// references it (spec §15.1).
+    pub fn hash(&self, bytes: &[u8]) -> ReplicaHash {
+        self.hash.hash(bytes)
+    }
+
+    /// An incremental hasher for a body streamed into the blob store.
+    pub fn hasher(&self) -> PimdirHasher {
+        self.hash.hasher()
     }
 
     /// Binds this producer to an account, so a collection its enqueue creates
@@ -1492,7 +1578,7 @@ impl PimdirProducer {
         self
     }
 
-    /// Appends one action to a collection's queue (spec §14.1), returning the
+    /// Appends one action to a collection's queue (spec §15.1), returning the
     /// row's append id.
     ///
     /// Runs exactly the producer transaction, `BEGIN IMMEDIATE` and short:
@@ -1554,7 +1640,7 @@ impl PimdirProducer {
     }
 
     /// The collection's pending (non-parked) actions in append order — the
-    /// producer's read-your-writes overlay (spec §14.4): a just-enqueued
+    /// producer's read-your-writes overlay (spec §15.4): a just-enqueued
     /// action shows here before the owner has applied it.
     pub fn pending_actions(
         &self,
@@ -1573,14 +1659,37 @@ impl PimdirProducer {
 #[derive(Clone, Debug)]
 pub struct PimdirBlobs {
     root: PathBuf,
+    hash: PimdirHashAlgo,
 }
 
 impl PimdirBlobs {
-    /// Opens the blob reader for the store rooted at `dir`.
-    pub fn open(dir: impl AsRef<Path>) -> Self {
+    /// Opens the blob handle for the store rooted at `dir`, naming bodies with
+    /// `hash`.
+    ///
+    /// The algorithm is the store's, not a choice made here: it is what the
+    /// files are named by. [`PimdirStore::blobs`] hands one out already bound to
+    /// the store it came from, which is how a consumer avoids picking one.
+    pub fn open(dir: impl AsRef<Path>, hash: PimdirHashAlgo) -> Self {
         Self {
             root: dir.as_ref().join("objects"),
+            hash,
         }
+    }
+
+    /// The hash bodies here are named by.
+    pub fn hash_algo(&self) -> PimdirHashAlgo {
+        self.hash
+    }
+
+    /// The content hash of a whole body, under this store's algorithm.
+    pub fn hash(&self, bytes: &[u8]) -> ReplicaHash {
+        self.hash.hash(bytes)
+    }
+
+    /// An incremental hasher, for a body streamed through
+    /// [`writer`](Self::writer) rather than held whole in memory.
+    pub fn hasher(&self) -> PimdirHasher {
+        self.hash.hasher()
     }
 
     /// Reads the body stored under `hash` from the sharded layout, or `None`
@@ -1747,7 +1856,7 @@ impl ReplicaStorage for PimdirStore {
     }
 
     fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Self::Error> {
-        // BEGIN IMMEDIATE takes the single writer lock up front (§7): under WAL
+        // BEGIN IMMEDIATE takes the single writer lock up front (§8): under WAL
         // reads never block, but two writers serialise here, and a writer that
         // cannot get the lock within `busy_timeout` fails fast and loud (`Busy`)
         // rather than deep inside the batch on a deferred lock upgrade.
@@ -1890,12 +1999,14 @@ fn collect_garbage(tx: &Connection) -> Result<Vec<(String, u64)>, rusqlite::Erro
 /// transaction. A store stamped with a `user_version` higher than
 /// [`sql::VERSION`] is refused: the spec is a draft with a single schema
 /// version, so such a store is recreated, never migrated.
-fn init_schema(conn: &mut Connection) -> Result<(), PimdirError> {
+fn init_schema(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), PimdirError> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version > sql::VERSION {
         return Err(PimdirError::Version { found: version });
     }
     if version == sql::VERSION {
+        check_version_agreement(conn, version)?;
+        check_rename_cascades(conn)?;
         return reconcile_draft_shape(conn);
     }
 
@@ -1912,10 +2023,51 @@ fn init_schema(conn: &mut Connection) -> Result<(), PimdirError> {
     tx.execute(
         "INSERT OR IGNORE INTO store_meta(id, version, hash_algo, created_at) \
          VALUES(1, ?1, ?2, ?3)",
-        params![sql::VERSION, "blake3", now],
+        params![sql::VERSION, hash.as_str(), now],
     )?;
     tx.pragma_update(None, "user_version", sql::VERSION)?;
     tx.commit().map_err(busy_or_sql)?;
+
+    Ok(())
+}
+
+/// Refuses a store whose foreign keys predate the `ON UPDATE CASCADE` every
+/// key onto a renamed row now carries (spec §14).
+///
+/// This is the half of the draft allowance (spec §6) that reconciliation
+/// cannot reach: a column can be added in place, a foreign-key action cannot,
+/// short of rebuilding every table that carries one. §6's other branch is to
+/// refuse the store and tell the operator to recreate it, which costs a resync
+/// of what is by design a derived cache (spec §1) and is what this does.
+///
+/// Without the cascade a rename is refused by SQLite one dependent row down,
+/// so such a store can never follow a server-side collection rename or an
+/// account rename; catching it on open says so once, rather than at the moment
+/// a rename fails.
+fn check_rename_cascades(conn: &Connection) -> Result<(), PimdirError> {
+    /// The tables whose foreign key onto a renamable parent must cascade, with
+    /// that parent. `bindings` is the second one the rename needs: it hangs off
+    /// `items(collection, link_id)`, which the first cascade updates.
+    const CASCADING: [(&str, &str); 5] = [
+        ("collections", "collections"),
+        ("sources", "collections"),
+        ("items", "collections"),
+        ("bindings", "items"),
+        ("queue", "collections"),
+    ];
+
+    for (table, parent) in CASCADING {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT on_update FROM pragma_foreign_key_list('{table}') WHERE \"table\" = '{parent}'"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let on_update: String = row.get(0)?;
+            if on_update != "CASCADE" {
+                return Err(PimdirError::Unreconcilable { table });
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1942,12 +2094,13 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     /// Columns folded into version 1 after it was first published, as
     /// `(table, column, declaration)`. Each must be nullable or carry a
     /// constant default, or it could not be added to a populated table.
-    const FOLDED_IN: [(&str, &str, &str); 5] = [
+    const FOLDED_IN: [(&str, &str, &str); 6] = [
         ("bindings", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
         ("bindings", "conflict_revision", "TEXT"),
         ("items", "retained_at", "TEXT"),
         ("items", "retained_by", "TEXT"),
         ("collections", "account", "TEXT"),
+        ("items", "sort_key", "TEXT NOT NULL DEFAULT ''"),
     ];
 
     let mut missing = Vec::new();
@@ -1970,8 +2123,66 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     // schema script builds it on a fresh database, where nothing is missing.
     tx.execute_batch(sql::ENSURE_RETAINED_INDEX)?;
     tx.execute_batch(sql::ENSURE_ACCOUNT_INDEX)?;
+    tx.execute_batch(sql::ENSURE_SORT_INDEX)?;
     tx.commit().map_err(busy_or_sql)?;
     Ok(())
+}
+
+/// The algorithm the store records, checked against the one the caller declared.
+///
+/// A store names every blob by its hash, so a handle computing a different one
+/// writes bodies no reader of that store finds and dedups against nothing. The
+/// failure is silent by nature, which is why it is caught on open rather than
+/// left to surface as a cache that never hits.
+fn read_hash_algo(
+    conn: &Connection,
+    declared: Option<PimdirHashAlgo>,
+) -> Result<PimdirHashAlgo, PimdirError> {
+    let stored: Option<String> = conn
+        .query_row("SELECT hash_algo FROM store_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+
+    let Some(stored) = stored else {
+        return Ok(declared.unwrap_or_default());
+    };
+    let Some(algo) = PimdirHashAlgo::parse(&stored) else {
+        return Err(PimdirError::HashAlgo {
+            found: stored,
+            declared: declared.map(|a| a.as_str()),
+        });
+    };
+    match declared {
+        Some(declared) if declared != algo => Err(PimdirError::HashAlgo {
+            found: stored,
+            declared: Some(declared.as_str()),
+        }),
+        _ => Ok(algo),
+    }
+}
+
+/// The two schema stamps a store carries, which spec §4.2 requires to agree:
+/// `PRAGMA user_version` and `store_meta.version`. A store where they differ is
+/// corrupt, so it is refused rather than read at the version one of them names.
+///
+/// A store whose `store_meta` row is absent is left alone: the row is seeded by
+/// whoever created the schema, and refusing here would turn a missing stamp
+/// into an unopenable store the crate could otherwise repair.
+fn check_version_agreement(conn: &Connection, user_version: i64) -> Result<(), PimdirError> {
+    let stamped: Option<i64> = conn
+        .query_row("SELECT version FROM store_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+
+    match stamped {
+        Some(store_meta) if store_meta != user_version => Err(PimdirError::VersionMismatch {
+            user_version,
+            store_meta,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Whether `table` already has `column`, via `PRAGMA table_info`.
@@ -2169,7 +2380,7 @@ fn insert_item(
 }
 
 /// Revives the retained row holding `(collection, link)`, if there is one: it
-/// stops being retained (spec §16), adopts the incoming content through the
+/// stops being retained (spec §11), adopts the incoming content through the
 /// ordinary item update and binds the sources. Returns whether a row was
 /// revived.
 ///
@@ -2443,7 +2654,7 @@ fn binding_from_row(
             handle: ReplicaHandle(handle),
             base,
             conflicted,
-            // Spec §11: the revision is meaningful only while conflicted, so a
+            // Spec §13: the revision is meaningful only while conflicted, so a
             // resolved binding cannot hand a stale one to the next sync even if
             // the column somehow still holds one.
             conflict_revision: conflicted.then_some(conflict_revision).flatten(),
@@ -2514,7 +2725,7 @@ pub enum PimdirError {
     /// JSON encoding failed at the storage seam (the link id array a lookup
     /// hands to SQLite); a malformed queue payload reports as `Action`.
     Json(serde_json::Error),
-    /// A queue action payload is malformed or unsupported (spec §14.3).
+    /// A queue action payload is malformed or unsupported (spec §15.3).
     Action(PimdirActionError),
     /// The store's schema version is not one this opener can service: newer
     /// than the crate for an owner, or not yet created for a producer (which
@@ -2523,7 +2734,34 @@ pub enum PimdirError {
         /// The store's `user_version`.
         found: i64,
     },
-    /// Another writer holds the store's single write lock (§7); the caller
+    /// The store's two schema stamps disagree, which spec §4.2 defines as
+    /// corruption: `PRAGMA user_version` and `store_meta.version` mirror one
+    /// another, so a store where they differ was half-written by something and
+    /// is refused rather than read.
+    VersionMismatch {
+        /// The store's `PRAGMA user_version`.
+        user_version: i64,
+        /// The version its `store_meta` row records.
+        store_meta: i64,
+    },
+    /// The store was created by a draft whose foreign keys lack the
+    /// `ON UPDATE CASCADE` a rename depends on (spec §14), which no
+    /// `ALTER TABLE` can add. Spec §6's other branch applies: the operator
+    /// recreates the store, which is a resync of a derived cache.
+    Unreconcilable {
+        /// The first table found without the cascade.
+        table: &'static str,
+    },
+    /// The store's `store_meta.hash_algo` is not one this crate computes, or
+    /// not the one the caller declared. Either way the handle would name bodies
+    /// the store does not use, so it is refused instead (spec §5).
+    HashAlgo {
+        /// The algorithm the store records.
+        found: String,
+        /// The algorithm the caller declared, when it declared one.
+        declared: Option<&'static str>,
+    },
+    /// Another writer holds the store's single write lock (§8); the caller
     /// should retry once the other writer (a sync, another client) is done.
     Busy,
 }
@@ -2539,6 +2777,31 @@ impl fmt::Display for PimdirError {
                 f,
                 "pimdir store schema version {found} is unsupported (this crate services version {})",
                 sql::VERSION
+            ),
+            PimdirError::VersionMismatch {
+                user_version,
+                store_meta,
+            } => write!(
+                f,
+                "pimdir store is corrupt: PRAGMA user_version is {user_version} but store_meta records {store_meta}"
+            ),
+            PimdirError::Unreconcilable { table } => write!(
+                f,
+                "pimdir store predates the ON UPDATE CASCADE on `{table}`, which cannot be added in place: delete the store and let it resync"
+            ),
+            PimdirError::HashAlgo {
+                found,
+                declared: Some(declared),
+            } => write!(
+                f,
+                "pimdir store names its objects with `{found}`, not the `{declared}` this handle declared"
+            ),
+            PimdirError::HashAlgo {
+                found,
+                declared: None,
+            } => write!(
+                f,
+                "pimdir store names its objects with `{found}`, which this crate does not compute"
             ),
             PimdirError::Busy => write!(
                 f,

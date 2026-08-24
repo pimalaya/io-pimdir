@@ -144,9 +144,11 @@ impl StoreFlags {
         PimdirProducer::open(&self.store, PRODUCER).map_err(report)
     }
 
-    /// The blob directory handle, for reading a body back.
-    pub fn blobs(&self) -> PimdirBlobs {
-        PimdirBlobs::open(&self.store)
+    /// The blob directory handle, for reading a body back, bound to the hash
+    /// the store names its bodies by.
+    pub fn blobs(&self) -> Result<PimdirBlobs> {
+        let store = PimdirStore::open_read_only(&self.store, PRODUCER).map_err(report)?;
+        Ok(store.blobs())
     }
 
     /// The read-only diagnostic connection (see [`db`]).

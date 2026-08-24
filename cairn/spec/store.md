@@ -29,7 +29,7 @@ The write SHALL be O(changed rows), not O(collection size), so an incremental
 sync that changed a handful of items does not rewrite the whole mailbox.
 A crash SHALL leave at worst an orphan blob, never a row without its body.
 The transaction SHALL begin with `BEGIN IMMEDIATE`, taking the store's single
-writer lock (SPEC §7) up front: under WAL readers never block, concurrent writers
+writer lock (SPEC §8) up front: under WAL readers never block, concurrent writers
 serialise on the busy timeout, and a writer that cannot acquire the lock within it
 SHALL fail with a clear `PimdirError::Busy` rather than a raw SQL error or a
 failure deep inside the batch. The busy timeout SHALL be generous enough (30s) to
@@ -236,6 +236,39 @@ and no upgrade path. An owner open creates the schema in a fresh database and
 refuses a store stamped with a higher `user_version` with `PimdirError::Version`;
 a draft store stamped otherwise is recreated, never migrated.
 
+### Requirement: The two schema stamps must agree
+`PRAGMA user_version` and `store_meta.version` mirror one another (spec §4.2),
+so a store where they differ is corrupt rather than a store at either version.
+Both the owner open and the read-only open SHALL compare them and refuse a
+disagreement with `PimdirError::VersionMismatch`.
+
+A store carrying no `store_meta` row SHALL be left alone: the row is seeded by
+whoever created the schema, and refusing there would make a missing stamp
+unrepairable.
+
+### Requirement: A store predating the rename cascades is refused
+Every foreign key onto a renamable parent carries `ON UPDATE CASCADE` (spec
+§14), which no `ALTER TABLE` can add to a store that lacks it. Reconciliation
+therefore cannot reach it, and spec §6's other branch applies: both opens SHALL
+check the cascade on every such key and refuse a store without it with
+`PimdirError::Unreconcilable`, naming the table.
+
+Refusing is what makes the limitation legible. Opened anyway, such a store works
+until something renames a collection, and then SQLite refuses the rename one
+dependent row down, so a server-side rename or an account rename can never be
+applied. Recreating the store costs a resync of what the format calls a derived
+cache.
+
+### Requirement: An unknown flag set is stored as NULL
+The `flags` column keeps two absences apart (spec §13): `NULL` means nothing has
+read the item's markers, `'[]'` means it is known to carry none. The store SHALL
+write `NULL` for an unknown set and decode `NULL` back to one, so a probed
+placement never claims to carry no markers.
+
+In a queue payload an unknown set SHALL encode as `null` rather than `[]`, since
+an action states an intent: every payload the format defines carries a known
+set, and an unknown one must not read as a deliberate clearing of every flag.
+
 ### Requirement: Producers append, only the owner pops
 The store SHALL support the pimdir action queue: any process may act as a
 producer whose sole write is the single enqueue transaction (ensure_collection,
@@ -293,9 +326,11 @@ columns, so the version check alone cannot detect it.
 On open, the store SHALL reconcile its shape: every folded-in column found
 missing SHALL be added (`ALTER TABLE … ADD COLUMN`, which requires the column to
 be nullable or carry a constant default), guarded so the check is a no-op for an
-up-to-date store, together with any index over a folded-in column. Failing a
-later query on a missing column is not acceptable. This requirement lapses when
-the spec leaves `draft` and versions are frozen.
+up-to-date store, together with any index over a folded-in column. The set of
+folded-in columns SHALL be kept complete as further columns are folded in;
+`items.sort_key` and its `items_by_sort` index are part of it. Failing a later
+query on a missing column is not acceptable. This requirement lapses when the
+spec leaves `draft` and versions are frozen.
 
 ### Requirement: An item is retained, never deleted, when its last binding goes
 `items` SHALL carry `retained_at` (TEXT, RFC 3339, nullable) and `retained_by`
@@ -400,3 +435,24 @@ derived.
 This supersedes the earlier arrangement, where the key was preserved by the
 update never naming it: that held only while nothing upstream carried a key, and
 stopped holding the moment io-replica put one on the placement.
+
+### Requirement: The store owns the content hash
+The crate SHALL implement the hashes the format admits (spec §4.3: `blake3`,
+recommended, and `sha256-128`) and encode them as spec §5 requires, in lowercase
+base32 (RFC 4648, no padding), since the hash is also a path component and a
+single-case, filesystem-safe alphabet is what keeps the blob path valid
+everywhere.
+
+A store, a producer and the algorithm itself SHALL expose the digest, whole and
+incremental, so a consumer hashes through the store it writes to instead of
+choosing an algorithm of its own. An object's name is its hash: two processes
+disagreeing about it write bodies neither finds and dedup against nothing, and
+nothing errors while they do it.
+
+### Requirement: A store declares its algorithm once and is refused on a mismatch
+The algorithm SHALL be recorded in `store_meta.hash_algo` when the store is
+created, and every blob being a file named by it, it cannot change afterwards.
+An open SHALL adopt what an existing store records; an open declaring a
+different algorithm, or meeting one this crate does not compute, SHALL be
+refused with `PimdirError::HashAlgo` rather than return a handle that names
+bodies the store does not use.

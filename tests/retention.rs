@@ -1,4 +1,4 @@
-//! Retention (spec §16): an item whose last source binding vanishes is
+//! Retention (spec §11): an item whose last source binding vanishes is
 //! retained, not deleted, and only a purge takes it away.
 //!
 //! The load-hiding half is what makes it safe rather than a resurrection loop,
