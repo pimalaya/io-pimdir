@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-24
+
 ### Added
 
 - **The store owns the content hash its objects are named by.** `PimdirHashAlgo` implements both algorithms the format admits (`blake3`, recommended, and `sha256-128`) with the encoding spec §5 fixes, lowercase base32 (RFC 4648, no padding), and a store, a producer and the algorithm itself hand it out whole (`hash`) or incremental (`hasher`, for a body streamed into the blob store).
@@ -32,6 +34,12 @@ All notable changes to this project are documented in this file. The format is b
 
   `set_sort_key` restates one item's key, for a store written before its kind had a convention or a consumer whose sync engine does not carry the key inline yet. An ordinary write never resets a key it does not carry.
 
+- **A collection can declare which account it belongs to.** `collections` gained a nullable `account` column and the partial `collections_by_account` index (spec §9.2), a handle speaks for one account (`PimdirStore::open(dir, source).for_account("work")`, and the same builder on `PimdirProducer`), and `list_accounts`, `list_collections_by_account`, `collection_account` and `set_collection_account` read and restate it. Without the column, a merged view, whose defining operation is "everything except this account", had to reverse-engineer the owner's naming convention with a `LIKE 'work/%'` over collection ids. Folded into version 1, since the format is still a draft, and reconciled on open, so an earlier-draft store heals rather than failing on a missing column.
+
+  **The account partitions nothing, which is the substance of the change.** Link ids, object hashes and `seq`s keep their store-wide meaning, so two accounts holding one `Message-ID` share a `seq` and one body reaching both is one object refcounted twice: scoping identity per account would compile a mail-shaped policy into a kind-agnostic store, and would leave one link id carrying two short forms. What reports the multiplicity instead is `link_placements` on the identity axis and `object_placements` on the dedup axis, each returning every live placement (`PimdirPlacement`) with the collection and account it sits in, and resolving nothing: a mail view lists them, because two receipts of a newsletter have two read states, while a contact view may offer to merge them.
+
+  There is no `accounts` table: the store records which account a collection belongs to and nothing else, so credentials, endpoints and display names stay with whatever configures the owner. `list_accounts` is therefore what the collections say rather than a configured roster, and an account with no collection yet does not appear in it.
+
 - **`rename_collection`**, which gives a collection a new id and carries its items, bindings, sources, queue rows and child collections with it. Every foreign key onto `collections(id)` is now `ON UPDATE CASCADE`, as is `bindings(collection, link_id)`, which is a parent one level down and refuses the cascade without it.
 
   This is the only safe way to change an id, and it matters because the obvious alternative is destructive: deleting a collection and recreating it under a new id cascades every item and binding away, turning a rename into a full re-download and discarding staged local changes. A server renaming a folder and an owner renaming an account both land here.
@@ -53,8 +61,6 @@ All notable changes to this project are documented in this file. The format is b
 - **`PimdirItem` and `PimdirRetainedItem` gained a `sort_key` field.** Breaking for anyone constructing them.
 
 - **The sort key io-replica now carries on a placement is bound on write.** `load` returns it, insert and update write it. This reverses the arrangement above, where the key was preserved by the update never naming it: that held only while nothing upstream carried a key, and a `load` that drops it now hands every save an unknown key, which the update would write back, blanking on every sync what the previous one derived. Both halves have to carry the key or neither can.
-
-  io-replica is a path dependency until the field is released.
 
 ## [0.2.0] - 2026-08-07
 
@@ -114,6 +120,7 @@ All notable changes to this project are documented in this file. The format is b
 - Collection generations (spec §15): the handle-space epoch on PimdirCollection and generation(), bumped atomically with a rebuild batch by write_rekeyed().
 - Read-only store open (open_read_only): opens an existing store with SQLITE_OPEN_READ_ONLY, never creates anything, refuses any other schema version, and exposes the full read surface for frontend processes that must be unable to write.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.2.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.3.0..HEAD
+[0.3.0]: https://github.com/pimalaya/io-pimdir/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-pimdir/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-pimdir/compare/root..v0.1.0
