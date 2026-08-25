@@ -18,7 +18,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["client"]
-client = ["dep:rusqlite"]
+client = ["dep:fs4", "dep:rusqlite"]
 cli = ["client", "dep:anyhow", "dep:clap", "dep:humantime", "dep:log", "dep:serde", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
 
 [profile.release]
@@ -36,6 +36,7 @@ required-features = ["cli"]
 pimalaya-cli = { version = "0.2", default-features = false, features = ["build"], optional = true }
 
 [dev-dependencies]
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 tempfile = { version = "3", default-features = false }
 
@@ -43,6 +44,7 @@ tempfile = { version = "3", default-features = false }
 anyhow = { version = "1", default-features = false, features = ["std"], optional = true }
 blake3 = { version = "1", default-features = false }
 clap = { version = "4.4", features = ["derive", "wrap_help"], optional = true }
+fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 humantime = { version = "2.2", optional = true }
 # NOTE: a path dep until the release carrying `ReplicaStatus::Ambiguous` and
 # `ambiguous_handles` is published, at which point this becomes a version dep

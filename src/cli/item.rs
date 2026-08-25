@@ -293,9 +293,9 @@ impl ItemRestoreCommand {
         };
         drop(read);
 
-        // NOTE: taken before the enqueue, so an unresolvable write source fails
-        // while nothing has been appended yet.
-        let mut owner = store.owner_as_source()?;
+        // NOTE: resolved before the enqueue, so an unresolvable write source
+        // fails while nothing has been appended yet.
+        let source = store.write_source()?;
 
         let action = PimdirAction::Add {
             link_id: Some(ReplicaLinkId(item.link_id.clone())),
@@ -313,17 +313,25 @@ impl ItemRestoreCommand {
 
         // NOTE: the drain reports what it did to the whole collection's queue,
         // so the item itself is the only trustworthy proof that *this* action
-        // landed: it is live again, or it is not.
-        let status = match owner.drain_collection(&found.collection) {
-            Err(io_pimdir::PimdirError::Busy) => RestoreStatus::Queued,
-            Err(err) => return Err(report(err)),
-            Ok(_) => match owner
-                .get_item(&found.collection, self.seq)
-                .map_err(report)?
-            {
-                Some(_) => RestoreStatus::Applied,
-                None => RestoreStatus::Refused,
-            },
+        // landed: it is live again, or it is not. An owner that is running,
+        // or one that takes the store between here and there, leaves the
+        // action where it is: queued, for that owner to apply.
+        let status = match store.owner_if_free()? {
+            None => RestoreStatus::Queued,
+            Some(owner) => {
+                let mut owner = owner.for_source(source);
+                match owner.drain_collection(&found.collection) {
+                    Err(io_pimdir::PimdirError::Busy) => RestoreStatus::Queued,
+                    Err(err) => return Err(report(err)),
+                    Ok(_) => match owner
+                        .get_item(&found.collection, self.seq)
+                        .map_err(report)?
+                    {
+                        Some(_) => RestoreStatus::Applied,
+                        None => RestoreStatus::Refused,
+                    },
+                }
+            }
         };
 
         printer.out(ItemRestoreOutput {

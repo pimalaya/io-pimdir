@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **One owner, enforced (spec §8).** Every owning handle takes an exclusive advisory lock on the store directory and holds it for its lifetime; a second owner gets `PimdirError::Owned` immediately, naming the store, rather than the 30-second `busy_timeout` wait that used to end in a stall with no signal. The rule is about processes, so a two-sided sync or a multi-account owner opening several handles still holds one lock. Readers take none. Producers take a shared one, so several append at once while none of them keeps the owner out, and a body is never between the blob tree and the queue row that pins it while a collector runs. The kernel releases the lock with the process, so a crash leaves nothing to recover.
+
 - **`bindings.ambiguous_handles`**, the other handles a source holds one item's identity under. Folded into version 1 and reconciled on open, so a store written by an earlier draft gains it without a resync. `pimdir check` reports the bindings carrying any: not a defect, but the reason those items stop syncing, and an operator looking at a frozen item has no other way to see why.
 
 ### Fixed
@@ -29,6 +31,8 @@ All notable changes to this project are documented in this file. The format is b
 - **`created_at` held epoch milliseconds** where the column is declared to hold an RFC 3339 timestamp, and the empty string when the clock predated the epoch. It is written by SQLite itself now, in the form the retirement clock already uses, which also keeps the crate free of a clock.
 
 ### Changed
+
+- **`item restore` queues rather than fails when the store is owned.** It appends its action first and takes the owner role only to apply it, so a restore issued while a sync runs reports `queued` and is drained by the owner that holds the store, which is what the queue is for. Purge and `queue cancel` still need the role and still say so.
 
 - **A store handle names a source only where an operation acts as one.** `PimdirStore::open(dir)` and `open_read_only(dir)` take no source, and `for_source(source)` yields `PimdirSourceStore`, which carries the storage seam, the rekeyed write and the queue drain, and dereferences to the store for everything else. Breaking: the constructors lose a parameter. Purge, queue cancellation and every read consulted no source but had to be handed one anyway, so the CLI invented `"pimdir"` for its readers and scanned `bindings` for a name it then discarded. Both are gone, and a store an operator reads and sweeps now records no source at all.
 

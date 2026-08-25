@@ -63,12 +63,19 @@ none. A store syncing several sources SHALL NOT be guessed at, since creating an
 item for the wrong side would push it to the wrong server, and a store with no
 source at all offers no side to act as.
 
+What follows the enqueue is not a source question but an ownership one:
+`item restore` SHALL append its action first and take the owner role only to
+apply it, reporting the action as queued when another process owns the store
+rather than failing. The action is in the queue by then, and the owner holding
+the store is the one that will drain it.
+
 ### Requirement: Terminal operations take the owner role directly
 Purge, queue cancellation and orphan-blob reclamation have no action kind and
 cannot be queued: they SHALL take the owner role directly, without naming a
-source, and fail if the role is unavailable. When another writer holds the
-store's write lock, the CLI SHALL report it as a plain sentence naming the
-likely cause (a running sync) and never as a raw SQL or debug error dump.
+source, and fail if the role is unavailable. When another process owns the
+store, or another writer holds its write lock, the CLI SHALL report it as a
+plain sentence naming the likely cause (a running sync) and never as a raw SQL
+or debug error dump.
 
 ### Requirement: Destroying data is confirmed
 `item purge`, `queue cancel` and the orphan-blob sweep SHALL confirm

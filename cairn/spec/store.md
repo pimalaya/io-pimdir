@@ -35,8 +35,36 @@ SHALL fail with a clear `PimdirError::Busy` rather than a raw SQL error or a
 failure deep inside the batch. The busy timeout SHALL be generous enough (30s) to
 let a single process fan work across several same-source handles — one per worker,
 to overlap network while the writes serialise — without a burst of large writes
-tripping `Busy`. Coordinating who writes (one owning process, or a front daemon
-fronting a UI and a sync) is a platform decision, not enforced here.
+tripping `Busy`. Which process writes is not left to a convention: see the
+advisory lock below.
+
+### Requirement: One owner, enforced, and failing fast
+A store SHALL have at most one owner process at a time, and every owning handle
+SHALL take an exclusive advisory lock on the store directory (SPEC §8) for its
+lifetime. The lock lives on the open file description, so the kernel releases it
+when the process dies: a crashed owner leaves a lock file that locks nothing, and
+no stale-lock recovery is needed or offered.
+
+An owner that cannot take the lock SHALL fail immediately with
+`PimdirError::Owned`, naming the store. It SHALL NOT wait: a daemon syncing a
+large mailbox holds its transaction long enough that a bounded wait is neither a
+wait nor a failure, just a stall with no signal, and retrial policy (retry, back
+off, queue the intent, tell the user) belongs to the program on top.
+
+The rule is about processes, so several handles of one process SHALL share one
+lock: opening one handle per source, or one per account, is one owner. A
+read-only handle SHALL take no lock, and any number of readers MAY run against a
+store an owner holds.
+
+A producer is not an owner. It SHALL take a *shared* lock on the store directory
+for its handle's lifetime, so several producers run at once and none of them
+keeps the owner out. What that lock delimits is the window a collector must not
+run inside: a body is written to the blob tree before the queue row that pins it,
+and between the two it is a file nothing references.
+
+`PRAGMA busy_timeout` and `PimdirError::Busy` are unchanged by this: owners and
+producers still contend at the SQLite layer, and that contention is worth waiting
+out.
 
 ### Requirement: Blobs are content-addressed and sharded
 An object's bytes SHALL live at `objects/<hash[0:2]>/<hash[2:4]>/<hash>`,

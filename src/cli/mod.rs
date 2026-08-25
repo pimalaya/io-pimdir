@@ -27,7 +27,7 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
-use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirSourceStore, PimdirStore};
+use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirStore};
 use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
 
 use crate::cli::db::PimdirDb;
@@ -87,37 +87,46 @@ impl StoreFlags {
 
     /// Opens the store as its owner, for a verb whose effect is not tied to one
     /// source (purge, queue cancellation, orphan sweep).
+    ///
+    /// Fails when another process owns the store (spec §8): a verb that
+    /// destroys or repairs has nothing useful to do without the role.
     pub fn owner(&self) -> Result<PimdirStore> {
         self.ensure_store()?;
         PimdirStore::open(&self.store).map_err(report)
     }
 
-    /// Opens the store as its owner acting as one source, for a verb whose
-    /// effect *is* tied to a side (draining a queued mutation stages it for
-    /// that source).
+    /// The owner role when it is free, `None` when another process holds it:
+    /// what a verb that can leave its work queued reports instead of failing.
+    pub fn owner_if_free(&self) -> Result<Option<PimdirStore>> {
+        self.ensure_store()?;
+        match PimdirStore::open(&self.store) {
+            Ok(store) => Ok(Some(store)),
+            Err(PimdirError::Owned(_)) => Ok(None),
+            Err(err) => Err(report(err)),
+        }
+    }
+
+    /// The source a queued mutation is staged for: the flag when given, else
+    /// the store's own when it has exactly one.
     ///
     /// A store syncing several sources without `--source` is refused rather
     /// than guessed: creating an item for the wrong side would push it to the
     /// wrong server. A store that has synced no source at all is refused too,
     /// since there is no side to act as.
-    pub fn owner_as_source(&self) -> Result<PimdirSourceStore> {
-        let source = match &self.source {
-            Some(source) => source.clone(),
-            None => {
-                let sources = self.read()?.distinct_sources().map_err(report)?;
-                match sources.len() {
-                    1 => sources.into_iter().next().unwrap(),
-                    0 => bail!(
-                        "this store syncs no source yet: name the one to write as with --source"
-                    ),
-                    _ => bail!(
-                        "this store syncs several sources ({}): pick the one to write as with --source",
-                        sources.join(", ")
-                    ),
-                }
-            }
-        };
-        Ok(self.owner()?.for_source(source))
+    pub fn write_source(&self) -> Result<String> {
+        if let Some(source) = &self.source {
+            return Ok(source.clone());
+        }
+
+        let sources = self.read()?.distinct_sources().map_err(report)?;
+        match sources.len() {
+            1 => Ok(sources.into_iter().next().unwrap()),
+            0 => bail!("this store syncs no source yet: name the one to write as with --source"),
+            _ => bail!(
+                "this store syncs several sources ({}): pick the one to write as with --source",
+                sources.join(", ")
+            ),
+        }
     }
 
     /// Opens the store as a producer: the enqueue-only role, which never needs
@@ -148,6 +157,12 @@ impl StoreFlags {
 /// naming the likely cause instead of a raw error dump.
 pub fn report(err: PimdirError) -> anyhow::Error {
     match err {
+        PimdirError::Owned(store) => {
+            anyhow!(
+                "another process owns the store at {} (a sync is running?); retry once it releases",
+                store.display()
+            )
+        }
         PimdirError::Busy => {
             anyhow!(
                 "another writer holds the store lock (a sync is running?); retry once it releases"

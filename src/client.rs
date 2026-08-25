@@ -28,6 +28,7 @@ use std::{
     mem,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use io_replica::{
@@ -50,10 +51,13 @@ use rusqlite::{
 };
 
 use crate::{
+    client::lock::PimdirLock,
     codec::{self, PimdirAction, PimdirActionError},
     hash::{PimdirHashAlgo, PimdirHasher},
     sql,
 };
+
+mod lock;
 
 /// A pimdir store: the database and the blob directory, opened without naming
 /// a side.
@@ -65,6 +69,10 @@ use crate::{
 pub struct PimdirStore {
     conn: Connection,
     blobs: PathBuf,
+    /// The store's exclusive owner lock (spec §8), held for this handle's
+    /// lifetime; `None` on a read-only handle, which owns nothing. Several
+    /// handles of one process share one lock.
+    _lock: Option<Arc<PimdirLock>>,
     /// The hash this store names its objects by (spec §5), read back from
     /// `store_meta.hash_algo` so every body a consumer hashes lands under the
     /// name the store already uses.
@@ -292,7 +300,13 @@ pub struct PimdirDrainReport {
 }
 
 impl PimdirStore {
-    /// Opens (creating if absent) the store rooted at `dir`.
+    /// Opens (creating if absent) the store rooted at `dir`, as its owner.
+    ///
+    /// The handle takes the store's exclusive advisory lock (spec §8) and
+    /// holds it until it drops, so a store has one owner process at a time;
+    /// one already owned elsewhere is [`PimdirError::Owned`] immediately,
+    /// never a wait. Several handles of one process share that lock: opening
+    /// one per source, or one per account, is still one owner.
     ///
     /// A fresh database is created at the current schema version. A store
     /// stamped with a *higher* `user_version` than this crate services is
@@ -326,6 +340,10 @@ impl PimdirStore {
         let blobs = dir.join("objects");
         fs::create_dir_all(&blobs)?;
 
+        // NOTE: before the connection, so a store this process may not own is
+        // refused before anything is opened, created or migrated in it.
+        let lock = PimdirLock::own(dir)?;
+
         let mut conn = Connection::open(dir.join("pimdir.db"))?;
         // NOTE: `busy_timeout` lets several handles of one store wait out each
         // other's write transaction instead of failing with `SQLITE_BUSY` — §8's
@@ -342,6 +360,7 @@ impl PimdirStore {
         Ok(Self {
             conn,
             blobs,
+            _lock: Some(lock),
             hash,
             account: None,
         })
@@ -356,6 +375,9 @@ impl PimdirStore {
     /// the owner's opening write). The returned
     /// handle exposes the full read surface; any write through it fails at the
     /// SQLite layer.
+    ///
+    /// A reader owns nothing and takes no lock: any number of them may run
+    /// against a store an owner holds.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -375,6 +397,7 @@ impl PimdirStore {
         Ok(Self {
             conn,
             blobs: dir.join("objects"),
+            _lock: None,
             hash,
             account: None,
         })
@@ -1748,6 +1771,10 @@ fn stage_action(
 /// owner's batches — the two serialise on the write lock, never interleave.
 pub struct PimdirProducer {
     conn: Connection,
+    /// The store's shared staging lock (spec §8), held for this handle's
+    /// lifetime so a body written before an enqueue and the row that pins it
+    /// are one window a collector cannot run inside.
+    _lock: PimdirLock,
     producer: String,
     /// The hash the store names its objects by (spec §5), so a producer
     /// staging a body names it the way the owner will look it up.
@@ -1764,11 +1791,19 @@ impl PimdirProducer {
     /// The database must exist at the current schema version: a producer never
     /// creates a store (that is the owner's opening write), so a missing
     /// database errors and a version mismatch is [`PimdirError::Version`].
+    ///
+    /// A producer is not an owner: it takes the store's *shared* lock (spec
+    /// §8), so several run at once and none of them keeps the owner out. What
+    /// the lock buys is the window a collector must not run inside — a body is
+    /// written to the blob tree before the queue row that pins it, and between
+    /// the two it is a file nothing references — so a producer handle is opened
+    /// for the staging it is about to do and dropped when that is done.
     pub fn open(dir: impl AsRef<Path>, producer: impl Into<String>) -> Result<Self, PimdirError> {
+        let dir = dir.as_ref();
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(dir.as_ref().join("pimdir.db"), flags)?;
+        let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
         )?;
@@ -1783,6 +1818,7 @@ impl PimdirProducer {
 
         Ok(Self {
             conn,
+            _lock: PimdirLock::stage(dir)?,
             producer: producer.into(),
             hash,
             account: None,
@@ -3073,6 +3109,12 @@ pub enum PimdirError {
     /// Another writer holds the store's single write lock (§8); the caller
     /// should retry once the other writer (a sync, another client) is done.
     Busy,
+    /// Another **process** owns the store (§8), which this one asked to own
+    /// too. Reported as soon as the lock is refused rather than waited out: a
+    /// wait long enough to outlast a sync is a stall with no signal, and the
+    /// caller is the only layer that can choose between retrying, backing off,
+    /// queueing the intent and telling the user.
+    Owned(PathBuf),
 }
 
 impl fmt::Display for PimdirError {
@@ -3111,6 +3153,11 @@ impl fmt::Display for PimdirError {
             } => write!(
                 f,
                 "pimdir store names its objects with `{found}`, which this crate does not compute"
+            ),
+            PimdirError::Owned(store) => write!(
+                f,
+                "pimdir store at {} is owned by another process",
+                store.display()
             ),
             PimdirError::Busy => write!(
                 f,
