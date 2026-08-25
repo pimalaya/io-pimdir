@@ -16,6 +16,7 @@ use alloc::{format, string::String, vec::Vec};
 use std::collections::BTreeSet;
 
 use rusqlite::{OptionalExtension, named_params};
+use serde::Serialize;
 
 use crate::{
     client::{PimdirError, PimdirStore, rows},
@@ -23,8 +24,7 @@ use crate::{
 };
 
 /// How many objects the index holds and what they weigh.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct PimdirObjectStats {
     /// Indexed objects.
     pub count: u64,
@@ -34,8 +34,7 @@ pub struct PimdirObjectStats {
 
 /// One object whose stored refcount disagrees with the references that justify
 /// it (items, conflict copies, per-source bases and queue pins).
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PimdirRefcountDrift {
     /// The object's content hash.
     pub hash: String,
@@ -47,8 +46,7 @@ pub struct PimdirRefcountDrift {
 
 /// One binding whose source holds its identity under more than one handle, so
 /// the engine cannot say which copy a change belongs to and stops deriving.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PimdirAmbiguous {
     /// The owning collection.
     pub collection: String,
@@ -61,8 +59,7 @@ pub struct PimdirAmbiguous {
 }
 
 /// One row referencing something that is not there.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PimdirDangling {
     /// What kind of row dangles (`binding`, `item-object`, `queue-object`).
     pub kind: &'static str,

@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: own-the-kind-conventions
-status: active
+status: landed
 created: 2026-08-24
 ---
 

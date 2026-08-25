@@ -27,6 +27,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod codec;
+pub mod conventions;
 pub mod hash;
 pub mod sql;
 

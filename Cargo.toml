@@ -19,9 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["client"]
 client = ["dep:fs4", "dep:rusqlite"]
-cli = ["client", "serde", "dep:anyhow", "dep:clap", "dep:humantime", "dep:log", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
-# Serialisation of the types an operator surface renders: the diagnostics.
-serde = ["dep:serde"]
+cli = ["client", "dep:anyhow", "dep:clap", "dep:humantime", "dep:log", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
 
 [profile.release]
 lto = "fat"
@@ -55,6 +53,6 @@ io-replica = { path = "../io-replica" }
 log = { version = "0.4", default-features = false, optional = true }
 pimalaya-cli = { version = "0.2", default-features = false, optional = true }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"], optional = true }
-serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11", default-features = false }
