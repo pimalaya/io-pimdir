@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A write carrying a new sort key silently discarded it.** The diff that decides whether a row needs an `UPDATE` compared every column the statement writes except `sort_key`, so a key that changed and nothing else reported the row unchanged and no statement was issued. A key is derived rather than given, and a connector fixing its derivation, a tzdb update moving a zoned start, or the second source of a two-source sync all restate one; the item stayed where the first derivation put it, for good. The suite missed it because it only covered the other half of the invariant, that a write carrying no key must leave the stored one alone.
+
+- **A descending page hid every item sorting above its first cursor.** "No cursor" was expressed as a key no real one could outrank, but a sort key is arbitrary text a writer derives, so no value is reserved and the sentinel was outranked by two of the same character. Such an item was invisible to every descending page, permanently, while the count still reported it. The statement now says what it means, a `NULL` cursor, and keeps the same keyset comparison and the same index.
+
+- **Two owners draining one collection applied every action twice.** The pending rows are read outside any transaction, and the row was deleted at the *end* of the applying transaction, so a second owner holding the same list re-applied all of it; `add` and `copy` are not idempotent, and the operator CLI opens a second owner handle routinely. The delete is now the first statement of the transaction (`CLAIM_ACTION`, a `DELETE ... RETURNING id`) and a claim that deletes nothing skips the row: exactly-once is a property of the statement rather than a convention about who runs the drain.
+
+- **A blob rename was never made durable.** The body was written, `fsync`ed and renamed, and the directory entry that carries the name was not synced, while the SQLite commit is. A power loss could leave a committed row pointing at a body that never arrived, which is the one asymmetry the write order exists to prevent.
+
+- **A flag set the store could not decode read as a known-empty one**, an authoritative "this item carries no markers" that the merge took as one side's opinion: it cleared every marker the other side reported and persisted the result, turning a read failure into permanent loss. It now decodes as unknown, which holds no opinion.
+
+- **`created_at` held epoch milliseconds** where the column is declared to hold an RFC 3339 timestamp, and the empty string when the clock predated the epoch. It is written by SQLite itself now, in the form the retirement clock already uses, which also keeps the crate free of a clock.
+
+### Changed
+
+- **A write reads only the rows its batch names.** Folding a batch into a collection loaded, cloned and diffed the whole collection, so the cost of one flag on one message was the size of the mailbox: measured 3.5 ms at a thousand items, 13 ms at four thousand, 59 ms at sixteen thousand, cleanly linear, against a promise of hundreds of thousands. The read is now scoped to the link ids the batch carries, with each dropped handle resolved through the new `bindings_by_handle` index, and the same measurement is flat at 150 to 175 µs across that range.
+
+- **The residual is keyed rather than listed.** A first sync probes a whole collection before linking any of it, so the list grew to the collection size while every insertion, drop and lookup searched it linearly.
+
+- The object sweep tests `refcount <= 0`, so a count a double release drove negative is collected rather than leaking for ever with nothing reporting it.
+
+- New indexes: `objects_garbage` (partial, so the sweep stops scanning the whole table on every write transaction), `items_by_seq_global` (the store-global public id the format promises had no store-global index), `bindings_by_handle`, `items_by_conflict_object` and `queue_by_object`.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

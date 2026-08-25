@@ -254,3 +254,59 @@ fn a_key_written_by_a_placement_survives_a_later_write() {
         "a load-then-write cycle must not blank the key"
     );
 }
+
+#[test]
+fn a_write_carrying_a_new_sort_key_updates_the_stored_one() {
+    // The other half of the §9.3 invariant. A key is derived, not given:
+    // a connector fixing its derivation, a tzdb update moving a zoned
+    // start, or the second source of a two-source sync all restate one.
+    // A write that carries a key and is otherwise unchanged must land it,
+    // or the item stays where the first derivation put it for ever.
+    let dir = tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+
+    seed(&mut store, "INBOX", &[("1", "a", "2026-08-01T10:00:00Z")]);
+
+    let mut restated = placement("INBOX", "1", "a");
+    restated.sort_key = ReplicaSortKey::from("2026-08-01T12:00:00Z");
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(restated)])
+        .expect("re-write the placement with a new key");
+
+    let items = store.list_items_page_desc("INBOX", None, 10).unwrap();
+    assert_eq!(items[0].sort_key, "2026-08-01T12:00:00Z");
+}
+
+#[test]
+fn a_key_above_the_first_page_cursor_is_still_paged() {
+    // A sort key is arbitrary text a writer derives, so no value is
+    // reserved: "the largest key the store can hold" is not expressible.
+    // A descending page that starts from one silently hides everything
+    // above it, for ever, while the count still reports it.
+    let dir = tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+
+    seed(
+        &mut store,
+        "INBOX",
+        &[("1", "a", "aaa"), ("2", "b", "\u{10FFFF}\u{10FFFF}")],
+    );
+
+    let desc: Vec<String> = store
+        .list_items_page_desc("INBOX", None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.sort_key)
+        .collect();
+    let asc: Vec<String> = store
+        .list_items_page_asc("INBOX", None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.sort_key)
+        .collect();
+
+    assert_eq!(desc.len(), asc.len(), "both directions page every item");
+    assert_eq!(desc.first(), asc.last(), "descending starts at the largest");
+}

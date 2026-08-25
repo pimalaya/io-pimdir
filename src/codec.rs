@@ -31,14 +31,22 @@ pub fn flags_to_json(flags: &ReplicaFlags) -> Option<String> {
 }
 
 /// The inverse of [`flags_to_json`]: a `NULL` column (passed as `None`) decodes
-/// to the unknown set, and malformed JSON to a known-empty one, since the
-/// column was written by something that had read the markers.
+/// to the unknown set, and so does a column this cannot read.
+///
+/// Malformed JSON is a column written by something whose format this does not
+/// share, or one that was corrupted, and neither is evidence about the item's
+/// markers. Reading it as a known-empty set turns that into an authoritative
+/// "this item carries no markers", which the merge takes as one side's opinion:
+/// it clears every marker the other side reports and persists the result, so a
+/// read failure becomes permanent loss. Unknown holds no opinion instead.
 pub fn flags_from_json(json: Option<&str>) -> ReplicaFlags {
     let Some(json) = json else {
         return ReplicaFlags::Unknown;
     };
-    let items: Vec<String> = serde_json::from_str(json).unwrap_or_default();
-    ReplicaFlags::Known(items.into_iter().collect())
+    match serde_json::from_str::<Vec<String>>(json) {
+        Ok(items) => ReplicaFlags::Known(items.into_iter().collect()),
+        Err(_) => ReplicaFlags::Unknown,
+    }
 }
 
 /// The detail ladder as its column integer (spec §13).
@@ -424,6 +432,17 @@ mod tests {
             Some("[]")
         );
         assert_eq!(flags_from_json(Some("[]")), ReplicaFlags::default());
+    }
+
+    #[test]
+    fn a_malformed_flag_set_reads_as_unread_not_as_empty() {
+        // A decode failure must not become an authoritative "this item
+        // carries no markers": the merge would take that as one side's
+        // opinion, clear every marker the other side reports, and persist
+        // the result. Unknown holds no opinion, so the markers survive
+        // wherever they are still readable.
+        assert_eq!(flags_from_json(Some("not json")), ReplicaFlags::Unknown);
+        assert_eq!(flags_from_json(Some("{}")), ReplicaFlags::Unknown);
     }
 
     #[test]

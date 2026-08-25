@@ -17,11 +17,10 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use io_replica::{
@@ -64,9 +63,13 @@ pub struct PimdirStore {
     /// `None` in a single-account store. Set with
     /// [`for_account`](PimdirStore::for_account).
     account: Option<String>,
-    /// Unlinked probed placements, awaiting the `Meta` upgrade that gives them a
-    /// link id; kept in memory (empty at rest between syncs).
-    residual: Vec<ReplicaPlacement>,
+    /// Unlinked probed placements, awaiting the `Meta` upgrade that gives them
+    /// a link id; kept in memory (empty at rest between syncs).
+    ///
+    /// Keyed rather than listed: a first sync probes a whole collection before
+    /// linking any of it, so the residual grows to the collection size while
+    /// every insertion, every drop and every lookup searches it.
+    residual: HashMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
 }
 
 /// A collection as seen by a client read (`list_collections`): its identity and
@@ -253,13 +256,6 @@ pub struct PimdirParkedAction {
     pub error: String,
 }
 
-/// The cursor a descending first page starts from: a key no real one sorts
-/// above, so the page begins at the collection's largest.
-///
-/// `\u{10FFFF}` is the highest scalar value a Rust `str` can hold, and SQLite
-/// compares TEXT by its UTF-8 bytes, so nothing storable outranks it.
-const TOP_SORT_KEY: &str = "\u{10FFFF}";
-
 /// What a [`drain_collection`](PimdirStore::drain_collection) pass did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirDrainReport {
@@ -328,7 +324,7 @@ impl PimdirStore {
             source: ReplicaSourceId(source.into()),
             hash,
             account: None,
-            residual: Vec::new(),
+            residual: HashMap::new(),
         })
     }
 
@@ -367,7 +363,7 @@ impl PimdirStore {
             source: ReplicaSourceId(source.into()),
             hash,
             account: None,
-            residual: Vec::new(),
+            residual: HashMap::new(),
         })
     }
 
@@ -657,8 +653,15 @@ impl PimdirStore {
     ) -> Result<Vec<PimdirItem>, PimdirError> {
         // No real key sorts before an unknown one ascending, so the empty
         // string with seq 0 is the true beginning rather than a sentinel.
+        // NOTE: no cursor ascending is the empty key, which is a real
+        // one: an unknown key sorts first, so the page starts at it.
         let (key, seq) = after.unwrap_or(("", 0));
-        self.sorted_page(sql::LIST_ITEMS_PAGE_ASC, collection, key, seq, limit)
+        self.sorted_page(
+            sql::LIST_ITEMS_PAGE_ASC,
+            collection,
+            Some((key, seq)),
+            limit,
+        )
     }
 
     /// The same page **descending**: newest first for mail and calendars, Z to A
@@ -673,24 +676,22 @@ impl PimdirStore {
         after: Option<(&str, i64)>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
-        let (key, seq) = after.unwrap_or((TOP_SORT_KEY, i64::MAX));
-        self.sorted_page(sql::LIST_ITEMS_PAGE_DESC, collection, key, seq, limit)
+        self.sorted_page(sql::LIST_ITEMS_PAGE_DESC, collection, after, limit)
     }
 
     fn sorted_page(
         &self,
         statement: &str,
         collection: &str,
-        key: &str,
-        seq: i64,
+        after: Option<(&str, i64)>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
         let mut stmt = self.conn.prepare(statement)?;
         let rows = stmt.query_map(
             named_params! {
                 ":collection": collection,
-                ":after_key": key,
-                ":after_seq": seq,
+                ":after_key": after.map(|(key, _)| key),
+                ":after_seq": after.map(|(_, seq)| seq).unwrap_or_default(),
                 ":limit": limit as i64,
             },
             read_item_from_row,
@@ -1186,6 +1187,20 @@ impl PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
+
+        // NOTE: claim the row before doing its work. The pending rows were
+        // read outside any transaction, so another owner may hold the same
+        // list and have applied this one already; `add` and `copy` would
+        // then land twice. A claim that deletes nothing means exactly
+        // that, and there is nothing left to do.
+        let claimed = tx
+            .prepare(sql::CLAIM_ACTION)?
+            .query_row(named_params! { ":id": row.id }, |r| r.get::<_, i64>(0))
+            .optional()?;
+        if claimed.is_none() {
+            return Ok(None);
+        }
+
         let ops = match stage_action(&tx, &self.source, collection, row.id, action)? {
             Ok(ops) => ops,
             // NOTE: dropping the transaction rolls the attempt back.
@@ -1209,7 +1224,6 @@ impl PimdirStore {
                 named_params! { ":delta": -1, ":hash": hash },
             )?;
         }
-        tx.execute(sql::DELETE_ACTION, named_params! { ":id": row.id })?;
         let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
 
@@ -1767,6 +1781,9 @@ impl PimdirBlobWriter {
             fs::create_dir_all(parent)?;
         }
         fs::rename(&self.tmp, &path)?;
+        if let Some(parent) = path.parent() {
+            sync_dir(parent)?;
+        }
         Ok(self.written)
     }
 }
@@ -1801,7 +1818,7 @@ impl ReplicaStorage for PimdirStore {
         let mut placements = hub.project(collection, &self.source);
         placements.extend(
             self.residual
-                .iter()
+                .values()
                 .filter(|p| &p.collection == collection)
                 .cloned(),
         );
@@ -1844,7 +1861,7 @@ impl ReplicaStorage for PimdirStore {
         }
 
         // NOTE: a body hydrated on a not-yet-linked residual placement.
-        for placement in &self.residual {
+        for placement in self.residual.values() {
             if let (Some(link), Some(object)) = (&placement.link_id, &placement.object) {
                 if links.contains(link) {
                     map.entry(link.clone()).or_insert_with(|| object.clone());
@@ -1898,7 +1915,7 @@ fn apply_ops(
     blobs: &Path,
     source: &ReplicaSourceId,
     account: Option<&str>,
-    residual: &mut Vec<ReplicaPlacement>,
+    residual: &mut HashMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
     ops: Vec<ReplicaWriteOp>,
 ) -> Result<(), PimdirError> {
     // Placement/drop ops routed to the hub, grouped by collection.
@@ -1945,12 +1962,8 @@ fn apply_ops(
                 } else {
                     // NOTE: not yet linked — stage in the residual until a
                     // Meta upgrade resolves its link id.
-                    match residual.iter().position(|r| {
-                        r.collection == placement.collection && r.handle == placement.handle
-                    }) {
-                        Some(index) => residual[index] = placement,
-                        None => residual.push(placement),
-                    }
+                    let key = (placement.collection.clone(), placement.handle.clone());
+                    residual.insert(key, placement);
                 }
             }
             ReplicaWriteOp::DropPlacement { collection, handle } => {
@@ -1964,7 +1977,8 @@ fn apply_ops(
     }
 
     for (collection, ops) in hub_ops {
-        let old_hub = load_hub(tx, &collection)?;
+        let links = batch_links(tx, &collection, source, &ops)?;
+        let old_hub = load_hub_by_link(tx, &collection, &links)?;
         let mut new_hub = old_hub.clone();
         new_hub.absorb(source, &ops);
         save_hub_diff(tx, &collection, source, account, &old_hub, &new_hub)?;
@@ -2015,15 +2029,15 @@ fn init_schema(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pimdir
         .map_err(busy_or_sql)?;
     tx.execute_batch(sql::MIGRATION_0001)?;
     // NOTE: the script creates `store_meta`; seed its one row here, since the
-    // canonical script is pure DDL.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().to_string())
-        .unwrap_or_default();
+    // canonical script is pure DDL. The timestamp is SQLite's own, in the
+    // RFC 3339 form the column is declared to hold and the retirement clock
+    // already writes, which also keeps the crate free of a clock: reading
+    // one and formatting it by hand is what had this column holding epoch
+    // milliseconds, and the empty string when the clock predates the epoch.
     tx.execute(
         "INSERT OR IGNORE INTO store_meta(id, version, hash_algo, created_at) \
-         VALUES(1, ?1, ?2, ?3)",
-        params![sql::VERSION, hash.as_str(), now],
+         VALUES(1, ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![sql::VERSION, hash.as_str()],
     )?;
     tx.pragma_update(None, "user_version", sql::VERSION)?;
     tx.commit().map_err(busy_or_sql)?;
@@ -2200,15 +2214,83 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
 
 /// Removes any residual placement matching `(collection, handle)`.
 fn drop_residual(
-    residual: &mut Vec<ReplicaPlacement>,
+    residual: &mut HashMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
     collection: &ReplicaCollectionId,
     handle: &ReplicaHandle,
 ) {
-    residual.retain(|r| !(&r.collection == collection && &r.handle == handle));
+    residual.remove(&(collection.clone(), handle.clone()));
 }
 
 /// Loads a collection's [`ReplicaHub`] (items + per-source bindings + policy).
 fn load_hub(conn: &Connection, collection: &str) -> rusqlite::Result<ReplicaHub> {
+    read_hub(conn, collection, None)
+}
+
+/// The link ids one write batch touches: the ones its upserts carry, plus the
+/// ones its drops resolve to, since a drop names a handle and the shared item is
+/// keyed by link id.
+///
+/// A handle no binding holds resolves to nothing and is simply left out: there
+/// is no item to fold the drop into.
+fn batch_links(
+    conn: &Connection,
+    collection: &str,
+    source: &ReplicaSourceId,
+    ops: &[ReplicaWriteOp],
+) -> rusqlite::Result<Vec<String>> {
+    let mut links: BTreeSet<String> = BTreeSet::new();
+
+    for op in ops {
+        match op {
+            ReplicaWriteOp::UpsertPlacement(placement) => {
+                if let Some(link) = &placement.link_id {
+                    links.insert(link.0.clone());
+                }
+            }
+            ReplicaWriteOp::DropPlacement { handle, .. } => {
+                let link = conn
+                    .query_row(
+                        sql::LINK_FOR_HANDLE,
+                        named_params! {
+                            ":collection": collection,
+                            ":source": source.0,
+                            ":handle": handle.0,
+                        },
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                links.extend(link);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(links.into_iter().collect())
+}
+
+/// The hub narrowed to `links`, which is what a write folds its batch into.
+///
+/// The batch only ever produces writes for the items it names, so the rest of
+/// the collection would be read, cloned and diffed to conclude that nothing
+/// changed: the cost of one flag on one message would be the size of the
+/// mailbox. Both sides of the diff are narrowed the same way, so every
+/// comparison the persistence step makes, and every object reference the
+/// refcount step counts, sees exactly what it would have seen in full.
+fn load_hub_by_link(
+    conn: &Connection,
+    collection: &str,
+    links: &[String],
+) -> rusqlite::Result<ReplicaHub> {
+    read_hub(conn, collection, Some(links))
+}
+
+/// The shared reader behind [`load_hub`] and [`load_hub_by_link`]: `None` reads
+/// the whole collection, `Some` only the named link ids.
+fn read_hub(
+    conn: &Connection,
+    collection: &str,
+    links: Option<&[String]>,
+) -> rusqlite::Result<ReplicaHub> {
     let mut hub = ReplicaHub::default();
 
     if let Some(policy) = conn
@@ -2222,34 +2304,73 @@ fn load_hub(conn: &Connection, collection: &str) -> rusqlite::Result<ReplicaHub>
         hub.conflict = conflict_from_str(&policy);
     }
 
-    let mut items = conn.prepare(sql::LOAD_ITEMS)?;
-    let rows = items.query_map(named_params! { ":collection": collection }, item_from_row)?;
-    for row in rows {
-        let (link, item) = row?;
-        hub.items.insert(link, item);
-    }
+    // NOTE: the scoped statements name a `:links` the unscoped ones do not,
+    // and a bound parameter a statement never declared is an error, so each
+    // shape is prepared and bound on its own.
+    match links {
+        Some(links) => {
+            let scope = serde_json::to_string(links).unwrap_or_else(|_| "[]".into());
+            let params = named_params! { ":collection": collection, ":links": scope };
 
-    let mut bindings = conn.prepare(sql::LOAD_BINDINGS)?;
-    let rows = bindings.query_map(
-        named_params! { ":collection": collection },
-        binding_from_row,
-    )?;
-    for row in rows {
-        let (link, source, binding) = row?;
-        if let Some(item) = hub.items.get_mut(&link) {
-            item.sources.insert(source, binding);
+            let mut items = conn.prepare(sql::LOAD_ITEMS_BY_LINK)?;
+            read_hub_items(&mut hub, items.query_map(params, item_from_row)?)?;
+            let mut bindings = conn.prepare(sql::LOAD_BINDINGS_BY_LINK)?;
+            read_hub_bindings(&mut hub, bindings.query_map(params, binding_from_row)?)?;
+        }
+        None => {
+            let params = named_params! { ":collection": collection };
+
+            let mut items = conn.prepare(sql::LOAD_ITEMS)?;
+            read_hub_items(&mut hub, items.query_map(params, item_from_row)?)?;
+            let mut bindings = conn.prepare(sql::LOAD_BINDINGS)?;
+            read_hub_bindings(&mut hub, bindings.query_map(params, binding_from_row)?)?;
         }
     }
 
     Ok(hub)
 }
 
-/// Persists the change from `old` to `new` for a collection's hub by diffing the
-/// two in memory and issuing only the item/binding inserts, updates and deletes
-/// that actually differ — never a whole-collection delete-and-reinsert. So a
-/// write touches O(changed rows), not O(collection size). An item no source
-/// holds any more is retained rather than deleted, `source` naming the side
-/// whose removal retired it.
+fn read_hub_items<F>(
+    hub: &mut ReplicaHub,
+    rows: rusqlite::MappedRows<'_, F>,
+) -> rusqlite::Result<()>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(ReplicaLinkId, ReplicaHubItem)>,
+{
+    for row in rows {
+        let (link, item) = row?;
+        hub.items.insert(link, item);
+    }
+    Ok(())
+}
+
+fn read_hub_bindings<F>(
+    hub: &mut ReplicaHub,
+    rows: rusqlite::MappedRows<'_, F>,
+) -> rusqlite::Result<()>
+where
+    F: FnMut(
+        &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<(ReplicaLinkId, ReplicaSourceId, ReplicaSourceBinding)>,
+{
+    for row in rows {
+        let (link, source, binding) = row?;
+        if let Some(item) = hub.items.get_mut(&link) {
+            item.sources.insert(source, binding);
+        }
+    }
+    Ok(())
+}
+
+/// Persists the change from `old` to `new` for a collection's hub by diffing
+/// the two in memory and issuing only the item and binding inserts, updates and
+/// deletes that actually differ, never a whole-collection delete-and-reinsert.
+///
+/// Paired with a batch-scoped read ([`load_hub_by_link`]) that makes both
+/// halves of a write proportional to the batch rather than to the collection:
+/// the rows it reads as well as the rows it writes. An item no source holds any
+/// more is retained rather than deleted, `source` naming the side whose removal
+/// retired it.
 fn save_hub_diff(
     conn: &Connection,
     collection: &str,
@@ -2318,10 +2439,15 @@ fn save_hub_diff(
 }
 
 /// Whether two items' persisted columns (everything but their bindings) match.
+///
+/// Every column `UPDATE_ITEM` writes has to be here: one left out is a
+/// column that can never change again, since the diff reports the row
+/// unchanged and no statement is issued for it.
 fn item_columns_eq(a: &ReplicaHubItem, b: &ReplicaHubItem) -> bool {
     a.flags == b.flags
         && a.object == b.object
         && a.meta == b.meta
+        && a.sort_key == b.sort_key
         && a.level == b.level
         && a.deleted == b.deleted
         && a.conflicted == b.conflicted
@@ -2703,7 +2829,19 @@ fn write_blob(blobs: &Path, hash: &str, body: &[u8]) -> io::Result<()> {
         file.write_all(body)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, &path)
+    fs::rename(&tmp, &path)?;
+    sync_dir(parent)
+}
+
+/// Flushes a directory entry, so a rename into it survives a power loss.
+///
+/// Syncing the file makes its bytes durable and says nothing about the name
+/// that reaches them. The database commit is durable, so without this a crash
+/// can leave a committed row pointing at a body that never arrived: the one
+/// asymmetry the write order exists to prevent, since the reverse leaves at
+/// worst an orphan blob.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
 }
 
 /// Removes a blob file; a missing file is not an error.

@@ -141,6 +141,22 @@ CREATE INDEX items_retained ON items(collection, retained_at) WHERE retained_at 
 -- Orders a collection by the kind's own sort key, with `seq` as the tiebreaker
 -- that makes a keyset page over a non-unique key well defined.
 CREATE INDEX items_by_sort ON items(collection, sort_key, seq);
+-- `seq` is the store-global public id (spec §9.1), displayed and accepted back
+-- without naming its collection; resolving one against items_by_seq means
+-- scanning that whole index, since it leads with the collection.
+CREATE INDEX items_by_seq_global ON items(seq);
+-- The sweep of unreferenced objects. Partial, so it holds only what is about to
+-- be collected and is empty at rest: without it both the list and the delete
+-- scan the whole objects table, on every write transaction.
+CREATE INDEX objects_garbage ON objects(refcount) WHERE refcount <= 0;
+-- The other two pointers at an object, so a refcount recomputation reaches every
+-- reference by index rather than by scanning items and queue once per object.
+CREATE INDEX items_by_conflict_object ON items(conflict_object);
+CREATE INDEX queue_by_object ON queue(object_hash);
+-- Resolves one source handle back to the link id it is bound to, which is what
+-- a batch dropping a placement needs: a drop names a handle and the shared item
+-- is keyed by link id. Without it that resolution is a scan of every item.
+CREATE INDEX bindings_by_handle ON bindings(collection, source, handle);
 "#;
 
 /// The current schema version.
@@ -203,6 +219,17 @@ pub const LOAD_ITEMS: &str = "\
 SELECT link_id, flags, object_hash, meta, sort_key, level, deleted, conflicted, conflict_object \
 FROM items WHERE collection = :collection AND retained_at IS NULL";
 
+/// The same rows, narrowed to the link ids one write batch touches (spec §14).
+///
+/// A write folds its batch into the hub and persists the difference, and that
+/// difference only ever names rows the batch named: reading the rest costs a
+/// full pass over the collection to compute nothing. It is the whole cost of a
+/// small write, and it grows with the mailbox rather than with the batch.
+pub const LOAD_ITEMS_BY_LINK: &str = "\
+SELECT link_id, flags, object_hash, meta, sort_key, level, deleted, conflicted, conflict_object \
+FROM items WHERE collection = :collection AND retained_at IS NULL \
+  AND link_id IN (SELECT value FROM json_each(:links))";
+
 // Client read surface (kind-agnostic, indexed getters over the same store the
 // sync seam writes). Distinct from `LOAD_ITEMS`: paginated, live-only, ordered.
 
@@ -252,13 +279,18 @@ AND (sort_key, seq) > (:after_key, :after_seq) \
 ORDER BY sort_key, seq LIMIT :limit";
 
 /// The same page **descending**: newest first for mail and calendars, Z to A for
-/// contacts. The first page binds the largest key the store can hold, which
-/// [`PimdirStore`](crate::PimdirStore) hides behind an `Option` cursor rather
-/// than making a caller invent a sentinel.
+/// contacts.
+///
+/// The first page binds a NULL cursor rather than a key above every other one:
+/// a sort key is arbitrary text a writer derives, so no value is reserved and
+/// "the largest key the store can hold" is not expressible. A sentinel would
+/// hide everything sorting above it from every descending page, for good, while
+/// the count still reported it. The comparison stays a keyset one, so the index
+/// still serves it.
 pub const LIST_ITEMS_PAGE_DESC: &str = "\
 SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
 WHERE collection = :collection AND deleted = 0 \
-AND (sort_key, seq) < (:after_key, :after_seq) \
+AND (:after_key IS NULL OR (sort_key, seq) < (:after_key, :after_seq)) \
 ORDER BY sort_key DESC, seq DESC LIMIT :limit";
 
 /// Restates one item's ordering key, for a re-projection that derives sort keys
@@ -311,6 +343,23 @@ pub const LOAD_BINDINGS: &str = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision, \
 conflicted, conflict_revision \
 FROM bindings WHERE collection = :collection";
+
+/// The same rows, narrowed to the link ids one write batch touches: the binding
+/// half of [`LOAD_ITEMS_BY_LINK`].
+pub const LOAD_BINDINGS_BY_LINK: &str = "\
+SELECT link_id, source, handle, base_flags, base_object, base_revision, \
+conflicted, conflict_revision \
+FROM bindings WHERE collection = :collection \
+  AND link_id IN (SELECT value FROM json_each(:links))";
+
+/// The link id one source's handle is bound to, for a batch that drops a
+/// placement: a drop names a handle, and the hub is keyed by link id.
+///
+/// Served by the `bindings_by_handle` index, so resolving it is a seek rather
+/// than the scan over every item a whole-collection load would answer it with.
+pub const LINK_FOR_HANDLE: &str = "\
+SELECT link_id FROM bindings \
+WHERE collection = :collection AND source = :source AND handle = :handle";
 
 /// Reads one source's sync checkpoint for a collection.
 pub const LOAD_CHECKPOINT: &str =
@@ -499,12 +548,12 @@ pub const LIST_GARBAGE_OBJECTS: &str = "SELECT hash FROM objects WHERE refcount 
 
 /// The same set with each object's size, for a purge that reports how many
 /// bytes it actually reclaimed.
-pub const LIST_GARBAGE_SIZED: &str = "SELECT hash, size FROM objects WHERE refcount = 0";
+pub const LIST_GARBAGE_SIZED: &str = "SELECT hash, size FROM objects WHERE refcount <= 0";
 
 /// Drops the unreferenced object rows inside the write transaction; their
 /// blobs are unlinked after the commit, so a crash leaves at worst an orphan
 /// blob.
-pub const DELETE_GARBAGE_OBJECTS: &str = "DELETE FROM objects WHERE refcount = 0";
+pub const DELETE_GARBAGE_OBJECTS: &str = "DELETE FROM objects WHERE refcount <= 0";
 
 // The action queue (spec §15, `queries/queue.sql`): the write door for every
 // process that is not the store owner. A producer appends; the owner applies
@@ -528,9 +577,15 @@ pub const LOAD_PENDING_ACTIONS: &str = "\
 SELECT id, created_at, producer, action, payload, object_hash, attempts \
 FROM queue WHERE collection = :collection AND error IS NULL ORDER BY id";
 
-/// An applied action: deleted in the same transaction as its item and binding
-/// writes, so applying is exactly-once.
-pub const DELETE_ACTION: &str = "DELETE FROM queue WHERE id = :id";
+/// Deletes the row an owner is about to apply, and reports whether it was still
+/// there.
+///
+/// It runs **first** in the applying transaction, not last: the pending rows are
+/// read outside any transaction, so a second owner reading the same list would
+/// otherwise apply every action a second time, and `add` and `copy` are not
+/// idempotent. Claiming the row before doing its work makes exactly-once a
+/// property of the statement rather than a convention about who runs the drain.
+pub const CLAIM_ACTION: &str = "DELETE FROM queue WHERE id = :id RETURNING id";
 
 /// One queue row's spent attempts and pinned body, for a caller acting on a row
 /// by id: cancelling it, acknowledging an intent it performed out of band, or
@@ -591,6 +646,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("SET_CONFLICT", SET_CONFLICT),
     ("LOAD_CONFLICT", LOAD_CONFLICT),
     ("LOAD_ITEMS", LOAD_ITEMS),
+    ("LOAD_ITEMS_BY_LINK", LOAD_ITEMS_BY_LINK),
     ("LIST_COLLECTIONS", LIST_COLLECTIONS),
     ("LIST_COLLECTIONS_BY_ACCOUNT", LIST_COLLECTIONS_BY_ACCOUNT),
     ("LIST_ACCOUNTS", LIST_ACCOUNTS),
@@ -605,6 +661,8 @@ pub const ALL: &[(&str, &str)] = &[
     ("LIST_OBJECT_PLACEMENTS", LIST_OBJECT_PLACEMENTS),
     ("LIST_SOURCES", LIST_SOURCES),
     ("LOAD_BINDINGS", LOAD_BINDINGS),
+    ("LOAD_BINDINGS_BY_LINK", LOAD_BINDINGS_BY_LINK),
+    ("LINK_FOR_HANDLE", LINK_FOR_HANDLE),
     ("LOAD_CHECKPOINT", LOAD_CHECKPOINT),
     ("SEQ_FOR_LINK_ANY", SEQ_FOR_LINK_ANY),
     ("BUMP_NEXT_SEQ", BUMP_NEXT_SEQ),
@@ -637,7 +695,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("ENQUEUE_ACTION", ENQUEUE_ACTION),
     ("LIST_QUEUED_COLLECTIONS", LIST_QUEUED_COLLECTIONS),
     ("LOAD_PENDING_ACTIONS", LOAD_PENDING_ACTIONS),
-    ("DELETE_ACTION", DELETE_ACTION),
+    ("CLAIM_ACTION", CLAIM_ACTION),
     ("LOAD_ACTION_ROW", LOAD_ACTION_ROW),
     ("CANCEL_ACTION", CANCEL_ACTION),
     ("PARK_ACTION", PARK_ACTION),
@@ -693,8 +751,7 @@ mod tests {
         // constant. Order does not prove the pairing either, but it keeps the
         // index a line-for-line mirror of the module, which is what makes a
         // wrong pairing visible on review rather than buried in an arbitrary
-        // sequence. Two statements may legitimately share text (DELETE_ACTION
-        // and CANCEL_ACTION are one delete under two intents), so comparing
+        // sequence. Two statements may legitimately share text, so comparing
         // texts proves nothing.
         let declared: Vec<_> = declared()
             .into_iter()
