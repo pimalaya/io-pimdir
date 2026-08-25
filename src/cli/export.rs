@@ -214,19 +214,20 @@ impl ExportCommand {
             }
 
             for item in &page {
-                if let Some(hash) = &item.object_hash {
-                    hashes.insert(hash.clone());
+                if let Some(hash) = &item.object {
+                    hashes.insert(hash.0.clone());
                 }
+                let retention = item.retention.as_ref();
                 let line = json!({
                     "collection": collection,
                     "seq": item.seq,
-                    "link_id": item.link_id,
+                    "link_id": item.link_id.0,
                     "flags": item.flags.known(),
                     "level": level(item.level),
-                    "object": item.object_hash,
-                    "meta": item.meta,
-                    "retained_at": item.retained_at,
-                    "retained_by": item.retained_by,
+                    "object": item.object.as_ref().map(|hash| hash.0.clone()),
+                    "meta": item.meta.as_ref().map(|meta| meta.0.clone()),
+                    "retained_at": retention.map(|retention| retention.at.clone()),
+                    "retained_by": retention.and_then(|retention| retention.by.clone()),
                 });
                 writeln!(file, "{line}")?;
                 count += 1;

@@ -19,7 +19,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["client"]
 client = ["dep:fs4", "dep:rusqlite"]
-cli = ["client", "dep:anyhow", "dep:clap", "dep:humantime", "dep:log", "dep:serde", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
+cli = ["client", "serde", "dep:anyhow", "dep:clap", "dep:humantime", "dep:log", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
+# Serialisation of the types an operator surface renders: the diagnostics.
+serde = ["dep:serde"]
 
 [profile.release]
 lto = "fat"

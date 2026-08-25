@@ -46,8 +46,8 @@ use io_replica::{
     storage::{ReplicaLoadScope, ReplicaLoaded},
 };
 use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Row, TransactionBehavior, named_params,
-    params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Params, Row, TransactionBehavior,
+    named_params, params, types::ToSql,
 };
 
 use crate::{
@@ -57,6 +57,7 @@ use crate::{
     sql,
 };
 
+pub mod diagnostics;
 mod lock;
 
 /// A pimdir store: the database and the blob directory, opened without naming
@@ -151,13 +152,13 @@ pub struct PimdirPlacement {
     /// The item's public id, shared by every placement of one link id.
     pub seq: i64,
     /// The cross-collection identity.
-    pub link_id: String,
+    pub link_id: ReplicaLinkId,
     /// The body this placement points at, absent until hydrated.
     pub object: Option<ReplicaHash>,
-    /// The placement's flags, as the stored JSON array.
-    pub flags: Option<String>,
-    /// The detail level: 0 probed, 1 meta, 2 full.
-    pub level: i64,
+    /// The placement's flag set.
+    pub flags: ReplicaFlags,
+    /// The detail tier the item is hydrated to.
+    pub level: ReplicaLevel,
 }
 
 /// Maps a `LIST_COLLECTIONS`-shaped row.
@@ -202,40 +203,28 @@ pub struct PimdirItem {
     pub object: Option<ReplicaHash>,
     /// The detail tier the item is hydrated to.
     pub level: ReplicaLevel,
+    /// What retention holds about the row, `None` while it is live. The trash
+    /// view is the only read that fills it.
+    pub retention: Option<PimdirRetention>,
 }
 
-/// One retained (soft-deleted) item, as the trash view reads it
-/// (`list_retained`): the whole row retention kept, body pointer and size
-/// included, so a caller can show it, restore it or price a purge without a
-/// second query.
+/// What retention holds about an item no source binds any more (spec §11), on
+/// the row the trash view reads (`list_retained`).
+///
+/// Only that read fills it: a live item carries `None`, and the two reads are
+/// otherwise the same row, which is why they are the same type.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirRetainedItem {
-    /// The message's public id, the same it held while live: a restore keeps
-    /// it, and it is what `purge` addresses.
-    pub seq: i64,
-    /// The cross-source link id the retained row still holds.
-    pub link_id: String,
-    /// The flag set as of the moment the last binding vanished.
-    pub flags: ReplicaFlags,
-    /// The detail tier the item was hydrated to.
-    pub level: ReplicaLevel,
-    /// The raw per-domain summary blob, verbatim.
-    pub meta: Option<String>,
-    /// The kind's ordering key as of retirement, so a trash view can present
-    /// its rows in the same order the live listing uses.
-    pub sort_key: String,
-    /// The body hash the row still pins; `None` when the item was never
-    /// hydrated (nothing to reclaim, nothing to restore locally).
-    pub object_hash: Option<String>,
-    /// The body's size in bytes; `None` alongside an absent `object_hash`.
-    pub size: Option<u64>,
+pub struct PimdirRetention {
     /// The RFC 3339 instant the **last binding vanished** (not when a server
     /// deleted the item, which is unknowable). A revive clears it, so
     /// restore-then-redelete restarts the purge clock.
-    pub retained_at: String,
+    pub at: String,
     /// The source whose removal retired the item; diagnostic, nothing keys on
     /// it.
-    pub retained_by: Option<String>,
+    pub by: Option<String>,
+    /// The body's size in bytes; `None` alongside an absent `object`, and what
+    /// lets a caller price a purge without a second query.
+    pub size: Option<u64>,
 }
 
 /// What a purge retired.
@@ -302,7 +291,7 @@ pub struct PimdirParkedAction {
     pub error: String,
 }
 
-/// What a [`drain_collection`](PimdirStore::drain_collection) pass did.
+/// What a [`drain_collection`](PimdirSourceStore::drain_collection) pass did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirDrainReport {
     /// Actions applied to the store and deleted from the queue.
@@ -385,13 +374,13 @@ impl PimdirStore {
 
     /// Opens an **existing** store rooted at `dir` read-only.
     ///
-    /// The database is opened with `SQLITE_OPEN_READ_ONLY`: nothing is
-    /// created, so a missing database errors and a schema version other than
-    /// the current one is refused with [`PimdirError::Version`] (a reader's
-    /// SQL requires the current columns and never creates the schema; that is
-    /// the owner's opening write). The returned
-    /// handle exposes the full read surface; any write through it fails at the
-    /// SQLite layer.
+    /// The database is opened with `SQLITE_OPEN_READ_ONLY`: nothing is created,
+    /// so a missing database errors, one no owner has stamped yet is
+    /// [`PimdirError::Uncreated`], and any other schema version is refused with
+    /// [`PimdirError::Version`] (a reader's SQL requires the current columns and
+    /// never creates the schema; that is the owner's opening write). The
+    /// returned handle exposes the full read surface; any write through it
+    /// fails at the SQLite layer.
     ///
     /// A reader owns nothing and takes no lock: any number of them may run
     /// against a store an owner holds.
@@ -404,8 +393,13 @@ impl PimdirStore {
         conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != sql::VERSION {
-            return Err(PimdirError::Version { found: version });
+        match version {
+            version if version == sql::VERSION => {}
+            // NOTE: an unstamped database is one no owner has opened yet, not
+            // a version this crate cannot read, and the two want different
+            // answers from whoever is holding this handle.
+            0 => return Err(PimdirError::Uncreated),
+            found => return Err(PimdirError::Version { found }),
         }
         check_version_agreement(&conn, version)?;
         check_rename_cascades(&conn)?;
@@ -582,13 +576,7 @@ impl PimdirStore {
     /// direct getter — it observes the shared truth and never mutates; writes go
     /// through io-replica's [`write`](ReplicaStorage::write) seam.
     pub fn list_collections(&self) -> Result<Vec<PimdirCollection>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_COLLECTIONS)?;
-        let rows = stmt.query_map([], collection_row)?;
-        let mut collections = Vec::new();
-        for row in rows {
-            collections.push(row?);
-        }
-        Ok(collections)
+        Ok(rows(&self.conn, sql::LIST_COLLECTIONS, [], collection_row)?)
     }
 
     /// Lists one account's collections, the filter axis of a merged view
@@ -600,13 +588,12 @@ impl PimdirStore {
         &self,
         account: Option<&str>,
     ) -> Result<Vec<PimdirCollection>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_COLLECTIONS_BY_ACCOUNT)?;
-        let rows = stmt.query_map(named_params! { ":account": account }, collection_row)?;
-        let mut collections = Vec::new();
-        for row in rows {
-            collections.push(row?);
-        }
-        Ok(collections)
+        Ok(rows(
+            &self.conn,
+            sql::LIST_COLLECTIONS_BY_ACCOUNT,
+            named_params! { ":account": account },
+            collection_row,
+        )?)
     }
 
     /// The accounts owning at least one collection.
@@ -616,13 +603,7 @@ impl PimdirStore {
     /// here and a consumer holding the real roster reads it from its own
     /// configuration.
     pub fn list_accounts(&self) -> Result<Vec<String>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_ACCOUNTS)?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut accounts = Vec::new();
-        for row in rows {
-            accounts.push(row?);
-        }
-        Ok(accounts)
+        Ok(rows(&self.conn, sql::LIST_ACCOUNTS, [], |r| r.get(0))?)
     }
 
     /// Every live placement of one identity, with the collection and account it
@@ -634,46 +615,44 @@ impl PimdirStore {
     /// contact view may offer to merge them, because one person in two address
     /// books is usually one person. Both read these rows.
     pub fn link_placements(&self, link_id: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_LINK_PLACEMENTS)?;
-        let rows = stmt.query_map(named_params! { ":link_id": link_id }, |r| {
-            Ok(PimdirPlacement {
-                collection: r.get(0)?,
-                account: r.get(1)?,
-                seq: r.get(2)?,
-                link_id: link_id.to_string(),
-                object: r.get::<_, Option<String>>(3)?.map(ReplicaHash),
-                flags: r.get(4)?,
-                level: r.get(5)?,
-            })
-        })?;
-        let mut placements = Vec::new();
-        for row in rows {
-            placements.push(row?);
-        }
-        Ok(placements)
+        Ok(rows(
+            &self.conn,
+            sql::LIST_LINK_PLACEMENTS,
+            named_params! { ":link_id": link_id },
+            |r| {
+                Ok(PimdirPlacement {
+                    collection: r.get(0)?,
+                    account: r.get(1)?,
+                    seq: r.get(2)?,
+                    link_id: ReplicaLinkId(link_id.to_string()),
+                    object: r.get::<_, Option<String>>(3)?.map(ReplicaHash),
+                    flags: codec::flags_from_json(r.get::<_, Option<String>>(4)?.as_deref()),
+                    level: codec::level_from_int(r.get(5)?),
+                })
+            },
+        )?)
     }
 
     /// Every live placement of one body, by content hash: the dedup axis rather
     /// than the identity one, so it pairs placements two servers gave different
     /// link ids.
     pub fn object_placements(&self, hash: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_OBJECT_PLACEMENTS)?;
-        let rows = stmt.query_map(named_params! { ":hash": hash }, |r| {
-            Ok(PimdirPlacement {
-                collection: r.get(0)?,
-                account: r.get(1)?,
-                seq: r.get(2)?,
-                link_id: r.get(3)?,
-                object: Some(ReplicaHash(hash.to_string())),
-                flags: r.get(4)?,
-                level: r.get(5)?,
-            })
-        })?;
-        let mut placements = Vec::new();
-        for row in rows {
-            placements.push(row?);
-        }
-        Ok(placements)
+        Ok(rows(
+            &self.conn,
+            sql::LIST_OBJECT_PLACEMENTS,
+            named_params! { ":hash": hash },
+            |r| {
+                Ok(PimdirPlacement {
+                    collection: r.get(0)?,
+                    account: r.get(1)?,
+                    seq: r.get(2)?,
+                    link_id: ReplicaLinkId(r.get(3)?),
+                    object: Some(ReplicaHash(hash.to_string())),
+                    flags: codec::flags_from_json(r.get::<_, Option<String>>(4)?.as_deref()),
+                    level: codec::level_from_int(r.get(5)?),
+                })
+            },
+        )?)
     }
 
     /// A keyset page of a collection's live items (client read surface).
@@ -689,20 +668,16 @@ impl PimdirStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_ITEMS_PAGE)?;
-        let rows = stmt.query_map(
+        Ok(rows(
+            &self.conn,
+            sql::LIST_ITEMS_PAGE,
             named_params! {
                 ":collection": collection,
                 ":after": after.unwrap_or(""),
                 ":limit": limit as i64,
             },
             read_item_from_row,
-        )?;
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
-        }
-        Ok(items)
+        )?)
     }
 
     /// A keyset page of a collection's live items in the kind's own **ascending**
@@ -755,8 +730,9 @@ impl PimdirStore {
         after: Option<(&str, i64)>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
-        let mut stmt = self.conn.prepare(statement)?;
-        let rows = stmt.query_map(
+        Ok(rows(
+            &self.conn,
+            statement,
             named_params! {
                 ":collection": collection,
                 ":after_key": after.map(|(key, _)| key),
@@ -764,12 +740,7 @@ impl PimdirStore {
                 ":limit": limit as i64,
             },
             read_item_from_row,
-        )?;
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
-        }
-        Ok(items)
+        )?)
     }
 
     /// Restates one item's ordering key (spec §9.3).
@@ -856,13 +827,7 @@ impl PimdirStore {
     /// as a single source (the local-sync case) has exactly one, so the app
     /// writes as it without configuration.
     pub fn distinct_sources(&self) -> Result<Vec<String>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_SOURCES)?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut sources = Vec::new();
-        for row in rows {
-            sources.push(row?);
-        }
-        Ok(sources)
+        Ok(rows(&self.conn, sql::LIST_SOURCES, [], |r| r.get(0))?)
     }
 
     /// A collection's live (non-tombstone) item count (client read surface).
@@ -891,7 +856,7 @@ impl PimdirStore {
     ///
     /// `after` is the exclusive lower bound on the public `seq` (`None` starts
     /// from the beginning); at most `limit` items are returned, ordered by
-    /// `seq`, so the last item's [`seq`](PimdirRetainedItem::seq) is the cursor
+    /// `seq`, so the last item's [`seq`](PimdirItem::seq) is the cursor
     /// for the next page. This is the only read that returns retained items: a
     /// caller presents them as a trash view, never merged into the live listing.
     pub fn list_retained(
@@ -899,35 +864,17 @@ impl PimdirStore {
         collection: &ReplicaCollectionId,
         after: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<PimdirRetainedItem>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_RETAINED_PAGE)?;
-        let rows = stmt.query_map(
+    ) -> Result<Vec<PimdirItem>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            sql::LIST_RETAINED_PAGE,
             named_params! {
                 ":collection": collection.0,
                 ":after": after.unwrap_or(0),
                 ":limit": limit as i64,
             },
-            |row| {
-                let size: Option<i64> = row.get(9)?;
-                Ok(PimdirRetainedItem {
-                    seq: row.get(0)?,
-                    link_id: row.get(1)?,
-                    flags: codec::flags_from_json(row.get::<_, Option<String>>(2)?.as_deref()),
-                    object_hash: row.get(3)?,
-                    meta: row.get(4)?,
-                    sort_key: row.get(5)?,
-                    level: codec::level_from_int(row.get(6)?),
-                    retained_at: row.get(7)?,
-                    retained_by: row.get(8)?,
-                    size: size.map(|size| size.max(0) as u64),
-                })
-            },
-        )?;
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
-        }
-        Ok(items)
+            read_item_from_row,
+        )?)
     }
 
     /// A collection's retained item count, the counterpart of
@@ -1007,17 +954,12 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
 
-        let pinned: Vec<(Option<String>, Option<String>)> = {
-            let mut stmt = tx.prepare(sql::RETAINED_BEFORE)?;
-            let rows = stmt.query_map(named_params! { ":cutoff": cutoff }, |row| {
-                Ok((row.get(2)?, row.get(3)?))
-            })?;
-            let mut pinned = Vec::new();
-            for row in rows {
-                pinned.push(row?);
-            }
-            pinned
-        };
+        let pinned: Vec<(Option<String>, Option<String>)> = rows(
+            &tx,
+            sql::RETAINED_BEFORE,
+            named_params! { ":cutoff": cutoff },
+            |row| Ok((row.get(2)?, row.get(3)?)),
+        )?;
         let items = pinned.len();
         tx.execute(
             sql::PURGE_RETAINED_BEFORE,
@@ -1066,15 +1008,9 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         let objects = tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
-        let indexed: BTreeSet<String> = {
-            let mut stmt = tx.prepare(sql::LIST_OBJECT_HASHES)?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            let mut hashes = BTreeSet::new();
-            for row in rows {
-                hashes.insert(row?);
-            }
-            hashes
-        };
+        let indexed: BTreeSet<String> = rows(&tx, sql::LIST_OBJECT_HASHES, [], |r| r.get(0))?
+            .into_iter()
+            .collect();
         tx.commit().map_err(busy_or_sql)?;
 
         // NOTE: one pass over the tree rather than one unlink per collected
@@ -1120,6 +1056,20 @@ impl PimdirStore {
     }
 }
 
+/// Runs one statement and collects every row through `map`.
+///
+/// The shape fourteen reads of this crate wrote out by hand: prepare, map,
+/// push, return. A `Transaction` derefs to a `Connection`, so a read inside a
+/// write batch uses it too.
+fn rows<T>(
+    conn: &Connection,
+    sql: &str,
+    params: impl Params,
+    map: impl FnMut(&Row) -> rusqlite::Result<T>,
+) -> rusqlite::Result<Vec<T>> {
+    conn.prepare(sql)?.query_map(params, map)?.collect()
+}
+
 /// Releases the object references a retained row (or a queue row) held, so the
 /// ordinary sweep can reclaim a body nothing points at any more.
 fn release_pins(
@@ -1147,7 +1097,7 @@ fn release_pins(
 impl PimdirStore {
     /// A collection's handle-space epoch (spec §12), or `None` when the store
     /// has never seen the collection. Starts at 1; bumped only by
-    /// [`write_rekeyed`](Self::write_rekeyed), so a frontend derives
+    /// [`write_rekeyed`](PimdirSourceStore::write_rekeyed), so a frontend derives
     /// epoch-dependent protocol values (an IMAP UIDVALIDITY) from it alone.
     pub fn generation(&self, collection: &str) -> Result<Option<i64>, PimdirError> {
         Ok(self
@@ -1163,13 +1113,9 @@ impl PimdirStore {
     /// The collections with pending (non-parked) queue work, for the owner's
     /// drain loop.
     pub fn queued_collections(&self) -> Result<Vec<String>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LIST_QUEUED_COLLECTIONS)?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut collections = Vec::new();
-        for row in rows {
-            collections.push(row?);
-        }
-        Ok(collections)
+        Ok(rows(&self.conn, sql::LIST_QUEUED_COLLECTIONS, [], |r| {
+            r.get(0)
+        })?)
     }
 
     /// A collection's pending (non-parked) actions in append order, decoded
@@ -1187,8 +1133,7 @@ impl PimdirStore {
     /// surfaces and operator repair. Parked rows are skipped by the drain and
     /// never silently deleted.
     pub fn parked_actions(&self) -> Result<Vec<PimdirParkedAction>, PimdirError> {
-        let mut stmt = self.conn.prepare(sql::LOAD_PARKED_ACTIONS)?;
-        let rows = stmt.query_map([], |r| {
+        Ok(rows(&self.conn, sql::LOAD_PARKED_ACTIONS, [], |r| {
             Ok(PimdirParkedAction {
                 id: r.get(0)?,
                 created_at: r.get(1)?,
@@ -1199,12 +1144,7 @@ impl PimdirStore {
                 attempts: r.get(6)?,
                 error: r.get(7)?,
             })
-        })?;
-        let mut actions = Vec::new();
-        for row in rows {
-            actions.push(row?);
-        }
-        Ok(actions)
+        })?)
     }
 
     /// Removes one queue row by request rather than by application, pending or
@@ -1243,7 +1183,7 @@ impl PimdirStore {
     /// permanent one: the row parks with the failure, visible to operators
     /// instead of blocking its collection forever. An unknown id is a no-op,
     /// since the row may have been applied or cancelled in between.
-    pub fn fail_action(&mut self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
+    pub fn fail_action(&self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
         let Some(error) = error else {
             self.conn
                 .execute(sql::BUMP_ATTEMPTS, named_params! { ":id": id })?;
@@ -1343,30 +1283,26 @@ impl PimdirSourceStore {
     /// [`pending_actions`](PimdirStore::pending_actions), performs it, and
     /// acknowledges it with [`drop_action`](PimdirStore::drop_action).
     pub fn drain_collection(&mut self, collection: &str) -> Result<PimdirDrainReport, PimdirError> {
-        let rows: Vec<QueueRow> = {
-            let mut stmt = self.store.conn.prepare(sql::LOAD_PENDING_ACTIONS)?;
-            let rows = stmt.query_map(named_params! { ":collection": collection }, |r| {
+        let pending: Vec<QueueRow> = rows(
+            &self.store.conn,
+            sql::LOAD_PENDING_ACTIONS,
+            named_params! { ":collection": collection },
+            |r| {
                 Ok(QueueRow {
                     id: r.get(0)?,
                     action: r.get(3)?,
                     payload: r.get(4)?,
                     object_hash: r.get(5)?,
-                    attempts: r.get(6)?,
                 })
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            out
-        };
+            },
+        )?;
 
         let mut report = PimdirDrainReport::default();
-        for row in rows {
+        for row in pending {
             let action = match codec::action_from_payload(&row.action, &row.payload) {
                 Ok(action) => action,
                 Err(err) => {
-                    self.park(&row, &err.to_string())?;
+                    self.fail_action(row.id, Some(&err.to_string()))?;
                     report.parked += 1;
                     continue;
                 }
@@ -1378,7 +1314,7 @@ impl PimdirSourceStore {
             match self.apply_queued(collection, &row, &action) {
                 Ok(None) => report.applied += 1,
                 Ok(Some(reason)) => {
-                    self.park(&row, &reason)?;
+                    self.fail_action(row.id, Some(&reason))?;
                     report.parked += 1;
                 }
                 Err(err) => {
@@ -1446,15 +1382,6 @@ impl PimdirSourceStore {
         }
         tx.commit().map_err(busy_or_sql)?;
         Ok(None)
-    }
-    /// Parks one queue row: records the failure and the spent attempt, leaving
-    /// the row queryable and the rest of the queue flowing.
-    fn park(&self, row: &QueueRow, error: &str) -> Result<(), PimdirError> {
-        self.store.conn.execute(
-            sql::PARK_ACTION,
-            named_params! { ":id": row.id, ":attempts": row.attempts + 1, ":error": error },
-        )?;
-        Ok(())
     }
 }
 
@@ -1532,9 +1459,9 @@ impl ReplicaStorage for PimdirSourceStore {
         let ids: Vec<&str> = links.iter().map(|l| l.0.as_str()).collect();
         let json = serde_json::to_string(&ids)?;
 
-        let mut map = BTreeMap::new();
-        let mut stmt = self.store.conn.prepare(sql::LOOKUP_OBJECTS)?;
-        let rows = stmt.query_map(
+        let found = rows(
+            &self.store.conn,
+            sql::LOOKUP_OBJECTS,
             named_params! { ":links": json, ":account": self.store.account.as_deref() },
             |r| {
                 Ok((
@@ -1543,10 +1470,7 @@ impl ReplicaStorage for PimdirSourceStore {
                 ))
             },
         )?;
-        for row in rows {
-            let (link, hash) = row?;
-            map.insert(link, hash);
-        }
+        let mut map: BTreeMap<ReplicaLinkId, ReplicaHash> = found.into_iter().collect();
 
         // NOTE: a body hydrated on a not-yet-linked residual placement.
         for placement in self.residual.values() {
@@ -1604,7 +1528,6 @@ struct QueueRow {
     action: String,
     payload: String,
     object_hash: Option<String>,
-    attempts: i64,
 }
 
 /// Loads a collection's pending actions in append order, decoding each payload
@@ -1614,21 +1537,24 @@ fn load_pending_actions(
     conn: &Connection,
     collection: &str,
 ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
-    let mut stmt = conn.prepare(sql::LOAD_PENDING_ACTIONS)?;
-    let rows = stmt.query_map(named_params! { ":collection": collection }, |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, i64>(6)?,
-        ))
-    })?;
+    let pending = rows(
+        conn,
+        sql::LOAD_PENDING_ACTIONS,
+        named_params! { ":collection": collection },
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
 
     let mut actions = Vec::new();
-    for row in rows {
-        let (id, created_at, producer, kind, payload, attempts) = row?;
+    for (id, created_at, producer, kind, payload, attempts) in pending {
         actions.push(PimdirPendingAction {
             id,
             created_at,
@@ -1878,8 +1804,13 @@ impl PimdirProducer {
         )?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != sql::VERSION {
-            return Err(PimdirError::Version { found: version });
+        match version {
+            version if version == sql::VERSION => {}
+            // NOTE: an unstamped database is one no owner has opened yet, not
+            // a version this crate cannot read, and the two want different
+            // answers from whoever is holding this handle.
+            0 => return Err(PimdirError::Uncreated),
+            found => return Err(PimdirError::Version { found }),
         }
         check_version_agreement(&conn, version)?;
         check_rename_cascades(&conn)?;
@@ -2580,62 +2511,29 @@ fn read_hub(
         hub.conflict = conflict_from_str(&policy);
     }
 
-    // NOTE: the scoped statements name a `:links` the unscoped ones do not,
-    // and a bound parameter a statement never declared is an error, so each
-    // shape is prepared and bound on its own.
-    match links {
-        Some(links) => {
-            let scope = serde_json::to_string(links).unwrap_or_else(|_| "[]".into());
-            let params = named_params! { ":collection": collection, ":links": scope };
-
-            let mut items = conn.prepare(sql::LOAD_ITEMS_BY_LINK)?;
-            read_hub_items(&mut hub, items.query_map(params, item_from_row)?)?;
-            let mut bindings = conn.prepare(sql::LOAD_BINDINGS_BY_LINK)?;
-            read_hub_bindings(&mut hub, bindings.query_map(params, binding_from_row)?)?;
-        }
-        None => {
-            let params = named_params! { ":collection": collection };
-
-            let mut items = conn.prepare(sql::LOAD_ITEMS)?;
-            read_hub_items(&mut hub, items.query_map(params, item_from_row)?)?;
-            let mut bindings = conn.prepare(sql::LOAD_BINDINGS)?;
-            read_hub_bindings(&mut hub, bindings.query_map(params, binding_from_row)?)?;
-        }
+    // NOTE: the scoped statements name a `:links` the unscoped ones do not, and
+    // a bound parameter a statement never declared is an error, so the scope is
+    // pushed onto the binding list only when there is one.
+    let scope = links.map(|links| serde_json::to_string(links).unwrap_or_else(|_| "[]".into()));
+    let (items_sql, bindings_sql) = match scope {
+        Some(_) => (sql::LOAD_ITEMS_BY_LINK, sql::LOAD_BINDINGS_BY_LINK),
+        None => (sql::LOAD_ITEMS, sql::LOAD_BINDINGS),
+    };
+    let mut params: Vec<(&str, &dyn ToSql)> = vec![(":collection", &collection)];
+    if let Some(scope) = &scope {
+        params.push((":links", scope));
     }
 
-    Ok(hub)
-}
-
-fn read_hub_items<F>(
-    hub: &mut ReplicaHub,
-    rows: rusqlite::MappedRows<'_, F>,
-) -> rusqlite::Result<()>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(ReplicaLinkId, ReplicaHubItem)>,
-{
-    for row in rows {
-        let (link, item) = row?;
+    for (link, item) in rows(conn, items_sql, params.as_slice(), item_from_row)? {
         hub.items.insert(link, item);
     }
-    Ok(())
-}
-
-fn read_hub_bindings<F>(
-    hub: &mut ReplicaHub,
-    rows: rusqlite::MappedRows<'_, F>,
-) -> rusqlite::Result<()>
-where
-    F: FnMut(
-        &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<(ReplicaLinkId, ReplicaSourceId, ReplicaSourceBinding)>,
-{
-    for row in rows {
-        let (link, source, binding) = row?;
+    for (link, source, binding) in rows(conn, bindings_sql, params.as_slice(), binding_from_row)? {
         if let Some(item) = hub.items.get_mut(&link) {
             item.sources.insert(source, binding);
         }
     }
-    Ok(())
+
+    Ok(hub)
 }
 
 /// Persists the change from `old` to `new` for a collection's hub by diffing
@@ -3006,6 +2904,17 @@ fn read_item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
     let sort_key: String = row.get(5)?;
     let level: i64 = row.get(6)?;
 
+    // NOTE: the retained page selects these seven columns and three more, so
+    // one mapper reads both shapes; a live read has nothing past the level.
+    let retention = match row.as_ref().column_count() > 7 {
+        true => Some(PimdirRetention {
+            at: row.get(7)?,
+            by: row.get(8)?,
+            size: row.get::<_, Option<i64>>(9)?.map(|size| size.max(0) as u64),
+        }),
+        false => None,
+    };
+
     Ok(PimdirItem {
         seq,
         link_id: ReplicaLinkId(link),
@@ -3014,6 +2923,7 @@ fn read_item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
         sort_key,
         object: object.map(ReplicaHash),
         level: codec::level_from_int(level),
+        retention,
     })
 }
 
@@ -3163,13 +3073,17 @@ pub enum PimdirError {
     Json(serde_json::Error),
     /// A queue action payload is malformed or unsupported (spec §15.3).
     Action(PimdirActionError),
-    /// The store's schema version is not one this opener can service: newer
-    /// than the crate for an owner, or not yet created for a producer (which
-    /// never creates the schema; the owner must open first).
+    /// The store's schema version is not one this crate services: it was
+    /// written by a newer crate, or by a draft this one no longer reads. The
+    /// spec is a draft, so such a store is recreated, never migrated.
     Version {
         /// The store's `user_version`.
         found: i64,
     },
+    /// The store has no schema yet, and this opener does not create one. A
+    /// producer and a reader both require the owner to have opened it first,
+    /// which is the write that creates the database.
+    Uncreated,
     /// The store's two schema stamps disagree, which spec §4.2 defines as
     /// corruption: `PRAGMA user_version` and `store_meta.version` mirror one
     /// another, so a store where they differ was half-written by something and
@@ -3224,6 +3138,10 @@ impl fmt::Display for PimdirError {
                 f,
                 "pimdir store schema version {found} is unsupported (this crate services version {})",
                 sql::VERSION
+            ),
+            PimdirError::Uncreated => write!(
+                f,
+                "pimdir store has no schema yet: its owner has to create it first"
             ),
             PimdirError::VersionMismatch {
                 user_version,

@@ -126,13 +126,16 @@ The CLI SHALL expose, at minimum:
 Every command SHALL render as JSON under `--json`, write logs to stderr only,
 and carry its own `--help` text.
 
-### Requirement: Diagnostics may read the raw index
+### Requirement: Diagnostics are a library read
 `check` and the object figures of `store info` (object count, bytes, refcount
-drift, dangling references, orphan blobs) SHALL be allowed to query the SQLite
-index directly, read-only, instead of going through the library API. They are
-diagnostics *about* the store's internal consistency, so exposing them as a
-library API would publish invariants the library maintains rather than
-observes. No other verb may bypass the library API.
+drift, dangling references, orphan blobs) SHALL come from the library's
+diagnostics surface, on the handle the verb already holds. No verb opens a
+second connection to the index, and none bypasses the library API.
+
+That surface was the operator tool's own read while the library only
+*maintained* those invariants; it belongs to the library now that the library
+also repairs them, since a repair whose findings a caller cannot read is the
+worse seam.
 
 The drift check SHALL count exactly what the write path maintains: an item's
 body, an item's conflict copy, each source's stored base, and each queue row

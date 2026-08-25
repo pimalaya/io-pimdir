@@ -41,7 +41,6 @@ impl StoreInfoCommand {
     /// Prints the summary.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         let path = store.dir().display().to_string();
-        let db = store.db()?;
         let read = store.read()?;
 
         let mut collections = Vec::new();
@@ -61,13 +60,13 @@ impl StoreInfoCommand {
             });
         }
 
-        let objects = db.object_stats()?;
-        let live_bytes = db.live_bytes()?;
+        let objects = read.object_stats().map_err(report)?;
+        let live_bytes = read.live_bytes().map_err(report)?;
         let retained_bytes = read.retained_bytes().map_err(report)?;
 
         printer.out(StoreInfoOutput {
             path,
-            schema_version: db.version()?,
+            schema_version: io_pimdir::sql::VERSION,
             supported_schema_version: io_pimdir::sql::VERSION,
             sources: read.distinct_sources().map_err(report)?,
             collections,

@@ -124,17 +124,18 @@ fn an_expunge_retains_the_item_and_its_body() {
     let retained = store.list_retained(&inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].seq, seq);
-    assert_eq!(retained[0].link_id, "mid:a");
+    assert_eq!(retained[0].link_id.0, "mid:a");
     assert!(retained[0].flags.contains("\\Seen"));
     assert_eq!(retained[0].level, ReplicaLevel::Full);
-    assert_eq!(retained[0].meta.as_deref(), Some("{\"v\":1}"));
-    assert_eq!(retained[0].object_hash.as_deref(), Some("cafebabe"));
-    assert_eq!(retained[0].size, Some(3));
-    assert_eq!(retained[0].retained_by.as_deref(), Some("local"));
+    assert_eq!(retained[0].meta, Some(ReplicaMeta("{\"v\":1}".into())));
+    assert_eq!(retained[0].object, Some(ReplicaHash("cafebabe".into())));
+    let retention = retained[0].retention.as_ref().expect("a retained row");
+    assert_eq!(retention.size, Some(3));
+    assert_eq!(retention.by.as_deref(), Some("local"));
     assert!(
-        retained[0].retained_at.ends_with('Z'),
+        retention.at.ends_with('Z'),
         "an RFC 3339 stamp: {}",
-        retained[0].retained_at
+        retention.at
     );
     assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
     assert_eq!(store.retained_bytes().unwrap(), 3);
@@ -256,10 +257,10 @@ fn a_queued_add_restores_a_retained_item() {
         .enqueue(
             "INBOX",
             &PimdirAction::Add {
-                link_id: Some(ReplicaLinkId(retained.link_id.clone())),
+                link_id: Some(retained.link_id.clone()),
                 flags: retained.flags.clone(),
-                object: retained.object_hash.clone().map(ReplicaHash),
-                meta: retained.meta.clone().map(ReplicaMeta),
+                object: retained.object.clone(),
+                meta: retained.meta.clone(),
                 handle: None,
             },
             None,
@@ -366,7 +367,7 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
         .list_retained(&inbox(), None, 10)
         .unwrap()
         .into_iter()
-        .map(|item| item.link_id)
+        .map(|item| item.link_id.0)
         .collect();
     assert_eq!(kept, ["mid:edge", "mid:new"]);
     assert!(blob_exists(dir.path(), "beef0000"));
@@ -441,7 +442,10 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     let retained = right.list_retained(&inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(
-        retained[0].retained_by.as_deref(),
+        retained[0]
+            .retention
+            .as_ref()
+            .and_then(|retention| retention.by.as_deref()),
         Some("right"),
         "the source whose removal retired it"
     );
@@ -467,12 +471,12 @@ fn the_retained_page_is_keyed_on_seq_and_exclusive() {
     // The live item never shows up in the trash, whatever the page.
     let page = store.list_retained(&inbox(), None, 1).unwrap();
     assert_eq!(page.len(), 1);
-    assert_eq!(page[0].link_id, "mid:a");
+    assert_eq!(page[0].link_id.0, "mid:a");
     let next = store
         .list_retained(&inbox(), Some(page[0].seq), 10)
         .unwrap();
     assert_eq!(next.len(), 1);
-    assert_eq!(next[0].link_id, "mid:c");
+    assert_eq!(next[0].link_id.0, "mid:c");
     assert!(
         store
             .list_retained(&inbox(), Some(next[0].seq), 10)

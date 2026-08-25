@@ -36,6 +36,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The same code, once.** A pure refactor, no behaviour attached: fourteen reads that each wrote out prepare-map-push-return share one `rows` helper; the statements and the `sql::ALL` index are declared by one macro, so the two tests that re-read this crate's own source to keep them in step are gone; `PimdirRetainedItem` is folded into `PimdirItem` as an optional `retention`, read by one row mapper instead of two; the operator tool's second read-only connection (`PimdirDb`) is folded onto the store as a diagnostics block; `park` becomes a call to `fail_action`. Breaking: `PimdirRetainedItem` no longer exists, `PimdirPlacement` carries the same typed columns as every other read (`ReplicaLinkId`, `ReplicaFlags`, `ReplicaLevel`), and `PimdirError::Version` splits into `Version` (a schema this crate does not service) and `Uncreated` (no schema yet, which only an owner creates).
+
 - **`check` diagnoses and `--fix` repairs; neither reclaims.** `--fix` used to delete orphan blob files behind a `--grace` window and a confirmation prompt, while every write swept with neither. Both flags are gone: it now recomputes the drifted refcounts from the pointers that justify them and clears the bindings whose item is gone, which destroys nothing and needs no guard. Orphan files are reported, and `pimdir gc` takes them.
 
 - **A purge reports the rows it retired, not the bytes it reclaimed.** It releases the references a retained item held; the bodies are freed by the collector, which is what can report them. `PimdirPurgeReport` loses its `bytes` field and `item purge` its byte count.

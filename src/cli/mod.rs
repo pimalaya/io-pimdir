@@ -1,7 +1,7 @@
 //! The `pimdir` command tree, one module per verb group.
 //!
 //! Each module owns one group of subcommands ([`collection`], [`item`],
-//! [`queue`], [`store`], [`check`], [`export`]) and renders its own output as
+//! [`queue`], [`store`], [`check`], [`gc`], [`export`]) and renders its own output as
 //! both text and JSON. This module holds what they share: the global store
 //! flags, the roles a verb may open the store with, the human-facing
 //! error mapping, the confirmation prompt guarding destructive verbs and the
@@ -13,7 +13,6 @@
 
 pub mod check;
 pub mod collection;
-pub mod db;
 pub mod export;
 pub mod gc;
 pub mod item;
@@ -30,8 +29,6 @@ use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirStore};
 use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
-
-use crate::cli::db::PimdirDb;
 
 /// The producer name recorded on every queue row this tool appends, so an
 /// operator reading `queue list` can tell CLI-originated actions apart from a
@@ -142,12 +139,6 @@ impl StoreFlags {
     pub fn blobs(&self) -> Result<PimdirBlobs> {
         let store = PimdirStore::open_read_only(&self.store).map_err(report)?;
         Ok(store.blobs())
-    }
-
-    /// The read-only diagnostic connection (see [`db`]).
-    pub fn db(&self) -> Result<PimdirDb> {
-        self.ensure_store()?;
-        PimdirDb::open(&self.store)
     }
 }
 

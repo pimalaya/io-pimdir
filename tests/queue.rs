@@ -675,8 +675,8 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
     let fresh = tempfile::tempdir().unwrap();
     rusqlite::Connection::open(fresh.path().join("pimdir.db")).unwrap();
     match PimdirProducer::open(fresh.path(), "test") {
-        Err(PimdirError::Version { found: 0 }) => {}
-        Err(other) => panic!("expected a version refusal, got {other:?}"),
-        Ok(_) => panic!("expected a version refusal, got a producer"),
+        Err(PimdirError::Uncreated) => {}
+        Err(other) => panic!("expected an uncreated-store refusal, got {other:?}"),
+        Ok(_) => panic!("expected an uncreated-store refusal, got a producer"),
     }
 }

@@ -21,11 +21,9 @@ use clap::Args;
 use pimalaya_cli::printer::Printer;
 use serde::Serialize;
 
-use crate::cli::{
-    StoreFlags, bytes,
-    db::{PimdirAmbiguous, PimdirDangling, PimdirRefcountDrift},
-    report,
-};
+use io_pimdir::{PimdirAmbiguous, PimdirDangling, PimdirRefcountDrift};
+
+use crate::cli::{StoreFlags, bytes, report};
 
 /// How many entries of each kind the text output prints before summarising the
 /// rest. The JSON output always carries them all.
@@ -52,9 +50,9 @@ pub struct CheckCommand {
 impl CheckCommand {
     /// Runs the check, and the repairs when asked.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
-        let db = store.db()?;
-        let indexed = db.hashes()?;
-        let on_disk = store.blobs()?.files()?;
+        let read = store.read()?;
+        let indexed = read.indexed_hashes().map_err(report)?;
+        let on_disk = read.blobs().files()?;
 
         let mut orphans = Vec::new();
         let mut orphan_bytes = 0;
@@ -72,18 +70,18 @@ impl CheckCommand {
             .cloned()
             .collect();
 
-        let drift = db.refcount_drift()?;
-        let dangling = db.dangling()?;
-        let ambiguous = db.ambiguous_bindings()?;
+        let drift = read.refcount_drift().map_err(report)?;
+        let dangling = read.dangling().map_err(report)?;
+        let ambiguous = read.ambiguous_bindings().map_err(report)?;
 
         let mut repaired = 0;
         let mut cleared = 0;
 
         if self.fix && (!drift.is_empty() || !dangling.is_empty()) {
-            // NOTE: the read-only diagnostic connection cannot write, and the
-            // repair takes the owner role like every other write this tool
-            // makes. Dropped first, so the two never hold the store at once.
-            drop(db);
+            // NOTE: the read-only handle cannot write, and the repair takes the
+            // owner role like every other write this tool makes. Dropped first,
+            // so the two never hold the store at once.
+            drop(read);
             let owner = store.owner()?;
             repaired = owner.recompute_refcounts().map_err(report)?;
             cleared = owner.clear_dangling_bindings().map_err(report)?;

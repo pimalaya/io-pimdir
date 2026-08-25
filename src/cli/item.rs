@@ -14,11 +14,11 @@ use std::{
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
-use io_pimdir::{PimdirItem, PimdirRetainedItem, PimdirStore, codec::PimdirAction};
+use io_pimdir::{PimdirItem, PimdirStore, codec::PimdirAction};
 use io_replica::{
     collection::ReplicaCollectionId,
     object::ReplicaHash,
-    placement::{ReplicaFlags, ReplicaLevel, ReplicaLinkId, ReplicaMeta},
+    placement::{ReplicaFlags, ReplicaLevel},
 };
 use log::warn;
 use pimalaya_cli::{
@@ -110,14 +110,14 @@ impl ItemListCommand {
                 .list_retained(&collection, after, probe)
                 .map_err(report)?
                 .into_iter()
-                .map(|item| ItemRow::retained(&self.collection, &item))
+                .map(|item| ItemRow::new(&self.collection, &item))
                 .collect()
         } else {
             store
                 .list_items(&self.collection, self.after.as_deref(), probe)
                 .map_err(report)?
                 .into_iter()
-                .map(|item| ItemRow::live(&self.collection, &item))
+                .map(|item| ItemRow::new(&self.collection, &item))
                 .collect()
         };
 
@@ -155,7 +155,6 @@ pub struct ItemShowCommand {
 impl ItemShowCommand {
     /// Prints every placement of the item.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
-        let db = store.db().ok();
         let read = store.read()?;
         let found = locate(&read, self.seq, self.collection.as_deref())?;
 
@@ -170,7 +169,7 @@ impl ItemShowCommand {
                 row.size = row
                     .object
                     .as_deref()
-                    .and_then(|hash| db.as_ref().and_then(|db| db.object_size(hash).ok()))
+                    .and_then(|hash| read.object_size(hash).ok())
                     .flatten();
                 row
             })
@@ -284,13 +283,14 @@ impl ItemRestoreCommand {
             locate(&read, self.seq, self.collection.as_deref())?,
             self.seq,
         )?;
-        let FoundItem::Retained(item) = &found.item else {
+        let item = &found.item;
+        if item.retention.is_none() {
             bail!(
                 "seq {} is already live in {}: only a retained item can be restored",
                 self.seq,
                 found.collection
             );
-        };
+        }
         drop(read);
 
         // NOTE: resolved before the enqueue, so an unresolvable write source
@@ -298,10 +298,10 @@ impl ItemRestoreCommand {
         let source = store.write_source()?;
 
         let action = PimdirAction::Add {
-            link_id: Some(ReplicaLinkId(item.link_id.clone())),
+            link_id: Some(item.link_id.clone()),
             flags: item.flags.clone(),
-            object: item.object_hash.clone().map(ReplicaHash),
-            meta: item.meta.clone().map(ReplicaMeta),
+            object: item.object.clone(),
+            meta: item.meta.clone(),
             handle: None,
         };
         // NOTE: no size, since the body is already indexed: the retained row
@@ -337,7 +337,7 @@ impl ItemRestoreCommand {
         printer.out(ItemRestoreOutput {
             seq: self.seq,
             collection: found.collection,
-            link_id: item.link_id.clone(),
+            link_id: item.link_id.0.clone(),
             action: id,
             status,
         })
@@ -391,8 +391,8 @@ impl ItemPurgeCommand {
         };
 
         let preview = store
-            .db()
-            .and_then(|db| db.retained_before(&cutoff))
+            .read()
+            .and_then(|read| read.retained_before(&cutoff).map_err(report))
             .map_err(|err| warn!("cannot preview what this purge would destroy: {err}"))
             .ok();
 
@@ -420,13 +420,13 @@ impl ItemPurgeCommand {
     fn purge_one(&self, printer: &mut impl Printer, store: &StoreFlags, seq: i64) -> Result<()> {
         let read = store.read()?;
         let found = one(locate(&read, seq, self.collection.as_deref())?, seq)?;
-        let FoundItem::Retained(item) = &found.item else {
+        let Some(retention) = &found.item.retention else {
             bail!(
                 "seq {seq} is live in {}: purge only destroys retained items, remove it first",
                 found.collection
             );
         };
-        let size = item.size.unwrap_or(0);
+        let size = retention.size.unwrap_or(0);
         drop(read);
 
         confirm(
@@ -454,43 +454,27 @@ impl ItemPurgeCommand {
     }
 }
 
-/// One item found in a collection, live or retained.
-enum FoundItem {
-    /// A live item, as the read surface returns it.
-    Live(PimdirItem),
-    /// A retained item, as the retention surface returns it.
-    Retained(PimdirRetainedItem),
-}
-
-/// A located item together with the collection holding it.
+/// A located item together with the collection holding it. Retained or live is
+/// the item's own `retention`, not a shape of its own.
 struct Found {
     collection: String,
-    item: FoundItem,
+    item: PimdirItem,
 }
 
 impl Found {
     /// The item's body hash, when it has one.
     fn object(&self) -> Option<&String> {
-        match &self.item {
-            FoundItem::Live(item) => item.object.as_ref().map(|hash| &hash.0),
-            FoundItem::Retained(item) => item.object_hash.as_ref(),
-        }
+        self.item.object.as_ref().map(|hash| &hash.0)
     }
 
     /// The item's detail level.
     fn level(&self) -> ReplicaLevel {
-        match &self.item {
-            FoundItem::Live(item) => item.level,
-            FoundItem::Retained(item) => item.level,
-        }
+        self.item.level
     }
 
     /// The item as a printable row.
     fn row(&self) -> ItemRow {
-        match &self.item {
-            FoundItem::Live(item) => ItemRow::live(&self.collection, item),
-            FoundItem::Retained(item) => ItemRow::retained(&self.collection, item),
-        }
+        ItemRow::new(&self.collection, &self.item)
     }
 }
 
@@ -510,17 +494,11 @@ fn locate(store: &PimdirStore, seq: i64, collection: Option<&str>) -> Result<Vec
     let mut found = Vec::new();
     for collection in collections {
         if let Some(item) = store.get_item(&collection, seq).map_err(report)? {
-            found.push(Found {
-                collection,
-                item: FoundItem::Live(item),
-            });
+            found.push(Found { collection, item });
             continue;
         }
         if let Some(item) = retained(store, &collection, seq)? {
-            found.push(Found {
-                collection,
-                item: FoundItem::Retained(item),
-            });
+            found.push(Found { collection, item });
         }
     }
 
@@ -532,7 +510,7 @@ fn locate(store: &PimdirStore, seq: i64, collection: Option<&str>) -> Result<Vec
 /// The retained listing is keyset-paged on `seq` in ascending order, so asking
 /// for the single row after `seq - 1` either answers with `seq` itself or
 /// proves it is not retained here.
-fn retained(store: &PimdirStore, collection: &str, seq: i64) -> Result<Option<PimdirRetainedItem>> {
+fn retained(store: &PimdirStore, collection: &str, seq: i64) -> Result<Option<PimdirItem>> {
     let collection = ReplicaCollectionId(collection.to_string());
     let page = store
         .list_retained(&collection, Some(seq - 1), 1)
@@ -596,8 +574,9 @@ pub struct ItemRow {
 }
 
 impl ItemRow {
-    /// A live item's row.
-    fn live(collection: &str, item: &PimdirItem) -> Self {
+    /// One item's row, live or retained.
+    fn new(collection: &str, item: &PimdirItem) -> Self {
+        let retention = item.retention.as_ref();
         Self {
             collection: collection.to_string(),
             seq: item.seq,
@@ -605,26 +584,10 @@ impl ItemRow {
             flags: flag_list(&item.flags),
             level: level_name(item.level),
             object: item.object.as_ref().map(|hash| hash.0.clone()),
-            size: None,
+            size: retention.and_then(|retention| retention.size),
             meta: item.meta.as_ref().map(|meta| meta.0.clone()),
-            retained_at: None,
-            retained_by: None,
-        }
-    }
-
-    /// A retained item's row.
-    fn retained(collection: &str, item: &PimdirRetainedItem) -> Self {
-        Self {
-            collection: collection.to_string(),
-            seq: item.seq,
-            link_id: item.link_id.clone(),
-            flags: flag_list(&item.flags),
-            level: level_name(item.level),
-            object: item.object_hash.clone(),
-            size: item.size,
-            meta: item.meta.clone(),
-            retained_at: Some(item.retained_at.clone()),
-            retained_by: item.retained_by.clone(),
+            retained_at: retention.map(|retention| retention.at.clone()),
+            retained_by: retention.and_then(|retention| retention.by.clone()),
         }
     }
 

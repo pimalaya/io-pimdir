@@ -27,8 +27,8 @@
 //! ## Layout
 //!
 //! [`cli`] holds the command tree, one module per verb group, plus the shared
-//! store flags, the role handling and the read-only diagnostic connection the
-//! consistency checks use. The library the whole thing is a skin over is
+//! store flags and the role handling. The library the whole thing is a skin
+//! over is
 //! [`io_pimdir`]; the specification of this tool lives in the repository's
 //! `cairn/spec/cli.md`.
 
