@@ -1,59 +1,53 @@
-//! The canonical pimdir SQL, inlined verbatim from the spec so the crate is
-//! self-contained. Kept in sync with `pimdir/migrations/` and
-//! `pimdir/queries/`; the spec is the source of truth.
+//! The canonical pimdir SQL, inlined verbatim from the spec so the crate
+//! is self-contained. Kept in sync with `pimdir/migrations/` and
+//! `pimdir/queries/`, where the source of truth is.
 //!
-//! A store keeps one shared **item** per logical thing (its truth: flags, body,
-//! summary), and one **binding** per source that syncs it (that source's last
-//! agreed base). A single-source store is the degenerate case of one binding per
-//! item; a two-source store (two servers, or a server and a phone) keeps two.
+//! A store keeps one shared item per logical thing (its flags, body and
+//! summary) and one binding per source that syncs it (that source's last
+//! agreed base). A single-source store is the degenerate case of one
+//! binding per item; a two-source store keeps two.
 
 /// The current schema version.
 pub const VERSION: i64 = 1;
 
-/// Indexes an earlier draft created under the same name over different columns,
-/// as `(name, the columns it must hold now)`.
+/// Indexes an earlier draft created under the same name over different
+/// columns, as `(name, the columns it must hold now)`.
 ///
-/// [`ENSURE_INDEXES`] cannot repair one: `CREATE INDEX IF NOT EXISTS` keys on
-/// the name, so it silently leaves the old shape in place and the store keeps
-/// planning the read the way the schema no longer says. Such an index is dropped
-/// on open when its columns disagree, and the batch then recreates it.
+/// [`ENSURE_INDEXES`] cannot repair one: `CREATE INDEX IF NOT EXISTS`
+/// keys on the name, so it leaves the old shape in place and the store
+/// keeps planning the read the schema no longer says. Such an index is
+/// dropped on open when its columns disagree, then recreated.
 ///
-/// Checked rather than dropped unconditionally, since rebuilding an index of a
-/// large store on every open is the cost this exists to avoid.
+/// Checked rather than dropped unconditionally, since rebuilding a large
+/// store's index on every open is the cost this exists to avoid.
 pub const RESHAPED_INDEXES: &[(&str, &[&str])] = &[
-    // Was (collection, retained_at) while `list_retained_page` still paged by
-    // `link_id`. The page moved to the public `seq` (spec §14.1) and the index
-    // with it; a store keeping the old one sorts every retained row of the
-    // collection to return one page.
+    // NOTE: was (collection, retained_at) while `list_retained_page`
+    // still paged by `link_id`. A store keeping the old one sorts every
+    // retained row of the collection to return one page.
     ("items_retained", &["collection", "seq"]),
 ];
 
-/// Declares the module's statements and the [`ALL`] index in one expansion.
-///
-/// The index used to be written out by hand beside the constants and kept
-/// honest by two tests that re-read this file's source: one statement, three
-/// places to add it, and a guard whose job was to notice when somebody added it
-/// to two. Declaring both from one list is what removes the gap rather than
-/// reporting it.
+/// Declares the module's statements and the [`ALL`] index in one
+/// expansion, so a new statement is added in one place rather than three.
 macro_rules! statements {
     ($($(#[$doc:meta])* $name:ident = $sql:expr;)*) => {
         $($(#[$doc])* pub const $name: &str = $sql;)*
 
         /// Every statement in this module, paired with its constant name.
         ///
-        /// The way a consumer without the `client` feature reaches the canonical
-        /// SQL: it holds its own SQLite driver (an Android app runs the
-        /// platform's), so it needs the statements by name rather than a Rust
-        /// accessor per statement. [`MIGRATION_0001`] is included, since creating
-        /// the database is as much a consumer's job as querying it; [`VERSION`]
-        /// is not, being an integer and not a statement.
+        /// How a consumer without the `client` feature reaches the
+        /// canonical SQL: it holds its own SQLite driver, so it needs the
+        /// statements by name rather than a Rust accessor each.
+        /// [`MIGRATION_0001`] is included, creating the database being as
+        /// much a consumer's job as querying it; [`VERSION`] is not,
+        /// being an integer.
         pub const ALL: &[(&str, &str)] = &[$((stringify!($name), $name)),*];
     };
 }
 
-// NOTE: the statements below are not indented into the macro invocation. Half
-// of them are raw strings holding the spec's SQL verbatim, and indenting the
-// invocation would rewrite that text.
+// NOTE: the statements below are not indented into the macro invocation:
+// half of them are raw strings holding the spec's SQL verbatim, and
+// indenting would rewrite that text.
 statements! {
 /// Schema version 1 (`migrations/0001_init.sql`), the whole draft schema
 /// including the action queue and collection generations. Applied to a fresh
@@ -269,24 +263,24 @@ LOAD_CONFLICT = "SELECT conflict FROM collections WHERE id = :collection";
 /// Loads a whole collection for the sync seam: every item, tombstones
 /// included, unpaginated and unordered.
 ///
-/// Retained (soft-deleted) rows are excluded. That is what makes retention safe
-/// under io-replica's contract: the merge reconciles only what `load` returns,
-/// so a hidden row is never re-derived, on a delta or a full resync.
+/// Retained (soft-deleted) rows are excluded, which is what makes
+/// retention safe under io-replica's contract: the merge reconciles only
+/// what `load` returns, so a hidden row is never re-derived.
 ///
-/// `sort_key` rides along so the round trip preserves it: the engine now
-/// carries the key on a placement, so a load that dropped it would hand every
-/// save an unknown key and the update below would write that back, erasing on
-/// every sync what the last one derived (spec §9.3).
+/// `sort_key` rides along so the round trip preserves it: the engine
+/// carries the key on a placement, so a load that dropped it would hand
+/// every save an unknown key and erase on every sync what the last one
+/// derived (spec §9.3).
 LOAD_ITEMS = "\
 SELECT link_id, flags, object_hash, meta, sort_key, level, deleted, conflicted, conflict_object \
 FROM items WHERE collection = :collection AND retained_at IS NULL";
 
 /// The same rows, narrowed to the link ids one write batch touches (spec §14).
 ///
-/// A write folds its batch into the hub and persists the difference, and that
-/// difference only ever names rows the batch named: reading the rest costs a
-/// full pass over the collection to compute nothing. It is the whole cost of a
-/// small write, and it grows with the mailbox rather than with the batch.
+/// A write folds its batch into the hub and persists the difference, and
+/// that difference only names rows the batch named: reading the rest
+/// costs a full pass over the collection to compute nothing, growing
+/// with the mailbox rather than with the batch.
 LOAD_ITEMS_BY_LINK = "\
 SELECT link_id, flags, object_hash, meta, sort_key, level, deleted, conflicted, conflict_object \
 FROM items WHERE collection = :collection AND retained_at IS NULL \
@@ -312,64 +306,64 @@ FROM collections WHERE account IS :account ORDER BY sort_order IS NULL, sort_ord
 LIST_ACCOUNTS = "\
 SELECT DISTINCT account FROM collections WHERE account IS NOT NULL ORDER BY account";
 
-/// A keyset page of a collection's live items in **link-id order**. `:after` is
-/// the exclusive lower bound on `link_id` (the empty string starts from the
-/// beginning, since a `link_id` is never empty); rides the `items` primary key,
-/// no extra index.
+/// A keyset page of a collection's live items in link-id order. `:after`
+/// is the exclusive lower bound on `link_id`, the empty string starting
+/// from the beginning since a `link_id` is never empty; rides the `items`
+/// primary key, with no extra index.
 ///
-/// Link-id order means nothing to a reader: this is the page for a sweep that
-/// must see every item exactly once (an export, a re-projection). A reader
-/// presenting a list wants one of the two ordered pages below.
+/// Link-id order means nothing to a reader: this is the page for a sweep
+/// that must see every item exactly once. A reader presenting a list
+/// wants one of the two ordered pages below.
 LIST_ITEMS_PAGE = "\
 SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
 WHERE collection = :collection AND deleted = 0 AND link_id > :after \
 ORDER BY link_id LIMIT :limit";
 
-/// A keyset page of a collection's live items in the kind's own **ascending**
-/// order (spec §9.3): A to Z for contacts, earliest first for mail and
-/// calendars.
+/// A keyset page of a collection's live items in the kind's own
+/// ascending order (spec §9.3): A to Z for contacts, earliest first for
+/// mail and calendars.
 ///
-/// The cursor is the pair `(:after_key, :after_seq)`, because a sort key is not
-/// unique: two messages share a timestamp, two contacts share a name. `seq`
-/// breaks the tie, and being unique per collection it makes the page total. The
-/// empty string with seq 0 starts from the beginning, since no real key sorts
-/// before an unknown one ascending.
+/// The cursor is the pair `(:after_key, :after_seq)`, because a sort key
+/// is not unique: two messages share a timestamp, two contacts a name.
+/// `seq` breaks the tie and, being unique per collection, makes the page
+/// total. The empty string with seq 0 starts from the beginning, since
+/// no real key sorts before an unknown one ascending.
 LIST_ITEMS_PAGE_ASC = "\
 SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
 WHERE collection = :collection AND deleted = 0 \
 AND (sort_key, seq) > (:after_key, :after_seq) \
 ORDER BY sort_key, seq LIMIT :limit";
 
-/// The same page **descending**: newest first for mail and calendars, Z to A for
-/// contacts.
+/// The same page descending: newest first for mail and calendars, Z to A
+/// for contacts.
 ///
-/// The first page binds a NULL cursor rather than a key above every other one:
-/// a sort key is arbitrary text a writer derives, so no value is reserved and
-/// "the largest key the store can hold" is not expressible. A sentinel would
-/// hide everything sorting above it from every descending page, for good, while
-/// the count still reported it. The comparison stays a keyset one, so the index
-/// still serves it.
+/// The first page binds a NULL cursor rather than a key above every other
+/// one: a sort key is arbitrary text a writer derives, so no value is
+/// reserved and "the largest key the store can hold" is not expressible.
+/// A sentinel would hide everything sorting above it from every
+/// descending page, for good. The comparison stays a keyset one, so the
+/// index still serves it.
 LIST_ITEMS_PAGE_DESC = "\
 SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
 WHERE collection = :collection AND deleted = 0 \
 AND (:after_key IS NULL OR (sort_key, seq) < (:after_key, :after_seq)) \
 ORDER BY sort_key DESC, seq DESC LIMIT :limit";
 
-/// Restates one item's ordering key, for a re-projection that derives sort keys
-/// for items already stored: a store written before its kind had a convention,
-/// one whose convention changed, or a consumer whose sync engine does not carry
-/// the key inline yet (spec §9.3). Not part of the ordinary write path.
+/// Restates one item's ordering key, for a re-projection over items
+/// already stored: a store written before its kind had a convention, one
+/// whose convention changed, or a consumer whose sync engine does not
+/// carry the key inline (spec §9.3). Not the ordinary write path.
 SET_SORT_KEY = "\
 UPDATE items SET sort_key = :sort_key \
 WHERE collection = :collection AND link_id = :link_id";
 
-/// Fetches one live item by its public id (`seq`) — the client-facing key.
+/// Fetches one live item by its public id (`seq`), the client-facing key.
 GET_ITEM = "\
 SELECT seq, link_id, flags, object_hash, meta, sort_key, level FROM items \
 WHERE collection = :collection AND seq = :seq AND deleted = 0";
 
-/// Resolves an item's public id (`seq`) from its internal `link_id` — the inverse
-/// of `GET_ITEM`, for a consumer that just staged an add and wants the new id.
+/// Resolves an item's public id (`seq`) from its internal `link_id`, the
+/// inverse of `GET_ITEM`, for a consumer that just staged an add.
 SEQ_BY_LINK =
     "SELECT seq FROM items WHERE collection = :collection AND link_id = :link_id";
 
@@ -377,10 +371,10 @@ SEQ_BY_LINK =
 COUNT_ITEMS =
     "SELECT count(*) FROM items WHERE collection = :collection AND deleted = 0";
 
-/// Every live placement of one identity, with the collection and account it
-/// sits in (spec §9.2). The store reports where a link id occurs and takes no
-/// position on whether the placements are one thing: a mail view lists them, a
-/// contact view may offer to merge them, off the same rows.
+/// Every live placement of one identity, with the collection and account
+/// it sits in (spec §9.2). The store reports where a link id occurs and
+/// takes no position on whether the placements are one thing: a mail view
+/// lists them, a contact view may offer to merge them, off these rows.
 LIST_LINK_PLACEMENTS = "\
 SELECT i.collection, c.account, i.seq, i.object_hash, i.flags, i.level \
 FROM items i JOIN collections c ON c.id = i.collection \
@@ -395,8 +389,9 @@ FROM items i JOIN collections c ON c.id = i.collection \
 WHERE i.object_hash = :hash AND i.deleted = 0 AND i.retained_at IS NULL \
 ORDER BY c.account IS NULL, c.account, i.collection";
 
-/// The distinct source names the store has synced (across all collections), so a
-/// client can discover which source to attribute its writes to.
+/// The distinct source names the store has synced, across all
+/// collections, so a client discovers which source to attribute writes
+/// to.
 LIST_SOURCES = "SELECT DISTINCT source FROM bindings ORDER BY source";
 
 /// Loads every per-source binding of a collection: the stored base (handle,
@@ -414,12 +409,12 @@ conflicted, conflict_revision, ambiguous_handles \
 FROM bindings WHERE collection = :collection \
   AND link_id IN (SELECT value FROM json_each(:links))";
 
-/// Whether a collection holds a live (non-retained, non-deleted) item under a
-/// link id: the collision check a queued `add` runs before staging.
+/// Whether a collection holds a live item under a link id: the collision
+/// check a queued `add` runs before staging.
 ///
-/// A point read on the items primary key, because it runs once per drained
-/// action: answering it by loading the collection makes a drain of N actions
-/// cost N passes over the mailbox.
+/// A point read on the items primary key, because it runs once per
+/// drained action: answering it by loading the collection would make a
+/// drain of N actions cost N passes over the mailbox.
 LIVE_ITEM_FOR_LINK = "\
 SELECT seq FROM items \
 WHERE collection = :collection AND link_id = :link_id \
@@ -434,8 +429,8 @@ WHERE collection = :collection AND link_id = :link_id AND source = :source";
 /// The link id one source's handle is bound to, for a batch that drops a
 /// placement: a drop names a handle, and the hub is keyed by link id.
 ///
-/// Served by the `bindings_by_handle` index, so resolving it is a seek rather
-/// than the scan over every item a whole-collection load would answer it with.
+/// Served by the `bindings_by_handle` index, so resolving it is a seek
+/// rather than a scan over every item.
 LINK_FOR_HANDLE = "\
 SELECT link_id FROM bindings \
 WHERE collection = :collection AND source = :source AND handle = :handle";
@@ -448,9 +443,9 @@ LOAD_CHECKPOINT =
 /// has one (in any collection), so all placements of a message share one id.
 SEQ_FOR_LINK_ANY = "SELECT seq FROM items WHERE link_id = :link_id LIMIT 1";
 
-/// Hands out (and advances) the store-global next public id via `RETURNING`. The
-/// counter only ever increases, so a `seq` is never reused. Run only when the
-/// message has no id yet.
+/// Hands out, and advances, the store-global next public id via
+/// `RETURNING`. The counter only ever increases, so a `seq` is never
+/// reused. Run only when the message has no id yet.
 BUMP_NEXT_SEQ =
     "UPDATE store_meta SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1";
 
@@ -471,21 +466,20 @@ WHERE collection = :collection AND link_id = :link_id";
 // deleting it, a reappearing link id revives it, and purge is the only true
 // delete.
 
-/// Retires one item: it stands exactly where a hard-deleting store would have
-/// issued its delete. The row keeps its `object_hash`, so the body keeps its
-/// reference and its blob survives the sweep. SQLite stamps the instant itself,
-/// so no clock is plumbed through the crate to reach this statement; a purge's
-/// *cutoff* is by contrast the caller's parameter, which keeps the tests
-/// deterministic.
+/// Retires one item: it stands exactly where a hard-deleting store would
+/// have issued its delete. The row keeps its `object_hash`, so the body
+/// keeps its reference and its blob survives the sweep. SQLite stamps the
+/// instant itself, so no clock is plumbed through the crate; a purge's
+/// cutoff is by contrast the caller's parameter.
 RETAIN_ITEM = "\
 UPDATE items SET deleted = 1, \
 retained_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), retained_by = :source \
 WHERE collection = :collection AND link_id = :link_id";
 
-/// Deletes every binding of one item, for the retire path: the row survives, but
-/// no source holds it, so no base does either (a delete would have cascaded).
-/// A retained row carrying no binding at all is the persisted form of "the
-/// removal has finished propagating" (spec §11).
+/// Deletes every binding of one item, for the retire path: the row
+/// survives, but no source holds it, so no base does either. A retained
+/// row carrying no binding is the persisted form of "the removal has
+/// finished propagating" (spec §11).
 DELETE_ITEM_BINDINGS =
     "DELETE FROM bindings WHERE collection = :collection AND link_id = :link_id";
 
@@ -495,11 +489,10 @@ RETAINED_ITEM = "\
 SELECT seq, object_hash, conflict_object FROM items \
 WHERE collection = :collection AND link_id = :link_id AND retained_at IS NOT NULL";
 
-/// Revives a retained row: the link id is back (a source-side resurrection, or a
-/// client `add`), so it stops being retained instead of conflicting on the
-/// primary key. The caller adopts the new content with `UPDATE_ITEM` in the same
-/// transaction. The row keeps its `seq`, so a restored item keeps the public id
-/// it always had.
+/// Revives a retained row: the link id is back, from a source-side
+/// resurrection or a client `add`, so it stops being retained instead of
+/// conflicting on the primary key. The caller adopts the new content with
+/// `UPDATE_ITEM` in the same transaction, and the row keeps its `seq`.
 REVIVE_ITEM = "\
 UPDATE items SET deleted = 0, retained_at = NULL, retained_by = NULL \
 WHERE collection = :collection AND link_id = :link_id";
@@ -508,10 +501,10 @@ WHERE collection = :collection AND link_id = :link_id";
 /// row still pins (`NULL` when unhydrated): the trash listing beside
 /// `LIST_ITEMS_PAGE`, and the only read that returns them.
 ///
-/// `:after` is the exclusive lower bound on the public `seq`, with 0 starting
-/// from the beginning: a real sentinel rather than an invented one, since `seq`
-/// is handed out from 1. A caller pages the trash by the same small integer it
-/// purges and restores by, and never sees the internal `link_id`.
+/// `:after` is the exclusive lower bound on the public `seq`, 0 starting
+/// from the beginning: a real sentinel rather than an invented one, since
+/// `seq` is handed out from 1. A caller pages the trash by the same small
+/// integer it purges and restores by.
 LIST_RETAINED_PAGE = "\
 SELECT i.seq, i.link_id, i.flags, i.object_hash, i.meta, i.sort_key, i.level, \
 i.retained_at, i.retained_by, o.size \
@@ -523,13 +516,13 @@ ORDER BY i.seq LIMIT :limit";
 /// idempotent batch: a store written by an earlier draft has the tables but not
 /// these, and an index is not something a reader can do without.
 ///
-/// Run on open rather than only when a column is missing, because most of these
-/// index columns that were always there: what changed is that a statement now
-/// needs them. A store that kept the old plans would keep scanning where the
-/// schema says it seeks, silently and for good.
+/// Run on open rather than only when a column is missing, because most of
+/// these index columns that were always there: what changed is that a
+/// statement now needs them. A store keeping the old plans would scan
+/// where the schema says it seeks.
 ///
-/// `IF NOT EXISTS` keys on the *name*, so an index whose columns changed is not
-/// replaced by this batch and has to be dropped before it runs (see
+/// `IF NOT EXISTS` keys on the name, so an index whose columns changed is
+/// not replaced by this batch and has to be dropped first (see
 /// [`RESHAPED_INDEXES`]).
 ENSURE_INDEXES = "\
 CREATE INDEX IF NOT EXISTS items_retained ON items(collection, seq) \
@@ -548,35 +541,34 @@ CREATE INDEX IF NOT EXISTS bindings_by_handle ON bindings(collection, source, ha
 COUNT_RETAINED =
     "SELECT count(*) FROM items WHERE collection = :collection AND retained_at IS NOT NULL";
 
-/// The store-wide size of the bodies retention is holding, each distinct object
-/// counted once (two retained placements of one message share it). An upper
-/// bound on what a purge reclaims: an object a live item also points at keeps a
-/// reference and survives the sweep.
+/// The store-wide size of the bodies retention is holding, each distinct
+/// object counted once. An upper bound on what a purge reclaims: an
+/// object a live item also points at keeps a reference and survives.
 RETAINED_BYTES = "\
 SELECT coalesce(sum(o.size), 0) FROM objects o WHERE o.hash IN \
 (SELECT object_hash FROM items WHERE retained_at IS NOT NULL AND object_hash IS NOT NULL)";
 
-/// Purges one retained item by its public id: the only true delete. Its bindings
-/// cascade, and the body it released is unlinked by the collector once nothing
-/// else references it. Guarded on `retained_at`, so a purge can never take a
-/// live item.
+/// Purges one retained item by its public id: the only true delete. Its
+/// bindings cascade, and the body it released is unlinked by the
+/// collector once nothing else references it. Guarded on `retained_at`,
+/// so a purge can never take a live item.
 ///
 /// Returns the two hashes the row pinned, so the caller settles them with
-/// [`RELEASE_PINS`] in the same transaction rather than reading the row first
-/// and visiting it twice.
+/// [`RELEASE_PINS`] in the same transaction rather than visiting the row
+/// twice.
 PURGE_ITEM = "\
 DELETE FROM items WHERE collection = :collection AND seq = :seq AND retained_at IS NOT NULL \
 RETURNING object_hash, conflict_object";
 
-/// The time-based sweep: every item retired **strictly before** `:cutoff`
-/// (RFC 3339), so an item retained exactly at that instant is kept. Store-wide,
-/// since how long to keep is the owner's policy rather than a collection's. The
-/// cutoff is the caller's parameter, not the store's clock, so the boundary is
+/// The time-based sweep: every item retired strictly before `:cutoff`
+/// (RFC 3339), so one retained exactly at that instant is kept.
+/// Store-wide, since how long to keep is the owner's policy. The cutoff
+/// is the caller's parameter, not the store's clock, so the boundary is
 /// deterministic even though the stamps are SQLite's.
 ///
 /// Returns each purged row's two pinned hashes, on the same terms as
-/// [`PURGE_ITEM`]: this is where reading the rows twice costs most, being the
-/// sweep that takes fifty thousand of them at once.
+/// [`PURGE_ITEM`]: this is where visiting the rows twice costs most,
+/// being the sweep that takes fifty thousand at once.
 PURGE_RETAINED_BEFORE = "\
 DELETE FROM items WHERE retained_at IS NOT NULL AND retained_at < :cutoff \
 RETURNING object_hash, conflict_object";
@@ -592,14 +584,13 @@ VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, \
 /// Updates one existing binding's columns in place (its primary key
 /// `(collection, link_id, source)` is unchanged).
 ///
-/// `handle` is deliberately not among them. A binding pins one handle, and
-/// repointing it to a different one is how the fact that a source holds an
-/// identity twice was destroyed, silently, at the write: no later rule could
-/// then act on it, because the evidence was already gone. A second copy is
-/// recorded in `ambiguous_handles` instead, which freezes the item until the
-/// source holds the identity once again. Rebinding a handle legitimately, after
-/// a handle-space change, goes through the rebuild that drops the old spine and
-/// inserts the new one, never through this statement.
+/// `handle` is deliberately not among them. A binding pins one handle,
+/// and repointing it would destroy the evidence that a source holds an
+/// identity twice, before any later rule could act on it. A second copy
+/// is recorded in `ambiguous_handles` instead, which freezes the item
+/// until the source holds the identity once again. A legitimate rebind,
+/// after a handle-space change, goes through the rebuild that drops the
+/// old spine and inserts the new one.
 UPDATE_BINDING = "\
 UPDATE bindings SET base_flags = :base_flags, \
 base_object = :base_object, base_revision = :base_revision, base_present = :base_present, \
@@ -610,8 +601,8 @@ WHERE collection = :collection AND link_id = :link_id AND source = :source";
 /// Deletes one source's binding of an item.
 DELETE_BINDING = "DELETE FROM bindings WHERE collection = :collection AND link_id = :link_id AND source = :source";
 
-/// Adjusts one object's refcount by a signed delta (the incremental-refcount
-/// path); the hash's primary key makes this an indexed point update.
+/// Adjusts one object's refcount by a signed delta; the hash's primary
+/// key makes this an indexed point update.
 ADJUST_REFCOUNT =
     "UPDATE objects SET refcount = refcount + :delta WHERE hash = :hash";
 
@@ -619,8 +610,8 @@ ADJUST_REFCOUNT =
 /// set-based form of [`ADJUST_REFCOUNT`] at `-1`.
 ///
 /// A hash listed twice releases twice, which is what makes it the same
-/// operation as the loop it replaces: a retained item pins its body and its
-/// conflict body separately, and a purge releases both.
+/// operation as the loop it replaces: a retained item pins its body and
+/// its conflict body separately, and a purge releases both.
 RELEASE_PINS = "\
 UPDATE objects SET refcount = refcount - \
   (SELECT count(*) FROM json_each(:hashes) WHERE value = objects.hash) \
@@ -642,14 +633,13 @@ ON CONFLICT(hash) DO UPDATE SET size = excluded.size";
 /// Resolves the object hash currently bound to each of the given link ids
 /// (passed as a JSON array), skipping the ones carrying no body.
 ///
-/// Scoped to one account, which is the axis a link id is trustworthy on. Across
-/// collections it is exactly what this read exists for: one message filed in two
-/// mailboxes is one body, downloaded once. Across accounts it is not a fact at
-/// all, because two unrelated servers may mint the same vCard `UID` (spec §9.2),
-/// and answering with the other account's body hands one account's content to
-/// the other's sync, which then believes the item is hydrated. A single-account
-/// store writes no account, so the filter is a no-op there and the dedup is
-/// whole-store, as it should be.
+/// Scoped to one account, the axis a link id is trustworthy on. Across
+/// collections it is what this read exists for: one message filed in two
+/// mailboxes is one body, downloaded once. Across accounts it is not a
+/// fact at all, two unrelated servers being free to mint the same vCard
+/// `UID` (spec §9.2), and answering with the other account's body hands
+/// one account's content to the other's sync. A single-account store
+/// writes no account, so the filter is a no-op and the dedup whole-store.
 LOOKUP_OBJECTS = "\
 SELECT i.link_id, i.object_hash FROM items i \
 JOIN collections c ON c.id = i.collection \
@@ -657,26 +647,25 @@ WHERE i.object_hash IS NOT NULL \
   AND i.link_id IN (SELECT value FROM json_each(:links)) \
   AND c.account IS :account";
 
-/// Lists the objects nothing references any more: what the collector takes, and
-/// never a write's business, since the batch that attaches a body may not be the
-/// one that indexed it (spec §5).
+/// Lists the objects nothing references any more: what the collector
+/// takes, and never a write's business, since the batch that attaches a
+/// body may not be the one that indexed it (spec §5).
 ///
-/// `<= 0` rather than `= 0`, matching the partial index `objects_garbage`
-/// exactly so neither statement scans the table. Under the refcount floor
-/// (spec §7) the two select the same rows; the wider one is for the reader that
-/// cannot apply the floor, since it opens read-only and a store written before
-/// the constraint may still carry a negative count.
+/// `<= 0` rather than `= 0`, matching the partial index
+/// `objects_garbage` exactly so neither statement scans the table. Under
+/// the refcount floor (spec §7) the two select the same rows; the wider
+/// one is for a read-only reader, whose store may predate the constraint
+/// and still carry a negative count.
 LIST_GARBAGE_OBJECTS = "SELECT hash FROM objects WHERE refcount <= 0";
 
 /// Whether the index still holds a body: the collector's question about the one
 /// file in front of it, asked on the primary key (spec §5).
 OBJECT_EXISTS = "SELECT 1 FROM objects WHERE hash = :hash";
 
-/// Every hash the index holds. For the diagnosis that has to visit every row
-/// anyway (an object row whose blob is missing is a read that will fail, and
-/// only a pass over the rows finds one), never for the collector, which asks
-/// about the file in front of it with [`OBJECT_EXISTS`] rather than holding the
-/// whole index in memory to answer.
+/// Every hash the index holds. For the diagnosis that has to visit every
+/// row anyway, never for the collector, which asks about the file in
+/// front of it with [`OBJECT_EXISTS`] rather than holding the whole index
+/// in memory.
 LIST_OBJECT_HASHES = "SELECT hash FROM objects";
 
 /// Drops the unreferenced object rows inside the collector's transaction; their
@@ -688,14 +677,14 @@ DELETE_GARBAGE_OBJECTS = "DELETE FROM objects WHERE refcount <= 0";
 /// §7): an item's body, an item's conflict copy, a source's stored base and a
 /// pending queue action's body.
 ///
-/// The repair, not the write path: writes maintain the count incrementally with
-/// `ADJUST_REFCOUNT`, which is O(changes) where this is O(items+bindings+queue).
-/// The pointers are gathered into one stream and counted in a single grouped
-/// pass, so the cost is linear in them rather than in their product with the
-/// object table. The left join is what settles an object no pointer names any
-/// more: it counts zero rather than going unvisited. A row already holding its
-/// true count is left alone, so the statement writes only the drift it found,
-/// and reports how many rows that was.
+/// The repair, not the write path: writes maintain the count
+/// incrementally with `ADJUST_REFCOUNT`, which is O(changes) where this
+/// is O(items+bindings+queue). The pointers are gathered into one stream
+/// and counted in a single grouped pass, so the cost is linear in them
+/// rather than in their product with the object table. The left join
+/// settles an object no pointer names any more, counting zero rather
+/// than going unvisited, and a row already holding its true count is
+/// left alone.
 RECOMPUTE_REFCOUNTS = "\
 UPDATE objects SET refcount = counted.n \
 FROM ( \
@@ -723,8 +712,9 @@ DELETE FROM bindings WHERE NOT EXISTS ( \
 // pending actions in append order and deletes each in the same transaction as
 // its effects.
 
-/// A producer's append. Runs after `ENSURE_COLLECTION`, in one transaction with
-/// the `STORE_OBJECT` upsert when the payload references a body (spec §15.1).
+/// A producer's append. Runs after `ENSURE_COLLECTION`, in one
+/// transaction with the `STORE_OBJECT` upsert when the payload references
+/// a body (spec §15.1).
 ENQUEUE_ACTION = "\
 INSERT INTO queue(created_at, producer, collection, action, payload, object_hash) \
 VALUES(:created_at, :producer, :collection, :action, :payload, :object_hash)";
@@ -743,11 +733,11 @@ FROM queue WHERE collection = :collection AND error IS NULL ORDER BY id";
 /// Deletes the row an owner is about to apply, and reports whether it was still
 /// there.
 ///
-/// It runs **first** in the applying transaction, not last: the pending rows are
-/// read outside any transaction, so a second owner reading the same list would
-/// otherwise apply every action a second time, and `add` and `copy` are not
-/// idempotent. Claiming the row before doing its work makes exactly-once a
-/// property of the statement rather than a convention about who runs the drain.
+/// It runs first in the applying transaction, not last: the pending rows
+/// are read outside any transaction, so a second owner reading the same
+/// list would otherwise apply every action twice, and `add` and `copy`
+/// are not idempotent. Claiming the row first makes exactly-once a
+/// property of the statement rather than a convention about who drains.
 CLAIM_ACTION = "DELETE FROM queue WHERE id = :id RETURNING id";
 
 /// One queue row's spent attempts and pinned body, for a caller acting on a row
@@ -755,21 +745,21 @@ CLAIM_ACTION = "DELETE FROM queue WHERE id = :id RETURNING id";
 /// recording a failure.
 LOAD_ACTION_ROW = "SELECT attempts, object_hash FROM queue WHERE id = :id";
 
-/// One queue row removed by request rather than by application, pending or
-/// parked (spec §15.5): a queued item withdrawn, or a performed intent
-/// acknowledged by the process that could carry it out. The same delete as
-/// `DELETE_ACTION`, named apart because the trigger is a request, not an apply.
-/// It releases the row's `object_hash` pin, so it runs in one transaction with
-/// the refcount settle.
+/// One queue row removed by request rather than by application, pending
+/// or parked (spec §15.5): a queued item withdrawn, or a performed intent
+/// acknowledged by the process that carried it out. The same delete as
+/// `DELETE_ACTION`, named apart because the trigger is a request. It
+/// releases the row's `object_hash` pin, so it runs in one transaction
+/// with the refcount settle.
 CANCEL_ACTION = "DELETE FROM queue WHERE id = :id";
 
-/// A permanently failing action: recorded and skipped, visible to operators and
-/// frontends instead of blocking the collection's queue forever.
+/// A permanently failing action: recorded and skipped, visible to
+/// operators instead of blocking the collection's queue.
 PARK_ACTION =
     "UPDATE queue SET attempts = :attempts, error = :error WHERE id = :id";
 
-/// Records a failed apply attempt without parking (the retry path; equivalent
-/// substitution of the reference `park_action` with a `NULL` error).
+/// Records a failed apply attempt without parking: the retry path, the
+/// reference `park_action` with a `NULL` error.
 BUMP_ATTEMPTS = "UPDATE queue SET attempts = attempts + 1 WHERE id = :id";
 
 /// The parked actions, for status surfaces and operator repair.
@@ -787,17 +777,17 @@ RETURNING generation";
 /// protocol values (an IMAP UIDVALIDITY) from the store alone.
 LOAD_GENERATION = "SELECT generation FROM collections WHERE id = :collection";
 
-// Diagnostics (spec §7): what a consistency check asks *about* the index rather
-// than through it. Not canonical statements — the spec states the invariants,
-// not the queries that observe them — but inlined here with the rest, so a
-// consumer running its own driver can check a store it wrote.
+// NOTE: diagnostics (spec §7), what a consistency check asks about the
+// index rather than through it. Not canonical statements, the spec
+// stating the invariants rather than the queries that observe them, but
+// inlined so a consumer running its own driver can check what it wrote.
 
 /// How many objects are indexed and what they weigh.
 OBJECT_STATS = "SELECT count(*), coalesce(sum(size), 0) FROM objects";
 
-/// The bytes held by objects at least one live item binds; an object a live and
-/// a retained item share counts here, since purging the retained one frees
-/// nothing.
+/// The bytes held by objects at least one live item binds. An object a
+/// live and a retained item share counts here, since purging the
+/// retained one frees nothing.
 LIVE_BYTES = "\
 SELECT coalesce(sum(size), 0) FROM objects WHERE hash IN \
 (SELECT object_hash FROM items WHERE object_hash IS NOT NULL AND retained_at IS NULL)";
@@ -805,8 +795,9 @@ SELECT coalesce(sum(size), 0) FROM objects WHERE hash IN \
 /// One object's stored size.
 OBJECT_SIZE = "SELECT size FROM objects WHERE hash = :hash";
 
-/// What a purge with this cutoff would retire, and what its bodies weigh: the
-/// preview a confirmation prints, where `PURGE_RETAINED_BEFORE` is the act.
+/// What a purge with this cutoff would retire, and what its bodies weigh:
+/// the preview a confirmation prints, `PURGE_RETAINED_BEFORE` being the
+/// act.
 COUNT_RETAINED_BEFORE = "\
 SELECT count(*), coalesce(sum(o.size), 0) FROM items i \
 LEFT JOIN objects o ON o.hash = i.object_hash \
@@ -825,8 +816,8 @@ SELECT o.hash, o.refcount, coalesce(c.n, 0) FROM objects o \
 LEFT JOIN counted c ON c.hash = o.hash \
 WHERE o.refcount != coalesce(c.n, 0) ORDER BY o.hash";
 
-/// The bindings whose source holds one identity under more than one handle
-/// (spec §13), with how many copies it holds: not a defect, but the reason
+/// The bindings whose source holds one identity under more than one
+/// handle (spec §13), with how many copies: not a defect, but the reason
 /// those items stop syncing.
 AMBIGUOUS_BINDINGS = "\
 SELECT collection, link_id, source, json_array_length(ambiguous_handles) + 1 \
@@ -841,15 +832,15 @@ WHERE NOT EXISTS (SELECT 1 FROM items i \
   WHERE i.collection = b.collection AND i.link_id = b.link_id) \
 ORDER BY b.collection, b.link_id, b.source";
 
-/// The items whose body is not indexed. Reported, never repaired: the item is
-/// still the item.
+/// The items whose body is not indexed. Reported, never repaired: the
+/// item is still the item.
 DANGLING_ITEM_OBJECTS = "\
 SELECT collection, link_id, object_hash FROM items \
 WHERE object_hash IS NOT NULL AND object_hash NOT IN (SELECT hash FROM objects) \
 ORDER BY collection, link_id";
 
-/// The queue rows whose body is not indexed. Reported, never repaired: the row
-/// is still an intent somebody expressed.
+/// The queue rows whose body is not indexed. Reported, never repaired:
+/// the row is still an intent somebody expressed.
 DANGLING_QUEUE_OBJECTS = "\
 SELECT id, collection, object_hash FROM queue \
 WHERE object_hash IS NOT NULL AND object_hash NOT IN (SELECT hash FROM objects) \

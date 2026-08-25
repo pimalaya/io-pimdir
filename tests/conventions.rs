@@ -1,14 +1,14 @@
 //! The crate's Annex A derivations against the format's own vectors.
 //!
-//! Annex A is informative, so nothing in the store enforces it and no error
-//! reports a disagreement: two writers of one collection simply summarise the
-//! same body differently, and a reader shows one of them a blank row. The
-//! vectors (pimdir SPEC §16) are what a claim to implement the conventions
-//! means, and they were derived from the prose rather than from any
+//! Annex A is informative, so nothing in the store enforces it and no
+//! error reports a disagreement: two writers of one collection summarise
+//! the same body differently, and a reader shows one of them a blank row.
+//! The vectors (pimdir SPEC §16) are what a claim to implement the
+//! conventions means, derived from the prose rather than from any
 //! implementation, this one included.
 //!
-//! The spec is a sibling checkout rather than a vendored copy, so the test
-//! skips when it is absent and runs whenever the two sit side by side.
+//! The spec is a sibling checkout rather than a vendored copy, so the
+//! test skips when it is absent and runs when the two sit side by side.
 
 use std::{fs, path::PathBuf};
 
@@ -40,9 +40,9 @@ fn every_vector_derives_what_the_conventions_say() {
         let label = case["label"].as_str().unwrap();
         let kind = case["kind"].as_str().unwrap();
 
-        // NOTE: read as bytes. The fixtures are CRLF throughout, as RFC 5322
-        // and RFC 5545 require, and a harness that normalises line endings
-        // changes the body and therefore its name.
+        // NOTE: read as bytes. The fixtures are CRLF throughout, as RFC
+        // 5322 and RFC 5545 require, and a harness normalising line
+        // endings changes the body and therefore its name.
         let fixture = spec.join("vectors").join(case["fixture"].as_str().unwrap());
         let body = fs::read(&fixture).unwrap();
         assert_eq!(
@@ -60,8 +60,8 @@ fn every_vector_derives_what_the_conventions_say() {
 
         match case["link_id"].as_str() {
             Some(link_id) => assert_eq!(derived.link_id.0, link_id, "{label}: link id"),
-            // NOTE: the format deliberately pins no id for content carrying
-            // none, so what is checked is that one was derived at all.
+            // NOTE: the format pins no id for content carrying none, so
+            // what is checked is that one was derived at all.
             None => assert!(!derived.link_id.0.is_empty(), "{label}: no id was derived"),
         }
 
@@ -71,16 +71,16 @@ fn every_vector_derives_what_the_conventions_say() {
             "{label}: sort key"
         );
 
-        // NOTE: parsed structures, never JSON text: key order is not fixed by
-        // the vectors and pinning one would pin an accident of whichever
-        // serialiser wrote the file.
+        // NOTE: parsed structures, never JSON text: key order is not
+        // fixed by the vectors, and pinning one would pin an accident of
+        // whichever serialiser wrote the file.
         let written: Value = serde_json::from_str(&derived.meta.0).unwrap();
         assert_eq!(written, case["meta"], "{label}: meta");
     }
 }
 
-/// The two fallbacks the vectors leave open, which this crate fixes so two
-/// writers cannot link one item twice and store one body twice.
+/// The two fallbacks the vectors leave open, which this crate fixes so
+/// two writers cannot link one item twice and store one body twice.
 #[test]
 fn a_body_with_no_identity_falls_back_to_a_stable_id() {
     let card = b"BEGIN:VCARD\r\nVERSION:4.0\r\nFN:No UID\r\nEND:VCARD\r\n";
@@ -103,16 +103,16 @@ fn a_body_with_no_identity_falls_back_to_a_stable_id() {
     );
 }
 
-/// A media type this crate has no conventions for is not an error and not a
-/// guess: the caller writes its own summary.
+/// A media type this crate has no conventions for is neither an error nor
+/// a guess: the caller writes its own summary.
 #[test]
 fn an_unknown_kind_derives_nothing() {
     assert!(conventions::derive("application/octet-stream", b"...").is_none());
     assert!(conventions::derive("text/vcard; charset=utf-8", b"BEGIN:VCARD\r\n").is_some());
 }
 
-/// A header value the writer folded, and an address list: neither appears in
-/// the vectors, and both are what a real message carries.
+/// A header value the writer folded, and an address list: neither appears
+/// in the vectors, and both are what a real message carries.
 #[test]
 fn a_folded_header_and_an_address_list_read_as_one_value() {
     let message = b"Subject: a subject the writer\r\n folded across two lines\r\n\
@@ -131,15 +131,15 @@ fn a_folded_header_and_an_address_list_read_as_one_value() {
         meta["subject"],
         "a subject the writer folded across two lines"
     );
-    // The display name carries the comma the list splits on, and the seconds
-    // and the zone are the obsolete forms RFC 5322 §4.3 still requires.
+    // the display name carries the comma the list splits on, and the
+    // seconds and zone are the obsolete forms RFC 5322 §4.3 requires
     assert_eq!(meta["from"], "alice@example.org");
     assert_eq!(meta["to"], "bob@example.org");
     assert_eq!(meta["date"], "2026-08-01T14:00:00Z");
 }
 
-/// A resource holding only an override, and a zone that never changes: the two
-/// shapes the master and the zone lookups have to fall back on.
+/// A resource holding only an override, and a zone that never changes:
+/// the two shapes the master and zone lookups fall back on.
 #[test]
 fn an_override_only_resource_and_a_fixed_zone_still_summarise() {
     let body = b"BEGIN:VCALENDAR\r\n\

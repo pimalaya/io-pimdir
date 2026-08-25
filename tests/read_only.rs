@@ -17,13 +17,13 @@ use io_replica::{
 fn read_only_open_reads_but_never_writes_or_creates() {
     let dir = tempfile::tempdir().unwrap();
 
-    // NOTE: no database yet: a reader never creates one.
+    // NOTE: no database yet, and a reader never creates one.
     assert!(matches!(
         PimdirStore::open_read_only(dir.path()),
         Err(PimdirError::Sql(_))
     ));
 
-    // The owner creates and fills the store.
+    // the owner creates and fills the store
     let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("left");
     owner.ensure_collection("INBOX", "message/rfc822").unwrap();
     let flags = ReplicaFlags::from_iter(["\\Seen"]);
@@ -58,7 +58,7 @@ fn read_only_open_reads_but_never_writes_or_creates() {
         ])
         .unwrap();
 
-    // The reader sees the shared truth through the same read surface.
+    // the reader sees the shared truth through the same read surface
     let reader = PimdirStore::open_read_only(dir.path()).unwrap();
     let collections = reader.list_collections().unwrap();
     assert_eq!(collections.len(), 1);
@@ -69,7 +69,7 @@ fn read_only_open_reads_but_never_writes_or_creates() {
     assert_eq!(items[0].link_id, ReplicaLinkId("mid:a".into()));
 
     // NOTE: a write through the read-only handle fails at the SQLite
-    // layer instead of mutating the owner's store.
+    // layer rather than mutating the owner's store.
     assert!(reader.ensure_collection("Other", "message/rfc822").is_err());
     let mut reader = reader.for_source("left");
     assert!(

@@ -1,16 +1,15 @@
 //! The content hash naming a body in the object store (spec §5).
 //!
 //! An object's name is its hash, so every process touching one store must
-//! compute the same value: a disagreement writes blobs no other reader finds,
-//! and it fails silently, as a dedup that never dedups. The store therefore
-//! records which algorithm it was built with in `store_meta.hash_algo` (spec
-//! §4.3) and hands the digest out, rather than leaving each consumer to pick
-//! one.
+//! compute the same value: a disagreement writes blobs no other reader
+//! finds, and it fails silently, as a dedup that never dedups. The store
+//! therefore records its algorithm in `store_meta.hash_algo` (spec §4.3)
+//! and hands the digest out, rather than leaving each consumer to pick.
 //!
-//! The spec admits two, and the encoding is part of the contract: lowercase
-//! base32 (RFC 4648, no padding), because the hash is also a path component
-//! (objects/ab/cd/abcd…) and a single-case, filesystem-safe alphabet is what
-//! keeps that path valid everywhere. Hex would work on Linux and collide on a
+//! The encoding is part of the contract: lowercase base32 (RFC 4648, no
+//! padding), because the hash is also a path component and a
+//! single-case, filesystem-safe alphabet is what keeps that path valid
+//! everywhere. Hex would work on Linux and collide on a
 //! case-insensitive filesystem.
 
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -18,19 +17,19 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use io_replica::object::ReplicaHash;
 use sha2::{Digest, Sha256};
 
-/// The hash a store names its objects by, as `store_meta.hash_algo` records it.
+/// The hash a store names its objects by, as `store_meta.hash_algo`
+/// records it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PimdirHashAlgo {
     /// BLAKE3, the whole 256-bit digest, which the spec recommends.
     #[default]
     Blake3,
-    /// SHA-256 truncated to its first 128 bits, for a consumer whose platform
-    /// ships SHA-256 and would otherwise bundle a BLAKE3 implementation and
-    /// keep it byte-identical forever (the Android app takes this one).
+    /// SHA-256 truncated to its first 128 bits, for a consumer whose
+    /// platform ships SHA-256 and would otherwise bundle a BLAKE3
+    /// implementation (the Android app takes this one).
     ///
-    /// Truncation is what the name means: content addressing needs collision
-    /// resistance, not signature strength, and a 26-character name keeps the
-    /// blob paths short.
+    /// Content addressing needs collision resistance, not signature
+    /// strength, and a 26-character name keeps the blob paths short.
     Sha256_128,
 }
 
@@ -43,8 +42,9 @@ impl PimdirHashAlgo {
         }
     }
 
-    /// The algorithm a stored spelling names, or `None` for one this crate does
-    /// not implement, which a caller reports rather than guessing around.
+    /// The algorithm a stored spelling names, or `None` for one this
+    /// crate does not implement, which a caller reports rather than
+    /// guessing around.
     pub fn parse(algo: &str) -> Option<Self> {
         match algo {
             "blake3" => Some(Self::Blake3),
@@ -60,8 +60,9 @@ impl PimdirHashAlgo {
         hasher.finish()
     }
 
-    /// An incremental hasher, for a body streamed into the blob store rather
-    /// than held whole in memory (spec §14's byteless `StoreObject`).
+    /// An incremental hasher, for a body streamed into the blob store
+    /// rather than held whole in memory (spec §14's byteless
+    /// `StoreObject`).
     pub fn hasher(&self) -> PimdirHasher {
         match self {
             Self::Blake3 => PimdirHasher::Blake3(Box::new(blake3::Hasher::new())),
@@ -73,8 +74,9 @@ impl PimdirHashAlgo {
 /// An incremental hasher over a body's bytes (see
 /// [`hasher`](PimdirHashAlgo::hasher)).
 pub enum PimdirHasher {
-    /// A BLAKE3 digest in progress, boxed: its state is nearly two kilobytes,
-    /// which would otherwise be the size of every hasher this enum hands out.
+    /// A BLAKE3 digest in progress, boxed: its state is nearly two
+    /// kilobytes, which would otherwise size every hasher this enum
+    /// hands out.
     Blake3(Box<blake3::Hasher>),
     /// A SHA-256 digest in progress, truncated when it finishes.
     Sha256_128(Sha256),
@@ -102,12 +104,12 @@ impl PimdirHasher {
     }
 }
 
-/// Lowercase base32 (RFC 4648, no padding), the encoding spec §5 fixes for an
-/// object name.
+/// Lowercase base32 (RFC 4648, no padding), the encoding spec §5 fixes
+/// for an object name.
 ///
-/// A digest length is rarely a multiple of five bits, so the last character
-/// carries the leftover bits padded with zeroes, which is what RFC 4648
-/// prescribes once its padding characters are dropped.
+/// A digest length is rarely a multiple of five bits, so the last
+/// character carries the leftover bits padded with zeroes, which is what
+/// RFC 4648 prescribes once its padding characters are dropped.
 fn base32(digest: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
@@ -136,10 +138,9 @@ mod tests {
 
     #[test]
     fn sha256_128_matches_the_shape_every_implementation_must_agree_on() {
-        // NOTE: pinned against the Android app's PimdirHash, which computes the
-        // same name in Java: the first 16 bytes of the SHA-256 digest as
-        // lowercase base32. A disagreement here does not fail loudly, it writes
-        // blobs the other implementation never finds.
+        // NOTE: pinned against the Android app's PimdirHash, which
+        // computes the same name in Java. A disagreement here does not
+        // fail loudly, it writes blobs the other never finds.
         let hash = PimdirHashAlgo::Sha256_128.hash(b"pimdir");
         assert_eq!(hash.0.len(), 26);
         assert!(hash.0.chars().all(|c| ALPHABET_CHARS.contains(c)));
@@ -149,7 +150,7 @@ mod tests {
 
     #[test]
     fn base32_encodes_rfc_4648_vectors_lowercased() {
-        // RFC 4648 §10, lowercased and unpadded.
+        // RFC 4648 §10, lowercased and unpadded
         assert_eq!(base32(b"f"), "my");
         assert_eq!(base32(b"fo"), "mzxq");
         assert_eq!(base32(b"foo"), "mzxw6");

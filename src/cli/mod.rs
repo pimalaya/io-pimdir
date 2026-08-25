@@ -1,15 +1,15 @@
 //! The `pimdir` command tree, one module per verb group.
 //!
 //! Each module owns one group of subcommands ([`collection`], [`item`],
-//! [`queue`], [`store`], [`check`], [`gc`], [`export`]) and renders its own output as
-//! both text and JSON. This module holds what they share: the global store
-//! flags, the roles a verb may open the store with, the human-facing
-//! error mapping, the confirmation prompt guarding destructive verbs and the
-//! small formatting helpers.
+//! [`queue`], [`store`], [`check`], [`gc`], [`export`]) and renders its
+//! own output as both text and JSON. This module holds what they share:
+//! the global store flags, the roles a verb may open the store with, the
+//! error mapping, the confirmation prompt guarding destructive verbs and
+//! the formatting helpers.
 //!
-//! The modules hang off the binary crate root rather than off the library's
-//! `lib.rs`: the command structs are the binary's business, so the library's
-//! public API stays free of clap.
+//! The modules hang off the binary crate root rather than the library's
+//! `lib.rs`: the command structs are the binary's business, so the
+//! library's public API stays free of clap.
 
 pub mod check;
 pub mod collection;

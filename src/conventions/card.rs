@@ -1,12 +1,12 @@
 //! The `text/vcard` conventions (spec Annex A.2).
 //!
-//! A card has one derivation: a CardDAV `sync-collection` REPORT returns hrefs
-//! and ETags but no `UID`, so a card resolves at `Full` only and there is no
-//! second reading to keep in agreement.
+//! A card has one derivation: a CardDAV `sync-collection` REPORT returns
+//! hrefs and ETags but no `UID`, so a card resolves at `Full` only and
+//! there is no second reading to keep in agreement.
 //!
-//! The values are carried verbatim, escapes and all, because `fn` is what a
-//! reader displays and the card itself is stored untouched beside it. Only the
-//! sort key is normalised.
+//! The values are carried verbatim, escapes and all, because `fn` is
+//! what a reader displays and the card is stored untouched beside it.
+//! Only the sort key is normalised.
 
 use alloc::{
     format,
@@ -27,7 +27,7 @@ pub struct PimdirCardMeta {
     /// The card's `UID`, verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    /// The `FN` display name, verbatim: whitespace and case included, since
+    /// The `FN` display name, verbatim, whitespace and case included:
     /// this is what a reader shows.
     #[serde(default, rename = "fn")]
     pub fn_: String,
@@ -41,8 +41,8 @@ pub struct PimdirCardMeta {
 
 /// Derives a card's link id, summary and sort key.
 ///
-/// The link id is the `UID`. A card carrying none falls back to `hash:` over
-/// the body, which is the only thing left that identifies it: a card has no
+/// The link id is the `UID`. A card carrying none falls back to `hash:`
+/// over the body, the only thing left that identifies it: a card has no
 /// date and no sender to stand in.
 pub fn derive(body: &[u8]) -> PimdirDerivation {
     let lines = unfold(body, false);
@@ -71,12 +71,11 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
 
 /// The display name normalised for ordering: lowercased, then trimmed.
 ///
-/// Annex A.2 asks for the Unicode **simple** lowercase mapping, which Rust does
-/// not expose: [`str::to_lowercase`] is the full mapping, and the two differ on
-/// exactly two points (the Greek final sigma, and `İ` expanding to two chars).
-/// Neither appears in a display name often enough to prefer a hand-rolled table
-/// to the standard library's, and the format's own vectors stay ASCII for the
-/// same reason.
+/// Annex A.2 asks for the Unicode simple lowercase mapping, which Rust
+/// does not expose: [`str::to_lowercase`] is the full mapping, and the
+/// two differ on exactly two points, the Greek final sigma and `İ`
+/// expanding to two chars. Neither appears in a display name often enough
+/// to prefer a hand-rolled table to the standard library's.
 fn sort_key(display_name: &str) -> String {
     display_name.to_lowercase().trim().to_string()
 }
@@ -96,8 +95,8 @@ fn properties(lines: &[String], name: &str) -> Vec<String> {
 
 /// One content line's value, when it carries the named property.
 ///
-/// A line is `[group "."] name *(";" param) ":" value` (RFC 6350 §3.3), and the
-/// group is dropped: `item1.EMAIL` is an `EMAIL`.
+/// A line is `[group "."] name *(";" param) ":" value` (RFC 6350 §3.3),
+/// and the group is dropped: `item1.EMAIL` is an `EMAIL`.
 fn value_of(line: &str, name: &str) -> Option<String> {
     let (head, value) = line.split_once(':')?;
     let head = head.split(';').next().unwrap_or_default();

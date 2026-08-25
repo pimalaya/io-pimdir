@@ -1,7 +1,7 @@
-//! The action queue and collection generations: a producer's enqueue against
-//! a real temp store, the owner's drain per action kind, parking, refcount
-//! pinning of queued bodies, generation bumps, and the refusal of a store
-//! stamped with a schema version this crate does not service.
+//! The action queue and collection generations: a producer's enqueue
+//! against a real temp store, the owner's drain per action kind, parking,
+//! refcount pinning of queued bodies, generation bumps, and the refusal
+//! of a store stamped with an unserviced schema version.
 
 use std::{io::Write, path::Path};
 
@@ -82,8 +82,8 @@ fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
     (store, seq)
 }
 
-/// Streams `body` into the blob store under `hash` (the producer's blob-first
-/// step) and returns its size.
+/// Streams `body` into the blob store under `hash`, the producer's
+/// blob-first step, and returns its size.
 fn write_blob(dir: &Path, hash: &str, body: &[u8]) -> u64 {
     let blobs = PimdirBlobs::open(dir, PimdirHashAlgo::default());
     let mut writer = blobs.writer().unwrap();
@@ -96,8 +96,8 @@ fn a_queued_add_round_trips_into_a_staged_item() {
     let dir = tempfile::tempdir().unwrap();
     let (mut store, _) = seeded(dir.path());
 
-    // The producer writes the blob durably first, then enqueues in one
-    // transaction; the pending action is visible to its own reads (overlay).
+    // the producer writes the blob durably first, then enqueues in one
+    // transaction, and the pending action shows in its own reads
     let size = write_blob(dir.path(), "beef0000", b"new body");
     let mut producer = PimdirProducer::open(dir.path(), "smtp").unwrap();
     let add = PimdirAction::Add {
@@ -115,7 +115,7 @@ fn a_queued_add_round_trips_into_a_staged_item() {
     assert_eq!(pending[0].producer, "smtp");
     assert_eq!(store.queued_collections().unwrap(), ["INBOX"]);
 
-    // The owner drains: the item lands, staged as a pending push.
+    // the owner drains: the item lands, staged as a pending push
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
     assert!(store.pending_actions("INBOX").unwrap().is_empty());
@@ -131,8 +131,8 @@ fn a_queued_add_round_trips_into_a_staged_item() {
         "{\"subject\":\"hi\",\"v\":1}"
     );
 
-    // Projected as a pending, base-less push for the sync layer to derive
-    // (the same shape a staged in-process Add projects).
+    // projected as a base-less pending push, the shape a staged
+    // in-process Add projects
     let projected = store
         .load(&inbox(), &ReplicaLoadScope::All)
         .unwrap()
@@ -166,7 +166,7 @@ fn a_duplicate_add_parks_instead_of_clobbering() {
     assert_eq!(parked.len(), 1);
     assert!(parked[0].error.contains("already present"), "{parked:?}");
     assert_eq!(parked[0].attempts, 1);
-    // The live item is untouched.
+    // the live item is untouched
     assert!(
         store.list_items("INBOX", None, 10).unwrap()[0]
             .flags
@@ -188,11 +188,11 @@ fn set_flags_is_absolute_and_reapplies_idempotently() {
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
 
-    // Absolute replacement: the old flag is gone, not merged.
+    // absolute replacement: the old flag is gone, not merged
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
     assert_eq!(item.flags, ReplicaFlags::from_iter(["\\Flagged"]));
 
-    // Reapplying the same absolute set is a no-op, never an error.
+    // reapplying the same absolute set is a no-op, never an error
     producer.enqueue("INBOX", &set, None, NOW).unwrap();
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
@@ -212,7 +212,7 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
 
-    // Hidden from reads, kept as a tombstone for the sync to push.
+    // hidden from reads, kept as a tombstone for the sync to push
     assert!(store.get_item("INBOX", seq).unwrap().is_none());
     let projected = store
         .load(&inbox(), &ReplicaLoadScope::All)
@@ -220,7 +220,7 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
         .placements;
     assert_eq!(projected[0].status, ReplicaStatus::Tombstone);
 
-    // Removing it again is success (idempotent), not a park.
+    // removing it again is success, not a park
     producer
         .enqueue("INBOX", &PimdirAction::Remove { seq }, None, NOW)
         .unwrap();
@@ -280,14 +280,15 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (2, 0));
 
-    // Copy: source keeps the item, the target gains it under the same seq.
+    // copy: the source keeps the item, the target gains it under the
+    // same seq
     assert_eq!(store.count_items("INBOX").unwrap(), 1, "mid:b moved away");
     let backup = store.list_items("Backup", None, 10).unwrap();
     assert_eq!(backup.len(), 1);
     assert_eq!(backup[0].link_id.0, "mid:a");
     assert_eq!(backup[0].seq, seq_a, "a message keeps one public id");
 
-    // Move: the source empties, the target fills.
+    // move: the source empties, the target fills
     let archive = store.list_items("Archive", None, 10).unwrap();
     assert_eq!(archive.len(), 1);
     assert_eq!(archive[0].link_id.0, "mid:b");
@@ -320,10 +321,10 @@ fn update_repoints_the_body() {
 
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
     assert_eq!(item.object, Some(ReplicaHash("beef0000".into())));
-    // The old body survives: the sync base still references it.
+    // the old body survives: the sync base still references it
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert!(blob_exists(dir.path(), "beef0000"));
-    // Projected dirty, so the next sync pushes the edit.
+    // projected dirty, so the next sync pushes the edit
     let projected = store
         .load(&inbox(), &ReplicaLoadScope::All)
         .unwrap()
@@ -337,11 +338,11 @@ fn a_parked_action_does_not_block_later_actions() {
     let (mut store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
 
-    // First an unappliable action (unknown seq), then a valid one behind it.
+    // an unappliable action, then a valid one behind it
     producer
         .enqueue("INBOX", &PimdirAction::Remove { seq: 9999 }, None, NOW)
         .unwrap();
-    // NOTE: remove-of-absent succeeds, so use set-flags for the parking case.
+    // NOTE: remove-of-absent succeeds, so the parking case is set-flags.
     producer
         .enqueue(
             "INBOX",
@@ -368,11 +369,11 @@ fn a_parked_action_does_not_block_later_actions() {
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (2, 1));
 
-    // The later action applied despite the parked one before it.
+    // the later action applied despite the parked one before it
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
     assert!(item.flags.contains("\\Answered"));
 
-    // The parked row is recorded, queryable, and skipped by the next pass.
+    // the parked row is recorded, queryable and skipped by the next pass
     let parked = store.parked_actions().unwrap();
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].collection, "INBOX");
@@ -388,7 +389,7 @@ fn gc_never_sweeps_a_queued_body() {
     let dir = tempfile::tempdir().unwrap();
     let (mut store, seeded_seq) = seeded(dir.path());
 
-    // A producer stages a body and enqueues the add that references it.
+    // a producer stages a body and enqueues the add referencing it
     let size = write_blob(dir.path(), "beef0000", b"queued body");
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     producer
@@ -406,18 +407,17 @@ fn gc_never_sweeps_a_queued_body() {
         )
         .unwrap();
 
-    // A collector cannot run while the producer holds its staging lock: the
-    // body it just wrote is pinned by nothing until the enqueue commits, and
-    // that window is the whole reason the lock exists.
+    // a collector cannot run while the producer holds its staging lock:
+    // the body it just wrote is pinned by nothing until the enqueue
+    // commits, and that window is why the lock exists
     assert!(matches!(
         store.collect_garbage(),
         Err(PimdirError::Staging(_))
     ));
     drop(producer);
 
-    // The owner retires and purges the seeded item, genuinely orphaning its
-    // body, and collects: the queued body must survive the sweep, pinned by
-    // its row.
+    // the owner retires and purges the seeded item, orphaning its body,
+    // and collects: the queued body survives the sweep, pinned by its row
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -435,14 +435,14 @@ fn gc_never_sweeps_a_queued_body() {
         "the queued body is not"
     );
 
-    // Draining hands the pin over to the applied item.
+    // draining hands the pin over to the applied item
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
     assert!(blob_exists(dir.path(), "beef0000"), "now the item pins it");
 
-    // The hand-over was exact (+1 item, -1 queue): retiring and purging the
-    // item's only placement orphans the body, so the next collection takes it,
-    // with no leaked queue pin.
+    // the hand-over was exact, so retiring and purging the item's only
+    // placement orphans the body and the next collection takes it, with
+    // no leaked queue pin
     let seq = store.seq_for_link("INBOX", "mid:new").unwrap().unwrap();
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
@@ -458,9 +458,9 @@ fn gc_never_sweeps_a_queued_body() {
 
 #[test]
 fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
-    // The store defines no semantics for a `submit` intent, but another owner
-    // does: skipping leaves it pending for that owner, where parking would
-    // claim it can never be applied by anyone.
+    // the store defines no semantics for a `submit` intent but another
+    // owner does, so skipping leaves it pending for that owner, where
+    // parking would claim nobody can ever apply it
     let dir = tempfile::tempdir().unwrap();
     let (mut store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
@@ -487,7 +487,7 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 0, 1));
 
-    // The action behind it applied all the same.
+    // the action behind it applied all the same
     assert!(
         store
             .get_item("INBOX", seq)
@@ -497,8 +497,8 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
             .contains("\\Answered")
     );
 
-    // The intent is still pending, never parked, and still readable whole by
-    // the owner that can perform it; its body is still pinned.
+    // the intent is still pending, never parked, readable whole by the
+    // owner that can perform it, and its body still pinned
     assert!(store.parked_actions().unwrap().is_empty());
     let pending = store.pending_actions("INBOX").unwrap();
     assert_eq!(pending.len(), 1);
@@ -506,7 +506,7 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     assert_eq!(pending[0].action, submit);
     assert!(blob_exists(dir.path(), "beef0000"));
 
-    // A second pass skips it again rather than accumulating attempts.
+    // a second pass skips it again rather than accumulating attempts
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 1));
     assert_eq!(store.pending_actions("INBOX").unwrap()[0].attempts, 0);
@@ -514,8 +514,8 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
 
 #[test]
 fn an_acknowledged_action_releases_its_queued_body() {
-    // The other half of skip-not-park: the owner that performed the intent out
-    // of band takes the row away, and with it the pin on the body it carried.
+    // the other half of skip-not-park: the owner that performed the
+    // intent out of band takes the row away, and its body's pin with it
     let dir = tempfile::tempdir().unwrap();
     let (mut store, _) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
@@ -546,14 +546,15 @@ fn an_acknowledged_action_releases_its_queued_body() {
         "the pin went with the row"
     );
 
-    // Acknowledging a row that is already gone reports nothing to drop.
+    // acknowledging a row that is already gone reports nothing to drop
     assert!(!store.drop_action(id).unwrap());
 }
 
 #[test]
 fn a_failed_action_retries_until_it_is_parked() {
-    // The two failure shapes an owner reports itself: transient (still
-    // pending, attempts advancing) and permanent (parked with the reason).
+    // the two failure shapes an owner reports itself: transient, still
+    // pending with attempts advancing, and permanent, parked with the
+    // reason
     let dir = tempfile::tempdir().unwrap();
     let (mut store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
@@ -575,7 +576,7 @@ fn a_failed_action_retries_until_it_is_parked() {
     assert_eq!(parked[0].attempts, 3, "the parking attempt counts too");
     assert_eq!(parked[0].error, "the channel is gone");
 
-    // A parked row is still cancellable, and an unknown id is a no-op.
+    // a parked row is still cancellable, and an unknown id is a no-op
     assert!(store.drop_action(id).unwrap());
     assert!(store.parked_actions().unwrap().is_empty());
     store.fail_action(id, Some("gone")).unwrap();
@@ -587,7 +588,7 @@ fn a_generation_bump_is_visible_to_a_reader() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
-    // The epoch starts at 1 and ordinary writes never bump it.
+    // the epoch starts at 1 and ordinary writes never bump it
     assert_eq!(store.generation("INBOX").unwrap(), Some(1));
     store
         .write(vec![
@@ -597,8 +598,8 @@ fn a_generation_bump_is_visible_to_a_reader() {
         .unwrap();
     assert_eq!(store.generation("INBOX").unwrap(), Some(1));
 
-    // A handle-space rebuild (rekey) bumps it in the same transaction: the
-    // item is re-bound under its new handle and the epoch advances together.
+    // a rekey bumps it in the same transaction: the item is re-bound
+    // under its new handle and the epoch advances together
     let mut rekeyed = placement("101", "mid:a", "cafebabe", &[]);
     rekeyed.status = ReplicaStatus::Clean;
     let generation = store
@@ -608,8 +609,9 @@ fn a_generation_bump_is_visible_to_a_reader() {
                 ReplicaWriteOp::DropPlacement {
                     collection: inbox(),
                     handle: ReplicaHandle("1".into()),
-                    // NOTE: a rekey replaces the row, it does not delete the
-                    // item; the same batch upserts it under its new handle.
+                    // NOTE: a rekey replaces the row rather than deleting
+                    // the item; the same batch upserts it under its new
+                    // handle.
                     reason: ReplicaDropReason::Superseded,
                 },
                 ReplicaWriteOp::UpsertPlacement(rekeyed),
@@ -618,21 +620,20 @@ fn a_generation_bump_is_visible_to_a_reader() {
         .unwrap();
     assert_eq!(generation, 2);
 
-    // And the item came with it. Asserting the epoch alone let a rekey freeze
-    // the whole collection unnoticed: the drop and the upsert read as one
-    // source reporting an identity under a second handle, so the binding kept
-    // the handle the server had just voided.
+    // and the item came with it: without this, the drop and the upsert
+    // read as one source reporting an identity under a second handle, so
+    // the binding would keep the handle the server had just voided
     let carried = store.load(&inbox(), &ReplicaLoadScope::All).unwrap();
     assert_eq!(carried.placements.len(), 1);
     assert_eq!(carried.placements[0].handle, ReplicaHandle("101".into()));
     assert!(carried.placements[0].ambiguous_handles.is_empty());
 
-    // A second reader handle over the same files observes the new epoch.
+    // a second reader handle over the same files observes the new epoch
     let reader = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(reader.generation("INBOX").unwrap(), Some(2));
     let collections = reader.list_collections().unwrap();
     assert_eq!(collections[0].generation, 2);
-    // An unknown collection has no epoch.
+    // an unknown collection has no epoch
     assert_eq!(reader.generation("nope").unwrap(), None);
 }
 
@@ -640,8 +641,8 @@ fn a_generation_bump_is_visible_to_a_reader() {
 fn a_store_stamped_with_a_higher_version_is_refused() {
     let dir = tempfile::tempdir().unwrap();
 
-    // A fresh store lands at the current draft schema version, with
-    // `user_version` and `store_meta.version` in agreement.
+    // a fresh store lands at the current draft schema version, with
+    // `user_version` and `store_meta.version` in agreement
     {
         let _store = PimdirStore::open(dir.path()).unwrap();
         let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
@@ -656,17 +657,17 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
         assert_eq!((user_version, meta_version), (sql::VERSION, sql::VERSION));
     }
 
-    // Stamp the store with a higher schema version, as a newer draft would.
+    // stamp the store with a higher schema version, as a newer draft
+    // would
     {
         let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
         conn.pragma_update(None, "user_version", sql::VERSION + 1)
             .unwrap();
     }
 
-    // Every opener refuses it rather than half-reading: the owner (which
-    // never migrates; a draft store is recreated), the producer and the
-    // read-only reader (which additionally refuse any version but the
-    // current one).
+    // every opener refuses it rather than half-reading: the owner, which
+    // never migrates, the producer, and the read-only reader, which
+    // refuses any version but the current one
     for result in [
         PimdirStore::open(dir.path()).map(drop),
         PimdirProducer::open(dir.path(), "test").map(drop),
@@ -679,8 +680,8 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
         }
     }
 
-    // A producer also refuses a store the owner has not created yet
-    // (`user_version` 0): it never creates the schema.
+    // a producer also refuses a store the owner has not created yet: it
+    // never creates the schema
     let fresh = tempfile::tempdir().unwrap();
     rusqlite::Connection::open(fresh.path().join("pimdir.db")).unwrap();
     match PimdirProducer::open(fresh.path(), "test") {

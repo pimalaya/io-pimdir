@@ -1,10 +1,10 @@
 //! The `message/rfc822` conventions (spec Annex A.1).
 //!
-//! A message is read as its header block alone: every field a summary carries
-//! is a header, and the body is never touched. `Date:` is normalised to UTC
-//! here and only here, because two writers either side of the sender would
-//! otherwise record the same message differently and a reader comparing two
-//! accounts would see two dates.
+//! A message is read as its header block alone: every field a summary
+//! carries is a header, and the body is never touched. `Date:` is
+//! normalised to UTC here and only here, or two writers either side of
+//! the sender would record the same message differently and a reader
+//! comparing two accounts would see two dates.
 
 use alloc::{
     format,
@@ -19,8 +19,8 @@ use crate::conventions::{PimdirDerivation, time, unfold};
 
 /// The `message/rfc822` summary (spec Annex A.1), `v: 1`.
 ///
-/// Every optional field absent means unknown. Flags are not here: they are the
-/// item's own (spec §13).
+/// Every absent optional field means unknown. Flags are not here: they
+/// are the item's own (spec §13).
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PimdirMailMeta {
     /// The convention version, `1` today.
@@ -52,10 +52,10 @@ pub struct PimdirMailMeta {
 
 /// Derives a message's link id, summary and sort key.
 ///
-/// The link id is the bare `Message-ID`. A message carrying none falls back to
-/// `alt:` over the three fields that identify it in practice — subject, date
-/// and sender — rather than to the body's hash, so a message re-fetched at a
-/// different detail tier still links to the item it already has.
+/// The link id is the bare `Message-ID`. A message carrying none falls
+/// back to `alt:` over the three fields that identify it in practice,
+/// subject, date and sender, rather than to the body's hash, so a
+/// message re-fetched at another detail tier still links to its item.
 pub fn derive(body: &[u8]) -> PimdirDerivation {
     let headers = headers(body);
     let message_id = header(&headers, "message-id").and_then(strip_angles);
@@ -105,7 +105,7 @@ fn headers(body: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The first occurrence of a header, which is the one RFC 5322 §3.6 allows for
+/// The first occurrence of a header, the one RFC 5322 §3.6 allows for
 /// every field a summary reads.
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
@@ -114,8 +114,8 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// Strips a `msg-id`'s angle brackets, so every writer's id compares byte for
-/// byte. An empty result is no id at all.
+/// Strips a `msg-id`'s angle brackets, so every writer's id compares byte
+/// for byte. An empty result is no id at all.
 fn strip_angles(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let inner = trimmed
@@ -127,11 +127,12 @@ fn strip_angles(raw: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
-/// Splits an `In-Reply-To` value into its bare ids (RFC 5322 §3.6.4, `1*msg-id`).
+/// Splits an `In-Reply-To` value into its bare ids (RFC 5322 §3.6.4,
+/// `1*msg-id`).
 ///
-/// The ids are read off the angle brackets that delimit them; a value carrying
-/// none is split on whitespace instead, since that is what a writer that
-/// stripped them leaves behind.
+/// The ids are read off the angle brackets delimiting them; a value
+/// carrying none is split on whitespace instead, which is what a writer
+/// that stripped them leaves behind.
 fn message_ids(raw: &str) -> Vec<String> {
     if raw.contains('<') {
         return raw
@@ -144,8 +145,9 @@ fn message_ids(raw: &str) -> Vec<String> {
     raw.split_whitespace().filter_map(strip_angles).collect()
 }
 
-/// The bare `addr-spec` of the first address in an address list, the display
-/// name stripped: `Alice Example <alice@example.org>` reads `alice@example.org`.
+/// The bare `addr-spec` of the first address in a list, the display name
+/// stripped: `Alice Example <alice@example.org>` reads
+/// `alice@example.org`.
 fn first_address(raw: &str) -> Option<String> {
     let mut quoted = false;
     let mut angled = false;
@@ -173,13 +175,14 @@ fn first_address(raw: &str) -> Option<String> {
     (!address.is_empty()).then(|| address.to_string())
 }
 
-/// Reads an RFC 5322 `date-time` as the RFC 3339 instant in UTC the convention
-/// stores, or `None` when it does not parse.
+/// Reads an RFC 5322 `date-time` as the RFC 3339 instant in UTC the
+/// convention stores, or `None` when it does not parse.
 ///
-/// `[day-of-week ","] day month year hour ":" minute [":" second] zone`, with
-/// the obsolete alphabetic zones RFC 5322 §4.3 still requires a reader to
-/// accept. Nothing is guessed: a date this cannot read is absent rather than
-/// invented, and the item lands at the end of a descending listing.
+/// `[day-of-week ","] day month year hour ":" minute [":" second] zone`,
+/// with the obsolete alphabetic zones RFC 5322 §4.3 still requires a
+/// reader to accept. Nothing is guessed: a date this cannot read is
+/// absent rather than invented, and the item lands at the end of a
+/// descending listing.
 fn rfc3339_from_rfc5322(raw: &str) -> Option<String> {
     let raw = raw.split(&['(', ';'][..]).next().unwrap_or_default();
     let rest = match raw.split_once(',') {
@@ -219,8 +222,8 @@ fn month(name: &str) -> Option<u32> {
         .map(|index| index as u32 + 1)
 }
 
-/// A `date-time`'s year, with the two- and three-digit forms RFC 5322 §4.3
-/// keeps for the messages that carry them.
+/// A `date-time`'s year, with the two- and three-digit forms RFC 5322
+/// §4.3 keeps for the messages that carry them.
 fn year(raw: &str) -> Option<i32> {
     let year: i32 = raw.parse().ok()?;
     match raw.len() {
@@ -233,9 +236,9 @@ fn year(raw: &str) -> Option<i32> {
 
 /// A `date-time`'s zone, as the seconds to subtract to reach UTC.
 ///
-/// `+hhmm` and `-hhmm`, plus the obsolete names. `-0000` states an unknown
-/// zone rather than UTC, but the instant it names is the same one, which is
-/// all a key needs.
+/// `+hhmm` and `-hhmm`, plus the obsolete names. `-0000` states an
+/// unknown zone rather than UTC, but names the same instant, which is all
+/// a key needs.
 fn zone(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();
     if matches!(bytes.first(), Some(b'+' | b'-')) && bytes.len() >= 5 {
@@ -252,8 +255,9 @@ fn zone(raw: &str) -> Option<i64> {
         "CST" | "MDT" => Some(-6 * 3_600),
         "MST" | "PDT" => Some(-7 * 3_600),
         "PST" => Some(-8 * 3_600),
-        // NOTE: RFC 5322 §4.3 makes every other single letter, `J` included,
-        // mean an unknown zone, which is `-0000` and therefore UTC's instant.
+        // NOTE: RFC 5322 §4.3 makes every other single letter, `J`
+        // included, mean an unknown zone, which is `-0000` and therefore
+        // UTC's instant.
         name if name.len() == 1 => Some(0),
         _ => None,
     }

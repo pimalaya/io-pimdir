@@ -1,18 +1,19 @@
 //! The calendar arithmetic the conventions normalise dates with.
 //!
-//! Both date-carrying kinds fix their `sort_key` as an RFC 3339 instant in UTC
-//! at seconds precision, so byte order is chronological order (spec Annex A.1,
-//! A.3). Getting there from a wall time and an offset is a civil-calendar
-//! conversion and nothing more, which is why it is a few functions here rather
-//! than a dependency: the crate is `no_std`, and a date library that reads a
-//! clock or a zone database is neither needed nor wanted at this seam.
+//! Both date-carrying kinds fix their `sort_key` as an RFC 3339 instant
+//! in UTC at seconds precision, so byte order is chronological order
+//! (spec Annex A.1, A.3). Getting there from a wall time and an offset
+//! is a civil-calendar conversion and nothing more, which is why it is a
+//! few functions here rather than a dependency: the crate is `no_std`,
+//! and a date library that reads a clock or a zone database is neither
+//! needed nor wanted at this seam.
 
 use alloc::{format, string::String};
 
 /// Days from the Unix epoch to a civil date, proleptic Gregorian.
 ///
-/// Howard Hinnant's `days_from_civil`, which is exact over the whole range of
-/// `i32` years and carries no table.
+/// Howard Hinnant's `days_from_civil`, exact over the whole range of
+/// `i32` years and carrying no table.
 pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let year = year - i32::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -49,8 +50,8 @@ pub fn unix(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32
         + second as i64
 }
 
-/// A Unix timestamp as the RFC 3339 instant in UTC, at seconds precision, that
-/// every date-carrying `sort_key` holds.
+/// A Unix timestamp as the RFC 3339 instant in UTC, at seconds
+/// precision, that every date-carrying `sort_key` holds.
 pub fn rfc3339(timestamp: i64) -> String {
     let days = timestamp.div_euclid(86_400);
     let seconds = timestamp.rem_euclid(86_400);
@@ -64,8 +65,8 @@ pub fn rfc3339(timestamp: i64) -> String {
     )
 }
 
-/// The day of the week, Sunday 0 through Saturday 6, of a day count from the
-/// Unix epoch (a Thursday).
+/// The day of the week, Sunday 0 through Saturday 6, of a day count from
+/// the Unix epoch, a Thursday.
 pub fn weekday(days: i64) -> u32 {
     (days + 4).rem_euclid(7) as u32
 }

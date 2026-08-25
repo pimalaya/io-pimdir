@@ -1,15 +1,14 @@
-//! What a consistency check asks *about* the index rather than through it.
+//! What a consistency check asks about the index rather than through it.
 //!
 //! These reads observe invariants the store maintains: whether a refcount
-//! matches the references justifying it, whether a row points at something
-//! absent, what the bodies weigh. They sat in the operator CLI on a second
-//! read-only connection, on the reasoning that publishing them would publish
-//! invariants the library maintains rather than observes. That stopped holding
-//! when the library gained the repairs (`recompute_refcounts`,
-//! `clear_dangling_bindings`): a repair that cannot report what it found is a
-//! worse seam than a diagnostic that can.
+//! matches the references justifying it, whether a row points at
+//! something absent, what the bodies weigh. They live here rather than in
+//! the operator CLI because the library owns the repairs
+//! (`recompute_refcounts`, `clear_dangling_bindings`), and a repair that
+//! cannot report what it found is a worse seam than a diagnostic that
+//! can.
 //!
-//! Every statement here is a `SELECT`, and each runs on the handle the caller
+//! Every statement here is a `SELECT`, running on the handle the caller
 //! already holds, read-only or owning.
 
 use alloc::{format, string::String, vec::Vec};
@@ -32,8 +31,8 @@ pub struct PimdirObjectStats {
     pub bytes: u64,
 }
 
-/// One object whose stored refcount disagrees with the references that justify
-/// it (items, conflict copies, per-source bases and queue pins).
+/// One object whose stored refcount disagrees with the references that
+/// justify it: items, conflict copies, per-source bases and queue pins.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PimdirRefcountDrift {
     /// The object's content hash.
@@ -44,8 +43,8 @@ pub struct PimdirRefcountDrift {
     pub expected: i64,
 }
 
-/// One binding whose source holds its identity under more than one handle, so
-/// the engine cannot say which copy a change belongs to and stops deriving.
+/// One binding whose source holds its identity under more than one
+/// handle, so the engine cannot say which copy a change belongs to.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PimdirAmbiguous {
     /// The owning collection.
@@ -81,10 +80,10 @@ impl PimdirStore {
         })
     }
 
-    /// The bytes held by objects at least one **live** item still binds.
+    /// The bytes held by objects at least one live item still binds.
     ///
-    /// An object a live and a retained item share counts here, since purging
-    /// the retained one would not free it.
+    /// An object a live and a retained item share counts here, since
+    /// purging the retained one would not free it.
     pub fn live_bytes(&self) -> Result<u64, PimdirError> {
         let bytes: i64 = self.conn.query_row(sql::LIVE_BYTES, [], |r| r.get(0))?;
         Ok(bytes.max(0) as u64)
@@ -101,8 +100,8 @@ impl PimdirStore {
         Ok(size.map(|size| size.max(0) as u64))
     }
 
-    /// What a purge with this cutoff would retire: how many retained items, and
-    /// the bytes their bodies weigh.
+    /// What a purge with this cutoff would retire: how many retained
+    /// items, and the bytes their bodies weigh.
     ///
     /// A preview, so a confirmation can say what is at stake; the purge itself
     /// is the authority, and the collector is what frees the bytes.

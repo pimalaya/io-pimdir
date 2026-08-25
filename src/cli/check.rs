@@ -1,17 +1,17 @@
 //! The `check` verb: diagnosis, and the repairs that need no guessing.
 //!
-//! It reports what should not happen. A refcount is maintained incrementally,
-//! so a bug here or a foreign writer could leave **drift** between a count and
-//! the references that justify it. Foreign keys are enforced only when the
-//! writer enabled them, so a **dangling** row is conceivable. An object row
-//! whose blob is **missing** is a read that will fail. An **orphan blob** is
-//! the benign one, a file no row references, and `pimdir gc` is what takes it:
-//! reclamation is the collector's, and this verb reclaims nothing.
+//! It reports what should not happen. A refcount is maintained
+//! incrementally, so a bug or a foreign writer could leave drift between
+//! a count and the references justifying it; foreign keys are enforced
+//! only when the writer enabled them, so a dangling row is conceivable;
+//! an object row whose blob is missing is a read that will fail. An
+//! orphan blob is the benign one, a file no row references, and `pimdir
+//! gc` is what takes it: this verb reclaims nothing.
 //!
-//! `--fix` repairs, which is a different thing from reclaiming: it recomputes
-//! the drifted refcounts from the pointers that justify them, and clears the
-//! bindings whose item is gone. Both are recoveries of a fact the store already
-//! holds. Nothing else is touched, because a wrong repair is worse than a
+//! `--fix` repairs, which is not reclaiming: it recomputes the drifted
+//! refcounts from the pointers that justify them, and clears the
+//! bindings whose item is gone. Both recover a fact the store already
+//! holds. Nothing else is touched, a wrong repair being worse than a
 //! reported inconsistency.
 
 use std::{collections::BTreeSet, fmt, path::PathBuf};
@@ -78,9 +78,9 @@ impl CheckCommand {
         let mut cleared = 0;
 
         if self.fix && (!drift.is_empty() || !dangling.is_empty()) {
-            // NOTE: the read-only handle cannot write, and the repair takes the
-            // owner role like every other write this tool makes. Dropped first,
-            // so the two never hold the store at once.
+            // NOTE: the read-only handle cannot write, and the repair
+            // takes the owner role like every other write this tool
+            // makes. Dropped first, so the two never hold it at once.
             drop(read);
             let owner = store.owner()?;
             repaired = owner.recompute_refcounts().map_err(report)?;

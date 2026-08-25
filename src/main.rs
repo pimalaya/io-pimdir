@@ -1,36 +1,35 @@
 //! # pimdir
 //!
-//! The operator command line over a pimdir store: inspect it, restore what a
-//! delete retained, purge what should really go, check what a crash left
-//! behind, and collect what nothing references any more. It is to a store what
-//! `sqlite3` is to a database, a tool for the person maintaining the data
-//! rather than for the person reading it.
+//! The operator command line over a pimdir store: inspect it, restore
+//! what a delete retained, purge what should really go, check what a
+//! crash left behind, and collect what nothing references. It is to a
+//! store what `sqlite3` is to a database, a tool for the person
+//! maintaining the data rather than the person reading it.
 //!
 //! ## What it does not do
 //!
-//! It never interprets item content. A pimdir store is kind-agnostic (mail,
-//! contacts, calendars all live in the same shape), so this binary prints the
-//! public id, the link id, the flags, the detail level and the **raw** meta,
-//! and exports bodies as raw bytes. Rendering a message or a vCard belongs to
-//! the per-kind clients (himalaya, cardamum), which know the kind they hold.
+//! It never interprets item content. A pimdir store is kind-agnostic, so
+//! this binary prints the public id, the link id, the flags, the detail
+//! level and the raw meta, and exports bodies as raw bytes. Rendering a
+//! message or a vCard belongs to the per-kind clients (himalaya,
+//! cardamum), which know the kind they hold.
 //!
 //! ## Roles
 //!
-//! Every read opens the store read-only, so inspecting a store while a sync is
-//! running is always safe. An item mutation is appended to the store's action
-//! queue, exactly as any other non-owner process does, and then applied by this
-//! process when the owner role is free; when a sync holds it, the action stays
-//! queued and applies at the next drain. Purge, queue cancellation, repair and
-//! collection have no queue action kind, so they take the owner role directly
-//! and say so plainly when they cannot.
+//! Every read opens the store read-only, so inspecting one while a sync
+//! runs is always safe. An item mutation is appended to the store's
+//! action queue, as any other non-owner process does, and applied by
+//! this process when the owner role is free; when a sync holds it, the
+//! action stays queued for the next drain. Purge, queue cancellation,
+//! repair and collection have no queue action kind, so they take the
+//! owner role directly and say so plainly when they cannot.
 //!
 //! ## Layout
 //!
-//! [`cli`] holds the command tree, one module per verb group, plus the shared
-//! store flags and the role handling. The library the whole thing is a skin
-//! over is
-//! [`io_pimdir`]; the specification of this tool lives in the repository's
-//! `cairn/spec/cli.md`.
+//! [`cli`] holds the command tree, one module per verb group, plus the
+//! shared store flags and the role handling. The library underneath is
+//! [`io_pimdir`], and this tool's specification lives in the
+//! repository's `cairn/spec/cli.md`.
 
 mod cli;
 

@@ -1,12 +1,10 @@
 //! A store never collects itself (spec §5, §14).
 //!
-//! Every write used to sweep: an object at refcount zero had its row deleted
-//! and its blob unlinked as the batch committed. That made the pattern §14
-//! invites impossible — stream a body straight to its sharded path, index it,
-//! attach it in a later batch — because the first batch destroyed the body the
-//! second was going to reference, silently and bytes included. Refcounts are
-//! still maintained exactly as they were; only the reclamation moved out, into
-//! a collector that runs when it is asked to.
+//! Reclamation lives in a collector rather than in the write path, so
+//! the pattern §14 invites works: stream a body straight to its sharded
+//! path, index it, attach it in a later batch. A write that swept its own
+//! refcount-zero objects would destroy the body the second batch was
+//! going to reference, silently and bytes included.
 
 use std::fs;
 
@@ -66,16 +64,16 @@ fn blob_exists(dir: &std::path::Path, hash: &str) -> bool {
         .exists()
 }
 
-/// The bug the collector exists to fix: bodies stored in one batch, attached in
-/// the next.
+/// The pattern the collector exists for: bodies stored in one batch,
+/// attached in the next.
 #[test]
 fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
-    // Batch one indexes two bodies and attaches neither, which is what a
-    // consumer streaming bodies ahead of their metadata does.
+    // batch one indexes two bodies and attaches neither, which is what a
+    // consumer streaming bodies ahead of their metadata does
     store
         .write(vec![
             store_object("cafebabe", b"first"),
@@ -85,7 +83,7 @@ fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert!(blob_exists(dir.path(), "beef0000"));
 
-    // Batch two attaches one of them. Both were still there to be attached.
+    // batch two attaches one of them, both having survived
     store
         .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
             "1", "mid:a", "cafebabe",
@@ -96,7 +94,7 @@ fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
         Some(ReplicaHash("cafebabe".into()))
     );
 
-    // The one nothing attached is what a collection is for.
+    // the one nothing attached is what a collection is for
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.objects, collected.blobs), (1, 1));
     assert_eq!(collected.bytes, 6);
@@ -107,7 +105,7 @@ fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
     );
 }
 
-/// The other half of what a collector takes: a file no row references at all,
+/// The other half of what a collector takes: a file no row references,
 /// which a crash between the blob write and the commit leaves behind.
 #[test]
 fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
@@ -121,13 +119,13 @@ fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
         ])
         .unwrap();
 
-    // A body on disk that no batch ever indexed.
+    // a body on disk that no batch ever indexed
     let shard = dir.path().join("objects/de/adb");
     fs::create_dir_all(&shard).unwrap();
     fs::write(shard.join("deadbeef"), b"crashed").unwrap();
 
-    // A half-written body belongs to a writer that has not committed, so it is
-    // not an orphan and the collector leaves it alone.
+    // a half-written body belongs to a writer that has not committed, so
+    // the collector leaves it alone
     fs::write(dir.path().join("objects/.tmp-1-1"), b"in flight").unwrap();
 
     let collected = store.collect_garbage().unwrap();
@@ -172,8 +170,8 @@ fn a_purge_retires_rows_and_the_collector_reclaims_the_bytes() {
     assert!(!blob_exists(dir.path(), "cafebabe"));
 }
 
-/// The repair `check --fix` runs: a drifted count settled from the pointers
-/// that justify it, and the one dangling row a repair can clear.
+/// The repair `check --fix` runs: a drifted count settled from the
+/// pointers that justify it, and the one dangling row it can clear.
 #[test]
 fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
     let dir = tempfile::tempdir().unwrap();
@@ -185,9 +183,9 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
         ])
         .unwrap();
 
-    // Drift the count and dangle a binding the way a foreign writer would.
-    // Foreign keys are per connection and off by default, which is exactly how
-    // a store acquires a row the schema forbids.
+    // drift the count and dangle a binding the way a foreign writer
+    // would: foreign keys are per connection and off by default, which is
+    // how a store acquires a row the schema forbids
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
     conn.execute("UPDATE objects SET refcount = 7", []).unwrap();
@@ -202,8 +200,8 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
     assert_eq!(store.recompute_refcounts().unwrap(), 1);
     assert_eq!(store.clear_dangling_bindings().unwrap(), 1);
 
-    // Settled, not swept: the item still references the body, so the repair
-    // leaves it at exactly one and the collector finds nothing.
+    // settled, not swept: the item still references the body, so the
+    // repair leaves it at one and the collector finds nothing
     assert_eq!(store.collect_garbage().unwrap().blobs, 0);
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert_eq!(
@@ -212,7 +210,7 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
         "nothing left to fix"
     );
 
-    // And the statement is the canonical one, run against the real schema.
+    // and the statement is the canonical one, run against the real schema
     assert!(
         sql::ALL
             .iter()

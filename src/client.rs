@@ -1,14 +1,13 @@
 //! [`PimdirStore`]: the std store that services [`io_replica`]'s storage seam.
 //!
-//! It persists a [`ReplicaHub`] per collection — one shared item plus a base per
-//! source — and splits by whether an operation has a side at all:
-//! [`PimdirStore`] is the store itself (the client reads, retention, the queue),
-//! and [`PimdirSourceStore`], which [`for_source`] yields, services
-//! [`ReplicaStorage`] for one source: `load` projects the hub for that source,
-//! `write` absorbs the source's writes back. A single-source store is the N=1
-//! case (one binding per item). Unlinked, freshly probed placements have no link
-//! id to key an item on yet, so they are held in-memory as a residual until a
-//! `Meta` upgrade resolves their link id.
+//! It persists a [`ReplicaHub`] per collection, one shared item plus a
+//! base per source, and splits by whether an operation has a side at all:
+//! [`PimdirStore`] is the store itself (the client reads, retention, the
+//! queue), and [`PimdirSourceStore`], which [`for_source`] yields,
+//! services [`ReplicaStorage`] for one source. A single-source store is
+//! the N=1 case. Freshly probed placements have no link id to key an item
+//! on yet, so they are held in memory as a residual until a `Meta`
+//! upgrade resolves it.
 //!
 //! [`for_source`]: PimdirStore::for_source
 //!
@@ -63,10 +62,11 @@ mod lock;
 /// A pimdir store: the database and the blob directory, opened without naming
 /// a side.
 ///
-/// It carries what an operation means for the store as a whole — every client
-/// read, retention and purge, the queue rows a cancellation removes — none of
-/// which consults a source. The sync seam does, and lives on
-/// [`PimdirSourceStore`], which [`for_source`](Self::for_source) yields.
+/// It carries what an operation means for the store as a whole: every
+/// client read, retention and purge, and the queue rows a cancellation
+/// removes, none of which consults a source. The sync seam does, and
+/// lives on [`PimdirSourceStore`], which
+/// [`for_source`](Self::for_source) yields.
 pub struct PimdirStore {
     conn: Connection,
     /// The store directory, which the collector locks and the blob tree hangs
@@ -74,12 +74,12 @@ pub struct PimdirStore {
     dir: PathBuf,
     blobs: PathBuf,
     /// The store's exclusive owner lock (spec §8), held for this handle's
-    /// lifetime; `None` on a read-only handle, which owns nothing. Several
-    /// handles of one process share one lock.
+    /// lifetime; `None` on a read-only handle. Several handles of one
+    /// process share one lock.
     _lock: Option<Arc<PimdirLock>>,
     /// The hash this store names its objects by (spec §5), read back from
-    /// `store_meta.hash_algo` so every body a consumer hashes lands under the
-    /// name the store already uses.
+    /// `store_meta.hash_algo` so every body a consumer hashes lands under
+    /// the name the store already uses.
     hash: PimdirHashAlgo,
     /// The account every collection this handle creates belongs to (spec §9.2);
     /// `None` in a single-account store. Set with
@@ -90,35 +90,37 @@ pub struct PimdirStore {
 /// A pimdir store acting as one source (`"left"`, `"right"`, `"phone"`, …):
 /// the sync seam, where every operation means "as this side".
 ///
-/// The underlying database and blobs are shared; several sources of one store
-/// are several handles over the same files. Dereferences to the
-/// [`PimdirStore`] it was made from, so the source-less surface stays reachable
-/// through it.
+/// The underlying database and blobs are shared: several sources of one
+/// store are several handles over the same files. Dereferences to the
+/// [`PimdirStore`] it was made from, so the source-less surface stays
+/// reachable through it.
 pub struct PimdirSourceStore {
     store: PimdirStore,
     source: ReplicaSourceId,
-    /// Unlinked probed placements, awaiting the `Meta` upgrade that gives them
-    /// a link id; kept in memory (empty at rest between syncs).
+    /// Unlinked probed placements, awaiting the `Meta` upgrade that gives
+    /// them a link id; empty at rest between syncs.
     ///
-    /// Keyed rather than listed: a first sync probes a whole collection before
-    /// linking any of it, so the residual grows to the collection size while
-    /// every insertion, every drop and every lookup searches it.
+    /// Keyed rather than listed: a first sync probes a whole collection
+    /// before linking any of it, so the residual grows to the collection
+    /// size while every insertion, drop and lookup searches it.
     residual: HashMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
 }
 
-/// A collection as seen by a client read (`list_collections`): its identity and
-/// presentation, kind-agnostic. The sync bindings and per-source state are not
-/// exposed here — a reader observes the shared truth only.
+/// A collection as seen by a client read (`list_collections`): its
+/// identity and presentation, kind-agnostic. The sync bindings and
+/// per-source state are not exposed here: a reader observes the shared
+/// truth only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirCollection {
     /// The stable collection id (the mailbox name for a mail store).
     pub id: String,
-    /// The account this collection is grouped under (spec §9.2), `None` in a
-    /// single-account store. It groups and nothing more: no identifier is
-    /// scoped by it.
+    /// The account this collection is grouped under (spec §9.2), `None`
+    /// in a single-account store. It groups and nothing more: no
+    /// identifier is scoped by it.
     pub account: Option<String>,
-    /// The declared IANA media type (`message/rfc822`, `text/vcard`, …), or the
-    /// empty string when a sync created the collection before a kind was set.
+    /// The declared IANA media type (`message/rfc822`, `text/vcard`, …),
+    /// or the empty string when a sync created the collection before a
+    /// kind was set.
     pub kind: String,
     /// The display name.
     pub name: String,
@@ -130,19 +132,19 @@ pub struct PimdirCollection {
     pub description: Option<String>,
     /// An explicit sort key; `None` sorts after the ordered ones.
     pub sort_order: Option<i64>,
-    /// The handle-space epoch (spec §12): starts at 1, bumped by the owner only
-    /// on a handle-space rebuild (rekey), so a frontend derives epoch-dependent
+    /// The handle-space epoch (spec §12): starts at 1, bumped by the
+    /// owner only on a rekey, so a frontend derives epoch-dependent
     /// protocol values (an IMAP UIDVALIDITY) from the store alone.
     pub generation: i64,
 }
 
-/// Where one identity or one body sits, as the multiplicity reads report it
-/// (spec §9.2): one row per live placement, carrying the collection and account
-/// it occurs in.
+/// Where one identity or one body sits, as the multiplicity reads report
+/// it (spec §9.2): one row per live placement, carrying the collection
+/// and account it occurs in.
 ///
-/// A fact, not a verdict. The same vCard `UID` in two accounts' address books
-/// is two of these; whether that is one person shown twice or two people is the
-/// consumer's call, and the store never makes it.
+/// A fact, not a verdict. The same vCard `UID` in two accounts' address
+/// books is two of these; whether that is one person shown twice or two
+/// people is the consumer's call.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirPlacement {
     /// The collection the placement sits in.
@@ -176,16 +178,17 @@ fn collection_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PimdirCollection> {
     })
 }
 
-/// One live item as seen by a client read (`list_items`/`get_item`): the shared
-/// truth a domain projects (an envelope, a vCard, an event), kind-agnostic. The
-/// `meta` is the raw stored summary — the reader parses it against its domain
-/// schema. The `level` makes the read availability-aware: `level < Full` (and an
-/// absent `object`) means the body is not local and a hydrate is needed.
+/// One live item as seen by a client read (`list_items`/`get_item`): the
+/// shared truth a domain projects (an envelope, a vCard, an event),
+/// kind-agnostic. The `meta` is the raw stored summary, parsed by the
+/// reader against its own schema, and the `level` makes the read
+/// availability-aware: below `Full` the body is not local.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirItem {
-    /// The message's public id (`items.seq`): a small, stable, store-global
-    /// integer — the same across every mailbox the message is filed in — a
-    /// consumer shows and passes back, instead of the long internal `link_id`.
+    /// The message's public id (`items.seq`): a small, stable,
+    /// store-global integer, the same across every mailbox the message is
+    /// filed in, that a consumer shows and passes back instead of the
+    /// long internal `link_id`.
     pub seq: i64,
     /// The cross-source link id (`Message-ID` for mail, UID for a vCard, …).
     /// Internal: a consumer keys reads and edits by `seq`, not this.
@@ -194,44 +197,43 @@ pub struct PimdirItem {
     pub flags: ReplicaFlags,
     /// The raw per-domain summary blob, verbatim; `None` when never projected.
     pub meta: Option<ReplicaMeta>,
-    /// The kind's ordering key (spec §9.3): a normalised RFC 3339 instant for
-    /// mail and calendars, a normalised display name for contacts. Empty means
-    /// unknown, which sorts before every real key ascending and after every one
-    /// descending.
+    /// The kind's ordering key (spec §9.3): a normalised RFC 3339 instant
+    /// for mail and calendars, a normalised display name for contacts.
+    /// Empty means unknown, which sorts before every real key ascending
+    /// and after every one descending.
     pub sort_key: String,
     /// The content-addressed body hash; `None` until a `Full` hydrate.
     pub object: Option<ReplicaHash>,
     /// The detail tier the item is hydrated to.
     pub level: ReplicaLevel,
-    /// What retention holds about the row, `None` while it is live. The trash
-    /// view is the only read that fills it.
+    /// What retention holds about the row, `None` while it is live. The
+    /// trash view is the only read that fills it.
     pub retention: Option<PimdirRetention>,
 }
 
 /// What retention holds about an item no source binds any more (spec §11), on
 /// the row the trash view reads (`list_retained`).
 ///
-/// Only that read fills it: a live item carries `None`, and the two reads are
-/// otherwise the same row, which is why they are the same type.
+/// Only that read fills it: a live item carries `None`, and the two reads
+/// are otherwise the same row, which is why they are the same type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirRetention {
-    /// The RFC 3339 instant the **last binding vanished** (not when a server
-    /// deleted the item, which is unknowable). A revive clears it, so
+    /// The RFC 3339 instant the last binding vanished, not when a server
+    /// deleted the item, which is unknowable. A revive clears it, so
     /// restore-then-redelete restarts the purge clock.
     pub at: String,
-    /// The source whose removal retired the item; diagnostic, nothing keys on
-    /// it.
+    /// The source whose removal retired the item; diagnostic only.
     pub by: Option<String>,
-    /// The body's size in bytes; `None` alongside an absent `object`, and what
-    /// lets a caller price a purge without a second query.
+    /// The body's size in bytes, `None` alongside an absent `object`:
+    /// what lets a caller price a purge without a second query.
     pub size: Option<u64>,
 }
 
 /// What a purge retired.
 ///
-/// Rows, not bytes: a purge releases the references a retained item held and
-/// nothing more. The bodies those references were keeping are reclaimed by the
-/// collector, which is what reports the bytes ([`PimdirStore::collect_garbage`]).
+/// Rows, not bytes: a purge releases the references a retained item held
+/// and nothing more. The bodies they kept are reclaimed by the collector,
+/// which is what reports the bytes ([`PimdirStore::collect_garbage`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirPurgeReport {
     /// Retained items deleted.
@@ -243,16 +245,16 @@ pub struct PimdirPurgeReport {
 pub struct PimdirGcReport {
     /// Object rows dropped: bodies nothing references any more.
     pub objects: usize,
-    /// Blob files unlinked, those rows' bodies and the orphans a crash left
-    /// together.
+    /// Blob files unlinked: those rows' bodies and the orphans a crash
+    /// left, together.
     pub blobs: usize,
     /// The bytes those files freed.
     pub bytes: u64,
 }
 
-/// One pending (non-parked) queue row, in append order (spec §15.4): what a
-/// frontend overlays on its item projection for read-your-writes, and what the
-/// owner's drain applies.
+/// One pending (non-parked) queue row, in append order (spec §15.4):
+/// what a frontend overlays on its item projection for read-your-writes,
+/// and what the owner's drain applies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirPendingAction {
     /// The row's global append id (`queue.id`).
@@ -267,10 +269,10 @@ pub struct PimdirPendingAction {
     pub attempts: i64,
 }
 
-/// One parked queue row: an action the owner judged permanently unappliable,
-/// recorded and skipped instead of blocking its collection's queue. Left for
-/// operators and status surfaces, never silently deleted (spec §15.2). The
-/// payload stays raw, since being undecodable may be why the row parked.
+/// One parked queue row: an action the owner judged permanently
+/// unappliable, recorded and skipped instead of blocking its collection's
+/// queue. Left for operators, never silently deleted (spec §15.2). The
+/// payload stays raw, since being undecodable may be why it parked.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirParkedAction {
     /// The row's global append id (`queue.id`).
@@ -298,9 +300,9 @@ pub struct PimdirDrainReport {
     pub applied: usize,
     /// Actions parked with an error, left queryable.
     pub parked: usize,
-    /// Actions this owner could not perform, left **pending** for one that can
-    /// (spec §15.2). Not a failure: parking would claim the action is
-    /// permanently unappliable, which is a different and wrong statement.
+    /// Actions this owner could not perform, left pending for one that
+    /// can (spec §15.2). Not a failure: parking would claim the action is
+    /// permanently unappliable, which is a different statement.
     pub skipped: usize,
 }
 
@@ -308,15 +310,15 @@ impl PimdirStore {
     /// Opens (creating if absent) the store rooted at `dir`, as its owner.
     ///
     /// The handle takes the store's exclusive advisory lock (spec §8) and
-    /// holds it until it drops, so a store has one owner process at a time;
-    /// one already owned elsewhere is [`PimdirError::Owned`] immediately,
-    /// never a wait. Several handles of one process share that lock: opening
-    /// one per source, or one per account, is still one owner.
+    /// holds it until it drops, so a store has one owner process at a
+    /// time; one already owned elsewhere is [`PimdirError::Owned`]
+    /// immediately, never a wait. Several handles of one process share
+    /// that lock: one per source, or one per account, is still one owner.
     ///
     /// A fresh database is created at the current schema version. A store
-    /// stamped with a *higher* `user_version` than this crate services is
-    /// refused with [`PimdirError::Version`] rather than half-read; the spec
-    /// is a draft, so such a store is recreated, never migrated.
+    /// stamped with a higher `user_version` than this crate services is
+    /// refused with [`PimdirError::Version`] rather than half-read: the
+    /// spec is a draft, so such a store is recreated, never migrated.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         Self::open_with_hash(dir, None)
     }
@@ -325,17 +327,18 @@ impl PimdirStore {
     /// its objects are named by (spec §5).
     ///
     /// A store records its algorithm once, at creation, in
-    /// `store_meta.hash_algo`: every blob is a file named by it, so it cannot
-    /// change afterwards. `hash` therefore applies to a store this call
-    /// creates, and an existing store whose algorithm differs is refused with
-    /// [`PimdirError::HashAlgo`] rather than opened into a handle that would
-    /// hash bodies to names it does not use. Passing `None` adopts whatever the
-    /// store records, and creates with [`PimdirHashAlgo::default`].
+    /// `store_meta.hash_algo`: every blob is a file named by it, so it
+    /// cannot change afterwards. `hash` therefore applies to a store this
+    /// call creates, and an existing store whose algorithm differs is
+    /// refused with [`PimdirError::HashAlgo`] rather than opened into a
+    /// handle that would hash bodies to names it does not use. `None`
+    /// adopts what the store records, creating with
+    /// [`PimdirHashAlgo::default`].
     ///
     /// A consumer hashes through [`hash`](Self::hash) or
-    /// [`hasher`](Self::hasher) rather than choosing an algorithm of its own,
-    /// which is what keeps two implementations of one store (this crate and the
-    /// Android app's SQLite driver) naming the same body the same way.
+    /// [`hasher`](Self::hasher) rather than choosing an algorithm of its
+    /// own, which is what keeps two implementations of one store naming
+    /// the same body the same way.
     pub fn open_with_hash(
         dir: impl AsRef<Path>,
         hash: Option<PimdirHashAlgo>,
@@ -350,12 +353,11 @@ impl PimdirStore {
         let lock = PimdirLock::own(dir)?;
 
         let mut conn = Connection::open(dir.join("pimdir.db"))?;
-        // NOTE: `busy_timeout` lets several handles of one store wait out each
-        // other's write transaction instead of failing with `SQLITE_BUSY` — §8's
-        // single-owner process opening `"left"` and `"right"`, and a sync that
-        // fans work across several same-source handles (one per worker) to overlap
-        // network while the writes serialise. 30s absorbs a burst of large writes
-        // (a first sync's per-mailbox meta insert) contending on the write lock.
+        // NOTE: `busy_timeout` lets several handles of one store wait out
+        // each other's write transaction instead of failing with
+        // `SQLITE_BUSY`: §8's single-owner process opening `"left"` and
+        // `"right"`, or a sync fanning work across same-source handles.
+        // 30s absorbs a burst of large writes contending on the lock.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
         )?;
@@ -374,16 +376,15 @@ impl PimdirStore {
 
     /// Opens an **existing** store rooted at `dir` read-only.
     ///
-    /// The database is opened with `SQLITE_OPEN_READ_ONLY`: nothing is created,
-    /// so a missing database errors, one no owner has stamped yet is
-    /// [`PimdirError::Uncreated`], and any other schema version is refused with
-    /// [`PimdirError::Version`] (a reader's SQL requires the current columns and
-    /// never creates the schema; that is the owner's opening write). The
-    /// returned handle exposes the full read surface; any write through it
-    /// fails at the SQLite layer.
+    /// The database is opened with `SQLITE_OPEN_READ_ONLY`: nothing is
+    /// created, so a missing database errors, one no owner has stamped
+    /// yet is [`PimdirError::Uncreated`], and any other schema version is
+    /// refused with [`PimdirError::Version`]. The returned handle exposes
+    /// the full read surface; any write through it fails at the SQLite
+    /// layer.
     ///
-    /// A reader owns nothing and takes no lock: any number of them may run
-    /// against a store an owner holds.
+    /// A reader owns nothing and takes no lock: any number of them may
+    /// run against a store an owner holds.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -423,8 +424,8 @@ impl PimdirStore {
     /// A blob handle over this store's object directory, bound to the hash the
     /// store names its bodies by.
     ///
-    /// Independent of the SQLite connection, so a body can be read while the
-    /// store is mutably borrowed servicing a sync.
+    /// Independent of the SQLite connection, so a body can be read while
+    /// the store is mutably borrowed servicing a sync.
     pub fn blobs(&self) -> PimdirBlobs {
         PimdirBlobs {
             root: self.blobs.clone(),
@@ -437,8 +438,9 @@ impl PimdirStore {
         self.hash.hash(bytes)
     }
 
-    /// An incremental hasher for a body streamed into the blob store rather
-    /// than held whole in memory, paired with [`PimdirBlobs::writer`].
+    /// An incremental hasher for a body streamed into the blob store
+    /// rather than held whole in memory, paired with
+    /// [`PimdirBlobs::writer`].
     pub fn hasher(&self) -> PimdirHasher {
         self.hash.hasher()
     }
@@ -446,18 +448,18 @@ impl PimdirStore {
     /// Binds this handle to an account, so every collection it creates is
     /// grouped under it (spec §9.2).
     ///
-    /// A single-account store never calls this and its collections carry a
-    /// `NULL` account, which is what every by-account read matches when given
-    /// `None`. A multi-account owner opens one handle per account, the same way
-    /// it already opens one per source; handles are a SQLite connection each,
-    /// and §8's single-owner rule is unchanged by how many a process holds.
+    /// A single-account store never calls this and its collections carry
+    /// a `NULL` account, which is what every by-account read matches when
+    /// given `None`. A multi-account owner opens one handle per account,
+    /// the way it already opens one per source; §8's single-owner rule is
+    /// unchanged by how many a process holds.
     ///
-    /// The account groups and nothing more: it partitions no identifier, so two
-    /// accounts holding one link id still share a `seq`, and one body reaching
-    /// both is still stored once. Where an identity or a body occurs is
-    /// reported by [`link_placements`](Self::link_placements) and
-    /// [`object_placements`](Self::object_placements), for the consumer to
-    /// interpret.
+    /// The account groups and nothing more: it partitions no identifier,
+    /// so two accounts holding one link id still share a `seq`, and one
+    /// body reaching both is still stored once. Where an identity or a
+    /// body occurs is reported by
+    /// [`link_placements`](Self::link_placements) and
+    /// [`object_placements`](Self::object_placements).
     pub fn for_account(mut self, account: impl Into<String>) -> Self {
         self.account = Some(account.into());
         self
@@ -472,9 +474,9 @@ impl PimdirStore {
     /// the hub for that side and `write` folds its decisions back.
     ///
     /// A source is a side this store syncs with (`"left"`, `"right"`,
-    /// `"phone"`, …), so it is only ever named by an operation that acts as
-    /// one. Everything else — the reads, retention, the queue — stays on the
-    /// source-less handle and is still reachable through the returned one.
+    /// `"phone"`, …), so it is only ever named by an operation acting as
+    /// one. Everything else, the reads, retention and the queue, stays on
+    /// the source-less handle and is still reachable through this one.
     pub fn for_source(self, source: impl Into<String>) -> PimdirSourceStore {
         PimdirSourceStore {
             store: self,
@@ -483,13 +485,12 @@ impl PimdirStore {
         }
     }
 
-    /// Loads a collection's full [`ReplicaHub`] — every source's items and
+    /// Loads a collection's full [`ReplicaHub`]: every source's items and
     /// bindings, not only this handle's source.
     ///
     /// [`load`](ReplicaStorage::load) projects the hub for one source; a
-    /// multi-source consumer (a two-sided sync driving one handle per source
-    /// over the shared files) reads the whole hub to project each side and to
-    /// spot items held by a single source.
+    /// multi-source consumer reads the whole hub to project each side and
+    /// to spot items held by a single source.
     pub fn load_hub(&self, collection: &str) -> Result<ReplicaHub, PimdirError> {
         Ok(load_hub(&self.conn, collection)?)
     }
@@ -497,17 +498,19 @@ impl PimdirStore {
     /// Declares a collection's media type (`kind`), creating the collection if
     /// absent and updating its kind otherwise.
     ///
-    /// The kind is an [IANA media type](https://www.iana.org/assignments/media-types)
-    /// (`message/rfc822`, `text/vcard`, `text/calendar`, …) — static consumer
-    /// configuration, not something the sync engine derives — so a consumer
-    /// sets it out of band from the [`ReplicaStorage`] seam. This is what makes
-    /// the store self-describing (§4.3) and lets one store hold several item
-    /// kinds. The lazy collection creation inside [`write`](ReplicaStorage::write)
-    /// uses `ON CONFLICT DO NOTHING`, so it never clobbers a kind set here,
-    /// whichever runs first.
+    /// The kind is an [IANA media
+    /// type](https://www.iana.org/assignments/media-types)
+    /// (`message/rfc822`, `text/vcard`, `text/calendar`, …), static
+    /// consumer configuration rather than something the sync engine
+    /// derives, so a consumer sets it out of band from the
+    /// [`ReplicaStorage`] seam. That is what makes the store
+    /// self-describing (§4.3) and lets one store hold several kinds. The
+    /// lazy creation inside [`write`](ReplicaStorage::write) uses
+    /// `ON CONFLICT DO NOTHING`, so it never clobbers a kind set here.
+    ///
     /// The collection is grouped under this handle's account
-    /// ([`for_account`](Self::for_account)), and an existing row keeps the
-    /// account it already had: only the kind is updated.
+    /// ([`for_account`](Self::for_account)); an existing row keeps the
+    /// account it had, and only the kind is updated.
     pub fn ensure_collection(&self, collection: &str, kind: &str) -> Result<(), PimdirError> {
         self.conn.execute(
             sql::SET_COLLECTION_KIND,
@@ -538,9 +541,9 @@ impl PimdirStore {
 
     /// The account a collection is grouped under.
     ///
-    /// The outer `Option` is "does the collection exist", the inner one "is it
-    /// grouped": `Ok(None)` for an unknown collection, `Ok(Some(None))` for one
-    /// in a single-account store.
+    /// The outer `Option` is whether the collection exists, the inner one
+    /// whether it is grouped: `Ok(None)` for an unknown collection,
+    /// `Ok(Some(None))` for one in a single-account store.
     pub fn collection_account(
         &self,
         collection: &str,
@@ -555,10 +558,10 @@ impl PimdirStore {
             .optional()?)
     }
 
-    /// The declared media type of a collection, or `None` if the store has
-    /// never seen it. An empty string means the collection exists but was
-    /// created lazily by a sync before any [`ensure_collection`](Self::ensure_collection)
-    /// declared its kind.
+    /// The declared media type of a collection, or `None` if the store
+    /// has never seen it. An empty string means the collection exists but
+    /// was created lazily by a sync before any
+    /// [`ensure_collection`](Self::ensure_collection) declared its kind.
     pub fn collection_kind(&self, collection: &str) -> Result<Option<String>, PimdirError> {
         Ok(self
             .conn
@@ -572,9 +575,9 @@ impl PimdirStore {
 
     /// Lists every collection in the store (client read surface).
     ///
-    /// Ordered by `sort_order` then `id`, unordered collections last. This is a
-    /// direct getter — it observes the shared truth and never mutates; writes go
-    /// through io-replica's [`write`](ReplicaStorage::write) seam.
+    /// Ordered by `sort_order` then `id`, unordered collections last. A
+    /// direct getter: it observes the shared truth and never mutates, and
+    /// writes go through io-replica's [`write`](ReplicaStorage::write).
     pub fn list_collections(&self) -> Result<Vec<PimdirCollection>, PimdirError> {
         Ok(rows(&self.conn, sql::LIST_COLLECTIONS, [], collection_row)?)
     }
@@ -598,10 +601,9 @@ impl PimdirStore {
 
     /// The accounts owning at least one collection.
     ///
-    /// Not a configured roster: a store learns an account only through its
-    /// collections (spec §9.2), so an account with none yet does not appear
-    /// here and a consumer holding the real roster reads it from its own
-    /// configuration.
+    /// Not a configured roster: a store learns an account only through
+    /// its collections (spec §9.2), so one with none yet does not appear
+    /// here and a consumer holding the real roster reads its own config.
     pub fn list_accounts(&self) -> Result<Vec<String>, PimdirError> {
         Ok(rows(&self.conn, sql::LIST_ACCOUNTS, [], |r| r.get(0))?)
     }
@@ -610,10 +612,9 @@ impl PimdirStore {
     /// sits in (spec §9.2).
     ///
     /// The store reports where a link id occurs and takes no position on
-    /// whether the placements are one thing. A mail view lists them, because
-    /// two receipts of a newsletter have two read states and two servers; a
-    /// contact view may offer to merge them, because one person in two address
-    /// books is usually one person. Both read these rows.
+    /// whether the placements are one thing. A mail view lists them, two
+    /// receipts of a newsletter having two read states; a contact view
+    /// may offer to merge them. Both read these rows.
     pub fn link_placements(&self, link_id: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
         Ok(rows(
             &self.conn,
@@ -633,9 +634,9 @@ impl PimdirStore {
         )?)
     }
 
-    /// Every live placement of one body, by content hash: the dedup axis rather
-    /// than the identity one, so it pairs placements two servers gave different
-    /// link ids.
+    /// Every live placement of one body, by content hash: the dedup axis
+    /// rather than the identity one, so it pairs placements two servers
+    /// gave different link ids.
     pub fn object_placements(&self, hash: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
         Ok(rows(
             &self.conn,
@@ -657,11 +658,12 @@ impl PimdirStore {
 
     /// A keyset page of a collection's live items (client read surface).
     ///
-    /// `after` is the exclusive lower bound on `link_id` (`None` starts from the
-    /// beginning); at most `limit` items are returned, ordered by `link_id`, so
-    /// the last item's [`link_id`](PimdirItem::link_id) is the cursor for the
-    /// next page. Tombstones (`deleted`) are excluded. Each item carries its
-    /// `level`, so the caller sees a body's absence without probing the blobs.
+    /// `after` is the exclusive lower bound on `link_id`, `None` starting
+    /// from the beginning; at most `limit` items come back ordered by
+    /// `link_id`, so the last item's [`link_id`](PimdirItem::link_id) is
+    /// the next page's cursor. Tombstones are excluded, and each item
+    /// carries its `level`, so a body's absence shows without probing the
+    /// blobs.
     pub fn list_items(
         &self,
         collection: &str,
@@ -680,25 +682,22 @@ impl PimdirStore {
         )?)
     }
 
-    /// A keyset page of a collection's live items in the kind's own **ascending**
-    /// order (spec §9.3): A to Z for contacts, earliest first for mail and
-    /// calendars.
+    /// A keyset page of a collection's live items in the kind's own
+    /// ascending order (spec §9.3): A to Z for contacts, earliest first
+    /// for mail and calendars.
     ///
-    /// `after` is the previous page's last `(sort_key, seq)`; `None` starts from
-    /// the beginning. The pair is the cursor because a sort key is not unique
-    /// (two messages share a timestamp, two contacts share a name) and `seq`,
-    /// unique per collection, is what makes the page total: no item is skipped
-    /// or repeated across a boundary.
+    /// `after` is the previous page's last `(sort_key, seq)`, `None`
+    /// starting from the beginning. The pair is the cursor because a sort
+    /// key is not unique and `seq`, unique per collection, is what makes
+    /// the page total: no item is skipped or repeated across a boundary.
     pub fn list_items_page_asc(
         &self,
         collection: &str,
         after: Option<(&str, i64)>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
-        // No real key sorts before an unknown one ascending, so the empty
-        // string with seq 0 is the true beginning rather than a sentinel.
-        // NOTE: no cursor ascending is the empty key, which is a real
-        // one: an unknown key sorts first, so the page starts at it.
+        // NOTE: no real key sorts before an unknown one ascending, so the
+        // empty string with seq 0 is the true beginning, not a sentinel.
         let (key, seq) = after.unwrap_or(("", 0));
         self.sorted_page(
             sql::LIST_ITEMS_PAGE_ASC,
@@ -708,12 +707,12 @@ impl PimdirStore {
         )
     }
 
-    /// The same page **descending**: newest first for mail and calendars, Z to A
-    /// for contacts.
+    /// The same page descending: newest first for mail and calendars, Z
+    /// to A for contacts.
     ///
-    /// `None` starts from the end, which the statement expresses by binding a
-    /// key above every representable one; a caller never has to invent that
-    /// sentinel itself.
+    /// `None` starts from the end, which the statement expresses by
+    /// binding a key above every representable one, so a caller never
+    /// invents that sentinel itself.
     pub fn list_items_page_desc(
         &self,
         collection: &str,
@@ -745,11 +744,10 @@ impl PimdirStore {
 
     /// Restates one item's ordering key (spec §9.3).
     ///
-    /// For a re-projection: a store written before its kind had a sort-key
-    /// convention, one whose convention changed, or a consumer whose sync engine
-    /// does not carry the key inline yet and derives it from the `meta` it wrote
-    /// itself. Not part of the ordinary write path, which preserves an existing
-    /// key by never naming it.
+    /// For a re-projection: a store written before its kind had a
+    /// sort-key convention, one whose convention changed, or a consumer
+    /// deriving the key from the `meta` it wrote itself. Not part of the
+    /// ordinary write path, which preserves a key by never naming it.
     pub fn set_sort_key(
         &self,
         collection: &str,
@@ -769,19 +767,18 @@ impl PimdirStore {
 
     /// Gives a collection a new id, carrying its whole contents with it.
     ///
-    /// Every foreign key onto `collections(id)` is `ON UPDATE CASCADE`, so the
-    /// items, bindings, sources, queue rows and child collections follow in the
-    /// same statement (spec §14). This is the **only** safe way to change an id:
-    /// deleting the collection and recreating it under the new one destroys the
-    /// cache, because `ON DELETE CASCADE` takes every item and binding with it,
-    /// turning a rename into a full re-download and discarding any staged local
-    /// change not yet pushed.
+    /// Every foreign key onto `collections(id)` is `ON UPDATE CASCADE`,
+    /// so the items, bindings, sources, queue rows and child collections
+    /// follow in the same statement (spec §14). This is the only safe way
+    /// to change an id: recreating the collection under the new one takes
+    /// every item and binding with it through `ON DELETE CASCADE`,
+    /// turning a rename into a full re-download and discarding any staged
+    /// local change.
     ///
-    /// Two things make an id change: a server renaming the collection (an IMAP
-    /// `RENAME`, a DAV move), and an owner renaming an account whose id it
-    /// namespaced its collection ids with. An account rename is one call per
-    /// collection of that account; run them in one transaction and the account
-    /// moves atomically or not at all.
+    /// Two things make an id change: a server renaming the collection,
+    /// and an owner renaming an account whose id it namespaced its
+    /// collection ids with. An account rename is one call per collection;
+    /// run them in one transaction and the account moves atomically.
     pub fn rename_collection(&self, collection: &str, new_id: &str) -> Result<(), PimdirError> {
         self.conn.execute(
             sql::RENAME_COLLECTION,
@@ -790,8 +787,8 @@ impl PimdirStore {
         Ok(())
     }
 
-    /// One live item by its public id `(collection, seq)`, or `None` (client read
-    /// surface). A tombstoned item reads as `None`. The returned item carries its
+    /// One live item by its public id `(collection, seq)`, or `None`. A
+    /// tombstoned item reads as `None`, and the returned item carries its
     /// internal `link_id` for the caller to edit by.
     pub fn get_item(&self, collection: &str, seq: i64) -> Result<Option<PimdirItem>, PimdirError> {
         Ok(self
@@ -804,9 +801,9 @@ impl PimdirStore {
             .optional()?)
     }
 
-    /// Resolves an item's public id (`seq`) from its internal `link_id` — the
-    /// inverse of [`get_item`](Self::get_item), for a consumer that just staged an
-    /// add and wants the id the item now shows under.
+    /// Resolves an item's public id (`seq`) from its internal `link_id`,
+    /// the inverse of [`get_item`](Self::get_item), for a consumer that
+    /// just staged an add and wants the id it now shows under.
     pub fn seq_for_link(
         &self,
         collection: &str,
@@ -822,10 +819,10 @@ impl PimdirStore {
             .optional()?)
     }
 
-    /// The distinct source names the store has synced against (across all
-    /// collections). A client uses this to attribute its writes: a store synced
-    /// as a single source (the local-sync case) has exactly one, so the app
-    /// writes as it without configuration.
+    /// The distinct source names the store has synced against, across all
+    /// collections. A client attributes its writes with this: a store
+    /// synced as a single source has exactly one, so the app writes as it
+    /// without configuration.
     pub fn distinct_sources(&self) -> Result<Vec<String>, PimdirError> {
         Ok(rows(&self.conn, sql::LIST_SOURCES, [], |r| r.get(0))?)
     }
@@ -841,24 +838,25 @@ impl PimdirStore {
     }
 }
 
-/// The retention surface (spec §11): the trash a store keeps instead of losing
-/// items, and the only operations that truly destroy one.
+/// The retention surface (spec §11): the trash a store keeps instead of
+/// losing items, and the only operations that truly destroy one.
 ///
-/// An item whose last source binding vanished is retained, not deleted: hidden
-/// from the sync seam (so no sync ever re-derives it) and from the live client
-/// reads, but kept whole, body included. It comes back either by revival (its
-/// link id reappears, whether from a source or from a client `add`) or not at
-/// all, until a purge reclaims it. Retention is unconditional; *when* to
-/// reclaim is the owner's schedule, which is why every purge takes its
-/// boundary from the caller.
+/// An item whose last source binding vanished is retained, not deleted:
+/// hidden from the sync seam and from the live client reads, but kept
+/// whole, body included. It comes back by revival, its link id
+/// reappearing from a source or a client `add`, or not at all until a
+/// purge reclaims it. Retention is unconditional; when to reclaim is the
+/// owner's schedule, which is why every purge takes its boundary from the
+/// caller.
 impl PimdirStore {
     /// A keyset page of a collection's retained items.
     ///
-    /// `after` is the exclusive lower bound on the public `seq` (`None` starts
-    /// from the beginning); at most `limit` items are returned, ordered by
-    /// `seq`, so the last item's [`seq`](PimdirItem::seq) is the cursor
-    /// for the next page. This is the only read that returns retained items: a
-    /// caller presents them as a trash view, never merged into the live listing.
+    /// `after` is the exclusive lower bound on the public `seq`, `None`
+    /// starting from the beginning; at most `limit` items come back
+    /// ordered by `seq`, so the last item's [`seq`](PimdirItem::seq) is
+    /// the next page's cursor. The only read that returns retained items:
+    /// a caller presents them as a trash view, never merged into the live
+    /// listing.
     pub fn list_retained(
         &self,
         collection: &ReplicaCollectionId,
@@ -890,9 +888,9 @@ impl PimdirStore {
     /// The bytes retention is holding across the whole store, each distinct body
     /// counted once.
     ///
-    /// An **upper bound** on what a purge would reclaim: a body a live item also
-    /// points at keeps that reference and survives the sweep. Reported so an
-    /// operator can price a retention duration before choosing one.
+    /// An upper bound on what a purge would reclaim: a body a live item
+    /// also points at keeps that reference and survives the sweep.
+    /// Reported so an operator can price a retention duration.
     pub fn retained_bytes(&self) -> Result<u64, PimdirError> {
         let bytes: i64 = self.conn.query_row(sql::RETAINED_BYTES, [], |r| r.get(0))?;
         Ok(bytes.max(0) as u64)
@@ -901,11 +899,11 @@ impl PimdirStore {
     /// Purges one retained item by its public id, returning whether there was
     /// one to purge.
     ///
-    /// The row goes, its bindings cascade, and the body it released is unlinked
-    /// by the ordinary refcount sweep once nothing else references it: a purge
-    /// runs no garbage collection of its own. A **live** item is never reached
-    /// by this (the statement is guarded on the retention stamp), so an
-    /// operator emptying the trash cannot destroy synced data.
+    /// The row goes, its bindings cascade, and the body it released is
+    /// unlinked by the ordinary sweep once nothing else references it: a
+    /// purge collects nothing itself. A live item is never reached, the
+    /// statement being guarded on the retention stamp, so an operator
+    /// emptying the trash cannot destroy synced data.
     pub fn purge(
         &mut self,
         collection: &ReplicaCollectionId,
@@ -916,10 +914,11 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
 
-        // NOTE: the delete reports the hashes the row pinned, so the release
-        // rides the statement that caused it instead of a read that visits the
-        // same row first. Nothing to return means there was no retained item
-        // under that id, which is also how a live one is refused.
+        // NOTE: the delete reports the hashes the row pinned, so the
+        // release rides the statement that caused it rather than a read
+        // visiting the same row first. Nothing to return means there was
+        // no retained item under that id, which is how a live one is
+        // refused too.
         let pinned: Option<(Option<String>, Option<String>)> = tx
             .prepare(sql::PURGE_ITEM)?
             .query_row(
@@ -939,12 +938,12 @@ impl PimdirStore {
     /// The scheduled sweep: purges every item retired **strictly before**
     /// `cutoff` (RFC 3339), store-wide, reporting how many it retired.
     ///
-    /// The boundary is the caller's, not the store's clock: an owner computes it
-    /// from its own retention duration, so the store holds no policy and the
-    /// sweep stays deterministic even though the stamps are SQLite's. An item
-    /// retained exactly at `cutoff` is kept. A cutoff of *now* reproduces the
-    /// terminal-delete behaviour of a store that never retained, which is why
-    /// there is no on/off switch.
+    /// The boundary is the caller's, not the store's clock: an owner
+    /// computes it from its own retention duration, so the store holds no
+    /// policy and the sweep stays deterministic. An item retained exactly
+    /// at `cutoff` is kept, and a cutoff of now reproduces the
+    /// terminal-delete behaviour of a store that never retained, which is
+    /// why there is no on/off switch.
     pub fn purge_retained_before(
         &mut self,
         cutoff: &str,
@@ -956,8 +955,7 @@ impl PimdirStore {
 
         // NOTE: one pass. The delete reports what each row it takes was
         // pinning, so the count and the pins to release both come off the
-        // statement that did the work, where reading the set first visited
-        // every swept row twice.
+        // statement that did the work.
         let pinned: Vec<(Option<String>, Option<String>)> = rows(
             &tx,
             sql::PURGE_RETAINED_BEFORE,
@@ -978,28 +976,28 @@ impl PimdirStore {
     }
 }
 
-/// Reclamation and repair (spec §5, §7): the two things a store does not do to
-/// itself.
+/// Reclamation and repair (spec §5, §7): the two things a store does not
+/// do to itself.
 ///
-/// No write collects. An object at refcount zero is unreferenced, not deleted,
-/// and stays until a collector runs: that is what lets a consumer store a body
-/// in one batch and attach it in a later one, which spec §14 invites and a
-/// sweep at the end of every write made impossible. Repair is the other half —
-/// a refcount is maintained incrementally, so recomputing it from the pointers
-/// that justify it is how a drift is settled rather than reported for ever.
+/// No write collects. An object at refcount zero is unreferenced rather
+/// than deleted, and stays until a collector runs, which is what lets a
+/// consumer store a body in one batch and attach it in a later one (spec
+/// §14). Repair is the other half: a refcount is maintained
+/// incrementally, so recomputing it from the pointers that justify it is
+/// how a drift is settled rather than reported for ever.
 impl PimdirStore {
     /// Reclaims what nothing references: the object rows at refcount zero, the
     /// bodies they held, and any orphan blob a crash left behind.
     ///
-    /// Takes the store's staging lock exclusively, so no producer is between a
-    /// blob write and the queue row that pins it, and runs on an owning handle,
-    /// which already holds the store against other owners. Those two are what
-    /// let the sweep take a body the moment nothing references it, with no
-    /// grace window standing in for a lock.
+    /// Takes the store's staging lock exclusively, so no producer is
+    /// between a blob write and the queue row that pins it, and runs on
+    /// an owning handle, which already holds the store against other
+    /// owners. Those two let the sweep take a body the moment nothing
+    /// references it, with no grace window standing in for a lock.
     ///
-    /// The rows go inside a transaction and the files after it, in the order a
-    /// crash can afford: a body without its row is an orphan the next
-    /// collection takes, where a row without its body is a read that fails.
+    /// The rows go inside a transaction and the files after it, in the
+    /// order a crash can afford: a body without its row is an orphan the
+    /// next collection takes, where a row without its body fails a read.
     pub fn collect_garbage(&mut self) -> Result<PimdirGcReport, PimdirError> {
         let _staging = PimdirLock::collect(&self.dir)?;
 
@@ -1010,14 +1008,12 @@ impl PimdirStore {
         let objects = tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
 
-        // NOTE: one pass over the tree rather than one unlink per collected
-        // row plus a pass for the orphans. A body whose row the transaction
-        // above just dropped is an orphan by now, so both cases are the same
-        // case.
-        //
-        // Asked per file on the primary key rather than read whole into a set:
-        // a store of the size §1 promises holds hundreds of thousands of
-        // hashes, and the question is always about one file.
+        // NOTE: one pass over the tree rather than an unlink per
+        // collected row plus a pass for the orphans: a body whose row the
+        // transaction above dropped is an orphan by now. Asked per file
+        // on the primary key rather than read whole into a set, since a
+        // store holds hundreds of thousands of hashes and the question is
+        // always about one file.
         let mut report = PimdirGcReport {
             objects,
             ..Default::default()
@@ -1040,9 +1036,9 @@ impl PimdirStore {
     /// (spec §7), returning how many rows disagreed and were corrected.
     ///
     /// The counterpart of the incremental maintenance every write does: a
-    /// count that has drifted, from a bug here or from a foreign writer, is
-    /// otherwise reported for ever and never settled. It is a whole-store pass,
-    /// so it belongs to a repair verb rather than to a write.
+    /// count that drifted, from a bug here or a foreign writer, is
+    /// otherwise reported for ever. A whole-store pass, so it belongs to
+    /// a repair verb rather than to a write.
     pub fn recompute_refcounts(&self) -> Result<usize, PimdirError> {
         Ok(self.conn.execute(sql::RECOMPUTE_REFCOUNTS, [])?)
     }
@@ -1050,12 +1046,11 @@ impl PimdirStore {
     /// Deletes the bindings whose item is gone, returning how many, and leaves
     /// every other dangling row alone.
     ///
-    /// A binding with no item is unreachable: nothing can read it and no sync
-    /// projects it. The other rows a check reports as dangling are not like
-    /// that — an item whose object row is missing is still the item, and a
-    /// queue row whose body is missing is still an intent somebody expressed —
-    /// so deleting them would destroy data rather than repair it, and they stay
-    /// reported.
+    /// A binding with no item is unreachable: nothing reads it and no
+    /// sync projects it. The other dangling rows a check reports are not
+    /// like that, an item whose object row is missing being still the
+    /// item and a queue row whose body is missing still an intent, so
+    /// deleting them would destroy data rather than repair it.
     pub fn clear_dangling_bindings(&self) -> Result<usize, PimdirError> {
         Ok(self.conn.execute(sql::DELETE_DANGLING_BINDINGS, [])?)
     }
@@ -1063,9 +1058,8 @@ impl PimdirStore {
 
 /// Runs one statement and collects every row through `map`.
 ///
-/// The shape fourteen reads of this crate wrote out by hand: prepare, map,
-/// push, return. A `Transaction` derefs to a `Connection`, so a read inside a
-/// write batch uses it too.
+/// A `Transaction` derefs to a `Connection`, so a read inside a write
+/// batch uses this too.
 fn rows<T>(
     conn: &Connection,
     sql: &str,
@@ -1081,10 +1075,10 @@ fn release_pins(
     conn: &Connection,
     hashes: impl Iterator<Item = String>,
 ) -> Result<(), PimdirError> {
-    // NOTE: one statement rather than one per hash. A purge sweeping fifty
-    // thousand retained items releases two pins each, and a point update per
-    // pin is a hundred thousand statements inside one transaction to express
-    // a set operation.
+    // NOTE: one statement rather than one per hash: a purge sweeping
+    // fifty thousand retained items releases two pins each, and a point
+    // update per pin is a hundred thousand statements to express a set
+    // operation.
     let hashes: Vec<String> = hashes.collect();
     if hashes.is_empty() {
         return Ok(());
@@ -1096,14 +1090,14 @@ fn release_pins(
     Ok(())
 }
 
-/// The action-queue owner surface (spec §15) and collection generations (spec
-/// §12): the single owning process drains producer-requested mutations into the
-/// store, and marks a handle-space rebuild for readers.
+/// The action-queue owner surface (spec §15) and collection generations
+/// (spec §12): the single owning process drains producer-requested
+/// mutations into the store, and marks a rebuild for readers.
 impl PimdirStore {
-    /// A collection's handle-space epoch (spec §12), or `None` when the store
-    /// has never seen the collection. Starts at 1; bumped only by
-    /// [`write_rekeyed`](PimdirSourceStore::write_rekeyed), so a frontend derives
-    /// epoch-dependent protocol values (an IMAP UIDVALIDITY) from it alone.
+    /// A collection's handle-space epoch (spec §12), or `None` when the
+    /// store has never seen it. Starts at 1, bumped only by
+    /// [`write_rekeyed`](PimdirSourceStore::write_rekeyed), so a frontend
+    /// derives an IMAP UIDVALIDITY from it alone.
     pub fn generation(&self, collection: &str) -> Result<Option<i64>, PimdirError> {
         Ok(self
             .conn
@@ -1123,10 +1117,10 @@ impl PimdirStore {
         })?)
     }
 
-    /// A collection's pending (non-parked) actions in append order, decoded
-    /// (read surface, spec §15.4): a frontend overlays them on its item
-    /// projection for read-your-writes. An undecodable payload errors; the
-    /// owner's next drain parks such a row.
+    /// A collection's pending (non-parked) actions in append order,
+    /// decoded (spec §15.4): a frontend overlays them on its item
+    /// projection for read-your-writes. An undecodable payload errors,
+    /// and the owner's next drain parks such a row.
     pub fn pending_actions(
         &self,
         collection: &str,
@@ -1135,8 +1129,8 @@ impl PimdirStore {
     }
 
     /// Every parked action across the store, in append order, for status
-    /// surfaces and operator repair. Parked rows are skipped by the drain and
-    /// never silently deleted.
+    /// surfaces and operator repair. Parked rows are skipped by the drain
+    /// and never silently deleted.
     pub fn parked_actions(&self) -> Result<Vec<PimdirParkedAction>, PimdirError> {
         Ok(rows(&self.conn, sql::LOAD_PARKED_ACTIONS, [], |r| {
             Ok(PimdirParkedAction {
@@ -1155,11 +1149,11 @@ impl PimdirStore {
     /// Removes one queue row by request rather than by application, pending or
     /// parked, returning whether there was a row to remove (spec §15.5).
     ///
-    /// One verb for the two ways a row leaves the queue unapplied: a producer
-    /// (or an operator) **cancelling** a queued action, and an owner
-    /// **acknowledging** an intent it performed out of band, which the drain
-    /// could only skip. The row's body pin is released in the same transaction,
-    /// so a blob nothing else references falls to the ordinary sweep.
+    /// One verb for the two ways a row leaves the queue unapplied: a
+    /// producer cancelling a queued action, and an owner acknowledging an
+    /// intent it performed out of band, which the drain could only skip.
+    /// The row's body pin is released in the same transaction, so a blob
+    /// nothing else references falls to the ordinary sweep.
     pub fn drop_action(&mut self, id: i64) -> Result<bool, PimdirError> {
         let tx = self
             .conn
@@ -1183,11 +1177,11 @@ impl PimdirStore {
 
     /// Records a failed apply an owner performed itself (spec §15.2).
     ///
-    /// `None` is the transient case: the attempt counter advances and the row
-    /// stays pending, so the next drain picks it up again. `Some(error)` is the
-    /// permanent one: the row parks with the failure, visible to operators
-    /// instead of blocking its collection forever. An unknown id is a no-op,
-    /// since the row may have been applied or cancelled in between.
+    /// `None` is the transient case: the attempt counter advances and the
+    /// row stays pending for the next drain. `Some(error)` is the
+    /// permanent one: the row parks with the failure, visible to
+    /// operators instead of blocking its collection. An unknown id is a
+    /// no-op, since the row may have been applied or cancelled meanwhile.
     pub fn fail_action(&self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
         let Some(error) = error else {
             self.conn
@@ -1211,8 +1205,8 @@ impl PimdirStore {
     }
 }
 
-/// The sync seam and what only a side can mean: the source-bound writes, and
-/// the drain that stages a producer's queued mutation for that side.
+/// The sync seam and what only a side can mean: the source-bound writes,
+/// and the drain that stages a producer's queued mutation for that side.
 impl PimdirSourceStore {
     /// The source this handle acts as.
     pub fn source(&self) -> &str {
@@ -1231,11 +1225,11 @@ impl PimdirSourceStore {
     /// Applies a handle-space rebuild's write batch and bumps the collection's
     /// generation **in the same transaction**, returning the new generation.
     ///
-    /// The owner drives io-replica's rekey coroutine and routes its rebuild
-    /// writes here instead of [`write`](ReplicaStorage::write), so "the ids you
-    /// cached are void" commits atomically with the rebuild that voided them.
-    /// Ordinary syncs, full resyncs from an expired checkpoint, and content
-    /// changes never bump; they keep using `write`.
+    /// The owner drives io-replica's rekey coroutine and routes its
+    /// rebuild writes here rather than to
+    /// [`write`](ReplicaStorage::write), so "the ids you cached are void"
+    /// commits atomically with the rebuild that voided them. Ordinary
+    /// syncs, full resyncs and content changes never bump.
     pub fn write_rekeyed(
         &mut self,
         collection: &str,
@@ -1272,24 +1266,23 @@ impl PimdirSourceStore {
 
     /// Drains a collection's pending actions in append order (spec §15.2).
     ///
-    /// Each action is applied as the store mutation it names — resolving its
-    /// public `seq` to the internal link id, staging the corresponding
-    /// io-replica mutation and folding its writes through the store's own write
-    /// machinery — and its row is deleted **in the same transaction**, so
-    /// application is exactly-once and never partially visible. An action the
-    /// owner judges permanently unappliable (malformed payload, unknown `seq`,
-    /// duplicate `add` link id) is parked with its error and skipped without
-    /// blocking later actions. A transient failure increments the row's
-    /// `attempts` and stops the pass with the error, preserving apply order for
-    /// the retry.
+    /// Each action is applied as the store mutation it names, resolving
+    /// its public `seq` to the internal link id and folding the
+    /// corresponding io-replica mutation through the store's own write
+    /// machinery, and its row is deleted in the same transaction, so
+    /// application is exactly-once and never partially visible. An action
+    /// the owner judges permanently unappliable is parked with its error
+    /// and skipped; a transient failure increments the row's `attempts`
+    /// and stops the pass, preserving apply order for the retry.
     ///
-    /// An action whose kind this store defines no semantics for is **skipped**:
-    /// left pending, never parked, never blocking the actions behind it. That
-    /// is what lets one queue carry store mutations any owner applies beside
-    /// capability-bound intents (a mail submission) only a specific owner can
-    /// perform; that owner reads the row through
-    /// [`pending_actions`](PimdirStore::pending_actions), performs it, and
-    /// acknowledges it with [`drop_action`](PimdirStore::drop_action).
+    /// An action whose kind this store defines no semantics for is
+    /// skipped: left pending, never parked, never blocking the actions
+    /// behind it. That is what lets one queue carry store mutations any
+    /// owner applies beside capability-bound intents only a specific
+    /// owner can perform; that owner reads the row through
+    /// [`pending_actions`](PimdirStore::pending_actions), performs it,
+    /// and acknowledges it with
+    /// [`drop_action`](PimdirStore::drop_action).
     pub fn drain_collection(&mut self, collection: &str) -> Result<PimdirDrainReport, PimdirError> {
         let pending: Vec<QueueRow> = rows(
             &self.store.conn,
@@ -1337,9 +1330,9 @@ impl PimdirSourceStore {
     }
 
     /// Applies one queued action and deletes its row in one transaction,
-    /// releasing the row's object pin as the applied item takes its own
-    /// reference. Returns `Some(reason)` when the action must be parked (the
-    /// transaction is rolled back), `None` when applied.
+    /// releasing the row's object pin as the applied item takes its own.
+    /// Returns `Some(reason)` when the action must be parked, rolling the
+    /// transaction back, `None` when applied.
     fn apply_queued(
         &mut self,
         collection: &str,
@@ -1352,11 +1345,10 @@ impl PimdirSourceStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
 
-        // NOTE: claim the row before doing its work. The pending rows were
-        // read outside any transaction, so another owner may hold the same
-        // list and have applied this one already; `add` and `copy` would
-        // then land twice. A claim that deletes nothing means exactly
-        // that, and there is nothing left to do.
+        // NOTE: claim the row before doing its work. The pending rows
+        // were read outside any transaction, so another owner may have
+        // applied this one already and `add` or `copy` would land twice.
+        // A claim that deletes nothing means exactly that.
         let claimed = tx
             .prepare(sql::CLAIM_ACTION)?
             .query_row(named_params! { ":id": row.id }, |r| r.get::<_, i64>(0))
@@ -1378,10 +1370,10 @@ impl PimdirSourceStore {
             &mut self.residual,
             ops,
         )?;
-        // NOTE: the incremental pin hand-over: the queue row's reference
-        // (taken at enqueue) is released as the row goes, while the applied
-        // item's own reference was just taken by `apply_ops`, all in this
-        // transaction, so a queued body is never sweepable in between.
+        // NOTE: the pin hand-over: the queue row's reference, taken at
+        // enqueue, is released as the row goes, while the applied item's
+        // own was just taken by `apply_ops`, both in this transaction, so
+        // a queued body is never sweepable in between.
         if let Some(hash) = &row.object_hash {
             tx.execute(
                 sql::ADJUST_REFCOUNT,
@@ -1401,11 +1393,11 @@ impl ReplicaStorage for PimdirSourceStore {
         collection: &ReplicaCollectionId,
         scope: &ReplicaLoadScope,
     ) -> Result<ReplicaLoaded, Self::Error> {
-        // NOTE: the scope narrows the hub read, and the projection then only
-        // ever produces placements for what was read. A handle scope cannot
-        // narrow the query, since the hub is keyed by link id and a handle
-        // resolves to one only through a binding: it is resolved first, and a
-        // handle no binding holds simply contributes nothing.
+        // NOTE: the scope narrows the hub read, and the projection only
+        // produces placements for what was read. A handle scope cannot
+        // narrow the query, the hub being keyed by link id, so a handle
+        // is resolved through its binding first and one no binding holds
+        // contributes nothing.
         let hub = match scope {
             ReplicaLoadScope::All => load_hub(&self.store.conn, &collection.0)?,
             ReplicaLoadScope::Links(links) => {
@@ -1493,14 +1485,14 @@ impl ReplicaStorage for PimdirSourceStore {
     }
 
     fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Self::Error> {
-        // NOTE: bodies first, outside the transaction, so the writer lock is
-        // never held across a file write and two `fsync`s (spec §14).
+        // NOTE: bodies first, outside the transaction, so the writer lock
+        // is never held across a file write and two `fsync`s (spec §14).
         stage_blobs(&self.store.blobs, &ops)?;
 
-        // BEGIN IMMEDIATE takes the single writer lock up front (§8): under WAL
-        // reads never block, but two writers serialise here, and a writer that
-        // cannot get the lock within `busy_timeout` fails fast and loud (`Busy`)
-        // rather than deep inside the batch on a deferred lock upgrade.
+        // NOTE: BEGIN IMMEDIATE takes the single writer lock up front
+        // (§8), so a writer that cannot get it within `busy_timeout`
+        // fails fast with `Busy` rather than deep inside the batch on a
+        // deferred lock upgrade.
         let tx = self
             .store
             .conn
@@ -1533,8 +1525,8 @@ impl DerefMut for PimdirSourceStore {
     }
 }
 
-/// One raw pending queue row, as the drain loads it (the payload undecoded, so
-/// a malformed one can be parked instead of failing the pass).
+/// One raw pending queue row, as the drain loads it: the payload
+/// undecoded, so a malformed one parks instead of failing the pass.
 struct QueueRow {
     id: i64,
     action: String,
@@ -1580,17 +1572,15 @@ fn load_pending_actions(
 
 /// Stages the io-replica write ops one queued action folds into the store
 /// (spec §15.3), inside the drain transaction. The inner `Err` is a park
-/// reason (the action is permanently unappliable); an empty op list is a
-/// no-op success (a `remove` of an already-absent item).
+/// reason; an empty op list is a no-op success, a `remove` of an
+/// already-absent item.
 ///
-/// Existing items are addressed by `seq`, resolved to their link id and then
-/// to this source's projected placement; the matching [`ReplicaMutation`] is
-/// then pumped through the real [`ReplicaMutate`] coroutine, so the staging
-/// semantics (dirty/tombstone/created marking, conflict handling) stay the
-/// engine's, not a re-implementation. An `add` is staged directly as the same
-/// `Created` placement the engine's `Add` mutation stages, minus the body
-/// bytes: the producer already wrote the blob and indexed the object at
-/// enqueue.
+/// Existing items are addressed by `seq`, resolved to their link id and
+/// then to this source's projected placement, and the matching
+/// [`ReplicaMutation`] is pumped through the real [`ReplicaMutate`]
+/// coroutine, so the staging semantics stay the engine's. An `add` is
+/// staged directly as the `Created` placement the engine's `Add` stages,
+/// minus the body bytes: the producer wrote the blob at enqueue.
 fn stage_action(
     tx: &Connection,
     source: &ReplicaSourceId,
@@ -1614,12 +1604,11 @@ fn stage_action(
         let Some(link) = link else {
             return Ok(Err("add carries neither link_id nor object".to_string()));
         };
-        // NOTE: the same collision rule as the engine's Add mutation — a live
-        // item blocks the create, a tombstone does not (the delete is in
-        // flight; the new item supersedes it). Asked of the one row that could
-        // collide, not of the collection: this runs once per drained action,
-        // so loading the whole collection to answer it makes a drain of N
-        // actions cost N passes over the mailbox.
+        // NOTE: the same collision rule as the engine's Add mutation: a
+        // live item blocks the create, a tombstone does not, the delete
+        // being in flight. Asked of the one row that could collide, since
+        // this runs once per drained action and loading the collection
+        // would make a drain of N actions cost N passes over the mailbox.
         let live = tx
             .query_row(
                 sql::LIVE_ITEM_FOR_LINK,
@@ -1645,7 +1634,7 @@ fn stage_action(
             level,
             meta: meta.clone(),
             // NOTE: a queue producer is not a connector, so it derives no
-            // sort key; the sync that pushes this create resolves one.
+            // sort key; the sync pushing this create resolves one.
             sort_key: ReplicaSortKey::default(),
             flags: flags.clone(),
             status: ReplicaStatus::Created,
@@ -1657,7 +1646,6 @@ fn stage_action(
         return Ok(Ok(vec![ReplicaWriteOp::UpsertPlacement(create)]));
     }
 
-    // Every other kind reads an existing item, addressed by `seq`.
     let (seq, removes) = match action {
         PimdirAction::SetFlags { seq, .. }
         | PimdirAction::Move { seq, .. }
@@ -1675,8 +1663,8 @@ fn stage_action(
         )
         .optional()?;
     let Some(item) = item else {
-        // NOTE: a remove of an already-absent item is success, not an error
-        // (spec §15.3); anything else addressing a gone item parks.
+        // NOTE: a remove of an already-absent item is success, not an
+        // error (spec §15.3); anything else addressing a gone item parks.
         return if removes {
             Ok(Ok(Vec::new()))
         } else {
@@ -1684,9 +1672,7 @@ fn stage_action(
         };
     };
 
-    // NOTE: the binding's own primary key answers this, so it is a seek. It
-    // used to project the whole collection to read one handle out of it, once
-    // per drained action.
+    // NOTE: the binding's own primary key answers this, so it is a seek.
     let handle = tx
         .query_row(
             sql::HANDLE_FOR_LINK,
@@ -1722,8 +1708,9 @@ fn stage_action(
         },
         PimdirAction::Update { object, meta, .. } => ReplicaMutation::Edit {
             handle,
-            // NOTE: the size only rides the StoreObject op, stripped below;
-            // the object row was indexed with its real size at enqueue.
+            // NOTE: the size only rides the StoreObject op, stripped
+            // below; the object row was indexed with its real size at
+            // enqueue.
             object: ReplicaObject {
                 hash: object.clone(),
                 size: 0,
@@ -1737,8 +1724,8 @@ fn stage_action(
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
 
-    // NOTE: the mutation reads one placement, so the hub is read for the one
-    // identity it names rather than for the collection.
+    // NOTE: the mutation reads one placement, so the hub is read for the
+    // one identity it names rather than for the collection.
     let mut mutate = ReplicaMutate::new(collection_id.clone(), mutation);
     let _ = mutate.resume(None);
     let placements = load_hub_by_link(tx, collection, core::slice::from_ref(&item.link_id.0))?
@@ -1749,9 +1736,9 @@ fn stage_action(
     };
     match mutate.resume(Some(ReplicaArg::Load(loaded))) {
         ReplicaCoroutineState::Yielded(ReplicaYield::WantsWrite(ops)) => {
-            // NOTE: the body already sits in the blob store and its object row
-            // was upserted (and pinned) at enqueue; re-storing here would
-            // clobber the recorded size with the placeholder.
+            // NOTE: the body already sits in the blob store and its
+            // object row was upserted and pinned at enqueue, so
+            // re-storing would clobber the recorded size.
             let ops = ops
                 .into_iter()
                 .filter(|op| !matches!(op, ReplicaWriteOp::StoreObject { .. }))
@@ -1763,24 +1750,24 @@ fn stage_action(
     }
 }
 
-/// A pimdir store opened as a **producer** (spec §8): a process that is not
-/// the owner but legitimately originates mutations (a submission daemon, a
-/// server frontend). Its only write is the single enqueue transaction of spec
-/// §15.1 — `ensure_collection`, at most one object upsert pinning a body it
-/// already wrote durably to the blob directory ([`PimdirBlobs::writer`]), and
-/// one queue insert. It never touches items, bindings, sources or the other
-/// collections columns, and never creates the schema: it requires a store the
-/// owner has already opened at the current schema version.
+/// A pimdir store opened as a producer (spec §8): a process that is not
+/// the owner but legitimately originates mutations (a submission daemon,
+/// a server frontend). Its only write is the single enqueue transaction
+/// of spec §15.1: `ensure_collection`, at most one object upsert pinning
+/// a body it already wrote durably through [`PimdirBlobs::writer`], and
+/// one queue insert. It never touches items, bindings or sources, and
+/// never creates the schema: it requires a store the owner has already
+/// opened at the current version.
 ///
-/// This coexists with the store's single-writer serialisation: the guard is
-/// the per-transaction `BEGIN IMMEDIATE` plus the busy timeout, and the spec
-/// explicitly sanctions the producer's short append transaction beside the
-/// owner's batches — the two serialise on the write lock, never interleave.
+/// This coexists with the store's single-writer serialisation: the guard
+/// is the per-transaction `BEGIN IMMEDIATE` plus the busy timeout, and
+/// the spec sanctions the producer's short append transaction beside the
+/// owner's batches, the two serialising on the write lock.
 pub struct PimdirProducer {
     conn: Connection,
     /// The store's shared staging lock (spec §8), held for this handle's
-    /// lifetime so a body written before an enqueue and the row that pins it
-    /// are one window a collector cannot run inside.
+    /// lifetime so a body written before an enqueue and the row pinning
+    /// it are one window a collector cannot run inside.
     _lock: PimdirLock,
     producer: String,
     /// The hash the store names its objects by (spec §5), so a producer
@@ -1795,16 +1782,16 @@ impl PimdirProducer {
     /// Opens the store rooted at `dir` as producer `producer` (a diagnostic
     /// process name recorded on each row).
     ///
-    /// The database must exist at the current schema version: a producer never
-    /// creates a store (that is the owner's opening write), so a missing
-    /// database errors and a version mismatch is [`PimdirError::Version`].
+    /// The database must exist at the current schema version: a producer
+    /// never creates a store, so a missing database errors and a version
+    /// mismatch is [`PimdirError::Version`].
     ///
-    /// A producer is not an owner: it takes the store's *shared* lock (spec
-    /// §8), so several run at once and none of them keeps the owner out. What
-    /// the lock buys is the window a collector must not run inside — a body is
-    /// written to the blob tree before the queue row that pins it, and between
-    /// the two it is a file nothing references — so a producer handle is opened
-    /// for the staging it is about to do and dropped when that is done.
+    /// A producer is not an owner: it takes the store's shared lock (spec
+    /// §8), so several run at once and none keeps the owner out. What the
+    /// lock buys is the window a collector must not run inside, between
+    /// the blob write and the queue row that pins it, so a producer
+    /// handle is opened for the staging it is about to do and dropped
+    /// when that is done.
     pub fn open(dir: impl AsRef<Path>, producer: impl Into<String>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1842,9 +1829,9 @@ impl PimdirProducer {
         self.hash
     }
 
-    /// The content hash of a whole body, under this store's algorithm: what a
-    /// producer names the blob it writes before enqueueing the action that
-    /// references it (spec §15.1).
+    /// The content hash of a whole body, under this store's algorithm:
+    /// what a producer names the blob it writes before enqueueing the
+    /// action referencing it (spec §15.1).
     pub fn hash(&self, bytes: &[u8]) -> ReplicaHash {
         self.hash.hash(bytes)
     }
@@ -1854,8 +1841,8 @@ impl PimdirProducer {
         self.hash.hasher()
     }
 
-    /// Binds this producer to an account, so a collection its enqueue creates
-    /// is grouped under it (spec §9.2). Mirrors
+    /// Binds this producer to an account, so a collection its enqueue
+    /// creates is grouped under it (spec §9.2). Mirrors
     /// [`PimdirStore::for_account`].
     pub fn for_account(mut self, account: impl Into<String>) -> Self {
         self.account = Some(account.into());
@@ -1865,16 +1852,15 @@ impl PimdirProducer {
     /// Appends one action to a collection's queue (spec §15.1), returning the
     /// row's append id.
     ///
-    /// Runs exactly the producer transaction, `BEGIN IMMEDIATE` and short:
-    /// `ensure_collection`, at most one object upsert when the action's
-    /// payload references a body, and one queue insert pinning that body's
-    /// hash against garbage collection. When the action carries an object, the
-    /// caller has **already written its blob durably** through
-    /// [`PimdirBlobs::writer`] (temp → fsync → rename needs no coordination)
-    /// and passes the byte size the writer's commit returned; `None` reuses an
-    /// object the store already indexes. `created_at` is the caller's RFC 3339
-    /// timestamp. When the owner applies the action is the owner's business;
-    /// nudging it to run (a signal, a socket) is out of scope.
+    /// Runs exactly the producer transaction, `BEGIN IMMEDIATE` and
+    /// short: `ensure_collection`, at most one object upsert when the
+    /// payload references a body, and one queue insert pinning that
+    /// body's hash against garbage collection. When the action carries an
+    /// object the caller has already written its blob durably through
+    /// [`PimdirBlobs::writer`] and passes the byte size the commit
+    /// returned; `None` reuses an object the store already indexes.
+    /// `created_at` is the caller's RFC 3339 timestamp. When the owner
+    /// applies the action is the owner's business.
     pub fn enqueue(
         &mut self,
         collection: &str,
@@ -1909,9 +1895,9 @@ impl PimdirProducer {
                 ":object_hash": hash.as_ref().map(|h| h.0.as_str()),
             },
         )?;
-        // NOTE: the incremental pin (+1): the queue row now references the
-        // body, so garbage collection never sweeps it between enqueue and
-        // apply; the drain releases it as the row is deleted.
+        // NOTE: the pin (+1): the queue row now references the body, so
+        // garbage collection never sweeps it between enqueue and apply,
+        // and the drain releases it as the row is deleted.
         if let Some(hash) = &hash {
             tx.execute(
                 sql::ADJUST_REFCOUNT,
@@ -1923,7 +1909,7 @@ impl PimdirProducer {
         Ok(id)
     }
 
-    /// The collection's pending (non-parked) actions in append order — the
+    /// The collection's pending (non-parked) actions in append order, the
     /// producer's read-your-writes overlay (spec §15.4): a just-enqueued
     /// action shows here before the owner has applied it.
     pub fn pending_actions(
@@ -1937,9 +1923,9 @@ impl PimdirProducer {
 /// A read-only handle to a pimdir store's content-addressed blob directory,
 /// independent of the SQLite [`Connection`].
 ///
-/// A body can be read through it while the [`PimdirStore`] is mutably borrowed
-/// to service a sync (e.g. a remote reads a stored body back to re-upload it as
-/// a cross-source copy). Cheap to clone: it wraps only the `objects/` path.
+/// A body can be read through it while the [`PimdirStore`] is mutably
+/// borrowed to service a sync, a remote reading a stored body back to
+/// re-upload it. Cheap to clone: it wraps only the `objects/` path.
 #[derive(Clone, Debug)]
 pub struct PimdirBlobs {
     root: PathBuf,
@@ -1950,9 +1936,9 @@ impl PimdirBlobs {
     /// Opens the blob handle for the store rooted at `dir`, naming bodies with
     /// `hash`.
     ///
-    /// The algorithm is the store's, not a choice made here: it is what the
-    /// files are named by. [`PimdirStore::blobs`] hands one out already bound to
-    /// the store it came from, which is how a consumer avoids picking one.
+    /// The algorithm is the store's, not a choice made here: it is what
+    /// the files are named by. [`PimdirStore::blobs`] hands one out
+    /// already bound to the store it came from.
     pub fn open(dir: impl AsRef<Path>, hash: PimdirHashAlgo) -> Self {
         Self {
             root: dir.as_ref().join("objects"),
@@ -1979,10 +1965,10 @@ impl PimdirBlobs {
     /// Where a body under `hash` lives: `objects/<name[0:2]>/<name[2:4]>/<name>`
     /// (spec §5).
     ///
-    /// Public because the format invites a consumer to stream a body straight
-    /// to this path and index it with a byteless `StoreObject` afterwards
-    /// (spec §14), and a consumer deriving the sharding itself would be a
-    /// second implementation of a rule whose whole point is that one store's
+    /// Public because the format invites a consumer to stream a body
+    /// straight to this path and index it with a byteless `StoreObject`
+    /// afterwards (spec §14), and deriving the sharding itself would be a
+    /// second implementation of a rule whose point is that one store's
     /// writers agree on it.
     pub fn path(&self, hash: &ReplicaHash) -> PathBuf {
         blob_path(&self.root, &hash.0)
@@ -1998,10 +1984,10 @@ impl PimdirBlobs {
         }
     }
 
-    /// Opens a stored object as a readable stream, or `None` when absent — the
-    /// append side of bounded-memory transfer, so a body is uploaded without
-    /// being read whole into memory. The returned file's metadata gives the
-    /// octet length a protocol that needs it up front (IMAP `APPEND`) requires.
+    /// Opens a stored object as a readable stream, or `None` when absent:
+    /// the append side of bounded-memory transfer, so a body is uploaded
+    /// without being read whole into memory. The file's metadata gives
+    /// the octet length IMAP `APPEND` needs up front.
     pub fn reader(&self, hash: &ReplicaHash) -> io::Result<Option<fs::File>> {
         match fs::File::open(blob_path(&self.root, &hash.0)) {
             Ok(file) => Ok(Some(file)),
@@ -2010,10 +1996,10 @@ impl PimdirBlobs {
         }
     }
 
-    /// Opens a streaming writer for a new object: bytes are written to a
-    /// temporary file and placed at their content-addressed path only on
-    /// [`commit`](PimdirBlobWriter::commit), once the hash is known. The store
-    /// is hash-agnostic, so the caller hashes the bytes as it writes them.
+    /// Opens a streaming writer for a new object: bytes go to a temporary
+    /// file and reach their content-addressed path only on
+    /// [`commit`](PimdirBlobWriter::commit), once the hash is known. The
+    /// caller hashes the bytes as it writes them.
     pub fn writer(&self) -> io::Result<PimdirBlobWriter> {
         fs::create_dir_all(&self.root)?;
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2029,11 +2015,10 @@ impl PimdirBlobs {
 
     /// Every body the blob tree holds, walking the two-level sharding.
     ///
-    /// The files, not the index: this is what a collector and a consistency
-    /// check compare the object rows against, and the difference either way is
-    /// a defect (a file no row references, a row whose body is gone). A
-    /// half-written body is skipped, since a temp file belongs to a writer that
-    /// has not committed.
+    /// The files, not the index: what a collector and a consistency check
+    /// compare the object rows against, the difference either way being a
+    /// defect. A half-written body is skipped, a temp file belonging to a
+    /// writer that has not committed.
     pub fn files(&self) -> io::Result<Vec<PimdirBlobFile>> {
         let mut files = Vec::new();
         if self.root.is_dir() {
@@ -2046,8 +2031,8 @@ impl PimdirBlobs {
 /// One body as it sits in the blob tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirBlobFile {
-    /// The hash its filename claims, unverified: checking it against the bytes
-    /// is what `pimdir check` is for.
+    /// The hash its filename claims, unverified: checking it against the
+    /// bytes is what `pimdir check` is for.
     pub hash: String,
     /// Where it sits.
     pub path: PathBuf,
@@ -2079,15 +2064,15 @@ fn walk_blobs(dir: &Path, files: &mut Vec<PimdirBlobFile>) -> io::Result<()> {
     Ok(())
 }
 
-/// A unique-per-write temp-file discriminator, so concurrent writers of one
-/// store do not collide on the staging file.
+/// A unique-per-write temp-file discriminator, so concurrent writers of
+/// one store do not collide on the staging file.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A streaming writer for one new blob (see [`PimdirBlobs::writer`]).
 ///
-/// It is a [`Write`] sink over a temporary file; [`commit`](Self::commit) fsyncs
-/// and renames it into the content-addressed path once the caller knows the
-/// hash. Dropped without a commit (an error mid-stream), it removes the temp.
+/// A [`Write`] sink over a temporary file; [`commit`](Self::commit)
+/// fsyncs and renames it into the content-addressed path once the caller
+/// knows the hash. Dropped without a commit, it removes the temp.
 pub struct PimdirBlobWriter {
     root: PathBuf,
     tmp: PathBuf,
@@ -2096,10 +2081,10 @@ pub struct PimdirBlobWriter {
 }
 
 impl PimdirBlobWriter {
-    /// Finalises the object under `hash`: fsync, then atomically rename the temp
-    /// file into its sharded content-addressed path. A body already present
-    /// (dedup) keeps the stored copy and drops the temp. Returns the object's
-    /// byte size.
+    /// Finalises the object under `hash`: fsync, then atomically rename
+    /// the temp file into its sharded content-addressed path. A body
+    /// already present keeps the stored copy and drops the temp. Returns
+    /// the object's byte size.
     pub fn commit(mut self, hash: &ReplicaHash) -> io::Result<u64> {
         let file = self.file.take().expect("writer open");
         file.sync_all()?;
@@ -2136,24 +2121,23 @@ impl Write for PimdirBlobWriter {
 
 impl Drop for PimdirBlobWriter {
     fn drop(&mut self) {
-        // Uncommitted (an error mid-stream): best-effort remove the temp file.
         if self.file.is_some() {
             let _ = fs::remove_file(&self.tmp);
         }
     }
 }
 
-/// Applies a write batch's ops inside the caller's transaction: blob and object
-/// writes, checkpoint upserts, and placement ops folded per collection through
-/// the hub (absorb, then persist only what changed: diff the loaded hub against
-/// the absorbed one — touch just the changed items/bindings — and adjust object
-/// refcounts by only the per-hash change in references, never a
-/// whole-collection rewrite or a global refcount recompute).
+/// Applies a write batch's ops inside the caller's transaction: blob and
+/// object writes, checkpoint upserts, and placement ops folded per
+/// collection through the hub. The fold absorbs, then persists only what
+/// changed, diffing the loaded hub against the absorbed one and adjusting
+/// object refcounts by the per-hash change alone, never a
+/// whole-collection rewrite or a global recompute.
 ///
 /// Shared by the seam's [`write`](ReplicaStorage::write), the rekey write
 /// ([`PimdirStore::write_rekeyed`]) and the queue drain
-/// ([`PimdirStore::drain_collection`]), so each wraps the same folding in its
-/// own transaction shape.
+/// ([`PimdirStore::drain_collection`]), each wrapping the same folding in
+/// its own transaction shape.
 fn apply_ops(
     tx: &Connection,
     blobs: &Path,
@@ -2162,21 +2146,19 @@ fn apply_ops(
     residual: &mut HashMap<(ReplicaCollectionId, ReplicaHandle), ReplicaPlacement>,
     ops: Vec<ReplicaWriteOp>,
 ) -> Result<(), PimdirError> {
-    // Placement/drop ops routed to the hub, grouped by collection.
     let mut hub_ops: BTreeMap<String, Vec<ReplicaWriteOp>> = BTreeMap::new();
-    // The handles this batch is replacing rather than removing, per collection.
+    // NOTE: the handles this batch replaces rather than removes.
     let mut superseded: BTreeMap<String, BTreeSet<ReplicaHandle>> = BTreeMap::new();
 
     for op in ops {
         match op {
             ReplicaWriteOp::StoreObject { object, body } => {
-                // NOTE: a byteless op indexes an object the consumer already
-                // streamed into the blob store during a fetch (bounded-memory
-                // transfer); inline bytes are the buffered path, normally
-                // already staged by `stage_blobs` before this transaction
-                // opened, and re-offered here as the floor for a caller that
-                // could not stage ahead. The write is idempotent, so that
-                // costs one `exists` check per object.
+                // NOTE: a byteless op indexes an object the consumer
+                // already streamed into the blob store. Inline bytes are
+                // normally staged by `stage_blobs` before this
+                // transaction opened, and re-offered here as the floor
+                // for a caller that could not stage ahead; the write is
+                // idempotent, so that costs one `exists` check.
                 if let Some(body) = body {
                     write_blob(blobs, &object.hash.0, &body)?;
                 }
@@ -2210,8 +2192,8 @@ fn apply_ops(
                         .or_default()
                         .push(ReplicaWriteOp::UpsertPlacement(placement));
                 } else {
-                    // NOTE: not yet linked — stage in the residual until a
-                    // Meta upgrade resolves its link id.
+                    // NOTE: not yet linked, so it stages in the residual
+                    // until a Meta upgrade resolves its link id.
                     let key = (placement.collection.clone(), placement.handle.clone());
                     residual.insert(key, placement);
                 }
@@ -2222,12 +2204,12 @@ fn apply_ops(
                 reason,
             } => {
                 drop_residual(residual, &collection, &handle);
-                // NOTE: a superseded handle is one the batch is replacing, so
-                // the binding that holds it may legitimately be repointed at
-                // whatever the same batch upserts. Recorded here because the
-                // hub diff cannot tell that apart from the source reporting one
-                // identity under a second handle, and reads the second as a
-                // duplicate to freeze (spec §10, §12).
+                // NOTE: a superseded handle is one the batch is
+                // replacing, so its binding may legitimately be repointed
+                // at whatever the same batch upserts. Recorded here
+                // because the hub diff cannot tell that from a source
+                // reporting one identity under a second handle, and
+                // reads the second as a duplicate to freeze (§10, §12).
                 if reason == ReplicaDropReason::Superseded {
                     superseded
                         .entry(collection.0.clone())
@@ -2266,9 +2248,9 @@ fn apply_ops(
     Ok(())
 }
 
-/// Creates the schema in a fresh database (spec §6), advancing `user_version`
-/// and seeding `store_meta.version` in agreement (spec §4.2) inside one
-/// transaction. A store stamped with a `user_version` higher than
+/// Creates the schema in a fresh database (spec §6), advancing
+/// `user_version` and seeding `store_meta.version` in agreement (spec
+/// §4.2) in one transaction. A store stamped higher than
 /// [`sql::VERSION`] is refused: the spec is a draft with a single schema
 /// version, so such a store is recreated, never migrated.
 fn init_schema(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), PimdirError> {
@@ -2286,12 +2268,10 @@ fn init_schema(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pimdir
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(busy_or_sql)?;
     tx.execute_batch(sql::MIGRATION_0001)?;
-    // NOTE: the script creates `store_meta`; seed its one row here, since the
-    // canonical script is pure DDL. The timestamp is SQLite's own, in the
-    // RFC 3339 form the column is declared to hold and the retirement clock
-    // already writes, which also keeps the crate free of a clock: reading
-    // one and formatting it by hand is what had this column holding epoch
-    // milliseconds, and the empty string when the clock predates the epoch.
+    // NOTE: the canonical script is pure DDL, so `store_meta`'s one row
+    // is seeded here. The timestamp is SQLite's own, in the RFC 3339 form
+    // the column is declared to hold, which keeps the crate free of a
+    // clock.
     tx.execute(
         "INSERT OR IGNORE INTO store_meta(id, version, hash_algo, created_at) \
          VALUES(1, ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
@@ -2303,23 +2283,21 @@ fn init_schema(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pimdir
     Ok(())
 }
 
-/// Refuses a store whose foreign keys predate the `ON UPDATE CASCADE` every
-/// key onto a renamed row now carries (spec §14).
+/// Refuses a store whose foreign keys predate the `ON UPDATE CASCADE`
+/// every key onto a renamed row now carries (spec §14).
 ///
-/// This is the half of the draft allowance (spec §6) that reconciliation
-/// cannot reach: a column can be added in place, a foreign-key action cannot,
-/// short of rebuilding every table that carries one. §6's other branch is to
-/// refuse the store and tell the operator to recreate it, which costs a resync
-/// of what is by design a derived cache (spec §1) and is what this does.
+/// The half of the draft allowance (spec §6) that reconciliation cannot
+/// reach: a column can be added in place, a foreign-key action cannot.
+/// §6's other branch is to refuse the store and have the operator
+/// recreate it, which costs a resync of a derived cache.
 ///
-/// Without the cascade a rename is refused by SQLite one dependent row down,
-/// so such a store can never follow a server-side collection rename or an
-/// account rename; catching it on open says so once, rather than at the moment
-/// a rename fails.
+/// Without the cascade SQLite refuses a rename one dependent row down, so
+/// such a store can never follow a server-side collection rename;
+/// catching it on open says so once rather than when a rename fails.
 fn check_rename_cascades(conn: &Connection) -> Result<(), PimdirError> {
-    /// The tables whose foreign key onto a renamable parent must cascade, with
-    /// that parent. `bindings` is the second one the rename needs: it hangs off
-    /// `items(collection, link_id)`, which the first cascade updates.
+    /// The tables whose foreign key onto a renamable parent must cascade,
+    /// with that parent. `bindings` hangs off `items(collection,
+    /// link_id)`, which the first cascade updates.
     const CASCADING: [(&str, &str); 5] = [
         ("collections", "collections"),
         ("sources", "collections"),
@@ -2344,28 +2322,26 @@ fn check_rename_cascades(conn: &Connection) -> Result<(), PimdirError> {
     Ok(())
 }
 
-/// Adds columns folded into version 1 after a store was already created at
-/// version 1 (spec §6, the `draft` allowance).
+/// Adds columns folded into version 1 after a store was already created
+/// at version 1 (spec §6, the `draft` allowance).
 ///
-/// While the spec is a draft, version 1 is not frozen: a schema change may be
-/// folded into `0001_init.sql` rather than added as version 2. The cost is that
-/// a store written by an earlier draft is not *detectably* out of date — its
-/// `user_version` already matches, so the runner would do nothing and the
-/// missing column would surface much later as a query error. §6 requires an
-/// implementation to reconcile the shape on open or refuse the store outright;
-/// this reconciles.
+/// While the spec is a draft, version 1 is not frozen: a schema change
+/// may be folded into `0001_init.sql` rather than added as version 2. The
+/// cost is that such a store is not detectably out of date, its
+/// `user_version` already matching, so the missing column would surface
+/// later as a query error. §6 requires an implementation to reconcile the
+/// shape on open or refuse the store; this reconciles.
 ///
-/// `ALTER TABLE … ADD COLUMN` is cheap (a metadata-only rewrite for a column
-/// with a constant default), and guarding on `PRAGMA table_info` makes it a
-/// no-op for a current store, which is every store after the first open. Only
-/// columns that are nullable or carry a default can be folded in this way.
+/// `ALTER TABLE … ADD COLUMN` is cheap, and guarding on `PRAGMA
+/// table_info` makes it a no-op for a current store. Only nullable
+/// columns or ones carrying a default can be folded in this way.
 ///
-/// This disappears when the spec leaves `draft`; from the first frozen version
-/// onwards, a shape change is an ordinary numbered migration.
+/// This disappears when the spec leaves `draft`: from the first frozen
+/// version onwards, a shape change is a numbered migration.
 fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     /// Columns folded into version 1 after it was first published, as
     /// `(table, column, declaration)`. Each must be nullable or carry a
-    /// constant default, or it could not be added to a populated table.
+    /// default, or it could not be added to a populated table.
     const FOLDED_IN: [(&str, &str, &str); 8] = [
         ("bindings", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
         ("bindings", "conflict_revision", "TEXT"),
@@ -2397,28 +2373,28 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     for (table, column, decl) in missing {
         tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     }
-    // NOTE: before the batch below, which cannot replace it: an index whose
-    // columns moved keeps its name, so `CREATE INDEX IF NOT EXISTS` sees one
-    // already there and leaves the store planning the old read.
+    // NOTE: before the batch below, which cannot replace it: an index
+    // whose columns moved keeps its name, so `CREATE INDEX IF NOT EXISTS`
+    // sees one already there and leaves the old plan in place.
     for index in reshaped {
         tx.execute_batch(&format!("DROP INDEX IF EXISTS {index}"))?;
     }
-    // NOTE: unconditionally, unlike the columns. An index over a folded-in
-    // column has to be created with it, but most of these index columns that
-    // were always there: what changed is that a statement now needs them. A
-    // store that kept the old plans would keep scanning where the schema says
-    // it seeks, silently and for good.
+    // NOTE: unconditionally, unlike the columns: most of these index
+    // columns that were always there, and what changed is that a
+    // statement now needs them. A store keeping the old plans would scan
+    // where the schema says it seeks.
     tx.execute_batch(sql::ENSURE_INDEXES)?;
     tx.commit().map_err(busy_or_sql)?;
     Ok(())
 }
 
-/// The algorithm the store records, checked against the one the caller declared.
+/// The algorithm the store records, checked against the one the caller
+/// declared.
 ///
-/// A store names every blob by its hash, so a handle computing a different one
-/// writes bodies no reader of that store finds and dedups against nothing. The
-/// failure is silent by nature, which is why it is caught on open rather than
-/// left to surface as a cache that never hits.
+/// A store names every blob by its hash, so a handle computing a
+/// different one writes bodies no reader finds and dedups against
+/// nothing. The failure is silent by nature, which is why it is caught on
+/// open rather than left to surface as a cache that never hits.
 fn read_hash_algo(
     conn: &Connection,
     declared: Option<PimdirHashAlgo>,
@@ -2447,13 +2423,14 @@ fn read_hash_algo(
     }
 }
 
-/// The two schema stamps a store carries, which spec §4.2 requires to agree:
-/// `PRAGMA user_version` and `store_meta.version`. A store where they differ is
-/// corrupt, so it is refused rather than read at the version one of them names.
+/// The two schema stamps a store carries, which spec §4.2 requires to
+/// agree: `PRAGMA user_version` and `store_meta.version`. A store where
+/// they differ is corrupt, so it is refused rather than read at the
+/// version one of them names.
 ///
-/// A store whose `store_meta` row is absent is left alone: the row is seeded by
-/// whoever created the schema, and refusing here would turn a missing stamp
-/// into an unopenable store the crate could otherwise repair.
+/// A store whose `store_meta` row is absent is left alone: the row is
+/// seeded by whoever created the schema, and refusing here would turn a
+/// missing stamp into an unopenable store the crate could repair.
 fn check_version_agreement(conn: &Connection, user_version: i64) -> Result<(), PimdirError> {
     let stamped: Option<i64> = conn
         .query_row("SELECT version FROM store_meta WHERE id = 1", [], |row| {
@@ -2483,13 +2460,12 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
     Ok(false)
 }
 
-/// The columns `index` holds, in order, or `None` when the store has no such
-/// index.
+/// The columns `index` holds, in order, or `None` when the store has no
+/// such index.
 ///
-/// `PRAGMA index_info` reports the columns and not the partial predicate, which
-/// is all a reshape check needs: a column order is what decides whether a read
-/// seeks or sorts, and the predicate of the one index this crate has ever
-/// reshaped never moved.
+/// `PRAGMA index_info` reports the columns and not the partial predicate,
+/// which is all a reshape check needs: the column order decides whether a
+/// read seeks or sorts.
 fn index_columns(conn: &Connection, index: &str) -> rusqlite::Result<Option<Vec<String>>> {
     let columns = rows(conn, &format!("PRAGMA index_info({index})"), [], |row| {
         row.get::<_, String>(2)
@@ -2512,11 +2488,11 @@ fn load_hub(conn: &Connection, collection: &str) -> rusqlite::Result<ReplicaHub>
     read_hub(conn, collection, None)
 }
 
-/// The link ids one write batch touches: the ones its upserts carry, plus the
-/// ones its drops resolve to, since a drop names a handle and the shared item is
-/// keyed by link id.
+/// The link ids one write batch touches: the ones its upserts carry, plus
+/// the ones its drops resolve to, a drop naming a handle where the shared
+/// item is keyed by link id.
 ///
-/// A handle no binding holds resolves to nothing and is simply left out: there
+/// A handle no binding holds resolves to nothing and is left out: there
 /// is no item to fold the drop into.
 fn batch_links(
     conn: &Connection,
@@ -2556,12 +2532,12 @@ fn batch_links(
 
 /// The hub narrowed to `links`, which is what a write folds its batch into.
 ///
-/// The batch only ever produces writes for the items it names, so the rest of
-/// the collection would be read, cloned and diffed to conclude that nothing
-/// changed: the cost of one flag on one message would be the size of the
+/// The batch only produces writes for the items it names, so the rest of
+/// the collection would be read, cloned and diffed to conclude that
+/// nothing changed: one flag on one message would cost the size of the
 /// mailbox. Both sides of the diff are narrowed the same way, so every
-/// comparison the persistence step makes, and every object reference the
-/// refcount step counts, sees exactly what it would have seen in full.
+/// comparison and every counted object reference sees what it would have
+/// seen in full.
 fn load_hub_by_link(
     conn: &Connection,
     collection: &str,
@@ -2590,9 +2566,9 @@ fn read_hub(
         hub.conflict = conflict_from_str(&policy);
     }
 
-    // NOTE: the scoped statements name a `:links` the unscoped ones do not, and
-    // a bound parameter a statement never declared is an error, so the scope is
-    // pushed onto the binding list only when there is one.
+    // NOTE: the scoped statements name a `:links` the unscoped ones do
+    // not, and a parameter a statement never declared is an error, so the
+    // scope is bound only when there is one.
     let scope = links.map(|links| serde_json::to_string(links).unwrap_or_else(|_| "[]".into()));
     let (items_sql, bindings_sql) = match scope {
         Some(_) => (sql::LOAD_ITEMS_BY_LINK, sql::LOAD_BINDINGS_BY_LINK),
@@ -2615,19 +2591,19 @@ fn read_hub(
     Ok(hub)
 }
 
-/// Persists the change from `old` to `new` for a collection's hub by diffing
-/// the two in memory and issuing only the item and binding inserts, updates and
-/// deletes that actually differ, never a whole-collection delete-and-reinsert.
+/// Persists the change from `old` to `new` for a collection's hub by
+/// diffing the two in memory and issuing only the item and binding
+/// writes that differ, never a whole-collection delete-and-reinsert.
 ///
 /// Paired with a batch-scoped read ([`load_hub_by_link`]) that makes both
-/// halves of a write proportional to the batch rather than to the collection:
-/// the rows it reads as well as the rows it writes. An item no source holds any
-/// more is retained rather than deleted, `source` naming the side whose removal
-/// retired it.
+/// halves of a write proportional to the batch rather than to the
+/// collection. An item no source holds any more is retained rather than
+/// deleted, `source` naming the side whose removal retired it.
 ///
-/// `superseded` carries the handles this batch is replacing, which is the one
-/// thing the two hubs cannot say: a rebuilt spine and a duplicated identity
-/// produce the same diff, and only the drop's reason separates them.
+/// `superseded` carries the handles this batch is replacing, the one
+/// thing the two hubs cannot say: a rebuilt spine and a duplicated
+/// identity produce the same diff, and only the drop's reason separates
+/// them.
 fn save_hub_diff(
     conn: &Connection,
     collection: &str,
@@ -2648,10 +2624,10 @@ fn save_hub_diff(
         )?;
     }
 
-    // Items gone in `new`: no source holds them any more, so they are retained
-    // (soft-deleted), never deleted: a store loses an item only to a purge.
-    // The bindings go with the sources that held them; the row stays, hidden
-    // from `LOAD_ITEMS` so no later sync, delta or full, re-derives against it.
+    // NOTE: an item no source holds any more is retained rather than
+    // deleted, a store losing one only to a purge. The bindings go with
+    // the sources that held them; the row stays, hidden from `LOAD_ITEMS`
+    // so no later sync re-derives against it.
     for (link, item) in &old.items {
         if new.items.contains_key(link) {
             continue;
@@ -2664,11 +2640,11 @@ fn save_hub_diff(
             sql::DELETE_ITEM_BINDINGS,
             named_params! { ":collection": collection, ":link_id": link.0 },
         )?;
-        // NOTE: the caller's refcount diff is about to release this item's
-        // object references as it leaves the hub, but the row survives and
-        // still points at them. Pin them back, exactly as a queue row pins a
-        // queued body, so garbage collection cannot sweep a retained body.
-        // Revive and purge release the pin.
+        // NOTE: the caller's refcount diff is about to release this
+        // item's object references as it leaves the hub, but the row
+        // survives and still points at them. Pinning them back, as a
+        // queue row pins a queued body, keeps a retained body out of the
+        // collector; revive and purge release the pin.
         for hash in [item.object.as_ref(), item.conflict_object.as_ref()]
             .into_iter()
             .flatten()
@@ -2680,7 +2656,6 @@ fn save_hub_diff(
         }
     }
 
-    // Items added or changed in `new`.
     for (link, item) in &new.items {
         match old.items.get(link) {
             None => insert_item(conn, collection, link, item)?,
@@ -2696,11 +2671,12 @@ fn save_hub_diff(
     Ok(())
 }
 
-/// Whether two items' persisted columns (everything but their bindings) match.
+/// Whether two items' persisted columns, everything but their bindings,
+/// match.
 ///
-/// Every column `UPDATE_ITEM` writes has to be here: one left out is a
-/// column that can never change again, since the diff reports the row
-/// unchanged and no statement is issued for it.
+/// Every column `UPDATE_ITEM` writes has to be here: one left out can
+/// never change again, since the diff reports the row unchanged and no
+/// statement is issued for it.
 fn item_columns_eq(a: &ReplicaHubItem, b: &ReplicaHubItem) -> bool {
     a.flags == b.flags
         && a.object == b.object
@@ -2718,18 +2694,17 @@ fn insert_item(
     link: &ReplicaLinkId,
     item: &ReplicaHubItem,
 ) -> rusqlite::Result<()> {
-    // A retained row may still hold this primary key: the item is back, either
-    // resurrected on a source or restored by a client `add` over the values the
-    // row still carries. Revive it in place instead of colliding, keeping its
-    // `seq` (a message keeps one public id for life, and ids are never reused).
+    // NOTE: a retained row may still hold this primary key, the item
+    // being back from a source or a client `add`. Reviving it in place
+    // keeps its `seq`: a message holds one public id for life.
     if revive_item(conn, collection, link, item)? {
         return Ok(());
     }
 
-    // The public id is a property of the message: if this link id already has a
-    // seq in any collection (the message is filed in another mailbox too), reuse
-    // it, so all its placements share one id; otherwise draw a fresh store-global
-    // id (never reused). A consumer keys on this small integer, not the link id.
+    // NOTE: the public id is a property of the message, so a link id
+    // already carrying a seq in another collection reuses it and every
+    // placement shares one id; otherwise a fresh store-global id is
+    // drawn, and ids are never reused.
     let seq: i64 = match conn
         .query_row(
             sql::SEQ_FOR_LINK_ANY,
@@ -2763,15 +2738,13 @@ fn insert_item(
     Ok(())
 }
 
-/// Revives the retained row holding `(collection, link)`, if there is one: it
-/// stops being retained (spec §11), adopts the incoming content through the
-/// ordinary item update and binds the sources. Returns whether a row was
-/// revived.
+/// Revives the retained row holding `(collection, link)`, if there is
+/// one: it stops being retained (spec §11), adopts the incoming content
+/// through the ordinary item update and binds the sources.
 ///
-/// The retention pin the retire took is released here; the caller's refcount
-/// diff takes the live reference for the adopted content in the same
-/// transaction, so a body kept only by the retained row is never sweepable in
-/// between.
+/// The retention pin the retire took is released here, and the caller's
+/// refcount diff takes the live reference in the same transaction, so a
+/// body kept only by the retained row is never sweepable in between.
 fn revive_item(
     conn: &Connection,
     collection: &str,
@@ -2830,8 +2803,8 @@ fn update_item(
     Ok(())
 }
 
-/// Diffs one item's per-source bindings between `old` and `new`, issuing only the
-/// binding inserts/updates/deletes that changed.
+/// Diffs one item's per-source bindings between `old` and `new`, issuing
+/// only the binding writes that changed.
 fn save_bindings_diff(
     conn: &Connection,
     collection: &str,
@@ -2851,11 +2824,10 @@ fn save_bindings_diff(
     for (source, binding) in &new.sources {
         match old.sources.get(source) {
             None => insert_binding(conn, collection, link, source, binding)?,
-            // A handle-space rebuild: this batch superseded the handle the
-            // binding holds, so the row is being replaced rather than
-            // repointed, and it goes the way spec §10 says a legitimate
-            // rebind goes, by dropping the old spine and inserting the new
-            // one. `UPDATE_BINDING` could not do it in any case: it writes
+            // NOTE: a handle-space rebuild superseded the handle this
+            // binding holds, so the row is replaced rather than
+            // repointed, the way spec §10 says a legitimate rebind goes.
+            // `UPDATE_BINDING` could not do it in any case: it writes
             // every column but `handle`, for the reason below.
             Some(prev) if binding.handle != prev.handle && superseded.contains(&prev.handle) => {
                 conn.execute(
@@ -2865,14 +2837,13 @@ fn save_bindings_diff(
                 insert_binding(conn, collection, link, source, binding)?
             }
             Some(prev) if prev != binding => {
-                // NOTE: a binding pins one handle, and repointing it is how
-                // the fact that a source holds an identity twice used to be
-                // destroyed, silently, at this write: no later rule could act
-                // on it because the evidence was already gone. The bound
-                // handle stays and the incoming one is recorded instead,
-                // which freezes the item. The engine no longer produces such
-                // an upsert, so this is the floor under it: a store written
-                // by an older one, or a consumer staging its own writes.
+                // NOTE: a binding pins one handle, and repointing it
+                // would destroy the evidence that a source holds an
+                // identity twice. The bound handle stays and the incoming
+                // one is recorded instead, which freezes the item. The
+                // engine no longer produces such an upsert, so this is
+                // the floor under a store written by an older one, or a
+                // consumer staging its own writes.
                 let mut binding = binding.clone();
                 if binding.handle != prev.handle {
                     let incoming = mem::replace(&mut binding.handle, prev.handle.clone());
@@ -2939,10 +2910,10 @@ fn update_binding(
     Ok(())
 }
 
-/// The multiset of object references a hub holds — every item's `object` and
-/// `conflict_object` plus every binding's `base.object` — keyed by hash. This is
-/// exactly what the old global recompute counted, computed in memory so refcount
-/// maintenance is a per-hash delta rather than a full-table rescan.
+/// The multiset of object references a hub holds, keyed by hash: every
+/// item's `object` and `conflict_object` plus every binding's
+/// `base.object`. Computed in memory, so refcount maintenance is a
+/// per-hash delta rather than a full-table rescan.
 fn object_refs(hub: &ReplicaHub) -> HashMap<String, i64> {
     let mut refs: HashMap<String, i64> = HashMap::new();
     let mut bump = |hash: &ReplicaHash| *refs.entry(hash.0.clone()).or_insert(0) += 1;
@@ -2962,9 +2933,9 @@ fn object_refs(hub: &ReplicaHub) -> HashMap<String, i64> {
     refs
 }
 
-/// Applies the change in object references between two reference multisets as
-/// per-hash refcount deltas (`refcount += new - old`), touching only hashes whose
-/// count moved. A hash referenced by other collections keeps their share: the
+/// Applies the change between two reference multisets as per-hash
+/// refcount deltas (`refcount += new - old`), touching only hashes whose
+/// count moved. A hash other collections reference keeps their share: the
 /// delta reflects this collection's change alone.
 fn adjust_refcounts(
     conn: &Connection,
@@ -2991,8 +2962,8 @@ fn adjust_refcounts(
     Ok(())
 }
 
-/// Maps a client-read row (`seq, link_id, flags, object_hash, meta, level`) to a
-/// [`PimdirItem`]. Shared by `list_items` and `get_item`.
+/// Maps a client-read row to a [`PimdirItem`]. Shared by `list_items` and
+/// `get_item`.
 fn read_item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
     let seq: i64 = row.get(0)?;
     let link: String = row.get(1)?;
@@ -3002,8 +2973,8 @@ fn read_item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
     let sort_key: String = row.get(5)?;
     let level: i64 = row.get(6)?;
 
-    // NOTE: the retained page selects these seven columns and three more, so
-    // one mapper reads both shapes; a live read has nothing past the level.
+    // NOTE: the retained page selects these seven columns and three more,
+    // so one mapper reads both shapes; a live read stops at the level.
     let retention = match row.as_ref().column_count() > 7 {
         true => Some(PimdirRetention {
             at: row.get(7)?,
@@ -3066,12 +3037,12 @@ fn binding_from_row(
     let conflict_revision: Option<String> = row.get(8)?;
     let ambiguous_handles: Option<String> = row.get(9)?;
 
-    // NOTE: either witness. The column is the fact, and a base of no revision,
-    // no body and markers nobody has read is a real agreement its three value
-    // columns cannot express: reading presence off them alone has such a
-    // placement come back as never-agreed, so the sync re-derives the same push
-    // on every run. The value columns stay a witness for a row written before
-    // the column existed, where they are the only evidence there is.
+    // NOTE: either witness. The column is the fact, and a base of no
+    // revision, no body and markers nobody has read is a real agreement
+    // its three value columns cannot express: reading presence off them
+    // alone has such a placement come back as never-agreed, so the sync
+    // re-derives the same push every run. The value columns stay a
+    // witness for a row written before the column existed.
     let base = if base_present != 0
         || base_flags.is_some()
         || base_object.is_some()
@@ -3094,9 +3065,9 @@ fn binding_from_row(
             handle: ReplicaHandle(handle),
             base,
             conflicted,
-            // Spec §13: the revision is meaningful only while conflicted, so a
-            // resolved binding cannot hand a stale one to the next sync even if
-            // the column somehow still holds one.
+            // NOTE: spec §13, the revision is meaningful only while
+            // conflicted, so a resolved binding cannot hand a stale one
+            // to the next sync.
             conflict_revision: conflicted.then_some(conflict_revision).flatten(),
             ambiguous_handles: codec::handles_from_json(ambiguous_handles.as_deref()),
         },
@@ -3132,21 +3103,20 @@ fn blob_path(blobs: &Path, hash: &str) -> PathBuf {
 /// Writes every body a batch carries to the blob store, ahead of the
 /// transaction that indexes them (spec §14).
 ///
-/// A body is content-addressed and immutable, so writing it early can only
-/// produce a file some later batch produces identically, and the worst a crash
-/// between the two leaves is an orphan blob for the collector. Inside the
-/// transaction the same write holds SQLite's single writer lock across a file
-/// write, two `fsync`s and a rename, serialising every other writer behind an
-/// I/O path that touches no database page.
+/// A body is content-addressed and immutable, so writing it early can
+/// only produce a file some later batch produces identically, and the
+/// worst a crash between the two leaves is an orphan blob. Inside the
+/// transaction the same write would hold SQLite's single writer lock
+/// across a file write, two `fsync`s and a rename, serialising every
+/// other writer behind an I/O path that touches no database page.
 ///
-/// What keeps a collector out of the window this opens is the writer's lock
-/// (spec §8), not the file's age: between the write and the commit the file is
-/// on disk with no row, and indistinguishable from an orphan by inspection.
+/// What keeps a collector out of the window this opens is the writer's
+/// lock (spec §8), not the file's age: between the write and the commit
+/// the file is on disk with no row, indistinguishable from an orphan.
 ///
 /// [`write_blob`] is idempotent, so the batch may re-offer the same body
-/// without cost, which is what lets [`apply_ops`] keep its own write as the
-/// floor for a caller that cannot stage ahead (the queue drain builds its ops
-/// inside the transaction that claims the row).
+/// without cost, which lets [`apply_ops`] keep its own write as the floor
+/// for a caller that cannot stage ahead.
 fn stage_blobs(blobs: &Path, ops: &[ReplicaWriteOp]) -> io::Result<()> {
     for op in ops {
         if let ReplicaWriteOp::StoreObject {
@@ -3182,11 +3152,11 @@ fn write_blob(blobs: &Path, hash: &str, body: &[u8]) -> io::Result<()> {
 
 /// Flushes a directory entry, so a rename into it survives a power loss.
 ///
-/// Syncing the file makes its bytes durable and says nothing about the name
-/// that reaches them. The database commit is durable, so without this a crash
-/// can leave a committed row pointing at a body that never arrived: the one
-/// asymmetry the write order exists to prevent, since the reverse leaves at
-/// worst an orphan blob.
+/// Syncing the file makes its bytes durable and says nothing about the
+/// name that reaches them. The database commit is durable, so without
+/// this a crash can leave a committed row pointing at a body that never
+/// arrived: the one asymmetry the write order exists to prevent, the
+/// reverse leaving at worst an orphan blob.
 fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
@@ -3198,26 +3168,26 @@ pub enum PimdirError {
     Sql(rusqlite::Error),
     /// The blob directory refused a read, a write or a rename.
     Io(io::Error),
-    /// JSON encoding failed at the storage seam (the link id array a lookup
-    /// hands to SQLite); a malformed queue payload reports as `Action`.
+    /// JSON encoding failed at the storage seam, the link id array a
+    /// lookup hands to SQLite; a malformed queue payload reports as
+    /// `Action`.
     Json(serde_json::Error),
     /// A queue action payload is malformed or unsupported (spec §15.3).
     Action(PimdirActionError),
     /// The store's schema version is not one this crate services: it was
-    /// written by a newer crate, or by a draft this one no longer reads. The
-    /// spec is a draft, so such a store is recreated, never migrated.
+    /// written by a newer crate, or by a draft this one no longer reads.
+    /// Such a store is recreated, never migrated.
     Version {
         /// The store's `user_version`.
         found: i64,
     },
-    /// The store has no schema yet, and this opener does not create one. A
-    /// producer and a reader both require the owner to have opened it first,
-    /// which is the write that creates the database.
+    /// The store has no schema yet, and this opener does not create one.
+    /// A producer and a reader both require the owner to have opened it
+    /// first, which is the write that creates the database.
     Uncreated,
     /// The store's two schema stamps disagree, which spec §4.2 defines as
-    /// corruption: `PRAGMA user_version` and `store_meta.version` mirror one
-    /// another, so a store where they differ was half-written by something and
-    /// is refused rather than read.
+    /// corruption: `PRAGMA user_version` and `store_meta.version` mirror
+    /// one another, so a store where they differ was half-written.
     VersionMismatch {
         /// The store's `PRAGMA user_version`.
         user_version: i64,
@@ -3226,34 +3196,34 @@ pub enum PimdirError {
     },
     /// The store was created by a draft whose foreign keys lack the
     /// `ON UPDATE CASCADE` a rename depends on (spec §14), which no
-    /// `ALTER TABLE` can add. Spec §6's other branch applies: the operator
-    /// recreates the store, which is a resync of a derived cache.
+    /// `ALTER TABLE` can add. Spec §6's other branch applies: the
+    /// operator recreates the store, a resync of a derived cache.
     Unreconcilable {
         /// The first table found without the cascade.
         table: &'static str,
     },
-    /// The store's `store_meta.hash_algo` is not one this crate computes, or
-    /// not the one the caller declared. Either way the handle would name bodies
-    /// the store does not use, so it is refused instead (spec §5).
+    /// The store's `store_meta.hash_algo` is not one this crate computes,
+    /// or not the one the caller declared. Either way the handle would
+    /// name bodies the store does not use, so it is refused (spec §5).
     HashAlgo {
         /// The algorithm the store records.
         found: String,
         /// The algorithm the caller declared, when it declared one.
         declared: Option<&'static str>,
     },
-    /// Another writer holds the store's single write lock (§8); the caller
-    /// should retry once the other writer (a sync, another client) is done.
+    /// Another writer holds the store's single write lock (§8); the
+    /// caller retries once that writer is done.
     Busy,
-    /// Another **process** owns the store (§8), which this one asked to own
-    /// too. Reported as soon as the lock is refused rather than waited out: a
-    /// wait long enough to outlast a sync is a stall with no signal, and the
-    /// caller is the only layer that can choose between retrying, backing off,
-    /// queueing the intent and telling the user.
+    /// Another process owns the store (§8), which this one asked to own
+    /// too. Reported as soon as the lock is refused rather than waited
+    /// out: a wait long enough to outlast a sync is a stall with no
+    /// signal, and the caller is the only layer that can choose between
+    /// retrying, backing off, queueing the intent and telling the user.
     Owned(PathBuf),
-    /// A producer is between its blob write and the enqueue that pins it (§8),
-    /// so a collector cannot run: the body it just wrote is referenced by
-    /// nothing yet and a sweep would take it. Reported rather than waited out,
-    /// since a producer holds its lock for as long as its handle lives.
+    /// A producer is between its blob write and the enqueue that pins it
+    /// (§8), so a collector cannot run: the body it just wrote is
+    /// referenced by nothing yet. Reported rather than waited out, since
+    /// a producer holds its lock for as long as its handle lives.
     Staging(PathBuf),
 }
 
@@ -3316,7 +3286,7 @@ impl fmt::Display for PimdirError {
     }
 }
 
-/// Maps a SQLite busy/locked failure to the clear [`PimdirError::Busy`], leaving
+/// Maps a SQLite busy/locked failure to [`PimdirError::Busy`], leaving
 /// any other error as a plain SQL error.
 fn busy_or_sql(err: rusqlite::Error) -> PimdirError {
     match &err {

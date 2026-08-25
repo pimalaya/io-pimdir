@@ -1,10 +1,9 @@
 //! Retention (spec §11): an item whose last source binding vanishes is
 //! retained, not deleted, and only a purge takes it away.
 //!
-//! The load-hiding half is what makes it safe rather than a resurrection loop,
-//! so the quiescence tests here drive a **real** [`ReplicaClient`] against a
-//! fake source, mirroring `io-replica/tests/soft_delete.rs`: the reference
-//! implementation of the contract this store now satisfies.
+//! The load-hiding half is what makes it safe rather than a resurrection
+//! loop, so the quiescence tests here drive a real [`ReplicaClient`]
+//! against a fake source, mirroring `io-replica/tests/soft_delete.rs`.
 
 use std::{collections::BTreeMap, convert::Infallible, path::Path};
 
@@ -80,8 +79,8 @@ fn drop_placement(handle: &str) -> ReplicaWriteOp {
     }
 }
 
-/// Overwrites a retained row's stamp, so a cutoff test does not depend on the
-/// wall clock: a store aged in place is exactly what the sweep meets.
+/// Overwrites a retained row's stamp, so a cutoff test does not depend on
+/// the wall clock: a store aged in place is what the sweep meets.
 fn backdate(dir: &Path, link: &str, retained_at: &str) {
     let conn = rusqlite::Connection::open(dir.join("pimdir.db")).unwrap();
     let updated = conn
@@ -105,10 +104,10 @@ fn an_expunge_retains_the_item_and_its_body() {
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
 
-    // The source expunges it: its last (only) binding goes.
+    // the source expunges it, so its last binding goes
     store.write(vec![drop_placement("1")]).unwrap();
 
-    // Gone from the sync seam and from the live reads...
+    // gone from the sync seam and from the live reads
     assert!(
         store
             .load(&inbox(), &ReplicaLoadScope::All)
@@ -120,7 +119,7 @@ fn an_expunge_retains_the_item_and_its_body() {
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
     assert!(store.get_item("INBOX", seq).unwrap().is_none());
 
-    // ...but kept whole, body included, under the id it always had.
+    // but kept whole, body included, under the id it always had
     let retained = store.list_retained(&inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].seq, seq);
@@ -144,7 +143,7 @@ fn an_expunge_retains_the_item_and_its_body() {
         "the retained row pins its body against the sweep"
     );
 
-    // It survives a reopen as retained, not as a live item.
+    // it survives a reopen as retained, not as a live item
     drop(store);
     let store = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
@@ -160,21 +159,21 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
     let mut client = ReplicaClient::new(store, remote);
 
     client.sync("INBOX", ReplicaSyncOptions::default()).unwrap();
-    // A sync enumerates handles only; the hydrate is what resolves the link id
-    // and the body, so the probe becomes a persisted item.
+    // a sync enumerates handles only, and the hydrate resolves the link
+    // id and the body, so the probe becomes a persisted item
     client
         .upgrade("INBOX", vec![ReplicaHandle("1".into())], ReplicaTier::Full)
         .unwrap();
     assert_eq!(client.storage().count_items("INBOX").unwrap(), 1);
 
-    // The source expunges the item; the sync observes the vanish.
+    // the source expunges the item and the sync observes the vanish
     client.remote_mut().remove("1");
     let report = client.sync("INBOX", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(report.pulled, 1, "the vanish is observed");
     assert_eq!(client.storage().count_retained(&inbox()).unwrap(), 1);
 
-    // Neither a delta nor a full resync re-derives against the hidden row: the
-    // merge only ever sees what `load` returns.
+    // neither a delta nor a full resync re-derives against the hidden
+    // row: the merge only sees what `load` returns
     let delta = client.sync("INBOX", ReplicaSyncOptions::default()).unwrap();
     assert_eq!(delta, ReplicaSyncReport::default(), "quiescent delta sync");
     let full = client
@@ -188,7 +187,7 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
         .unwrap();
     assert_eq!(full, ReplicaSyncReport::default(), "quiescent full sync");
 
-    // Nothing was re-uploaded either, and the copy is still there to restore.
+    // nothing was re-uploaded either, and the copy is still restorable
     assert!(client.remote().is_empty(), "no resurrection push");
     assert_eq!(client.storage().count_retained(&inbox()).unwrap(), 1);
     assert_eq!(client.storage().count_items("INBOX").unwrap(), 0);
@@ -208,8 +207,8 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     store.write(vec![drop_placement("1")]).unwrap();
     assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
 
-    // The source hands the same link id back under a new handle (a
-    // resurrection): the retained row revives instead of colliding on the key.
+    // the source hands the same link id back under a new handle, so the
+    // retained row revives instead of colliding on the key
     store
         .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
             "9",
@@ -227,8 +226,8 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     assert_eq!(store.retained_bytes().unwrap(), 0);
     assert!(blob_exists(dir.path(), "cafebabe"));
 
-    // The pin hand-over was exact: retiring it again keeps the body once more,
-    // and purging then reclaims it (no leaked reference either way).
+    // the pin hand-over was exact: retiring it again keeps the body once
+    // more, and purging then reclaims it
     store.write(vec![drop_placement("9")]).unwrap();
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert!(store.purge(&inbox(), seq).unwrap());
@@ -238,8 +237,9 @@ fn a_reappearing_link_id_revives_the_retained_row() {
 
 #[test]
 fn a_queued_add_restores_a_retained_item() {
-    // Restore is `Add` over the values retention preserved (no new action kind,
-    // no network): the duplicate-link-id guard must exempt the retained row.
+    // restore is `Add` over the values retention preserved, with no new
+    // action kind and no network, so the duplicate-link-id guard has to
+    // exempt the retained row
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
@@ -277,7 +277,7 @@ fn a_queued_add_restores_a_retained_item() {
     assert_eq!(items[0].object, Some(ReplicaHash("cafebabe".into())));
     assert!(store.list_retained(&inbox(), None, 10).unwrap().is_empty());
 
-    // Staged as a local creation, so the next sync pushes it back to the source.
+    // staged as a local creation, so the next sync pushes it back
     let projected = store
         .load(&inbox(), &ReplicaLoadScope::All)
         .unwrap()
@@ -301,7 +301,7 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
     let live = store.list_items("INBOX", None, 10).unwrap();
     let (seq_a, seq_b) = (live[0].seq, live[1].seq);
 
-    // A live item is out of a purge's reach entirely.
+    // a live item is out of a purge's reach entirely
     assert!(!store.purge(&inbox(), seq_a).unwrap());
     assert_eq!(store.count_items("INBOX").unwrap(), 2);
 
@@ -313,12 +313,12 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
         !blob_exists(dir.path(), "cafebabe"),
         "the last reference went with the row"
     );
-    // The other item is untouched, body included.
+    // the other item is untouched, body included
     assert_eq!(store.count_items("INBOX").unwrap(), 1);
     assert!(blob_exists(dir.path(), "beef0000"));
     assert!(store.get_item("INBOX", seq_b).unwrap().is_some());
 
-    // Purging what is already gone reports nothing to purge.
+    // purging what is already gone reports nothing to purge
     assert!(!store.purge(&inbox(), seq_a).unwrap());
 }
 
@@ -350,14 +350,14 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     backdate(dir.path(), "mid:new", "2026-07-01T00:00:00.000Z");
     assert_eq!(store.retained_bytes().unwrap(), 13);
 
-    // Nothing is old enough for a cutoff before every stamp.
+    // nothing is old enough for a cutoff before every stamp
     let report = store
         .purge_retained_before("2020-01-01T00:00:00.000Z")
         .unwrap();
     assert_eq!(report.items, 0);
     assert_eq!(store.count_retained(&inbox()).unwrap(), 3);
 
-    // Strictly before: the item retired exactly at the cutoff is kept.
+    // strictly before: the item retired exactly at the cutoff is kept
     let report = store.purge_retained_before(CUTOFF).unwrap();
     assert_eq!(report.items, 1, "only the January one");
     let collected = store.collect_garbage().unwrap();
@@ -373,7 +373,7 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     assert!(blob_exists(dir.path(), "beef0000"));
     assert!(blob_exists(dir.path(), "d0d00000"));
 
-    // A cutoff past every stamp empties the trash.
+    // a cutoff past every stamp empties the trash
     let report = store
         .purge_retained_before("2030-01-01T00:00:00.000Z")
         .unwrap();
@@ -388,9 +388,9 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
 
 #[test]
 fn a_two_side_delete_propagates_before_the_item_is_retired() {
-    // Retention is the terminal state of the `deleted` memory, not a shortcut
-    // past it: while another source still holds the item, the removal has to
-    // reach that source first.
+    // retention is the terminal state of the `deleted` memory rather than
+    // a shortcut past it: while another source holds the item, the
+    // removal has to reach that source first
     let dir = tempfile::tempdir().unwrap();
     let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
     let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
@@ -409,8 +409,8 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
         ))])
         .unwrap();
 
-    // Left's source expunged it: right must still be told, so the item is a
-    // tombstone, NOT retained.
+    // left's source expunged it and right must still be told, so the item
+    // is a tombstone rather than retained
     left.write(vec![drop_placement("L1")]).unwrap();
     let projected = right
         .load(&inbox(), &ReplicaLoadScope::All)
@@ -424,7 +424,8 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
         "the delete is still in flight"
     );
 
-    // Right pushes the remove and drops its own binding: now nothing holds it.
+    // right pushes the remove and drops its own binding, so nothing holds
+    // it
     right
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -468,7 +469,7 @@ fn the_retained_page_is_keyed_on_seq_and_exclusive() {
         .write(vec![drop_placement("1"), drop_placement("3")])
         .unwrap();
 
-    // The live item never shows up in the trash, whatever the page.
+    // the live item never shows up in the trash, whatever the page
     let page = store.list_retained(&inbox(), None, 1).unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].link_id.0, "mid:a");
@@ -486,9 +487,9 @@ fn the_retained_page_is_keyed_on_seq_and_exclusive() {
     );
 }
 
-/// A minimal fake source: it reports everything it currently holds, serves the
-/// bodies, and accepts every push. Enough to drive a real sync end to end and
-/// see whether a retained row provokes one.
+/// A minimal fake source: it reports everything it holds, serves the
+/// bodies and accepts every push. Enough to drive a real sync end to end
+/// and see whether a retained row provokes one.
 #[derive(Default)]
 struct MemRemote {
     items: BTreeMap<ReplicaHandle, (ReplicaLinkId, Vec<u8>)>,
@@ -511,8 +512,8 @@ impl MemRemote {
     }
 }
 
-/// A stable, store-agnostic content hash for the fake bodies (the store is
-/// hash-agnostic; only its stability matters here).
+/// A stable, store-agnostic content hash for the fake bodies: the store
+/// is hash-agnostic, and only stability matters here.
 fn fake_hash(body: &[u8]) -> ReplicaHash {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in body {
@@ -576,8 +577,8 @@ impl ReplicaRemote for MemRemote {
         _collection: &ReplicaCollectionId,
         changes: Vec<ReplicaChange>,
     ) -> Result<Vec<ReplicaPushResult>, Infallible> {
-        // NOTE: a retained item must provoke none of these; the tests assert on
-        // the report, and this keeps a stray push from silently succeeding.
+        // NOTE: a retained item must provoke none of these, so a stray
+        // push fails loudly rather than succeeding in silence.
         Ok(changes
             .into_iter()
             .map(|change| {

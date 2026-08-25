@@ -1,9 +1,9 @@
 //! The `item` verb group: list, show, export, restore and purge.
 //!
-//! None of it interprets content. An item prints as its public `seq`, its
-//! cross-source link id, its flags, its detail level, its body hash and its
-//! meta **verbatim**; a body leaves as the raw bytes that went in. Turning
-//! those into a rendered message or contact is a per-kind consumer's job.
+//! None of it interprets content. An item prints as its public `seq`,
+//! its cross-source link id, its flags, its detail level, its body hash
+//! and its meta verbatim; a body leaves as the raw bytes that went in.
+//! Rendering those is a per-kind consumer's job.
 
 use std::{
     fmt,
@@ -94,8 +94,8 @@ impl ItemListCommand {
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         let store = store.read()?;
         let limit = self.limit.max(1);
-        // NOTE: one more than asked, so the page knows whether it is the last
-        // without a second query.
+        // NOTE: one more than asked, so the page knows whether it is the
+        // last without a second query.
         let probe = limit.saturating_add(1);
 
         let mut rows: Vec<ItemRow> = if self.retained {
@@ -293,8 +293,8 @@ impl ItemRestoreCommand {
         }
         drop(read);
 
-        // NOTE: resolved before the enqueue, so an unresolvable write source
-        // fails while nothing has been appended yet.
+        // NOTE: resolved before the enqueue, so an unresolvable write
+        // source fails while nothing has been appended yet.
         let source = store.write_source()?;
 
         let action = PimdirAction::Add {
@@ -304,18 +304,17 @@ impl ItemRestoreCommand {
             meta: item.meta.clone(),
             handle: None,
         };
-        // NOTE: no size, since the body is already indexed: the retained row
-        // kept its object alive, which is the whole point of retention.
+        // NOTE: no size, the body being already indexed: the retained row
+        // kept its object alive, which is the point of retention.
         let id = store
             .producer()?
             .enqueue(&found.collection, &action, None, &now())
             .map_err(report)?;
 
-        // NOTE: the drain reports what it did to the whole collection's queue,
-        // so the item itself is the only trustworthy proof that *this* action
-        // landed: it is live again, or it is not. An owner that is running,
-        // or one that takes the store between here and there, leaves the
-        // action where it is: queued, for that owner to apply.
+        // NOTE: the drain reports what it did to the whole collection's
+        // queue, so the item itself is the only trustworthy proof that
+        // this action landed: it is live again, or it is not. An owner
+        // running meanwhile leaves the action queued for itself.
         let status = match store.owner_if_free()? {
             None => RestoreStatus::Queued,
             Some(owner) => {
@@ -383,8 +382,8 @@ impl ItemPurgeCommand {
             return self.purge_one(printer, store, seq);
         }
 
-        // NOTE: `--all` is `--older-than 0`: nothing can be retained in the
-        // future, so "before now" is "everything".
+        // NOTE: `--all` is `--older-than 0`: nothing can be retained in
+        // the future, so "before now" is "everything".
         let cutoff = match self.older_than {
             Some(age) => crate::cli::cutoff(*age),
             None => now(),
@@ -662,8 +661,8 @@ impl fmt::Display for ItemsOutput {
 
         writeln!(f, "{table}")?;
 
-        // NOTE: a page that stops short says so; an operator must never mistake
-        // one page for the whole collection.
+        // NOTE: a page that stops short says so, or an operator would
+        // mistake one page for the whole collection.
         if let Some(next) = &self.next {
             writeln!(f, "More items follow: continue with --after {next}")?;
         }

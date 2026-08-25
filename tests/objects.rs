@@ -1,19 +1,19 @@
 //! The crate's object naming against the format's own vectors (pimdir SPEC
 //! §16).
 //!
-//! The one vector file the format makes a **MUST**, and the reason is the
-//! failure mode rather than the importance: a store whose two writers name the
-//! same body differently reports nothing. It does not error and no read returns
-//! a wrong answer; it silently never deduplicates and silently never finds the
-//! blob the other side wrote. Prose cannot close that, because two readers of
-//! the same prose are what produced it.
+//! The one vector file the format makes a MUST, and the reason is the
+//! failure mode rather than the importance: a store whose two writers
+//! name the same body differently reports nothing. It does not error and
+//! no read returns a wrong answer; it silently never deduplicates and
+//! never finds the blob the other side wrote. Prose cannot close that,
+//! two readers of the same prose being what produced it.
 //!
-//! The expected values were derived from the algorithm and prose
-//! specifications rather than by running any implementation, so this crate can
-//! genuinely disagree with them.
+//! The expected values were derived from the algorithm and prose rather
+//! than by running any implementation, so this crate can genuinely
+//! disagree with them.
 //!
-//! The spec is a sibling checkout rather than a vendored copy, so the test
-//! skips when it is absent and runs whenever the two sit side by side.
+//! The spec is a sibling checkout rather than a vendored copy, so the
+//! test skips when it is absent and runs when the two sit side by side.
 
 use std::{fs, path::PathBuf};
 
@@ -37,9 +37,9 @@ fn vectors() -> Option<Value> {
     Some(serde_json::from_str(&text).unwrap())
 }
 
-/// The body a case describes: its bytes verbatim, or the pattern the long ones
-/// are generated from (byte `i` is `i mod 251`, the BLAKE3 project's own
-/// convention, which is what lets those cases be checked against its published
+/// The body a case describes: its bytes verbatim, or the pattern the long
+/// ones are generated from (byte `i` is `i mod 251`, the BLAKE3
+/// project's own convention, so those cases check against its published
 /// vectors).
 fn body(case: &Value) -> Vec<u8> {
     let len = case["body_len"].as_u64().unwrap() as usize;
@@ -69,8 +69,8 @@ fn body(case: &Value) -> Vec<u8> {
     }
 }
 
-/// Object naming is the format's one MUST: every body names the same under both
-/// algorithms, and lands at the same sharded path.
+/// Object naming is the format's one MUST: every body names the same
+/// under both algorithms, and lands at the same sharded path.
 #[test]
 fn every_body_names_what_the_format_says() {
     let Some(vectors) = vectors() else {
@@ -97,11 +97,11 @@ fn every_body_names_what_the_format_says() {
                 "{label} under {spelling}",
             );
 
-            // The shard path §5 derives from the name, which is as normative as
-            // the name itself: two writers agreeing on the name and disagreeing
-            // on where it lives still never find each other's bodies. Rooted at
-            // an empty store directory, so the path reads exactly as the
-            // vectors write it, `objects/` included.
+            // the shard path §5 derives from the name is as normative as
+            // the name: two writers agreeing on the name and disagreeing
+            // on where it lives still never find each other's bodies.
+            // Rooted at an empty store directory, so the path reads
+            // exactly as the vectors write it.
             let blobs = PimdirBlobs::open("", algo);
             assert_eq!(
                 blobs.path(&ReplicaHash(name.0.clone())),
@@ -114,9 +114,9 @@ fn every_body_names_what_the_format_says() {
 
 /// A body fed in pieces names what the same body fed whole names.
 ///
-/// The streamed path is what §14's byteless `StoreObject` rides, and it is
-/// where a hasher most often breaks: the vectors carry 1023, 1024 and 1025
-/// bytes because that is BLAKE3's chunk boundary.
+/// The streamed path is what §14's byteless `StoreObject` rides, and
+/// where a hasher most often breaks: the vectors carry 1023, 1024 and
+/// 1025 bytes because that is BLAKE3's chunk boundary.
 #[test]
 fn a_streamed_body_names_what_a_whole_one_names() {
     let Some(vectors) = vectors() else {

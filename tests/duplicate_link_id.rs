@@ -1,9 +1,9 @@
 //! Persisting an identity a collection holds twice (spec §10).
 //!
-//! The engine freezes such an item, and the freeze is only worth anything if
-//! it survives: the second copy appears in exactly one enumeration, and an
-//! incremental one never mentions it again. That makes this the store's
-//! contract, not the engine's alone.
+//! The engine freezes such an item, and the freeze is only worth
+//! anything if it survives: the second copy appears in exactly one
+//! enumeration, and an incremental one never mentions it again. That
+//! makes this the store's contract, not the engine's alone.
 
 use io_pimdir::{PimdirSourceStore, PimdirStore};
 use io_replica::{
@@ -66,7 +66,7 @@ fn ambiguous_handles_survive_a_reopen() {
             .unwrap();
     }
 
-    // A fresh handle, as the next run of a daemon is.
+    // a fresh handle, as the next run of a daemon is
     let store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     let placements = projected(&store);
     assert_eq!(placements.len(), 1);
@@ -84,9 +84,8 @@ fn ambiguous_handles_survive_a_reopen() {
 
 #[test]
 fn a_write_never_repoints_a_binding_to_another_handle() {
-    // The evidence used to be destroyed here, at the write: the second copy
-    // repointed the binding and no later layer could tell the source held the
-    // identity twice.
+    // the second copy must not repoint the binding, or no later layer
+    // could tell the source holds the identity twice
     let dir = tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
@@ -170,15 +169,14 @@ fn the_engine_clearing_the_freeze_clears_the_column() {
 /// A rebuilt handle space is a repoint the floor above MUST let through.
 ///
 /// A rekey drops the whole old spine and upserts every item under its new
-/// handle, in one batch (spec §12). Read without knowing that, the two halves
-/// are indistinguishable from the same source reporting one identity under a
-/// second handle, and the floor keeps the old handle and records the new one:
-/// a UIDVALIDITY bump then freezes every item of the collection, bound to
-/// handles the server no longer has, with no way back.
+/// handle, in one batch (spec §12). Read without knowing that, the two
+/// halves are indistinguishable from one source reporting an identity
+/// under a second handle, and a UIDVALIDITY bump would freeze every item
+/// of the collection, bound to handles the server no longer has.
 ///
-/// What separates the two is the drop's reason. `Superseded` says the row is
-/// being replaced, `Deleted` says the item went; only the first licenses a
-/// repoint, and only for the handle it names.
+/// What separates the two is the drop's reason. `Superseded` says the row
+/// is being replaced, `Deleted` that the item went; only the first
+/// licenses a repoint, and only for the handle it names.
 #[test]
 fn a_rekey_carries_the_binding_over_instead_of_freezing_it() {
     let dir = tempdir().unwrap();
@@ -191,8 +189,8 @@ fn a_rekey_carries_the_binding_over_instead_of_freezing_it() {
         ))])
         .unwrap();
 
-    // The handle-space rebuild: the old spine goes, the same items come back
-    // renumbered.
+    // the handle-space rebuild: the old spine goes, the same items come
+    // back renumbered
     store
         .write_rekeyed(
             "INBOX",
@@ -223,10 +221,10 @@ fn a_rekey_carries_the_binding_over_instead_of_freezing_it() {
 
 /// The licence is per handle, not per batch.
 ///
-/// A rekey batch that also carries a genuine second copy of one identity must
-/// still freeze it: superseding `u1` says nothing about `u9`, and reading the
-/// reason as a blanket permission would put the data loss back inside the one
-/// operation that legitimately repoints.
+/// A rekey batch that also carries a genuine second copy of one identity
+/// must still freeze it: superseding `u1` says nothing about `u9`, and
+/// reading the reason as a blanket permission would put the loss back
+/// inside the one operation that legitimately repoints.
 #[test]
 fn a_superseded_handle_licenses_only_its_own_repoint() {
     let dir = tempdir().unwrap();
@@ -244,14 +242,14 @@ fn a_superseded_handle_licenses_only_its_own_repoint() {
         .write_rekeyed(
             "INBOX",
             vec![
-                // msg-a is superseded and renumbered: carried over.
+                // msg-a is superseded and renumbered, so it carries over
                 ReplicaWriteOp::DropPlacement {
                     collection: inbox(),
                     handle: ReplicaHandle("u1".into()),
                     reason: ReplicaDropReason::Superseded,
                 },
                 ReplicaWriteOp::UpsertPlacement(placement("101", "msg-a")),
-                // msg-b is not: this is the source holding it twice.
+                // msg-b is not: the source holds it twice
                 ReplicaWriteOp::UpsertPlacement(placement("u9", "msg-b")),
             ],
         )

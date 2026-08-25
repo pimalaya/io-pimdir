@@ -1,11 +1,11 @@
 //! One store holding several accounts.
 //!
-//! The account groups collections and partitions nothing (spec §9.2), so what
-//! these check is mostly what *stays true* when a second account moves in: the
-//! `seq` a link id draws, the single copy a shared body gets, and the fact that
-//! regrouping a collection disturbs neither. The two multiplicity reads are the
-//! store's whole answer to "the same thing is in two accounts": they report it,
-//! and every merge policy is built on top of them rather than inside.
+//! The account groups collections and partitions nothing (spec §9.2), so
+//! what these check is mostly what stays true when a second account moves
+//! in: the `seq` a link id draws, the single copy a shared body gets, and
+//! that regrouping a collection disturbs neither. The two multiplicity
+//! reads are the store's whole answer to "the same thing is in two
+//! accounts": they report it, and every merge policy is built on top.
 
 use io_pimdir::PimdirStore;
 use io_replica::{
@@ -39,7 +39,7 @@ fn placement(collection: &str, handle: &str, link_id: &str, hash: &str) -> Repli
 }
 
 /// The placement plus the body it points at, in one batch: an object no
-/// placement references is swept at the end of its own batch.
+/// placement references is swept at the end of that batch.
 fn batch(collection: &str, handle: &str, link_id: &str, hash: &str) -> Vec<ReplicaWriteOp> {
     vec![
         ReplicaWriteOp::StoreObject {
@@ -88,7 +88,7 @@ fn collections_carry_their_account() {
     assert_eq!(work[0].id, "work/INBOX");
     assert_eq!(work[0].account.as_deref(), Some("work"));
 
-    // Every collection is grouped, so the single-account bucket is empty.
+    // every collection is grouped, so the single-account bucket is empty
     assert!(store.list_collections_by_account(None).unwrap().is_empty());
 }
 
@@ -99,8 +99,8 @@ fn an_ungrouped_store_is_the_null_bucket() {
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store.write(batch("INBOX", "1", "<a@x>", "beef")).unwrap();
 
-    // The point of matching with `IS`: a NULL account matches itself, where
-    // `=` would match nothing and a single-account store would be invisible.
+    // the point of matching with `IS`: a NULL account matches itself,
+    // where `=` would match nothing
     let listed = store.list_collections_by_account(None).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "INBOX");
@@ -117,11 +117,11 @@ fn the_account_partitions_no_identifier() {
     let placements = store.link_placements("<news@x>").unwrap();
     assert_eq!(placements.len(), 2);
 
-    // One link id, one seq, whichever account holds it: the seq is the short
-    // form of the link id, so equal link ids share it wherever they sit.
+    // one link id, one seq, whichever account holds it: the seq is the
+    // short form of the link id
     assert_eq!(placements[0].seq, placements[1].seq);
 
-    // And one body, stored once for both accounts.
+    // and one body, stored once for both accounts
     let bodies: Vec<_> = placements.iter().map(|p| p.object.clone()).collect();
     assert_eq!(bodies[0], bodies[1]);
 }
@@ -133,7 +133,7 @@ fn multiplicity_is_reported_on_both_axes() {
 
     let store = PimdirStore::open(dir.path()).unwrap();
 
-    // The identity axis: where this link id occurs, account included.
+    // the identity axis: where this link id occurs, account included
     let by_link = store.link_placements("<news@x>").unwrap();
     let seen: Vec<_> = by_link
         .iter()
@@ -144,8 +144,8 @@ fn multiplicity_is_reported_on_both_axes() {
         [(Some("home"), "home/INBOX"), (Some("work"), "work/INBOX")]
     );
 
-    // The dedup axis: the same two, found by body instead, which is what pairs
-    // placements two servers gave different link ids.
+    // the dedup axis: the same two found by body, which is what pairs
+    // placements two servers gave different link ids
     let by_object = store.object_placements("beef").unwrap();
     let seen: Vec<_> = by_object
         .iter()
@@ -156,7 +156,7 @@ fn multiplicity_is_reported_on_both_axes() {
         [(Some("home"), "home/INBOX"), (Some("work"), "work/INBOX")]
     );
 
-    // An identity nobody holds reports nothing rather than erroring.
+    // an identity nobody holds reports nothing rather than erroring
     assert!(store.link_placements("<absent@x>").unwrap().is_empty());
 }
 
@@ -176,8 +176,8 @@ fn regrouping_a_collection_disturbs_nothing() {
         Some(Some("personal".into()))
     );
 
-    // The move regroups and nothing else: same placements, same seqs, same
-    // bodies. Only the label changed.
+    // the move regroups and nothing else: same placements, same seqs,
+    // same bodies
     let after = store.link_placements("<news@x>").unwrap();
     assert_eq!(before.len(), after.len());
     let seqs_before: Vec<_> = before.iter().map(|p| p.seq).collect();
@@ -192,8 +192,8 @@ fn a_sync_declaring_a_kind_never_moves_a_collection() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
 
-    // A handle bound to another account re-declaring the kind must not steal
-    // the collection: set_collection_kind updates the kind alone.
+    // a handle bound to another account re-declaring the kind must not
+    // steal the collection: set_collection_kind updates the kind alone
     let other = PimdirStore::open(dir.path())
         .unwrap()
         .for_account("home")
@@ -215,17 +215,16 @@ fn an_unknown_collection_has_no_account() {
     let dir = tempfile::tempdir().unwrap();
     let store = PimdirStore::open(dir.path()).unwrap();
 
-    // The outer None is "no such collection", distinct from Some(None), which
-    // is "exists, ungrouped".
+    // the outer None is "no such collection", distinct from Some(None),
+    // which is "exists, ungrouped"
     assert_eq!(store.collection_account("nope").unwrap(), None);
 }
 
 #[test]
 fn a_body_lookup_never_crosses_an_account() {
-    // Spec §9.2 names the case: two unrelated servers may mint the same
-    // identity. Answering a body lookup with the other account's object hands
-    // one account's content to the other's sync, which then believes the item
-    // is hydrated and never fetches the real one.
+    // spec §9.2 names the case: two unrelated servers may mint the same
+    // identity, so answering a body lookup with the other account's
+    // object would have that sync believe the item hydrated
     let dir = tempfile::tempdir().unwrap();
 
     let mut work = PimdirStore::open(dir.path())
@@ -236,7 +235,7 @@ fn a_body_lookup_never_crosses_an_account() {
     work.write(batch("work/AB", "1", "uid-collide", "aaaabbbb"))
         .unwrap();
 
-    // home holds the same identity, with a different body and no body cached.
+    // home holds the same identity, with a different body and none cached
     let home = PimdirStore::open(dir.path())
         .unwrap()
         .for_account("home")
@@ -251,8 +250,8 @@ fn a_body_lookup_never_crosses_an_account() {
         "home has no body for this identity; work's is not an answer: {found:?}",
     );
 
-    // The same lookup within the owning account still answers, which is what
-    // the read exists for.
+    // the same lookup within the owning account still answers, which is
+    // what the read exists for
     let found = work
         .lookup_objects(&[ReplicaLinkId("uid-collide".into())])
         .unwrap();

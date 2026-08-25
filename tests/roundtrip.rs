@@ -1,6 +1,6 @@
-//! Single-source round-trip (write → reopen → load → lookup → drop → GC), and
-//! two-source propagation (a copy appears on the other side; a delete lingers as
-//! a tombstone) — the N=1 and N=2 cases of the same store.
+//! Single-source round-trip (write, reopen, load, lookup, drop, GC) and
+//! two-source propagation (a copy appears on the other side, a delete
+//! lingers as a tombstone): the N=1 and N=2 cases of the same store.
 
 use std::path::Path;
 
@@ -19,8 +19,8 @@ use io_replica::{
     storage::ReplicaLoadScope,
 };
 
-/// Drives a `ReplicaMutate` against the store to completion — the same load /
-/// write pump a client (himalaya) runs, so a test exercises the real staged
+/// Drives a `ReplicaMutate` against the store to completion, the same
+/// load/write pump a client runs, so a test exercises the real staged
 /// mutation path end to end.
 fn run_mutation(store: &mut PimdirSourceStore, collection: &str, mutation: ReplicaMutation) {
     let mut coroutine = ReplicaMutate::new(collection.to_string(), mutation);
@@ -71,8 +71,8 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPla
     }
 }
 
-/// A `Meta`-tier linked placement with no body (the availability-aware case: a
-/// summary is known, the object is not local yet).
+/// A `Meta`-tier linked placement with no body: a summary is known, the
+/// object is not local yet.
 fn meta_placement(handle: &str, link: &str, meta: &str) -> ReplicaPlacement {
     ReplicaPlacement {
         sort_key: Default::default(),
@@ -130,7 +130,7 @@ fn single_source_write_reopen_lookup_and_gc() {
         .unwrap();
     assert!(blob_exists(dir.path(), "cafebabe"), "blob written");
 
-    // Reopen: the item, its flags, its body and the checkpoint all survive.
+    // reopen: the item, its flags, its body and the checkpoint survive
     drop(store);
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     let loaded = store.load(&inbox(), &ReplicaLoadScope::All).unwrap();
@@ -150,8 +150,8 @@ fn single_source_write_reopen_lookup_and_gc() {
         Some(&ReplicaHash("cafebabe".into()))
     );
 
-    // Dropping the only binding retires the item: gone from the seam, kept in
-    // the trash with its body (retention, `tests/retention.rs`).
+    // dropping the only binding retires the item: gone from the seam,
+    // kept in the trash with its body
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -170,8 +170,8 @@ fn single_source_write_reopen_lookup_and_gc() {
     assert_eq!(retained.len(), 1);
     assert!(blob_exists(dir.path(), "cafebabe"), "the body is kept");
 
-    // Purging is what orphans the blob. It stays until a collector runs: a
-    // store never collects itself.
+    // purging is what orphans the blob, and it stays until a collector
+    // runs
     assert!(store.purge(&inbox(), retained[0].seq).unwrap());
     assert!(blob_exists(dir.path(), "cafebabe"), "no write collects");
 
@@ -188,17 +188,17 @@ fn collection_kind_is_declared_and_survives_a_lazy_write() {
     let dir = tempfile::tempdir().unwrap();
     let store = PimdirStore::open(dir.path()).unwrap().for_source("local");
 
-    // Unknown until declared.
+    // unknown until declared
     assert_eq!(store.collection_kind("INBOX").unwrap(), None);
 
-    // Declaring creates the collection with its media type.
+    // declaring creates the collection with its media type
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     assert_eq!(
         store.collection_kind("INBOX").unwrap().as_deref(),
         Some("message/rfc822")
     );
 
-    // A write's lazy `ENSURE_COLLECTION` must not clobber the declared kind.
+    // a write's lazy `ENSURE_COLLECTION` must not clobber the kind
     let mut store = store;
     store
         .write(vec![ReplicaWriteOp::SetCheckpoint {
@@ -212,7 +212,7 @@ fn collection_kind_is_declared_and_survives_a_lazy_write() {
         "a sync write preserves the declared kind"
     );
 
-    // Redeclaring updates it (e.g. a store reused for another kind).
+    // redeclaring updates it
     store.ensure_collection("INBOX", "text/vcard").unwrap();
     assert_eq!(
         store.collection_kind("INBOX").unwrap().as_deref(),
@@ -226,15 +226,15 @@ fn two_source_copy_and_delete_propagation() {
     let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
     let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
 
-    // The item lands on the left source only.
+    // the item lands on the left source only
     left.write(vec![
         store_object("cafebabe", b"abc"),
         ReplicaWriteOp::UpsertPlacement(placement("L1", "mid:a", "cafebabe", &["\\Seen"])),
     ])
     .unwrap();
 
-    // Right doesn't hold it yet, but the body is hydrated, so right projects a
-    // Created copy — the cross-source propagation.
+    // right does not hold it yet, but the body is hydrated, so it
+    // projects a Created copy
     let right_view = right.load(&inbox(), &ReplicaLoadScope::All).unwrap();
     assert_eq!(right_view.placements.len(), 1);
     assert_eq!(right_view.placements[0].status, ReplicaStatus::Created);
@@ -243,7 +243,7 @@ fn two_source_copy_and_delete_propagation() {
         Some(ReplicaHash("cafebabe".into()))
     );
 
-    // Right accepts the copy (binds its own handle).
+    // right accepts the copy, binding its own handle
     right
         .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
             "R1",
@@ -253,7 +253,7 @@ fn two_source_copy_and_delete_propagation() {
         ))])
         .unwrap();
 
-    // Left deletes it. The item lingers (deleted) because right still holds it.
+    // left deletes it, and the item lingers because right still holds it
     left.write(vec![ReplicaWriteOp::DropPlacement {
         collection: inbox(),
         handle: ReplicaHandle("L1".into()),
@@ -261,11 +261,13 @@ fn two_source_copy_and_delete_propagation() {
     }])
     .unwrap();
 
-    // Right now sees a tombstone — the delete propagated as a pending remove.
+    // right now sees a tombstone: the delete propagated as a pending
+    // remove
     let right_view = right.load(&inbox(), &ReplicaLoadScope::All).unwrap();
     assert_eq!(right_view.placements.len(), 1);
     assert_eq!(right_view.placements[0].status, ReplicaStatus::Tombstone);
-    // Left no longer holds it, so it projects nothing (not a re-copy).
+    // left no longer holds it, so it projects nothing rather than a
+    // re-copy
     assert!(
         left.load(&inbox(), &ReplicaLoadScope::All)
             .unwrap()
@@ -280,7 +282,7 @@ fn client_reads_collections_items_page_and_one() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
-    // Three live items, out of link-id order on write.
+    // three live items, out of link-id order on write
     store
         .write(vec![
             store_object("cafebabe", b"a"),
@@ -292,13 +294,13 @@ fn client_reads_collections_items_page_and_one() {
         ])
         .unwrap();
 
-    // list_collections surfaces the declared kind.
+    // list_collections surfaces the declared kind
     let collections = store.list_collections().unwrap();
     assert_eq!(collections.len(), 1);
     assert_eq!(collections[0].id, "INBOX");
     assert_eq!(collections[0].kind, "message/rfc822");
 
-    // Keyset pagination: ordered by link_id, `after` is exclusive.
+    // keyset pagination: ordered by link_id, `after` exclusive
     let page1 = store.list_items("INBOX", None, 2).unwrap();
     assert_eq!(
         page1
@@ -317,18 +319,19 @@ fn client_reads_collections_items_page_and_one() {
         ["mid:c"]
     );
 
-    // Full items carry their object and level; flags round-trip.
+    // full items carry their object and level, and flags round-trip
     assert_eq!(page1[0].level, ReplicaLevel::Full);
     assert_eq!(page1[0].object, Some(ReplicaHash("cafebabe".into())));
     assert!(page1[0].flags.contains("\\Seen"));
 
-    // Every item carries a per-collection public id, monotonic in insert order.
+    // every item carries a public id, monotonic in insert order
     assert_eq!(
         store.get_item("INBOX", page1[0].seq).unwrap().unwrap().seq,
         page1[0].seq
     );
 
-    // get_item keys on the public seq: hit resolves to the link id, miss is None.
+    // get_item keys on the public seq: a hit resolves to the link id, a
+    // miss is None
     let seq_b = page1[1].seq; // mid:b
     assert_eq!(
         store.get_item("INBOX", seq_b).unwrap().unwrap().link_id.0,
@@ -352,10 +355,10 @@ fn client_read_surfaces_level_for_a_meta_only_item() {
         ))])
         .unwrap();
 
-    // First (and only) item in a fresh collection gets public seq 1.
+    // the only item in a fresh collection gets public seq 1
     let item = store.get_item("INBOX", 1).unwrap().unwrap();
-    // Availability-aware: a hydrate is needed (level < Full, no local body), and
-    // the caller can tell without touching the blob store.
+    // availability-aware: a hydrate is needed, and the caller can tell
+    // without touching the blob store
     assert_eq!(item.level, ReplicaLevel::Meta);
     assert!(item.object.is_none());
     assert_eq!(item.meta.unwrap().0, "{\"v\":1,\"subject\":\"hi\"}");
@@ -371,7 +374,7 @@ fn public_seq_is_message_scoped_global_and_never_reused() {
             .unwrap();
     }
 
-    // Two messages in INBOX.
+    // two messages in INBOX
     store
         .write(vec![
             ReplicaWriteOp::UpsertPlacement(meta_placement("1", "mid:a", "{\"v\":1}")),
@@ -390,8 +393,8 @@ fn public_seq_is_message_scoped_global_and_never_reused() {
     let b = seq(&store, "INBOX", "mid:b").unwrap();
     assert!(b > a, "store-global and monotonic: {a} then {b}");
 
-    // The SAME message (link id) filed in another mailbox keeps the SAME id — the
-    // id belongs to the message, not the placement (dedup / merged view).
+    // the same message filed in another mailbox keeps the same id: the id
+    // belongs to the message, not the placement
     let mut a_in_arch = meta_placement("A1", "mid:a", "{\"v\":1}");
     a_in_arch.collection = ReplicaCollectionId("Archives".into());
     store
@@ -402,11 +405,11 @@ fn public_seq_is_message_scoped_global_and_never_reused() {
         Some(a),
         "a message keeps one id across every mailbox it is filed in"
     );
-    // …and `seq_for_link` agrees from either collection.
+    // and `seq_for_link` agrees from either collection
     assert_eq!(store.seq_for_link("Archives", "mid:a").unwrap(), Some(a));
 
-    // A DIFFERENT message draws the next store-global id — ids do NOT restart per
-    // mailbox, so they never clash across mailboxes.
+    // a different message draws the next store-global id: ids do not
+    // restart per mailbox, so they never clash
     let mut s = meta_placement("S1", "mid:s", "{\"v\":1}");
     s.collection = ReplicaCollectionId("Sent".into());
     store
@@ -418,8 +421,8 @@ fn public_seq_is_message_scoped_global_and_never_reused() {
         "a new message takes the next global id: {s_seq} > {b}"
     );
 
-    // Retire `mid:b`, then add a new message: b's id is never reused (nor is it
-    // handed back by a revive, which keeps the id it retired with).
+    // retire `mid:b`, then add a new message: b's id is never reused, and
+    // a revive keeps the id it retired with
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -447,7 +450,7 @@ fn client_read_excludes_tombstones() {
     let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
     let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
 
-    // Two items on left; only `mid:a` also gets bound on right.
+    // two items on left, only `mid:a` also bound on right
     left.write(vec![
         store_object("cafebabe", b"a"),
         store_object("cafebabf", b"b"),
@@ -465,8 +468,8 @@ fn client_read_excludes_tombstones() {
         ))])
         .unwrap();
 
-    // Left drops `mid:a`; right still holds it, so it lingers as a tombstone
-    // (deleted), while `mid:b` stays live.
+    // left drops `mid:a` and right still holds it, so it lingers as a
+    // tombstone while `mid:b` stays live
     left.write(vec![ReplicaWriteOp::DropPlacement {
         collection: inbox(),
         handle: ReplicaHandle("LA".into()),
@@ -474,7 +477,7 @@ fn client_read_excludes_tombstones() {
     }])
     .unwrap();
 
-    // The client read excludes the tombstone selectively — `mid:b` remains.
+    // the client read excludes the tombstone selectively
     let items = left.list_items("INBOX", None, 10).unwrap();
     assert_eq!(
         items
@@ -484,7 +487,7 @@ fn client_read_excludes_tombstones() {
         ["mid:b"]
     );
     assert_eq!(left.count_items("INBOX").unwrap(), 1);
-    // `mid:a` (public seq 1) is a tombstone → excluded from the client read.
+    // `mid:a`, public seq 1, is a tombstone and excluded from the read
     assert!(left.get_item("INBOX", 1).unwrap().is_none());
 }
 
@@ -495,7 +498,7 @@ fn a_body_streams_in_and_back_out() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = io_pimdir::PimdirBlobs::open(dir.path(), PimdirHashAlgo::default());
 
-    // Stream a body in, in chunks, committing under its (caller-computed) hash.
+    // stream a body in, in chunks, committing under its hash
     let mut w = blobs.writer().unwrap();
     w.write_all(b"hello ").unwrap();
     w.write_all(b"world").unwrap();
@@ -506,7 +509,7 @@ fn a_body_streams_in_and_back_out() {
         "committed to the shard path"
     );
 
-    // Read it back as a stream and buffered — both see the same bytes.
+    // read it back as a stream and buffered: both see the same bytes
     let mut file = blobs
         .reader(&ReplicaHash("aabbccdd".into()))
         .unwrap()
@@ -519,7 +522,7 @@ fn a_body_streams_in_and_back_out() {
         b"hello world"
     );
 
-    // A missing object streams as None.
+    // a missing object streams as None
     assert!(
         blobs
             .reader(&ReplicaHash("00000000".into()))
@@ -536,13 +539,13 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
     let blobs = io_pimdir::PimdirBlobs::open(dir.path(), PimdirHashAlgo::default());
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
 
-    // The consumer streams the blob into place during a fetch...
+    // the consumer streams the blob into place during a fetch
     let mut w = blobs.writer().unwrap();
     w.write_all(b"streamed-body").unwrap();
     let size = w.commit(&ReplicaHash("beef0000".into())).unwrap() as usize;
 
-    // ...then the write batch records the object with NO bytes, plus a
-    // placement pointing at it.
+    // then the write batch records the object with no bytes, plus a
+    // placement pointing at it
     store
         .write(vec![
             ReplicaWriteOp::StoreObject {
@@ -556,8 +559,8 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
         ])
         .unwrap();
 
-    // Reopen: the object survived indexing, its blob is the streamed bytes, and
-    // it was not GC'd (a placement references it).
+    // reopen: the object survived indexing, its blob is the streamed
+    // bytes, and a placement references it so nothing collected it
     drop(store);
     let store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     let loaded = store.load(&inbox(), &ReplicaLoadScope::All).unwrap();
@@ -573,11 +576,10 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
 
 #[test]
 fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
-    // Incremental refcounts must dedup: two items pointing at one content hash
-    // hold it with a refcount > 1, so losing one keeps the blob and only the
-    // last release GCs it. A naive per-batch delta would double-count or GC
-    // early. Retention adds a second holder of that reference: a retired row
-    // pins its body exactly as a live one does, so both must be purged.
+    // two items pointing at one content hash hold it with a refcount
+    // above 1, so losing one keeps the blob and only the last release
+    // collects it. Retention adds a second holder: a retired row pins its
+    // body exactly as a live one does, so both must be purged.
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
 
@@ -590,8 +592,8 @@ fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
         .unwrap();
     assert!(blob_exists(dir.path(), "cafebabe"), "shared blob written");
 
-    // Drop the first referrer: it is retired, and the blob stays for both the
-    // second item and the retained row.
+    // drop the first referrer: it is retired, and the blob stays for both
+    // the second item and the retained row
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -612,8 +614,8 @@ fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
         "blob kept while a second item still references it"
     );
 
-    // Drop the last live referrer: nothing is live any more, yet both retained
-    // rows still pin the body.
+    // drop the last live referrer: nothing is live any more, yet both
+    // retained rows still pin the body
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -632,14 +634,14 @@ fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
     assert_eq!(retained.len(), 2);
     assert!(blob_exists(dir.path(), "cafebabe"), "both rows pin it");
 
-    // Purging the first releases one reference; the blob outlives it.
+    // purging the first releases one reference, and the blob outlives it
     assert!(store.purge(&inbox(), retained[0].seq).unwrap());
     assert!(
         blob_exists(dir.path(), "cafebabe"),
         "blob kept while the second retained row still references it"
     );
 
-    // Purging the last orphans it, and the collector is what unlinks it.
+    // purging the last orphans it, and the collector unlinks it
     let report = store.purge(&inbox(), retained[1].seq).unwrap();
     assert!(report);
     assert!(blob_exists(dir.path(), "cafebabe"), "no purge collects");
@@ -653,8 +655,8 @@ fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
 
 #[test]
 fn a_flag_only_update_keeps_the_body() {
-    // A flag change updates the item row in place (diffed save) and must not
-    // disturb the object refcount, so the body stays put.
+    // a flag change updates the item row in place and must not disturb
+    // the object refcount, so the body stays put
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
 
@@ -665,7 +667,7 @@ fn a_flag_only_update_keeps_the_body() {
         ])
         .unwrap();
 
-    // Re-upsert the same item with a different flag set: same object, new flags.
+    // re-upsert the same item with a different flag set
     store
         .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
             "1",
@@ -690,9 +692,8 @@ fn a_flag_only_update_keeps_the_body() {
 
 #[test]
 fn a_staged_remove_hides_the_item_but_keeps_it_pending_a_sync() {
-    // A client-staged Remove must drop the item from the read surface yet keep
-    // the binding, so the next sync still pushes the expunge (the bug was a
-    // silent no-op: the item stayed live and nothing synced).
+    // a client-staged Remove drops the item from the read surface yet
+    // keeps the binding, so the next sync still pushes the expunge
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("right");
     store
@@ -709,12 +710,12 @@ fn a_staged_remove_hides_the_item_but_keeps_it_pending_a_sync() {
         ReplicaMutation::Remove(ReplicaHandle("1".into())),
     );
 
-    // Gone from the client read surface (live-only).
+    // gone from the live-only client read surface
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
     assert!(store.list_items("INBOX", None, 100).unwrap().is_empty());
 
-    // But still projected as a Tombstone on reopen, so the next sync pushes the
-    // remove against the kept remote handle.
+    // but still projected as a Tombstone on reopen, so the next sync
+    // pushes the remove against the kept remote handle
     let reopened = PimdirStore::open(dir.path()).unwrap().for_source("right");
     let projected = reopened
         .load(&inbox(), &ReplicaLoadScope::All)
@@ -730,9 +731,9 @@ fn a_staged_remove_hides_the_item_but_keeps_it_pending_a_sync() {
 
 #[test]
 fn a_staged_move_empties_the_source_and_fills_the_target() {
-    // A move stages a target create and a source tombstone: the source empties,
-    // the target gains the item under the same message-scoped seq, and each side
-    // projects the push its next sync derives.
+    // a move stages a target create and a source tombstone: the source
+    // empties, the target gains the item under the same message-scoped
+    // seq, and each side projects the push its next sync derives
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("right");
     store
@@ -753,7 +754,7 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
         },
     );
 
-    // Source empties; target gains it, sharing the message's seq.
+    // the source empties and the target gains it, sharing the seq
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
     let archived = store.list_items("Archive", None, 100).unwrap();
     assert_eq!(archived.len(), 1);
@@ -763,9 +764,8 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
         "the moved message keeps its public id"
     );
 
-    // The source projects a Tombstone (push the remove); the target a based-less
-    // pending push (the copy the sync appends, like an offline copy) — both
-    // derived on the next sync.
+    // the source projects a Tombstone and the target a base-less pending
+    // push, both derived on the next sync
     let inbox_proj = store
         .load(&inbox(), &ReplicaLoadScope::All)
         .unwrap()
@@ -793,9 +793,9 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
 
 #[test]
 fn an_unknown_flag_set_stores_as_null_and_loads_back_unknown() {
-    // Spec §13 keeps the two absences apart: NULL means nothing has read the
-    // markers, '[]' means the item is known to carry none. A probed placement
-    // that stored '[]' would claim the second while only the first is true.
+    // spec §13 keeps the two absences apart: NULL means nothing has read
+    // the markers, '[]' that the item carries none. A probed placement
+    // storing '[]' would claim the second while only the first is true.
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
 
@@ -832,10 +832,9 @@ fn an_unknown_flag_set_stores_as_null_and_loads_back_unknown() {
 
 #[test]
 fn the_store_declares_the_hash_it_names_objects_by() {
-    // A store records its algorithm once, at creation (spec §4.3), and every
-    // process touching it hashes through the store rather than picking one:
-    // a handle computing a different name writes blobs no other reader finds,
-    // and it fails as a dedup that silently never dedups.
+    // a store records its algorithm once, at creation (spec §4.3), and a
+    // handle computing a different name writes blobs no other reader
+    // finds, failing as a dedup that never dedups
     let dir = tempfile::tempdir().unwrap();
 
     let store = PimdirStore::open_with_hash(dir.path(), Some(PimdirHashAlgo::Sha256_128)).unwrap();
@@ -852,8 +851,8 @@ fn the_store_declares_the_hash_it_names_objects_by() {
     assert_eq!(stored, "sha256-128");
     drop(conn);
 
-    // Reopening adopts what the store records, and declaring another is
-    // refused rather than silently renaming every body written from now on.
+    // reopening adopts what the store records, and declaring another is
+    // refused rather than renaming every body written from now on
     let reopened = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(reopened.hash_algo(), PimdirHashAlgo::Sha256_128);
     drop(reopened);
@@ -866,12 +865,10 @@ fn the_store_declares_the_hash_it_names_objects_by() {
 
 #[test]
 fn a_base_of_nothing_round_trips_as_a_base() {
-    // A source that reports no revision, no body and markers nobody has read
-    // still agreed with the placement, and that agreement is what tells a
-    // pending push from a settled one. Inferring the base's presence from its
-    // three nullable columns loses exactly this shape: the placement reads as
-    // never-agreed, so the sync re-derives the same push on every run and
-    // never converges.
+    // a source reporting no revision, no body and markers nobody has read
+    // still agreed, and that agreement is what tells a pending push from
+    // a settled one. Inferring the base's presence from its three
+    // nullable columns loses exactly this shape.
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
 

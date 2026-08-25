@@ -1,16 +1,15 @@
 //! The `export` verb: a portable dump of a store.
 //!
-//! The dump is the store's own metadata plus its bodies, byte for byte: a
-//! manifest naming the collections, one JSON-lines file of items per
-//! collection, and a copy of the blob tree. Nothing is parsed on the way out,
-//! so a dump of a mail store and a dump of an address book differ only in what
-//! the bytes happen to be.
+//! The dump is the store's own metadata plus its bodies, byte for byte:
+//! a manifest naming the collections, one JSON-lines file of items per
+//! collection, and a copy of the blob tree. Nothing is parsed on the way
+//! out, so a mail dump and an address-book dump differ only in what the
+//! bytes happen to be.
 //!
-//! There is deliberately no `import` beside it. The documented import path
-//! (`cairn/spec/import.md`) converts Maildir, m2dir and vdir trees, and every
-//! step of it reads item content (a `Message-ID` out of RFC 822 bytes, Maildir
-//! flag letters, a vCard `UID`), which is the one thing this tool must not do.
-//! That belongs to a per-kind importer.
+//! There is deliberately no `import` beside it. The documented import
+//! path (`cairn/spec/import.md`) converts Maildir, m2dir and vdir trees,
+//! and every step of it reads item content, the one thing this tool must
+//! not do. That belongs to a per-kind importer.
 
 use std::{
     collections::BTreeSet,
@@ -88,9 +87,9 @@ impl ExportCommand {
             .into_iter()
             .enumerate()
         {
-            // NOTE: a collection id may hold anything a mailbox name may hold,
-            // slashes included, so files are numbered and the manifest carries
-            // the mapping rather than escaping ids into filenames.
+            // NOTE: a collection id may hold anything a mailbox name may,
+            // slashes included, so files are numbered and the manifest
+            // carries the mapping rather than escaping ids into names.
             let file = format!("items/{:04}.jsonl", index + 1);
             let live = self.dump_live(&read, &collection.id, &self.dir.join(&file), &mut hashes)?;
 

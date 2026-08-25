@@ -1,11 +1,10 @@
 //! The `gc` verb: the collector.
 //!
-//! A store never collects itself. Writes maintain the refcounts and stop there,
-//! so an object nothing references is unreferenced rather than deleted, and a
-//! body a consumer streamed into the blob tree survives until the batch that
-//! attaches it — which is what spec §14 invites and a sweep at the end of every
-//! write silently broke. What reclaims is this verb, when an operator or a
-//! schedule asks for it.
+//! A store never collects itself. Writes maintain the refcounts and stop
+//! there, so an object nothing references is unreferenced rather than
+//! deleted, and a body a consumer streamed into the blob tree survives
+//! until the batch that attaches it, which is what spec §14 invites. What
+//! reclaims is this verb, when an operator or a schedule asks.
 
 use std::fmt;
 

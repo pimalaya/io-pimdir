@@ -1,9 +1,9 @@
-//! Pure, I/O-free encodings between the [`io_replica`] model and the pimdir
-//! columns (spec §13). No SQLite, no filesystem: this is the part an Android or
-//! any other implementation reuses.
+//! Pure, I/O-free encodings between the [`io_replica`] model and the
+//! pimdir columns (spec §13). No SQLite, no filesystem: the part an
+//! Android or any other implementation reuses.
 //!
-//! Beside the column encodings, this module holds the action-queue payload
-//! codec (spec §15.3): the six v1 action kinds as [`PimdirAction`], encoded to
+//! Beside the column encodings it holds the action-queue payload codec
+//! (spec §15.3): the six v1 action kinds as [`PimdirAction`], encoded to
 //! and from the versioned JSON `queue.payload` column.
 
 use alloc::{
@@ -19,26 +19,25 @@ use io_replica::{
 };
 use serde_json::{Map, Value, json};
 
-/// A flag set to its canonical JSON array (sorted; the model's set is already
-/// ordered), or `None` for the column's `NULL`.
+/// A flag set to its canonical JSON array, the model's set being already
+/// sorted, or `None` for the column's `NULL`.
 ///
-/// The two absences the spec (§13) keeps apart: a known-empty set encodes as
-/// `"[]"`, and a set nobody has read encodes as `NULL`. Collapsing them would
-/// have a probed item claim to carry no markers.
+/// The two absences spec §13 keeps apart: a known-empty set encodes as
+/// `"[]"`, a set nobody has read as `NULL`. Collapsing them would have a
+/// probed item claim to carry no markers.
 pub fn flags_to_json(flags: &ReplicaFlags) -> Option<String> {
     let items: Vec<&String> = flags.known()?.iter().collect();
     Some(serde_json::to_string(&items).unwrap_or_else(|_| String::from("[]")))
 }
 
-/// The inverse of [`flags_to_json`]: a `NULL` column (passed as `None`) decodes
-/// to the unknown set, and so does a column this cannot read.
+/// The inverse of [`flags_to_json`]: a `NULL` column decodes to the
+/// unknown set, and so does a column this cannot read.
 ///
-/// Malformed JSON is a column written by something whose format this does not
-/// share, or one that was corrupted, and neither is evidence about the item's
-/// markers. Reading it as a known-empty set turns that into an authoritative
-/// "this item carries no markers", which the merge takes as one side's opinion:
-/// it clears every marker the other side reports and persists the result, so a
-/// read failure becomes permanent loss. Unknown holds no opinion instead.
+/// Malformed JSON is not evidence about the item's markers. Reading it as
+/// a known-empty set turns it into an authoritative "this item carries no
+/// markers", which the merge takes as one side's opinion: it clears every
+/// marker the other side reports and persists that, so a read failure
+/// becomes permanent loss. Unknown holds no opinion instead.
 pub fn flags_from_json(json: Option<&str>) -> ReplicaFlags {
     let Some(json) = json else {
         return ReplicaFlags::Unknown;
@@ -70,15 +69,16 @@ pub fn level_from_int(value: i64) -> ReplicaLevel {
 /// A queued mutation request (spec §15.3): what a producer appends to the
 /// `queue` table and the owner applies to the store.
 ///
-/// The kinds mirror io-replica's mutation vocabulary on purpose: the queue is
-/// the cross-process projection of the engine's mutate verb. Existing items are
-/// addressed by their public `seq` (spec §9.1), the same identifier a reading
-/// client already holds; the owner resolves it back to the internal link id.
+/// The kinds mirror io-replica's mutation vocabulary on purpose: the
+/// queue is the cross-process projection of the engine's mutate verb.
+/// Existing items are addressed by their public `seq` (spec §9.1), the
+/// identifier a reading client already holds, which the owner resolves
+/// back to the internal link id.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirAction {
-    /// Create an item in the collection, staged as a local creation for the
-    /// sync layer to push. A duplicate live `link_id` in the collection parks
-    /// the action (the item already exists).
+    /// Create an item in the collection, staged as a local creation for
+    /// the sync layer to push. A duplicate live `link_id` parks the
+    /// action, the item already existing.
     Add {
         /// The item's cross-source link id; `None` derives it from `object`.
         link_id: Option<ReplicaLinkId>,
@@ -87,36 +87,36 @@ pub enum PimdirAction {
         /// The body's content hash, matching the row's `object_hash`; the
         /// producer wrote the blob durably before enqueueing.
         object: Option<ReplicaHash>,
-        /// The item's summary (spec Annex A), or `None` when not projected.
+        /// The item's summary (spec Annex A), or `None` when not
+        /// projected.
         meta: Option<ReplicaMeta>,
-        /// The provisional handle the create is staged under; `None` lets the
-        /// owner derive one.
+        /// The provisional handle the create is staged under; `None` lets
+        /// the owner derive one.
         handle: Option<ReplicaHandle>,
     },
-    /// Replace the item's flag set (absolute, never a delta, so reapplication
-    /// is idempotent).
+    /// Replace the item's flag set: absolute, never a delta, so
+    /// reapplication is idempotent.
     SetFlags {
         /// The item's public id.
         seq: i64,
         /// The new flag set.
         flags: ReplicaFlags,
     },
-    /// Remove the item from the collection; already-absent is success, not an
-    /// error.
+    /// Remove the item from the collection; already-absent is success,
+    /// not an error.
     Remove {
         /// The item's public id.
         seq: i64,
     },
-    /// Refile the item into another collection (target create plus source
-    /// removal).
+    /// Refile the item into another collection: a target create plus a
+    /// source removal.
     Move {
         /// The item's public id.
         seq: i64,
         /// The collection to move it into.
         to: ReplicaCollectionId,
     },
-    /// Copy the item into another collection (same as a move, without the
-    /// removal).
+    /// Copy the item into another collection: a move without the removal.
     Copy {
         /// The item's public id.
         seq: i64,
@@ -127,32 +127,32 @@ pub enum PimdirAction {
     Update {
         /// The item's public id.
         seq: i64,
-        /// The new body's content hash; the producer wrote the blob durably
-        /// before enqueueing.
+        /// The new body's content hash; the producer wrote the blob
+        /// durably before enqueueing.
         object: ReplicaHash,
         /// The refreshed summary, or `None` to keep the cached one.
         meta: Option<ReplicaMeta>,
     },
-    /// An action this crate defines no semantics for: an owner-defined intent
-    /// (a mail submission) carried by the same queue as the store mutations
-    /// above.
+    /// An action this crate defines no semantics for: an owner-defined
+    /// intent, a mail submission, carried by the same queue as the store
+    /// mutations above.
     ///
-    /// The store cannot apply it, so its drain **skips** the row rather than
-    /// parking it: the action is not unappliable, only unappliable *here*. An
-    /// owner that recognises the kind inspects it, performs it out of band and
-    /// acknowledges it with [`drop_action`]. Only a genuinely malformed payload
-    /// (not JSON, no supported `v`) parks.
+    /// The store cannot apply it, so its drain skips the row rather than
+    /// parking it: the action is not unappliable, only unappliable here.
+    /// An owner that recognises the kind performs it out of band and
+    /// acknowledges it with [`drop_action`]. Only a malformed payload
+    /// parks.
     ///
     /// [`drop_action`]: ../client/struct.PimdirStore.html#method.drop_action
     Unknown {
         /// The raw `queue.action` kind.
         kind: String,
-        /// The raw versioned JSON payload, verbatim: only its owner knows the
-        /// shape, so nothing here re-encodes it.
+        /// The raw versioned JSON payload, verbatim: only its owner knows
+        /// the shape, so nothing here re-encodes it.
         payload: String,
         /// The body hash the payload's `object` field names, by the same
-        /// convention as the known kinds, so an intent carrying a body pins it
-        /// against garbage collection like any other queued body.
+        /// convention as the known kinds, so an intent carrying a body
+        /// pins it against garbage collection like any other.
         object_hash: Option<ReplicaHash>,
     },
 }
@@ -171,9 +171,9 @@ impl PimdirAction {
         }
     }
 
-    /// The body hash the payload references, if any: the value the enqueue
-    /// carries in `queue.object_hash` so the pending body is pinned against
-    /// garbage collection (spec §15.1).
+    /// The body hash the payload references, if any: the value the
+    /// enqueue carries in `queue.object_hash` so the pending body is
+    /// pinned against garbage collection (spec §15.1).
     pub fn object_hash(&self) -> Option<&ReplicaHash> {
         match self {
             Self::Add { object, .. } => object.as_ref(),
@@ -188,9 +188,9 @@ impl PimdirAction {
 
 /// A malformed action payload; the owner parks the row instead of applying it.
 ///
-/// An unrecognised *kind* is not one of these: it decodes as
-/// [`PimdirAction::Unknown`] and is skipped, since another owner may be able to
-/// perform it. Only a payload no owner could act on lands here.
+/// An unrecognised kind is not one of these: it decodes as
+/// [`PimdirAction::Unknown`] and is skipped, since another owner may be
+/// able to perform it. Only a payload no owner could act on lands here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirActionError {
     /// The payload is not a JSON object.
@@ -214,12 +214,12 @@ impl fmt::Display for PimdirActionError {
 
 impl core::error::Error for PimdirActionError {}
 
-/// Encodes an action to its versioned JSON `queue.payload` column (spec §15.3,
-/// `v: 1`). Absent optional fields are omitted; `meta` embeds as parsed JSON
-/// when it is valid JSON, else as a JSON string.
+/// Encodes an action to its versioned JSON `queue.payload` column (spec
+/// §15.3, `v: 1`). Absent optional fields are omitted; `meta` embeds as
+/// parsed JSON when it is valid JSON, else as a JSON string.
 pub fn action_to_payload(action: &PimdirAction) -> String {
-    // NOTE: an owner-defined intent round-trips byte for byte; this crate knows
-    // no more of its shape than the `object` field it pins.
+    // NOTE: an owner-defined intent round-trips byte for byte; this crate
+    // knows no more of its shape than the `object` field it pins.
     if let PimdirAction::Unknown { payload, .. } = action {
         return payload.clone();
     }
@@ -267,7 +267,6 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
                 map.insert("meta".into(), meta_to_value(meta));
             }
         }
-        // NOTE: returned verbatim above.
         PimdirAction::Unknown { .. } => {}
     }
 
@@ -275,9 +274,9 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
 }
 
 /// Decodes a `queue.action` kind plus its `queue.payload` JSON back to a
-/// [`PimdirAction`] — the inverse of [`action_to_payload`]. Strict, unlike the
-/// lenient column decoders: a malformed payload is an error the owner parks
-/// the row with, never a silently-empty action.
+/// [`PimdirAction`], the inverse of [`action_to_payload`]. Strict, unlike
+/// the lenient column decoders: a malformed payload is an error the owner
+/// parks the row with, never a silently-empty action.
 pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, PimdirActionError> {
     let value: Value = serde_json::from_str(payload).map_err(|_| PimdirActionError::Json)?;
     let map = value.as_object().ok_or(PimdirActionError::Json)?;
@@ -315,10 +314,9 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
             object: ReplicaHash(require_string(map, "object")?),
             meta: map.get("meta").map(meta_from_value),
         }),
-        // NOTE: an owner-defined intent, not a malformed row: the payload is
-        // well-formed and versioned, this crate simply defines no semantics for
-        // the kind. Kept whole for the owner that does, which is what lets one
-        // queue carry store mutations beside capability-bound intents.
+        // NOTE: an owner-defined intent, not a malformed row: the payload
+        // is well-formed and versioned, this crate simply defines no
+        // semantics for the kind. Kept whole for the owner that does.
         other => Ok(PimdirAction::Unknown {
             kind: other.to_string(),
             payload: payload.to_string(),
@@ -327,13 +325,12 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
     }
 }
 
-/// A flag set as a JSON array value (the model's set is already sorted), or
-/// `null` for an unknown one.
+/// A flag set as a JSON array value, or `null` for an unknown one.
 ///
-/// An action states an intent, so its set is known in every payload the spec
-/// defines (§15.3). Encoding an unknown one as `null` rather than as `[]` keeps
-/// a nonsensical action legible instead of turning it into a deliberate
-/// clearing of every flag.
+/// An action states an intent, so its set is known in every payload the
+/// spec defines (§15.3). Encoding an unknown one as `null` rather than
+/// `[]` keeps a nonsensical action legible instead of turning it into a
+/// deliberate clearing of every flag.
 fn flags_to_value(flags: &ReplicaFlags) -> Value {
     match flags.known() {
         None => Value::Null,
@@ -341,9 +338,9 @@ fn flags_to_value(flags: &ReplicaFlags) -> Value {
     }
 }
 
-/// The inverse of [`flags_to_value`]; an absent or `null` value decodes to the
-/// unknown set and a malformed array to a known-empty one, matching
-/// [`flags_from_json`].
+/// The inverse of [`flags_to_value`]: an absent or `null` value decodes
+/// to the unknown set and a malformed array to a known-empty one,
+/// matching [`flags_from_json`].
 fn flags_from_value(value: Option<&Value>) -> ReplicaFlags {
     match value {
         None | Some(Value::Null) => ReplicaFlags::Unknown,
@@ -362,14 +359,14 @@ fn flags_from_value(value: Option<&Value>) -> ReplicaFlags {
     }
 }
 
-/// A stored summary embedded in a payload: parsed JSON when the opaque meta is
-/// valid JSON (the spec Annex A conventions), a JSON string otherwise.
+/// A stored summary embedded in a payload: parsed JSON when the opaque
+/// meta is valid JSON, a JSON string otherwise.
 fn meta_to_value(meta: &ReplicaMeta) -> Value {
     serde_json::from_str(&meta.0).unwrap_or_else(|_| json!(meta.0))
 }
 
-/// The inverse of [`meta_to_value`]: a JSON string is taken verbatim, any other
-/// value is re-serialised to the stored opaque form.
+/// The inverse of [`meta_to_value`]: a JSON string is taken verbatim,
+/// any other value re-serialised to the stored opaque form.
 fn meta_from_value(value: &Value) -> ReplicaMeta {
     match value.as_str() {
         Some(text) => ReplicaMeta(text.to_string()),
@@ -406,11 +403,11 @@ fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
         .ok_or(PimdirActionError::MissingField("seq"))
 }
 
-/// The other handles a source holds one identity under, as the JSON array the
-/// column stores; `None` for the ordinary case of none.
+/// The other handles a source holds one identity under, as the JSON array
+/// the column stores; `None` for the ordinary case of none.
 ///
-/// Recorded rather than inferred: a source holds an identity twice for exactly
-/// as long as it does, and the enumeration that reveals it says so once.
+/// Recorded rather than inferred: the enumeration that reveals a
+/// duplicate says so once.
 pub fn handles_to_json(handles: &[ReplicaHandle]) -> Option<String> {
     if handles.is_empty() {
         return None;
@@ -419,9 +416,9 @@ pub fn handles_to_json(handles: &[ReplicaHandle]) -> Option<String> {
     serde_json::to_string(&items).ok()
 }
 
-/// The inverse of [`handles_to_json`]. A column this cannot read decodes to
-/// none, on the same terms as a flag set: it is not evidence of a duplicate,
-/// and freezing an item on an unreadable column would strand it.
+/// The inverse of [`handles_to_json`]. A column this cannot read decodes
+/// to none, on the same terms as a flag set: it is not evidence of a
+/// duplicate, and freezing an item on one would strand it.
 pub fn handles_from_json(json: Option<&str>) -> Vec<ReplicaHandle> {
     let Some(json) = json else {
         return Vec::new();
@@ -440,15 +437,15 @@ mod tests {
         let flags = ReplicaFlags::from_iter(["\\Seen", "$flagged", "a\"b"]);
         let json = flags_to_json(&flags).expect("a known set encodes");
         assert_eq!(flags_from_json(Some(&json)), flags);
-        // NOTE: canonical (sorted) and JSON-escaped.
+        // canonical, sorted and JSON-escaped
         assert!(json.starts_with('['));
         assert!(json.contains("\\\\Seen"));
     }
 
     #[test]
     fn an_unknown_set_is_null_and_a_known_empty_one_is_a_list() {
-        // The two absences the store keeps apart (spec §13): NULL means the
-        // markers were never read, '[]' means the item carries none.
+        // the two absences the store keeps apart (spec §13): NULL means
+        // the markers were never read, '[]' that the item carries none
         assert_eq!(flags_to_json(&ReplicaFlags::Unknown), None);
         assert_eq!(flags_from_json(None), ReplicaFlags::Unknown);
 
@@ -461,19 +458,16 @@ mod tests {
 
     #[test]
     fn a_malformed_flag_set_reads_as_unread_not_as_empty() {
-        // A decode failure must not become an authoritative "this item
-        // carries no markers": the merge would take that as one side's
-        // opinion, clear every marker the other side reports, and persist
-        // the result. Unknown holds no opinion, so the markers survive
-        // wherever they are still readable.
+        // a decode failure must not become an authoritative "this item
+        // carries no markers", which the merge would take as one side's
+        // opinion and persist over the other's
         assert_eq!(flags_from_json(Some("not json")), ReplicaFlags::Unknown);
         assert_eq!(flags_from_json(Some("{}")), ReplicaFlags::Unknown);
     }
 
     #[test]
     fn ambiguous_handles_round_trip_and_none_is_null() {
-        // The column distinguishes "no duplicate" from "a duplicate": NULL is
-        // the ordinary case, and a list is the freeze.
+        // NULL is the ordinary case, a list is the freeze
         assert_eq!(handles_to_json(&[]), None);
         assert!(handles_from_json(None).is_empty());
 
@@ -481,8 +475,8 @@ mod tests {
         let json = handles_to_json(&handles).expect("a non-empty list encodes");
         assert_eq!(handles_from_json(Some(&json)), handles);
 
-        // A column this cannot read is not evidence of a duplicate, and
-        // freezing an item on one would strand it.
+        // a column this cannot read is not evidence of a duplicate, and
+        // freezing an item on one would strand it
         assert!(handles_from_json(Some("not json")).is_empty());
     }
 
@@ -531,7 +525,7 @@ mod tests {
         ];
         for action in actions {
             let payload = action_to_payload(&action);
-            // NOTE: versioned with a leading `v` (spec §15.3).
+            // versioned with a leading `v` (spec §15.3)
             assert!(payload.contains("\"v\":1"), "versioned: {payload}");
             let decoded = action_from_payload(action.kind(), &payload).unwrap();
             assert_eq!(decoded, action, "round-trip of {payload}");
@@ -551,7 +545,7 @@ mod tests {
 
     #[test]
     fn malformed_action_payloads_error_instead_of_decaying() {
-        // NOTE: strict, unlike the column decoders: the owner parks these.
+        // strict, unlike the column decoders: the owner parks these
         assert_eq!(
             action_from_payload("remove", "not json"),
             Err(PimdirActionError::Json)
@@ -572,9 +566,8 @@ mod tests {
 
     #[test]
     fn an_owner_defined_kind_survives_whole_instead_of_erroring() {
-        // An intent only its owner can perform (a mail submission): this crate
-        // keeps it verbatim rather than parking the row, and still pins the body
-        // the payload references.
+        // an intent only its owner can perform is kept verbatim rather
+        // than parked, and still pins the body the payload references
         let payload = "{\"v\":1,\"object\":\"cafebabe\",\"to\":[\"a@b.c\"]}";
         let decoded = action_from_payload("submit", payload).unwrap();
         assert_eq!(
@@ -587,11 +580,11 @@ mod tests {
         );
         assert_eq!(decoded.kind(), "submit");
         assert_eq!(decoded.object_hash(), Some(&ReplicaHash("cafebabe".into())));
-        // Byte-for-byte: nothing here understands the shape well enough to
-        // re-encode it.
+        // byte for byte: nothing here understands the shape well enough
+        // to re-encode it
         assert_eq!(action_to_payload(&decoded), payload);
 
-        // A malformed payload still parks, whatever its kind.
+        // a malformed payload still parks, whatever its kind
         assert_eq!(
             action_from_payload("submit", "{\"to\":[]}"),
             Err(PimdirActionError::UnknownVersion(None))

@@ -1,9 +1,10 @@
 //! The `queue` verb group: what is waiting to be applied, and what gave up.
 //!
-//! The queue is the write door for every process that does not own the store.
-//! An action waits there until the owner applies it; one the owner judged
-//! permanently unappliable is parked with its error instead of blocking the
-//! others, and stays there until somebody looks. This is that somebody.
+//! The queue is the write door for every process that does not own the
+//! store. An action waits there until the owner applies it; one the owner
+//! judged permanently unappliable is parked with its error instead of
+//! blocking the others, and stays until somebody looks. This is that
+//! somebody.
 
 use std::fmt;
 
@@ -88,8 +89,8 @@ impl QueueListCommand {
                         }
                     }
                     Err(err) => {
-                        // NOTE: one undecodable payload must not hide the whole
-                        // queue; the collection is reported instead.
+                        // NOTE: one undecodable payload must not hide the
+                        // whole queue, so the collection is reported.
                         warn!("cannot decode the pending actions of {collection}: {err}");
                         undecodable.push(collection);
                     }
@@ -171,9 +172,8 @@ fn summary(action: &PimdirAction) -> String {
         PimdirAction::Move { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Copy { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Update { seq, object, .. } => format!("seq {seq}, object {}", object.0),
-        // NOTE: an owner-defined intent this build has no semantics for. Its
-        // payload is printed verbatim, since only its owner knows the shape and
-        // this tool interprets nothing.
+        // NOTE: an owner-defined intent this build has no semantics for,
+        // so its payload is printed verbatim.
         PimdirAction::Unknown { payload, .. } => payload.clone(),
     }
 }
@@ -255,8 +255,8 @@ impl fmt::Display for QueueOutput {
             writeln!(f, "{table}")?;
         }
 
-        // NOTE: never silently short: a collection left out of the listing is
-        // said out loud.
+        // NOTE: never silently short: a collection left out of the
+        // listing is said out loud.
         for collection in &self.undecodable {
             writeln!(
                 f,

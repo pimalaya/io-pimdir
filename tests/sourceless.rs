@@ -1,10 +1,10 @@
 //! A store handle names a source only where an operation acts as one.
 //!
-//! The operator surface — the client reads, retention and its purge, a queued
-//! action cancelled rather than applied — reads no source, so it opens a store
-//! that carries none. What the source-less handle protects is the store: a name
-//! invented to satisfy a constructor is a side that never synced anything, and
-//! it is one write away from being recorded as one.
+//! The operator surface, the client reads, retention and its purge and a
+//! queued action cancelled rather than applied, reads no source, so it
+//! opens a store that carries none. What the source-less handle protects
+//! is the store: a name invented to satisfy a constructor is a side that
+//! never synced anything, one write away from being recorded as one.
 
 use io_pimdir::{PimdirProducer, PimdirStore, codec::PimdirAction};
 use io_replica::{
@@ -44,13 +44,13 @@ fn placement(handle: &str, link: &str, hash: &str) -> ReplicaPlacement {
     }
 }
 
-/// Everything an operator does to a store, done without naming a side: read
-/// the collection, cancel a queued action, purge what retention holds.
+/// Everything an operator does to a store without naming a side: read the
+/// collection, cancel a queued action, purge what retention holds.
 #[test]
 fn a_source_less_handle_reads_purges_and_cancels() {
     let dir = tempfile::tempdir().unwrap();
 
-    // The one role that does name a side seeds the item, then retires it.
+    // the one role that does name a side seeds the item, then retires it
     let mut sync = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     sync.write(vec![
         ReplicaWriteOp::StoreObject {
@@ -92,9 +92,7 @@ fn a_source_less_handle_reads_purges_and_cancels() {
     assert_eq!(store.count_retained(&inbox()).unwrap(), 0);
 }
 
-/// A store an operator opened, read and swept still syncs no source: the name
-/// a constructor used to demand was one write away from being recorded as a
-/// side of a store that has none.
+/// A store an operator opened, read and swept still syncs no source.
 #[test]
 fn an_operator_pass_records_no_source() {
     let dir = tempfile::tempdir().unwrap();
