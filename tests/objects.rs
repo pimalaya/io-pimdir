@@ -1,0 +1,146 @@
+//! The crate's object naming against the format's own vectors (pimdir SPEC
+//! §16).
+//!
+//! The one vector file the format makes a **MUST**, and the reason is the
+//! failure mode rather than the importance: a store whose two writers name the
+//! same body differently reports nothing. It does not error and no read returns
+//! a wrong answer; it silently never deduplicates and silently never finds the
+//! blob the other side wrote. Prose cannot close that, because two readers of
+//! the same prose are what produced it.
+//!
+//! The expected values were derived from the algorithm and prose
+//! specifications rather than by running any implementation, so this crate can
+//! genuinely disagree with them.
+//!
+//! The spec is a sibling checkout rather than a vendored copy, so the test
+//! skips when it is absent and runs whenever the two sit side by side.
+
+use std::{fs, path::PathBuf};
+
+use io_pimdir::{PimdirBlobs, hash::PimdirHashAlgo};
+use io_replica::object::ReplicaHash;
+use serde_json::Value;
+
+/// The canonical spec checkout, beside this one.
+fn spec_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .join("pimdir");
+
+    dir.join("vectors/objects.json").is_file().then_some(dir)
+}
+
+fn vectors() -> Option<Value> {
+    let spec = spec_dir()?;
+    let text = fs::read_to_string(spec.join("vectors/objects.json")).unwrap();
+
+    Some(serde_json::from_str(&text).unwrap())
+}
+
+/// The body a case describes: its bytes verbatim, or the pattern the long ones
+/// are generated from (byte `i` is `i mod 251`, the BLAKE3 project's own
+/// convention, which is what lets those cases be checked against its published
+/// vectors).
+fn body(case: &Value) -> Vec<u8> {
+    let len = case["body_len"].as_u64().unwrap() as usize;
+
+    match case["body_hex"].as_str() {
+        Some(hex) => {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            assert_eq!(
+                bytes.len(),
+                len,
+                "case {} declares a length its bytes do not match",
+                case["label"]
+            );
+            bytes
+        }
+        None => {
+            assert!(
+                case["body_pattern"].is_string(),
+                "case {} carries neither bytes nor a pattern",
+                case["label"]
+            );
+            (0..len).map(|i| (i % 251) as u8).collect()
+        }
+    }
+}
+
+/// Object naming is the format's one MUST: every body names the same under both
+/// algorithms, and lands at the same sharded path.
+#[test]
+fn every_body_names_what_the_format_says() {
+    let Some(vectors) = vectors() else {
+        eprintln!("skipped: no pimdir spec checkout beside this one");
+        return;
+    };
+
+    let cases = vectors["objects"].as_array().unwrap();
+    assert!(!cases.is_empty(), "the vectors carry no object");
+
+    for case in cases {
+        let label = case["label"].as_str().unwrap();
+        let body = body(case);
+
+        for (algo, spelling) in [
+            (PimdirHashAlgo::Blake3, "blake3"),
+            (PimdirHashAlgo::Sha256_128, "sha256-128"),
+        ] {
+            let expected = &case[spelling];
+            let name = algo.hash(&body);
+            assert_eq!(
+                name.0,
+                expected["name"].as_str().unwrap(),
+                "{label} under {spelling}",
+            );
+
+            // The shard path §5 derives from the name, which is as normative as
+            // the name itself: two writers agreeing on the name and disagreeing
+            // on where it lives still never find each other's bodies. Rooted at
+            // an empty store directory, so the path reads exactly as the
+            // vectors write it, `objects/` included.
+            let blobs = PimdirBlobs::open("", algo);
+            assert_eq!(
+                blobs.path(&ReplicaHash(name.0.clone())),
+                PathBuf::from(expected["path"].as_str().unwrap()),
+                "{label} under {spelling} lands elsewhere",
+            );
+        }
+    }
+}
+
+/// A body fed in pieces names what the same body fed whole names.
+///
+/// The streamed path is what §14's byteless `StoreObject` rides, and it is
+/// where a hasher most often breaks: the vectors carry 1023, 1024 and 1025
+/// bytes because that is BLAKE3's chunk boundary.
+#[test]
+fn a_streamed_body_names_what_a_whole_one_names() {
+    let Some(vectors) = vectors() else {
+        eprintln!("skipped: no pimdir spec checkout beside this one");
+        return;
+    };
+
+    for case in vectors["objects"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let body = body(case);
+
+        for (algo, spelling) in [
+            (PimdirHashAlgo::Blake3, "blake3"),
+            (PimdirHashAlgo::Sha256_128, "sha256-128"),
+        ] {
+            let mut hasher = algo.hasher();
+            for chunk in body.chunks(7) {
+                hasher.update(chunk);
+            }
+            assert_eq!(
+                hasher.finish().0,
+                case[spelling]["name"].as_str().unwrap(),
+                "{label} under {spelling}, streamed in 7-byte pieces",
+            );
+        }
+    }
+}

@@ -32,7 +32,7 @@ use std::{
 };
 
 use io_replica::{
-    change::ReplicaWriteOp,
+    change::{ReplicaDropReason, ReplicaWriteOp},
     client::ReplicaStorage,
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     coroutine::{ReplicaArg, ReplicaCoroutine, ReplicaCoroutineState, ReplicaYield},
@@ -916,9 +916,13 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
 
+        // NOTE: the delete reports the hashes the row pinned, so the release
+        // rides the statement that caused it instead of a read that visits the
+        // same row first. Nothing to return means there was no retained item
+        // under that id, which is also how a live one is refused.
         let pinned: Option<(Option<String>, Option<String>)> = tx
+            .prepare(sql::PURGE_ITEM)?
             .query_row(
-                sql::RETAINED_ITEM_BY_SEQ,
                 named_params! { ":collection": collection.0, ":seq": seq },
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -927,10 +931,6 @@ impl PimdirStore {
             return Ok(false);
         };
 
-        tx.execute(
-            sql::PURGE_ITEM,
-            named_params! { ":collection": collection.0, ":seq": seq },
-        )?;
         release_pins(&tx, [object, conflict_object].into_iter().flatten())?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(true)
@@ -954,17 +954,17 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
 
+        // NOTE: one pass. The delete reports what each row it takes was
+        // pinning, so the count and the pins to release both come off the
+        // statement that did the work, where reading the set first visited
+        // every swept row twice.
         let pinned: Vec<(Option<String>, Option<String>)> = rows(
             &tx,
-            sql::RETAINED_BEFORE,
-            named_params! { ":cutoff": cutoff },
-            |row| Ok((row.get(2)?, row.get(3)?)),
-        )?;
-        let items = pinned.len();
-        tx.execute(
             sql::PURGE_RETAINED_BEFORE,
             named_params! { ":cutoff": cutoff },
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        let items = pinned.len();
         release_pins(
             &tx,
             pinned
@@ -1008,26 +1008,31 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         let objects = tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
-        let indexed: BTreeSet<String> = rows(&tx, sql::LIST_OBJECT_HASHES, [], |r| r.get(0))?
-            .into_iter()
-            .collect();
         tx.commit().map_err(busy_or_sql)?;
 
         // NOTE: one pass over the tree rather than one unlink per collected
-        // row plus a pass for the orphans. A body whose row this transaction
-        // just dropped is an orphan by then, so both cases are the same case.
+        // row plus a pass for the orphans. A body whose row the transaction
+        // above just dropped is an orphan by now, so both cases are the same
+        // case.
+        //
+        // Asked per file on the primary key rather than read whole into a set:
+        // a store of the size §1 promises holds hundreds of thousands of
+        // hashes, and the question is always about one file.
         let mut report = PimdirGcReport {
             objects,
             ..Default::default()
         };
+        let mut exists = self.conn.prepare(sql::OBJECT_EXISTS)?;
         for blob in self.blobs().files()? {
-            if indexed.contains(&blob.hash) {
+            if exists.exists(named_params! { ":hash": blob.hash })? {
                 continue;
             }
             fs::remove_file(&blob.path)?;
             report.blobs += 1;
             report.bytes += blob.size;
         }
+        drop(exists);
+
         Ok(report)
     }
 
@@ -1236,6 +1241,9 @@ impl PimdirSourceStore {
         collection: &str,
         ops: Vec<ReplicaWriteOp>,
     ) -> Result<i64, PimdirError> {
+        // NOTE: as in `write`, the bodies land before the transaction opens.
+        stage_blobs(&self.store.blobs, &ops)?;
+
         let tx = self
             .store
             .conn
@@ -1485,6 +1493,10 @@ impl ReplicaStorage for PimdirSourceStore {
     }
 
     fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Self::Error> {
+        // NOTE: bodies first, outside the transaction, so the writer lock is
+        // never held across a file write and two `fsync`s (spec §14).
+        stage_blobs(&self.store.blobs, &ops)?;
+
         // BEGIN IMMEDIATE takes the single writer lock up front (§8): under WAL
         // reads never block, but two writers serialise here, and a writer that
         // cannot get the lock within `busy_timeout` fails fast and loud (`Busy`)
@@ -1964,6 +1976,18 @@ impl PimdirBlobs {
         self.hash.hasher()
     }
 
+    /// Where a body under `hash` lives: `objects/<name[0:2]>/<name[2:4]>/<name>`
+    /// (spec §5).
+    ///
+    /// Public because the format invites a consumer to stream a body straight
+    /// to this path and index it with a byteless `StoreObject` afterwards
+    /// (spec §14), and a consumer deriving the sharding itself would be a
+    /// second implementation of a rule whose whole point is that one store's
+    /// writers agree on it.
+    pub fn path(&self, hash: &ReplicaHash) -> PathBuf {
+        blob_path(&self.root, &hash.0)
+    }
+
     /// Reads the body stored under `hash` from the sharded layout, or `None`
     /// when absent.
     pub fn get(&self, hash: &ReplicaHash) -> io::Result<Option<Vec<u8>>> {
@@ -2140,13 +2164,19 @@ fn apply_ops(
 ) -> Result<(), PimdirError> {
     // Placement/drop ops routed to the hub, grouped by collection.
     let mut hub_ops: BTreeMap<String, Vec<ReplicaWriteOp>> = BTreeMap::new();
+    // The handles this batch is replacing rather than removing, per collection.
+    let mut superseded: BTreeMap<String, BTreeSet<ReplicaHandle>> = BTreeMap::new();
 
     for op in ops {
         match op {
             ReplicaWriteOp::StoreObject { object, body } => {
                 // NOTE: a byteless op indexes an object the consumer already
                 // streamed into the blob store during a fetch (bounded-memory
-                // transfer); inline bytes are the buffered path.
+                // transfer); inline bytes are the buffered path, normally
+                // already staged by `stage_blobs` before this transaction
+                // opened, and re-offered here as the floor for a caller that
+                // could not stage ahead. The write is idempotent, so that
+                // costs one `exists` check per object.
                 if let Some(body) = body {
                     write_blob(blobs, &object.hash.0, &body)?;
                 }
@@ -2192,6 +2222,18 @@ fn apply_ops(
                 reason,
             } => {
                 drop_residual(residual, &collection, &handle);
+                // NOTE: a superseded handle is one the batch is replacing, so
+                // the binding that holds it may legitimately be repointed at
+                // whatever the same batch upserts. Recorded here because the
+                // hub diff cannot tell that apart from the source reporting one
+                // identity under a second handle, and reads the second as a
+                // duplicate to freeze (spec §10, §12).
+                if reason == ReplicaDropReason::Superseded {
+                    superseded
+                        .entry(collection.0.clone())
+                        .or_default()
+                        .insert(handle.clone());
+                }
                 hub_ops.entry(collection.0.clone()).or_default().push(
                     ReplicaWriteOp::DropPlacement {
                         collection,
@@ -2208,7 +2250,16 @@ fn apply_ops(
         let old_hub = load_hub_by_link(tx, &collection, &links)?;
         let mut new_hub = old_hub.clone();
         new_hub.absorb(source, &ops);
-        save_hub_diff(tx, &collection, source, account, &old_hub, &new_hub)?;
+        let superseded = superseded.remove(&collection).unwrap_or_default();
+        save_hub_diff(
+            tx,
+            &collection,
+            source,
+            account,
+            &old_hub,
+            &new_hub,
+            &superseded,
+        )?;
         adjust_refcounts(tx, &object_refs(&old_hub), &object_refs(&new_hub))?;
     }
 
@@ -2333,11 +2384,24 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
         }
     }
 
+    let mut reshaped = Vec::new();
+    for (index, columns) in sql::RESHAPED_INDEXES {
+        if index_columns(conn, index)?.is_some_and(|held| held != *columns) {
+            reshaped.push(*index);
+        }
+    }
+
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(busy_or_sql)?;
     for (table, column, decl) in missing {
         tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    // NOTE: before the batch below, which cannot replace it: an index whose
+    // columns moved keeps its name, so `CREATE INDEX IF NOT EXISTS` sees one
+    // already there and leaves the store planning the old read.
+    for index in reshaped {
+        tx.execute_batch(&format!("DROP INDEX IF EXISTS {index}"))?;
     }
     // NOTE: unconditionally, unlike the columns. An index over a folded-in
     // column has to be created with it, but most of these index columns that
@@ -2417,6 +2481,21 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
         }
     }
     Ok(false)
+}
+
+/// The columns `index` holds, in order, or `None` when the store has no such
+/// index.
+///
+/// `PRAGMA index_info` reports the columns and not the partial predicate, which
+/// is all a reshape check needs: a column order is what decides whether a read
+/// seeks or sorts, and the predicate of the one index this crate has ever
+/// reshaped never moved.
+fn index_columns(conn: &Connection, index: &str) -> rusqlite::Result<Option<Vec<String>>> {
+    let columns = rows(conn, &format!("PRAGMA index_info({index})"), [], |row| {
+        row.get::<_, String>(2)
+    })?;
+
+    Ok((!columns.is_empty()).then_some(columns))
 }
 
 /// Removes any residual placement matching `(collection, handle)`.
@@ -2545,6 +2624,10 @@ fn read_hub(
 /// the rows it reads as well as the rows it writes. An item no source holds any
 /// more is retained rather than deleted, `source` naming the side whose removal
 /// retired it.
+///
+/// `superseded` carries the handles this batch is replacing, which is the one
+/// thing the two hubs cannot say: a rebuilt spine and a duplicated identity
+/// produce the same diff, and only the drop's reason separates them.
 fn save_hub_diff(
     conn: &Connection,
     collection: &str,
@@ -2552,6 +2635,7 @@ fn save_hub_diff(
     account: Option<&str>,
     old: &ReplicaHub,
     new: &ReplicaHub,
+    superseded: &BTreeSet<ReplicaHandle>,
 ) -> rusqlite::Result<()> {
     conn.execute(
         sql::ENSURE_COLLECTION,
@@ -2604,7 +2688,7 @@ fn save_hub_diff(
                 if !item_columns_eq(prev, item) {
                     update_item(conn, collection, link, item)?;
                 }
-                save_bindings_diff(conn, collection, link, prev, item)?;
+                save_bindings_diff(conn, collection, link, prev, item, superseded)?;
             }
         }
     }
@@ -2754,6 +2838,7 @@ fn save_bindings_diff(
     link: &ReplicaLinkId,
     old: &ReplicaHubItem,
     new: &ReplicaHubItem,
+    superseded: &BTreeSet<ReplicaHandle>,
 ) -> rusqlite::Result<()> {
     for source in old.sources.keys() {
         if !new.sources.contains_key(source) {
@@ -2766,6 +2851,19 @@ fn save_bindings_diff(
     for (source, binding) in &new.sources {
         match old.sources.get(source) {
             None => insert_binding(conn, collection, link, source, binding)?,
+            // A handle-space rebuild: this batch superseded the handle the
+            // binding holds, so the row is being replaced rather than
+            // repointed, and it goes the way spec §10 says a legitimate
+            // rebind goes, by dropping the old spine and inserting the new
+            // one. `UPDATE_BINDING` could not do it in any case: it writes
+            // every column but `handle`, for the reason below.
+            Some(prev) if binding.handle != prev.handle && superseded.contains(&prev.handle) => {
+                conn.execute(
+                    sql::DELETE_BINDING,
+                    named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
+                )?;
+                insert_binding(conn, collection, link, source, binding)?
+            }
             Some(prev) if prev != binding => {
                 // NOTE: a binding pins one handle, and repointing it is how
                 // the fact that a source holds an identity twice used to be
@@ -3031,8 +3129,40 @@ fn blob_path(blobs: &Path, hash: &str) -> PathBuf {
     }
 }
 
-/// Writes a blob atomically (temp → fsync → rename); a present hash is immutable
-/// and left untouched.
+/// Writes every body a batch carries to the blob store, ahead of the
+/// transaction that indexes them (spec §14).
+///
+/// A body is content-addressed and immutable, so writing it early can only
+/// produce a file some later batch produces identically, and the worst a crash
+/// between the two leaves is an orphan blob for the collector. Inside the
+/// transaction the same write holds SQLite's single writer lock across a file
+/// write, two `fsync`s and a rename, serialising every other writer behind an
+/// I/O path that touches no database page.
+///
+/// What keeps a collector out of the window this opens is the writer's lock
+/// (spec §8), not the file's age: between the write and the commit the file is
+/// on disk with no row, and indistinguishable from an orphan by inspection.
+///
+/// [`write_blob`] is idempotent, so the batch may re-offer the same body
+/// without cost, which is what lets [`apply_ops`] keep its own write as the
+/// floor for a caller that cannot stage ahead (the queue drain builds its ops
+/// inside the transaction that claims the row).
+fn stage_blobs(blobs: &Path, ops: &[ReplicaWriteOp]) -> io::Result<()> {
+    for op in ops {
+        if let ReplicaWriteOp::StoreObject {
+            object,
+            body: Some(body),
+        } = op
+        {
+            write_blob(blobs, &object.hash.0, body)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes a blob atomically (temp → `fsync` → rename → `fsync` the shard
+/// directory, spec §5); a present hash is immutable and left untouched.
 fn write_blob(blobs: &Path, hash: &str, body: &[u8]) -> io::Result<()> {
     let path = blob_path(blobs, hash);
     if path.exists() {

@@ -581,13 +581,7 @@ impl ReplicaRemote for MemRemote {
         Ok(changes
             .into_iter()
             .map(|change| {
-                let handle = match change {
-                    ReplicaChange::Add { handle, .. }
-                    | ReplicaChange::Remove { handle, .. }
-                    | ReplicaChange::SetFlags { handle, .. }
-                    | ReplicaChange::Update { handle, .. } => handle,
-                };
-                panic!("unexpected push of {}", handle.0);
+                panic!("unexpected push of {}", change.handle().0);
             })
             .collect())
     }

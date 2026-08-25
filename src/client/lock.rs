@@ -18,7 +18,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, PoisonError, Weak},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
 };
 
 // NOTE: std grew these locks in 1.89 and its inherent methods would shadow the
@@ -41,17 +41,37 @@ const OBJECTS: &str = "objects.lock";
 /// first one took instead of contending with itself: a two-sided sync opens one
 /// handle per source and a multi-account owner one per account, and each of
 /// those processes is one owner.
-static OWNED: LazyLock<Mutex<HashMap<PathBuf, Weak<PimdirLock>>>> =
+///
+/// The registry owns the description and counts the handles sharing it, rather
+/// than tracking a `Weak` and letting each handle hold its own: a strong count
+/// reaches zero the moment the last handle is dropped, while the file it named
+/// stays open until that drop returns, so a handle taken in between would find
+/// no entry, open a second description and `flock` itself out of its own store.
+/// Counting here means the release and the next acquisition are the same
+/// critical section, and the only `own` that opens a file is one finding no
+/// entry at all.
+static OWNED: LazyLock<Mutex<HashMap<PathBuf, Owned>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One store's owner lock and the handles sharing it.
+struct Owned {
+    /// The locked description. Closing it is what releases the lock, so it is
+    /// dropped inside the registry's critical section and never merely
+    /// unreferenced.
+    _file: File,
+    handles: usize,
+}
 
 /// An advisory lock on a store directory, held for as long as it lives.
 pub struct PimdirLock {
-    /// The locked file, kept because the lock is the description rather than
-    /// anything written in it: closing this releases the lock, and nothing
-    /// ever reads or writes its bytes.
-    _file: File,
-    /// The [`OWNED`] key to withdraw on drop; `None` for a lock the registry
-    /// does not track, which is every shared one.
+    /// The locked file for a lock the registry does not track, which is every
+    /// staging one. Kept because the lock is the description rather than
+    /// anything written in it, and nothing ever reads or writes its bytes.
+    ///
+    /// `None` for an owner lock, whose description belongs to [`OWNED`].
+    /// Exactly one of this and `registered` is set.
+    _file: Option<File>,
+    /// The [`OWNED`] key whose count to drop on release.
     registered: Option<PathBuf>,
 }
 
@@ -65,19 +85,26 @@ impl PimdirLock {
     pub fn own(dir: &Path) -> Result<Arc<Self>, PimdirError> {
         let key = dir.canonicalize()?;
         let mut owned = OWNED.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(lock) = owned.get(&key).and_then(Weak::upgrade) {
-            return Ok(lock);
+
+        match owned.get_mut(&key) {
+            Some(entry) => entry.handles += 1,
+            None => {
+                let file = open(&dir.join(OWNER))?;
+                FileExt::try_lock(&file).map_err(|_| PimdirError::Owned(dir.to_path_buf()))?;
+                owned.insert(
+                    key.clone(),
+                    Owned {
+                        _file: file,
+                        handles: 1,
+                    },
+                );
+            }
         }
 
-        let file = open(&dir.join(OWNER))?;
-        FileExt::try_lock(&file).map_err(|_| PimdirError::Owned(dir.to_path_buf()))?;
-
-        let lock = Arc::new(Self {
-            _file: file,
-            registered: Some(key.clone()),
-        });
-        owned.insert(key, Arc::downgrade(&lock));
-        Ok(lock)
+        Ok(Arc::new(Self {
+            _file: None,
+            registered: Some(key),
+        }))
     }
 
     /// Takes the store's staging lock exclusively: the collector's half of the
@@ -94,7 +121,7 @@ impl PimdirLock {
         let file = open(&dir.join(OBJECTS))?;
         FileExt::try_lock(&file).map_err(|_| PimdirError::Staging(dir.to_path_buf()))?;
         Ok(Self {
-            _file: file,
+            _file: Some(file),
             registered: None,
         })
     }
@@ -113,7 +140,7 @@ impl PimdirLock {
         let file = open(&dir.join(OBJECTS))?;
         FileExt::lock_shared(&file)?;
         Ok(Self {
-            _file: file,
+            _file: Some(file),
             registered: None,
         })
     }
@@ -125,11 +152,17 @@ impl Drop for PimdirLock {
             return;
         };
 
-        // NOTE: only when the entry is still this lock's. A handle taken
-        // between this one losing its last reference and this line runs
-        // registers its own under the same key, and that one is live.
+        // NOTE: the release and the close are one critical section. Removing
+        // the entry drops the description it holds, here, before the mutex is
+        // handed on, so the next `own` cannot find the store unregistered and
+        // still locked.
         let mut owned = OWNED.lock().unwrap_or_else(PoisonError::into_inner);
-        if owned.get(key).is_some_and(|lock| lock.strong_count() == 0) {
+        let Some(entry) = owned.get_mut(key) else {
+            return;
+        };
+
+        entry.handles -= 1;
+        if entry.handles == 0 {
             owned.remove(key);
         }
     }
@@ -143,4 +176,43 @@ fn open(path: &Path) -> Result<File, PimdirError> {
         .write(true)
         .truncate(false)
         .open(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{format, string::String, vec::Vec};
+    use std::{sync::Arc, thread};
+
+    use super::PimdirLock;
+
+    /// Handing the owner role over inside one process never reports the store
+    /// owned by somebody else.
+    ///
+    /// The lock is registered per store directory and shared, so the last
+    /// handle to drop releases it. If the registry entry can be observed gone
+    /// while the file description it named is still open, the next `own` gets a
+    /// fresh descriptor and `flock` refuses it against this process's own: an
+    /// `Owned` naming a store nobody else holds, which nothing above can act on
+    /// and which reproduces on no schedule.
+    #[test]
+    fn a_handover_within_one_process_is_never_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().to_path_buf());
+
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                thread::spawn(move || {
+                    for _ in 0..20_000 {
+                        PimdirLock::own(&path).map_err(|err| format!("{err}"))?;
+                    }
+                    Ok::<(), String>(())
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap().expect("a handover was refused");
+        }
+    }
 }

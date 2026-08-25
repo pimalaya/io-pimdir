@@ -8,7 +8,7 @@
 //! invisible until a store is created with a column the readers expect and the
 //! writer never made.
 //!
-//! Two things are checked, and deliberately not a third:
+//! Three things are checked, and deliberately not a fourth:
 //!
 //! - **The schema must be identical**, semantically. Migrations are normative
 //!   ("every implementation applies the identical SQL"), so a missing column,
@@ -17,17 +17,25 @@
 //!   free to differ.
 //! - **Every canonical statement must exist here**, by name. An implementation
 //!   may not silently omit an operation.
+//! - **Every canonical statement must prepare** against the canonical schema.
+//!   The spec repository holds no toolchain, so this is the only place its own
+//!   SQL is ever loaded: without this, a spec edit naming a column the
+//!   migration does not have is found by whichever consumer runs it first.
 //! - **Statement text is *not* compared.** SPEC §4.4 explicitly permits an
 //!   equivalent substitution that preserves the same invariants, and this crate
-//!   uses several deliberately (`LIST_RETAINED_PAGE` pages by `seq` rather than
-//!   `link_id`; `LOAD_ITEMS` omits `sort_key` because the save is diffed rather
-//!   than replace-all). Comparing text would forbid what the spec allows.
+//!   uses one deliberately (`LOAD_ITEMS` omits `sort_key`, because the save is
+//!   diffed rather than replace-all). Comparing text would forbid what the spec
+//!   allows.
 //!
 //! The spec is a sibling checkout, not a vendored copy, so the test skips when
 //! it is absent (a consumer building from crates.io has no reason to hold it)
 //! and runs whenever the two sit side by side, which is where drift is created.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use io_pimdir::sql;
 use rusqlite::Connection;
@@ -180,21 +188,10 @@ fn every_canonical_statement_is_inlined() {
         return;
     };
 
-    let mut canonical = BTreeSet::new();
-    for file in [
-        "items",
-        "collections",
-        "bindings",
-        "sources",
-        "objects",
-        "queue",
-    ] {
-        let text = fs::read_to_string(spec.join(format!("queries/{file}.sql"))).unwrap();
-        for chunk in text.split("-- name: ").skip(1) {
-            let name = chunk.lines().next().unwrap().trim();
-            canonical.insert(name.to_uppercase());
-        }
-    }
+    let canonical: BTreeSet<String> = canonical_statements(&spec)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
 
     let inlined: BTreeSet<String> = sql::ALL.iter().map(|(name, _)| name.to_string()).collect();
     let missing: Vec<&String> = canonical
@@ -208,6 +205,61 @@ fn every_canonical_statement_is_inlined() {
          which is what `sql::ALL` exists for): {missing:?}. If one is a deliberate \
          §4.4 substitution, add it to SUBSTITUTED with the statement that replaces it"
     );
+}
+
+/// Every canonical statement the spec checkout carries, as
+/// `(CONSTANT_NAME, sql)`.
+///
+/// The files are the format's own reference statements, split on the `-- name:`
+/// marker each one is introduced by.
+fn canonical_statements(spec: &Path) -> Vec<(String, String)> {
+    let mut statements = Vec::new();
+
+    for file in [
+        "items",
+        "collections",
+        "bindings",
+        "sources",
+        "objects",
+        "queue",
+    ] {
+        let text = fs::read_to_string(spec.join(format!("queries/{file}.sql"))).unwrap();
+        for chunk in text.split("-- name: ").skip(1) {
+            let mut lines = chunk.lines();
+            let name = lines.next().unwrap().trim().to_uppercase();
+            let sql: String = lines
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            statements.push((name, sql.trim().to_string()));
+        }
+    }
+
+    statements
+}
+
+/// Every canonical statement prepares against the canonical schema.
+///
+/// The name check above says the crate reaches each one; this says the format's
+/// own SQL is SQL, and that it agrees with the format's own schema. Nothing
+/// else checks it: this repository holds the only toolchain that ever loads
+/// those files, and a spec edit that names a column the migration does not have
+/// would otherwise be found by whichever consumer ran it first.
+#[test]
+fn every_canonical_statement_prepares() {
+    let Some(spec) = spec_dir() else {
+        eprintln!("skipped: no pimdir spec checkout beside this one");
+        return;
+    };
+
+    let migration = fs::read_to_string(spec.join("migrations/0001_init.sql")).unwrap();
+    let conn = applied(&migration);
+
+    for (name, sql) in canonical_statements(&spec) {
+        if let Err(err) = conn.prepare(&sql) {
+            panic!("canonical `{name}` does not prepare against the canonical schema: {err:?}");
+        }
+    }
 }
 
 /// Canonical statements this crate deliberately does not inline, each replaced

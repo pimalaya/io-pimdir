@@ -618,6 +618,15 @@ fn a_generation_bump_is_visible_to_a_reader() {
         .unwrap();
     assert_eq!(generation, 2);
 
+    // And the item came with it. Asserting the epoch alone let a rekey freeze
+    // the whole collection unnoticed: the drop and the upsert read as one
+    // source reporting an identity under a second handle, so the binding kept
+    // the handle the server had just voided.
+    let carried = store.load(&inbox(), &ReplicaLoadScope::All).unwrap();
+    assert_eq!(carried.placements.len(), 1);
+    assert_eq!(carried.placements[0].handle, ReplicaHandle("101".into()));
+    assert!(carried.placements[0].ambiguous_handles.is_empty());
+
     // A second reader handle over the same files observes the new epoch.
     let reader = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(reader.generation("INBOX").unwrap(), Some(2));

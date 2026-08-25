@@ -86,6 +86,50 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
     assert!(store.list_accounts().unwrap().is_empty());
 }
 
+/// An index an earlier draft created under a name the schema still uses, over
+/// columns it no longer uses, is rebuilt rather than left alone.
+///
+/// `CREATE INDEX IF NOT EXISTS` keys on the name, so the ensure batch cannot
+/// see the difference: it finds an index called `items_retained` and does
+/// nothing, and the store goes on sorting every retained row of a collection to
+/// return one page of the trash. Nothing errors, which is why this is checked.
+#[test]
+fn an_index_whose_columns_moved_is_rebuilt_on_open() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("objects")).unwrap();
+
+    let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch(sql::MIGRATION_0001).unwrap();
+    conn.execute_batch(
+        "INSERT INTO store_meta(id, version, hash_algo, created_at) VALUES(1, 1, 'blake3', '0')",
+    )
+    .unwrap();
+    // The shape an earlier draft wrote, under the name the current one keeps.
+    conn.execute_batch(
+        "DROP INDEX items_retained; \
+         CREATE INDEX items_retained ON items(collection, retained_at) \
+         WHERE retained_at IS NOT NULL",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", sql::VERSION)
+        .unwrap();
+    drop(conn);
+
+    let _store = PimdirStore::open(dir.path()).unwrap();
+
+    let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
+    for (index, wanted) in sql::RESHAPED_INDEXES {
+        let held: Vec<String> = conn
+            .prepare(&format!("PRAGMA index_info({index})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(&held, wanted, "index {index} was not rebuilt");
+    }
+}
+
 /// Spec §4.2: `PRAGMA user_version` and `store_meta.version` mirror one
 /// another, and a store where they disagree is corrupt rather than a store at
 /// either version. The stamps are written by two different statements, so one

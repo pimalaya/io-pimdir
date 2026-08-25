@@ -7,7 +7,7 @@
 
 use io_pimdir::{PimdirSourceStore, PimdirStore};
 use io_replica::{
-    change::ReplicaWriteOp,
+    change::{ReplicaDropReason, ReplicaWriteOp},
     client::ReplicaStorage,
     collection::ReplicaCollectionId,
     placement::{
@@ -165,4 +165,112 @@ fn the_engine_clearing_the_freeze_clears_the_column() {
     let placements = projected(&store);
     assert!(placements[0].ambiguous_handles.is_empty());
     assert_eq!(placements[0].status, ReplicaStatus::Clean);
+}
+
+/// A rebuilt handle space is a repoint the floor above MUST let through.
+///
+/// A rekey drops the whole old spine and upserts every item under its new
+/// handle, in one batch (spec §12). Read without knowing that, the two halves
+/// are indistinguishable from the same source reporting one identity under a
+/// second handle, and the floor keeps the old handle and records the new one:
+/// a UIDVALIDITY bump then freezes every item of the collection, bound to
+/// handles the server no longer has, with no way back.
+///
+/// What separates the two is the drop's reason. `Superseded` says the row is
+/// being replaced, `Deleted` says the item went; only the first licenses a
+/// repoint, and only for the handle it names.
+#[test]
+fn a_rekey_carries_the_binding_over_instead_of_freezing_it() {
+    let dir = tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+
+    store
+        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+            "u1", "msg-a",
+        ))])
+        .unwrap();
+
+    // The handle-space rebuild: the old spine goes, the same items come back
+    // renumbered.
+    store
+        .write_rekeyed(
+            "INBOX",
+            vec![
+                ReplicaWriteOp::DropPlacement {
+                    collection: inbox(),
+                    handle: ReplicaHandle("u1".into()),
+                    reason: ReplicaDropReason::Superseded,
+                },
+                ReplicaWriteOp::UpsertPlacement(placement("101", "msg-a")),
+            ],
+        )
+        .unwrap();
+
+    let placements = projected(&store);
+    assert_eq!(placements.len(), 1);
+    assert_eq!(
+        placements[0].handle,
+        ReplicaHandle("101".into()),
+        "the binding follows the rebuilt spine",
+    );
+    assert!(
+        placements[0].ambiguous_handles.is_empty(),
+        "and renumbering is not a duplicate",
+    );
+    assert_eq!(placements[0].status, ReplicaStatus::Clean);
+}
+
+/// The licence is per handle, not per batch.
+///
+/// A rekey batch that also carries a genuine second copy of one identity must
+/// still freeze it: superseding `u1` says nothing about `u9`, and reading the
+/// reason as a blanket permission would put the data loss back inside the one
+/// operation that legitimately repoints.
+#[test]
+fn a_superseded_handle_licenses_only_its_own_repoint() {
+    let dir = tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+
+    store
+        .write(vec![
+            ReplicaWriteOp::UpsertPlacement(placement("u1", "msg-a")),
+            ReplicaWriteOp::UpsertPlacement(placement("u2", "msg-b")),
+        ])
+        .unwrap();
+
+    store
+        .write_rekeyed(
+            "INBOX",
+            vec![
+                // msg-a is superseded and renumbered: carried over.
+                ReplicaWriteOp::DropPlacement {
+                    collection: inbox(),
+                    handle: ReplicaHandle("u1".into()),
+                    reason: ReplicaDropReason::Superseded,
+                },
+                ReplicaWriteOp::UpsertPlacement(placement("101", "msg-a")),
+                // msg-b is not: this is the source holding it twice.
+                ReplicaWriteOp::UpsertPlacement(placement("u9", "msg-b")),
+            ],
+        )
+        .unwrap();
+
+    let mut placements = projected(&store);
+    placements.sort_by(|a, b| a.link_id.cmp(&b.link_id));
+    assert_eq!(placements[0].handle, ReplicaHandle("101".into()));
+    assert!(placements[0].ambiguous_handles.is_empty());
+
+    assert_eq!(
+        placements[1].handle,
+        ReplicaHandle("u2".into()),
+        "the untouched binding keeps its handle",
+    );
+    assert_eq!(
+        placements[1].ambiguous_handles,
+        vec![ReplicaHandle("u9".into())],
+        "and the second copy is still recorded",
+    );
+    assert_eq!(placements[1].status, ReplicaStatus::Ambiguous);
 }

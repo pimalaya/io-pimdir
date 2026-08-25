@@ -10,6 +10,24 @@
 /// The current schema version.
 pub const VERSION: i64 = 1;
 
+/// Indexes an earlier draft created under the same name over different columns,
+/// as `(name, the columns it must hold now)`.
+///
+/// [`ENSURE_INDEXES`] cannot repair one: `CREATE INDEX IF NOT EXISTS` keys on
+/// the name, so it silently leaves the old shape in place and the store keeps
+/// planning the read the way the schema no longer says. Such an index is dropped
+/// on open when its columns disagree, and the batch then recreates it.
+///
+/// Checked rather than dropped unconditionally, since rebuilding an index of a
+/// large store on every open is the cost this exists to avoid.
+pub const RESHAPED_INDEXES: &[(&str, &[&str])] = &[
+    // Was (collection, retained_at) while `list_retained_page` still paged by
+    // `link_id`. The page moved to the public `seq` (spec §14.1) and the index
+    // with it; a store keeping the old one sorts every retained row of the
+    // collection to return one page.
+    ("items_retained", &["collection", "seq"]),
+];
+
 /// Declares the module's statements and the [`ALL`] index in one expansion.
 ///
 /// The index used to be written out by hand beside the constants and kept
@@ -176,9 +194,14 @@ CREATE INDEX bindings_by_object ON bindings(base_object);
 CREATE UNIQUE INDEX items_by_seq ON items(collection, seq);
 -- Indexes the cross-collection "does this message already have a seq?" lookup.
 CREATE INDEX items_by_link ON items(link_id);
--- Partial: the trash view and the purge sweep scan the retained set without
--- ever touching the live rows, which are the overwhelming majority.
-CREATE INDEX items_retained ON items(collection, retained_at) WHERE retained_at IS NOT NULL;
+-- Retained (soft-deleted) items: every retained read rides this one index, and
+-- none of them touches the live rows, which are the overwhelming majority. It
+-- leads with `seq` because the trash listing pages on the public id
+-- (LIST_RETAINED_PAGE, spec §14.1), and ordering by anything this index does not
+-- lead with sorts every retained row in the collection to return one page.
+-- COUNT_RETAINED rides the collection prefix, and the store-wide purge scans the
+-- index whole, which is O(retained) because the index is partial.
+CREATE INDEX items_retained ON items(collection, seq) WHERE retained_at IS NOT NULL;
 -- Orders a collection by the kind's own sort key, with `seq` as the tiebreaker
 -- that makes a keyset page over a non-unique key well defined.
 CREATE INDEX items_by_sort ON items(collection, sort_key, seq);
@@ -485,10 +508,10 @@ WHERE collection = :collection AND link_id = :link_id";
 /// row still pins (`NULL` when unhydrated): the trash listing beside
 /// `LIST_ITEMS_PAGE`, and the only read that returns them.
 ///
-/// `:after` is the exclusive lower bound on the public `seq` (0 starts from the
-/// beginning), an equivalent substitution for the reference statement's
-/// `link_id` cursor (spec §7): a caller pages the trash by the same small
-/// integer it purges and restores by.
+/// `:after` is the exclusive lower bound on the public `seq`, with 0 starting
+/// from the beginning: a real sentinel rather than an invented one, since `seq`
+/// is handed out from 1. A caller pages the trash by the same small integer it
+/// purges and restores by, and never sees the internal `link_id`.
 LIST_RETAINED_PAGE = "\
 SELECT i.seq, i.link_id, i.flags, i.object_hash, i.meta, i.sort_key, i.level, \
 i.retained_at, i.retained_by, o.size \
@@ -504,8 +527,12 @@ ORDER BY i.seq LIMIT :limit";
 /// index columns that were always there: what changed is that a statement now
 /// needs them. A store that kept the old plans would keep scanning where the
 /// schema says it seeks, silently and for good.
+///
+/// `IF NOT EXISTS` keys on the *name*, so an index whose columns changed is not
+/// replaced by this batch and has to be dropped before it runs (see
+/// [`RESHAPED_INDEXES`]).
 ENSURE_INDEXES = "\
-CREATE INDEX IF NOT EXISTS items_retained ON items(collection, retained_at) \
+CREATE INDEX IF NOT EXISTS items_retained ON items(collection, seq) \
 WHERE retained_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS collections_by_account ON collections(account) \
 WHERE account IS NOT NULL;
@@ -529,32 +556,30 @@ RETAINED_BYTES = "\
 SELECT coalesce(sum(o.size), 0) FROM objects o WHERE o.hash IN \
 (SELECT object_hash FROM items WHERE retained_at IS NOT NULL AND object_hash IS NOT NULL)";
 
-/// The objects one retained item pins, addressed by its public id: what the
-/// targeted purge releases before deleting the row. A live item matches nothing,
-/// so a purge can never reach one.
-RETAINED_ITEM_BY_SEQ = "\
-SELECT object_hash, conflict_object FROM items \
-WHERE collection = :collection AND seq = :seq AND retained_at IS NOT NULL";
-
 /// Purges one retained item by its public id: the only true delete. Its bindings
-/// cascade, and the body it released is unlinked by the ordinary refcount sweep.
-/// Guarded on `retained_at`, so a purge can never take a live item.
+/// cascade, and the body it released is unlinked by the collector once nothing
+/// else references it. Guarded on `retained_at`, so a purge can never take a
+/// live item.
+///
+/// Returns the two hashes the row pinned, so the caller settles them with
+/// [`RELEASE_PINS`] in the same transaction rather than reading the row first
+/// and visiting it twice.
 PURGE_ITEM = "\
-DELETE FROM items WHERE collection = :collection AND seq = :seq AND retained_at IS NOT NULL";
+DELETE FROM items WHERE collection = :collection AND seq = :seq AND retained_at IS NOT NULL \
+RETURNING object_hash, conflict_object";
 
-/// The objects the time-based sweep is about to release, with the rows'
-/// collections and link ids. Strictly before the cutoff, so an item retained
-/// exactly at that instant is kept.
-RETAINED_BEFORE = "\
-SELECT collection, link_id, object_hash, conflict_object FROM items \
-WHERE retained_at IS NOT NULL AND retained_at < :cutoff";
-
-/// The time-based sweep: every item retired before `:cutoff` (RFC 3339),
-/// store-wide, since how long to keep is the owner's policy rather than a
-/// collection's. The cutoff is the caller's parameter, not the store's clock, so
-/// the boundary is deterministic even though the stamp is SQLite's.
-PURGE_RETAINED_BEFORE =
-    "DELETE FROM items WHERE retained_at IS NOT NULL AND retained_at < :cutoff";
+/// The time-based sweep: every item retired **strictly before** `:cutoff`
+/// (RFC 3339), so an item retained exactly at that instant is kept. Store-wide,
+/// since how long to keep is the owner's policy rather than a collection's. The
+/// cutoff is the caller's parameter, not the store's clock, so the boundary is
+/// deterministic even though the stamps are SQLite's.
+///
+/// Returns each purged row's two pinned hashes, on the same terms as
+/// [`PURGE_ITEM`]: this is where reading the rows twice costs most, being the
+/// sweep that takes fifty thousand of them at once.
+PURGE_RETAINED_BEFORE = "\
+DELETE FROM items WHERE retained_at IS NOT NULL AND retained_at < :cutoff \
+RETURNING object_hash, conflict_object";
 
 /// Inserts one item's binding for one source (the new-binding path;
 /// `UPDATE_BINDING` handles an existing one).
@@ -632,12 +657,26 @@ WHERE i.object_hash IS NOT NULL \
   AND i.link_id IN (SELECT value FROM json_each(:links)) \
   AND c.account IS :account";
 
-/// Lists the objects no placement references any more: the blobs the write
-/// transaction is about to collect.
-LIST_GARBAGE_OBJECTS = "SELECT hash FROM objects WHERE refcount = 0";
+/// Lists the objects nothing references any more: what the collector takes, and
+/// never a write's business, since the batch that attaches a body may not be the
+/// one that indexed it (spec §5).
+///
+/// `<= 0` rather than `= 0`, matching the partial index `objects_garbage`
+/// exactly so neither statement scans the table. Under the refcount floor
+/// (spec §7) the two select the same rows; the wider one is for the reader that
+/// cannot apply the floor, since it opens read-only and a store written before
+/// the constraint may still carry a negative count.
+LIST_GARBAGE_OBJECTS = "SELECT hash FROM objects WHERE refcount <= 0";
 
-/// Every hash the index holds, for the collector to diff the blob tree against:
-/// a file this does not name is a body nothing references.
+/// Whether the index still holds a body: the collector's question about the one
+/// file in front of it, asked on the primary key (spec §5).
+OBJECT_EXISTS = "SELECT 1 FROM objects WHERE hash = :hash";
+
+/// Every hash the index holds. For the diagnosis that has to visit every row
+/// anyway (an object row whose blob is missing is a read that will fail, and
+/// only a pass over the rows finds one), never for the collector, which asks
+/// about the file in front of it with [`OBJECT_EXISTS`] rather than holding the
+/// whole index in memory to answer.
 LIST_OBJECT_HASHES = "SELECT hash FROM objects";
 
 /// Drops the unreferenced object rows inside the collector's transaction; their

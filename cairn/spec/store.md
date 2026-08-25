@@ -580,3 +580,81 @@ Every other dangling row stays reported and untouched: an item whose object row
 is missing is still the item, and a queue row whose body is missing is still an
 intent somebody expressed, so deleting either would destroy data rather than
 repair it.
+
+### Requirement: A superseded handle licenses its own rebind
+A write batch dropping a handle with `ReplicaDropReason::Superseded` SHALL let
+the binding holding it move to whatever handle the same batch upserts for that
+identity, by deleting the binding and inserting the new one (SPEC §10, §12). A
+batch dropping a handle for any other reason, or not dropping it at all, SHALL
+keep the bound handle and record the incoming one as ambiguous.
+
+The two are indistinguishable from the rows: a rebuilt spine and a source
+reporting one identity under a second handle produce the same before and after,
+and only the drop's reason separates them. Reading a rebuild as a duplicate
+freezes every item of the collection under handles the server has just voided,
+with no way back, since what clears an ambiguity is the source reporting the
+recorded handle gone and the recorded handle is the live one.
+
+The licence SHALL be per handle rather than per batch, so a rebuild carrying a
+genuine second copy of an identity still freezes that one and the floor stays
+intact inside the one operation that legitimately repoints.
+
+#### Scenario: A renumbered collection is not a duplicated one
+- GIVEN a binding on a handle a rekey batch supersedes
+- WHEN the batch drops it and upserts the item under a new handle
+- THEN the binding follows the new handle, projects `Clean`, and records no ambiguity
+
+### Requirement: An index whose columns moved is rebuilt
+A store opened against a schema whose index of the same name holds different
+columns SHALL have that index dropped and recreated. `CREATE INDEX IF NOT
+EXISTS` keys on the name, so the ensure batch cannot repair one: it finds an
+index already there and leaves the store planning the read the way the schema no
+longer says, silently and for good.
+
+The columns SHALL be compared rather than the index dropped unconditionally,
+rebuilding an index of a large store on every open being the cost this avoids.
+
+### Requirement: A body is written before its transaction opens
+A write SHALL land the bodies its batch carries in the blob store before opening
+the transaction that indexes them (SPEC §14). A body is content-addressed and
+immutable, so writing it early can only produce a file some later batch produces
+identically, and the worst a crash between the two leaves is an orphan for the
+collector; inside the transaction the same write holds SQLite's single writer
+lock across a file write, two `fsync`s and a rename, serialising every other
+writer behind an I/O path that touches no database page.
+
+What keeps a collector out of the window this opens is the writer's lock (SPEC
+§8), not the file's age. A caller that cannot stage ahead, the queue drain
+building its ops inside the transaction that claims the row, MAY write inside
+it: the blob write is idempotent, so the batch may re-offer a body at the cost of
+one existence check.
+
+### Requirement: The collector asks about the file in front of it
+The collector SHALL resolve each blob file against the index with a point lookup
+on the primary key (`OBJECT_EXISTS`), never by reading every hash into memory
+first: a store of the size SPEC §1 promises holds hundreds of thousands of them,
+and the question is always about one file. `LIST_OBJECT_HASHES` remains for the
+diagnosis that visits every row anyway.
+
+### Requirement: A purge releases the pins the delete reported
+`PURGE_ITEM` and `PURGE_RETAINED_BEFORE` SHALL return each removed row's
+`object_hash` and `conflict_object`, and the caller SHALL settle them with
+`RELEASE_PINS` in the same transaction. The pins have to be released by whoever
+deletes the rows, and reading them beforehand visits every swept row twice for an
+answer the delete already has.
+
+### Requirement: Releasing the owner role and retaking it is one operation
+The process-wide owner lock SHALL be released and reacquired under one critical
+section: the registry owns the locked file description and closes it as the last
+handle goes, rather than tracking a weak reference while each handle holds its
+own.
+
+A strong count reaches zero before the description it named is closed, so a
+registry that let the two be observed apart would have the next handle open a
+second description and `flock` itself out of its own store, reporting `Owned`
+with no other process in it (SPEC §8).
+
+#### Scenario: Handing the role over inside one process
+- GIVEN a store whose owner handles are taken and dropped concurrently
+- WHEN a handle is taken as the last one is being released
+- THEN it shares the role, and no acquisition reports the store owned
