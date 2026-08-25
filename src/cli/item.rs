@@ -344,10 +344,11 @@ impl ItemRestoreCommand {
     }
 }
 
-/// Destroy retained items for good, reclaiming their bodies.
+/// Destroy retained items for good, releasing their bodies.
 ///
 /// This is the only true delete a pimdir store has, and it cannot be undone:
-/// the row goes, and the body goes with it once no other item references it.
+/// the row goes, and the body it held is reclaimed by `pimdir gc` once nothing
+/// else references it.
 /// Give one `seq`, or `--older-than` to sweep everything retained before a
 /// point in time, or `--all` to empty the trash. Destructive, so it asks first
 /// unless `--yes` is passed.
@@ -397,7 +398,7 @@ impl ItemPurgeCommand {
 
         let question = match preview {
             Some((items, size)) => format!(
-                "Destroy {items} retained item(s) and up to {} for good?",
+                "Destroy {items} retained item(s) for good, releasing up to {}?",
                 bytes(size)
             ),
             None => format!("Destroy every item retained before {cutoff} for good?"),
@@ -412,7 +413,6 @@ impl ItemPurgeCommand {
         printer.out(ItemPurgeOutput {
             cutoff: Some(cutoff),
             items: purged.items,
-            bytes: purged.bytes,
         })
     }
 
@@ -450,7 +450,6 @@ impl ItemPurgeCommand {
         printer.out(ItemPurgeOutput {
             cutoff: None,
             items: 1,
-            bytes: size,
         })
     }
 }
@@ -841,17 +840,14 @@ pub struct ItemPurgeOutput {
     pub cutoff: Option<String>,
     /// How many items were destroyed.
     pub items: usize,
-    /// How many bytes were reclaimed.
-    pub bytes: u64,
 }
 
 impl fmt::Display for ItemPurgeOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "Purged {} item(s), reclaiming {}",
-            self.items,
-            bytes(self.bytes)
-        )
+        writeln!(f, "Purged {} item(s)", self.items)?;
+        if self.items > 0 {
+            writeln!(f, "Run `pimdir gc` to reclaim the bodies they released")?;
+        }
+        Ok(())
     }
 }

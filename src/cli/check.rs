@@ -1,31 +1,30 @@
-//! The `check` verb: the store's internal consistency, and the one repair that
-//! is safe to automate.
+//! The `check` verb: diagnosis, and the repairs that need no guessing.
 //!
-//! Three inconsistencies are possible by design or by accident. Blob files are
-//! unlinked only after the transaction that dropped their rows commits, so a
-//! crash in between leaves an **orphan blob**: a file no row references, which
-//! nothing else cleans. A refcount is maintained incrementally, so a bug or a
-//! foreign writer could leave **drift** between a count and the references that
-//! justify it. Foreign keys are enforced only when the writer enabled them, so
-//! a **dangling** row is conceivable. All three are reported; only orphan blobs
-//! are reclaimable without guessing.
+//! It reports what should not happen. A refcount is maintained incrementally,
+//! so a bug here or a foreign writer could leave **drift** between a count and
+//! the references that justify it. Foreign keys are enforced only when the
+//! writer enabled them, so a **dangling** row is conceivable. An object row
+//! whose blob is **missing** is a read that will fail. An **orphan blob** is
+//! the benign one, a file no row references, and `pimdir gc` is what takes it:
+//! reclamation is the collector's, and this verb reclaims nothing.
+//!
+//! `--fix` repairs, which is a different thing from reclaiming: it recomputes
+//! the drifted refcounts from the pointers that justify them, and clears the
+//! bindings whose item is gone. Both are recoveries of a fact the store already
+//! holds. Nothing else is touched, because a wrong repair is worse than a
+//! reported inconsistency.
 
-use std::{
-    collections::BTreeSet,
-    fmt, fs,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::{collections::BTreeSet, fmt, path::PathBuf};
 
 use anyhow::Result;
 use clap::Args;
-use log::debug;
 use pimalaya_cli::printer::Printer;
 use serde::Serialize;
 
 use crate::cli::{
-    StoreFlags, bytes, confirm,
+    StoreFlags, bytes,
     db::{PimdirAmbiguous, PimdirDangling, PimdirRefcountDrift},
+    report,
 };
 
 /// How many entries of each kind the text output prints before summarising the
@@ -34,39 +33,28 @@ const SHOWN: usize = 20;
 
 /// Check a store's internal consistency.
 ///
-/// Reports blob files no row references (a crash can leave them and nothing
-/// else cleans them), object rows whose body is missing, refcounts that
-/// disagree with the references justifying them, and rows pointing at something
-/// absent. Reading only, unless `--fix` is passed.
+/// Reports object rows whose body is missing, refcounts that disagree with the
+/// references justifying them, rows pointing at something absent, and blob
+/// files no row references (which `pimdir gc` reclaims). Reading only, unless
+/// `--fix` is passed.
 #[derive(Debug, Args)]
 pub struct CheckCommand {
-    /// Delete the orphan blob files the check found.
+    /// Repair what can be repaired from what the store already holds.
     ///
-    /// Only orphan files older than the grace period are deleted, and nothing
-    /// else is touched: refcount drift and dangling rows are reported, never
-    /// repaired, because a wrong repair is worse than a reported inconsistency.
+    /// Recomputes the drifted refcounts from the pointers that justify them,
+    /// and deletes the bindings whose item is gone. It destroys nothing and
+    /// reclaims nothing, so it neither asks nor waits: a body is `pimdir gc`'s
+    /// to take.
     #[arg(long)]
     pub fix: bool,
-
-    /// Leave orphan files younger than this alone (`1h`, `30m`, `7d`).
-    ///
-    /// A body is written to the blob store before the row that references it,
-    /// so a file that has just appeared may belong to a write in flight. The
-    /// grace period is what keeps `--fix` from deleting it.
-    #[arg(long, value_name = "DURATION", default_value = "1h")]
-    pub grace: humantime::Duration,
-
-    /// Do not ask for confirmation before deleting orphan files.
-    #[arg(long, short = 'y')]
-    pub yes: bool,
 }
 
 impl CheckCommand {
-    /// Runs the check, and the orphan sweep when asked.
+    /// Runs the check, and the repairs when asked.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         let db = store.db()?;
         let indexed = db.hashes()?;
-        let on_disk = blob_files(&store.dir().join("objects"))?;
+        let on_disk = store.blobs()?.files()?;
 
         let mut orphans = Vec::new();
         let mut orphan_bytes = 0;
@@ -88,38 +76,17 @@ impl CheckCommand {
         let dangling = db.dangling()?;
         let ambiguous = db.ambiguous_bindings()?;
 
-        let mut removed = 0;
-        let mut reclaimed = 0;
+        let mut repaired = 0;
+        let mut cleared = 0;
 
-        if self.fix && !orphans.is_empty() {
-            let cutoff = SystemTime::now()
-                .checked_sub(*self.grace)
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let stale: Vec<&BlobFile> = orphans
-                .iter()
-                .filter(|blob| blob.modified.is_none_or(|modified| modified < cutoff))
-                .collect();
-
-            if stale.is_empty() {
-                debug!("every orphan blob is younger than the grace period, nothing to delete");
-            } else {
-                let total: u64 = stale.iter().map(|blob| blob.size).sum();
-                confirm(
-                    printer,
-                    self.yes,
-                    &format!(
-                        "Delete {} orphan blob file(s), reclaiming {}?",
-                        stale.len(),
-                        bytes(total)
-                    ),
-                )?;
-
-                for blob in stale {
-                    fs::remove_file(&blob.path)?;
-                    removed += 1;
-                    reclaimed += blob.size;
-                }
-            }
+        if self.fix && (!drift.is_empty() || !dangling.is_empty()) {
+            // NOTE: the read-only diagnostic connection cannot write, and the
+            // repair takes the owner role like every other write this tool
+            // makes. Dropped first, so the two never hold the store at once.
+            drop(db);
+            let owner = store.owner()?;
+            repaired = owner.recompute_refcounts().map_err(report)?;
+            cleared = owner.clear_dangling_bindings().map_err(report)?;
         }
 
         printer.out(CheckOutput {
@@ -136,56 +103,10 @@ impl CheckCommand {
             drift,
             dangling,
             ambiguous,
-            removed,
-            reclaimed,
+            repaired,
+            cleared,
         })
     }
-}
-
-/// One file found in the blob directory.
-#[derive(Clone, Debug)]
-struct BlobFile {
-    hash: String,
-    path: PathBuf,
-    size: u64,
-    modified: Option<SystemTime>,
-}
-
-/// Every blob file under `root`, walking the two-level sharding (and the flat
-/// fallback for very short hashes). Temporary files (a leading dot) are skipped:
-/// they belong to a writer that has not committed.
-fn blob_files(root: &Path) -> Result<Vec<BlobFile>> {
-    let mut files = Vec::new();
-    if !root.is_dir() {
-        return Ok(files);
-    }
-    walk(root, &mut files)?;
-    Ok(files)
-}
-
-/// Recurses one directory of the blob tree.
-fn walk(dir: &Path, files: &mut Vec<BlobFile>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            walk(&entry.path(), files)?;
-        } else if metadata.is_file() {
-            files.push(BlobFile {
-                hash: name,
-                path: entry.path(),
-                size: metadata.len(),
-                modified: metadata.modified().ok(),
-            });
-        }
-    }
-
-    Ok(())
 }
 
 /// One blob file no object row references.
@@ -214,10 +135,10 @@ pub struct CheckOutput {
     pub dangling: Vec<PimdirDangling>,
     /// Identities a source holds more than once, so their items are frozen.
     pub ambiguous: Vec<PimdirAmbiguous>,
-    /// Orphan files deleted by `--fix`.
-    pub removed: usize,
-    /// Bytes those files freed.
-    pub reclaimed: u64,
+    /// Refcounts `--fix` recomputed from the pointers justifying them.
+    pub repaired: usize,
+    /// Dangling bindings `--fix` cleared.
+    pub cleared: usize,
 }
 
 impl CheckOutput {
@@ -247,9 +168,7 @@ impl fmt::Display for CheckOutput {
                 writeln!(f, " - {} ({})", orphan.hash, bytes(orphan.size))?;
             }
             more(f, self.orphans.len())?;
-            if self.removed == 0 {
-                writeln!(f, "   Reclaim them with `pimdir check --fix`")?;
-            }
+            writeln!(f, "   Reclaim them with `pimdir gc`")?;
         }
 
         if !self.missing.is_empty() {
@@ -305,12 +224,11 @@ impl fmt::Display for CheckOutput {
             more(f, self.ambiguous.len())?;
         }
 
-        if self.removed > 0 {
+        if self.repaired > 0 || self.cleared > 0 {
             writeln!(
                 f,
-                "Deleted {} orphan blob file(s), reclaiming {}",
-                self.removed,
-                bytes(self.reclaimed)
+                "Repaired {} refcount(s) and cleared {} dangling binding(s)",
+                self.repaired, self.cleared
             )?;
         }
 

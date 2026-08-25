@@ -68,6 +68,9 @@ mod lock;
 /// [`PimdirSourceStore`], which [`for_source`](Self::for_source) yields.
 pub struct PimdirStore {
     conn: Connection,
+    /// The store directory, which the collector locks and the blob tree hangs
+    /// off.
+    dir: PathBuf,
     blobs: PathBuf,
     /// The store's exclusive owner lock (spec §8), held for this handle's
     /// lifetime; `None` on a read-only handle, which owns nothing. Several
@@ -235,13 +238,26 @@ pub struct PimdirRetainedItem {
     pub retained_by: Option<String>,
 }
 
-/// What a purge reclaimed.
+/// What a purge retired.
+///
+/// Rows, not bytes: a purge releases the references a retained item held and
+/// nothing more. The bodies those references were keeping are reclaimed by the
+/// collector, which is what reports the bytes ([`PimdirStore::collect_garbage`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirPurgeReport {
     /// Retained items deleted.
     pub items: usize,
-    /// Blob bytes actually unlinked; a body another item still references is
-    /// not counted, since it was not reclaimed.
+}
+
+/// What a collection reclaimed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirGcReport {
+    /// Object rows dropped: bodies nothing references any more.
+    pub objects: usize,
+    /// Blob files unlinked, those rows' bodies and the orphans a crash left
+    /// together.
+    pub blobs: usize,
+    /// The bytes those files freed.
     pub bytes: u64,
 }
 
@@ -359,6 +375,7 @@ impl PimdirStore {
 
         Ok(Self {
             conn,
+            dir: dir.to_path_buf(),
             blobs,
             _lock: Some(lock),
             hash,
@@ -396,6 +413,7 @@ impl PimdirStore {
 
         Ok(Self {
             conn,
+            dir: dir.to_path_buf(),
             blobs: dir.join("objects"),
             _lock: None,
             hash,
@@ -967,17 +985,12 @@ impl PimdirStore {
             named_params! { ":collection": collection.0, ":seq": seq },
         )?;
         release_pins(&tx, [object, conflict_object].into_iter().flatten())?;
-        let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
-
-        for (hash, _) in garbage {
-            remove_blob(&self.blobs, &hash)?;
-        }
         Ok(true)
     }
 
     /// The scheduled sweep: purges every item retired **strictly before**
-    /// `cutoff` (RFC 3339), store-wide, reporting what it reclaimed.
+    /// `cutoff` (RFC 3339), store-wide, reporting how many it retired.
     ///
     /// The boundary is the caller's, not the store's clock: an owner computes it
     /// from its own retention duration, so the store holds no policy and the
@@ -1017,17 +1030,93 @@ impl PimdirStore {
                 .flat_map(|(object, conflict)| [object, conflict])
                 .flatten(),
         )?;
-        let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
 
-        // NOTE: the bytes are the blobs actually unlinked, so a body another
-        // item still references is not claimed as reclaimed.
-        let mut bytes = 0;
-        for (hash, size) in garbage {
-            remove_blob(&self.blobs, &hash)?;
-            bytes += size;
+        Ok(PimdirPurgeReport { items })
+    }
+}
+
+/// Reclamation and repair (spec §5, §7): the two things a store does not do to
+/// itself.
+///
+/// No write collects. An object at refcount zero is unreferenced, not deleted,
+/// and stays until a collector runs: that is what lets a consumer store a body
+/// in one batch and attach it in a later one, which spec §14 invites and a
+/// sweep at the end of every write made impossible. Repair is the other half —
+/// a refcount is maintained incrementally, so recomputing it from the pointers
+/// that justify it is how a drift is settled rather than reported for ever.
+impl PimdirStore {
+    /// Reclaims what nothing references: the object rows at refcount zero, the
+    /// bodies they held, and any orphan blob a crash left behind.
+    ///
+    /// Takes the store's staging lock exclusively, so no producer is between a
+    /// blob write and the queue row that pins it, and runs on an owning handle,
+    /// which already holds the store against other owners. Those two are what
+    /// let the sweep take a body the moment nothing references it, with no
+    /// grace window standing in for a lock.
+    ///
+    /// The rows go inside a transaction and the files after it, in the order a
+    /// crash can afford: a body without its row is an orphan the next
+    /// collection takes, where a row without its body is a read that fails.
+    pub fn collect_garbage(&mut self) -> Result<PimdirGcReport, PimdirError> {
+        let _staging = PimdirLock::collect(&self.dir)?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let objects = tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
+        let indexed: BTreeSet<String> = {
+            let mut stmt = tx.prepare(sql::LIST_OBJECT_HASHES)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut hashes = BTreeSet::new();
+            for row in rows {
+                hashes.insert(row?);
+            }
+            hashes
+        };
+        tx.commit().map_err(busy_or_sql)?;
+
+        // NOTE: one pass over the tree rather than one unlink per collected
+        // row plus a pass for the orphans. A body whose row this transaction
+        // just dropped is an orphan by then, so both cases are the same case.
+        let mut report = PimdirGcReport {
+            objects,
+            ..Default::default()
+        };
+        for blob in self.blobs().files()? {
+            if indexed.contains(&blob.hash) {
+                continue;
+            }
+            fs::remove_file(&blob.path)?;
+            report.blobs += 1;
+            report.bytes += blob.size;
         }
-        Ok(PimdirPurgeReport { items, bytes })
+        Ok(report)
+    }
+
+    /// Recomputes every object's refcount from the four columns that pin one
+    /// (spec §7), returning how many rows disagreed and were corrected.
+    ///
+    /// The counterpart of the incremental maintenance every write does: a
+    /// count that has drifted, from a bug here or from a foreign writer, is
+    /// otherwise reported for ever and never settled. It is a whole-store pass,
+    /// so it belongs to a repair verb rather than to a write.
+    pub fn recompute_refcounts(&self) -> Result<usize, PimdirError> {
+        Ok(self.conn.execute(sql::RECOMPUTE_REFCOUNTS, [])?)
+    }
+
+    /// Deletes the bindings whose item is gone, returning how many, and leaves
+    /// every other dangling row alone.
+    ///
+    /// A binding with no item is unreachable: nothing can read it and no sync
+    /// projects it. The other rows a check reports as dangling are not like
+    /// that — an item whose object row is missing is still the item, and a
+    /// queue row whose body is missing is still an intent somebody expressed —
+    /// so deleting them would destroy data rather than repair it, and they stay
+    /// reported.
+    pub fn clear_dangling_bindings(&self) -> Result<usize, PimdirError> {
+        Ok(self.conn.execute(sql::DELETE_DANGLING_BINDINGS, [])?)
     }
 }
 
@@ -1143,12 +1232,7 @@ impl PimdirStore {
 
         tx.execute(sql::CANCEL_ACTION, named_params! { ":id": id })?;
         release_pins(&tx, hash.into_iter())?;
-        let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
-
-        for (hash, _) in garbage {
-            remove_blob(&self.blobs, &hash)?;
-        }
         Ok(true)
     }
 
@@ -1234,12 +1318,7 @@ impl PimdirSourceStore {
             named_params! { ":collection": collection },
             |r| r.get(0),
         )?;
-        let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
-
-        for (hash, _) in garbage {
-            remove_blob(&self.store.blobs, &hash)?;
-        }
         Ok(generation)
     }
 
@@ -1365,12 +1444,7 @@ impl PimdirSourceStore {
                 named_params! { ":delta": -1, ":hash": hash },
             )?;
         }
-        let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
-
-        for (hash, _) in garbage {
-            remove_blob(&self.store.blobs, &hash)?;
-        }
         Ok(None)
     }
     /// Parks one queue row: records the failure and the spent attempt, leaving
@@ -1504,12 +1578,7 @@ impl ReplicaStorage for PimdirSourceStore {
             &mut self.residual,
             ops,
         )?;
-        let garbage = collect_garbage(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
-
-        for (hash, _) in garbage {
-            remove_blob(&self.store.blobs, &hash)?;
-        }
         Ok(())
     }
 }
@@ -2002,6 +2071,57 @@ impl PimdirBlobs {
             written: 0,
         })
     }
+
+    /// Every body the blob tree holds, walking the two-level sharding.
+    ///
+    /// The files, not the index: this is what a collector and a consistency
+    /// check compare the object rows against, and the difference either way is
+    /// a defect (a file no row references, a row whose body is gone). A
+    /// half-written body is skipped, since a temp file belongs to a writer that
+    /// has not committed.
+    pub fn files(&self) -> io::Result<Vec<PimdirBlobFile>> {
+        let mut files = Vec::new();
+        if self.root.is_dir() {
+            walk_blobs(&self.root, &mut files)?;
+        }
+        Ok(files)
+    }
+}
+
+/// One body as it sits in the blob tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirBlobFile {
+    /// The hash its filename claims, unverified: checking it against the bytes
+    /// is what `pimdir check` is for.
+    pub hash: String,
+    /// Where it sits.
+    pub path: PathBuf,
+    /// Its size on disk.
+    pub size: u64,
+}
+
+/// Recurses one directory of the blob tree.
+fn walk_blobs(dir: &Path, files: &mut Vec<PimdirBlobFile>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            walk_blobs(&entry.path(), files)?;
+        } else if metadata.is_file() {
+            files.push(PimdirBlobFile {
+                hash: name,
+                path: entry.path(),
+                size: metadata.len(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// A unique-per-write temp-file discriminator, so concurrent writers of one
@@ -2162,26 +2282,6 @@ fn apply_ops(
     }
 
     Ok(())
-}
-
-/// Deletes the zero-refcount object rows inside the caller's transaction and
-/// returns their hashes and sizes; the caller unlinks the blob files **after**
-/// the commit, so a crash leaves at worst an orphan blob, never a row without
-/// its body. The sizes are what a purge reports as bytes reclaimed.
-fn collect_garbage(tx: &Connection) -> Result<Vec<(String, u64)>, rusqlite::Error> {
-    let garbage: Vec<(String, u64)> = {
-        let mut stmt = tx.prepare(sql::LIST_GARBAGE_SIZED)?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
-        })?;
-        let mut objects = Vec::new();
-        for row in rows {
-            objects.push(row?);
-        }
-        objects
-    };
-    tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
-    Ok(garbage)
 }
 
 /// Creates the schema in a fresh database (spec §6), advancing `user_version`
@@ -3051,15 +3151,6 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
-/// Removes a blob file; a missing file is not an error.
-fn remove_blob(blobs: &Path, hash: &str) -> io::Result<()> {
-    match fs::remove_file(blob_path(blobs, hash)) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
 /// Everything that can go wrong servicing the seam.
 #[derive(Debug)]
 pub enum PimdirError {
@@ -3115,6 +3206,11 @@ pub enum PimdirError {
     /// caller is the only layer that can choose between retrying, backing off,
     /// queueing the intent and telling the user.
     Owned(PathBuf),
+    /// A producer is between its blob write and the enqueue that pins it (§8),
+    /// so a collector cannot run: the body it just wrote is referenced by
+    /// nothing yet and a sweep would take it. Reported rather than waited out,
+    /// since a producer holds its lock for as long as its handle lives.
+    Staging(PathBuf),
 }
 
 impl fmt::Display for PimdirError {
@@ -3157,6 +3253,11 @@ impl fmt::Display for PimdirError {
             PimdirError::Owned(store) => write!(
                 f,
                 "pimdir store at {} is owned by another process",
+                store.display()
+            ),
+            PimdirError::Staging(store) => write!(
+                f,
+                "pimdir store at {} has a producer staging a body",
                 store.display()
             ),
             PimdirError::Busy => write!(

@@ -1,9 +1,10 @@
 //! # pimdir
 //!
 //! The operator command line over a pimdir store: inspect it, restore what a
-//! delete retained, purge what should really go, and check what a crash left
-//! behind. It is to a store what `sqlite3` is to a database, a tool for the
-//! person maintaining the data rather than for the person reading it.
+//! delete retained, purge what should really go, check what a crash left
+//! behind, and collect what nothing references any more. It is to a store what
+//! `sqlite3` is to a database, a tool for the person maintaining the data
+//! rather than for the person reading it.
 //!
 //! ## What it does not do
 //!
@@ -19,9 +20,9 @@
 //! running is always safe. An item mutation is appended to the store's action
 //! queue, exactly as any other non-owner process does, and then applied by this
 //! process when the owner role is free; when a sync holds it, the action stays
-//! queued and applies at the next drain. Purge, queue cancellation and the
-//! orphan-blob sweep have no queue action kind, so they take the owner role
-//! directly and say so plainly when they cannot.
+//! queued and applies at the next drain. Purge, queue cancellation, repair and
+//! collection have no queue action kind, so they take the owner role directly
+//! and say so plainly when they cannot.
 //!
 //! ## Layout
 //!
@@ -48,7 +49,7 @@ use pimalaya_cli::{
 
 use crate::cli::{
     StoreFlags, check::CheckCommand, collection::CollectionCommand, export::ExportCommand,
-    item::ItemCommand, queue::QueueCommand, store::StoreCommand,
+    gc::GcCommand, item::ItemCommand, queue::QueueCommand, store::StoreCommand,
 };
 
 fn main() {
@@ -93,6 +94,8 @@ enum Command {
     Store(StoreCommand),
     /// Check the store's internal consistency.
     Check(CheckCommand),
+    /// Reclaim what nothing references any more.
+    Gc(GcCommand),
     /// Dump the store to a directory.
     Export(ExportCommand),
     Completions(CompletionCommand),
@@ -107,6 +110,7 @@ impl Command {
             Self::Queue(cmd) => cmd.execute(printer, store),
             Self::Store(cmd) => cmd.execute(printer, store),
             Self::Check(cmd) => cmd.execute(printer, store),
+            Self::Gc(cmd) => cmd.execute(printer, store),
             Self::Export(cmd) => cmd.execute(printer, store),
             Self::Completions(cmd) => cmd.execute(printer, Cli::command()),
             Self::Manuals(cmd) => cmd.execute(printer, Cli::command()),

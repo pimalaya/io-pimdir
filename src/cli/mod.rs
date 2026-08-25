@@ -15,6 +15,7 @@ pub mod check;
 pub mod collection;
 pub mod db;
 pub mod export;
+pub mod gc;
 pub mod item;
 pub mod queue;
 pub mod store;
@@ -160,6 +161,13 @@ pub fn report(err: PimdirError) -> anyhow::Error {
         PimdirError::Owned(store) => {
             anyhow!(
                 "another process owns the store at {} (a sync is running?); retry once it releases",
+                store.display()
+            )
+        }
+        PimdirError::Staging(store) => {
+            anyhow!(
+                "a producer is staging a body in the store at {} (a frontend is open?); \
+                 retry once it is done",
                 store.display()
             )
         }

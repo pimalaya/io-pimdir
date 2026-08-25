@@ -30,7 +30,7 @@ This project is composed of 3 feature-gated layers:
 - **Crash-safe writes**: one transaction per batch, bodies durable before the rows that reference them, and blobs garbage collected inside it.
 - **Retention**: a removal retires an item instead of destroying it, hidden from every read and from the sync, until an explicit purge reclaims it.
 - **Action queue**: processes that do not own the store request mutations by appending actions the owner applies exactly once, with parked failures queryable and collection generations carrying the handle-space epoch to readers.
-- **Operator CLI**: inspect a store while a sync is running, read the trash, restore or purge an item, prune the queue, check for orphan blobs and dump the whole store (requires the `cli` feature).
+- **Operator CLI**: inspect a store while a sync is running, read the trash, restore or purge an item, prune the queue, check consistency, collect what nothing references and dump the whole store (requires the `cli` feature).
 - **no_std core**: the schema, statements and encodings need no allocator beyond `alloc` and pull SQLite in only behind the `client` feature.
 
 > [!TIP]

@@ -608,14 +608,48 @@ WHERE i.object_hash IS NOT NULL \
 /// transaction is about to collect.
 pub const LIST_GARBAGE_OBJECTS: &str = "SELECT hash FROM objects WHERE refcount = 0";
 
-/// The same set with each object's size, for a purge that reports how many
-/// bytes it actually reclaimed.
-pub const LIST_GARBAGE_SIZED: &str = "SELECT hash, size FROM objects WHERE refcount <= 0";
+/// Every hash the index holds, for the collector to diff the blob tree against:
+/// a file this does not name is a body nothing references.
+pub const LIST_OBJECT_HASHES: &str = "SELECT hash FROM objects";
 
-/// Drops the unreferenced object rows inside the write transaction; their
+/// Drops the unreferenced object rows inside the collector's transaction; their
 /// blobs are unlinked after the commit, so a crash leaves at worst an orphan
 /// blob.
 pub const DELETE_GARBAGE_OBJECTS: &str = "DELETE FROM objects WHERE refcount <= 0";
+
+/// Recomputes every object's refcount from the four columns that pin one (spec
+/// §7): an item's body, an item's conflict copy, a source's stored base and a
+/// pending queue action's body.
+///
+/// The repair, not the write path: writes maintain the count incrementally with
+/// `ADJUST_REFCOUNT`, which is O(changes) where this is O(items+bindings+queue).
+/// The pointers are gathered into one stream and counted in a single grouped
+/// pass, so the cost is linear in them rather than in their product with the
+/// object table. The left join is what settles an object no pointer names any
+/// more: it counts zero rather than going unvisited. A row already holding its
+/// true count is left alone, so the statement writes only the drift it found,
+/// and reports how many rows that was.
+pub const RECOMPUTE_REFCOUNTS: &str = "\
+UPDATE objects SET refcount = counted.n \
+FROM ( \
+  SELECT o.hash AS hash, count(r.hash) AS n FROM objects o \
+  LEFT JOIN ( \
+    SELECT object_hash AS hash FROM items WHERE object_hash IS NOT NULL \
+    UNION ALL SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
+    UNION ALL SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
+    UNION ALL SELECT object_hash FROM queue WHERE object_hash IS NOT NULL \
+  ) r ON r.hash = o.hash \
+  GROUP BY o.hash \
+) AS counted \
+WHERE counted.hash = objects.hash AND objects.refcount != counted.n";
+
+/// Deletes the bindings whose item is gone, the one dangling row a repair can
+/// clear without guessing: a binding with no item is unreachable, where an item
+/// with no object row still holds the item.
+pub const DELETE_DANGLING_BINDINGS: &str = "\
+DELETE FROM bindings WHERE NOT EXISTS ( \
+  SELECT 1 FROM items i \
+  WHERE i.collection = bindings.collection AND i.link_id = bindings.link_id)";
 
 // The action queue (spec §15, `queries/queue.sql`): the write door for every
 // process that is not the store owner. A producer appends; the owner applies
@@ -753,8 +787,10 @@ pub const ALL: &[(&str, &str)] = &[
     ("STORE_OBJECT", STORE_OBJECT),
     ("LOOKUP_OBJECTS", LOOKUP_OBJECTS),
     ("LIST_GARBAGE_OBJECTS", LIST_GARBAGE_OBJECTS),
-    ("LIST_GARBAGE_SIZED", LIST_GARBAGE_SIZED),
+    ("LIST_OBJECT_HASHES", LIST_OBJECT_HASHES),
     ("DELETE_GARBAGE_OBJECTS", DELETE_GARBAGE_OBJECTS),
+    ("RECOMPUTE_REFCOUNTS", RECOMPUTE_REFCOUNTS),
+    ("DELETE_DANGLING_BINDINGS", DELETE_DANGLING_BINDINGS),
     ("ENQUEUE_ACTION", ENQUEUE_ACTION),
     ("LIST_QUEUED_COLLECTIONS", LIST_QUEUED_COLLECTIONS),
     ("LOAD_PENDING_ACTIONS", LOAD_PENDING_ACTIONS),

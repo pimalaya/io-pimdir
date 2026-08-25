@@ -406,9 +406,18 @@ fn gc_never_sweeps_a_queued_body() {
         )
         .unwrap();
 
-    // The owner runs a write batch whose GC sweeps a genuinely orphaned body
-    // (the seeded item's, retired then purged out of retention): the queued
-    // body must survive it, pinned by its row.
+    // A collector cannot run while the producer holds its staging lock: the
+    // body it just wrote is pinned by nothing until the enqueue commits, and
+    // that window is the whole reason the lock exists.
+    assert!(matches!(
+        store.collect_garbage(),
+        Err(PimdirError::Staging(_))
+    ));
+    drop(producer);
+
+    // The owner retires and purges the seeded item, genuinely orphaning its
+    // body, and collects: the queued body must survive the sweep, pinned by
+    // its row.
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
@@ -417,7 +426,10 @@ fn gc_never_sweeps_a_queued_body() {
         }])
         .unwrap();
     assert!(store.purge(&inbox(), seeded_seq).unwrap());
-    assert!(!blob_exists(dir.path(), "cafebabe"), "the orphan is GC'd");
+
+    let collected = store.collect_garbage().unwrap();
+    assert_eq!((collected.objects, collected.blobs), (1, 1));
+    assert!(!blob_exists(dir.path(), "cafebabe"), "the orphan is taken");
     assert!(
         blob_exists(dir.path(), "beef0000"),
         "the queued body is not"
@@ -429,8 +441,8 @@ fn gc_never_sweeps_a_queued_body() {
     assert!(blob_exists(dir.path(), "beef0000"), "now the item pins it");
 
     // The hand-over was exact (+1 item, -1 queue): retiring and purging the
-    // item's only placement orphans the body, so it is swept, with no
-    // leaked queue pin.
+    // item's only placement orphans the body, so the next collection takes it,
+    // with no leaked queue pin.
     let seq = store.seq_for_link("INBOX", "mid:new").unwrap().unwrap();
     store
         .write(vec![ReplicaWriteOp::DropPlacement {
@@ -440,6 +452,7 @@ fn gc_never_sweeps_a_queued_body() {
         }])
         .unwrap();
     assert!(store.purge(&inbox(), seq).unwrap());
+    assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(!blob_exists(dir.path(), "beef0000"), "no refcount leak");
 }
 
@@ -524,6 +537,10 @@ fn an_acknowledged_action_releases_its_queued_body() {
 
     assert!(store.drop_action(id).unwrap());
     assert!(store.pending_actions("INBOX").unwrap().is_empty());
+    assert!(blob_exists(dir.path(), "beef0000"), "no write collects");
+
+    drop(producer);
+    assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(
         !blob_exists(dir.path(), "beef0000"),
         "the pin went with the row"

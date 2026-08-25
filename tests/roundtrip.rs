@@ -170,9 +170,17 @@ fn single_source_write_reopen_lookup_and_gc() {
     assert_eq!(retained.len(), 1);
     assert!(blob_exists(dir.path(), "cafebabe"), "the body is kept");
 
-    // Purging is what orphans the blob, and the sweep then unlinks it.
+    // Purging is what orphans the blob. It stays until a collector runs: a
+    // store never collects itself.
     assert!(store.purge(&inbox(), retained[0].seq).unwrap());
-    assert!(!blob_exists(dir.path(), "cafebabe"), "orphan blob GC'd");
+    assert!(blob_exists(dir.path(), "cafebabe"), "no write collects");
+
+    let collected = store.collect_garbage().unwrap();
+    assert_eq!((collected.objects, collected.blobs), (1, 1));
+    assert!(
+        !blob_exists(dir.path(), "cafebabe"),
+        "orphan blob collected"
+    );
 }
 
 #[test]
@@ -631,12 +639,15 @@ fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
         "blob kept while the second retained row still references it"
     );
 
-    // Purging the last orphans it, and the sweep unlinks it.
+    // Purging the last orphans it, and the collector is what unlinks it.
     let report = store.purge(&inbox(), retained[1].seq).unwrap();
     assert!(report);
+    assert!(blob_exists(dir.path(), "cafebabe"), "no purge collects");
+
+    store.collect_garbage().unwrap();
     assert!(
         !blob_exists(dir.path(), "cafebabe"),
-        "blob GC'd once its last referrer is purged"
+        "blob collected once its last referrer is purged"
     );
 }
 

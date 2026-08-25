@@ -19,10 +19,9 @@ are saved **by diffing the loaded hub against the absorbed one, touching only th
 items and bindings that changed** (never a whole-collection delete-and-reinsert);
 **object refcounts are maintained incrementally, applying only the per-hash
 difference between the hub's object references before and after the batch** (never
-a global recompute); zero-refcount objects are collected, their rows dropped
-inside the transaction and their blob files unlinked only after commit. An item
-the batch leaves held by no source is **retained, not deleted**, and keeps its
-object references pinned. The
+a global recompute). The batch reclaims nothing: see the collector below. An
+item the batch leaves held by no source is **retained, not deleted**, and keeps
+its object references pinned. The
 incremental refcount is cross-collection correct: a batch adjusts a hash's count
 by this collection's change alone, leaving other collections' references counted.
 The write SHALL be O(changed rows), not O(collection size), so an incremental
@@ -550,3 +549,34 @@ The column is what makes the freeze survive a restart, and it has to: the second
 
 ### Requirement: A folded-in index is ensured on every open
 `ENSURE_INDEXES` SHALL run on open, not only when a column is missing. Most of these index columns that were always there: what changed is that a statement now needs them, and a store that kept the old plans would keep scanning where the schema says it seeks, silently and for good.
+
+### Requirement: A store never collects itself
+No write SHALL reclaim. `write`, `write_rekeyed`, the queue drain, a cancelled
+action and both purges maintain the refcounts exactly as before and delete
+nothing: an object at refcount zero is unreferenced, not deleted, and its body
+stays. That is what lets a consumer index a body in one batch and attach it in a
+later one, which SPEC §14 invites and a sweep at the end of every write silently
+broke, taking the bytes with it.
+
+`PimdirStore::collect_garbage` is the collector: it drops the object rows at
+refcount zero and unlinks every blob file the index does not name, which is those
+rows' own bodies and the orphans a crash left, reporting the rows, the files and
+the bytes. It takes the store's staging lock exclusively and runs on an owning
+handle, which already holds the owner lock; those two are what let it reclaim
+with no grace window, since neither an owner nor a producer can be mid-write
+while it sweeps. A period-prefixed temporary file belongs to a writer that has
+not committed and SHALL be left alone.
+
+Unreferenced objects accumulate until someone collects. A consumer that wants
+that bounded schedules the verb.
+
+### Requirement: The store repairs what it can recompute
+`recompute_refcounts` SHALL settle every object's count from the four columns
+that pin one (SPEC §7), returning how many disagreed, and
+`clear_dangling_bindings` SHALL delete the bindings whose item is gone, returning
+how many. Both recover a fact the store already holds.
+
+Every other dangling row stays reported and untouched: an item whose object row
+is missing is still the item, and a queue row whose body is missing is still an
+intent somebody expressed, so deleting either would destroy data rather than
+repair it.

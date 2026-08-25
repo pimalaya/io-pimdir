@@ -70,7 +70,7 @@ rather than failing. The action is in the queue by then, and the owner holding
 the store is the one that will drain it.
 
 ### Requirement: Terminal operations take the owner role directly
-Purge, queue cancellation and orphan-blob reclamation have no action kind and
+Purge, queue cancellation, repair and collection have no action kind and
 cannot be queued: they SHALL take the owner role directly, without naming a
 source, and fail if the role is unavailable. When another process owns the
 store, or another writer holds its write lock, the CLI SHALL report it as a
@@ -78,16 +78,17 @@ plain sentence naming the likely cause (a running sync) and never as a raw SQL
 or debug error dump.
 
 ### Requirement: Destroying data is confirmed
-`item purge`, `queue cancel` and the orphan-blob sweep SHALL confirm
-interactively before destroying anything, stating what will be destroyed (how
-many items, how many bytes) whenever the store can tell. `--yes` SHALL skip the
-confirmation. When the output is not a terminal, or `--json` is set, the CLI
-SHALL refuse to proceed without `--yes` rather than prompt into a pipe.
+`item purge` and `queue cancel` SHALL confirm interactively before destroying
+anything, stating what will be destroyed (how many items, how many bytes)
+whenever the store can tell. `--yes` SHALL skip the confirmation. When the output
+is not a terminal, or `--json` is set, the CLI SHALL refuse to proceed without
+`--yes` rather than prompt into a pipe.
 
-The orphan sweep carries one further guard: a body is written to the blob store
-*before* the row referencing it, so a file that has just appeared may belong to
-a write in flight. The sweep SHALL therefore leave orphans younger than a grace
-period alone, and that period SHALL be operator-visible.
+`gc` and `check --fix` SHALL NOT ask. A collection destroys nothing a caller
+could want: it takes what the index says nothing references, under the locks that
+prove nobody is mid-write, and a store that asks before doing its routine
+housekeeping teaches an operator to answer yes without reading. A repair destroys
+nothing at all.
 
 ### Requirement: A listing never truncates silently
 Every paged listing SHALL state what it omitted and the cursor to continue
@@ -115,8 +116,11 @@ The CLI SHALL expose, at minimum:
 - `queue cancel`: drop one queue row by id.
 - `store info`: schema version, sources, per-collection live and retained
   counts, object count and bytes live versus retained.
-- `check`: orphan blob files, refcount drift and dangling references, with an
-  optional sweep of the orphans.
+- `check`: object rows whose body is missing, refcount drift, dangling
+  references and orphan blob files, with `--fix` repairing the drift and the
+  dangling bindings.
+- `gc`: reclaim the object rows nothing references, their bodies, and the orphan
+  blob files a crash left, reporting what it freed.
 - `export`: a portable dump of the store.
 
 Every command SHALL render as JSON under `--json`, write logs to stderr only,
@@ -132,9 +136,11 @@ observes. No other verb may bypass the library API.
 
 The drift check SHALL count exactly what the write path maintains: an item's
 body, an item's conflict copy, each source's stored base, and each queue row
-pinning a body. Drift and dangling rows SHALL be reported and never repaired
-automatically, since a wrong repair is worse than a reported inconsistency;
-orphan blob files are the one exception, being reclaimable without a guess.
+pinning a body. `--fix` SHALL repair only what the store can recompute from what
+it already holds: the drifted counts, and the bindings whose item is gone. Every
+other dangling row SHALL be reported and left alone, since a wrong repair is
+worse than a reported inconsistency, and reclaiming is not repairing: a body is
+`gc`'s to take.
 
 ### Requirement: The dump carries metadata and bytes, nothing derived
 `export` SHALL write a manifest describing the store and its collections, one

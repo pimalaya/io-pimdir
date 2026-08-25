@@ -223,11 +223,6 @@ const SUBSTITUTED: &[&str] = &[
     // is identical, and the diffed form is what keeps an item's `sort_key`
     // (§9.3) without having to carry it back out through `LOAD_ITEMS`.
     "DELETE_ITEMS",
-    // The reference refcount repair, a full O(items+bindings+queue) recompute
-    // from the pointer tables. This crate uses `ADJUST_REFCOUNT`, the per-hash
-    // net-change form the spec offers alongside it, which is O(changes). §7's
-    // invariant binds, not the form.
-    "RECOMPUTE_REFCOUNTS",
 ];
 
 #[test]

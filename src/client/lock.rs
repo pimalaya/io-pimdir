@@ -80,6 +80,25 @@ impl PimdirLock {
         Ok(lock)
     }
 
+    /// Takes the store's staging lock exclusively: the collector's half of the
+    /// pairing below.
+    ///
+    /// A producer holds this lock for as long as its handle lives, so a
+    /// collector that waited would wait on a program's lifetime rather than on
+    /// an operation: it reports [`PimdirError::Staging`] instead, and the
+    /// operator retries when the frontend is done. The owner side needs no
+    /// separate acquisition: a collector runs on an owning handle, which
+    /// already holds the owner lock, so no other owner can be writing while it
+    /// sweeps.
+    pub fn collect(dir: &Path) -> Result<Self, PimdirError> {
+        let file = open(&dir.join(OBJECTS))?;
+        FileExt::try_lock(&file).map_err(|_| PimdirError::Staging(dir.to_path_buf()))?;
+        Ok(Self {
+            _file: file,
+            registered: None,
+        })
+    }
+
     /// Takes the store's shared staging lock: any number of producers hold it
     /// at once, and a collector holds it exclusively.
     ///

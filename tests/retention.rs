@@ -231,6 +231,7 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     store.write(vec![drop_placement("9")]).unwrap();
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert!(store.purge(&inbox(), seq).unwrap());
+    assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(!blob_exists(dir.path(), "cafebabe"), "no refcount leak");
 }
 
@@ -306,6 +307,7 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
     store.write(vec![drop_placement("1")]).unwrap();
     assert!(store.purge(&inbox(), seq_a).unwrap());
     assert_eq!(store.count_retained(&inbox()).unwrap(), 0);
+    assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(
         !blob_exists(dir.path(), "cafebabe"),
         "the last reference went with the row"
@@ -351,12 +353,14 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     let report = store
         .purge_retained_before("2020-01-01T00:00:00.000Z")
         .unwrap();
-    assert_eq!((report.items, report.bytes), (0, 0));
+    assert_eq!(report.items, 0);
     assert_eq!(store.count_retained(&inbox()).unwrap(), 3);
 
     // Strictly before: the item retired exactly at the cutoff is kept.
     let report = store.purge_retained_before(CUTOFF).unwrap();
-    assert_eq!((report.items, report.bytes), (1, 3), "only the January one");
+    assert_eq!(report.items, 1, "only the January one");
+    let collected = store.collect_garbage().unwrap();
+    assert_eq!((collected.blobs, collected.bytes), (1, 3));
     assert!(!blob_exists(dir.path(), "cafebabe"));
     let kept: Vec<String> = store
         .list_retained(&inbox(), None, 10)
@@ -372,9 +376,11 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     let report = store
         .purge_retained_before("2030-01-01T00:00:00.000Z")
         .unwrap();
-    assert_eq!((report.items, report.bytes), (2, 10));
+    assert_eq!(report.items, 2);
     assert_eq!(store.count_retained(&inbox()).unwrap(), 0);
     assert_eq!(store.retained_bytes().unwrap(), 0);
+    let collected = store.collect_garbage().unwrap();
+    assert_eq!((collected.blobs, collected.bytes), (2, 10));
     assert!(!blob_exists(dir.path(), "beef0000"));
     assert!(!blob_exists(dir.path(), "d0d00000"));
 }

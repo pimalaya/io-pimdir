@@ -6,11 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`pimdir gc`, the collector.** It drops the object rows nothing references, unlinks their bodies and the orphan blob files a crash left, and reports what it freed. It takes the owner role, so it never runs beside a sync, and reports a producer mid-append rather than waiting on one. A store that wants its unreferenced objects bounded schedules the verb.
+
 - **One owner, enforced (spec §8).** Every owning handle takes an exclusive advisory lock on the store directory and holds it for its lifetime; a second owner gets `PimdirError::Owned` immediately, naming the store, rather than the 30-second `busy_timeout` wait that used to end in a stall with no signal. The rule is about processes, so a two-sided sync or a multi-account owner opening several handles still holds one lock. Readers take none. Producers take a shared one, so several append at once while none of them keeps the owner out, and a body is never between the blob tree and the queue row that pins it while a collector runs. The kernel releases the lock with the process, so a crash leaves nothing to recover.
 
 - **`bindings.ambiguous_handles`**, the other handles a source holds one item's identity under. Folded into version 1 and reconciled on open, so a store written by an earlier draft gains it without a resync. `pimdir check` reports the bindings carrying any: not a defect, but the reason those items stop syncing, and an operator looking at a frozen item has no other way to see why.
 
 ### Fixed
+
+- **A body stored without a placement was destroyed at the end of the batch.** Every write swept the object rows at refcount zero and unlinked their blobs, so a consumer that streamed bodies into the blob tree and attached them in a later batch — which spec §14 invites, and which `STORE_OBJECT` inserting at refcount zero exists for — lost them silently, bytes included, before the batch that would have referenced them ran. No write collects any more; `pimdir gc` does.
 
 - **A body lookup crossed accounts.** `lookup_objects` resolved a link id against every collection in the store, so two accounts holding the same vCard `UID`, which spec §9.2 names as a thing unrelated servers do, handed each other's bodies across: the receiving sync then believed the item was hydrated and never fetched the real one. It is scoped to the caller's own account now, which is the axis a link id is trustworthy on; across collections it still answers, which is what the read exists for.
 
@@ -31,6 +35,10 @@ All notable changes to this project are documented in this file. The format is b
 - **`created_at` held epoch milliseconds** where the column is declared to hold an RFC 3339 timestamp, and the empty string when the clock predated the epoch. It is written by SQLite itself now, in the form the retirement clock already uses, which also keeps the crate free of a clock.
 
 ### Changed
+
+- **`check` diagnoses and `--fix` repairs; neither reclaims.** `--fix` used to delete orphan blob files behind a `--grace` window and a confirmation prompt, while every write swept with neither. Both flags are gone: it now recomputes the drifted refcounts from the pointers that justify them and clears the bindings whose item is gone, which destroys nothing and needs no guard. Orphan files are reported, and `pimdir gc` takes them.
+
+- **A purge reports the rows it retired, not the bytes it reclaimed.** It releases the references a retained item held; the bodies are freed by the collector, which is what can report them. `PimdirPurgeReport` loses its `bytes` field and `item purge` its byte count.
 
 - **`item restore` queues rather than fails when the store is owned.** It appends its action first and takes the owner role only to apply it, so a restore issued while a sync runs reports `queued` and is drained by the owner that holds the store, which is what the queue is for. Purge and `queue cancel` still need the role and still say so.
 
