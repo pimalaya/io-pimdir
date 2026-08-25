@@ -295,7 +295,7 @@ impl ItemRestoreCommand {
 
         // NOTE: taken before the enqueue, so an unresolvable write source fails
         // while nothing has been appended yet.
-        let mut owner = store.owner()?;
+        let mut owner = store.owner_as_source()?;
 
         let action = PimdirAction::Add {
             link_id: Some(ReplicaLinkId(item.link_id.clone())),
@@ -397,7 +397,7 @@ impl ItemPurgeCommand {
         confirm(printer, self.yes, &question)?;
 
         let purged = store
-            .owner_any_source()?
+            .owner()?
             .purge_retained_before(&cutoff)
             .map_err(report)?;
 
@@ -432,10 +432,7 @@ impl ItemPurgeCommand {
         )?;
 
         let collection = ReplicaCollectionId(found.collection.clone());
-        let purged = store
-            .owner_any_source()?
-            .purge(&collection, seq)
-            .map_err(report)?;
+        let purged = store.owner()?.purge(&collection, seq).map_err(report)?;
 
         if !purged {
             let collection = &found.collection;

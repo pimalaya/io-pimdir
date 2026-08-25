@@ -57,16 +57,18 @@ than re-writing a blob.
 ### Requirement: The write source is resolved before anything is enqueued
 A queued mutation is staged for one source, so the CLI SHALL resolve which
 source it writes as before appending anything: the `--source` flag when given,
-else the store's own source when it has exactly one, else a refusal naming the
-candidates. A store syncing several sources SHALL NOT be guessed at, since
-creating an item for the wrong side would push it to the wrong server.
+else the store's own source when it has exactly one, else a refusal: naming the
+candidates when there are several, asking for the flag when the store has synced
+none. A store syncing several sources SHALL NOT be guessed at, since creating an
+item for the wrong side would push it to the wrong server, and a store with no
+source at all offers no side to act as.
 
 ### Requirement: Terminal operations take the owner role directly
 Purge, queue cancellation and orphan-blob reclamation have no action kind and
-cannot be queued: they SHALL take the owner role directly and fail if it is
-unavailable. When another writer holds the store's write lock, the CLI SHALL
-report it as a plain sentence naming the likely cause (a running sync) and
-never as a raw SQL or debug error dump.
+cannot be queued: they SHALL take the owner role directly, without naming a
+source, and fail if the role is unavailable. When another writer holds the
+store's write lock, the CLI SHALL report it as a plain sentence naming the
+likely cause (a running sync) and never as a raw SQL or debug error dump.
 
 ### Requirement: Destroying data is confirmed
 `item purge`, `queue cancel` and the orphan-blob sweep SHALL confirm

@@ -236,8 +236,17 @@ fn every_inlined_statement_prepares() {
     // name check cannot see, and it would only surface when a consumer ran it.
     let conn = applied(sql::MIGRATION_0001);
 
+    // NOTE: the two DDL batches are several statements each, so they are run
+    // rather than prepared. Running them against the freshly applied schema is
+    // the stronger check anyway: it proves they are idempotent, which is the
+    // whole reason they exist.
     for (name, text) in sql::ALL {
         if *name == "MIGRATION_0001" {
+            continue;
+        }
+        if *name == "ENSURE_INDEXES" {
+            conn.execute_batch(text)
+                .unwrap_or_else(|err| panic!("`{name}` does not apply: {err:?}"));
             continue;
         }
         assert!(

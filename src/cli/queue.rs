@@ -132,10 +132,7 @@ impl QueueCancelCommand {
             &format!("Drop queued action {} for good?", self.id),
         )?;
 
-        let dropped = store
-            .owner_any_source()?
-            .drop_action(self.id)
-            .map_err(report)?;
+        let dropped = store.owner()?.drop_action(self.id).map_err(report)?;
 
         if !dropped {
             bail!("no queued action with id {}", self.id);

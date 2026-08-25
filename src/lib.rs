@@ -37,5 +37,5 @@ pub mod client;
 pub use client::{
     PimdirBlobWriter, PimdirBlobs, PimdirCollection, PimdirDrainReport, PimdirError, PimdirItem,
     PimdirParkedAction, PimdirPendingAction, PimdirProducer, PimdirPurgeReport, PimdirRetainedItem,
-    PimdirStore,
+    PimdirSourceStore, PimdirStore,
 };

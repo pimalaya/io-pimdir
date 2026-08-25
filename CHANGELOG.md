@@ -4,7 +4,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`bindings.ambiguous_handles`**, the other handles a source holds one item's identity under. Folded into version 1 and reconciled on open, so a store written by an earlier draft gains it without a resync. `pimdir check` reports the bindings carrying any: not a defect, but the reason those items stop syncing, and an operator looking at a frozen item has no other way to see why.
+
 ### Fixed
+
+- **A body lookup crossed accounts.** `lookup_objects` resolved a link id against every collection in the store, so two accounts holding the same vCard `UID`, which spec §9.2 names as a thing unrelated servers do, handed each other's bodies across: the receiving sync then believed the item was hydrated and never fetched the real one. It is scoped to the caller's own account now, which is the axis a link id is trustworthy on; across collections it still answers, which is what the read exists for.
+
+- **A base of no revision, no body and unread markers round-tripped as no base at all**, so an agreed placement read as never-agreed and the sync re-derived the same push on every run. `bindings.base_present` records the fact its three value columns cannot express; those columns stay a witness for rows written before it.
+
+- **A write silently repointed a binding to another handle, and the evidence went with it.** A binding pins one handle, so a source holding one link id twice (a double delivery, a retried append, a restore, a migration) had nowhere to put the second copy: the write repointed the binding, and no layer above could afterwards tell the source held the identity twice. Deleting the bound copy then propagated a delete that removed the only copy on a source nobody touched. The bound handle now stays and the incoming one is recorded, which freezes the item until the source holds the identity once again.
 
 - **A write carrying a new sort key silently discarded it.** The diff that decides whether a row needs an `UPDATE` compared every column the statement writes except `sort_key`, so a key that changed and nothing else reported the row unchanged and no statement was issued. A key is derived rather than given, and a connector fixing its derivation, a tzdb update moving a zoned start, or the second source of a two-source sync all restate one; the item stayed where the first derivation put it, for good. The suite missed it because it only covered the other half of the invariant, that a write carrying no key must leave the stored one alone.
 
@@ -20,9 +30,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **A store handle names a source only where an operation acts as one.** `PimdirStore::open(dir)` and `open_read_only(dir)` take no source, and `for_source(source)` yields `PimdirSourceStore`, which carries the storage seam, the rekeyed write and the queue drain, and dereferences to the store for everything else. Breaking: the constructors lose a parameter. Purge, queue cancellation and every read consulted no source but had to be handed one anyway, so the CLI invented `"pimdir"` for its readers and scanned `bindings` for a name it then discarded. Both are gone, and a store an operator reads and sweeps now records no source at all.
+
+- **`io-replica` is a path dependency** until the release carrying `ReplicaStatus::Ambiguous` is published; it becomes a version dependency again at that point. Taking those types meant taking the rest of the engine's new API with them: `load` carries a scope, `DropPlacement` carries a reason, and `ReplicaCollection` is gone.
+
 - **A write reads only the rows its batch names.** Folding a batch into a collection loaded, cloned and diffed the whole collection, so the cost of one flag on one message was the size of the mailbox: measured 3.5 ms at a thousand items, 13 ms at four thousand, 59 ms at sixteen thousand, cleanly linear, against a promise of hundreds of thousands. The read is now scoped to the link ids the batch carries, with each dropped handle resolved through the new `bindings_by_handle` index, and the same measurement is flat at 150 to 175 µs across that range.
 
 - **The residual is keyed rather than listed.** A first sync probes a whole collection before linking any of it, so the list grew to the collection size while every insertion, drop and lookup searched it linearly.
+
+- **The drain answers its point questions with point reads.** The `Add` collision check, the handle lookup and the mutation it drives each loaded the whole collection, once per drained action.
+
+- **`release_pins` is one statement** rather than one per hash: a purge of fifty thousand retained items was a hundred thousand point updates inside one transaction.
 
 - The object sweep tests `refcount <= 0`, so a count a double release drove negative is collected rather than leaking for ever with nothing reporting it.
 

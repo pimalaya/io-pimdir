@@ -500,9 +500,7 @@ dependencies = [
 
 [[package]]
 name = "io-replica"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a46462f7385c1f2626263e192a65f2ef08569808e0e2fbb7892282c0a64c1a1"
+version = "0.4.2"
 dependencies = [
  "log",
  "thiserror",

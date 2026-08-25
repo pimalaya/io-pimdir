@@ -6,11 +6,11 @@
 use std::{io::Write, path::Path};
 
 use io_pimdir::{
-    PimdirBlobs, PimdirError, PimdirProducer, PimdirStore, codec::PimdirAction,
+    PimdirBlobs, PimdirError, PimdirProducer, PimdirSourceStore, PimdirStore, codec::PimdirAction,
     hash::PimdirHashAlgo, sql,
 };
 use io_replica::{
-    change::ReplicaWriteOp,
+    change::{ReplicaDropReason, ReplicaWriteOp},
     client::ReplicaStorage,
     collection::ReplicaCollectionId,
     object::{ReplicaHash, ReplicaObject},
@@ -18,6 +18,7 @@ use io_replica::{
         ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
         ReplicaPlacement, ReplicaStatus,
     },
+    storage::ReplicaLoadScope,
 };
 
 const NOW: &str = "2026-08-07T00:00:00Z";
@@ -46,6 +47,7 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPla
             object: Some(ReplicaHash(hash.into())),
         }),
         origin: None,
+        ambiguous_handles: Vec::new(),
     }
 }
 
@@ -68,8 +70,8 @@ fn blob_exists(dir: &Path, hash: &str) -> bool {
 }
 
 /// Seeds a one-item INBOX and returns `(store, seq)` for the item.
-fn seeded(dir: &Path) -> (PimdirStore, i64) {
-    let mut store = PimdirStore::open(dir, "local").unwrap();
+fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
@@ -131,7 +133,10 @@ fn a_queued_add_round_trips_into_a_staged_item() {
 
     // Projected as a pending, base-less push for the sync layer to derive
     // (the same shape a staged in-process Add projects).
-    let projected = store.load(&inbox()).unwrap().placements;
+    let projected = store
+        .load(&inbox(), &ReplicaLoadScope::All)
+        .unwrap()
+        .placements;
     let created = projected
         .iter()
         .find(|p| p.link_id.as_ref().is_some_and(|l| l.0 == "mid:new"))
@@ -209,7 +214,10 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
 
     // Hidden from reads, kept as a tombstone for the sync to push.
     assert!(store.get_item("INBOX", seq).unwrap().is_none());
-    let projected = store.load(&inbox()).unwrap().placements;
+    let projected = store
+        .load(&inbox(), &ReplicaLoadScope::All)
+        .unwrap()
+        .placements;
     assert_eq!(projected[0].status, ReplicaStatus::Tombstone);
 
     // Removing it again is success (idempotent), not a park.
@@ -224,7 +232,7 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
 #[test]
 fn copy_fills_the_target_and_move_also_empties_the_source() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"a"),
@@ -316,7 +324,10 @@ fn update_repoints_the_body() {
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert!(blob_exists(dir.path(), "beef0000"));
     // Projected dirty, so the next sync pushes the edit.
-    let projected = store.load(&inbox()).unwrap().placements;
+    let projected = store
+        .load(&inbox(), &ReplicaLoadScope::All)
+        .unwrap()
+        .placements;
     assert_eq!(projected[0].status, ReplicaStatus::Dirty);
 }
 
@@ -402,6 +413,7 @@ fn gc_never_sweeps_a_queued_body() {
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
             handle: ReplicaHandle("1".into()),
+            reason: ReplicaDropReason::Deleted,
         }])
         .unwrap();
     assert!(store.purge(&inbox(), seeded_seq).unwrap());
@@ -424,6 +436,7 @@ fn gc_never_sweeps_a_queued_body() {
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
             handle: ReplicaHandle("draft-1".into()),
+            reason: ReplicaDropReason::Deleted,
         }])
         .unwrap();
     assert!(store.purge(&inbox(), seq).unwrap());
@@ -554,7 +567,7 @@ fn a_failed_action_retries_until_it_is_parked() {
 #[test]
 fn a_generation_bump_is_visible_to_a_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     // The epoch starts at 1 and ordinary writes never bump it.
@@ -578,6 +591,9 @@ fn a_generation_bump_is_visible_to_a_reader() {
                 ReplicaWriteOp::DropPlacement {
                     collection: inbox(),
                     handle: ReplicaHandle("1".into()),
+                    // NOTE: a rekey replaces the row, it does not delete the
+                    // item; the same batch upserts it under its new handle.
+                    reason: ReplicaDropReason::Superseded,
                 },
                 ReplicaWriteOp::UpsertPlacement(rekeyed),
             ],
@@ -586,7 +602,7 @@ fn a_generation_bump_is_visible_to_a_reader() {
     assert_eq!(generation, 2);
 
     // A second reader handle over the same files observes the new epoch.
-    let reader = PimdirStore::open(dir.path(), "local").unwrap();
+    let reader = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(reader.generation("INBOX").unwrap(), Some(2));
     let collections = reader.list_collections().unwrap();
     assert_eq!(collections[0].generation, 2);
@@ -601,7 +617,7 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
     // A fresh store lands at the current draft schema version, with
     // `user_version` and `store_meta.version` in agreement.
     {
-        let _store = PimdirStore::open(dir.path(), "local").unwrap();
+        let _store = PimdirStore::open(dir.path()).unwrap();
         let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
         let user_version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -626,9 +642,9 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
     // read-only reader (which additionally refuse any version but the
     // current one).
     for result in [
-        PimdirStore::open(dir.path(), "local").map(drop),
+        PimdirStore::open(dir.path()).map(drop),
         PimdirProducer::open(dir.path(), "test").map(drop),
-        PimdirStore::open_read_only(dir.path(), "local").map(drop),
+        PimdirStore::open_read_only(dir.path()).map(drop),
     ] {
         match result {
             Err(PimdirError::Version { found }) => assert_eq!(found, sql::VERSION + 1),

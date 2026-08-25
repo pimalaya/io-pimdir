@@ -44,7 +44,10 @@ anyhow = { version = "1", default-features = false, features = ["std"], optional
 blake3 = { version = "1", default-features = false }
 clap = { version = "4.4", features = ["derive", "wrap_help"], optional = true }
 humantime = { version = "2.2", optional = true }
-io-replica = "0.4"
+# NOTE: a path dep until the release carrying `ReplicaStatus::Ambiguous` and
+# `ambiguous_handles` is published, at which point this becomes a version dep
+# again (the pattern this org uses for an extracted-but-unpublished lib).
+io-replica = { path = "../io-replica" }
 log = { version = "0.4", default-features = false, optional = true }
 pimalaya-cli = { version = "0.2", default-features = false, optional = true }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"], optional = true }

@@ -3,7 +3,7 @@
 //! Each module owns one group of subcommands ([`collection`], [`item`],
 //! [`queue`], [`store`], [`check`], [`export`]) and renders its own output as
 //! both text and JSON. This module holds what they share: the global store
-//! flags, the three roles a verb may open the store with, the human-facing
+//! flags, the roles a verb may open the store with, the human-facing
 //! error mapping, the confirmation prompt guarding destructive verbs and the
 //! small formatting helpers.
 //!
@@ -27,7 +27,7 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
-use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirStore};
+use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirSourceStore, PimdirStore};
 use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
 
 use crate::cli::db::PimdirDb;
@@ -36,11 +36,6 @@ use crate::cli::db::PimdirDb;
 /// operator reading `queue list` can tell CLI-originated actions apart from a
 /// frontend's.
 pub const PRODUCER: &str = "pimdir-cli";
-
-/// The source name used when the store has no binding to name one (a brand new
-/// or fully emptied store): reads never depend on it, and a write attributed to
-/// it is still a legitimate local creation.
-pub const FALLBACK_SOURCE: &str = "pimdir";
 
 /// Where the store is and which source to act as, shared by every command.
 #[derive(Debug, Args)]
@@ -56,9 +51,9 @@ pub struct StoreFlags {
     /// Act as this source rather than the store's own.
     ///
     /// A store records one source per side it syncs with (`left`, `right`,
-    /// `phone`, …). Reads do not depend on it. A write does, so when a store
-    /// syncs several sources this flag says which one a restored item is
-    /// created for; a single-source store needs no flag.
+    /// `phone`, …). Only a verb that writes as a side reads this flag, which
+    /// today is `item restore`: it says which source the restored item is
+    /// created for. A single-source store needs no flag.
     #[arg(long, global = true, value_name = "NAME")]
     pub source: Option<String>,
 }
@@ -87,46 +82,34 @@ impl StoreFlags {
     /// run while a sync holds the write lock.
     pub fn read(&self) -> Result<PimdirStore> {
         self.ensure_store()?;
-        let source = self
-            .source
-            .clone()
-            .unwrap_or_else(|| FALLBACK_SOURCE.into());
-        PimdirStore::open_read_only(&self.store, source).map_err(report)
+        PimdirStore::open_read_only(&self.store).map_err(report)
     }
 
     /// Opens the store as its owner, for a verb whose effect is not tied to one
     /// source (purge, queue cancellation, orphan sweep).
-    ///
-    /// The source is taken from the flag, else from the store's own bindings,
-    /// else from the fallback; an ambiguity is harmless here, so it never asks.
-    pub fn owner_any_source(&self) -> Result<PimdirStore> {
-        let source = match &self.source {
-            Some(source) => source.clone(),
-            None => self
-                .read()?
-                .distinct_sources()
-                .map_err(report)?
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| FALLBACK_SOURCE.into()),
-        };
-        PimdirStore::open(&self.store, source).map_err(report)
+    pub fn owner(&self) -> Result<PimdirStore> {
+        self.ensure_store()?;
+        PimdirStore::open(&self.store).map_err(report)
     }
 
-    /// Opens the store as its owner for a verb whose effect *is* tied to a
-    /// source (draining a queued mutation stages it for that source).
+    /// Opens the store as its owner acting as one source, for a verb whose
+    /// effect *is* tied to a side (draining a queued mutation stages it for
+    /// that source).
     ///
     /// A store syncing several sources without `--source` is refused rather
     /// than guessed: creating an item for the wrong side would push it to the
-    /// wrong server.
-    pub fn owner(&self) -> Result<PimdirStore> {
+    /// wrong server. A store that has synced no source at all is refused too,
+    /// since there is no side to act as.
+    pub fn owner_as_source(&self) -> Result<PimdirSourceStore> {
         let source = match &self.source {
             Some(source) => source.clone(),
             None => {
                 let sources = self.read()?.distinct_sources().map_err(report)?;
                 match sources.len() {
-                    0 => FALLBACK_SOURCE.into(),
                     1 => sources.into_iter().next().unwrap(),
+                    0 => bail!(
+                        "this store syncs no source yet: name the one to write as with --source"
+                    ),
                     _ => bail!(
                         "this store syncs several sources ({}): pick the one to write as with --source",
                         sources.join(", ")
@@ -134,7 +117,7 @@ impl StoreFlags {
                 }
             }
         };
-        PimdirStore::open(&self.store, source).map_err(report)
+        Ok(self.owner()?.for_source(source))
     }
 
     /// Opens the store as a producer: the enqueue-only role, which never needs
@@ -147,7 +130,7 @@ impl StoreFlags {
     /// The blob directory handle, for reading a body back, bound to the hash
     /// the store names its bodies by.
     pub fn blobs(&self) -> Result<PimdirBlobs> {
-        let store = PimdirStore::open_read_only(&self.store, PRODUCER).map_err(report)?;
+        let store = PimdirStore::open_read_only(&self.store).map_err(report)?;
         Ok(store.blobs())
     }
 

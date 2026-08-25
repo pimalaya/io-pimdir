@@ -25,7 +25,7 @@ use serde::Serialize;
 
 use crate::cli::{
     StoreFlags, bytes, confirm,
-    db::{PimdirDangling, PimdirRefcountDrift},
+    db::{PimdirAmbiguous, PimdirDangling, PimdirRefcountDrift},
 };
 
 /// How many entries of each kind the text output prints before summarising the
@@ -86,6 +86,7 @@ impl CheckCommand {
 
         let drift = db.refcount_drift()?;
         let dangling = db.dangling()?;
+        let ambiguous = db.ambiguous_bindings()?;
 
         let mut removed = 0;
         let mut reclaimed = 0;
@@ -134,6 +135,7 @@ impl CheckCommand {
             missing,
             drift,
             dangling,
+            ambiguous,
             removed,
             reclaimed,
         })
@@ -210,6 +212,8 @@ pub struct CheckOutput {
     pub drift: Vec<PimdirRefcountDrift>,
     /// Rows pointing at something absent.
     pub dangling: Vec<PimdirDangling>,
+    /// Identities a source holds more than once, so their items are frozen.
+    pub ambiguous: Vec<PimdirAmbiguous>,
     /// Orphan files deleted by `--fix`.
     pub removed: usize,
     /// Bytes those files freed.
@@ -282,6 +286,23 @@ impl fmt::Display for CheckOutput {
                 )?;
             }
             more(f, self.dangling.len())?;
+        }
+
+        if !self.ambiguous.is_empty() {
+            writeln!(
+                f,
+                "{} identity/identities a source holds more than once, whose items \
+                 do not sync until it holds them once again:",
+                self.ambiguous.len()
+            )?;
+            for ambiguous in self.ambiguous.iter().take(SHOWN) {
+                writeln!(
+                    f,
+                    " - {}/{} on {}: {} copies",
+                    ambiguous.collection, ambiguous.link_id, ambiguous.source, ambiguous.copies,
+                )?;
+            }
+            more(f, self.ambiguous.len())?;
         }
 
         if self.removed > 0 {

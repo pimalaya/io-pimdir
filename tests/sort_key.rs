@@ -6,7 +6,7 @@
 //! forces every consumer to scan a whole collection to show fifty rows, and a
 //! store that cannot rename forces a full re-download to change one string.
 
-use io_pimdir::PimdirStore;
+use io_pimdir::{PimdirSourceStore, PimdirStore};
 use io_replica::{
     change::ReplicaWriteOp,
     client::ReplicaStorage,
@@ -15,6 +15,7 @@ use io_replica::{
         ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaPlacement,
         ReplicaSortKey, ReplicaStatus,
     },
+    storage::ReplicaLoadScope,
 };
 use tempfile::tempdir;
 
@@ -32,13 +33,14 @@ fn placement(collection: &str, handle: &str, link_id: &str) -> ReplicaPlacement 
         conflict_revision: None,
         base: None,
         origin: None,
+        ambiguous_handles: Vec::new(),
     }
 }
 
 /// Writes `items` as `(handle, link_id, sort_key)` into `collection`, staging
 /// them through the storage seam and then restating their keys the way a
 /// consumer does while the engine does not carry one inline.
-fn seed(store: &mut PimdirStore, collection: &str, items: &[(&str, &str, &str)]) {
+fn seed(store: &mut PimdirSourceStore, collection: &str, items: &[(&str, &str, &str)]) {
     let ops = items
         .iter()
         .map(|(handle, link, _)| {
@@ -67,7 +69,7 @@ fn a_page_is_total_in_both_directions_across_a_tie() {
     // alone does exactly that, and the bug only appears when a limit happens to
     // split a tie, which is why it is worth pinning.
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(
@@ -120,7 +122,7 @@ fn an_unknown_key_sorts_last_descending_and_first_ascending() {
     // at the end of a newest-first mail listing, where an unresolved row belongs,
     // and at the head of an A-to-Z contact listing, where it is visible.
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(
@@ -156,7 +158,7 @@ fn an_ordinary_write_does_not_reset_a_sort_key() {
     // alone; if it did not, ordering would be wiped on every sync and a consumer
     // restating keys afterwards would race its own sync forever.
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(&mut store, "INBOX", &[("1", "a", "2026-08-01T10:00:00Z")]);
@@ -178,9 +180,10 @@ fn renaming_a_collection_carries_its_contents() {
     // the whole cache away. This is the operation that makes an account rename
     // or a server-side folder rename survivable.
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "remote")
+    let mut store = PimdirStore::open(dir.path())
         .unwrap()
-        .for_account("alice");
+        .for_account("alice")
+        .for_source("remote");
     store
         .ensure_collection("alice/INBOX", "message/rfc822")
         .unwrap();
@@ -207,7 +210,10 @@ fn renaming_a_collection_carries_its_contents() {
     // The binding followed too, which is what a sync needs: without it the next
     // pass would treat every item as new and re-download the collection.
     let loaded = store
-        .load(&ReplicaCollectionId("personal/INBOX".into()))
+        .load(
+            &ReplicaCollectionId("personal/INBOX".into()),
+            &ReplicaLoadScope::All,
+        )
         .expect("load the renamed collection");
     assert_eq!(loaded.placements.len(), 1);
     assert_eq!(loaded.placements[0].handle.0, "1");
@@ -220,7 +226,7 @@ fn a_key_written_by_a_placement_survives_a_later_write() {
     // any link drops it the item lands unsorted, and the failure is
     // invisible until a list comes back in the wrong order.
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     let mut placed = placement("INBOX", "1", "a");
@@ -236,7 +242,7 @@ fn a_key_written_by_a_placement_survives_a_later_write() {
     // key round-trips through `load`, so the update rewrites what was
     // already there rather than blanking it.
     let loaded = store
-        .load(&ReplicaCollectionId("INBOX".into()))
+        .load(&ReplicaCollectionId("INBOX".into()), &ReplicaLoadScope::All)
         .expect("load the collection");
     store
         .write(
@@ -263,7 +269,7 @@ fn a_write_carrying_a_new_sort_key_updates_the_stored_one() {
     // A write that carries a key and is otherwise unchanged must land it,
     // or the item stays where the first derivation put it for ever.
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(&mut store, "INBOX", &[("1", "a", "2026-08-01T10:00:00Z")]);
@@ -285,7 +291,7 @@ fn a_key_above_the_first_page_cursor_is_still_paged() {
     // A descending page that starts from one silently hides everything
     // above it, for ever, while the count still reports it.
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "remote").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(

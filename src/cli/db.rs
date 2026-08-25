@@ -42,6 +42,20 @@ pub struct PimdirRefcountDrift {
     pub expected: i64,
 }
 
+/// One binding whose source holds its identity under more than one handle, so
+/// the engine cannot say which copy a change belongs to and stops deriving.
+#[derive(Clone, Debug, Serialize)]
+pub struct PimdirAmbiguous {
+    /// The owning collection.
+    pub collection: String,
+    /// The identity held more than once.
+    pub link_id: String,
+    /// The source holding it more than once.
+    pub source: String,
+    /// How many copies of it that source holds.
+    pub copies: i64,
+}
+
 /// One row referencing something that is not there.
 #[derive(Clone, Debug, Serialize)]
 pub struct PimdirDangling {
@@ -166,6 +180,35 @@ impl PimdirDb {
             drifts.push(row?);
         }
         Ok(drifts)
+    }
+
+    /// The bindings holding an identity their source holds more than once, as
+    /// `(collection, link_id, source, handle count)`.
+    ///
+    /// Not a defect: two copies of one message is redundancy, and the store
+    /// records it rather than judging it. It is reported because it is the
+    /// reason those items stop syncing, and an operator looking at a frozen
+    /// item has no other way to see why.
+    pub fn ambiguous_bindings(&self) -> Result<Vec<PimdirAmbiguous>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT collection, link_id, source, \
+                    json_array_length(ambiguous_handles) + 1 \
+             FROM bindings WHERE ambiguous_handles IS NOT NULL \
+             ORDER BY collection, link_id, source",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PimdirAmbiguous {
+                collection: r.get(0)?,
+                link_id: r.get(1)?,
+                source: r.get(2)?,
+                copies: r.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Every row pointing at something absent: a binding whose item is gone, an

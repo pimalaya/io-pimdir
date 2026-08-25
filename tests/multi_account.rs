@@ -34,6 +34,7 @@ fn placement(collection: &str, handle: &str, link_id: &str, hash: &str) -> Repli
         conflict_revision: None,
         base: None,
         origin: None,
+        ambiguous_handles: Vec::new(),
     }
 }
 
@@ -54,18 +55,20 @@ fn batch(collection: &str, handle: &str, link_id: &str, hash: &str) -> Vec<Repli
 
 /// Two accounts, one mailbox each, both holding the same message.
 fn seed(dir: &std::path::Path) {
-    let mut work = PimdirStore::open(dir, "server")
+    let mut work = PimdirStore::open(dir)
         .unwrap()
-        .for_account("work");
+        .for_account("work")
+        .for_source("server");
     work.ensure_collection("work/INBOX", "message/rfc822")
         .unwrap();
     work.write(batch("work/INBOX", "1", "<news@x>", "beef"))
         .unwrap();
     drop(work);
 
-    let mut home = PimdirStore::open(dir, "server")
+    let mut home = PimdirStore::open(dir)
         .unwrap()
-        .for_account("home");
+        .for_account("home")
+        .for_source("server");
     home.ensure_collection("home/INBOX", "message/rfc822")
         .unwrap();
     home.write(batch("home/INBOX", "9", "<news@x>", "beef"))
@@ -77,7 +80,7 @@ fn collections_carry_their_account() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
 
-    let store = PimdirStore::open(dir.path(), "server").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(store.list_accounts().unwrap(), ["home", "work"]);
 
     let work = store.list_collections_by_account(Some("work")).unwrap();
@@ -92,7 +95,7 @@ fn collections_carry_their_account() {
 #[test]
 fn an_ungrouped_store_is_the_null_bucket() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "server").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("server");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store.write(batch("INBOX", "1", "<a@x>", "beef")).unwrap();
 
@@ -110,7 +113,7 @@ fn the_account_partitions_no_identifier() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
 
-    let store = PimdirStore::open(dir.path(), "server").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
     let placements = store.link_placements("<news@x>").unwrap();
     assert_eq!(placements.len(), 2);
 
@@ -128,7 +131,7 @@ fn multiplicity_is_reported_on_both_axes() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
 
-    let store = PimdirStore::open(dir.path(), "server").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
 
     // The identity axis: where this link id occurs, account included.
     let by_link = store.link_placements("<news@x>").unwrap();
@@ -162,7 +165,7 @@ fn regrouping_a_collection_disturbs_nothing() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
 
-    let store = PimdirStore::open(dir.path(), "server").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
     let before = store.link_placements("<news@x>").unwrap();
 
     store
@@ -191,9 +194,10 @@ fn a_sync_declaring_a_kind_never_moves_a_collection() {
 
     // A handle bound to another account re-declaring the kind must not steal
     // the collection: set_collection_kind updates the kind alone.
-    let other = PimdirStore::open(dir.path(), "server")
+    let other = PimdirStore::open(dir.path())
         .unwrap()
-        .for_account("home");
+        .for_account("home")
+        .for_source("server");
     other.ensure_collection("work/INBOX", "text/vcard").unwrap();
 
     assert_eq!(
@@ -209,9 +213,75 @@ fn a_sync_declaring_a_kind_never_moves_a_collection() {
 #[test]
 fn an_unknown_collection_has_no_account() {
     let dir = tempfile::tempdir().unwrap();
-    let store = PimdirStore::open(dir.path(), "server").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
 
     // The outer None is "no such collection", distinct from Some(None), which
     // is "exists, ungrouped".
     assert_eq!(store.collection_account("nope").unwrap(), None);
+}
+
+#[test]
+fn a_body_lookup_never_crosses_an_account() {
+    // Spec §9.2 names the case: two unrelated servers may mint the same
+    // identity. Answering a body lookup with the other account's object hands
+    // one account's content to the other's sync, which then believes the item
+    // is hydrated and never fetches the real one.
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut work = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_account("work")
+        .for_source("server");
+    work.ensure_collection("work/AB", "text/vcard").unwrap();
+    work.write(batch("work/AB", "1", "uid-collide", "aaaabbbb"))
+        .unwrap();
+
+    // home holds the same identity, with a different body and no body cached.
+    let home = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_account("home")
+        .for_source("server");
+    home.ensure_collection("home/AB", "text/vcard").unwrap();
+
+    let found = home
+        .lookup_objects(&[ReplicaLinkId("uid-collide".into())])
+        .unwrap();
+    assert!(
+        found.is_empty(),
+        "home has no body for this identity; work's is not an answer: {found:?}",
+    );
+
+    // The same lookup within the owning account still answers, which is what
+    // the read exists for.
+    let found = work
+        .lookup_objects(&[ReplicaLinkId("uid-collide".into())])
+        .unwrap();
+    assert_eq!(found.len(), 1);
+}
+
+#[test]
+fn a_body_lookup_still_dedups_across_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_account("work")
+        .for_source("server");
+    store
+        .ensure_collection("work/INBOX", "message/rfc822")
+        .unwrap();
+    store
+        .ensure_collection("work/Archive", "message/rfc822")
+        .unwrap();
+    store
+        .write(batch("work/INBOX", "1", "<msg@x>", "beef"))
+        .unwrap();
+
+    let found = store
+        .lookup_objects(&[ReplicaLinkId("<msg@x>".into())])
+        .unwrap();
+    assert_eq!(
+        found.len(),
+        1,
+        "one message filed in two mailboxes is one body, downloaded once",
+    );
 }

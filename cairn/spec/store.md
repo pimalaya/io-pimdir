@@ -44,11 +44,19 @@ immutable once written, so an identical body delivered twice is stored once.
 `PimdirBlobs` reads a blob independently of the SQLite connection, so a body can
 be read while the store is mutably borrowed to service a sync.
 
+### Requirement: A handle names a source only where an operation acts as one
+`PimdirStore::open(dir)` and `PimdirStore::open_read_only(dir)` SHALL take no source. The handle they return serves what an operation means for the store as a whole: every client read, retention and its purges, the queue rows a cancellation or an acknowledgement removes, and the collection generations. None of those consult a source, and none SHALL require one to be named.
+
+`for_source(source)` SHALL yield the source-bound handle (`PimdirSourceStore`), which carries the io-replica storage seam (`load` / `lookup_objects` / `write`), the rekeyed write and the queue drain: the operations that mean "as this side". It SHALL dereference to the source-less handle, so the store-wide surface stays reachable through it, and a caller that named no source SHALL NOT be able to reach the source-bound one.
+
+No API SHALL invent a source name to satisfy a constructor. A store an operator reads, sweeps and purges therefore records no source, and `distinct_sources` on it stays empty.
+
 ### Requirement: Several sources share one store
 A store MAY be opened as several source handles (`"left"`, `"right"`, …) over the
-same files; each services the seam for its own source, and the shared database is
-the multi-source hub. `load_hub` reads a collection's whole hub (every source's
-bindings) for a consumer that projects each side.
+same files, each made by binding an open store to a source; each services the seam
+for its own source, and the shared database is the multi-source hub. `load_hub`
+reads a collection's whole hub (every source's bindings) for a consumer that
+projects each side.
 
 ### Requirement: Collections declare a media type
 A collection SHALL carry a `kind` (an IANA media type). `ensure_collection` sets
@@ -217,11 +225,12 @@ source without configuration — a store synced as a single source returns exact
 one. This is a kind-agnostic read; it never mutates.
 
 ### Requirement: A reader can open the store read-only
-`PimdirStore::open_read_only(dir, source)` SHALL open an existing store with
+`PimdirStore::open_read_only(dir)` SHALL open an existing store with
 `SQLITE_OPEN_READ_ONLY`: it never creates the schema (that is the owner's
 opening write), and refuses a schema version other than the current one with
 the version error. The returned handle exposes the full read surface; any write
-through it fails at the SQLite layer.
+through it fails at the SQLite layer, whether the write is reached directly or
+through the source-bound handle it yields.
 
 ### Requirement: Reads are availability-aware
 A read result SHALL carry each item's detail `level` (`Probed`/`Meta`/`Full`), so
@@ -493,3 +502,23 @@ Writing a blob SHALL sync the shard directory after the rename. Syncing the file
 
 ### Requirement: An unreadable flag set holds no opinion
 A `flags` column this crate cannot decode SHALL read as unknown, never as a known-empty set. Malformed JSON is a column written by something whose format this does not share, or a corrupted one, and neither is evidence about the item's markers. Reading it as known-empty makes it an authoritative "this item carries no markers", which the merge takes as one side's opinion: it clears every marker the other side reports and persists the result, so a read failure becomes permanent loss.
+
+### Requirement: An identity a source holds twice is recorded, never repointed
+`bindings.ambiguous_handles` (a JSON array, or `NULL`) SHALL hold the other handles a source holds one item's identity under, and `UPDATE_BINDING` SHALL NOT repoint an existing binding's `handle`.
+
+A binding pins one handle, so a second copy of one identity has nowhere to live, and repointing is where the evidence was destroyed: silently, at the write, before any later rule could act on it. The bound handle stays and the incoming one is recorded instead, which freezes the item (`ReplicaStatus::Ambiguous`) until the source holds the identity once again. Rebinding legitimately, after a handle-space change, goes through the rebuild that drops the old spine and inserts the new one.
+
+The column is what makes the freeze survive a restart, and it has to: the second copy appears in exactly one enumeration, and an incremental one never mentions it again.
+
+#### Scenario: The same identity arrives under another handle
+- GIVEN a stored binding for an identity
+- WHEN a write carries the same identity under a different handle
+- THEN the bound handle is unchanged and the incoming one is recorded as ambiguous
+
+#### Scenario: The freeze survives a reopen
+- GIVEN a store holding ambiguous handles for a binding
+- WHEN it is reopened
+- THEN the projection still reads `Ambiguous`, carrying those handles
+
+### Requirement: A folded-in index is ensured on every open
+`ENSURE_INDEXES` SHALL run on open, not only when a column is missing. Most of these index columns that were always there: what changed is that a statement now needs them, and a store that kept the old plans would keep scanning where the schema says it seeks, silently and for good.

@@ -3,7 +3,7 @@
 
 use io_pimdir::{PimdirError, PimdirStore};
 use io_replica::{
-    change::ReplicaWriteOp,
+    change::{ReplicaDropReason, ReplicaWriteOp},
     client::ReplicaStorage,
     collection::ReplicaCollectionId,
     object::{ReplicaHash, ReplicaObject},
@@ -19,12 +19,12 @@ fn read_only_open_reads_but_never_writes_or_creates() {
 
     // NOTE: no database yet: a reader never creates one.
     assert!(matches!(
-        PimdirStore::open_read_only(dir.path(), "left"),
+        PimdirStore::open_read_only(dir.path()),
         Err(PimdirError::Sql(_))
     ));
 
     // The owner creates and fills the store.
-    let mut owner = PimdirStore::open(dir.path(), "left").unwrap();
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("left");
     owner.ensure_collection("INBOX", "message/rfc822").unwrap();
     let flags = ReplicaFlags::from_iter(["\\Seen"]);
     owner
@@ -53,12 +53,13 @@ fn read_only_open_reads_but_never_writes_or_creates() {
                     object: Some(ReplicaHash("cafe".into())),
                 }),
                 origin: None,
+                ambiguous_handles: Vec::new(),
             }),
         ])
         .unwrap();
 
     // The reader sees the shared truth through the same read surface.
-    let mut reader = PimdirStore::open_read_only(dir.path(), "left").unwrap();
+    let reader = PimdirStore::open_read_only(dir.path()).unwrap();
     let collections = reader.list_collections().unwrap();
     assert_eq!(collections.len(), 1);
     assert_eq!(collections[0].id, "INBOX");
@@ -70,11 +71,13 @@ fn read_only_open_reads_but_never_writes_or_creates() {
     // NOTE: a write through the read-only handle fails at the SQLite
     // layer instead of mutating the owner's store.
     assert!(reader.ensure_collection("Other", "message/rfc822").is_err());
+    let mut reader = reader.for_source("left");
     assert!(
         reader
             .write(vec![ReplicaWriteOp::DropPlacement {
                 collection: ReplicaCollectionId("INBOX".into()),
                 handle: ReplicaHandle("1".into()),
+                reason: ReplicaDropReason::Deleted,
             }])
             .is_err()
     );

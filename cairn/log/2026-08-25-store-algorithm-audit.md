@@ -46,7 +46,21 @@ Every fix went in test-first: the regression test was written against the old co
 
 ## Verification
 
-- 76 tests green (16 lib, 60 integration), `cargo clippy --all-targets --all-features` clean, `cargo fmt`.
+- 84 tests green, `cargo clippy --all-targets --all-features` clean, `cargo fmt`.
 - The spec-fidelity suite compares the inlined DDL against `pimdir/migrations/0001_init.sql` through SQLite's own pragmas, and every canonical statement name against the constants, so both the schema and the statement changes are checked against the format on both axes.
 
 Capabilities moved: `store`.
+
+## Addendum, same day
+
+The findings this change deferred as blocked, or as needing a format decision, were revisited once `duplicate-link-id-freeze` had moved both repos together.
+
+- **`lookup_objects` is scoped, by account rather than by collection.** The audit called for a collection scope, and that would have been wrong: across collections the answer is exactly what the read exists for, one message filed in two mailboxes being one body downloaded once. The account is the axis a link id is trustworthy on, and the one §9.2 names: two unrelated servers may mint the same vCard `UID`. A single-account store writes no account, so the filter is a no-op there and the dedup stays whole-store. No seam change was needed after all.
+
+- **A base of nothing round-trips as a base.** `bindings.base_present` is now the fact, its three value columns being a witness only for rows written before it existed. Inferring presence from them lost a real agreement: a source reporting no revision, no body and markers nobody has read still agreed, and the placement came back as never-agreed, re-deriving the same push for ever.
+
+- **The drain answers its two point questions with point reads.** The `Add` collision check is one row of `items`, the handle lookup is the binding's own primary key, and the mutation it drives reads the hub for the one identity it names. All three loaded the whole collection, once per drained action.
+
+- **`release_pins` is one statement.** A purge of fifty thousand retained items was a hundred thousand point updates inside one transaction to express a set operation.
+
+Still open: `distinct_sources` scans `bindings`, and closing it means deciding whether the `sources` table alone is authoritative or whether the scan buys an index nobody else needs; `objects.refcount` has no `CHECK`, which is a table rebuild; the compaction list is untouched; and §5 and §14 still disagree about an object indexed with no referrer, which is a decision about the format rather than a repair.

@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, convert::Infallible, path::Path};
 
 use io_pimdir::{PimdirStore, codec::PimdirAction};
 use io_replica::{
-    change::{ReplicaChange, ReplicaWriteOp},
+    change::{ReplicaChange, ReplicaDropReason, ReplicaWriteOp},
     client::{ReplicaClient, ReplicaRemote, ReplicaStorage},
     collection::{ReplicaCheckpoint, ReplicaCollectionId},
     object::{ReplicaHash, ReplicaObject},
@@ -22,6 +22,7 @@ use io_replica::{
         ReplicaFetchedBody, ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteItem,
         ReplicaRemoteSnapshot, ReplicaTier,
     },
+    storage::ReplicaLoadScope,
     sync::{ReplicaSyncOptions, ReplicaSyncReport},
 };
 
@@ -49,6 +50,7 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPla
             object: Some(ReplicaHash(hash.into())),
         }),
         origin: None,
+        ambiguous_handles: Vec::new(),
     }
 }
 
@@ -74,6 +76,7 @@ fn drop_placement(handle: &str) -> ReplicaWriteOp {
     ReplicaWriteOp::DropPlacement {
         collection: inbox(),
         handle: ReplicaHandle(handle.into()),
+        reason: ReplicaDropReason::Deleted,
     }
 }
 
@@ -93,7 +96,7 @@ fn backdate(dir: &Path, link: &str, retained_at: &str) {
 #[test]
 fn an_expunge_retains_the_item_and_its_body() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
@@ -106,7 +109,13 @@ fn an_expunge_retains_the_item_and_its_body() {
     store.write(vec![drop_placement("1")]).unwrap();
 
     // Gone from the sync seam and from the live reads...
-    assert!(store.load(&inbox()).unwrap().placements.is_empty());
+    assert!(
+        store
+            .load(&inbox(), &ReplicaLoadScope::All)
+            .unwrap()
+            .placements
+            .is_empty()
+    );
     assert!(store.list_items("INBOX", None, 10).unwrap().is_empty());
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
     assert!(store.get_item("INBOX", seq).unwrap().is_none());
@@ -136,7 +145,7 @@ fn an_expunge_retains_the_item_and_its_body() {
 
     // It survives a reopen as retained, not as a live item.
     drop(store);
-    let store = PimdirStore::open(dir.path(), "local").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
 }
@@ -144,7 +153,7 @@ fn an_expunge_retains_the_item_and_its_body() {
 #[test]
 fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
     let dir = tempfile::tempdir().unwrap();
-    let store = PimdirStore::open(dir.path(), "local").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     let mut remote = MemRemote::default();
     remote.seed("1", "mid:a", b"body");
     let mut client = ReplicaClient::new(store, remote);
@@ -187,7 +196,7 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
 #[test]
 fn a_reappearing_link_id_revives_the_retained_row() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
@@ -230,7 +239,7 @@ fn a_queued_add_restores_a_retained_item() {
     // Restore is `Add` over the values retention preserved (no new action kind,
     // no network): the duplicate-link-id guard must exempt the retained row.
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
@@ -267,7 +276,10 @@ fn a_queued_add_restores_a_retained_item() {
     assert!(store.list_retained(&inbox(), None, 10).unwrap().is_empty());
 
     // Staged as a local creation, so the next sync pushes it back to the source.
-    let projected = store.load(&inbox()).unwrap().placements;
+    let projected = store
+        .load(&inbox(), &ReplicaLoadScope::All)
+        .unwrap()
+        .placements;
     assert_eq!(projected.len(), 1);
     assert_ne!(projected[0].status, ReplicaStatus::Clean, "a pending push");
 }
@@ -275,7 +287,7 @@ fn a_queued_add_restores_a_retained_item() {
 #[test]
 fn purge_deletes_the_row_and_unlinks_the_body() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
@@ -310,7 +322,7 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
 #[test]
 fn purge_retained_before_respects_the_cutoff_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"old"),
@@ -373,8 +385,8 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     // past it: while another source still holds the item, the removal has to
     // reach that source first.
     let dir = tempfile::tempdir().unwrap();
-    let mut left = PimdirStore::open(dir.path(), "left").unwrap();
-    let mut right = PimdirStore::open(dir.path(), "right").unwrap();
+    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
 
     left.write(vec![
         store_object("cafebabe", b"abc"),
@@ -393,7 +405,10 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     // Left's source expunged it: right must still be told, so the item is a
     // tombstone, NOT retained.
     left.write(vec![drop_placement("L1")]).unwrap();
-    let projected = right.load(&inbox()).unwrap().placements;
+    let projected = right
+        .load(&inbox(), &ReplicaLoadScope::All)
+        .unwrap()
+        .placements;
     assert_eq!(projected.len(), 1);
     assert_eq!(projected[0].status, ReplicaStatus::Tombstone);
     assert_eq!(
@@ -407,9 +422,16 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
         .write(vec![ReplicaWriteOp::DropPlacement {
             collection: inbox(),
             handle: ReplicaHandle("R1".into()),
+            reason: ReplicaDropReason::Deleted,
         }])
         .unwrap();
-    assert!(right.load(&inbox()).unwrap().placements.is_empty());
+    assert!(
+        right
+            .load(&inbox(), &ReplicaLoadScope::All)
+            .unwrap()
+            .placements
+            .is_empty()
+    );
     let retained = right.list_retained(&inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(
@@ -423,7 +445,7 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
 #[test]
 fn the_retained_page_is_keyed_on_seq_and_exclusive() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path(), "local").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
             store_object("cafebabe", b"shared"),

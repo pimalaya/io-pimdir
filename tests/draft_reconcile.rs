@@ -27,9 +27,20 @@ const FOLDED_IN: &[(&str, &str)] = &[
     ("items", "retained_by"),
     ("items", "sort_key"),
     ("collections", "account"),
+    ("bindings", "ambiguous_handles"),
+    ("bindings", "base_present"),
 ];
 
-const FOLDED_INDEXES: &[&str] = &["items_retained", "collections_by_account", "items_by_sort"];
+const FOLDED_INDEXES: &[&str] = &[
+    "items_retained",
+    "collections_by_account",
+    "items_by_sort",
+    "items_by_seq_global",
+    "objects_garbage",
+    "items_by_conflict_object",
+    "queue_by_object",
+    "bindings_by_handle",
+];
 
 #[test]
 fn an_earlier_draft_store_is_reconciled_on_open() {
@@ -53,7 +64,7 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
         .unwrap();
     drop(conn);
 
-    let store = PimdirStore::open(dir.path(), "left").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     // Every read naming a folded-in column, which is what an unreconciled
@@ -87,21 +98,21 @@ fn disagreeing_schema_stamps_are_refused() {
 
     // An owner-created store, then its store_meta stamp moved out from under
     // the pragma one.
-    PimdirStore::open(dir.path(), "left").unwrap();
+    PimdirStore::open(dir.path()).unwrap();
     let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch("UPDATE store_meta SET version = 2 WHERE id = 1")
         .unwrap();
     drop(conn);
 
     assert!(matches!(
-        PimdirStore::open(dir.path(), "left"),
+        PimdirStore::open(dir.path()),
         Err(PimdirError::VersionMismatch {
             user_version: 1,
             store_meta: 2
         })
     ));
     assert!(matches!(
-        PimdirStore::open_read_only(dir.path(), "left"),
+        PimdirStore::open_read_only(dir.path()),
         Err(PimdirError::VersionMismatch { .. })
     ));
 }
@@ -128,11 +139,11 @@ fn a_store_without_the_rename_cascades_is_refused() {
     drop(conn);
 
     assert!(matches!(
-        PimdirStore::open(dir.path(), "left"),
+        PimdirStore::open(dir.path()),
         Err(PimdirError::Unreconcilable { .. })
     ));
     assert!(matches!(
-        PimdirStore::open_read_only(dir.path(), "left"),
+        PimdirStore::open_read_only(dir.path()),
         Err(PimdirError::Unreconcilable { .. })
     ));
 }

@@ -6,7 +6,7 @@
 //! converging, and a client cannot tell which items need a human — so this is
 //! about the state surviving a *reopen*, not just a round trip in memory.
 
-use io_pimdir::PimdirStore;
+use io_pimdir::{PimdirSourceStore, PimdirStore};
 use io_replica::{
     change::ReplicaWriteOp,
     client::ReplicaStorage,
@@ -16,6 +16,7 @@ use io_replica::{
         ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
         ReplicaPlacement, ReplicaStatus,
     },
+    storage::ReplicaLoadScope,
 };
 
 fn contacts() -> ReplicaCollectionId {
@@ -41,11 +42,12 @@ fn card(status: ReplicaStatus, conflict_revision: Option<&str>) -> ReplicaPlacem
             object: Some(ReplicaHash("0rig".into())),
         }),
         origin: None,
+        ambiguous_handles: Vec::new(),
     }
 }
 
-fn seed(dir: &std::path::Path) -> PimdirStore {
-    let store = PimdirStore::open(dir, "left").unwrap();
+fn seed(dir: &std::path::Path) -> PimdirSourceStore {
+    let store = PimdirStore::open(dir).unwrap().for_source("left");
     store.ensure_collection("contacts", "text/vcard").unwrap();
     store
 }
@@ -87,8 +89,8 @@ fn a_conflict_survives_a_reopen() {
 
     // Reopened from disk: the merge must still see the conflict, or it
     // re-derives the push the remote already rejected.
-    let store = PimdirStore::open(dir.path(), "left").unwrap();
-    let loaded = store.load(&contacts()).unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let loaded = store.load(&contacts(), &ReplicaLoadScope::All).unwrap();
     assert_eq!(loaded.placements.len(), 1);
     assert_eq!(loaded.placements[0].status, ReplicaStatus::Conflict);
     assert_eq!(
@@ -110,8 +112,8 @@ fn resolving_the_conflict_clears_it_on_disk() {
     store.write(card_batch(ReplicaStatus::Dirty, None)).unwrap();
     drop(store);
 
-    let store = PimdirStore::open(dir.path(), "left").unwrap();
-    let loaded = store.load(&contacts()).unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let loaded = store.load(&contacts(), &ReplicaLoadScope::All).unwrap();
     assert_ne!(loaded.placements[0].status, ReplicaStatus::Conflict);
     assert_eq!(
         loaded.placements[0].conflict_revision, None,
@@ -126,7 +128,7 @@ fn a_store_from_an_earlier_draft_of_v1_is_reconciled_on_open() {
     // `user_version = 1` yet lacks them. It must be healed on open, not left to
     // fail on the next query.
     let dir = tempfile::tempdir().unwrap();
-    let store = PimdirStore::open(dir.path(), "left").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
     drop(store);
 
     // Rewind the store to the earlier draft's shape.
@@ -143,13 +145,13 @@ fn a_store_from_an_earlier_draft_of_v1_is_reconciled_on_open() {
     drop(conn);
 
     // Opening heals it, and the store works.
-    let mut store = PimdirStore::open(dir.path(), "left").unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("left");
     store.ensure_collection("contacts", "text/vcard").unwrap();
     store
         .write(card_batch(ReplicaStatus::Conflict, Some("r-remote")))
         .unwrap();
 
-    let loaded = store.load(&contacts()).unwrap();
+    let loaded = store.load(&contacts(), &ReplicaLoadScope::All).unwrap();
     assert_eq!(loaded.placements[0].status, ReplicaStatus::Conflict);
     assert_eq!(
         loaded.placements[0].conflict_revision.as_deref(),
@@ -158,9 +160,13 @@ fn a_store_from_an_earlier_draft_of_v1_is_reconciled_on_open() {
 
     // Idempotent: a second open of a current store changes nothing.
     drop(store);
-    let store = PimdirStore::open(dir.path(), "left").unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
     assert_eq!(
-        store.load(&contacts()).unwrap().placements[0].status,
+        store
+            .load(&contacts(), &ReplicaLoadScope::All)
+            .unwrap()
+            .placements[0]
+            .status,
         ReplicaStatus::Conflict
     );
 }

@@ -103,10 +103,21 @@ CREATE TABLE bindings (
     base_flags    TEXT,
     base_object   TEXT REFERENCES objects(hash),
     base_revision TEXT,
+    -- Whether a base exists at all, which its three value columns cannot say: a
+    -- source reporting no revision, no body and markers nobody has read still
+    -- agreed, and that agreement is what tells a pending push from a settled
+    -- one. Inferring presence from the three loses exactly that shape.
+    base_present  INTEGER NOT NULL DEFAULT 0,
     -- This source and its OWN remote diverged. Distinct from
     -- items.conflicted, which is the cross-source divergence.
     conflicted        INTEGER NOT NULL DEFAULT 0,
     conflict_revision TEXT,
+    -- The OTHER handles this source holds this identity under, as a JSON array,
+    -- or NULL: the identity-axis twin of `conflicted`. A source may hold one
+    -- link id twice, and a binding pins one handle, so the second has nowhere
+    -- to live; recording it keeps the write from silently repointing the
+    -- binding, and makes the freeze survive a restart.
+    ambiguous_handles TEXT,
     PRIMARY KEY (collection, link_id, source),
     FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT;
@@ -340,17 +351,34 @@ pub const LIST_SOURCES: &str = "SELECT DISTINCT source FROM bindings ORDER BY so
 /// Loads every per-source binding of a collection: the stored base (handle,
 /// flags, object, revision) each sync merges against.
 pub const LOAD_BINDINGS: &str = "\
-SELECT link_id, source, handle, base_flags, base_object, base_revision, \
-conflicted, conflict_revision \
+SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
+conflicted, conflict_revision, ambiguous_handles \
 FROM bindings WHERE collection = :collection";
 
 /// The same rows, narrowed to the link ids one write batch touches: the binding
 /// half of [`LOAD_ITEMS_BY_LINK`].
 pub const LOAD_BINDINGS_BY_LINK: &str = "\
-SELECT link_id, source, handle, base_flags, base_object, base_revision, \
-conflicted, conflict_revision \
+SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
+conflicted, conflict_revision, ambiguous_handles \
 FROM bindings WHERE collection = :collection \
   AND link_id IN (SELECT value FROM json_each(:links))";
+
+/// Whether a collection holds a live (non-retained, non-deleted) item under a
+/// link id: the collision check a queued `add` runs before staging.
+///
+/// A point read on the items primary key, because it runs once per drained
+/// action: answering it by loading the collection makes a drain of N actions
+/// cost N passes over the mailbox.
+pub const LIVE_ITEM_FOR_LINK: &str = "\
+SELECT seq FROM items \
+WHERE collection = :collection AND link_id = :link_id \
+  AND deleted = 0 AND retained_at IS NULL";
+
+/// One source's handle for an item, which its binding's primary key answers
+/// directly: the lookup a queued action needs to name the placement it edits.
+pub const HANDLE_FOR_LINK: &str = "\
+SELECT handle FROM bindings \
+WHERE collection = :collection AND link_id = :link_id AND source = :source";
 
 /// The link id one source's handle is bound to, for a batch that drops a
 /// placement: a drop names a handle, and the hub is keyed by link id.
@@ -440,23 +468,25 @@ FROM items i LEFT JOIN objects o ON o.hash = i.object_hash \
 WHERE i.collection = :collection AND i.retained_at IS NOT NULL AND i.seq > :after \
 ORDER BY i.seq LIMIT :limit";
 
-/// The partial retained index as an idempotent statement, for reconciling a
-/// store written by an earlier draft of version 1 (the schema script above
-/// creates it unconditionally, on a database that has no index yet).
-pub const ENSURE_RETAINED_INDEX: &str = "\
+/// Every index the schema grew after version 1 was first published, as one
+/// idempotent batch: a store written by an earlier draft has the tables but not
+/// these, and an index is not something a reader can do without.
+///
+/// Run on open rather than only when a column is missing, because most of these
+/// index columns that were always there: what changed is that a statement now
+/// needs them. A store that kept the old plans would keep scanning where the
+/// schema says it seeks, silently and for good.
+pub const ENSURE_INDEXES: &str = "\
 CREATE INDEX IF NOT EXISTS items_retained ON items(collection, retained_at) \
-WHERE retained_at IS NOT NULL";
-
-/// The partial by-account index, idempotent, for the same reconciliation.
-pub const ENSURE_ACCOUNT_INDEX: &str = "\
+WHERE retained_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS collections_by_account ON collections(account) \
-WHERE account IS NOT NULL";
-
-/// The by-sort-key index, idempotent, for the same reconciliation. A store
-/// written before the `sort_key` column existed has neither the column nor
-/// this index, and every paged read names both.
-pub const ENSURE_SORT_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS items_by_sort ON items(collection, sort_key, seq)";
+WHERE account IS NOT NULL;
+CREATE INDEX IF NOT EXISTS items_by_sort ON items(collection, sort_key, seq);
+CREATE INDEX IF NOT EXISTS items_by_seq_global ON items(seq);
+CREATE INDEX IF NOT EXISTS objects_garbage ON objects(refcount) WHERE refcount <= 0;
+CREATE INDEX IF NOT EXISTS items_by_conflict_object ON items(conflict_object);
+CREATE INDEX IF NOT EXISTS queue_by_object ON queue(object_hash);
+CREATE INDEX IF NOT EXISTS bindings_by_handle ON bindings(collection, source, handle);";
 
 /// Counts a collection's retained items, the counterpart of `COUNT_ITEMS`;
 /// rides the `items_retained` partial index.
@@ -502,16 +532,26 @@ pub const PURGE_RETAINED_BEFORE: &str =
 /// `UPDATE_BINDING` handles an existing one).
 pub const INSERT_BINDING: &str = "\
 INSERT INTO bindings(collection, link_id, source, handle, base_flags, base_object, \
-base_revision, conflicted, conflict_revision) \
+base_revision, base_present, conflicted, conflict_revision, ambiguous_handles) \
 VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, \
-:base_revision, :conflicted, :conflict_revision)";
+:base_revision, :base_present, :conflicted, :conflict_revision, :ambiguous_handles)";
 
 /// Updates one existing binding's columns in place (its primary key
 /// `(collection, link_id, source)` is unchanged).
+///
+/// `handle` is deliberately not among them. A binding pins one handle, and
+/// repointing it to a different one is how the fact that a source holds an
+/// identity twice was destroyed, silently, at the write: no later rule could
+/// then act on it, because the evidence was already gone. A second copy is
+/// recorded in `ambiguous_handles` instead, which freezes the item until the
+/// source holds the identity once again. Rebinding a handle legitimately, after
+/// a handle-space change, goes through the rebuild that drops the old spine and
+/// inserts the new one, never through this statement.
 pub const UPDATE_BINDING: &str = "\
-UPDATE bindings SET handle = :handle, base_flags = :base_flags, \
-base_object = :base_object, base_revision = :base_revision, \
-conflicted = :conflicted, conflict_revision = :conflict_revision \
+UPDATE bindings SET base_flags = :base_flags, \
+base_object = :base_object, base_revision = :base_revision, base_present = :base_present, \
+conflicted = :conflicted, conflict_revision = :conflict_revision, \
+ambiguous_handles = :ambiguous_handles \
 WHERE collection = :collection AND link_id = :link_id AND source = :source";
 
 /// Deletes one source's binding of an item.
@@ -521,6 +561,17 @@ pub const DELETE_BINDING: &str = "DELETE FROM bindings WHERE collection = :colle
 /// path); the hash's primary key makes this an indexed point update.
 pub const ADJUST_REFCOUNT: &str =
     "UPDATE objects SET refcount = refcount + :delta WHERE hash = :hash";
+
+/// Releases one reference from each of the given hashes (a JSON array), the
+/// set-based form of [`ADJUST_REFCOUNT`] at `-1`.
+///
+/// A hash listed twice releases twice, which is what makes it the same
+/// operation as the loop it replaces: a retained item pins its body and its
+/// conflict body separately, and a purge releases both.
+pub const RELEASE_PINS: &str = "\
+UPDATE objects SET refcount = refcount - \
+  (SELECT count(*) FROM json_each(:hashes) WHERE value = objects.hash) \
+WHERE hash IN (SELECT value FROM json_each(:hashes))";
 
 /// Writes one source's sync checkpoint for a collection, replacing the
 /// previous one.
@@ -537,10 +588,21 @@ ON CONFLICT(hash) DO UPDATE SET size = excluded.size";
 
 /// Resolves the object hash currently bound to each of the given link ids
 /// (passed as a JSON array), skipping the ones carrying no body.
+///
+/// Scoped to one account, which is the axis a link id is trustworthy on. Across
+/// collections it is exactly what this read exists for: one message filed in two
+/// mailboxes is one body, downloaded once. Across accounts it is not a fact at
+/// all, because two unrelated servers may mint the same vCard `UID` (spec §9.2),
+/// and answering with the other account's body hands one account's content to
+/// the other's sync, which then believes the item is hydrated. A single-account
+/// store writes no account, so the filter is a no-op there and the dedup is
+/// whole-store, as it should be.
 pub const LOOKUP_OBJECTS: &str = "\
-SELECT link_id, object_hash FROM items \
-WHERE object_hash IS NOT NULL \
-  AND link_id IN (SELECT value FROM json_each(:links))";
+SELECT i.link_id, i.object_hash FROM items i \
+JOIN collections c ON c.id = i.collection \
+WHERE i.object_hash IS NOT NULL \
+  AND i.link_id IN (SELECT value FROM json_each(:links)) \
+  AND c.account IS :account";
 
 /// Lists the objects no placement references any more: the blobs the write
 /// transaction is about to collect.
@@ -662,6 +724,8 @@ pub const ALL: &[(&str, &str)] = &[
     ("LIST_SOURCES", LIST_SOURCES),
     ("LOAD_BINDINGS", LOAD_BINDINGS),
     ("LOAD_BINDINGS_BY_LINK", LOAD_BINDINGS_BY_LINK),
+    ("LIVE_ITEM_FOR_LINK", LIVE_ITEM_FOR_LINK),
+    ("HANDLE_FOR_LINK", HANDLE_FOR_LINK),
     ("LINK_FOR_HANDLE", LINK_FOR_HANDLE),
     ("LOAD_CHECKPOINT", LOAD_CHECKPOINT),
     ("SEQ_FOR_LINK_ANY", SEQ_FOR_LINK_ANY),
@@ -673,9 +737,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("RETAINED_ITEM", RETAINED_ITEM),
     ("REVIVE_ITEM", REVIVE_ITEM),
     ("LIST_RETAINED_PAGE", LIST_RETAINED_PAGE),
-    ("ENSURE_RETAINED_INDEX", ENSURE_RETAINED_INDEX),
-    ("ENSURE_ACCOUNT_INDEX", ENSURE_ACCOUNT_INDEX),
-    ("ENSURE_SORT_INDEX", ENSURE_SORT_INDEX),
+    ("ENSURE_INDEXES", ENSURE_INDEXES),
     ("COUNT_RETAINED", COUNT_RETAINED),
     ("RETAINED_BYTES", RETAINED_BYTES),
     ("RETAINED_ITEM_BY_SEQ", RETAINED_ITEM_BY_SEQ),
@@ -686,6 +748,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("UPDATE_BINDING", UPDATE_BINDING),
     ("DELETE_BINDING", DELETE_BINDING),
     ("ADJUST_REFCOUNT", ADJUST_REFCOUNT),
+    ("RELEASE_PINS", RELEASE_PINS),
     ("UPSERT_CHECKPOINT", UPSERT_CHECKPOINT),
     ("STORE_OBJECT", STORE_OBJECT),
     ("LOOKUP_OBJECTS", LOOKUP_OBJECTS),
