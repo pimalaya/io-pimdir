@@ -147,11 +147,10 @@ impl PimdirReader {
     /// applied without an operator, and reading it as pending would
     /// promise otherwise.
     ///
-    /// Two costs are worth knowing. A read consults the queue, which is a
-    /// handful of small statements over rows a sync drains, not a scan.
-    /// And a page shortened by a staged removal comes back below its
-    /// limit, so a caller paging until a short page must page until an
-    /// empty one instead.
+    /// A page keeps its meaning: it comes back short only where the
+    /// collection ends, staged removals or not, so a caller pages the way
+    /// it always did. The cost is that a read consults the queue, which is
+    /// a handful of small statements over rows a sync drains, not a scan.
     pub fn with_pending(mut self) -> Self {
         self.overlay = true;
         self
@@ -326,22 +325,22 @@ impl PimdirReader {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
-        let page = rows(
-            &self.conn,
-            sql::LIST_ITEMS_PAGE,
-            named_params! {
-                ":collection": collection,
-                ":after": after.unwrap_or(""),
-                ":limit": limit as i64,
-            },
-            read_item_from_row,
-        )?;
-
         let after = after.unwrap_or("");
         self.overlaid(
             collection,
-            page,
             limit,
+            |limit| {
+                Ok(rows(
+                    &self.conn,
+                    sql::LIST_ITEMS_PAGE,
+                    named_params! {
+                        ":collection": collection,
+                        ":after": after,
+                        ":limit": limit as i64,
+                    },
+                    read_item_from_row,
+                )?)
+            },
             |item| item.link_id.0.as_str() > after,
             |left, right| left.link_id.0.cmp(&right.link_id.0),
         )
@@ -396,23 +395,23 @@ impl PimdirReader {
         limit: usize,
         descending: bool,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
-        let page = rows(
-            &self.conn,
-            statement,
-            named_params! {
-                ":collection": collection,
-                ":after_key": after.map(|(key, _)| key),
-                ":after_seq": after.map(|(_, seq)| seq).unwrap_or_default(),
-                ":limit": limit as i64,
-            },
-            read_item_from_row,
-        )?;
-
         let after = after.map(|(key, seq)| (key.to_string(), seq));
         self.overlaid(
             collection,
-            page,
             limit,
+            |limit| {
+                Ok(rows(
+                    &self.conn,
+                    statement,
+                    named_params! {
+                        ":collection": collection,
+                        ":after_key": after.as_ref().map(|(key, _)| key.as_str()),
+                        ":after_seq": after.as_ref().map(|(_, seq)| *seq).unwrap_or_default(),
+                        ":limit": limit as i64,
+                    },
+                    read_item_from_row,
+                )?)
+            },
             |item| {
                 let here = (item.sort_key.as_str(), item.seq);
                 match &after {
@@ -622,6 +621,22 @@ struct PimdirPending {
     creates: usize,
 }
 
+impl PimdirPending {
+    /// How many rows the fold can drop from a page: the items an action
+    /// takes out of the collection, by removing them or by moving them
+    /// away.
+    fn removals(&self) -> usize {
+        self.edits
+            .values()
+            .filter(|actions| {
+                actions
+                    .iter()
+                    .any(|action| matches!(action, PimdirAction::Remove { .. }))
+            })
+            .count()
+    }
+}
+
 impl PimdirReader {
     /// One live item as the committed rows hold it, the queue ignored.
     fn committed_item(
@@ -712,16 +727,23 @@ impl PimdirReader {
     fn overlaid(
         &self,
         collection: &str,
-        page: Vec<PimdirItem>,
         limit: usize,
+        fetch: impl Fn(usize) -> Result<Vec<PimdirItem>, PimdirError>,
         inside: impl Fn(&PimdirItem) -> bool,
         order: impl Fn(&PimdirItem, &PimdirItem) -> Ordering,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
         if !self.overlay {
-            return Ok(page);
+            return fetch(limit);
         }
 
         let pending = self.pending(collection)?;
+        // NOTE: a staged removal drops a row the statement returned, so a
+        // page asked for exactly `limit` rows would come back short in the
+        // middle of a collection, and a caller paging until a short page
+        // stops early and never sees the rest. At most one row per removing
+        // action can go, so over-reading by that many makes a page short
+        // only where the collection really ends.
+        let page = fetch(limit + pending.removals())?;
         let mut items: Vec<PimdirItem> = page
             .into_iter()
             .filter_map(|item| {

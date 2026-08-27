@@ -352,3 +352,32 @@ fn a_cancel_never_creates_the_store_it_cannot_find() {
     ));
     assert!(!dir.path().join("pimdir.db").exists());
 }
+
+#[test]
+fn a_page_stays_full_across_a_staged_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let seqs = store(dir.path());
+
+    // the first item of the collection goes, so a page of two asked from
+    // the beginning has to reach past it rather than come back short
+    enqueue(dir.path(), "INBOX", &PimdirAction::Remove { seq: seqs[0] });
+
+    let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let page = overlaid.list_items("INBOX", None, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(
+        page.iter().map(|item| item.seq).collect::<Vec<_>>(),
+        vec![seqs[1], seqs[2]]
+    );
+
+    // NOTE: a caller paging until a short page is the ordinary contract,
+    // and it is what a whole-collection scan is written against; a page cut
+    // short in the middle would end that scan two items early.
+    let last = page.last().unwrap();
+    assert!(
+        overlaid
+            .list_items("INBOX", Some(&last.link_id.0), 2)
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -362,9 +362,15 @@ A parked row SHALL NOT overlay, its error asserting that it will not be applied
 without an operator.
 
 The overlay SHALL be chosen when the reader is built rather than per call, so
-one handle cannot answer two ways about one collection. A page shortened by a
-staged removal comes back below its limit, so a caller pages until an empty page
-rather than until a short one.
+one handle cannot answer two ways about one collection.
+
+An overlaid page SHALL keep the meaning an unoverlaid one has: it comes back
+short only where the collection ends. A staged removal drops a row the statement
+returned, so the fold SHALL read past the limit by the number of pending
+removals and cut back to the limit afterwards, rather than returning a page
+shortened in the middle of a collection. A caller therefore pages until a short
+page, as it always did, and a whole-collection scan written that way does not end
+early.
 
 > Initial seed spec (Cairn adopted 2026-07-31): captures the store's core
 > guarantees; further capabilities may be spelled out as they are touched.
