@@ -10,7 +10,7 @@
 use std::{fs::File, fs::OpenOptions, path::Path};
 
 use fs4::FileExt;
-use io_pimdir::{PimdirError, PimdirProducer, PimdirStore, codec::PimdirAction};
+use io_pimdir::{PimdirError, PimdirProducer, PimdirReader, PimdirStore, codec::PimdirAction};
 
 /// Creates the store, then lets go of it.
 fn create(dir: &Path) {
@@ -66,7 +66,7 @@ fn a_reader_opens_while_another_process_owns_the_store() {
     create(dir.path());
     let _held = own_elsewhere(dir.path());
 
-    let reader = PimdirStore::open_read_only(dir.path()).unwrap();
+    let reader = PimdirReader::open(dir.path()).unwrap();
     assert_eq!(reader.list_collections().unwrap().len(), 1);
 }
 

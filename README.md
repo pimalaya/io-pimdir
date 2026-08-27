@@ -1,11 +1,11 @@
 # I/O Pimdir [![Documentation](https://img.shields.io/docsrs/io-pimdir?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-pimdir/latest/io_pimdir) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya) [![Sponsor](https://img.shields.io/badge/sponsor-pink?style=flat&logo=github-sponsors&logoColor=white)](https://pimalaya.org/sponsor/)
 
-pimdir store and operator CLI for Rust: a SQLite and content-addressed blob storage backend for io-replica
+Rust implementation of [Pimdir](https://github.com/pimalaya/pimdir) standard
 
 This project is composed of 3 feature-gated layers:
 
 - Low-level **I/O-free** core: no_std-compatible schema, statements and model-to-column encodings, reusable by any implementation
-- Mid-level **std client**: `PimdirStore`, which runs the statements against SQLite and the blob files, servicing the io-replica storage seam
+- Mid-level **std client**: `PimdirStore`, `PimdirProducer` and `PimdirReader`, the owner, producer and reader handles running the statements against SQLite and the blob files, servicing the io-replica storage seam
 - High-level **CLI**: the `pimdir` binary, the operator front-end over a store (requires the `cli` feature)
 
 ## Table of contents
@@ -30,6 +30,8 @@ This project is composed of 3 feature-gated layers:
 - **Crash-safe writes**: one transaction per batch, bodies durable before the rows that reference them, and blobs garbage collected inside it.
 - **Retention**: a removal retires an item instead of destroying it, hidden from every read and from the sync, until an explicit purge reclaims it.
 - **Action queue**: processes that do not own the store request mutations by appending actions the owner applies exactly once, with parked failures queryable and collection generations carrying the handle-space epoch to readers.
+- **Three roles, three handles**: one owner that writes, any number of producers that enqueue, and any number of readers that take no lock and carry no write at all, so a frontend cannot drain or sweep a store it only reads.
+- **Read-your-writes**: a reader folds the queue over the committed items on request, so a staged flag, removal, move or copy shows before the owner applies it, while a queued creation is reported apart, having no public id yet.
 - **Operator CLI**: inspect a store while a sync is running, read the trash, restore or purge an item, prune the queue, check consistency, collect what nothing references and dump the whole store (requires the `cli` feature).
 - **no_std core**: the schema, statements and encodings need no allocator beyond `alloc` and pull SQLite in only behind the `client` feature.
 

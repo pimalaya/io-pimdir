@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
-use io_pimdir::{PimdirItem, PimdirStore, codec::PimdirAction};
+use io_pimdir::{PimdirItem, PimdirReader, codec::PimdirAction};
 use io_replica::{
     collection::ReplicaCollectionId,
     object::ReplicaHash,
@@ -479,7 +479,7 @@ impl Found {
 
 /// Finds every placement of `seq`, live or retained, in one collection or in
 /// the whole store.
-fn locate(store: &PimdirStore, seq: i64, collection: Option<&str>) -> Result<Vec<Found>> {
+fn locate(store: &PimdirReader, seq: i64, collection: Option<&str>) -> Result<Vec<Found>> {
     let collections: Vec<String> = match collection {
         Some(collection) => vec![collection.to_string()],
         None => store
@@ -509,7 +509,7 @@ fn locate(store: &PimdirStore, seq: i64, collection: Option<&str>) -> Result<Vec
 /// The retained listing is keyset-paged on `seq` in ascending order, so asking
 /// for the single row after `seq - 1` either answers with `seq` itself or
 /// proves it is not retained here.
-fn retained(store: &PimdirStore, collection: &str, seq: i64) -> Result<Option<PimdirItem>> {
+fn retained(store: &PimdirReader, collection: &str, seq: i64) -> Result<Option<PimdirItem>> {
     let collection = ReplicaCollectionId(collection.to_string());
     let page = store
         .list_retained(&collection, Some(seq - 1), 1)

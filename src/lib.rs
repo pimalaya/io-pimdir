@@ -13,10 +13,13 @@
 //! model and the store columns: the flag JSON, the detail-level integer
 //! map and the action queue's versioned payload JSON. [`conventions`]
 //! derives a writer's `link_id`, `meta` and `sort_key` from an item's
-//! bytes, and [`hash`] names a body. [`client`] (feature `client`) is
-//! [`PimdirStore`], which runs the statements against SQLite and the
-//! blob files to service the storage seam, plus [`PimdirProducer`], the
-//! enqueue-only handle for processes that do not own the store.
+//! bytes, and [`hash`] names a body. [`client`] (feature `client`) holds
+//! the three roles the format defines (spec §8), one handle each:
+//! [`PimdirStore`] is the owner, which runs the statements against SQLite
+//! and the blob files to service the storage seam; [`PimdirProducer`] is
+//! the enqueue-only handle for a process that does not own the store; and
+//! [`PimdirReader`] is the read surface both of them share, which takes
+//! no lock and carries no write at all.
 //!
 //! The crate is `no_std` with `alloc`; `std` only enters behind the
 //! `client` feature, where the SQLite driver lives.
@@ -41,4 +44,5 @@ pub use client::{
     PimdirError, PimdirGcReport, PimdirItem, PimdirParkedAction, PimdirPendingAction,
     PimdirProducer, PimdirPurgeReport, PimdirRetention, PimdirSourceStore, PimdirStore,
     diagnostics::{PimdirAmbiguous, PimdirDangling, PimdirObjectStats, PimdirRefcountDrift},
+    reader::PimdirReader,
 };

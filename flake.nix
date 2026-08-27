@@ -1,5 +1,5 @@
 {
-  description = "pimdir store (SQLite + blobs) implementing the io-replica storage seam";
+  description = "Rust implementation of Pimdir standard";
 
   inputs = {
     nixpkgs = {

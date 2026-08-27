@@ -14,7 +14,7 @@
 
 use std::fs;
 
-use io_pimdir::{PimdirError, PimdirStore, sql};
+use io_pimdir::{PimdirError, PimdirReader, PimdirStore, sql};
 use rusqlite::Connection;
 use tempfile::tempdir;
 
@@ -156,7 +156,7 @@ fn disagreeing_schema_stamps_are_refused() {
         })
     ));
     assert!(matches!(
-        PimdirStore::open_read_only(dir.path()),
+        PimdirReader::open(dir.path()),
         Err(PimdirError::VersionMismatch { .. })
     ));
 }
@@ -187,7 +187,7 @@ fn a_store_without_the_rename_cascades_is_refused() {
         Err(PimdirError::Unreconcilable { .. })
     ));
     assert!(matches!(
-        PimdirStore::open_read_only(dir.path()),
+        PimdirReader::open(dir.path()),
         Err(PimdirError::Unreconcilable { .. })
     ));
 }

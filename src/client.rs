@@ -50,41 +50,52 @@ use rusqlite::{
 };
 
 use crate::{
-    client::lock::PimdirLock,
+    client::{lock::PimdirLock, reader::PimdirReader},
     codec::{self, PimdirAction, PimdirActionError},
     hash::{PimdirHashAlgo, PimdirHasher},
     sql,
 };
 
 pub mod diagnostics;
+pub mod reader;
+
 mod lock;
 
-/// A pimdir store: the database and the blob directory, opened without naming
-/// a side.
+/// A pimdir store held as its owner: the write surface, over the read
+/// surface every role shares.
 ///
-/// It carries what an operation means for the store as a whole: every
-/// client read, retention and purge, and the queue rows a cancellation
-/// removes, none of which consults a source. The sync seam does, and
-/// lives on [`PimdirSourceStore`], which
-/// [`for_source`](Self::for_source) yields.
+/// It carries what only an owner may do, none of which consults a
+/// source: retention and purge, the sweep and its repairs, and the queue
+/// rows a drain or a cancellation removes. The sync seam does consult
+/// one, and lives on [`PimdirSourceStore`], which
+/// [`for_source`](Self::for_source) yields. Reading is not an owner's
+/// privilege, so the reads live on [`PimdirReader`] and this handle
+/// dereferences to one.
 pub struct PimdirStore {
-    conn: Connection,
-    /// The store directory, which the collector locks and the blob tree hangs
-    /// off.
-    dir: PathBuf,
-    blobs: PathBuf,
+    reader: PimdirReader,
     /// The store's exclusive owner lock (spec §8), held for this handle's
-    /// lifetime; `None` on a read-only handle. Several handles of one
-    /// process share one lock.
+    /// lifetime; `None` on a handle opened through the deprecated
+    /// read-only constructor. Several handles of one process share one
+    /// lock.
     _lock: Option<Arc<PimdirLock>>,
-    /// The hash this store names its objects by (spec §5), read back from
-    /// `store_meta.hash_algo` so every body a consumer hashes lands under
-    /// the name the store already uses.
-    hash: PimdirHashAlgo,
     /// The account every collection this handle creates belongs to (spec §9.2);
     /// `None` in a single-account store. Set with
     /// [`for_account`](PimdirStore::for_account).
     account: Option<String>,
+}
+
+impl Deref for PimdirStore {
+    type Target = PimdirReader;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reader
+    }
+}
+
+impl DerefMut for PimdirStore {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.reader
+    }
 }
 
 /// A pimdir store acting as one source (`"left"`, `"right"`, `"phone"`, …):
@@ -335,8 +346,8 @@ impl PimdirStore {
     /// adopts what the store records, creating with
     /// [`PimdirHashAlgo::default`].
     ///
-    /// A consumer hashes through [`hash`](Self::hash) or
-    /// [`hasher`](Self::hasher) rather than choosing an algorithm of its
+    /// A consumer hashes through [`hash`](PimdirReader::hash) or
+    /// [`hasher`](PimdirReader::hasher) rather than choosing an algorithm of its
     /// own, which is what keeps two implementations of one store naming
     /// the same body the same way.
     pub fn open_with_hash(
@@ -365,11 +376,8 @@ impl PimdirStore {
         let hash = read_hash_algo(&conn, hash)?;
 
         Ok(Self {
-            conn,
-            dir: dir.to_path_buf(),
-            blobs,
+            reader: PimdirReader::over(conn, dir.to_path_buf(), blobs, hash),
             _lock: Some(lock),
-            hash,
             account: None,
         })
     }
@@ -385,6 +393,10 @@ impl PimdirStore {
     ///
     /// A reader owns nothing and takes no lock: any number of them may
     /// run against a store an owner holds.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use `PimdirReader::open`, which carries the reads and no write at all"
+    )]
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -407,42 +419,10 @@ impl PimdirStore {
         let hash = read_hash_algo(&conn, None)?;
 
         Ok(Self {
-            conn,
-            dir: dir.to_path_buf(),
-            blobs: dir.join("objects"),
+            reader: PimdirReader::over(conn, dir.to_path_buf(), dir.join("objects"), hash),
             _lock: None,
-            hash,
             account: None,
         })
-    }
-
-    /// The hash this store names its objects by (spec §5).
-    pub fn hash_algo(&self) -> PimdirHashAlgo {
-        self.hash
-    }
-
-    /// A blob handle over this store's object directory, bound to the hash the
-    /// store names its bodies by.
-    ///
-    /// Independent of the SQLite connection, so a body can be read while
-    /// the store is mutably borrowed servicing a sync.
-    pub fn blobs(&self) -> PimdirBlobs {
-        PimdirBlobs {
-            root: self.blobs.clone(),
-            hash: self.hash,
-        }
-    }
-
-    /// The content hash of a whole body, under this store's algorithm.
-    pub fn hash(&self, bytes: &[u8]) -> ReplicaHash {
-        self.hash.hash(bytes)
-    }
-
-    /// An incremental hasher for a body streamed into the blob store
-    /// rather than held whole in memory, paired with
-    /// [`PimdirBlobs::writer`].
-    pub fn hasher(&self) -> PimdirHasher {
-        self.hash.hasher()
     }
 
     /// Binds this handle to an account, so every collection it creates is
@@ -458,8 +438,8 @@ impl PimdirStore {
     /// so two accounts holding one link id still share a `seq`, and one
     /// body reaching both is still stored once. Where an identity or a
     /// body occurs is reported by
-    /// [`link_placements`](Self::link_placements) and
-    /// [`object_placements`](Self::object_placements).
+    /// [`link_placements`](PimdirReader::link_placements) and
+    /// [`object_placements`](PimdirReader::object_placements).
     pub fn for_account(mut self, account: impl Into<String>) -> Self {
         self.account = Some(account.into());
         self
@@ -539,209 +519,6 @@ impl PimdirStore {
         Ok(())
     }
 
-    /// The account a collection is grouped under.
-    ///
-    /// The outer `Option` is whether the collection exists, the inner one
-    /// whether it is grouped: `Ok(None)` for an unknown collection,
-    /// `Ok(Some(None))` for one in a single-account store.
-    pub fn collection_account(
-        &self,
-        collection: &str,
-    ) -> Result<Option<Option<String>>, PimdirError> {
-        Ok(self
-            .conn
-            .query_row(
-                sql::LOAD_ACCOUNT,
-                named_params! { ":collection": collection },
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?)
-    }
-
-    /// The declared media type of a collection, or `None` if the store
-    /// has never seen it. An empty string means the collection exists but
-    /// was created lazily by a sync before any
-    /// [`ensure_collection`](Self::ensure_collection) declared its kind.
-    pub fn collection_kind(&self, collection: &str) -> Result<Option<String>, PimdirError> {
-        Ok(self
-            .conn
-            .query_row(
-                sql::LOAD_KIND,
-                named_params! { ":collection": collection },
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?)
-    }
-
-    /// Lists every collection in the store (client read surface).
-    ///
-    /// Ordered by `sort_order` then `id`, unordered collections last. A
-    /// direct getter: it observes the shared truth and never mutates, and
-    /// writes go through io-replica's [`write`](ReplicaStorage::write).
-    pub fn list_collections(&self) -> Result<Vec<PimdirCollection>, PimdirError> {
-        Ok(rows(&self.conn, sql::LIST_COLLECTIONS, [], collection_row)?)
-    }
-
-    /// Lists one account's collections, the filter axis of a merged view
-    /// (spec §9.2).
-    ///
-    /// `None` selects the collections of a single-account store, matching on
-    /// `IS` so a `NULL` account matches itself; `=` would match nothing.
-    pub fn list_collections_by_account(
-        &self,
-        account: Option<&str>,
-    ) -> Result<Vec<PimdirCollection>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            sql::LIST_COLLECTIONS_BY_ACCOUNT,
-            named_params! { ":account": account },
-            collection_row,
-        )?)
-    }
-
-    /// The accounts owning at least one collection.
-    ///
-    /// Not a configured roster: a store learns an account only through
-    /// its collections (spec §9.2), so one with none yet does not appear
-    /// here and a consumer holding the real roster reads its own config.
-    pub fn list_accounts(&self) -> Result<Vec<String>, PimdirError> {
-        Ok(rows(&self.conn, sql::LIST_ACCOUNTS, [], |r| r.get(0))?)
-    }
-
-    /// Every live placement of one identity, with the collection and account it
-    /// sits in (spec §9.2).
-    ///
-    /// The store reports where a link id occurs and takes no position on
-    /// whether the placements are one thing. A mail view lists them, two
-    /// receipts of a newsletter having two read states; a contact view
-    /// may offer to merge them. Both read these rows.
-    pub fn link_placements(&self, link_id: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            sql::LIST_LINK_PLACEMENTS,
-            named_params! { ":link_id": link_id },
-            |r| {
-                Ok(PimdirPlacement {
-                    collection: r.get(0)?,
-                    account: r.get(1)?,
-                    seq: r.get(2)?,
-                    link_id: ReplicaLinkId(link_id.to_string()),
-                    object: r.get::<_, Option<String>>(3)?.map(ReplicaHash),
-                    flags: codec::flags_from_json(r.get::<_, Option<String>>(4)?.as_deref()),
-                    level: codec::level_from_int(r.get(5)?),
-                })
-            },
-        )?)
-    }
-
-    /// Every live placement of one body, by content hash: the dedup axis
-    /// rather than the identity one, so it pairs placements two servers
-    /// gave different link ids.
-    pub fn object_placements(&self, hash: &str) -> Result<Vec<PimdirPlacement>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            sql::LIST_OBJECT_PLACEMENTS,
-            named_params! { ":hash": hash },
-            |r| {
-                Ok(PimdirPlacement {
-                    collection: r.get(0)?,
-                    account: r.get(1)?,
-                    seq: r.get(2)?,
-                    link_id: ReplicaLinkId(r.get(3)?),
-                    object: Some(ReplicaHash(hash.to_string())),
-                    flags: codec::flags_from_json(r.get::<_, Option<String>>(4)?.as_deref()),
-                    level: codec::level_from_int(r.get(5)?),
-                })
-            },
-        )?)
-    }
-
-    /// A keyset page of a collection's live items (client read surface).
-    ///
-    /// `after` is the exclusive lower bound on `link_id`, `None` starting
-    /// from the beginning; at most `limit` items come back ordered by
-    /// `link_id`, so the last item's [`link_id`](PimdirItem::link_id) is
-    /// the next page's cursor. Tombstones are excluded, and each item
-    /// carries its `level`, so a body's absence shows without probing the
-    /// blobs.
-    pub fn list_items(
-        &self,
-        collection: &str,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<PimdirItem>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            sql::LIST_ITEMS_PAGE,
-            named_params! {
-                ":collection": collection,
-                ":after": after.unwrap_or(""),
-                ":limit": limit as i64,
-            },
-            read_item_from_row,
-        )?)
-    }
-
-    /// A keyset page of a collection's live items in the kind's own
-    /// ascending order (spec §9.3): A to Z for contacts, earliest first
-    /// for mail and calendars.
-    ///
-    /// `after` is the previous page's last `(sort_key, seq)`, `None`
-    /// starting from the beginning. The pair is the cursor because a sort
-    /// key is not unique and `seq`, unique per collection, is what makes
-    /// the page total: no item is skipped or repeated across a boundary.
-    pub fn list_items_page_asc(
-        &self,
-        collection: &str,
-        after: Option<(&str, i64)>,
-        limit: usize,
-    ) -> Result<Vec<PimdirItem>, PimdirError> {
-        // NOTE: no real key sorts before an unknown one ascending, so the
-        // empty string with seq 0 is the true beginning, not a sentinel.
-        let (key, seq) = after.unwrap_or(("", 0));
-        self.sorted_page(
-            sql::LIST_ITEMS_PAGE_ASC,
-            collection,
-            Some((key, seq)),
-            limit,
-        )
-    }
-
-    /// The same page descending: newest first for mail and calendars, Z
-    /// to A for contacts.
-    ///
-    /// `None` starts from the end, which the statement expresses by
-    /// binding a key above every representable one, so a caller never
-    /// invents that sentinel itself.
-    pub fn list_items_page_desc(
-        &self,
-        collection: &str,
-        after: Option<(&str, i64)>,
-        limit: usize,
-    ) -> Result<Vec<PimdirItem>, PimdirError> {
-        self.sorted_page(sql::LIST_ITEMS_PAGE_DESC, collection, after, limit)
-    }
-
-    fn sorted_page(
-        &self,
-        statement: &str,
-        collection: &str,
-        after: Option<(&str, i64)>,
-        limit: usize,
-    ) -> Result<Vec<PimdirItem>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            statement,
-            named_params! {
-                ":collection": collection,
-                ":after_key": after.map(|(key, _)| key),
-                ":after_seq": after.map(|(_, seq)| seq).unwrap_or_default(),
-                ":limit": limit as i64,
-            },
-            read_item_from_row,
-        )?)
-    }
-
     /// Restates one item's ordering key (spec §9.3).
     ///
     /// For a re-projection: a store written before its kind had a
@@ -786,56 +563,6 @@ impl PimdirStore {
         )?;
         Ok(())
     }
-
-    /// One live item by its public id `(collection, seq)`, or `None`. A
-    /// tombstoned item reads as `None`, and the returned item carries its
-    /// internal `link_id` for the caller to edit by.
-    pub fn get_item(&self, collection: &str, seq: i64) -> Result<Option<PimdirItem>, PimdirError> {
-        Ok(self
-            .conn
-            .query_row(
-                sql::GET_ITEM,
-                named_params! { ":collection": collection, ":seq": seq },
-                read_item_from_row,
-            )
-            .optional()?)
-    }
-
-    /// Resolves an item's public id (`seq`) from its internal `link_id`,
-    /// the inverse of [`get_item`](Self::get_item), for a consumer that
-    /// just staged an add and wants the id it now shows under.
-    pub fn seq_for_link(
-        &self,
-        collection: &str,
-        link_id: &str,
-    ) -> Result<Option<i64>, PimdirError> {
-        Ok(self
-            .conn
-            .query_row(
-                sql::SEQ_BY_LINK,
-                named_params! { ":collection": collection, ":link_id": link_id },
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    /// The distinct source names the store has synced against, across all
-    /// collections. A client attributes its writes with this: a store
-    /// synced as a single source has exactly one, so the app writes as it
-    /// without configuration.
-    pub fn distinct_sources(&self) -> Result<Vec<String>, PimdirError> {
-        Ok(rows(&self.conn, sql::LIST_SOURCES, [], |r| r.get(0))?)
-    }
-
-    /// A collection's live (non-tombstone) item count (client read surface).
-    pub fn count_items(&self, collection: &str) -> Result<u64, PimdirError> {
-        let count: i64 = self.conn.query_row(
-            sql::COUNT_ITEMS,
-            named_params! { ":collection": collection },
-            |r| r.get(0),
-        )?;
-        Ok(count.max(0) as u64)
-    }
 }
 
 /// The retention surface (spec §11): the trash a store keeps instead of
@@ -849,53 +576,6 @@ impl PimdirStore {
 /// owner's schedule, which is why every purge takes its boundary from the
 /// caller.
 impl PimdirStore {
-    /// A keyset page of a collection's retained items.
-    ///
-    /// `after` is the exclusive lower bound on the public `seq`, `None`
-    /// starting from the beginning; at most `limit` items come back
-    /// ordered by `seq`, so the last item's [`seq`](PimdirItem::seq) is
-    /// the next page's cursor. The only read that returns retained items:
-    /// a caller presents them as a trash view, never merged into the live
-    /// listing.
-    pub fn list_retained(
-        &self,
-        collection: &ReplicaCollectionId,
-        after: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<PimdirItem>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            sql::LIST_RETAINED_PAGE,
-            named_params! {
-                ":collection": collection.0,
-                ":after": after.unwrap_or(0),
-                ":limit": limit as i64,
-            },
-            read_item_from_row,
-        )?)
-    }
-
-    /// A collection's retained item count, the counterpart of
-    /// [`count_items`](Self::count_items).
-    pub fn count_retained(&self, collection: &ReplicaCollectionId) -> Result<i64, PimdirError> {
-        Ok(self.conn.query_row(
-            sql::COUNT_RETAINED,
-            named_params! { ":collection": collection.0 },
-            |r| r.get(0),
-        )?)
-    }
-
-    /// The bytes retention is holding across the whole store, each distinct body
-    /// counted once.
-    ///
-    /// An upper bound on what a purge would reclaim: a body a live item
-    /// also points at keeps that reference and survives the sweep.
-    /// Reported so an operator can price a retention duration.
-    pub fn retained_bytes(&self) -> Result<u64, PimdirError> {
-        let bytes: i64 = self.conn.query_row(sql::RETAINED_BYTES, [], |r| r.get(0))?;
-        Ok(bytes.max(0) as u64)
-    }
-
     /// Purges one retained item by its public id, returning whether there was
     /// one to purge.
     ///
@@ -1094,56 +774,29 @@ fn release_pins(
 /// (spec §12): the single owning process drains producer-requested
 /// mutations into the store, and marks a rebuild for readers.
 impl PimdirStore {
-    /// A collection's handle-space epoch (spec §12), or `None` when the
-    /// store has never seen it. Starts at 1, bumped only by
-    /// [`write_rekeyed`](PimdirSourceStore::write_rekeyed), so a frontend
-    /// derives an IMAP UIDVALIDITY from it alone.
-    pub fn generation(&self, collection: &str) -> Result<Option<i64>, PimdirError> {
-        Ok(self
-            .conn
-            .query_row(
-                sql::LOAD_GENERATION,
-                named_params! { ":collection": collection },
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
+    /// Cancels one queue row (spec §15.5) as the store's owner, holding
+    /// that role only for the length of the call.
+    ///
+    /// Cancelling is an owner write, and it is the only retraction a
+    /// queued create has: the kinds that address an existing item are
+    /// retracted by their inverse instead, `set-flags` being absolute
+    /// rather than a delta. A consumer that is otherwise a reader and a
+    /// producer needs the role for this one statement, so it takes it
+    /// here rather than by holding a handle that could also drain the
+    /// queue or sweep the objects.
+    ///
+    /// The store must exist: this never creates one, so a mistyped path
+    /// is [`PimdirError::Uncreated`] rather than an empty store. A store
+    /// another process owns is [`PimdirError::Owned`] at once, never a
+    /// wait, and the caller reports it as a sync being in flight: the
+    /// action is still queued, and may have been applied in the meantime.
+    pub fn cancel_action(dir: impl AsRef<Path>, id: i64) -> Result<bool, PimdirError> {
+        let dir = dir.as_ref();
+        if !dir.join("pimdir.db").is_file() {
+            return Err(PimdirError::Uncreated);
+        }
 
-    /// The collections with pending (non-parked) queue work, for the owner's
-    /// drain loop.
-    pub fn queued_collections(&self) -> Result<Vec<String>, PimdirError> {
-        Ok(rows(&self.conn, sql::LIST_QUEUED_COLLECTIONS, [], |r| {
-            r.get(0)
-        })?)
-    }
-
-    /// A collection's pending (non-parked) actions in append order,
-    /// decoded (spec §15.4): a frontend overlays them on its item
-    /// projection for read-your-writes. An undecodable payload errors,
-    /// and the owner's next drain parks such a row.
-    pub fn pending_actions(
-        &self,
-        collection: &str,
-    ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
-        load_pending_actions(&self.conn, collection)
-    }
-
-    /// Every parked action across the store, in append order, for status
-    /// surfaces and operator repair. Parked rows are skipped by the drain
-    /// and never silently deleted.
-    pub fn parked_actions(&self) -> Result<Vec<PimdirParkedAction>, PimdirError> {
-        Ok(rows(&self.conn, sql::LOAD_PARKED_ACTIONS, [], |r| {
-            Ok(PimdirParkedAction {
-                id: r.get(0)?,
-                created_at: r.get(1)?,
-                producer: r.get(2)?,
-                collection: r.get(3)?,
-                action: r.get(4)?,
-                payload: r.get(5)?,
-                attempts: r.get(6)?,
-                error: r.get(7)?,
-            })
-        })?)
+        Self::open(dir)?.drop_action(id)
     }
 
     /// Removes one queue row by request rather than by application, pending or
@@ -1236,16 +889,17 @@ impl PimdirSourceStore {
         ops: Vec<ReplicaWriteOp>,
     ) -> Result<i64, PimdirError> {
         // NOTE: as in `write`, the bodies land before the transaction opens.
-        stage_blobs(&self.store.blobs, &ops)?;
+        stage_blobs(&self.store.reader.blobs, &ops)?;
 
         let tx = self
             .store
+            .reader
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         apply_ops(
             &tx,
-            &self.store.blobs,
+            &self.store.reader.blobs,
             &self.source,
             self.store.account.as_deref(),
             &mut self.residual,
@@ -1280,12 +934,12 @@ impl PimdirSourceStore {
     /// behind it. That is what lets one queue carry store mutations any
     /// owner applies beside capability-bound intents only a specific
     /// owner can perform; that owner reads the row through
-    /// [`pending_actions`](PimdirStore::pending_actions), performs it,
+    /// [`pending_actions`](PimdirReader::pending_actions), performs it,
     /// and acknowledges it with
     /// [`drop_action`](PimdirStore::drop_action).
     pub fn drain_collection(&mut self, collection: &str) -> Result<PimdirDrainReport, PimdirError> {
         let pending: Vec<QueueRow> = rows(
-            &self.store.conn,
+            &self.store.reader.conn,
             sql::LOAD_PENDING_ACTIONS,
             named_params! { ":collection": collection },
             |r| {
@@ -1341,6 +995,7 @@ impl PimdirSourceStore {
     ) -> Result<Option<String>, PimdirError> {
         let tx = self
             .store
+            .reader
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
@@ -1364,7 +1019,7 @@ impl PimdirSourceStore {
         };
         apply_ops(
             &tx,
-            &self.store.blobs,
+            &self.store.reader.blobs,
             &self.source,
             self.store.account.as_deref(),
             &mut self.residual,
@@ -1399,16 +1054,17 @@ impl ReplicaStorage for PimdirSourceStore {
         // is resolved through its binding first and one no binding holds
         // contributes nothing.
         let hub = match scope {
-            ReplicaLoadScope::All => load_hub(&self.store.conn, &collection.0)?,
+            ReplicaLoadScope::All => load_hub(&self.store.reader.conn, &collection.0)?,
             ReplicaLoadScope::Links(links) => {
                 let links: Vec<String> = links.iter().map(|l| l.0.clone()).collect();
-                load_hub_by_link(&self.store.conn, &collection.0, &links)?
+                load_hub_by_link(&self.store.reader.conn, &collection.0, &links)?
             }
             ReplicaLoadScope::Handles(handles) => {
                 let mut links = Vec::new();
                 for handle in handles {
                     let link = self
                         .store
+                        .reader
                         .conn
                         .query_row(
                             sql::LINK_FOR_HANDLE,
@@ -1422,7 +1078,7 @@ impl ReplicaStorage for PimdirSourceStore {
                         .optional()?;
                     links.extend(link);
                 }
-                load_hub_by_link(&self.store.conn, &collection.0, &links)?
+                load_hub_by_link(&self.store.reader.conn, &collection.0, &links)?
             }
         };
 
@@ -1436,6 +1092,7 @@ impl ReplicaStorage for PimdirSourceStore {
 
         let checkpoint = self
             .store
+            .reader
             .conn
             .query_row(
                 sql::LOAD_CHECKPOINT,
@@ -1460,7 +1117,7 @@ impl ReplicaStorage for PimdirSourceStore {
         let json = serde_json::to_string(&ids)?;
 
         let found = rows(
-            &self.store.conn,
+            &self.store.reader.conn,
             sql::LOOKUP_OBJECTS,
             named_params! { ":links": json, ":account": self.store.account.as_deref() },
             |r| {
@@ -1487,7 +1144,7 @@ impl ReplicaStorage for PimdirSourceStore {
     fn write(&mut self, ops: Vec<ReplicaWriteOp>) -> Result<(), Self::Error> {
         // NOTE: bodies first, outside the transaction, so the writer lock
         // is never held across a file write and two `fsync`s (spec §14).
-        stage_blobs(&self.store.blobs, &ops)?;
+        stage_blobs(&self.store.reader.blobs, &ops)?;
 
         // NOTE: BEGIN IMMEDIATE takes the single writer lock up front
         // (§8), so a writer that cannot get it within `busy_timeout`
@@ -1495,12 +1152,13 @@ impl ReplicaStorage for PimdirSourceStore {
         // deferred lock upgrade.
         let tx = self
             .store
+            .reader
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         apply_ops(
             &tx,
-            &self.store.blobs,
+            &self.store.reader.blobs,
             &self.source,
             self.store.account.as_deref(),
             &mut self.residual,
@@ -1937,7 +1595,7 @@ impl PimdirBlobs {
     /// `hash`.
     ///
     /// The algorithm is the store's, not a choice made here: it is what
-    /// the files are named by. [`PimdirStore::blobs`] hands one out
+    /// the files are named by. [`PimdirReader::blobs`] hands one out
     /// already bound to the store it came from.
     pub fn open(dir: impl AsRef<Path>, hash: PimdirHashAlgo) -> Self {
         Self {

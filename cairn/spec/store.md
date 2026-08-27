@@ -251,13 +251,22 @@ collections) via `distinct_sources`, so a client can attribute its writes to a
 source without configuration — a store synced as a single source returns exactly
 one. This is a kind-agnostic read; it never mutates.
 
-### Requirement: A reader can open the store read-only
-`PimdirStore::open_read_only(dir)` SHALL open an existing store with
+### Requirement: The store has a reader role of its own
+A consumer that only reads SHALL be able to hold a handle that can only read.
+`PimdirReader::open(dir)` SHALL open an existing store with
 `SQLITE_OPEN_READ_ONLY`: it never creates the schema (that is the owner's
 opening write), and refuses a schema version other than the current one with
-the version error. The returned handle exposes the full read surface; any write
-through it fails at the SQLite layer, whether the write is reached directly or
-through the source-bound handle it yields.
+the version error. It takes no lock (spec §8), so any number of readers run
+against a store an owner is syncing and none of them waits.
+
+The handle SHALL carry the read surface alone: it SHALL NOT expose the drain,
+the object sweep, a purge, a retention write, or an enqueue. `PimdirStore`
+SHALL dereference to one, so a reader and an owner run the same statements and
+the two roles never disagree about what the store holds.
+
+`PimdirStore::open_read_only(dir)` is deprecated: it returned an owner-shaped
+handle whose writes failed at the SQLite layer, which made the role a run-time
+property of a call rather than a compile-time property of the handle.
 
 ### Requirement: Reads are availability-aware
 A read result SHALL carry each item's detail `level` (`Probed`/`Meta`/`Full`), so
@@ -336,6 +345,26 @@ checkpoint, and content changes never bump it.
 The read surface SHALL expose a collection's pending (non-parked) actions in
 append order, so a frontend can overlay them on its item projection for
 read-your-writes.
+
+### Requirement: A reader may overlay a collection's pending actions
+A reader built with `with_pending` SHALL project a collection's pending actions
+over its committed items, in row `id` order, so a consumer sees its own staged
+writes before the owner applies them. The fold SHALL cover the kinds that
+address an existing item: `set-flags`, `remove`, `move`, `copy` and `update`.
+Each keeps the item's public id, a `seq` following the link id store-wide, so
+the overlay SHALL NOT invent an identifier.
+
+A pending `add` SHALL NOT be projected as an item: it has no `seq` until the
+owner applies it, and it is a request to create an item rather than one. The
+reader SHALL report pending creates apart, as rows and as a count.
+
+A parked row SHALL NOT overlay, its error asserting that it will not be applied
+without an operator.
+
+The overlay SHALL be chosen when the reader is built rather than per call, so
+one handle cannot answer two ways about one collection. A page shortened by a
+staged removal comes back below its limit, so a caller pages until an empty page
+rather than until a short one.
 
 > Initial seed spec (Cairn adopted 2026-07-31): captures the store's core
 > guarantees; further capabilities may be spelled out as they are touched.
@@ -449,6 +478,16 @@ performed out of band. `fail_action(id, error)` SHALL record a failed attempt:
 `None` bumps `attempts` and leaves the row pending (transient), `Some(error)`
 parks it (permanent). A collection's pending actions SHALL expose each row's
 `id`, since callers act on rows by id.
+
+Cancelling is an owner write, and it is the only retraction a queued create
+has: the kinds that address an existing item are retracted by their inverse
+instead, `set-flags` being absolute rather than a delta.
+`PimdirStore::cancel_action(dir, id)` SHALL therefore perform it as a scoped
+operation, opening the store as owner, cancelling one row and releasing the lock
+before returning, so a consumer that is otherwise a reader and a producer never
+holds a handle that could drain the queue or sweep the objects. It SHALL NOT
+create a store it cannot find, and a store another process owns SHALL fail fast
+rather than wait.
 
 ### Requirement: The canonical SQL is reachable by name
 `sql` SHALL expose `ALL`, a `&[(&str, &str)]` pairing every statement constant's

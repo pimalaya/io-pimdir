@@ -152,7 +152,7 @@ impl ExportCommand {
     /// Dumps a collection's live items, page by page, returning how many.
     fn dump_live(
         &self,
-        read: &io_pimdir::PimdirStore,
+        read: &io_pimdir::PimdirReader,
         collection: &str,
         path: &Path,
         hashes: &mut BTreeSet<String>,
@@ -196,7 +196,7 @@ impl ExportCommand {
     /// Dumps a collection's retained items, page by page, returning how many.
     fn dump_retained(
         &self,
-        read: &io_pimdir::PimdirStore,
+        read: &io_pimdir::PimdirReader,
         collection: &str,
         path: &Path,
         hashes: &mut BTreeSet<String>,

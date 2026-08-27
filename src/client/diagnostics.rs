@@ -18,7 +18,7 @@ use rusqlite::{OptionalExtension, named_params};
 use serde::Serialize;
 
 use crate::{
-    client::{PimdirError, PimdirStore, rows},
+    client::{PimdirError, reader::PimdirReader, rows},
     sql,
 };
 
@@ -68,7 +68,7 @@ pub struct PimdirDangling {
     pub target: String,
 }
 
-impl PimdirStore {
+impl PimdirReader {
     /// How many objects are indexed and what they weigh in total.
     pub fn object_stats(&self) -> Result<PimdirObjectStats, PimdirError> {
         let (count, bytes) = self.conn.query_row(sql::OBJECT_STATS, [], |r| {
@@ -128,7 +128,7 @@ impl PimdirStore {
     /// The expected count is exactly what the write path maintains
     /// incrementally: an item's body, an item's conflict copy, each source's
     /// stored base, and each queue row pinning a body it enqueued.
-    /// [`recompute_refcounts`](PimdirStore::recompute_refcounts) is what
+    /// [`recompute_refcounts`](crate::client::PimdirStore::recompute_refcounts) is what
     /// settles what this reports.
     pub fn refcount_drift(&self) -> Result<Vec<PimdirRefcountDrift>, PimdirError> {
         Ok(rows(&self.conn, sql::REFCOUNT_DRIFT, [], |r| {
@@ -160,7 +160,7 @@ impl PimdirStore {
     /// Every row pointing at something absent: a binding whose item is gone, an
     /// item or a queue row whose object is not indexed.
     ///
-    /// Only the first is repairable ([`clear_dangling_bindings`](PimdirStore::clear_dangling_bindings));
+    /// Only the first is repairable ([`clear_dangling_bindings`](crate::client::PimdirStore::clear_dangling_bindings));
     /// the other two still hold data, so they are reported and left alone.
     pub fn dangling(&self) -> Result<Vec<PimdirDangling>, PimdirError> {
         let mut dangling = rows(&self.conn, sql::DANGLING_BINDINGS, [], |r| {

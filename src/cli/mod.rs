@@ -27,7 +27,7 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
-use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirStore};
+use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirReader, PimdirStore};
 use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
 
 /// The producer name recorded on every queue row this tool appends, so an
@@ -76,11 +76,14 @@ impl StoreFlags {
         Ok(())
     }
 
-    /// Opens the store read-only: the role every inspection verb uses, safe to
+    /// Opens the store to read: the role every inspection verb uses, safe to
     /// run while a sync holds the write lock.
-    pub fn read(&self) -> Result<PimdirStore> {
+    ///
+    /// Without the pending overlay (spec §15.4): an operator inspects the
+    /// store as it stands, and reads the queue through `queue list`.
+    pub fn read(&self) -> Result<PimdirReader> {
         self.ensure_store()?;
-        PimdirStore::open_read_only(&self.store).map_err(report)
+        PimdirReader::open(&self.store).map_err(report)
     }
 
     /// Opens the store as its owner, for a verb whose effect is not tied to one
@@ -137,7 +140,7 @@ impl StoreFlags {
     /// The blob directory handle, for reading a body back, bound to the hash
     /// the store names its bodies by.
     pub fn blobs(&self) -> Result<PimdirBlobs> {
-        let store = PimdirStore::open_read_only(&self.store).map_err(report)?;
+        let store = PimdirReader::open(&self.store).map_err(report)?;
         Ok(store.blobs())
     }
 }

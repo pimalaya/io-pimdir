@@ -27,11 +27,15 @@ never compile clap or any terminal dependency. The command modules SHALL hang
 off the binary crate root, not off `lib.rs`, so the library's public API is
 unchanged by the presence of the CLI.
 
-### Requirement: Reads open the store read-only
-Every inspection verb SHALL open the store through the read-only role, so
-inspecting a store while a sync is running is always safe and can never take
-the write lock away from the owner. A verb that only reads SHALL NOT open the
-store read-write "just in case".
+### Requirement: Reads open the store through the reader role
+Every inspection verb SHALL open the store through the reader role
+(`PimdirReader`), so inspecting a store while a sync is running is always safe
+and can never take the write lock away from the owner. A verb that only reads
+SHALL NOT open the store read-write "just in case".
+
+Those reads SHALL NOT overlay the pending queue: an operator inspects the store
+as it stands, and reads what is queued through `queue list`, where a pending row
+shows as a row rather than as a fact about an item.
 
 ### Requirement: Item mutations enqueue, then drain when the owner role is free
 An item mutation requested from the CLI (today: `item restore`) SHALL be

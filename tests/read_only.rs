@@ -1,5 +1,8 @@
-//! The read-only open: reads an owner-created store, refuses a missing or
-//! stale-version one, and its write path fails at the SQLite layer.
+//! The deprecated read-only open, kept working until it goes: it reads an
+//! owner-created store, refuses a missing or stale-version one, and its
+//! write path fails at the SQLite layer. The role it stood in for is
+//! `PimdirReader`, covered by tests/overlay.rs.
+#![allow(deprecated)]
 
 use io_pimdir::{PimdirError, PimdirStore};
 use io_replica::{

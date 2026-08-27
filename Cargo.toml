@@ -1,6 +1,6 @@
 [package]
 name = "io-pimdir"
-description = "pimdir store and operator CLI for Rust: a SQLite and content-addressed blob storage backend for io-replica"
+description = "Rust implementation of Pimdir standard"
 version = "0.3.0"
 authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
 rust-version = "1.87"

@@ -6,8 +6,8 @@
 use std::{io::Write, path::Path};
 
 use io_pimdir::{
-    PimdirBlobs, PimdirError, PimdirProducer, PimdirSourceStore, PimdirStore, codec::PimdirAction,
-    hash::PimdirHashAlgo, sql,
+    PimdirBlobs, PimdirError, PimdirProducer, PimdirReader, PimdirSourceStore, PimdirStore,
+    codec::PimdirAction, hash::PimdirHashAlgo, sql,
 };
 use io_replica::{
     change::{ReplicaDropReason, ReplicaWriteOp},
@@ -671,7 +671,7 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
     for result in [
         PimdirStore::open(dir.path()).map(drop),
         PimdirProducer::open(dir.path(), "test").map(drop),
-        PimdirStore::open_read_only(dir.path()).map(drop),
+        PimdirReader::open(dir.path()).map(drop),
     ] {
         match result {
             Err(PimdirError::Version { found }) => assert_eq!(found, sql::VERSION + 1),
