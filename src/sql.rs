@@ -141,6 +141,9 @@ CREATE TABLE bindings (
     collection    TEXT NOT NULL,
     link_id       TEXT NOT NULL,
     source        TEXT NOT NULL,
+    -- The item's backend id on this source (IMAP UID, DAV href). Bound once: a
+    -- write resolving this binding to another handle is refused, and the one
+    -- licensed rebind is the handle-space rebuild (SPEC.md §10, §12).
     handle        TEXT NOT NULL,
     base_flags    TEXT,
     base_object   TEXT REFERENCES objects(hash),
@@ -154,12 +157,6 @@ CREATE TABLE bindings (
     -- items.conflicted, which is the cross-source divergence.
     conflicted        INTEGER NOT NULL DEFAULT 0,
     conflict_revision TEXT,
-    -- The OTHER handles this source holds this identity under, as a JSON array,
-    -- or NULL: the identity-axis twin of `conflicted`. A source may hold one
-    -- link id twice, and a binding pins one handle, so the second has nowhere
-    -- to live; recording it keeps the write from silently repointing the
-    -- binding, and makes the freeze survive a restart.
-    ambiguous_handles TEXT,
     PRIMARY KEY (collection, link_id, source),
     FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT;
@@ -398,14 +395,14 @@ LIST_SOURCES = "SELECT DISTINCT source FROM bindings ORDER BY source";
 /// flags, object, revision) each sync merges against.
 LOAD_BINDINGS = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
-conflicted, conflict_revision, ambiguous_handles \
+conflicted, conflict_revision \
 FROM bindings WHERE collection = :collection";
 
 /// The same rows, narrowed to the link ids one write batch touches: the binding
 /// half of [`LOAD_ITEMS_BY_LINK`].
 LOAD_BINDINGS_BY_LINK = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
-conflicted, conflict_revision, ambiguous_handles \
+conflicted, conflict_revision \
 FROM bindings WHERE collection = :collection \
   AND link_id IN (SELECT value FROM json_each(:links))";
 
@@ -577,25 +574,24 @@ RETURNING object_hash, conflict_object";
 /// `UPDATE_BINDING` handles an existing one).
 INSERT_BINDING = "\
 INSERT INTO bindings(collection, link_id, source, handle, base_flags, base_object, \
-base_revision, base_present, conflicted, conflict_revision, ambiguous_handles) \
+base_revision, base_present, conflicted, conflict_revision) \
 VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, \
-:base_revision, :base_present, :conflicted, :conflict_revision, :ambiguous_handles)";
+:base_revision, :base_present, :conflicted, :conflict_revision)";
 
 /// Updates one existing binding's columns in place (its primary key
 /// `(collection, link_id, source)` is unchanged).
 ///
-/// `handle` is deliberately not among them. A binding pins one handle,
-/// and repointing it would destroy the evidence that a source holds an
-/// identity twice, before any later rule could act on it. A second copy
-/// is recorded in `ambiguous_handles` instead, which freezes the item
-/// until the source holds the identity once again. A legitimate rebind,
-/// after a handle-space change, goes through the rebuild that drops the
-/// old spine and inserts the new one.
+/// `handle` is deliberately not among them, and cannot be. A binding
+/// pins one handle, and repointing it would destroy the evidence that a
+/// source holds an identity twice, before any later rule could act on it.
+/// A write resolving this binding to another handle is refused instead
+/// (spec §10), the second copy having a key and an item of its own (spec
+/// §9). A legitimate rebind, after a handle-space change, goes through
+/// the rebuild that drops the old spine and inserts the new one.
 UPDATE_BINDING = "\
 UPDATE bindings SET base_flags = :base_flags, \
 base_object = :base_object, base_revision = :base_revision, base_present = :base_present, \
-conflicted = :conflicted, conflict_revision = :conflict_revision, \
-ambiguous_handles = :ambiguous_handles \
+conflicted = :conflicted, conflict_revision = :conflict_revision \
 WHERE collection = :collection AND link_id = :link_id AND source = :source";
 
 /// Deletes one source's binding of an item.
@@ -816,13 +812,29 @@ SELECT o.hash, o.refcount, coalesce(c.n, 0) FROM objects o \
 LEFT JOIN counted c ON c.hash = o.hash \
 WHERE o.refcount != coalesce(c.n, 0) ORDER BY o.hash";
 
-/// The bindings whose source holds one identity under more than one
-/// handle (spec §13), with how many copies: not a defect, but the reason
-/// those items stop syncing.
-AMBIGUOUS_BINDINGS = "\
-SELECT collection, link_id, source, json_array_length(ambiguous_handles) + 1 \
-FROM bindings WHERE ambiguous_handles IS NOT NULL \
-ORDER BY collection, link_id, source";
+/// Every source's binding of one item: the handle it is bound to, the base
+/// the last sync agreed on, and the conflict it is stuck on. The read behind
+/// `item show`, which names one item and can afford to say everything about it.
+ITEM_BINDINGS = "\
+SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
+conflicted, conflict_revision \
+FROM bindings WHERE collection = :collection AND link_id = :link_id \
+ORDER BY source";
+
+/// How many minted keys (spec §9, `dup:<hint>#<handle>`) each collection
+/// holds: the second copy of an identity a source hands over twice,
+/// filed as an item of its own.
+///
+/// Informational, and the only read that looks at the shape of a key at
+/// all. It counts them and nothing more: no hint and no handle is read
+/// back out of one, since a minted key is opaque and a store that
+/// resolved a prefix would make the engine's assignment reversible by
+/// accident. `GLOB` rather than `LIKE`, which is case-insensitive over
+/// ASCII and would count a hint of its own spelling.
+MINTED_KEYS = "\
+SELECT collection, count(*) FROM items \
+WHERE link_id GLOB 'dup:*' AND deleted = 0 AND retained_at IS NULL \
+GROUP BY collection ORDER BY collection";
 
 /// The bindings whose item is gone: the one dangling row a repair can clear,
 /// since nothing can read it (`DELETE_DANGLING_BINDINGS`).

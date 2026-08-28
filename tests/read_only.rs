@@ -56,7 +56,6 @@ fn read_only_open_reads_but_never_writes_or_creates() {
                     object: Some(ReplicaHash("cafe".into())),
                 }),
                 origin: None,
-                ambiguous_handles: Vec::new(),
             }),
         ])
         .unwrap();

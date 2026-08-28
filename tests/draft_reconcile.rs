@@ -27,9 +27,13 @@ const FOLDED_IN: &[(&str, &str)] = &[
     ("items", "retained_by"),
     ("items", "sort_key"),
     ("collections", "account"),
-    ("bindings", "ambiguous_handles"),
     ("bindings", "base_present"),
 ];
+
+/// The columns a later draft folded back out, with their declaration, so
+/// a store written while one was in the schema can be recreated here.
+/// Mirrors `reconcile_draft_shape`'s own list.
+const FOLDED_OUT: &[(&str, &str, &str)] = &[("bindings", "ambiguous_handles", "TEXT")];
 
 const FOLDED_INDEXES: &[&str] = &[
     "items_retained",
@@ -84,6 +88,54 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
     );
     assert_eq!(store.count_retained(&"INBOX".into()).unwrap(), 0);
     assert!(store.list_accounts().unwrap().is_empty());
+}
+
+/// A column a later draft folded back *out* goes from an existing store on
+/// open, the other half of the same allowance.
+///
+/// `bindings.ambiguous_handles` recorded the handles a source held one identity
+/// under; the second copy is an item of its own now (spec §9), so the store
+/// records no trace of an incoming handle at all. Left in place the column
+/// would keep rows stating a rule the crate no longer has, and the store would
+/// disagree with the canonical schema on the one table the write path is
+/// strictest about.
+#[test]
+fn a_column_folded_back_out_is_dropped_on_open() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("objects")).unwrap();
+
+    let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch(sql::MIGRATION_0001).unwrap();
+    conn.execute_batch(
+        "INSERT INTO store_meta(id, version, hash_algo, created_at) VALUES(1, 1, 'blake3', '0')",
+    )
+    .unwrap();
+    for (table, column, decl) in FOLDED_OUT {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+            .unwrap();
+    }
+    conn.pragma_update(None, "user_version", sql::VERSION)
+        .unwrap();
+    drop(conn);
+
+    let store = PimdirStore::open(dir.path()).unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    drop(store);
+
+    let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
+    for (table, column, _) in FOLDED_OUT {
+        let held: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !held.contains(&column.to_string()),
+            "{table}.{column} is still there after the reconciliation"
+        );
+    }
 }
 
 /// An index an earlier draft created under a name the schema still uses, over

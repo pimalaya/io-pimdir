@@ -58,11 +58,26 @@ fn every_vector_derives_what_the_conventions_say() {
 
         let derived = conventions::derive(kind, &body).expect(label);
 
-        match case["link_id"].as_str() {
-            Some(link_id) => assert_eq!(derived.link_id.0, link_id, "{label}: link id"),
+        match (case["link_id"].as_str(), case["handle"].as_str()) {
+            // NOTE: a minted case (spec §9). Its key is the hint, the
+            // handle and two literals, none of which a body states, so
+            // what this crate owes such a case is the hint: minting is
+            // the engine's, and a store neither performs it nor reads it
+            // back. Checking the composition here is what keeps the two
+            // halves agreeing on which string is the input.
+            (Some(link_id), Some(handle)) => {
+                let hint = case["hint"].as_str().expect("a minted case names its hint");
+                assert_eq!(derived.link_id.0, hint, "{label}: identity hint");
+                assert_eq!(
+                    link_id,
+                    format!("dup:{hint}#{handle}"),
+                    "{label}: minted key"
+                );
+            }
+            (Some(link_id), None) => assert_eq!(derived.link_id.0, link_id, "{label}: link id"),
             // NOTE: the format pins no id for content carrying none, so
             // what is checked is that one was derived at all.
-            None => assert!(!derived.link_id.0.is_empty(), "{label}: no id was derived"),
+            (None, _) => assert!(!derived.link_id.0.is_empty(), "{label}: no id was derived"),
         }
 
         assert_eq!(

@@ -38,7 +38,6 @@ fn placement(collection: &str, handle: &str, link: &str, key: &str) -> ReplicaPl
             object: Some(ReplicaHash("cafe".into())),
         }),
         origin: None,
-        ambiguous_handles: Vec::new(),
     }
 }
 

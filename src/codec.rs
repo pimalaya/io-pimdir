@@ -403,34 +403,9 @@ fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
         .ok_or(PimdirActionError::MissingField("seq"))
 }
 
-/// The other handles a source holds one identity under, as the JSON array
-/// the column stores; `None` for the ordinary case of none.
-///
-/// Recorded rather than inferred: the enumeration that reveals a
-/// duplicate says so once.
-pub fn handles_to_json(handles: &[ReplicaHandle]) -> Option<String> {
-    if handles.is_empty() {
-        return None;
-    }
-    let items: Vec<&str> = handles.iter().map(|h| h.0.as_str()).collect();
-    serde_json::to_string(&items).ok()
-}
-
-/// The inverse of [`handles_to_json`]. A column this cannot read decodes
-/// to none, on the same terms as a flag set: it is not evidence of a
-/// duplicate, and freezing an item on one would strand it.
-pub fn handles_from_json(json: Option<&str>) -> Vec<ReplicaHandle> {
-    let Some(json) = json else {
-        return Vec::new();
-    };
-    serde_json::from_str::<Vec<String>>(json)
-        .map(|items| items.into_iter().map(ReplicaHandle).collect())
-        .unwrap_or_default()
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
     #[test]
     fn flags_round_trip_and_escape() {
@@ -463,21 +438,6 @@ mod tests {
         // opinion and persist over the other's
         assert_eq!(flags_from_json(Some("not json")), ReplicaFlags::Unknown);
         assert_eq!(flags_from_json(Some("{}")), ReplicaFlags::Unknown);
-    }
-
-    #[test]
-    fn ambiguous_handles_round_trip_and_none_is_null() {
-        // NULL is the ordinary case, a list is the freeze
-        assert_eq!(handles_to_json(&[]), None);
-        assert!(handles_from_json(None).is_empty());
-
-        let handles = vec![ReplicaHandle("u2".into()), ReplicaHandle("u3".into())];
-        let json = handles_to_json(&handles).expect("a non-empty list encodes");
-        assert_eq!(handles_from_json(Some(&json)), handles);
-
-        // a column this cannot read is not evidence of a duplicate, and
-        // freezing an item on one would strand it
-        assert!(handles_from_json(Some("not json")).is_empty());
     }
 
     #[test]

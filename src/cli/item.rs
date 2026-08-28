@@ -17,6 +17,7 @@ use clap::{ArgGroup, Args, Subcommand};
 use io_pimdir::{PimdirItem, PimdirReader, codec::PimdirAction};
 use io_replica::{
     collection::ReplicaCollectionId,
+    hub::{ReplicaSourceBinding, ReplicaSourceId},
     object::ReplicaHash,
     placement::{ReplicaFlags, ReplicaLevel},
 };
@@ -139,8 +140,9 @@ impl ItemListCommand {
 /// Show one item by its public id, across every collection holding it.
 ///
 /// A message filed in two mailboxes shares one `seq`, so this prints one
-/// placement per collection, retained placements included. The meta is printed
-/// exactly as stored: this tool does not parse it.
+/// placement per collection, retained placements included, each followed by the
+/// bindings the sources hold it under. The meta is printed exactly as stored:
+/// this tool does not parse it.
 #[derive(Debug, Args)]
 pub struct ItemShowCommand {
     /// Public id of the item (`seq`).
@@ -162,18 +164,24 @@ impl ItemShowCommand {
             bail!("no item with seq {} in this store", self.seq);
         }
 
-        let placements = found
-            .into_iter()
-            .map(|found| {
-                let mut row = found.row();
-                row.size = row
-                    .object
-                    .as_deref()
-                    .and_then(|hash| read.object_size(hash).ok())
-                    .flatten();
-                row
-            })
-            .collect();
+        let mut placements = Vec::with_capacity(found.len());
+        for found in found {
+            let mut item = found.row();
+            item.size = item
+                .object
+                .as_deref()
+                .and_then(|hash| read.object_size(hash).ok())
+                .flatten();
+
+            let bindings = read
+                .item_bindings(&item.collection, &item.link_id)
+                .map_err(report)?
+                .into_iter()
+                .map(|(source, binding)| BindingRow::new(&source, &binding))
+                .collect();
+
+            placements.push(ItemPlacement { item, bindings });
+        }
 
         printer.out(ItemShowOutput {
             seq: self.seq,
@@ -671,18 +679,75 @@ impl fmt::Display for ItemsOutput {
     }
 }
 
+/// One source's binding of an item: how that source addresses it, what the
+/// last sync agreed on, and the marker that says why it might have stopped
+/// moving.
+#[derive(Debug, Serialize)]
+pub struct BindingRow {
+    /// The source holding the binding.
+    pub source: String,
+    /// The handle the item is addressed by there (an IMAP UID, a DAV href).
+    pub handle: String,
+    /// Whether a base exists at all, which its three values cannot say: a
+    /// source reporting no revision, no body and no flags still agreed.
+    pub base: bool,
+    /// The base flag set, `null` while nothing has read them.
+    pub base_flags: Option<Vec<String>>,
+    /// The body the base agreed on, when it carried one.
+    pub base_object: Option<String>,
+    /// The revision the base agreed on, when the source reports one.
+    pub base_revision: Option<String>,
+    /// Whether this source and its own remote diverged.
+    pub conflicted: bool,
+    /// The remote revision observed when the divergence was recorded.
+    pub conflict_revision: Option<String>,
+}
+
+impl BindingRow {
+    /// One binding's row.
+    fn new(source: &ReplicaSourceId, binding: &ReplicaSourceBinding) -> Self {
+        Self {
+            source: source.0.clone(),
+            handle: binding.handle.0.clone(),
+            base: binding.base.is_some(),
+            base_flags: binding
+                .base
+                .as_ref()
+                .and_then(|base| flag_list(&base.flags)),
+            base_object: binding
+                .base
+                .as_ref()
+                .and_then(|base| base.object.as_ref())
+                .map(|hash| hash.0.clone()),
+            base_revision: binding.base.as_ref().and_then(|base| base.revision.clone()),
+            conflicted: binding.conflicted,
+            conflict_revision: binding.conflict_revision.clone(),
+        }
+    }
+}
+
+/// One placement of an item, with the bindings the sources hold it under.
+#[derive(Debug, Serialize)]
+pub struct ItemPlacement {
+    #[serde(flatten)]
+    pub item: ItemRow,
+    /// One entry per source holding this placement, ordered by source.
+    pub bindings: Vec<BindingRow>,
+}
+
 /// The `item show` output: every placement of one public id.
 #[derive(Debug, Serialize)]
 pub struct ItemShowOutput {
     /// The public id looked up.
     pub seq: i64,
     /// One entry per collection holding it.
-    pub placements: Vec<ItemRow>,
+    pub placements: Vec<ItemPlacement>,
 }
 
 impl fmt::Display for ItemShowOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, item) in self.placements.iter().enumerate() {
+        for (index, placement) in self.placements.iter().enumerate() {
+            let item = &placement.item;
             if index > 0 {
                 writeln!(f)?;
             }
@@ -713,6 +778,48 @@ impl fmt::Display for ItemShowOutput {
                 )?;
             }
             writeln!(f, " - meta: {}", or_dash(item.meta.as_deref()))?;
+
+            for binding in &placement.bindings {
+                writeln!(f, " - binding {}: {}", binding.source, binding.handle)?;
+
+                if !binding.base {
+                    writeln!(f, "    - base: none")?;
+                } else {
+                    writeln!(
+                        f,
+                        "    - base object: {}",
+                        or_dash(binding.base_object.as_deref())
+                    )?;
+                    writeln!(
+                        f,
+                        "    - base flags: {}",
+                        or_dash(
+                            binding
+                                .base_flags
+                                .as_ref()
+                                .map(|flags| flags.join(" "))
+                                .filter(|flags| !flags.is_empty())
+                                .as_deref()
+                        )
+                    )?;
+                    writeln!(
+                        f,
+                        "    - base revision: {}",
+                        or_dash(binding.base_revision.as_deref())
+                    )?;
+                }
+
+                // NOTE: the exception line. Printing it only when it applies
+                // is what makes a diverged binding stand out from the
+                // ordinary ones beside it.
+                if binding.conflicted {
+                    writeln!(
+                        f,
+                        "    - conflicted at revision: {}",
+                        or_dash(binding.conflict_revision.as_deref())
+                    )?;
+                }
+            }
         }
 
         Ok(())

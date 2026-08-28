@@ -24,7 +24,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
     io::{self, ErrorKind, Write},
-    mem,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Arc,
@@ -1299,7 +1298,6 @@ fn stage_action(
             conflict_revision: None,
             base: None,
             origin: None,
-            ambiguous_handles: Vec::new(),
         };
         return Ok(Ok(vec![ReplicaWriteOp::UpsertPlacement(create)]));
     }
@@ -1867,7 +1865,7 @@ fn apply_ops(
                 // at whatever the same batch upserts. Recorded here
                 // because the hub diff cannot tell that from a source
                 // reporting one identity under a second handle, and
-                // reads the second as a duplicate to freeze (§10, §12).
+                // refuses the second (§10, §12).
                 if reason == ReplicaDropReason::Superseded {
                     superseded
                         .entry(collection.0.clone())
@@ -1886,6 +1884,7 @@ fn apply_ops(
     }
 
     for (collection, ops) in hub_ops {
+        refuse_colliding_upserts(&collection, source, &ops)?;
         let links = batch_links(tx, &collection, source, &ops)?;
         let old_hub = load_hub_by_link(tx, &collection, &links)?;
         let mut new_hub = old_hub.clone();
@@ -1901,6 +1900,48 @@ fn apply_ops(
             &superseded,
         )?;
         adjust_refcounts(tx, &object_refs(&old_hub), &object_refs(&new_hub))?;
+    }
+
+    Ok(())
+}
+
+/// Refuses a batch carrying two placements of one collection under one
+/// link id and two handles, before any of it is folded.
+///
+/// The hub is keyed by link id, so absorbing both would keep whichever
+/// the batch names last and drop the other with no statement failing.
+/// The engine mints a key for the second copy it reads from a source
+/// (spec §9), but a handle-space rebuild re-resolves every identity from
+/// the new spine and mints none, so a collection that genuinely holds a
+/// duplicate hands this store two placements resolving to one key. It is
+/// the collision [`save_bindings_diff`] refuses against a stored binding,
+/// one write earlier and against the batch itself.
+fn refuse_colliding_upserts(
+    collection: &str,
+    source: &ReplicaSourceId,
+    ops: &[ReplicaWriteOp],
+) -> Result<(), PimdirError> {
+    let mut claimed: BTreeMap<&ReplicaLinkId, &ReplicaHandle> = BTreeMap::new();
+
+    for op in ops {
+        let ReplicaWriteOp::UpsertPlacement(placement) = op else {
+            continue;
+        };
+        let Some(link) = placement.link_id.as_ref() else {
+            continue;
+        };
+        match claimed.insert(link, &placement.handle) {
+            Some(bound) if *bound != placement.handle => {
+                return Err(PimdirError::Rebind {
+                    collection: collection.into(),
+                    link_id: link.0.clone(),
+                    source: source.0.clone(),
+                    bound: bound.0.clone(),
+                    incoming: placement.handle.0.clone(),
+                });
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -1992,7 +2033,10 @@ fn check_rename_cascades(conn: &Connection) -> Result<(), PimdirError> {
 ///
 /// `ALTER TABLE … ADD COLUMN` is cheap, and guarding on `PRAGMA
 /// table_info` makes it a no-op for a current store. Only nullable
-/// columns or ones carrying a default can be folded in this way.
+/// columns or ones carrying a default can be folded in this way. A draft
+/// may also fold a column back *out*, which the same guard reverses into
+/// a `DROP COLUMN`, so a store carrying one the format has retired stops
+/// carrying it.
 ///
 /// This disappears when the spec leaves `draft`: from the first frozen
 /// version onwards, a shape change is a numbered migration.
@@ -2000,21 +2044,42 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     /// Columns folded into version 1 after it was first published, as
     /// `(table, column, declaration)`. Each must be nullable or carry a
     /// default, or it could not be added to a populated table.
-    const FOLDED_IN: [(&str, &str, &str); 8] = [
+    const FOLDED_IN: [(&str, &str, &str); 7] = [
         ("bindings", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
         ("bindings", "conflict_revision", "TEXT"),
         ("items", "retained_at", "TEXT"),
         ("items", "retained_by", "TEXT"),
         ("collections", "account", "TEXT"),
         ("items", "sort_key", "TEXT NOT NULL DEFAULT ''"),
-        ("bindings", "ambiguous_handles", "TEXT"),
         ("bindings", "base_present", "INTEGER NOT NULL DEFAULT 0"),
     ];
+
+    /// Columns a later draft folded back out, as `(table, column)`.
+    ///
+    /// `bindings.ambiguous_handles` held the handles a source held one
+    /// identity under; the second copy is an item of its own now (spec
+    /// §9), so the column has nothing to hold and the store records no
+    /// trace of an incoming handle. A store written with it keeps rows
+    /// stating a rule the crate no longer has.
+    ///
+    /// Dropped in place rather than through the table rebuild §6
+    /// prescribes for a constraint: no index, key, foreign key or check
+    /// names this column, so `ALTER TABLE` expresses the change whole,
+    /// and rebuilding would mean a second copy of the canonical
+    /// `bindings` DDL for the reconciliation to drift from.
+    const FOLDED_OUT: [(&str, &str); 1] = [("bindings", "ambiguous_handles")];
 
     let mut missing = Vec::new();
     for (table, column, decl) in FOLDED_IN {
         if !has_column(conn, table, column)? {
             missing.push((table, column, decl));
+        }
+    }
+
+    let mut stale = Vec::new();
+    for (table, column) in FOLDED_OUT {
+        if has_column(conn, table, column)? {
+            stale.push((table, column));
         }
     }
 
@@ -2030,6 +2095,9 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
         .map_err(busy_or_sql)?;
     for (table, column, decl) in missing {
         tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    for (table, column) in stale {
+        tx.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
     }
     // NOTE: before the batch below, which cannot replace it: an index
     // whose columns moved keeps its name, so `CREATE INDEX IF NOT EXISTS`
@@ -2270,7 +2338,7 @@ fn save_hub_diff(
     old: &ReplicaHub,
     new: &ReplicaHub,
     superseded: &BTreeSet<ReplicaHandle>,
-) -> rusqlite::Result<()> {
+) -> Result<(), PimdirError> {
     conn.execute(
         sql::ENSURE_COLLECTION,
         named_params! { ":collection": collection, ":account": account },
@@ -2462,7 +2530,8 @@ fn update_item(
 }
 
 /// Diffs one item's per-source bindings between `old` and `new`, issuing
-/// only the binding writes that changed.
+/// only the binding writes that changed, and refusing the one write no
+/// diff may express: a binding resolved to another handle (spec §10).
 fn save_bindings_diff(
     conn: &Connection,
     collection: &str,
@@ -2470,7 +2539,7 @@ fn save_bindings_diff(
     old: &ReplicaHubItem,
     new: &ReplicaHubItem,
     superseded: &BTreeSet<ReplicaHandle>,
-) -> rusqlite::Result<()> {
+) -> Result<(), PimdirError> {
     for source in old.sources.keys() {
         if !new.sources.contains_key(source) {
             conn.execute(
@@ -2494,22 +2563,25 @@ fn save_bindings_diff(
                 )?;
                 insert_binding(conn, collection, link, source, binding)?
             }
+            // NOTE: a binding pins one handle, and repointing it would
+            // destroy the evidence that a source holds an identity twice,
+            // silently, at the write. The second copy has a key and an
+            // item of its own now (spec §9), so refusing is a complete
+            // answer and nothing is recorded in the incoming handle's
+            // place. The engine mints before it writes, so this catches a
+            // consumer staging its own writes, and a rebuilt handle space
+            // handing two placements to one key.
+            Some(prev) if binding.handle != prev.handle => {
+                return Err(PimdirError::Rebind {
+                    collection: collection.into(),
+                    link_id: link.0.clone(),
+                    source: source.0.clone(),
+                    bound: prev.handle.0.clone(),
+                    incoming: binding.handle.0.clone(),
+                });
+            }
             Some(prev) if prev != binding => {
-                // NOTE: a binding pins one handle, and repointing it
-                // would destroy the evidence that a source holds an
-                // identity twice. The bound handle stays and the incoming
-                // one is recorded instead, which freezes the item. The
-                // engine no longer produces such an upsert, so this is
-                // the floor under a store written by an older one, or a
-                // consumer staging its own writes.
-                let mut binding = binding.clone();
-                if binding.handle != prev.handle {
-                    let incoming = mem::replace(&mut binding.handle, prev.handle.clone());
-                    if !binding.ambiguous_handles.contains(&incoming) {
-                        binding.ambiguous_handles.push(incoming);
-                    }
-                }
-                update_binding(conn, collection, link, source, &binding)?
+                update_binding(conn, collection, link, source, binding)?
             }
             Some(_) => {}
         }
@@ -2537,7 +2609,6 @@ fn insert_binding(
             ":base_present": binding.base.is_some() as i64,
             ":conflicted": binding.conflicted as i64,
             ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
-            ":ambiguous_handles": codec::handles_to_json(&binding.ambiguous_handles),
         },
     )?;
     Ok(())
@@ -2562,7 +2633,6 @@ fn update_binding(
             ":base_present": binding.base.is_some() as i64,
             ":conflicted": binding.conflicted as i64,
             ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
-            ":ambiguous_handles": codec::handles_to_json(&binding.ambiguous_handles),
         },
     )?;
     Ok(())
@@ -2693,7 +2763,6 @@ fn binding_from_row(
     let base_present: i64 = row.get(6)?;
     let conflicted: i64 = row.get(7)?;
     let conflict_revision: Option<String> = row.get(8)?;
-    let ambiguous_handles: Option<String> = row.get(9)?;
 
     // NOTE: either witness. The column is the fact, and a base of no
     // revision, no body and markers nobody has read is a real agreement
@@ -2727,7 +2796,6 @@ fn binding_from_row(
             // conflicted, so a resolved binding cannot hand a stale one
             // to the next sync.
             conflict_revision: conflicted.then_some(conflict_revision).flatten(),
-            ambiguous_handles: codec::handles_from_json(ambiguous_handles.as_deref()),
         },
     ))
 }
@@ -2832,6 +2900,29 @@ pub enum PimdirError {
     Json(serde_json::Error),
     /// A queue action payload is malformed or unsupported (spec §15.3).
     Action(PimdirActionError),
+    /// A write resolved an existing `(collection, link_id, source)`
+    /// binding to a different handle, and was refused (spec §10).
+    ///
+    /// A binding pins one handle, so applying it would repoint the
+    /// binding from the copy it held to another, which is where the
+    /// evidence of a source holding one identity twice used to die. The
+    /// second copy is an item of its own under a minted key (spec §9),
+    /// which is what makes refusing a complete answer: nothing is
+    /// recorded in the incoming handle's place. The one licensed rebind
+    /// is the handle-space rebuild (spec §12), whose `Superseded` drop
+    /// names the handle it replaces.
+    Rebind {
+        /// The collection holding the binding.
+        collection: String,
+        /// The identity it is keyed by.
+        link_id: String,
+        /// The source whose binding it is.
+        source: String,
+        /// The handle the binding holds, and keeps.
+        bound: String,
+        /// The handle the refused write carried.
+        incoming: String,
+    },
     /// The store's schema version is not one this crate services: it was
     /// written by a newer crate, or by a draft this one no longer reads.
     /// Such a store is recreated, never migrated.
@@ -2892,6 +2983,16 @@ impl fmt::Display for PimdirError {
             PimdirError::Io(err) => write!(f, "pimdir I/O error: {err}"),
             PimdirError::Json(err) => write!(f, "pimdir JSON error: {err}"),
             PimdirError::Action(err) => write!(f, "pimdir action error: {err}"),
+            PimdirError::Rebind {
+                collection,
+                link_id,
+                source,
+                bound,
+                incoming,
+            } => write!(
+                f,
+                "pimdir binding {collection}/{link_id} on source {source} holds handle {bound}, and this write carries {incoming}: a binding pins one handle, and a second copy of an identity is stored under a key of its own"
+            ),
             PimdirError::Version { found } => write!(
                 f,
                 "pimdir store schema version {found} is unsupported (this crate services version {})",

@@ -42,7 +42,6 @@ fn card(status: ReplicaStatus, conflict_revision: Option<&str>) -> ReplicaPlacem
             object: Some(ReplicaHash("0rig".into())),
         }),
         origin: None,
-        ambiguous_handles: Vec::new(),
     }
 }
 

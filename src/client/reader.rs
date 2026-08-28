@@ -29,6 +29,7 @@ use std::{
 
 use io_replica::{
     collection::ReplicaCollectionId,
+    hub::{ReplicaSourceBinding, ReplicaSourceId},
     object::ReplicaHash,
     placement::{ReplicaLevel, ReplicaLinkId},
 };
@@ -37,8 +38,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params};
 use crate::{
     client::{
         PimdirBlobs, PimdirCollection, PimdirError, PimdirItem, PimdirParkedAction,
-        PimdirPendingAction, PimdirPlacement, check_rename_cascades, check_version_agreement,
-        collection_row, load_pending_actions, read_hash_algo, read_item_from_row, rows,
+        PimdirPendingAction, PimdirPlacement, binding_from_row, check_rename_cascades,
+        check_version_agreement, collection_row, load_pending_actions, read_hash_algo,
+        read_item_from_row, rows,
     },
     codec::{self, PimdirAction},
     hash::{PimdirHashAlgo, PimdirHasher},
@@ -467,6 +469,29 @@ impl PimdirReader {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    /// Every source's binding of one item, keyed by source: the handle it is
+    /// bound to, the base the last sync agreed on, and the conflict its own
+    /// sync is stuck on (spec §13).
+    ///
+    /// The same shape a hub carries per item, read for one item rather than a
+    /// collection: an operator asking why a placement stopped moving is asking
+    /// about exactly these columns, and nothing else exposes them.
+    pub fn item_bindings(
+        &self,
+        collection: &str,
+        link_id: &str,
+    ) -> Result<BTreeMap<ReplicaSourceId, ReplicaSourceBinding>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            sql::ITEM_BINDINGS,
+            named_params! { ":collection": collection, ":link_id": link_id },
+            binding_from_row,
+        )?
+        .into_iter()
+        .map(|(_, source, binding)| (source, binding))
+        .collect())
     }
 
     /// The distinct source names the store has synced against, across all

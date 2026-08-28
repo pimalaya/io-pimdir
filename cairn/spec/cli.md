@@ -109,7 +109,8 @@ The CLI SHALL expose, at minimum:
 - `item list`: a collection's live items, or its retained ones with
   `--retained`, keyset-paged with `--after` and `--limit`.
 - `item show`: one item by its public `seq`, across every collection that holds
-  it, retained placements included.
+  it, retained placements included, each with the bindings its sources hold it
+  under.
 - `item export`: an item's body as raw bytes on stdout, or to a file.
 - `item restore`: revive a retained item (see the enqueue-then-drain
   requirement above).
@@ -122,7 +123,8 @@ The CLI SHALL expose, at minimum:
   counts, object count and bytes live versus retained.
 - `check`: object rows whose body is missing, refcount drift, dangling
   references and orphan blob files, with `--fix` repairing the drift and the
-  dangling bindings.
+  dangling bindings, plus an informational count of the minted keys each
+  collection holds, which is a fact rather than a problem.
 - `gc`: reclaim the object rows nothing references, their bodies, and the orphan
   blob files a crash left, reporting what it freed.
 - `export`: a portable dump of the store.
@@ -163,3 +165,34 @@ SHALL NOT be implemented here. Every one of its steps reads item content (a
 the never-interpret-content requirement forbids. It belongs in a per-kind
 importer. A future `pimdir import` MAY restore a dump this tool's `export`
 produced, since that reads only the store's own metadata.
+
+### Requirement: A binding is readable, and `item show` prints it
+The library SHALL expose every source's binding of one item, keyed by source:
+the handle that source addresses it by, the base the last sync agreed on
+(flags, body and revision, and whether a base exists at all), and the exception
+marker `conflicted` with the revision observed when it was recorded.
+
+`item show` SHALL print one block per binding under each placement it names, in
+text and under `--json`. The exception line SHALL be printed only when it
+applies, so a diverged binding stands out from the ordinary ones beside it
+rather than being one more line that is usually empty.
+
+This is what makes a duplicated identity actionable. `check` counts the minted
+keys a collection holds, and the next question is always which resource each
+copy came from; the binding is the only thing that says so, and without it the
+only answers were the server and the database file.
+
+`item list` SHALL NOT carry bindings. Its rows are a page served by one query,
+and a per-row binding lookup would make a listing cost what a listing must not.
+The verb that names one item is the one that can afford to say everything about
+it.
+
+#### Scenario: A minted copy names the resource it came from
+- GIVEN a source holding one identity under two handles, the second filed under a minted key
+- WHEN `item show` names each of the two items
+- THEN each prints the binding of its own handle
+
+#### Scenario: Each source reports its own view
+- GIVEN two sources holding one item, one of them diverged from its own remote
+- WHEN `item show` names that item
+- THEN each source prints its own handle and base, and only the diverged one prints a conflict

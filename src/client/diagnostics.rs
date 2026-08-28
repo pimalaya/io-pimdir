@@ -43,18 +43,15 @@ pub struct PimdirRefcountDrift {
     pub expected: i64,
 }
 
-/// One binding whose source holds its identity under more than one
-/// handle, so the engine cannot say which copy a change belongs to.
+/// How many minted keys one collection holds: the second copies of
+/// identities a source hands over twice, each filed as an item of its own
+/// (spec §9).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct PimdirAmbiguous {
-    /// The owning collection.
+pub struct PimdirMinted {
+    /// The collection holding them.
     pub collection: String,
-    /// The identity held more than once.
-    pub link_id: String,
-    /// The source holding it more than once.
-    pub source: String,
-    /// How many copies of it that source holds.
-    pub copies: i64,
+    /// How many of its live items carry a minted key.
+    pub items: i64,
 }
 
 /// One row referencing something that is not there.
@@ -140,19 +137,18 @@ impl PimdirReader {
         })?)
     }
 
-    /// The bindings holding an identity their source holds more than once.
+    /// The minted keys each collection holds, where it holds any.
     ///
-    /// Not a defect: two copies of one message is redundancy, and the store
-    /// records it rather than judging it. It is reported because it is the
-    /// reason those items stop syncing, and an operator looking at a frozen
-    /// item has no other way to see why.
-    pub fn ambiguous_bindings(&self) -> Result<Vec<PimdirAmbiguous>, PimdirError> {
-        Ok(rows(&self.conn, sql::AMBIGUOUS_BINDINGS, [], |r| {
-            Ok(PimdirAmbiguous {
+    /// Not a defect and nothing to repair: two copies of one identity is
+    /// redundancy, and the store holds both rather than judging them. It
+    /// is reported because a collection whose count climbs every sync is
+    /// a source handing over the same duplicate under a new handle each
+    /// run, which an operator has no other way to see.
+    pub fn minted_keys(&self) -> Result<Vec<PimdirMinted>, PimdirError> {
+        Ok(rows(&self.conn, sql::MINTED_KEYS, [], |r| {
+            Ok(PimdirMinted {
                 collection: r.get(0)?,
-                link_id: r.get(1)?,
-                source: r.get(2)?,
-                copies: r.get(3)?,
+                items: r.get(1)?,
             })
         })?)
     }

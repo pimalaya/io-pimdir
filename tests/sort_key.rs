@@ -34,7 +34,6 @@ fn placement(collection: &str, handle: &str, link_id: &str) -> ReplicaPlacement 
         conflict_revision: None,
         base: None,
         origin: None,
-        ambiguous_handles: Vec::new(),
     }
 }
 

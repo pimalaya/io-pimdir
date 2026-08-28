@@ -40,7 +40,6 @@ fn placement(handle: &str, link: &str, hash: &str) -> ReplicaPlacement {
             object: Some(ReplicaHash(hash.into())),
         }),
         origin: None,
-        ambiguous_handles: Vec::new(),
     }
 }
 

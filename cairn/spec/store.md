@@ -575,22 +575,25 @@ Writing a blob SHALL sync the shard directory after the rename. Syncing the file
 ### Requirement: An unreadable flag set holds no opinion
 A `flags` column this crate cannot decode SHALL read as unknown, never as a known-empty set. Malformed JSON is a column written by something whose format this does not share, or a corrupted one, and neither is evidence about the item's markers. Reading it as known-empty makes it an authoritative "this item carries no markers", which the merge takes as one side's opinion: it clears every marker the other side reports and persists the result, so a read failure becomes permanent loss.
 
-### Requirement: An identity a source holds twice is recorded, never repointed
-`bindings.ambiguous_handles` (a JSON array, or `NULL`) SHALL hold the other handles a source holds one item's identity under, and `UPDATE_BINDING` SHALL NOT repoint an existing binding's `handle`.
+### Requirement: A binding never changes handle, and nothing is recorded in its place
+A write that resolves an existing `(collection, link_id, source)` to a different handle SHALL be refused with a typed error, leaving the bound handle and every other column untouched. The store SHALL record no trace of the incoming handle.
 
-A binding pins one handle, so a second copy of one identity has nowhere to live, and repointing is where the evidence was destroyed: silently, at the write, before any later rule could act on it. The bound handle stays and the incoming one is recorded instead, which freezes the item (`ReplicaStatus::Ambiguous`) until the source holds the identity once again. Rebinding legitimately, after a handle-space change, goes through the rebuild that drops the old spine and inserts the new one.
+A binding pins one handle, so a write carrying a second one is either a rebuild (licensed per handle by the drop reason, below) or a source holding two resources whose identities resolved to one key. The second is now the engine's to resolve before it writes, by minting a key for the second copy, so the store's whole obligation is to refuse the collision rather than to describe it. Applying it would repoint the binding from the copy it held to another, which is where the evidence used to die: silently, at the write, before any later rule could act on it.
 
-The column is what makes the freeze survive a restart, and it has to: the second copy appears in exactly one enumeration, and an incremental one never mentions it again.
-
-#### Scenario: The same identity arrives under another handle
+#### Scenario: A colliding write is refused
 - GIVEN a stored binding for an identity
-- WHEN a write carries the same identity under a different handle
-- THEN the bound handle is unchanged and the incoming one is recorded as ambiguous
+- WHEN a write carries the same `(collection, link_id, source)` under a different handle
+- THEN the write fails, the bound handle is unchanged, and no ambiguity is stored
 
-#### Scenario: The freeze survives a reopen
-- GIVEN a store holding ambiguous handles for a binding
-- WHEN it is reopened
-- THEN the projection still reads `Ambiguous`, carrying those handles
+### Requirement: A minted link id is an ordinary key
+The store SHALL persist whatever `link_id` the engine assigns, SHALL NOT parse it, and SHALL NOT re-canonicalise one. A minted key (pimdir SPEC §9, `dup:<hint>#<handle>`) is subject to every rule a bare key is: `seq` allocation, retention and revival, dedup by object hash, the reader's pages, and the queue.
+
+The key is the store's, the hint is the format's, and the two are only equal by default. A store that treated a prefix as meaning something would make the engine's assignment reversible by accident and would change a `seq` a consumer has already shown.
+
+#### Scenario: Two resources under one hint are two items
+- GIVEN a collection holding an item keyed by a bare hint
+- WHEN a write upserts a second item keyed `dup:<hint>#<handle>` for the same source under another handle
+- THEN both items exist with their own `seq`, their own binding and their own object reference
 
 ### Requirement: A folded-in index is ensured on every open
 `ENSURE_INDEXES` SHALL run on open, not only when a column is missing. Most of these index columns that were always there: what changed is that a statement now needs them, and a store that kept the old plans would keep scanning where the schema says it seeks, silently and for good.
@@ -627,27 +630,16 @@ intent somebody expressed, so deleting either would destroy data rather than
 repair it.
 
 ### Requirement: A superseded handle licenses its own rebind
-A write batch dropping a handle with `ReplicaDropReason::Superseded` SHALL let
-the binding holding it move to whatever handle the same batch upserts for that
-identity, by deleting the binding and inserting the new one (SPEC §10, §12). A
-batch dropping a handle for any other reason, or not dropping it at all, SHALL
-keep the bound handle and record the incoming one as ambiguous.
+A write batch dropping a handle with `ReplicaDropReason::Superseded` SHALL let the binding holding it move to whatever handle the same batch upserts for that identity, by deleting the binding and inserting the new one (SPEC §10, §12). A batch dropping a handle for any other reason, or not dropping it at all, SHALL keep the bound handle and **refuse the write**.
 
-The two are indistinguishable from the rows: a rebuilt spine and a source
-reporting one identity under a second handle produce the same before and after,
-and only the drop's reason separates them. Reading a rebuild as a duplicate
-freezes every item of the collection under handles the server has just voided,
-with no way back, since what clears an ambiguity is the source reporting the
-recorded handle gone and the recorded handle is the live one.
+The two are indistinguishable from the rows: a rebuilt spine and a source reporting one identity under a second handle produce the same before and after, and only the drop's reason separates them. Reading a rebuild as a collision refuses every write of a renumbered collection, under handles the server has just voided.
 
-The licence SHALL be per handle rather than per batch, so a rebuild carrying a
-genuine second copy of an identity still freezes that one and the floor stays
-intact inside the one operation that legitimately repoints.
+The licence SHALL be per handle rather than per batch, so a rebuild carrying a genuine second copy of an identity still refuses that one and the floor stays intact inside the one operation that legitimately repoints.
 
 #### Scenario: A renumbered collection is not a duplicated one
 - GIVEN a binding on a handle a rekey batch supersedes
 - WHEN the batch drops it and upserts the item under a new handle
-- THEN the binding follows the new handle, projects `Clean`, and records no ambiguity
+- THEN the binding follows the new handle and projects `Clean`
 
 ### Requirement: An index whose columns moved is rebuilt
 A store opened against a schema whose index of the same name holds different

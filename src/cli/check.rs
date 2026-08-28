@@ -21,7 +21,7 @@ use clap::Args;
 use pimalaya_cli::printer::Printer;
 use serde::Serialize;
 
-use io_pimdir::{PimdirAmbiguous, PimdirDangling, PimdirRefcountDrift};
+use io_pimdir::{PimdirDangling, PimdirMinted, PimdirRefcountDrift};
 
 use crate::cli::{StoreFlags, bytes, report};
 
@@ -72,7 +72,7 @@ impl CheckCommand {
 
         let drift = read.refcount_drift().map_err(report)?;
         let dangling = read.dangling().map_err(report)?;
-        let ambiguous = read.ambiguous_bindings().map_err(report)?;
+        let minted = read.minted_keys().map_err(report)?;
 
         let mut repaired = 0;
         let mut cleared = 0;
@@ -100,7 +100,7 @@ impl CheckCommand {
             missing,
             drift,
             dangling,
-            ambiguous,
+            minted,
             repaired,
             cleared,
         })
@@ -131,8 +131,9 @@ pub struct CheckOutput {
     pub drift: Vec<PimdirRefcountDrift>,
     /// Rows pointing at something absent.
     pub dangling: Vec<PimdirDangling>,
-    /// Identities a source holds more than once, so their items are frozen.
-    pub ambiguous: Vec<PimdirAmbiguous>,
+    /// Minted keys per collection, the second copies of an identity a
+    /// source holds twice. Informational, never a defect.
+    pub minted: Vec<PimdirMinted>,
     /// Refcounts `--fix` recomputed from the pointers justifying them.
     pub repaired: usize,
     /// Dangling bindings `--fix` cleared.
@@ -149,10 +150,10 @@ impl CheckOutput {
 impl fmt::Display for CheckOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.problems() == 0 {
-            return writeln!(
+            writeln!(
                 f,
                 "This store is consistent: no orphan blob, no refcount drift, no dangling row"
-            );
+            )?;
         }
 
         if !self.orphans.is_empty() {
@@ -205,21 +206,21 @@ impl fmt::Display for CheckOutput {
             more(f, self.dangling.len())?;
         }
 
-        if !self.ambiguous.is_empty() {
+        // NOTE: printed under the problems, and counted in none of them:
+        // a minted key is an identity a source hands over twice, stored
+        // as the second item it is, which the store neither repairs nor
+        // judges (spec §9). What it is worth saying is the count, since a
+        // collection whose count climbs every sync is a source renaming
+        // the same duplicate.
+        if !self.minted.is_empty() {
             writeln!(
                 f,
-                "{} identity/identities a source holds more than once, whose items \
-                 do not sync until it holds them once again:",
-                self.ambiguous.len()
+                "Minted keys, the second copies of an identity a source holds twice:"
             )?;
-            for ambiguous in self.ambiguous.iter().take(SHOWN) {
-                writeln!(
-                    f,
-                    " - {}/{} on {}: {} copies",
-                    ambiguous.collection, ambiguous.link_id, ambiguous.source, ambiguous.copies,
-                )?;
+            for minted in self.minted.iter().take(SHOWN) {
+                writeln!(f, " - {}: {} item(s)", minted.collection, minted.items)?;
             }
-            more(f, self.ambiguous.len())?;
+            more(f, self.minted.len())?;
         }
 
         if self.repaired > 0 || self.cleared > 0 {
