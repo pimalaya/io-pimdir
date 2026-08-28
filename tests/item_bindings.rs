@@ -38,6 +38,7 @@ fn card(handle: &str, status: ReplicaStatus) -> ReplicaPlacement {
         flags: ReplicaFlags::default(),
         status,
         conflict_revision: None,
+        conflict_object: None,
         base: Some(ReplicaBase {
             flags: ReplicaFlags::default(),
             revision: Some("etag-1".into()),

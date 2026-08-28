@@ -37,10 +37,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params};
 
 use crate::{
     client::{
-        PimdirBlobs, PimdirCollection, PimdirError, PimdirItem, PimdirParkedAction,
+        PimdirBlobs, PimdirCollection, PimdirConflict, PimdirError, PimdirItem, PimdirParkedAction,
         PimdirPendingAction, PimdirPlacement, binding_from_row, check_rename_cascades,
-        check_version_agreement, collection_row, load_pending_actions, read_hash_algo,
-        read_item_from_row, rows,
+        check_version_agreement, collection_row, conflict_row, load_pending_actions,
+        read_hash_algo, read_item_from_row, rows,
     },
     codec::{self, PimdirAction},
     hash::{PimdirHashAlgo, PimdirHasher},
@@ -492,6 +492,30 @@ impl PimdirReader {
         .into_iter()
         .map(|(_, source, binding)| (source, binding))
         .collect())
+    }
+
+    /// The bindings waiting for a decision, across one account's
+    /// collections, ordered by collection then link id then source.
+    ///
+    /// `None` lists a single-account store whole, the account grouping
+    /// nothing there. Each row carries the three bodies the divergence
+    /// is between, so a resolver holding no credentials reads base,
+    /// local and remote from the store alone (spec §13).
+    ///
+    /// The question a sync answers at the end of every run, and the one
+    /// a listing command asks directly. Both are served by the partial
+    /// index over the flag, so a store with nothing outstanding pays for
+    /// an empty index rather than for a pass over every collection.
+    pub fn list_conflicts(
+        &self,
+        account: Option<&str>,
+    ) -> Result<Vec<PimdirConflict>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            sql::LIST_CONFLICTED_BINDINGS,
+            named_params! { ":account": account },
+            conflict_row,
+        )?)
     }
 
     /// The distinct source names the store has synced against, across all

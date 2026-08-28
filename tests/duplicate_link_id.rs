@@ -37,6 +37,7 @@ fn placement(handle: &str, link: &str) -> ReplicaPlacement {
         flags: ReplicaFlags::default(),
         status: ReplicaStatus::Clean,
         conflict_revision: None,
+        conflict_object: None,
         base: Some(ReplicaBase {
             flags: ReplicaFlags::default(),
             revision: None,

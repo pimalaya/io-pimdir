@@ -134,9 +134,10 @@ CREATE TABLE items (
     PRIMARY KEY (collection, link_id)
 ) STRICT;
 
--- One source's binding of an item: its handle there, the base last synced with
--- it (the 3-way-merge baseline), and whether that source's own sync is stuck on
--- an unresolved content conflict.
+-- One source's binding of an item: its handle there, the two bases it agreed
+-- from (the one last synced with the source, which is the 3-way-merge baseline,
+-- and the shared body it last reconciled against), and whether that source's
+-- own sync is stuck on an unresolved content conflict.
 CREATE TABLE bindings (
     collection    TEXT NOT NULL,
     link_id       TEXT NOT NULL,
@@ -157,6 +158,21 @@ CREATE TABLE bindings (
     -- items.conflicted, which is the cross-source divergence.
     conflicted        INTEGER NOT NULL DEFAULT 0,
     conflict_revision TEXT,
+    -- The diverging remote body at that revision, so a resolver reads the
+    -- three sides (base, local, remote) from the store and needs no
+    -- credentials. Pinned like any other reference while the binding stays
+    -- conflicted, and released when it resolves.
+    conflict_object   TEXT REFERENCES objects(hash),
+    -- The shared body this source last reconciled against, the base of the
+    -- cross-source merge. base_object answers to the source's own remote and
+    -- only a sync moves it, so a body this source folded in and has not pushed
+    -- yet leaves it behind; read as the shared base it would have the source
+    -- disagree with itself. Meaningful on every binding, conflicted or not.
+    -- It names an object and pins none, hence no REFERENCES, no index and no
+    -- refcount: the value is only ever compared for equality, never read as
+    -- bytes, and a content hash compares the same after the body it named has
+    -- been swept.
+    shared_object     TEXT,
     PRIMARY KEY (collection, link_id, source),
     FOREIGN KEY (collection, link_id) REFERENCES items(collection, link_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT;
@@ -204,10 +220,17 @@ CREATE INDEX items_by_seq_global ON items(seq);
 -- be collected and is empty at rest: without it both the list and the delete
 -- scan the whole objects table, on every write transaction.
 CREATE INDEX objects_garbage ON objects(refcount) WHERE refcount <= 0;
--- The other two pointers at an object, so a refcount recomputation reaches every
--- reference by index rather than by scanning items and queue once per object.
+-- The other three pointers at an object, so a refcount recomputation reaches
+-- every reference by index rather than by scanning items, bindings and queue
+-- once per object.
 CREATE INDEX items_by_conflict_object ON items(conflict_object);
+CREATE INDEX bindings_by_conflict_object ON bindings(conflict_object);
 CREATE INDEX queue_by_object ON queue(object_hash);
+-- The bindings waiting for a decision. Partial, so it holds only what is
+-- outstanding and is empty at rest: a run reports that count on every
+-- invocation, and a listing command asks the same question directly, both of
+-- which would otherwise scan every binding in the store.
+CREATE INDEX bindings_conflicted ON bindings(collection, link_id, source) WHERE conflicted = 1;
 -- Resolves one source handle back to the link id it is bound to, which is what
 -- a batch dropping a placement needs: a drop names a handle and the shared item
 -- is keyed by link id. Without it that resolution is a scan of every item.
@@ -395,16 +418,40 @@ LIST_SOURCES = "SELECT DISTINCT source FROM bindings ORDER BY source";
 /// flags, object, revision) each sync merges against.
 LOAD_BINDINGS = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
-conflicted, conflict_revision \
+conflicted, conflict_revision, conflict_object, shared_object \
 FROM bindings WHERE collection = :collection";
 
 /// The same rows, narrowed to the link ids one write batch touches: the binding
 /// half of [`LOAD_ITEMS_BY_LINK`].
 LOAD_BINDINGS_BY_LINK = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
-conflicted, conflict_revision \
+conflicted, conflict_revision, conflict_object, shared_object \
 FROM bindings WHERE collection = :collection \
   AND link_id IN (SELECT value FROM json_each(:links))";
+
+/// The bindings waiting for a decision, across an account's collections:
+/// what each one is, and the three bodies a resolver merges.
+///
+/// The base is the last state the two sides agreed on, the item's own
+/// `object_hash` is the local side, and `conflict_object` is the remote
+/// one at `conflict_revision`. All three come off the one row, so a
+/// resolver holding no credentials reads the whole divergence from the
+/// store.
+///
+/// Scoped to one account with `IS`, so binding `NULL` lists a
+/// single-account store whole. Rides the partial index
+/// `bindings_conflicted`, which holds only the outstanding rows: the
+/// question is asked at the end of every run, and answering it by paging
+/// each collection costs a pass over the whole store to report a number
+/// that is usually zero.
+LIST_CONFLICTED_BINDINGS = "\
+SELECT b.collection, b.link_id, b.source, b.handle, b.conflict_revision, \
+b.base_object, i.object_hash, b.conflict_object \
+FROM bindings b \
+JOIN items i ON i.collection = b.collection AND i.link_id = b.link_id \
+JOIN collections c ON c.id = b.collection \
+WHERE b.conflicted = 1 AND c.account IS :account \
+ORDER BY b.collection, b.link_id, b.source";
 
 /// Whether a collection holds a live item under a link id: the collision
 /// check a queued `add` runs before staging.
@@ -530,6 +577,9 @@ CREATE INDEX IF NOT EXISTS items_by_sort ON items(collection, sort_key, seq);
 CREATE INDEX IF NOT EXISTS items_by_seq_global ON items(seq);
 CREATE INDEX IF NOT EXISTS objects_garbage ON objects(refcount) WHERE refcount <= 0;
 CREATE INDEX IF NOT EXISTS items_by_conflict_object ON items(conflict_object);
+CREATE INDEX IF NOT EXISTS bindings_by_conflict_object ON bindings(conflict_object);
+CREATE INDEX IF NOT EXISTS bindings_conflicted ON bindings(collection, link_id, source) \
+WHERE conflicted = 1;
 CREATE INDEX IF NOT EXISTS queue_by_object ON queue(object_hash);
 CREATE INDEX IF NOT EXISTS bindings_by_handle ON bindings(collection, source, handle);";
 
@@ -574,9 +624,11 @@ RETURNING object_hash, conflict_object";
 /// `UPDATE_BINDING` handles an existing one).
 INSERT_BINDING = "\
 INSERT INTO bindings(collection, link_id, source, handle, base_flags, base_object, \
-base_revision, base_present, conflicted, conflict_revision) \
+base_revision, base_present, conflicted, conflict_revision, conflict_object, \
+shared_object) \
 VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, \
-:base_revision, :base_present, :conflicted, :conflict_revision)";
+:base_revision, :base_present, :conflicted, :conflict_revision, :conflict_object, \
+:shared_object)";
 
 /// Updates one existing binding's columns in place (its primary key
 /// `(collection, link_id, source)` is unchanged).
@@ -591,8 +643,29 @@ VALUES(:collection, :link_id, :source, :handle, :base_flags, :base_object, \
 UPDATE_BINDING = "\
 UPDATE bindings SET base_flags = :base_flags, \
 base_object = :base_object, base_revision = :base_revision, base_present = :base_present, \
-conflicted = :conflicted, conflict_revision = :conflict_revision \
+conflicted = :conflicted, conflict_revision = :conflict_revision, \
+conflict_object = :conflict_object, shared_object = :shared_object \
 WHERE collection = :collection AND link_id = :link_id AND source = :source";
+
+/// Gives every binding written before `shared_object` existed the item's
+/// own body as its agreement point, once the column has been added
+/// (spec §6, the `draft` allowance).
+///
+/// Left empty the column reads as "this source has never folded", which
+/// falls back to the sync base, and a binding whose push is pending sits
+/// behind the shared body by definition: the first absorb after the
+/// upgrade would then measure the cross-source axis from the base again
+/// and file the source's own next edit as a divergence. An existing
+/// store's sources agree with the body they hold, so that body is what
+/// the rows already imply.
+///
+/// Guarded on `IS NULL`, which is every row of a column just added and
+/// no row of one already backfilled, so running it twice is a no-op.
+BACKFILL_SHARED_OBJECT = "\
+UPDATE bindings SET shared_object = \
+(SELECT object_hash FROM items \
+ WHERE items.collection = bindings.collection AND items.link_id = bindings.link_id) \
+WHERE shared_object IS NULL";
 
 /// Deletes one source's binding of an item.
 DELETE_BINDING = "DELETE FROM bindings WHERE collection = :collection AND link_id = :link_id AND source = :source";
@@ -669,9 +742,9 @@ LIST_OBJECT_HASHES = "SELECT hash FROM objects";
 /// blob.
 DELETE_GARBAGE_OBJECTS = "DELETE FROM objects WHERE refcount <= 0";
 
-/// Recomputes every object's refcount from the four columns that pin one (spec
-/// §7): an item's body, an item's conflict copy, a source's stored base and a
-/// pending queue action's body.
+/// Recomputes every object's refcount from the five columns that pin one (spec
+/// §7): an item's body, an item's conflict copy, a source's stored base, a
+/// binding's diverging remote body and a pending queue action's body.
 ///
 /// The repair, not the write path: writes maintain the count
 /// incrementally with `ADJUST_REFCOUNT`, which is O(changes) where this
@@ -689,6 +762,7 @@ FROM ( \
     SELECT object_hash AS hash FROM items WHERE object_hash IS NOT NULL \
     UNION ALL SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
     UNION ALL SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
+    UNION ALL SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL \
     UNION ALL SELECT object_hash FROM queue WHERE object_hash IS NOT NULL \
   ) r ON r.hash = o.hash \
   GROUP BY o.hash \
@@ -799,13 +873,14 @@ SELECT count(*), coalesce(sum(o.size), 0) FROM items i \
 LEFT JOIN objects o ON o.hash = i.object_hash \
 WHERE i.retained_at IS NOT NULL AND i.retained_at < :cutoff";
 
-/// The objects whose stored refcount disagrees with the four pointer columns
+/// The objects whose stored refcount disagrees with the five pointer columns
 /// that justify it: the read `RECOMPUTE_REFCOUNTS` settles.
 REFCOUNT_DRIFT = "\
 WITH refs(hash) AS ( \
   SELECT object_hash FROM items WHERE object_hash IS NOT NULL \
   UNION ALL SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
   UNION ALL SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
+  UNION ALL SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL \
   UNION ALL SELECT object_hash FROM queue WHERE object_hash IS NOT NULL \
 ), counted(hash, n) AS (SELECT hash, count(*) FROM refs GROUP BY hash) \
 SELECT o.hash, o.refcount, coalesce(c.n, 0) FROM objects o \
@@ -817,7 +892,7 @@ WHERE o.refcount != coalesce(c.n, 0) ORDER BY o.hash";
 /// `item show`, which names one item and can afford to say everything about it.
 ITEM_BINDINGS = "\
 SELECT link_id, source, handle, base_flags, base_object, base_revision, base_present, \
-conflicted, conflict_revision \
+conflicted, conflict_revision, conflict_object, shared_object \
 FROM bindings WHERE collection = :collection AND link_id = :link_id \
 ORDER BY source";
 

@@ -701,6 +701,13 @@ pub struct BindingRow {
     pub conflicted: bool,
     /// The remote revision observed when the divergence was recorded.
     pub conflict_revision: Option<String>,
+    /// The diverging remote body at that revision, `null` while the
+    /// upgrade pass has not supplied it yet.
+    pub conflict_object: Option<String>,
+    /// The shared body this source last reconciled against, `null` until
+    /// it has folded once. What a cross-source divergence is measured
+    /// from, where `base_object` is what a push is derived from.
+    pub shared_object: Option<String>,
 }
 
 impl BindingRow {
@@ -722,6 +729,8 @@ impl BindingRow {
             base_revision: binding.base.as_ref().and_then(|base| base.revision.clone()),
             conflicted: binding.conflicted,
             conflict_revision: binding.conflict_revision.clone(),
+            conflict_object: binding.conflict_object.as_ref().map(|hash| hash.0.clone()),
+            shared_object: binding.shared_object.as_ref().map(|hash| hash.0.clone()),
         }
     }
 }
@@ -809,6 +818,12 @@ impl fmt::Display for ItemShowOutput {
                     )?;
                 }
 
+                writeln!(
+                    f,
+                    "    - shared object: {}",
+                    or_dash(binding.shared_object.as_deref())
+                )?;
+
                 // NOTE: the exception line. Printing it only when it applies
                 // is what makes a diverged binding stand out from the
                 // ordinary ones beside it.
@@ -817,6 +832,11 @@ impl fmt::Display for ItemShowOutput {
                         f,
                         "    - conflicted at revision: {}",
                         or_dash(binding.conflict_revision.as_deref())
+                    )?;
+                    writeln!(
+                        f,
+                        "    - conflict object: {}",
+                        or_dash(binding.conflict_object.as_deref())
                     )?;
                 }
             }

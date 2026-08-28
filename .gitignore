@@ -6,3 +6,6 @@
 # direnv (https://direnv.net/)
 .envrc
 .direnv
+
+# Cargo local overrides
+/.cargo

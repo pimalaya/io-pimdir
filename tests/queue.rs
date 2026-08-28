@@ -41,6 +41,7 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPla
         flags: flags.clone(),
         status: ReplicaStatus::Clean,
         conflict_revision: None,
+        conflict_object: None,
         base: Some(ReplicaBase {
             flags,
             revision: None,

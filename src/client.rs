@@ -173,6 +173,55 @@ pub struct PimdirPlacement {
     pub level: ReplicaLevel,
 }
 
+/// One binding whose own sync is stuck on an unresolved content conflict
+/// (spec §13), as the conflict listing reports it: what the binding is,
+/// and the three bodies a resolver merges.
+///
+/// The whole divergence, off one row. Base is what the two sides last
+/// agreed on, `object` is the local side, `conflict_object` is the remote
+/// side at `conflict_revision`, and a resolver reading all three from the
+/// store needs no credentials and no round trip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirConflict {
+    /// The collection the conflicted binding sits in.
+    pub collection: String,
+    /// The item's cross-source identity.
+    pub link_id: ReplicaLinkId,
+    /// The source that diverged from its own remote. One source can be
+    /// conflicted while another holding the same item is in sync, which
+    /// is why a conflict is named by this and not by the item alone.
+    pub source: ReplicaSourceId,
+    /// The item's handle on that source, what a resolver pushes back to.
+    pub handle: ReplicaHandle,
+    /// The remote revision observed when the divergence was recorded;
+    /// `None` when the remote reports none. A resolution computed
+    /// against it is stale once it moves.
+    pub conflict_revision: Option<String>,
+    /// The body the last sync agreed on, the merge's common ancestor;
+    /// `None` when the base carried no body.
+    pub base_object: Option<ReplicaHash>,
+    /// The local side of the divergence, the item's own body.
+    pub object: Option<ReplicaHash>,
+    /// The remote side at `conflict_revision`; `None` until the upgrade
+    /// pass supplies it, which is a conflict that is visible and listable
+    /// and not yet resolvable.
+    pub conflict_object: Option<ReplicaHash>,
+}
+
+/// Maps a `LIST_CONFLICTED_BINDINGS`-shaped row.
+fn conflict_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PimdirConflict> {
+    Ok(PimdirConflict {
+        collection: r.get(0)?,
+        link_id: ReplicaLinkId(r.get(1)?),
+        source: ReplicaSourceId(r.get(2)?),
+        handle: ReplicaHandle(r.get(3)?),
+        conflict_revision: r.get(4)?,
+        base_object: r.get::<_, Option<String>>(5)?.map(ReplicaHash),
+        object: r.get::<_, Option<String>>(6)?.map(ReplicaHash),
+        conflict_object: r.get::<_, Option<String>>(7)?.map(ReplicaHash),
+    })
+}
+
 /// Maps a `LIST_COLLECTIONS`-shaped row.
 fn collection_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PimdirCollection> {
     Ok(PimdirCollection {
@@ -711,7 +760,7 @@ impl PimdirStore {
         Ok(report)
     }
 
-    /// Recomputes every object's refcount from the four columns that pin one
+    /// Recomputes every object's refcount from the five columns that pin one
     /// (spec §7), returning how many rows disagreed and were corrected.
     ///
     /// The counterpart of the incremental maintenance every write does: a
@@ -1321,6 +1370,7 @@ fn stage_action(
             flags: flags.clone(),
             status: ReplicaStatus::Created,
             conflict_revision: None,
+            conflict_object: None,
             base: None,
             origin: None,
         };
@@ -2071,9 +2121,15 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
     /// Columns folded into version 1 after it was first published, as
     /// `(table, column, declaration)`. Each must be nullable or carry a
     /// default, or it could not be added to a populated table.
-    const FOLDED_IN: [(&str, &str, &str); 7] = [
+    const FOLDED_IN: [(&str, &str, &str); 9] = [
         ("bindings", "conflicted", "INTEGER NOT NULL DEFAULT 0"),
         ("bindings", "conflict_revision", "TEXT"),
+        (
+            "bindings",
+            "conflict_object",
+            "TEXT REFERENCES objects(hash)",
+        ),
+        ("bindings", "shared_object", "TEXT"),
         ("items", "retained_at", "TEXT"),
         ("items", "retained_by", "TEXT"),
         ("collections", "account", "TEXT"),
@@ -2117,11 +2173,23 @@ fn reconcile_draft_shape(conn: &mut Connection) -> Result<(), PimdirError> {
         }
     }
 
+    let backfill_shared = missing
+        .iter()
+        .any(|(table, column, _)| (*table, *column) == ("bindings", "shared_object"));
+
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(busy_or_sql)?;
     for (table, column, decl) in missing {
         tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    // NOTE: the one folded-in column whose empty value is not what the
+    // rows already say. Left NULL it reads as "never folded", the sync
+    // base stands in for it, and a binding with a pending push sits
+    // behind the shared body by definition, so the first absorb after
+    // the upgrade files the source's own next edit as a divergence.
+    if backfill_shared {
+        tx.execute_batch(sql::BACKFILL_SHARED_OBJECT)?;
     }
     for (table, column) in stale {
         tx.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
@@ -2636,6 +2704,8 @@ fn insert_binding(
             ":base_present": binding.base.is_some() as i64,
             ":conflicted": binding.conflicted as i64,
             ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
+            ":conflict_object": conflict_object(binding).map(|hash| hash.0.as_str()),
+            ":shared_object": binding.shared_object.as_ref().map(|hash| hash.0.as_str()),
         },
     )?;
     Ok(())
@@ -2660,15 +2730,40 @@ fn update_binding(
             ":base_present": binding.base.is_some() as i64,
             ":conflicted": binding.conflicted as i64,
             ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
+            ":conflict_object": conflict_object(binding).map(|hash| hash.0.as_str()),
+            ":shared_object": binding.shared_object.as_ref().map(|hash| hash.0.as_str()),
         },
     )?;
     Ok(())
 }
 
+/// The diverging remote body a binding is stuck on, as the column holds
+/// it: the hash while the binding is conflicted, `NULL` otherwise.
+///
+/// Gated on the flag exactly as the revision beside it is (spec §13). A
+/// body outliving the revision it was fetched at describes a version the
+/// remote no longer holds, and it is also what releases the pin: a
+/// resolved binding stops referencing the object, so the collector takes
+/// it like any other unreferenced body.
+fn conflict_object(binding: &ReplicaSourceBinding) -> Option<&ReplicaHash> {
+    binding
+        .conflicted
+        .then_some(binding.conflict_object.as_ref())
+        .flatten()
+}
+
 /// The multiset of object references a hub holds, keyed by hash: every
 /// item's `object` and `conflict_object` plus every binding's
-/// `base.object`. Computed in memory, so refcount maintenance is a
-/// per-hash delta rather than a full-table rescan.
+/// `base.object` and its own `conflict_object`. Computed in memory, so
+/// refcount maintenance is a per-hash delta rather than a full-table
+/// rescan.
+///
+/// A binding's `shared_object` is deliberately not among them, where the
+/// column beside it is. It records which body this source last agreed
+/// with and is only ever compared for equality, never read as bytes, and
+/// a content hash compares the same after the body it named has been
+/// swept. Counting it would pin every body a source ever agreed with for
+/// as long as the binding lives, and buy nothing.
 fn object_refs(hub: &ReplicaHub) -> HashMap<String, i64> {
     let mut refs: HashMap<String, i64> = HashMap::new();
     let mut bump = |hash: &ReplicaHash| *refs.entry(hash.0.clone()).or_insert(0) += 1;
@@ -2682,6 +2777,14 @@ fn object_refs(hub: &ReplicaHub) -> HashMap<String, i64> {
         for binding in item.sources.values() {
             if let Some(object) = binding.base.as_ref().and_then(|b| b.object.as_ref()) {
                 bump(object);
+            }
+            // NOTE: the pin that keeps a diverging body readable until
+            // someone resolves the conflict, which is an interval of
+            // days. Read off the same gate the column is written
+            // through, so the two can never disagree about what is
+            // referenced.
+            if let Some(conflict) = conflict_object(binding) {
+                bump(conflict);
             }
         }
     }
@@ -2790,6 +2893,8 @@ fn binding_from_row(
     let base_present: i64 = row.get(6)?;
     let conflicted: i64 = row.get(7)?;
     let conflict_revision: Option<String> = row.get(8)?;
+    let conflict_object: Option<String> = row.get(9)?;
+    let shared_object: Option<String> = row.get(10)?;
 
     // NOTE: either witness. The column is the fact, and a base of no
     // revision, no body and markers nobody has read is a real agreement
@@ -2819,10 +2924,19 @@ fn binding_from_row(
             handle: ReplicaHandle(handle),
             base,
             conflicted,
-            // NOTE: spec §13, the revision is meaningful only while
-            // conflicted, so a resolved binding cannot hand a stale one
-            // to the next sync.
+            // NOTE: spec §13, the revision and the body beside it are
+            // meaningful only while conflicted, so a resolved binding
+            // cannot hand a stale pair to the next sync.
             conflict_revision: conflicted.then_some(conflict_revision).flatten(),
+            conflict_object: conflicted
+                .then_some(conflict_object)
+                .flatten()
+                .map(ReplicaHash),
+            // NOTE: ungated, where the pair above is gated: the
+            // agreement point is the ordinary state of an ordinary
+            // binding, and the edit resolving a conflict needs the one
+            // the conflict was filed at.
+            shared_object: shared_object.map(ReplicaHash),
         },
     ))
 }

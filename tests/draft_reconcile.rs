@@ -23,6 +23,8 @@ use tempfile::tempdir;
 const FOLDED_IN: &[(&str, &str)] = &[
     ("bindings", "conflicted"),
     ("bindings", "conflict_revision"),
+    ("bindings", "conflict_object"),
+    ("bindings", "shared_object"),
     ("items", "retained_at"),
     ("items", "retained_by"),
     ("items", "sort_key"),
@@ -42,6 +44,8 @@ const FOLDED_INDEXES: &[&str] = &[
     "items_by_seq_global",
     "objects_garbage",
     "items_by_conflict_object",
+    "bindings_by_conflict_object",
+    "bindings_conflicted",
     "queue_by_object",
     "bindings_by_handle",
 ];

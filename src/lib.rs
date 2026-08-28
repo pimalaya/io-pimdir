@@ -40,9 +40,10 @@ pub mod client;
 
 #[cfg(feature = "client")]
 pub use client::{
-    PimdirBlobFile, PimdirBlobWriter, PimdirBlobs, PimdirCollection, PimdirDrainReport,
-    PimdirError, PimdirGcReport, PimdirItem, PimdirParkedAction, PimdirPendingAction,
-    PimdirProducer, PimdirPurgeReport, PimdirRetention, PimdirSourceStore, PimdirStore,
+    PimdirBlobFile, PimdirBlobWriter, PimdirBlobs, PimdirCollection, PimdirConflict,
+    PimdirDrainReport, PimdirError, PimdirGcReport, PimdirItem, PimdirParkedAction,
+    PimdirPendingAction, PimdirProducer, PimdirPurgeReport, PimdirRetention, PimdirSourceStore,
+    PimdirStore,
     diagnostics::{PimdirDangling, PimdirMinted, PimdirObjectStats, PimdirRefcountDrift},
     reader::PimdirReader,
 };

@@ -50,6 +50,7 @@ fn read_only_open_reads_but_never_writes_or_creates() {
                 flags: flags.clone(),
                 status: ReplicaStatus::Clean,
                 conflict_revision: None,
+                conflict_object: None,
                 base: Some(ReplicaBase {
                     flags,
                     revision: None,
