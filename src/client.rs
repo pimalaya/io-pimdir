@@ -967,7 +967,8 @@ impl PimdirSourceStore {
             }
             match self.apply_queued(collection, &row, &action) {
                 Ok(None) => report.applied += 1,
-                Ok(Some(reason)) => {
+                Ok(Some(PimdirRefusal::Skip)) => report.skipped += 1,
+                Ok(Some(PimdirRefusal::Park(reason))) => {
                     self.fail_action(row.id, Some(&reason))?;
                     report.parked += 1;
                 }
@@ -984,14 +985,14 @@ impl PimdirSourceStore {
 
     /// Applies one queued action and deletes its row in one transaction,
     /// releasing the row's object pin as the applied item takes its own.
-    /// Returns `Some(reason)` when the action must be parked, rolling the
-    /// transaction back, `None` when applied.
+    /// Returns `None` when applied, and the [`PimdirRefusal`] otherwise,
+    /// rolling the transaction back so the row is as it was.
     fn apply_queued(
         &mut self,
         collection: &str,
         row: &QueueRow,
         action: &PimdirAction,
-    ) -> Result<Option<String>, PimdirError> {
+    ) -> Result<Option<PimdirRefusal>, PimdirError> {
         let tx = self
             .store
             .reader
@@ -1013,8 +1014,10 @@ impl PimdirSourceStore {
 
         let ops = match stage_action(&tx, &self.source, collection, row.id, action)? {
             Ok(ops) => ops,
-            // NOTE: dropping the transaction rolls the attempt back.
-            Err(reason) => return Ok(Some(reason)),
+            // NOTE: dropping the transaction rolls the attempt back, so a
+            // skipped row is left exactly as it was found: still pending,
+            // its attempts untouched, for the owner that can apply it.
+            Err(refusal) => return Ok(Some(refusal)),
         };
         apply_ops(
             &tx,
@@ -1227,9 +1230,26 @@ fn load_pending_actions(
     Ok(actions)
 }
 
+/// Why a queued action was not staged.
+///
+/// The distinction is the whole difference between a row that is broken
+/// and one that is simply not this owner's to apply, and it is the spec's
+/// (§15.3): an action the owner cannot apply **at all** parks, one it
+/// cannot apply **here** is left pending for whoever can.
+enum PimdirRefusal {
+    /// It will never stage: a payload that does not decode, an item that
+    /// is gone, an identity already taken. The row parks with this
+    /// reason, and no later drain retries it.
+    Park(String),
+    /// It cannot stage against this source, which holds no binding for
+    /// the item it names. The row stays pending, unmarked, so the source
+    /// that does hold one still applies it.
+    Skip,
+}
+
 /// Stages the io-replica write ops one queued action folds into the store
-/// (spec §15.3), inside the drain transaction. The inner `Err` is a park
-/// reason; an empty op list is a no-op success, a `remove` of an
+/// (spec §15.3), inside the drain transaction. The inner `Err` is why it
+/// was refused; an empty op list is a no-op success, a `remove` of an
 /// already-absent item.
 ///
 /// Existing items are addressed by `seq`, resolved to their link id and
@@ -1244,7 +1264,7 @@ fn stage_action(
     collection: &str,
     row_id: i64,
     action: &PimdirAction,
-) -> Result<Result<Vec<ReplicaWriteOp>, String>, PimdirError> {
+) -> Result<Result<Vec<ReplicaWriteOp>, PimdirRefusal>, PimdirError> {
     let collection_id = ReplicaCollectionId(collection.to_string());
 
     if let PimdirAction::Add {
@@ -1259,7 +1279,9 @@ fn stage_action(
             .clone()
             .or_else(|| object.as_ref().map(|hash| ReplicaLinkId(hash.0.clone())));
         let Some(link) = link else {
-            return Ok(Err("add carries neither link_id nor object".to_string()));
+            return Ok(Err(PimdirRefusal::Park(
+                "add carries neither link_id nor object".to_string(),
+            )));
         };
         // NOTE: the same collision rule as the engine's Add mutation: a
         // live item blocks the create, a tombstone does not, the delete
@@ -1274,7 +1296,10 @@ fn stage_action(
             )
             .optional()?;
         if live.is_some() {
-            return Ok(Err(format!("link id already present: {}", link.0)));
+            return Ok(Err(PimdirRefusal::Park(format!(
+                "link id already present: {}",
+                link.0
+            ))));
         }
         let level = match (object, meta) {
             (Some(_), _) => ReplicaLevel::Full,
@@ -1324,7 +1349,7 @@ fn stage_action(
         return if removes {
             Ok(Ok(Vec::new()))
         } else {
-            Ok(Err(format!("unknown seq: {seq}")))
+            Ok(Err(PimdirRefusal::Park(format!("unknown seq: {seq}"))))
         };
     };
 
@@ -1343,7 +1368,7 @@ fn stage_action(
     let handle = match handle {
         Some(handle) => ReplicaHandle(handle),
         None if removes => return Ok(Ok(Vec::new())),
-        None => return Ok(Err(format!("seq {seq} projects no placement"))),
+        None => return Ok(Err(PimdirRefusal::Skip)),
     };
 
     let mutation = match action {
@@ -1401,8 +1426,10 @@ fn stage_action(
                 .collect();
             Ok(Ok(ops))
         }
-        ReplicaCoroutineState::Complete(Err(err)) => Ok(Err(err.to_string())),
-        state => Ok(Err(format!("unexpected mutate state: {state:?}"))),
+        ReplicaCoroutineState::Complete(Err(err)) => Ok(Err(PimdirRefusal::Park(err.to_string()))),
+        state => Ok(Err(PimdirRefusal::Park(format!(
+            "unexpected mutate state: {state:?}"
+        )))),
     }
 }
 

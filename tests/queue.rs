@@ -688,3 +688,42 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
         Ok(_) => panic!("expected an uncreated-store refusal, got a producer"),
     }
 }
+
+/// The spec's "cannot apply *here*" case, which is what neverest hit on a
+/// mail account also syncing contacts and calendar: its sources take turns
+/// draining, and the first one to reach a mail action holds no binding for
+/// the item it names. Parking there loses the action for the source that
+/// could have applied it, since a parked row is skipped by every later
+/// drain, so the refusal has to leave the row alone instead.
+#[test]
+fn an_action_the_draining_source_cannot_place_is_skipped_not_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut owner, seq) = seeded(dir.path());
+
+    let mut producer = PimdirProducer::open(dir.path(), "frontend").unwrap();
+    producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::SetFlags {
+                seq,
+                flags: ReplicaFlags::default(),
+            },
+            None,
+            NOW,
+        )
+        .unwrap();
+
+    // A source with no binding in this collection drains first.
+    let mut stranger = PimdirStore::open(dir.path()).unwrap().for_source("other");
+    let report = stranger.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.skipped, report.parked), (0, 1, 0));
+    assert!(stranger.parked_actions().unwrap().is_empty());
+
+    // The row was left exactly as it was found, so the source that holds
+    // the item still applies it.
+    let report = owner.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.skipped, report.parked), (1, 0, 0));
+
+    let item = owner.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(item.flags, ReplicaFlags::default());
+}
