@@ -37,6 +37,7 @@ pimalaya-cli = { version = "0.2", default-features = false, features = ["build"]
 
 [dev-dependencies]
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 tempfile = { version = "3", default-features = false }
 
