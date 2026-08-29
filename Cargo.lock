@@ -512,7 +512,7 @@ dependencies = [
 [[package]]
 name = "io-replica"
 version = "0.4.2"
-source = "git+https://github.com/pimalaya/io-replica#89fd2121b9c1b39e98d6d7669ffec0d0b0380aec"
+source = "git+https://github.com/pimalaya/io-replica#198d70a995db9cf2d5ae880746a3ed0d64e829fb"
 dependencies = [
  "log",
  "thiserror",
