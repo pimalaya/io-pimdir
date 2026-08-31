@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "io-pimdir"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -530,8 +530,9 @@ dependencies = [
 
 [[package]]
 name = "io-replica"
-version = "0.4.2"
-source = "git+https://github.com/pimalaya/io-replica#3a71ebd25b87c418c04fc2150d0ddcfa83b5ae1d"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d5bb3465f40bdfb5ea1a13cf7e0b2f3d97cbcf651e019cce729ad733e3b33ae"
 dependencies = [
  "log",
  "thiserror",

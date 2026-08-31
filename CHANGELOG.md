@@ -4,93 +4,183 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-31
+
 ### Added
 
-- **`bindings.shared_object`, what a source last agreed with the hub on.** A binding recorded one base, the state last agreed with its own remote, and the engine measured two different questions against it: only a sync moves that base, so a body the source itself folded in and has not pushed yet leaves the same gap another source folding in leaves. A second offline edit was therefore filed as a cross-source conflict in a store with one source and no second source anywhere, and so was the edit resolving a conflict, whose merged body then never became the item's. io-replica gave the second axis a base of its own; this is where it survives a restart, which is the only place it matters, the absorb that files a conflict and the edit that settles it being different runs. Round-tripped through `ReplicaSourceBinding` and meaningful on every binding, conflicted or not, unlike the conflict pair beside it: gated on the flag it would be erased at the moment a resolving edit needs it. It names an object and pins none, taking no `REFERENCES`, no index and no refcount, being only ever compared for equality and never read as bytes. Folded into schema version 1 under the draft allowance (spec §6) and backfilled from the item's own body, so an upgraded store opens in agreement rather than conflicting once for every item whose push is pending. `item show` prints it beside the base it is not.
+- Added `bindings.shared_object`, what a source last agreed with the hub on.
 
-- **`bindings.conflict_object`, the diverging body an unresolved conflict is waiting on.** A binding recorded the remote revision it diverged at and nothing else, so whoever resolved the conflict had to fetch the body that revision named, which meant credentials in the resolving tool. The column holds that body, round-tripped through `ReplicaSourceBinding` and meaningful only while `conflicted` is set, on the same terms as the revision beside it: base, local and remote are all readable from the store alone. It is a reference like any other, counted in the refcount and therefore kept out of the collector for as long as the binding stays conflicted, which is the interval between the run that found the divergence and the day a person sits down to it; resolving is an ordinary edit and releases the pin. The item-level `items.conflicted` / `items.conflict_object`, the cross-source axis, is untouched. Folded into schema version 1 under the draft allowance (spec §6), so a store written before the column is reconciled on open rather than refused. `item show` prints it beside the revision.
+  A binding recorded one base, the state last agreed with its own remote, and the engine measured two different questions against it: only a sync moves that base, so a body the source itself folded in and has not pushed yet leaves the same gap another source folding in leaves. A second offline edit was therefore filed as a cross-source conflict in a store with one source and no second source anywhere, and so was the edit resolving a conflict, whose merged body then never became the item's. io-replica gave the second axis a base of its own; this is where it survives a restart, which is the only place it matters, the absorb that files a conflict and the edit that settles it being different runs.
 
-- **`PimdirReader::list_conflicts`, what is waiting for a decision.** The conflict flag was written and read back with its row and never filtered on, so counting the outstanding conflicts of a store meant paging every collection, on every run. One statement now answers it across an account's collections, naming each binding by its collection, link id, source and handle and carrying the three hashes the divergence is between, and it rides a partial index that holds only the outstanding rows and is empty at rest.
+  Round-tripped through `ReplicaSourceBinding` and meaningful on every binding, conflicted or not, unlike the conflict pair beside it: gated on the flag it would be erased at the moment a resolving edit needs it. It names an object and pins none, taking no `REFERENCES`, no index and no refcount, being only ever compared for equality and never read as bytes. Folded into schema version 1 under the draft allowance (spec §6) and backfilled from the item's own body, so an upgraded store opens in agreement rather than conflicting once for every item whose push is pending. `item show` prints it beside the base it is not.
 
-- **`PimdirReader`, the read role (spec §8).** The format names three roles and the crate shipped two handles: `open_read_only` returned a `PimdirStore`, the type that also drains the queue, sweeps the objects and purges the trash, so a consumer that only reads held a handle that could destroy the store and "it never calls those" was the only thing keeping it from doing so. The reads move to a handle that takes no lock and carries no write at all; `PimdirStore` dereferences to one, so the projection stays a single implementation whichever role reads it. `open_read_only` is deprecated.
+- Added `bindings.conflict_object`, the diverging body an unresolved conflict is waiting on.
 
-- **The pending-action overlay (spec §15.4).** A reader built with `with_pending` folds the queue's pending actions over the committed items, so a producer sees what it staged before the owner applies it: `set-flags` and `update` restate an item, `remove` and `move` take it out of a collection, and `move` and `copy` bring it into the target. All of them address an existing item, whose `seq` follows its link id store-wide (spec §9.1), so nothing invents an identifier. A queued create has no `seq` until the owner applies it and is reported apart, by `pending_creates` and `count_pending_creates`. Parked rows never overlay, their error saying they will not be applied without an operator. The choice is made when the reader is built, never per call, so one handle cannot answer two ways about one collection. A page keeps its meaning: the fold reads past the limit by the number of pending removals and cuts back afterwards, so a page comes back short only where the collection ends and a scan written to page until a short page does not end early.
+  A binding recorded the remote revision it diverged at and nothing else, so whoever resolved the conflict had to fetch the body that revision named, which meant credentials in the resolving tool. The column holds that body, round-tripped through `ReplicaSourceBinding` and meaningful only while `conflicted` is set, on the same terms as the revision beside it: base, local and remote are all readable from the store alone.
 
-- **`PimdirStore::cancel_action`**, cancelling one queue row as the owner while holding that role only for the length of the call. Cancelling is an owner write (spec §15.5) and the only retraction a queued create has, the kinds addressing an existing item being retracted by their inverse instead. A consumer that is otherwise a reader and a producer needed the whole owner handle to reach it, which is the handle it must not hold.
+  It is a reference like any other, counted in the refcount and therefore kept out of the collector for as long as the binding stays conflicted, which is the interval between the run that found the divergence and the day a person sits down to it; resolving is an ordinary edit and releases the pin. The item-level `items.conflicted` and `items.conflict_object`, the cross-source axis, is untouched. Folded into schema version 1 under the draft allowance (spec §6), so a store written before the column is reconciled on open rather than refused. `item show` prints it beside the revision.
 
-- **`PimdirBlobs::path`**, where a body under a hash lives. The sharded layout is normative (spec §5) and the format invites a consumer to stream a body straight to that path and index it with a byteless `StoreObject` afterwards (spec §14), which until now meant deriving the sharding a second time.
+- Added `PimdirReader::list_conflicts`, what is waiting for a decision.
 
-- **`conventions`, the per-kind derivations (spec Annex A).** One `derive(kind, body)` returning the `link_id`, the `meta` summary and the `sort_key` for `message/rfc822`, `text/vcard` and `text/calendar`, in the I/O-free core so a consumer running its own SQLite driver reaches it. Annex A is informative, so nothing reported the divergence three consumers writing it separately had already produced: one wrote a whole calendar summary and a resolved key where another wrote `{"v":1,"etag":…}` and an empty key for every item. The fallback ids are fixed here too (`alt:` for a message with no `Message-ID`, `hash:` for a card or a resource with no `UID`), because two writers disagreeing about one item's id link it twice and store one body twice. Checked against the format's own vectors, fixtures read as bytes and structures compared rather than JSON text.
+  The conflict flag was written and read back with its row and never filtered on, so counting the outstanding conflicts of a store meant paging every collection, on every run. One statement now answers it across an account's collections, naming each binding by its collection, link id, source and handle and carrying the three hashes the divergence is between, and it rides a partial index that holds only the outstanding rows and is empty at rest.
 
-- **`pimdir gc`, the collector.** It drops the object rows nothing references, unlinks their bodies and the orphan blob files a crash left, and reports what it freed. It takes the owner role, so it never runs beside a sync, and reports a producer mid-append rather than waiting on one. A store that wants its unreferenced objects bounded schedules the verb.
+- Added `PimdirReader`, the read role (spec §8).
 
-- **One owner, enforced (spec §8).** Every owning handle takes an exclusive advisory lock on the store directory and holds it for its lifetime; a second owner gets `PimdirError::Owned` immediately, naming the store, rather than the 30-second `busy_timeout` wait that used to end in a stall with no signal. The rule is about processes, so a two-sided sync or a multi-account owner opening several handles still holds one lock. Readers take none. Producers take a shared one, so several append at once while none of them keeps the owner out, and a body is never between the blob tree and the queue row that pins it while a collector runs. The kernel releases the lock with the process, so a crash leaves nothing to recover.
+  The format names three roles and the crate shipped two handles: `open_read_only` returned a `PimdirStore`, the type that also drains the queue, sweeps the objects and purges the trash, so a consumer that only reads held a handle that could destroy the store and "it never calls those" was the only thing keeping it from doing so. The reads move to a handle that takes no lock and carries no write at all; `PimdirStore` dereferences to one, so the projection stays a single implementation whichever role reads it.
 
-- **`PimdirReader::item_bindings` and the bindings `pimdir item show` prints.** A binding is where a source's own view of an item lives: the handle it is addressed by, the base the last sync agreed on, and the marker saying it diverged. None of it was readable, so the question a duplicated identity raises, *which resource does each copy come from*, could only be answered by going back to the server or opening the database by hand. `item show` now prints one block per source under each placement, `conflicted at revision` appearing only when it applies. `item list` is untouched: its rows are one query for a whole page, and a binding lookup per row is not what a listing should cost.
+- Added the pending-action overlay (spec §15.4).
 
-- **`pimdir check` counts the minted keys each collection holds**, the second copies of an identity a source hands over twice (spec §9). Not a defect and nothing to repair, so it is counted apart from the problems: what it is worth saying is that a collection whose count climbs every sync is a source renaming the same duplicate on every run.
+  A reader built with `with_pending` folds the queue's pending actions over the committed items, so a producer sees what it staged before the owner applies it: `set-flags` and `update` restate an item, `remove` and `move` take it out of a collection, and `move` and `copy` bring it into the target. All of them address an existing item, whose `seq` follows its link id store-wide (spec §9.1), so nothing invents an identifier. A queued create has no `seq` until the owner applies it and is reported apart, by `pending_creates` and `count_pending_creates`. Parked rows never overlay, their error saying they will not be applied without an operator.
 
-### Fixed
+  The choice is made when the reader is built, never per call, so one handle cannot answer two ways about one collection. A page keeps its meaning: the fold reads past the limit by the number of pending removals and cuts back afterwards, so a page comes back short only where the collection ends and a scan written to page until a short page does not end early.
 
-- **A queued action the draining source could not place was parked, destroying it for the source that could.** Staging an existing item's action resolves that item's binding for the *draining* source, and no binding was answered with a park: `error` set, filtered out by every later drain, cleared by nothing in the crate. The first source to reach an action it could not place therefore made it unappliable for the source that held the item. On a consumer draining once per source, in name order, over one store, that is every action a frontend queues against a collection whose source does not sort first. The spec already said an action the owner cannot apply *here* is skipped and left pending, never parked, so that is now what happens: the row is left exactly as found, its `attempts` untouched, and counted as `skipped`. Rows already parked stay parked, `queue cancel` remaining the only exit.
+- Added `PimdirStore::cancel_action`, cancelling one queue row as the owner while holding that role only for the length of the call.
 
-- **A trash page sorted the whole trash to return fifty rows.** `list_retained_page` moved onto the public `seq` (spec §14.1) and `items_retained` did not move with it, so the read could not ride its own index. An existing store is repaired on open: an index whose columns moved is now dropped and recreated, which the ensure batch could not do, `CREATE INDEX IF NOT EXISTS` keying on the name and leaving the old shape in place silently.
+  Cancelling is an owner write (spec §15.5) and the only retraction a queued create has, the kinds addressing an existing item being retracted by their inverse instead. A consumer that is otherwise a reader and a producer needed the whole owner handle to reach it, which is the handle it must not hold.
 
-- **A process could refuse itself the store it had just released.** The owner lock is the process's and shared across handles, but a strong count reaches zero before the file description it named is closed, so a handle taken in between opened a second description and `flock` refused it against this process's own: `PimdirError::Owned` naming a store nobody else held, on no schedule, which nothing above can act on. The registry owns the description now and closes it as the last handle goes, inside the same critical section the next acquisition takes.
+- Added `PimdirBlobs::path`, where a body under a hash lives.
 
-- **A body stored without a placement was destroyed at the end of the batch.** Every write swept the object rows at refcount zero and unlinked their blobs, so a consumer that streamed bodies into the blob tree and attached them in a later batch — which spec §14 invites, and which `STORE_OBJECT` inserting at refcount zero exists for — lost them silently, bytes included, before the batch that would have referenced them ran. No write collects any more; `pimdir gc` does.
+  The sharded layout is normative (spec §5) and the format invites a consumer to stream a body straight to that path and index it with a byteless `StoreObject` afterwards (spec §14), which until now meant deriving the sharding a second time.
 
-- **A body lookup crossed accounts.** `lookup_objects` resolved a link id against every collection in the store, so two accounts holding the same vCard `UID`, which spec §9.2 names as a thing unrelated servers do, handed each other's bodies across: the receiving sync then believed the item was hydrated and never fetched the real one. It is scoped to the caller's own account now, which is the axis a link id is trustworthy on; across collections it still answers, which is what the read exists for.
+- Added `conventions`, the per-kind derivations (spec Annex A).
 
-- **A base of no revision, no body and unread markers round-tripped as no base at all**, so an agreed placement read as never-agreed and the sync re-derived the same push on every run. `bindings.base_present` records the fact its three value columns cannot express; those columns stay a witness for rows written before it.
+  One `derive(kind, body)` returning the `link_id`, the `meta` summary and the `sort_key` for `message/rfc822`, `text/vcard` and `text/calendar`, in the I/O-free core so a consumer running its own SQLite driver reaches it. Annex A is informative, so nothing reported the divergence three consumers writing it separately had already produced: one wrote a whole calendar summary and a resolved key where another wrote `{"v":1,"etag":…}` and an empty key for every item. The fallback ids are fixed here too (`alt:` for a message with no `Message-ID`, `hash:` for a card or a resource with no `UID`), because two writers disagreeing about one item's id link it twice and store one body twice. Checked against the format's own vectors, fixtures read as bytes and structures compared rather than JSON text.
 
-- **An identity a source held twice was stored once, and the write that lost the other was silent.** A binding pins one handle, so a source holding one link id twice (a double delivery, a retried append, a restore, a migration, two DAV resources sharing a `UID`) had nowhere to put the second copy: the write repointed the binding at it, and no layer above could afterwards tell the source held the identity twice, while deleting the bound copy propagated a delete that removed the only copy on a source nobody touched. The second copy is an item of its own now, under the key the engine mints for it (spec §9), with its own `seq`, its own binding and its own body; a write that still resolves a stored binding to another handle is refused with `PimdirError::Rebind` rather than applied, and nothing is recorded in its place. The one licensed rebind stays licensed: a handle-space rebuild supersedes the handle it replaces, per handle, so a renumbered collection carries over and a rebuild holding a genuine second copy is still refused for that one.
+- Added `pimdir gc`, the collector.
 
-- **A write carrying a new sort key silently discarded it.** The diff that decides whether a row needs an `UPDATE` compared every column the statement writes except `sort_key`, so a key that changed and nothing else reported the row unchanged and no statement was issued. A key is derived rather than given, and a connector fixing its derivation, a tzdb update moving a zoned start, or the second source of a two-source sync all restate one; the item stayed where the first derivation put it, for good. The suite missed it because it only covered the other half of the invariant, that a write carrying no key must leave the stored one alone.
+  It drops the object rows nothing references, unlinks their bodies and the orphan blob files a crash left, and reports what it freed. It takes the owner role, so it never runs beside a sync, and reports a producer mid-append rather than waiting on one. A store that wants its unreferenced objects bounded schedules the verb.
 
-- **A descending page hid every item sorting above its first cursor.** "No cursor" was expressed as a key no real one could outrank, but a sort key is arbitrary text a writer derives, so no value is reserved and the sentinel was outranked by two of the same character. Such an item was invisible to every descending page, permanently, while the count still reported it. The statement now says what it means, a `NULL` cursor, and keeps the same keyset comparison and the same index.
+- Added the single-owner rule, enforced (spec §8).
 
-- **Two owners draining one collection applied every action twice.** The pending rows are read outside any transaction, and the row was deleted at the *end* of the applying transaction, so a second owner holding the same list re-applied all of it; `add` and `copy` are not idempotent, and the operator CLI opens a second owner handle routinely. The delete is now the first statement of the transaction (`CLAIM_ACTION`, a `DELETE ... RETURNING id`) and a claim that deletes nothing skips the row: exactly-once is a property of the statement rather than a convention about who runs the drain.
+  Every owning handle takes an exclusive advisory lock on the store directory and holds it for its lifetime; a second owner gets `PimdirError::Owned` immediately, naming the store, rather than the 30-second `busy_timeout` wait that used to end in a stall with no signal. The rule is about processes, so a two-sided sync or a multi-account owner opening several handles still holds one lock. Readers take none. Producers take a shared one, so several append at once while none of them keeps the owner out, and a body is never between the blob tree and the queue row that pins it while a collector runs. The kernel releases the lock with the process, so a crash leaves nothing to recover.
 
-- **A blob rename was never made durable.** The body was written, `fsync`ed and renamed, and the directory entry that carries the name was not synced, while the SQLite commit is. A power loss could leave a committed row pointing at a body that never arrived, which is the one asymmetry the write order exists to prevent.
+- Added `PimdirReader::item_bindings` and the bindings `pimdir item show` prints.
 
-- **A flag set the store could not decode read as a known-empty one**, an authoritative "this item carries no markers" that the merge took as one side's opinion: it cleared every marker the other side reported and persisted the result, turning a read failure into permanent loss. It now decodes as unknown, which holds no opinion.
+  A binding is where a source's own view of an item lives: the handle it is addressed by, the base the last sync agreed on, and the marker saying it diverged. None of it was readable, so the question a duplicated identity raises, which resource does each copy come from, could only be answered by going back to the server or opening the database by hand. `item show` now prints one block per source under each placement, `conflicted at revision` appearing only when it applies. `item list` is untouched: its rows are one query for a whole page, and a binding lookup per row is not what a listing should cost.
 
-- **`created_at` held epoch milliseconds** where the column is declared to hold an RFC 3339 timestamp, and the empty string when the clock predated the epoch. It is written by SQLite itself now, in the form the retirement clock already uses, which also keeps the crate free of a clock.
+- Added the minted-key count `pimdir check` reports per collection, the second copies of an identity a source hands over twice (spec §9).
+
+  Not a defect and nothing to repair, so it is counted apart from the problems: what it is worth saying is that a collection whose count climbs every sync is a source renaming the same duplicate on every run.
 
 ### Changed
 
-- **A write no longer holds the database's writer lock across a file write.** Bodies land in the blob store before the transaction that indexes them opens, which spec §14 asks for in as many words: inside it, the same write held SQLite's single writer lock across a file write, two `fsync`s and a rename, serialising every other writer behind an I/O path that touches no database page. The queue drain, which builds its ops inside the transaction that claims its row, keeps writing inside it; the blob write is idempotent, so that costs one existence check.
+- **BREAKING** Dropped the source parameter from `PimdirStore::open` and `open_read_only`, and moved the source-bound operations to `PimdirSourceStore`, yielded by `for_source`.
 
-- **The collector no longer holds every hash in memory.** It read the whole `objects` index into a set to diff the blob tree against, which is hundreds of thousands of names at the scale spec §1 promises, to answer a question that is always about one file. It asks per file on the primary key now (`OBJECT_EXISTS`, new in the format's statements).
+  `PimdirSourceStore` carries the storage seam, the rekeyed write and the queue drain, and dereferences to the store for everything else. Purge, queue cancellation and every read consulted no source but had to be handed one anyway, so the CLI invented `"pimdir"` for its readers and scanned `bindings` for a name it then discarded. Both are gone, and a store an operator reads and sweeps now records no source at all.
 
-- **A purge releases the pins its own delete reported.** `PURGE_ITEM` and `PURGE_RETAINED_BEFORE` return each removed row's `object_hash` and `conflict_object`, so the pins are settled from the statement that took them rather than from a read that visits every swept row a second time. `RETAINED_ITEM_BY_SEQ` and `RETAINED_BEFORE` are retired.
+- **BREAKING** Deduplicated the crate against itself, with no behaviour attached.
 
-- **The format's own SQL is checked, and so is the format's one MUST vector.** The fidelity suite prepares every canonical statement against the canonical schema rather than only checking that each is inlined here by name: this crate holds the only toolchain that ever loads those files. `tests/objects.rs` checks object naming against `vectors/objects.json` (spec §16), both algorithms, whole and streamed, shard paths included. Both suites, and `conventions`, skip silently without the sibling spec checkout, so the new CI in this repository and in pimdir asserts they ran.
+  Fourteen reads that each wrote out prepare-map-push-return share one `rows` helper; the statements and the `sql::ALL` index are declared by one macro, so the two tests that re-read this crate's own source to keep them in step are gone; `PimdirRetainedItem` is folded into `PimdirItem` as an optional `retention`, read by one row mapper instead of two; the operator tool's second read-only connection (`PimdirDb`) is folded onto the store as a diagnostics block; `park` becomes a call to `fail_action`. Breaking beyond the fold: `PimdirPlacement` carries the same typed columns as every other read (`ReplicaLinkId`, `ReplicaFlags`, `ReplicaLevel`), and `PimdirError::Version` splits into `Version` (a schema this crate does not service) and `Uncreated` (no schema yet, which only an owner creates).
 
-- **The same code, once.** A pure refactor, no behaviour attached: fourteen reads that each wrote out prepare-map-push-return share one `rows` helper; the statements and the `sql::ALL` index are declared by one macro, so the two tests that re-read this crate's own source to keep them in step are gone; `PimdirRetainedItem` is folded into `PimdirItem` as an optional `retention`, read by one row mapper instead of two; the operator tool's second read-only connection (`PimdirDb`) is folded onto the store as a diagnostics block; `park` becomes a call to `fail_action`. Breaking: `PimdirRetainedItem` no longer exists, `PimdirPlacement` carries the same typed columns as every other read (`ReplicaLinkId`, `ReplicaFlags`, `ReplicaLevel`), and `PimdirError::Version` splits into `Version` (a schema this crate does not service) and `Uncreated` (no schema yet, which only an owner creates).
+- **BREAKING** Bumped the `io-replica` dependency to 0.5, taking the engine's new API with it.
 
-- **`check` diagnoses and `--fix` repairs; neither reclaims.** `--fix` used to delete orphan blob files behind a `--grace` window and a confirmation prompt, while every write swept with neither. Both flags are gone: it now recomputes the drifted refcounts from the pointers that justify them and clears the bindings whose item is gone, which destroys nothing and needs no guard. Orphan files are reported, and `pimdir gc` takes them.
+  `load` carries a scope, `DropPlacement` carries a reason, and `ReplicaCollection` is gone. The git patch this crate carried until the engine release that mints a key for a duplicated identity is dropped.
 
-- **A purge reports the rows it retired, not the bytes it reclaimed.** It releases the references a retained item held; the bodies are freed by the collector, which is what can report them. `PimdirPurgeReport` loses its `bytes` field and `item purge` its byte count.
+- **BREAKING** Made a purge report the rows it retired, not the bytes it reclaimed.
 
-- **`item restore` queues rather than fails when the store is owned.** It appends its action first and takes the owner role only to apply it, so a restore issued while a sync runs reports `queued` and is drained by the owner that holds the store, which is what the queue is for. Purge and `queue cancel` still need the role and still say so.
+  It releases the references a retained item held; the bodies are freed by the collector, which is what can report them. `PimdirPurgeReport` loses its `bytes` field and `item purge` its byte count.
 
-- **A store handle names a source only where an operation acts as one.** `PimdirStore::open(dir)` and `open_read_only(dir)` take no source, and `for_source(source)` yields `PimdirSourceStore`, which carries the storage seam, the rekeyed write and the queue drain, and dereferences to the store for everything else. Breaking: the constructors lose a parameter. Purge, queue cancellation and every read consulted no source but had to be handed one anyway, so the CLI invented `"pimdir"` for its readers and scanned `bindings` for a name it then discarded. Both are gone, and a store an operator reads and sweeps now records no source at all.
+- Moved the blob write out of the database's writer lock.
 
-- **`io-replica` is patched to its git revision** until the release that mints a key for a duplicated identity is published; it becomes a plain version dependency again at that point. Taking that meant taking the rest of the engine's new API with it: `load` carries a scope, `DropPlacement` carries a reason, and `ReplicaCollection` is gone.
+  Bodies land in the blob store before the transaction that indexes them opens, which spec §14 asks for in as many words: inside it, the same write held SQLite's single writer lock across a file write, two `fsync`s and a rename, serialising every other writer behind an I/O path that touches no database page. The queue drain, which builds its ops inside the transaction that claims its row, keeps writing inside it; the blob write is idempotent, so that costs one existence check.
 
-- **A write reads only the rows its batch names.** Folding a batch into a collection loaded, cloned and diffed the whole collection, so the cost of one flag on one message was the size of the mailbox: measured 3.5 ms at a thousand items, 13 ms at four thousand, 59 ms at sixteen thousand, cleanly linear, against a promise of hundreds of thousands. The read is now scoped to the link ids the batch carries, with each dropped handle resolved through the new `bindings_by_handle` index, and the same measurement is flat at 150 to 175 µs across that range.
+- Stopped the collector from holding every hash in memory.
 
-- **The residual is keyed rather than listed.** A first sync probes a whole collection before linking any of it, so the list grew to the collection size while every insertion, drop and lookup searched it linearly.
+  It read the whole `objects` index into a set to diff the blob tree against, which is hundreds of thousands of names at the scale spec §1 promises, to answer a question that is always about one file. It asks per file on the primary key now (`OBJECT_EXISTS`, new in the format's statements).
 
-- **The drain answers its point questions with point reads.** The `Add` collision check, the handle lookup and the mutation it drives each loaded the whole collection, once per drained action.
+- Made a purge release the pins its own delete reported.
 
-- **`release_pins` is one statement** rather than one per hash: a purge of fifty thousand retained items was a hundred thousand point updates inside one transaction.
+  `PURGE_ITEM` and `PURGE_RETAINED_BEFORE` return each removed row's `object_hash` and `conflict_object`, so the pins are settled from the statement that took them rather than from a read that visits every swept row a second time. `RETAINED_ITEM_BY_SEQ` and `RETAINED_BEFORE` are retired.
 
-- The object sweep tests `refcount <= 0`, so a count a double release drove negative is collected rather than leaking for ever with nothing reporting it.
+- Checked the format's own SQL, and its one MUST vector.
 
-- New indexes: `objects_garbage` (partial, so the sweep stops scanning the whole table on every write transaction), `items_by_seq_global` (the store-global public id the format promises had no store-global index), `bindings_by_handle`, `items_by_conflict_object` and `queue_by_object`.
+  The fidelity suite prepares every canonical statement against the canonical schema rather than only checking that each is inlined here by name: this crate holds the only toolchain that ever loads those files. `tests/objects.rs` checks object naming against `vectors/objects.json` (spec §16), both algorithms, whole and streamed, shard paths included. Both suites, and `conventions`, skip silently without the sibling spec checkout, so the new CI in this repository and in pimdir asserts they ran.
+
+- Made `check` diagnose and `--fix` repair, neither reclaiming.
+
+  `--fix` used to delete orphan blob files behind a `--grace` window and a confirmation prompt, while every write swept with neither. Both flags are gone: it now recomputes the drifted refcounts from the pointers that justify them and clears the bindings whose item is gone, which destroys nothing and needs no guard. Orphan files are reported, and `pimdir gc` takes them.
+
+- Made `item restore` queue rather than fail when the store is owned.
+
+  It appends its action first and takes the owner role only to apply it, so a restore issued while a sync runs reports `queued` and is drained by the owner that holds the store, which is what the queue is for. Purge and `queue cancel` still need the role and still say so.
+
+- Scoped a write to the rows its batch names.
+
+  Folding a batch into a collection loaded, cloned and diffed the whole collection, so the cost of one flag on one message was the size of the mailbox: measured 3.5 ms at a thousand items, 13 ms at four thousand, 59 ms at sixteen thousand, cleanly linear, against a promise of hundreds of thousands. The read is now scoped to the link ids the batch carries, with each dropped handle resolved through the new `bindings_by_handle` index, and the same measurement is flat at 150 to 175 µs across that range.
+
+- Keyed the residual rather than listing it.
+
+  A first sync probes a whole collection before linking any of it, so the list grew to the collection size while every insertion, drop and lookup searched it linearly.
+
+- Made the drain answer its point questions with point reads.
+
+  The `Add` collision check, the handle lookup and the mutation it drives each loaded the whole collection, once per drained action.
+
+- Made `release_pins` one statement rather than one per hash.
+
+  A purge of fifty thousand retained items was a hundred thousand point updates inside one transaction.
+
+- Made the object sweep test `refcount <= 0`, so a count a double release drove negative is collected rather than leaking for ever with nothing reporting it.
+
+- Added the indexes `objects_garbage` (partial, so the sweep stops scanning the whole table on every write transaction), `items_by_seq_global` (the store-global public id the format promises had no store-global index), `bindings_by_handle`, `items_by_conflict_object` and `queue_by_object`.
+
+### Deprecated
+
+- Deprecated `open_read_only` in favour of `PimdirReader`.
+
+### Fixed
+
+- Fixed a queued action the draining source could not place being parked, destroying it for the source that could.
+
+  Staging an existing item's action resolves that item's binding for the draining source, and no binding was answered with a park: `error` set, filtered out by every later drain, cleared by nothing in the crate. The first source to reach an action it could not place therefore made it unappliable for the source that held the item. On a consumer draining once per source, in name order, over one store, that is every action a frontend queues against a collection whose source does not sort first. The spec already said an action the owner cannot apply here is skipped and left pending, never parked, so that is now what happens: the row is left exactly as found, its `attempts` untouched, and counted as `skipped`. Rows already parked stay parked, `queue cancel` remaining the only exit.
+
+- Fixed a trash page sorting the whole trash to return fifty rows.
+
+  `list_retained_page` moved onto the public `seq` (spec §14.1) and `items_retained` did not move with it, so the read could not ride its own index. An existing store is repaired on open: an index whose columns moved is now dropped and recreated, which the ensure batch could not do, `CREATE INDEX IF NOT EXISTS` keying on the name and leaving the old shape in place silently.
+
+- Fixed a process refusing itself the store it had just released.
+
+  The owner lock is the process's and shared across handles, but a strong count reaches zero before the file description it named is closed, so a handle taken in between opened a second description and `flock` refused it against this process's own: `PimdirError::Owned` naming a store nobody else held, on no schedule, which nothing above can act on. The registry owns the description now and closes it as the last handle goes, inside the same critical section the next acquisition takes.
+
+- Fixed a body stored without a placement being destroyed at the end of the batch.
+
+  Every write swept the object rows at refcount zero and unlinked their blobs, so a consumer that streamed bodies into the blob tree and attached them in a later batch, which spec §14 invites and which `STORE_OBJECT` inserting at refcount zero exists for, lost them silently, bytes included, before the batch that would have referenced them ran. No write collects any more; `pimdir gc` does.
+
+- Fixed a body lookup crossing accounts.
+
+  `lookup_objects` resolved a link id against every collection in the store, so two accounts holding the same vCard `UID`, which spec §9.2 names as a thing unrelated servers do, handed each other's bodies across: the receiving sync then believed the item was hydrated and never fetched the real one. It is scoped to the caller's own account now, which is the axis a link id is trustworthy on; across collections it still answers, which is what the read exists for.
+
+- Fixed a base of no revision, no body and unread markers round-tripping as no base at all, so an agreed placement read as never-agreed and the sync re-derived the same push on every run.
+
+  `bindings.base_present` records the fact its three value columns cannot express; those columns stay a witness for rows written before it.
+
+- Fixed an identity a source held twice being stored once, the write that lost the other silent.
+
+  A binding pins one handle, so a source holding one link id twice (a double delivery, a retried append, a restore, a migration, two DAV resources sharing a `UID`) had nowhere to put the second copy: the write repointed the binding at it, and no layer above could afterwards tell the source held the identity twice, while deleting the bound copy propagated a delete that removed the only copy on a source nobody touched. The second copy is an item of its own now, under the key the engine mints for it (spec §9), with its own `seq`, its own binding and its own body; a write that still resolves a stored binding to another handle is refused with `PimdirError::Rebind` rather than applied, and nothing is recorded in its place. The one licensed rebind stays licensed: a handle-space rebuild supersedes the handle it replaces, per handle, so a renumbered collection carries over and a rebuild holding a genuine second copy is still refused for that one.
+
+- Fixed a write carrying a new sort key silently discarding it.
+
+  The diff that decides whether a row needs an `UPDATE` compared every column the statement writes except `sort_key`, so a key that changed and nothing else reported the row unchanged and no statement was issued. A key is derived rather than given, and a connector fixing its derivation, a tzdb update moving a zoned start, or the second source of a two-source sync all restate one; the item stayed where the first derivation put it, for good. The suite missed it because it only covered the other half of the invariant, that a write carrying no key must leave the stored one alone.
+
+- Fixed a descending page hiding every item sorting above its first cursor.
+
+  "No cursor" was expressed as a key no real one could outrank, but a sort key is arbitrary text a writer derives, so no value is reserved and the sentinel was outranked by two of the same character. Such an item was invisible to every descending page, permanently, while the count still reported it. The statement now says what it means, a `NULL` cursor, and keeps the same keyset comparison and the same index.
+
+- Fixed two owners draining one collection applying every action twice.
+
+  The pending rows are read outside any transaction, and the row was deleted at the end of the applying transaction, so a second owner holding the same list re-applied all of it; `add` and `copy` are not idempotent, and the operator CLI opens a second owner handle routinely. The delete is now the first statement of the transaction (`CLAIM_ACTION`, a `DELETE ... RETURNING id`) and a claim that deletes nothing skips the row: exactly-once is a property of the statement rather than a convention about who runs the drain.
+
+- Fixed a blob rename never being made durable.
+
+  The body was written, `fsync`ed and renamed, and the directory entry that carries the name was not synced, while the SQLite commit is. A power loss could leave a committed row pointing at a body that never arrived, which is the one asymmetry the write order exists to prevent.
+
+- Fixed a flag set the store could not decode reading as a known-empty one.
+
+  That is an authoritative "this item carries no markers", which the merge took as one side's opinion: it cleared every marker the other side reported and persisted the result, turning a read failure into permanent loss. It now decodes as unknown, which holds no opinion.
+
+- Fixed `created_at` holding epoch milliseconds where the column is declared to hold an RFC 3339 timestamp, and the empty string when the clock predated the epoch.
+
+  It is written by SQLite itself now, in the form the retirement clock already uses, which also keeps the crate free of a clock.
 
 ## [0.3.0] - 2026-08-24
 
@@ -208,7 +298,8 @@ All notable changes to this project are documented in this file. The format is b
 - Collection generations (spec §15): the handle-space epoch on PimdirCollection and generation(), bumped atomically with a rebuild batch by write_rekeyed().
 - Read-only store open (open_read_only): opens an existing store with SQLITE_OPEN_READ_ONLY, never creates anything, refuses any other schema version, and exposes the full read surface for frontend processes that must be unable to write.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.3.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.4.0..HEAD
+[0.4.0]: https://github.com/pimalaya/io-pimdir/compare/v0.3.0..v0.4.0
 [0.3.0]: https://github.com/pimalaya/io-pimdir/compare/v0.2.0..v0.3.0
 [0.2.0]: https://github.com/pimalaya/io-pimdir/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-pimdir/compare/root..v0.1.0
