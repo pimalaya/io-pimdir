@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a write with no link id filing a second row for a handle already bound to an item.
+
+  A placement carries no link id because its identity has not been read yet, not because it has none, and a handle the store has bound already has one. Such an upsert now resolves through that binding and folds into the item it names; only a handle no binding holds still stages unlinked.
+
+  io-replica writes one on every remote edit that resurrects a locally deleted item, so `load` answered with two placements for one handle, the upgrade read that handle's identity twice, and a `dup:` key was minted for a copy nothing holds. The rebind guard skipped such a placement too, and now sees it.
+
 ## [0.4.0] - 2026-08-31
 
 ### Added

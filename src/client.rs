@@ -5,9 +5,9 @@
 //! [`PimdirStore`] is the store itself (the client reads, retention, the
 //! queue), and [`PimdirSourceStore`], which [`for_source`] yields,
 //! services [`ReplicaStorage`] for one source. A single-source store is
-//! the N=1 case. Freshly probed placements have no link id to key an item
-//! on yet, so they are held in memory as a residual until a `Meta`
-//! upgrade resolves it.
+//! the N=1 case. A freshly probed placement of a handle nothing binds
+//! has no link id to key an item on yet, so it is held in memory as a
+//! residual until a `Meta` upgrade resolves it.
 //!
 //! [`for_source`]: PimdirStore::for_source
 //!
@@ -107,8 +107,10 @@ impl DerefMut for PimdirStore {
 pub struct PimdirSourceStore {
     store: PimdirStore,
     source: ReplicaSourceId,
-    /// Unlinked probed placements, awaiting the `Meta` upgrade that gives
-    /// them a link id; empty at rest between syncs.
+    /// Probed placements of handles no binding holds, awaiting the `Meta`
+    /// upgrade that gives them a link id; empty at rest between syncs. A
+    /// probe of a bound handle is not one of these: it keys onto the item
+    /// that binding names.
     ///
     /// Keyed rather than listed: a first sync probes a whole collection
     /// before linking any of it, so the residual grows to the collection
@@ -1113,21 +1115,12 @@ impl ReplicaStorage for PimdirSourceStore {
             ReplicaLoadScope::Handles(handles) => {
                 let mut links = Vec::new();
                 for handle in handles {
-                    let link = self
-                        .store
-                        .reader
-                        .conn
-                        .query_row(
-                            sql::LINK_FOR_HANDLE,
-                            named_params! {
-                                ":collection": collection.0,
-                                ":source": self.source.0,
-                                ":handle": handle.0,
-                            },
-                            |r| r.get::<_, String>(0),
-                        )
-                        .optional()?;
-                    links.extend(link);
+                    links.extend(link_for_handle(
+                        &self.store.reader.conn,
+                        &collection.0,
+                        &self.source,
+                        handle,
+                    )?);
                 }
                 load_hub_by_link(&self.store.reader.conn, &collection.0, &links)?
             }
@@ -1917,7 +1910,19 @@ fn apply_ops(
                     },
                 )?;
             }
-            ReplicaWriteOp::UpsertPlacement(placement) => {
+            ReplicaWriteOp::UpsertPlacement(mut placement) => {
+                // NOTE: an upsert carrying no link id against a handle a
+                // binding already holds restates that item rather than
+                // announcing a new one: a sync reprobes a resurrected
+                // handle with no identity (io-replica, `pull_add`).
+                // Keying it back onto its binding folds it into the row
+                // the handle is bound to, instead of filing a second row
+                // beside it that `load` would then answer with (§10).
+                if placement.link_id.is_none() {
+                    placement.link_id =
+                        link_for_handle(tx, &placement.collection.0, source, &placement.handle)?
+                            .map(ReplicaLinkId);
+                }
                 if placement.link_id.is_some() {
                     drop_residual(residual, &placement.collection, &placement.handle);
                     hub_ops
@@ -2304,6 +2309,26 @@ fn drop_residual(
     residual.remove(&(collection.clone(), handle.clone()));
 }
 
+/// The link id one source's handle is bound to, if any: the hub is keyed
+/// by link id, so a write or a read naming a handle resolves it first.
+fn link_for_handle(
+    conn: &Connection,
+    collection: &str,
+    source: &ReplicaSourceId,
+    handle: &ReplicaHandle,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        sql::LINK_FOR_HANDLE,
+        named_params! {
+            ":collection": collection,
+            ":source": source.0,
+            ":handle": handle.0,
+        },
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+}
+
 /// Loads a collection's [`ReplicaHub`] (items + per-source bindings + policy).
 fn load_hub(conn: &Connection, collection: &str) -> rusqlite::Result<ReplicaHub> {
     read_hub(conn, collection, None)
@@ -2331,18 +2356,7 @@ fn batch_links(
                 }
             }
             ReplicaWriteOp::DropPlacement { handle, .. } => {
-                let link = conn
-                    .query_row(
-                        sql::LINK_FOR_HANDLE,
-                        named_params! {
-                            ":collection": collection,
-                            ":source": source.0,
-                            ":handle": handle.0,
-                        },
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()?;
-                links.extend(link);
+                links.extend(link_for_handle(conn, collection, source, handle)?);
             }
             _ => {}
         }
