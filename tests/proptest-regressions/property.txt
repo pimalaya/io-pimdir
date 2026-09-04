@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8e052c28016816d52d933da50eef70a1732d784bbf27579f8f6a93ecc01350d6 # shrinks to ops = [LocalCopy(0)]
+cc 0c8d5944d8da0d2ac1bb73cea6b8a07202d955094de5dd8b8161081ccdf7ae12 # shrinks to ops = [ServerAdd(0), BRemove(14797159832294004141), SyncA, ASetFlags(0, Known({})), ASetFlags(0, Known({})), SyncB, AEdit(5888495700507987931, 0)]
+cc 32a00f6c28b6220496d643bf44da68abc457e5992107793d0f5f62cf3c23cd04 # shrinks to ops = [LocalEdit(0, 0), LocalEdit(10987947027689112664, 0), ServerRemove(7376427700743267814), Bump, LocalCopy(1174138712964103490)]

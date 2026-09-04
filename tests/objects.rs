@@ -17,8 +17,8 @@
 
 use std::{fs, path::PathBuf};
 
-use io_pimdir::{PimdirBlobs, hash::PimdirHashAlgo};
-use io_replica::object::ReplicaHash;
+use io_pimdir::object::PimdirHash;
+use io_pimdir::{client::blobs::PimdirBlobs, hash::PimdirHashAlgo};
 use serde_json::Value;
 
 /// The canonical spec checkout, beside this one.
@@ -104,7 +104,7 @@ fn every_body_names_what_the_format_says() {
             // exactly as the vectors write it.
             let blobs = PimdirBlobs::open("", algo);
             assert_eq!(
-                blobs.path(&ReplicaHash(name.0.clone())),
+                blobs.path(&PimdirHash(name.0.clone())),
                 PathBuf::from(expected["path"].as_str().unwrap()),
                 "{label} under {spelling} lands elsewhere",
             );

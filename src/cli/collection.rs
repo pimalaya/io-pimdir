@@ -4,7 +4,7 @@ use std::fmt;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use io_replica::collection::ReplicaCollectionId;
+use io_pimdir::collection::PimdirCollectionId;
 use pimalaya_cli::{
     printer::Printer,
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
@@ -33,10 +33,12 @@ impl CollectionCommand {
 }
 
 /// List every collection: its id, declared media type, display name,
-/// handle-space generation, live item count and retained item count.
+/// handle-space generation, live, probed and retained item counts.
 ///
-/// The retained count is what a delete left behind: those items are hidden from
-/// every read and from the sync, and only `item purge` destroys them.
+/// A probe is a handle a source enumerated whose identity is not read yet, so
+/// no listing can show it. The retained count is what a delete left behind:
+/// hidden from every read and from the sync, and only `item purge` destroys
+/// them.
 #[derive(Debug, Args)]
 pub struct CollectionListCommand;
 
@@ -47,9 +49,10 @@ impl CollectionListCommand {
         let mut rows = Vec::new();
 
         for collection in store.list_collections().map_err(report)? {
-            let id = ReplicaCollectionId(collection.id.clone());
+            let id = PimdirCollectionId(collection.id.clone());
             rows.push(CollectionRow {
                 live: store.count_items(&collection.id).map_err(report)?,
+                probes: store.count_probes(&collection.id).map_err(report)?,
                 retained: store.count_retained(&id).map_err(report)?.max(0) as u64,
                 id: collection.id,
                 kind: collection.kind,
@@ -76,6 +79,8 @@ pub struct CollectionRow {
     pub generation: i64,
     /// Live items.
     pub live: u64,
+    /// Handles enumerated but not yet identified.
+    pub probes: u64,
     /// Retained (soft-deleted) items.
     pub retained: u64,
 }
@@ -101,6 +106,7 @@ impl fmt::Display for CollectionsOutput {
                 Cell::new("NAME"),
                 Cell::new("GEN"),
                 Cell::new("LIVE"),
+                Cell::new("PROBED"),
                 Cell::new("RETAINED"),
             ]);
 
@@ -111,6 +117,7 @@ impl fmt::Display for CollectionsOutput {
                 Cell::new(&row.name),
                 Cell::new(row.generation),
                 Cell::new(row.live),
+                Cell::new(row.probes),
                 Cell::new(row.retained),
             ]);
         }

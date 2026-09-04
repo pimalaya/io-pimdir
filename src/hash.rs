@@ -1,4 +1,6 @@
-//! The content hash naming a body in the object store (spec §5).
+//! # Content hash
+//!
+//! The content hash naming a body in the object store (STORAGE §5).
 //!
 //! An object's name is its hash, so every process touching one store must
 //! compute the same value: a disagreement writes blobs no other reader
@@ -14,8 +16,9 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 
-use io_replica::object::ReplicaHash;
 use sha2::{Digest, Sha256};
+
+use crate::object::PimdirHash;
 
 /// The hash a store names its objects by, as `store_meta.hash_algo`
 /// records it.
@@ -54,7 +57,7 @@ impl PimdirHashAlgo {
     }
 
     /// The content hash of a whole body.
-    pub fn hash(&self, bytes: &[u8]) -> ReplicaHash {
+    pub fn hash(&self, bytes: &[u8]) -> PimdirHash {
         let mut hasher = self.hasher();
         hasher.update(bytes);
         hasher.finish()
@@ -94,13 +97,13 @@ impl PimdirHasher {
     }
 
     /// The finished hash, as the object store names it.
-    pub fn finish(self) -> ReplicaHash {
+    pub fn finish(self) -> PimdirHash {
         let digest: Vec<u8> = match self {
             Self::Blake3(hasher) => hasher.finalize().as_bytes().to_vec(),
             Self::Sha256_128(hasher) => hasher.finalize()[..16].to_vec(),
         };
 
-        ReplicaHash(base32(&digest))
+        PimdirHash(base32(&digest))
     }
 }
 

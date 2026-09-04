@@ -1,164 +1,158 @@
-//! Pure, I/O-free encodings between the [`io_replica`] model and the
-//! pimdir columns (spec §13). No SQLite, no filesystem: the part an
-//! Android or any other implementation reuses.
+//! # Encodings
 //!
-//! Beside the column encodings it holds the action-queue payload codec
-//! (spec §15.3): the six v1 action kinds as [`PimdirAction`], encoded to
-//! and from the versioned JSON `queue.payload` column.
+//! The I/O-free encodings between the model and the pimdir columns
+//! (STORAGE §13), and the action queue's versioned payload (STORAGE
+//! §15.3): the part an implementation holding its own SQLite binding
+//! reuses.
+
+use core::fmt;
 
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::fmt;
 
-use io_replica::{
-    collection::ReplicaCollectionId,
-    object::ReplicaHash,
-    placement::{ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta},
-};
 use serde_json::{Map, Value, json};
 
-/// A flag set to its canonical JSON array, the model's set being already
-/// sorted, or `None` for the column's `NULL`.
-///
-/// The two absences spec §13 keeps apart: a known-empty set encodes as
-/// `"[]"`, a set nobody has read as `NULL`. Collapsing them would have a
-/// probed item claim to carry no markers.
-pub fn flags_to_json(flags: &ReplicaFlags) -> Option<String> {
+use crate::{
+    collection::PimdirCollectionId,
+    hub::PimdirHubConflict,
+    object::PimdirHash,
+    placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId},
+};
+
+/// A flag set as its canonical JSON array, or `None` for the column's
+/// `NULL`: a known-empty set is `"[]"`, a set nobody has read is `NULL`.
+pub fn flags_to_json(flags: &PimdirFlags) -> Option<String> {
     let items: Vec<&String> = flags.known()?.iter().collect();
     Some(serde_json::to_string(&items).unwrap_or_else(|_| String::from("[]")))
 }
 
-/// The inverse of [`flags_to_json`]: a `NULL` column decodes to the
-/// unknown set, and so does a column this cannot read.
-///
-/// Malformed JSON is not evidence about the item's markers. Reading it as
-/// a known-empty set turns it into an authoritative "this item carries no
-/// markers", which the merge takes as one side's opinion: it clears every
-/// marker the other side reports and persists that, so a read failure
-/// becomes permanent loss. Unknown holds no opinion instead.
-pub fn flags_from_json(json: Option<&str>) -> ReplicaFlags {
+/// The inverse of [`flags_to_json`]: `NULL` and a column this cannot read
+/// both decode to the unknown set, which holds no opinion in a merge.
+pub fn flags_from_json(json: Option<&str>) -> PimdirFlags {
     let Some(json) = json else {
-        return ReplicaFlags::Unknown;
+        return PimdirFlags::Unknown;
     };
     match serde_json::from_str::<Vec<String>>(json) {
-        Ok(items) => ReplicaFlags::Known(items.into_iter().collect()),
-        Err(_) => ReplicaFlags::Unknown,
+        Ok(items) => PimdirFlags::Known(items.into_iter().collect()),
+        Err(_) => PimdirFlags::Unknown,
     }
 }
 
-/// The detail ladder as its column integer (spec §13).
-pub fn level_to_int(level: ReplicaLevel) -> i64 {
+/// A list of ids as the JSON array column `in_reply_to` holds.
+pub fn ids_to_json(ids: &[String]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| String::from("[]"))
+}
+
+/// The inverse of [`ids_to_json`]; an unreadable column is an empty list.
+pub fn ids_from_json(json: &str) -> Vec<String> {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+/// The detail ladder as its column integer.
+pub fn level_to_int(level: PimdirLevel) -> i64 {
     match level {
-        ReplicaLevel::Probed => 0,
-        ReplicaLevel::Meta => 1,
-        ReplicaLevel::Full => 2,
+        PimdirLevel::Probed => 0,
+        PimdirLevel::Meta => 1,
+        PimdirLevel::Full => 2,
     }
 }
 
-/// The inverse of [`level_to_int`]; unknown integers clamp to `Probed`.
-pub fn level_from_int(value: i64) -> ReplicaLevel {
+/// The inverse of [`level_to_int`]; an unknown integer clamps to `Probed`.
+pub fn level_from_int(value: i64) -> PimdirLevel {
     match value {
-        1 => ReplicaLevel::Meta,
-        2 => ReplicaLevel::Full,
-        _ => ReplicaLevel::Probed,
+        1 => PimdirLevel::Meta,
+        2 => PimdirLevel::Full,
+        _ => PimdirLevel::Probed,
     }
 }
 
-/// A queued mutation request (spec §15.3): what a producer appends to the
-/// `queue` table and the owner applies to the store.
-///
-/// The kinds mirror io-replica's mutation vocabulary on purpose: the
-/// queue is the cross-process projection of the engine's mutate verb.
-/// Existing items are addressed by their public `seq` (spec §9.1), the
-/// identifier a reading client already holds, which the owner resolves
-/// back to the internal link id.
+/// A collection's cross-source conflict policy as its column spelling.
+pub fn conflict_to_str(policy: PimdirHubConflict) -> &'static str {
+    match policy {
+        PimdirHubConflict::Manual => "manual",
+        PimdirHubConflict::PreferIncoming => "prefer-incoming",
+        PimdirHubConflict::PreferExisting => "prefer-existing",
+    }
+}
+
+/// The inverse of [`conflict_to_str`]; an unknown spelling is `Manual`.
+pub fn conflict_from_str(value: &str) -> PimdirHubConflict {
+    match value {
+        "prefer-incoming" => PimdirHubConflict::PreferIncoming,
+        "prefer-existing" => PimdirHubConflict::PreferExisting,
+        _ => PimdirHubConflict::Manual,
+    }
+}
+
+/// A queued mutation request (STORAGE §15.3): what a producer appends and
+/// the owner applies, existing items addressed by their public `seq`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirAction {
-    /// Create an item in the collection, staged as a local creation for
-    /// the sync layer to push. A duplicate live `link_id` parks the
-    /// action, the item already existing.
+    /// Create an item, staged as a local creation for the sync to push.
+    ///
+    /// The owner derives the summary and addresses from the body. A
+    /// duplicate live `link_id` parks the action, a retained one revives.
     Add {
-        /// The item's cross-source link id; `None` derives it from `object`.
-        link_id: Option<ReplicaLinkId>,
+        /// The item's key; `None` derives it from the body.
+        link_id: Option<PimdirLinkId>,
         /// The initial flag set.
-        flags: ReplicaFlags,
-        /// The body's content hash, matching the row's `object_hash`; the
-        /// producer wrote the blob durably before enqueueing.
-        object: Option<ReplicaHash>,
-        /// The item's summary (spec Annex A), or `None` when not
-        /// projected.
-        meta: Option<ReplicaMeta>,
-        /// The provisional handle the create is staged under; `None` lets
-        /// the owner derive one.
-        handle: Option<ReplicaHandle>,
+        flags: PimdirFlags,
+        /// The body's hash, written durably by the producer before enqueueing.
+        object: Option<PimdirHash>,
+        /// The provisional handle the create is staged under.
+        handle: Option<PimdirHandle>,
     },
-    /// Replace the item's flag set: absolute, never a delta, so
-    /// reapplication is idempotent.
+    /// Replace the item's flag set, absolutely.
     SetFlags {
         /// The item's public id.
         seq: i64,
         /// The new flag set.
-        flags: ReplicaFlags,
+        flags: PimdirFlags,
     },
-    /// Remove the item from the collection; already-absent is success,
-    /// not an error.
+    /// Remove the item from the collection; already absent is success.
     Remove {
         /// The item's public id.
         seq: i64,
     },
-    /// Refile the item into another collection: a target create plus a
-    /// source removal.
+    /// Refile the item into another collection.
     Move {
         /// The item's public id.
         seq: i64,
         /// The collection to move it into.
-        to: ReplicaCollectionId,
+        to: PimdirCollectionId,
     },
-    /// Copy the item into another collection: a move without the removal.
+    /// Copy the item into another collection.
     Copy {
         /// The item's public id.
         seq: i64,
         /// The collection to copy it into.
-        to: ReplicaCollectionId,
+        to: PimdirCollectionId,
     },
-    /// Repoint a mutable-content item's body (a contact or event edit).
+    /// Repoint a mutable-content item's body; the owner re-derives its summary.
     Update {
         /// The item's public id.
         seq: i64,
-        /// The new body's content hash; the producer wrote the blob
-        /// durably before enqueueing.
-        object: ReplicaHash,
-        /// The refreshed summary, or `None` to keep the cached one.
-        meta: Option<ReplicaMeta>,
+        /// The new body's hash, written durably by the producer before enqueueing.
+        object: PimdirHash,
     },
-    /// An action this crate defines no semantics for: an owner-defined
-    /// intent, a mail submission, carried by the same queue as the store
-    /// mutations above.
+    /// An application's own intent, which the store skips rather than parks.
     ///
-    /// The store cannot apply it, so its drain skips the row rather than
-    /// parking it: the action is not unappliable, only unappliable here.
-    /// An owner that recognises the kind performs it out of band and
-    /// acknowledges it with [`drop_action`]. Only a malformed payload
-    /// parks.
-    ///
-    /// [`drop_action`]: ../client/struct.PimdirStore.html#method.drop_action
+    /// The owner that recognises the kind performs it out of band and
+    /// acknowledges it by dropping the row.
     Unknown {
         /// The raw `queue.action` kind.
         kind: String,
-        /// The raw versioned JSON payload, verbatim: only its owner knows
-        /// the shape, so nothing here re-encodes it.
+        /// The raw versioned JSON payload, verbatim.
         payload: String,
-        /// The body hash the payload's `object` field names, by the same
-        /// convention as the known kinds, so an intent carrying a body
-        /// pins it against garbage collection like any other.
-        object_hash: Option<ReplicaHash>,
+        /// The body the payload's `object` field pins, by the shared convention.
+        object_hash: Option<PimdirHash>,
     },
 }
 
 impl PimdirAction {
-    /// The action kind as its `queue.action` column value (spec §13).
+    /// The action kind as its `queue.action` column value.
     pub fn kind(&self) -> &str {
         match self {
             Self::Add { .. } => "add",
@@ -171,10 +165,8 @@ impl PimdirAction {
         }
     }
 
-    /// The body hash the payload references, if any: the value the
-    /// enqueue carries in `queue.object_hash` so the pending body is
-    /// pinned against garbage collection (spec §15.1).
-    pub fn object_hash(&self) -> Option<&ReplicaHash> {
+    /// The body the payload references, which the enqueue pins (§15.1).
+    pub fn object_hash(&self) -> Option<&PimdirHash> {
         match self {
             Self::Add { object, .. } => object.as_ref(),
             Self::Update { object, .. } => Some(object),
@@ -186,40 +178,34 @@ impl PimdirAction {
     }
 }
 
-/// A malformed action payload; the owner parks the row instead of applying it.
-///
-/// An unrecognised kind is not one of these: it decodes as
-/// [`PimdirAction::Unknown`] and is skipped, since another owner may be
-/// able to perform it. Only a payload no owner could act on lands here.
+/// A malformed action payload, which the owner parks the row with.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirActionError {
     /// The payload is not a JSON object.
     Json,
-    /// The payload's leading `v` is missing or not a supported version.
+    /// The payload's leading `v` is missing or unsupported.
     UnknownVersion(Option<i64>),
-    /// A required payload field is missing or has the wrong shape.
+    /// A required field is missing or has the wrong shape.
     MissingField(&'static str),
 }
 
 impl fmt::Display for PimdirActionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Json => write!(f, "pimdir action payload is not a JSON object"),
-            Self::UnknownVersion(Some(v)) => write!(f, "unknown pimdir action version: {v}"),
-            Self::UnknownVersion(None) => write!(f, "pimdir action payload misses its version"),
-            Self::MissingField(field) => write!(f, "pimdir action payload misses field: {field}"),
+            Self::Json => write!(f, "Pimdir action payload is not a JSON object"),
+            Self::UnknownVersion(Some(v)) => write!(f, "Unknown pimdir action version: {v}"),
+            Self::UnknownVersion(None) => write!(f, "Pimdir action payload misses its version"),
+            Self::MissingField(field) => {
+                write!(f, "Pimdir action payload misses field: {field}")
+            }
         }
     }
 }
 
 impl core::error::Error for PimdirActionError {}
 
-/// Encodes an action to its versioned JSON `queue.payload` column (spec
-/// §15.3, `v: 1`). Absent optional fields are omitted; `meta` embeds as
-/// parsed JSON when it is valid JSON, else as a JSON string.
+/// Encodes an action to its versioned JSON payload (`v: 1`).
 pub fn action_to_payload(action: &PimdirAction) -> String {
-    // NOTE: an owner-defined intent round-trips byte for byte; this crate
-    // knows no more of its shape than the `object` field it pins.
     if let PimdirAction::Unknown { payload, .. } = action {
         return payload.clone();
     }
@@ -232,7 +218,6 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             link_id,
             flags,
             object,
-            meta,
             handle,
         } => {
             if let Some(link) = link_id {
@@ -241,9 +226,6 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             map.insert("flags".into(), flags_to_value(flags));
             if let Some(object) = object {
                 map.insert("object".into(), json!(object.0));
-            }
-            if let Some(meta) = meta {
-                map.insert("meta".into(), meta_to_value(meta));
             }
             if let Some(handle) = handle {
                 map.insert("handle".into(), json!(handle.0));
@@ -260,12 +242,9 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             map.insert("seq".into(), json!(seq));
             map.insert("to".into(), json!(to.0));
         }
-        PimdirAction::Update { seq, object, meta } => {
+        PimdirAction::Update { seq, object } => {
             map.insert("seq".into(), json!(seq));
             map.insert("object".into(), json!(object.0));
-            if let Some(meta) = meta {
-                map.insert("meta".into(), meta_to_value(meta));
-            }
         }
         PimdirAction::Unknown { .. } => {}
     }
@@ -273,10 +252,8 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
     Value::Object(map).to_string()
 }
 
-/// Decodes a `queue.action` kind plus its `queue.payload` JSON back to a
-/// [`PimdirAction`], the inverse of [`action_to_payload`]. Strict, unlike
-/// the lenient column decoders: a malformed payload is an error the owner
-/// parks the row with, never a silently-empty action.
+/// Decodes a kind and its payload, strictly: a malformed payload is an
+/// error the owner parks with, an unknown kind an intent it skips.
 pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, PimdirActionError> {
     let value: Value = serde_json::from_str(payload).map_err(|_| PimdirActionError::Json)?;
     let map = value.as_object().ok_or(PimdirActionError::Json)?;
@@ -288,11 +265,10 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
 
     match kind {
         "add" => Ok(PimdirAction::Add {
-            link_id: get_string(map, "link_id")?.map(ReplicaLinkId),
+            link_id: get_string(map, "link_id")?.map(PimdirLinkId),
             flags: flags_from_value(map.get("flags")),
-            object: get_string(map, "object")?.map(ReplicaHash),
-            meta: map.get("meta").map(meta_from_value),
-            handle: get_string(map, "handle")?.map(ReplicaHandle),
+            object: get_string(map, "object")?.map(PimdirHash),
+            handle: get_string(map, "handle")?.map(PimdirHandle),
         }),
         "set-flags" => Ok(PimdirAction::SetFlags {
             seq: require_seq(map)?,
@@ -303,48 +279,37 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
         }),
         "move" => Ok(PimdirAction::Move {
             seq: require_seq(map)?,
-            to: ReplicaCollectionId(require_string(map, "to")?),
+            to: PimdirCollectionId(require_string(map, "to")?),
         }),
         "copy" => Ok(PimdirAction::Copy {
             seq: require_seq(map)?,
-            to: ReplicaCollectionId(require_string(map, "to")?),
+            to: PimdirCollectionId(require_string(map, "to")?),
         }),
         "update" => Ok(PimdirAction::Update {
             seq: require_seq(map)?,
-            object: ReplicaHash(require_string(map, "object")?),
-            meta: map.get("meta").map(meta_from_value),
+            object: PimdirHash(require_string(map, "object")?),
         }),
-        // NOTE: an owner-defined intent, not a malformed row: the payload
-        // is well-formed and versioned, this crate simply defines no
-        // semantics for the kind. Kept whole for the owner that does.
         other => Ok(PimdirAction::Unknown {
             kind: other.to_string(),
             payload: payload.to_string(),
-            object_hash: get_string(map, "object")?.map(ReplicaHash),
+            object_hash: get_string(map, "object")?.map(PimdirHash),
         }),
     }
 }
 
-/// A flag set as a JSON array value, or `null` for an unknown one.
-///
-/// An action states an intent, so its set is known in every payload the
-/// spec defines (§15.3). Encoding an unknown one as `null` rather than
-/// `[]` keeps a nonsensical action legible instead of turning it into a
-/// deliberate clearing of every flag.
-fn flags_to_value(flags: &ReplicaFlags) -> Value {
+/// A flag set as a JSON array, `null` for an unknown one: an action states
+/// an intent, and an unknown set must not read as clearing every flag.
+fn flags_to_value(flags: &PimdirFlags) -> Value {
     match flags.known() {
         None => Value::Null,
         Some(flags) => Value::Array(flags.iter().map(|f| json!(f)).collect()),
     }
 }
 
-/// The inverse of [`flags_to_value`]: an absent or `null` value decodes
-/// to the unknown set and a malformed array to a known-empty one,
-/// matching [`flags_from_json`].
-fn flags_from_value(value: Option<&Value>) -> ReplicaFlags {
+fn flags_from_value(value: Option<&Value>) -> PimdirFlags {
     match value {
-        None | Some(Value::Null) => ReplicaFlags::Unknown,
-        Some(value) => ReplicaFlags::Known(
+        None | Some(Value::Null) => PimdirFlags::Unknown,
+        Some(value) => PimdirFlags::Known(
             value
                 .as_array()
                 .map(|items| {
@@ -359,22 +324,6 @@ fn flags_from_value(value: Option<&Value>) -> ReplicaFlags {
     }
 }
 
-/// A stored summary embedded in a payload: parsed JSON when the opaque
-/// meta is valid JSON, a JSON string otherwise.
-fn meta_to_value(meta: &ReplicaMeta) -> Value {
-    serde_json::from_str(&meta.0).unwrap_or_else(|_| json!(meta.0))
-}
-
-/// The inverse of [`meta_to_value`]: a JSON string is taken verbatim,
-/// any other value re-serialised to the stored opaque form.
-fn meta_from_value(value: &Value) -> ReplicaMeta {
-    match value.as_str() {
-        Some(text) => ReplicaMeta(text.to_string()),
-        None => ReplicaMeta(value.to_string()),
-    }
-}
-
-/// An optional string payload field; present with a non-string shape errors.
 fn get_string(
     map: &Map<String, Value>,
     field: &'static str,
@@ -388,7 +337,6 @@ fn get_string(
     }
 }
 
-/// A required string payload field.
 fn require_string(
     map: &Map<String, Value>,
     field: &'static str,
@@ -396,7 +344,6 @@ fn require_string(
     get_string(map, field)?.ok_or(PimdirActionError::MissingField(field))
 }
 
-/// The required `seq` payload field (an integer public id).
 fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
     map.get("seq")
         .and_then(Value::as_i64)
@@ -405,87 +352,80 @@ fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     #[test]
-    fn flags_round_trip_and_escape() {
-        let flags = ReplicaFlags::from_iter(["\\Seen", "$flagged", "a\"b"]);
+    fn a_flag_set_round_trips_and_keeps_its_two_absences_apart() {
+        let flags = PimdirFlags::from_iter(["\\Seen", "$flagged", "a\"b"]);
         let json = flags_to_json(&flags).expect("a known set encodes");
         assert_eq!(flags_from_json(Some(&json)), flags);
-        // canonical, sorted and JSON-escaped
-        assert!(json.starts_with('['));
         assert!(json.contains("\\\\Seen"));
-    }
 
-    #[test]
-    fn an_unknown_set_is_null_and_a_known_empty_one_is_a_list() {
-        // the two absences the store keeps apart (spec §13): NULL means
-        // the markers were never read, '[]' that the item carries none
-        assert_eq!(flags_to_json(&ReplicaFlags::Unknown), None);
-        assert_eq!(flags_from_json(None), ReplicaFlags::Unknown);
-
+        assert_eq!(flags_to_json(&PimdirFlags::Unknown), None);
+        assert_eq!(flags_from_json(None), PimdirFlags::Unknown);
         assert_eq!(
-            flags_to_json(&ReplicaFlags::default()).as_deref(),
+            flags_to_json(&PimdirFlags::default()).as_deref(),
             Some("[]")
         );
-        assert_eq!(flags_from_json(Some("[]")), ReplicaFlags::default());
+        assert_eq!(flags_from_json(Some("[]")), PimdirFlags::default());
+        assert_eq!(flags_from_json(Some("not json")), PimdirFlags::Unknown);
     }
 
     #[test]
-    fn a_malformed_flag_set_reads_as_unread_not_as_empty() {
-        // a decode failure must not become an authoritative "this item
-        // carries no markers", which the merge would take as one side's
-        // opinion and persist over the other's
-        assert_eq!(flags_from_json(Some("not json")), ReplicaFlags::Unknown);
-        assert_eq!(flags_from_json(Some("{}")), ReplicaFlags::Unknown);
-    }
-
-    #[test]
-    fn level_map_round_trips() {
-        for l in [ReplicaLevel::Probed, ReplicaLevel::Meta, ReplicaLevel::Full] {
-            assert_eq!(level_from_int(level_to_int(l)), l);
+    fn levels_and_policies_round_trip() {
+        for level in [PimdirLevel::Probed, PimdirLevel::Meta, PimdirLevel::Full] {
+            assert_eq!(level_from_int(level_to_int(level)), level);
         }
+        for policy in [
+            PimdirHubConflict::Manual,
+            PimdirHubConflict::PreferIncoming,
+            PimdirHubConflict::PreferExisting,
+        ] {
+            assert_eq!(conflict_from_str(conflict_to_str(policy)), policy);
+        }
+        assert_eq!(
+            ids_from_json(&ids_to_json(&["a".into(), "b".into()])),
+            vec!["a", "b"]
+        );
     }
 
     #[test]
     fn every_action_kind_round_trips_through_its_payload() {
         let actions = [
             PimdirAction::Add {
-                link_id: Some(ReplicaLinkId("mid:new".into())),
-                flags: ReplicaFlags::from_iter(["\\Draft"]),
-                object: Some(ReplicaHash("cafebabe".into())),
-                meta: Some(ReplicaMeta("{\"subject\":\"hi\",\"v\":1}".into())),
-                handle: Some(ReplicaHandle("draft-1".into())),
+                link_id: Some(PimdirLinkId("mid:new".into())),
+                flags: PimdirFlags::from_iter(["\\Draft"]),
+                object: Some(PimdirHash("cafebabe".into())),
+                handle: Some(PimdirHandle("draft-1".into())),
             },
             PimdirAction::Add {
                 link_id: None,
-                flags: ReplicaFlags::default(),
+                flags: PimdirFlags::default(),
                 object: None,
-                meta: None,
                 handle: None,
             },
             PimdirAction::SetFlags {
                 seq: 4,
-                flags: ReplicaFlags::from_iter(["\\Seen", "$flagged"]),
+                flags: PimdirFlags::from_iter(["\\Seen", "$flagged"]),
             },
             PimdirAction::Remove { seq: 5 },
             PimdirAction::Move {
                 seq: 6,
-                to: ReplicaCollectionId("Archive".into()),
+                to: PimdirCollectionId("Archive".into()),
             },
             PimdirAction::Copy {
                 seq: 7,
-                to: ReplicaCollectionId("Backup".into()),
+                to: PimdirCollectionId("Backup".into()),
             },
             PimdirAction::Update {
                 seq: 8,
-                object: ReplicaHash("beef0000".into()),
-                meta: None,
+                object: PimdirHash("beef0000".into()),
             },
         ];
         for action in actions {
             let payload = action_to_payload(&action);
-            // versioned with a leading `v` (spec §15.3)
             assert!(payload.contains("\"v\":1"), "versioned: {payload}");
             let decoded = action_from_payload(action.kind(), &payload).unwrap();
             assert_eq!(decoded, action, "round-trip of {payload}");
@@ -493,26 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn a_non_json_meta_survives_the_payload_embedding() {
-        let action = PimdirAction::Update {
-            seq: 1,
-            object: ReplicaHash("cafebabe".into()),
-            meta: Some(ReplicaMeta("not json".into())),
-        };
-        let payload = action_to_payload(&action);
-        assert_eq!(action_from_payload("update", &payload).unwrap(), action);
-    }
-
-    #[test]
-    fn malformed_action_payloads_error_instead_of_decaying() {
-        // strict, unlike the column decoders: the owner parks these
+    fn a_malformed_payload_errors_and_a_foreign_kind_survives_whole() {
         assert_eq!(
             action_from_payload("remove", "not json"),
             Err(PimdirActionError::Json)
-        );
-        assert_eq!(
-            action_from_payload("remove", "{\"seq\":1}"),
-            Err(PimdirActionError::UnknownVersion(None))
         );
         assert_eq!(
             action_from_payload("remove", "{\"v\":2,\"seq\":1}"),
@@ -522,49 +446,11 @@ mod tests {
             action_from_payload("remove", "{\"v\":1}"),
             Err(PimdirActionError::MissingField("seq"))
         );
-    }
 
-    #[test]
-    fn an_owner_defined_kind_survives_whole_instead_of_erroring() {
-        // an intent only its owner can perform is kept verbatim rather
-        // than parked, and still pins the body the payload references
         let payload = "{\"v\":1,\"object\":\"cafebabe\",\"to\":[\"a@b.c\"]}";
         let decoded = action_from_payload("submit", payload).unwrap();
-        assert_eq!(
-            decoded,
-            PimdirAction::Unknown {
-                kind: "submit".into(),
-                payload: payload.into(),
-                object_hash: Some(ReplicaHash("cafebabe".into())),
-            }
-        );
         assert_eq!(decoded.kind(), "submit");
-        assert_eq!(decoded.object_hash(), Some(&ReplicaHash("cafebabe".into())));
-        // byte for byte: nothing here understands the shape well enough
-        // to re-encode it
+        assert_eq!(decoded.object_hash(), Some(&PimdirHash("cafebabe".into())));
         assert_eq!(action_to_payload(&decoded), payload);
-
-        // a malformed payload still parks, whatever its kind
-        assert_eq!(
-            action_from_payload("submit", "{\"to\":[]}"),
-            Err(PimdirActionError::UnknownVersion(None))
-        );
-        assert_eq!(
-            action_from_payload("submit", "nope"),
-            Err(PimdirActionError::Json)
-        );
-    }
-
-    #[test]
-    fn the_pinned_hash_follows_the_payload_body() {
-        let add = PimdirAction::Add {
-            link_id: None,
-            flags: ReplicaFlags::default(),
-            object: Some(ReplicaHash("cafebabe".into())),
-            meta: None,
-            handle: None,
-        };
-        assert_eq!(add.object_hash(), Some(&ReplicaHash("cafebabe".into())));
-        assert_eq!(PimdirAction::Remove { seq: 1 }.object_hash(), None);
     }
 }

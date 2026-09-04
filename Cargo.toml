@@ -1,13 +1,13 @@
 [package]
 name = "io-pimdir"
-description = "Rust implementation of Pimdir standard"
+description = "Rust implementation of the Pimdir standard: the store and the sync engine"
 version = "0.4.1"
 authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
 rust-version = "1.87"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 categories = ["api-bindings", "command-line-utilities", "database", "no-std"]
-keywords = ["pimdir", "sqlite", "storage", "no-std", "io-free"]
+keywords = ["pimdir", "sqlite", "sync", "no-std", "io-free"]
 homepage = "https://pimalaya.org"
 documentation = "https://docs.rs/io-pimdir/latest/io_pimdir"
 repository = "https://github.com/pimalaya/io-pimdir"
@@ -19,7 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["client"]
 client = ["dep:fs4", "dep:rusqlite"]
-cli = ["client", "dep:anyhow", "dep:clap", "dep:humantime", "dep:log", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
+cli = ["client", "dep:anyhow", "dep:clap", "dep:humantime", "pimalaya-cli/prompt", "pimalaya-cli/table", "pimalaya-cli/terminal"]
 
 [profile.release]
 lto = "fat"
@@ -44,11 +44,10 @@ tempfile = { version = "3", default-features = false }
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"], optional = true }
 blake3 = { version = "1", default-features = false }
-clap = { version = "4.4", features = ["derive", "wrap_help"], optional = true }
+clap = { version = "4.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "wrap_help"], optional = true }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
-humantime = { version = "2.2", optional = true }
-io-replica = "0.5"
-log = { version = "0.4", default-features = false, optional = true }
+humantime = { version = "2.2", default-features = false, optional = true }
+log = { version = "0.4", default-features = false }
 pimalaya-cli = { version = "0.2", default-features = false, optional = true }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"], optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

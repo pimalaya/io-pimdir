@@ -7,39 +7,41 @@
 //! own writes reaches the same rows, and a rebuilt handle space resolves
 //! two placements to one key without minting anything.
 
-use io_pimdir::{PimdirError, PimdirReader, PimdirSourceStore, PimdirStore};
-use io_replica::{
-    change::{ReplicaDropReason, ReplicaWriteOp},
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::{
+    change::{PimdirDropReason, PimdirWriteOp},
+    collection::PimdirCollectionId,
+    load::PimdirLoadScope,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
-    storage::ReplicaLoadScope,
+};
+use io_pimdir::{
+    client::reader::PimdirReader,
+    client::{PimdirError, PimdirSourceStore, PimdirStore},
 };
 use tempfile::tempdir;
 
-fn inbox() -> ReplicaCollectionId {
-    ReplicaCollectionId("INBOX".into())
+fn inbox() -> PimdirCollectionId {
+    PimdirCollectionId("INBOX".into())
 }
 
-fn placement(handle: &str, link: &str) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn placement(handle: &str, link: &str) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
         object: None,
-        level: ReplicaLevel::Meta,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        level: PimdirLevel::Meta,
+        summary: None,
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: None,
             object: None,
         }),
@@ -49,31 +51,31 @@ fn placement(handle: &str, link: &str) -> ReplicaPlacement {
 
 /// The same placement hydrated on `hash`, so two copies can be checked to
 /// share one object or to hold one each.
-fn hydrated(handle: &str, link: &str, hash: &str) -> ReplicaPlacement {
+fn hydrated(handle: &str, link: &str, hash: &str) -> PimdirPlacement {
     let mut placement = placement(handle, link);
-    placement.level = ReplicaLevel::Full;
-    placement.object = Some(ReplicaHash(hash.into()));
-    placement.base = Some(ReplicaBase {
-        flags: ReplicaFlags::default(),
+    placement.level = PimdirLevel::Full;
+    placement.object = Some(PimdirHash(hash.into()));
+    placement.base = Some(PimdirBase {
+        flags: PimdirFlags::default(),
         revision: None,
-        object: Some(ReplicaHash(hash.into())),
+        object: Some(PimdirHash(hash.into())),
     });
     placement
 }
 
-fn store_object(hash: &str, body: &[u8]) -> ReplicaWriteOp {
-    ReplicaWriteOp::StoreObject {
-        object: ReplicaObject {
-            hash: ReplicaHash(hash.into()),
+fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
+    PimdirWriteOp::StoreObject {
+        object: PimdirObject {
+            hash: PimdirHash(hash.into()),
             size: body.len(),
         },
         body: Some(body.to_vec()),
     }
 }
 
-fn projected(store: &PimdirSourceStore) -> Vec<ReplicaPlacement> {
+fn projected(store: &PimdirSourceStore) -> Vec<PimdirPlacement> {
     let mut placements = store
-        .load(&inbox(), &ReplicaLoadScope::All)
+        .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
     placements.sort_by(|a, b| a.link_id.cmp(&b.link_id));
@@ -94,13 +96,13 @@ fn a_colliding_write_is_refused_and_stores_nothing() {
     let mut store = opened(dir.path());
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "u1", "msg-a",
         ))])
         .unwrap();
 
     let refused = store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "u2", "msg-a",
         ))])
         .unwrap_err();
@@ -126,7 +128,7 @@ fn a_colliding_write_is_refused_and_stores_nothing() {
 
     let placements = projected(&store);
     assert_eq!(placements.len(), 1, "and nothing of it is stored");
-    assert_eq!(placements[0].handle, ReplicaHandle("u1".into()));
+    assert_eq!(placements[0].handle, PimdirHandle("u1".into()));
 }
 
 /// A minted key is an ordinary key: the two copies are two items, with
@@ -140,8 +142,8 @@ fn two_resources_under_one_hint_are_two_items() {
         .write(vec![
             store_object("cafebabe", b"first"),
             store_object("deadbeef", b"second"),
-            ReplicaWriteOp::UpsertPlacement(hydrated("u1", "msg-a", "cafebabe")),
-            ReplicaWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "deadbeef")),
+            PimdirWriteOp::UpsertPlacement(hydrated("u1", "msg-a", "cafebabe")),
+            PimdirWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "deadbeef")),
         ])
         .unwrap();
 
@@ -149,12 +151,12 @@ fn two_resources_under_one_hint_are_two_items() {
     assert_eq!(placements.len(), 2);
     assert_eq!(
         placements[0].link_id,
-        Some(ReplicaLinkId("dup:msg-a#u2".into()))
+        Some(PimdirLinkId("dup:msg-a#u2".into()))
     );
-    assert_eq!(placements[0].handle, ReplicaHandle("u2".into()));
-    assert_eq!(placements[0].object, Some(ReplicaHash("deadbeef".into())));
-    assert_eq!(placements[1].link_id, Some(ReplicaLinkId("msg-a".into())));
-    assert_eq!(placements[1].object, Some(ReplicaHash("cafebabe".into())));
+    assert_eq!(placements[0].handle, PimdirHandle("u2".into()));
+    assert_eq!(placements[0].object, Some(PimdirHash("deadbeef".into())));
+    assert_eq!(placements[1].link_id, Some(PimdirLinkId("msg-a".into())));
+    assert_eq!(placements[1].object, Some(PimdirHash("cafebabe".into())));
 
     let read = PimdirReader::open(dir.path()).unwrap();
     let bare = read.seq_for_link("INBOX", "msg-a").unwrap().unwrap();
@@ -180,8 +182,8 @@ fn a_byte_identical_pair_shares_one_object() {
     store
         .write(vec![
             store_object("cafebabe", b"same"),
-            ReplicaWriteOp::UpsertPlacement(hydrated("u1", "msg-a", "cafebabe")),
-            ReplicaWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "cafebabe")),
+            PimdirWriteOp::UpsertPlacement(hydrated("u1", "msg-a", "cafebabe")),
+            PimdirWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "cafebabe")),
         ])
         .unwrap();
 
@@ -207,32 +209,32 @@ fn a_minted_key_round_trips_through_retention_and_revival() {
     store
         .write(vec![
             store_object("cafebabe", b"body"),
-            ReplicaWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "cafebabe")),
+            PimdirWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "cafebabe")),
         ])
         .unwrap();
 
     let paged = store.list_items("INBOX", None, 10).unwrap();
     assert_eq!(paged.len(), 1);
-    assert_eq!(paged[0].link_id, ReplicaLinkId("dup:msg-a#u2".into()));
+    assert_eq!(paged[0].link_id, PimdirLinkId("dup:msg-a#u2".into()));
 
     // the source drops it: the row is retained rather than deleted, under
     // the same key
     store
-        .write(vec![ReplicaWriteOp::DropPlacement {
+        .write(vec![PimdirWriteOp::DropPlacement {
             collection: inbox(),
-            handle: ReplicaHandle("u2".into()),
-            reason: ReplicaDropReason::Deleted,
+            handle: PimdirHandle("u2".into()),
+            reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
     let retained = store.list_retained(&inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].link_id, ReplicaLinkId("dup:msg-a#u2".into()));
+    assert_eq!(retained[0].link_id, PimdirLinkId("dup:msg-a#u2".into()));
     let seq = retained[0].seq;
 
     // and the source hands the same resource back: the row revives on the
     // key it kept, with the public id it kept
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(hydrated(
+        .write(vec![PimdirWriteOp::UpsertPlacement(hydrated(
             "u2",
             "dup:msg-a#u2",
             "cafebabe",
@@ -240,7 +242,7 @@ fn a_minted_key_round_trips_through_retention_and_revival() {
         .unwrap();
     let revived = store.list_items("INBOX", None, 10).unwrap();
     assert_eq!(revived.len(), 1);
-    assert_eq!(revived[0].link_id, ReplicaLinkId("dup:msg-a#u2".into()));
+    assert_eq!(revived[0].link_id, PimdirLinkId("dup:msg-a#u2".into()));
     assert_eq!(revived[0].seq, seq, "a revived item keeps its public id");
 }
 
@@ -258,33 +260,30 @@ fn a_rekey_carries_the_binding_over_instead_of_refusing_it() {
     let mut store = opened(dir.path());
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "u1", "msg-a",
         ))])
         .unwrap();
 
     store
-        .write_rekeyed(
-            "INBOX",
-            vec![
-                ReplicaWriteOp::DropPlacement {
-                    collection: inbox(),
-                    handle: ReplicaHandle("u1".into()),
-                    reason: ReplicaDropReason::Superseded,
-                },
-                ReplicaWriteOp::UpsertPlacement(placement("101", "msg-a")),
-            ],
-        )
+        .write(vec![
+            PimdirWriteOp::DropPlacement {
+                collection: inbox(),
+                handle: PimdirHandle("u1".into()),
+                reason: PimdirDropReason::Rekeyed,
+            },
+            PimdirWriteOp::UpsertPlacement(placement("101", "msg-a")),
+        ])
         .unwrap();
 
     let placements = projected(&store);
     assert_eq!(placements.len(), 1);
     assert_eq!(
         placements[0].handle,
-        ReplicaHandle("101".into()),
+        PimdirHandle("101".into()),
         "the binding follows the rebuilt spine",
     );
-    assert_eq!(placements[0].status, ReplicaStatus::Clean);
+    assert_eq!(placements[0].status, PimdirStatus::Clean);
 }
 
 /// The licence is per handle, not per batch.
@@ -300,26 +299,23 @@ fn a_superseded_handle_licenses_only_its_own_rebind() {
 
     store
         .write(vec![
-            ReplicaWriteOp::UpsertPlacement(placement("u1", "msg-a")),
-            ReplicaWriteOp::UpsertPlacement(placement("u2", "msg-b")),
+            PimdirWriteOp::UpsertPlacement(placement("u1", "msg-a")),
+            PimdirWriteOp::UpsertPlacement(placement("u2", "msg-b")),
         ])
         .unwrap();
 
     let refused = store
-        .write_rekeyed(
-            "INBOX",
-            vec![
-                // msg-a is superseded and renumbered, so it carries over
-                ReplicaWriteOp::DropPlacement {
-                    collection: inbox(),
-                    handle: ReplicaHandle("u1".into()),
-                    reason: ReplicaDropReason::Superseded,
-                },
-                ReplicaWriteOp::UpsertPlacement(placement("101", "msg-a")),
-                // msg-b is not: the source holds it under a second handle
-                ReplicaWriteOp::UpsertPlacement(placement("u9", "msg-b")),
-            ],
-        )
+        .write(vec![
+            // msg-a is superseded and renumbered, so it carries over
+            PimdirWriteOp::DropPlacement {
+                collection: inbox(),
+                handle: PimdirHandle("u1".into()),
+                reason: PimdirDropReason::Rekeyed,
+            },
+            PimdirWriteOp::UpsertPlacement(placement("101", "msg-a")),
+            // msg-b is not: the source holds it under a second handle
+            PimdirWriteOp::UpsertPlacement(placement("u9", "msg-b")),
+        ])
         .unwrap_err();
 
     assert!(
@@ -331,11 +327,11 @@ fn a_superseded_handle_licenses_only_its_own_rebind() {
     let placements = projected(&store);
     assert_eq!(
         placements[0].handle,
-        ReplicaHandle("u1".into()),
+        PimdirHandle("u1".into()),
         "and the refused batch leaves the licensed half unwritten too, \
          a write being one transaction",
     );
-    assert_eq!(placements[1].handle, ReplicaHandle("u2".into()));
+    assert_eq!(placements[1].handle, PimdirHandle("u2".into()));
 }
 
 /// A rebuild mints nothing, so a collection that genuinely holds an
@@ -349,26 +345,23 @@ fn a_rebuilt_handle_space_resolving_two_placements_to_one_key_is_refused() {
     let mut store = opened(dir.path());
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "u1", "msg-a",
         ))])
         .unwrap();
 
     let refused = store
-        .write_rekeyed(
-            "INBOX",
-            vec![
-                ReplicaWriteOp::DropPlacement {
-                    collection: inbox(),
-                    handle: ReplicaHandle("u1".into()),
-                    reason: ReplicaDropReason::Superseded,
-                },
-                // both copies report the bare hint again, the rebuild
-                // having re-resolved every identity from the new spine
-                ReplicaWriteOp::UpsertPlacement(placement("101", "msg-a")),
-                ReplicaWriteOp::UpsertPlacement(placement("102", "msg-a")),
-            ],
-        )
+        .write(vec![
+            PimdirWriteOp::DropPlacement {
+                collection: inbox(),
+                handle: PimdirHandle("u1".into()),
+                reason: PimdirDropReason::Rekeyed,
+            },
+            // both copies report the bare hint again, the rebuild
+            // having re-resolved every identity from the new spine
+            PimdirWriteOp::UpsertPlacement(placement("101", "msg-a")),
+            PimdirWriteOp::UpsertPlacement(placement("102", "msg-a")),
+        ])
         .unwrap_err();
 
     assert!(
@@ -381,7 +374,7 @@ fn a_rebuilt_handle_space_resolving_two_placements_to_one_key_is_refused() {
     assert_eq!(placements.len(), 1);
     assert_eq!(
         placements[0].handle,
-        ReplicaHandle("u1".into()),
+        PimdirHandle("u1".into()),
         "the store holds what it held: no overwrite, no half-written spine",
     );
 }

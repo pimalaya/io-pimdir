@@ -171,7 +171,7 @@ fn summary(action: &PimdirAction) -> String {
         PimdirAction::Remove { seq } => format!("seq {seq}"),
         PimdirAction::Move { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Copy { seq, to } => format!("seq {seq} -> {}", to.0),
-        PimdirAction::Update { seq, object, .. } => format!("seq {seq}, object {}", object.0),
+        PimdirAction::Update { seq, object } => format!("seq {seq}, object {}", object.0),
         // NOTE: an owner-defined intent this build has no semantics for,
         // so its payload is printed verbatim.
         PimdirAction::Unknown { payload, .. } => payload.clone(),
@@ -183,7 +183,7 @@ fn summary(action: &PimdirAction) -> String {
 pub struct QueueRow {
     /// The row's append id.
     pub id: i64,
-    /// The producer-supplied enqueue timestamp.
+    /// The instant SQLite stamped the row with.
     pub created_at: String,
     /// The process that enqueued it.
     pub producer: String,

@@ -2,8 +2,8 @@
 //!
 //! None of it interprets content. An item prints as its public `seq`,
 //! its cross-source link id, its flags, its detail level, its body hash
-//! and its meta verbatim; a body leaves as the raw bytes that went in.
-//! Rendering those is a per-kind consumer's job.
+//! and its summary row as stored; a body leaves as the raw bytes that
+//! went in. Rendering those is a per-kind consumer's job.
 
 use std::{
     fmt,
@@ -14,12 +14,13 @@ use std::{
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
-use io_pimdir::{PimdirItem, PimdirReader, codec::PimdirAction};
-use io_replica::{
-    collection::ReplicaCollectionId,
-    hub::{ReplicaSourceBinding, ReplicaSourceId},
-    object::ReplicaHash,
-    placement::{ReplicaFlags, ReplicaLevel},
+use io_pimdir::{
+    client::reader::{PimdirItem, PimdirReader},
+    codec::PimdirAction,
+    collection::PimdirCollectionId,
+    hub::{PimdirBinding, PimdirSourceId},
+    object::PimdirHash,
+    placement::{PimdirFlags, PimdirLevel},
 };
 use log::warn;
 use pimalaya_cli::{
@@ -27,8 +28,9 @@ use pimalaya_cli::{
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
 };
 use serde::Serialize;
+use serde_json::Value;
 
-use crate::cli::{StoreFlags, bytes, confirm, now, or_dash, report};
+use crate::cli::{StoreFlags, bytes, confirm, now, or_dash, report, summary};
 
 /// The default page size of an item listing.
 const DEFAULT_LIMIT: usize = 50;
@@ -68,9 +70,9 @@ impl ItemCommand {
 /// List a collection's items, one page at a time.
 ///
 /// The listing is keyset-paged: it never truncates silently, and tells you the
-/// cursor to pass to `--after` for the next page. Live items are ordered by
-/// link id, retained ones by public id, so `--after` takes a link id normally
-/// and a `seq` with `--retained`.
+/// cursor to pass to `--after` for the next page. Live items come in the
+/// kind's own order (newest mail first, contacts and calendars ascending) with
+/// the summary's title, retained ones by public id.
 #[derive(Debug, Args)]
 pub struct ItemListCommand {
     /// Collection to list, as shown by `collection list`.
@@ -81,7 +83,7 @@ pub struct ItemListCommand {
     #[arg(long)]
     pub retained: bool,
 
-    /// Resume after this cursor: a link id, or a `seq` with `--retained`.
+    /// Resume after this cursor, as the previous page printed it.
     #[arg(long, value_name = "CURSOR")]
     pub after: Option<String>,
 
@@ -106,7 +108,7 @@ impl ItemListCommand {
                     anyhow::anyhow!("--after takes a seq with --retained, got {cursor:?}")
                 })?),
             };
-            let collection = ReplicaCollectionId(self.collection.clone());
+            let collection = PimdirCollectionId(self.collection.clone());
             store
                 .list_retained(&collection, after, probe)
                 .map_err(report)?
@@ -114,8 +116,26 @@ impl ItemListCommand {
                 .map(|item| ItemRow::new(&self.collection, &item))
                 .collect()
         } else {
+            // NOTE: the cursor is the pair a sort-key page is total on,
+            // spelled `seq:sort_key` since a seq carries no colon.
+            let after = match &self.after {
+                None => None,
+                Some(cursor) => {
+                    let (seq, key) = cursor.split_once(':').ok_or_else(|| {
+                        anyhow::anyhow!("--after takes the cursor a page printed, got {cursor:?}")
+                    })?;
+                    let seq: i64 = seq.parse().map_err(|_| {
+                        anyhow::anyhow!("--after takes the cursor a page printed, got {cursor:?}")
+                    })?;
+                    Some((key.to_string(), seq))
+                }
+            };
             store
-                .list_items(&self.collection, self.after.as_deref(), probe)
+                .list_summaries(
+                    &self.collection,
+                    after.as_ref().map(|(key, seq)| (key.as_str(), *seq)),
+                    probe,
+                )
                 .map_err(report)?
                 .into_iter()
                 .map(|item| ItemRow::new(&self.collection, &item))
@@ -140,9 +160,9 @@ impl ItemListCommand {
 /// Show one item by its public id, across every collection holding it.
 ///
 /// A message filed in two mailboxes shares one `seq`, so this prints one
-/// placement per collection, retained placements included, each followed by the
-/// bindings the sources hold it under. The meta is printed exactly as stored:
-/// this tool does not parse it.
+/// placement per collection, retained placements included, each with its
+/// summary row and addresses as stored, followed by the bindings the sources
+/// hold it under. Nothing here parses a body.
 #[derive(Debug, Args)]
 pub struct ItemShowCommand {
     /// Public id of the item (`seq`).
@@ -232,7 +252,7 @@ impl ItemExportCommand {
         };
 
         let blobs = store.blobs()?;
-        let Some(mut reader) = blobs.reader(&ReplicaHash(hash.clone()))? else {
+        let Some(mut reader) = blobs.reader(&PimdirHash(hash.clone()))? else {
             bail!(
                 "the body of seq {} is missing from the blob store (hash {hash}); run `pimdir check`",
                 self.seq
@@ -267,11 +287,12 @@ impl ItemExportCommand {
 
 /// Bring a retained item back into its collection.
 ///
-/// The retained row still holds the item's link id, flags, meta and body, so
-/// the restore rebuilds it from those, as an `add` action appended to the
-/// store's queue. The action is then applied straight away when the owner role
-/// is free; when a sync holds it, the action stays queued and applies at the
-/// next drain. Either way nothing is lost.
+/// The retained row still holds the item's link id, flags and body, so the
+/// restore rebuilds it from those, as an `add` action appended to the store's
+/// queue; the owner derives the summary from the body again. The action
+/// applies straight away when the owner role is free; when a sync holds it,
+/// the action stays queued and applies at the next drain. Either way nothing
+/// is lost.
 #[derive(Debug, Args)]
 pub struct ItemRestoreCommand {
     /// Public id of the retained item (`seq`).
@@ -309,14 +330,13 @@ impl ItemRestoreCommand {
             link_id: Some(item.link_id.clone()),
             flags: item.flags.clone(),
             object: item.object.clone(),
-            meta: item.meta.clone(),
             handle: None,
         };
         // NOTE: no size, the body being already indexed: the retained row
         // kept its object alive, which is the point of retention.
         let id = store
             .producer()?
-            .enqueue(&found.collection, &action, None, &now())
+            .enqueue(&found.collection, &action, None)
             .map_err(report)?;
 
         // NOTE: the drain reports what it did to the whole collection's
@@ -328,7 +348,7 @@ impl ItemRestoreCommand {
             Some(owner) => {
                 let mut owner = owner.for_source(source);
                 match owner.drain_collection(&found.collection) {
-                    Err(io_pimdir::PimdirError::Busy) => RestoreStatus::Queued,
+                    Err(io_pimdir::client::PimdirError::Busy) => RestoreStatus::Queued,
                     Err(err) => return Err(report(err)),
                     Ok(_) => match owner
                         .get_item(&found.collection, self.seq)
@@ -446,7 +466,7 @@ impl ItemPurgeCommand {
             ),
         )?;
 
-        let collection = ReplicaCollectionId(found.collection.clone());
+        let collection = PimdirCollectionId(found.collection.clone());
         let purged = store.owner()?.purge(&collection, seq).map_err(report)?;
 
         if !purged {
@@ -475,7 +495,7 @@ impl Found {
     }
 
     /// The item's detail level.
-    fn level(&self) -> ReplicaLevel {
+    fn level(&self) -> PimdirLevel {
         self.item.level
     }
 
@@ -518,7 +538,7 @@ fn locate(store: &PimdirReader, seq: i64, collection: Option<&str>) -> Result<Ve
 /// for the single row after `seq - 1` either answers with `seq` itself or
 /// proves it is not retained here.
 fn retained(store: &PimdirReader, collection: &str, seq: i64) -> Result<Option<PimdirItem>> {
-    let collection = ReplicaCollectionId(collection.to_string());
+    let collection = PimdirCollectionId(collection.to_string());
     let page = store
         .list_retained(&collection, Some(seq - 1), 1)
         .map_err(report)?;
@@ -541,17 +561,17 @@ fn one(found: Vec<Found>, seq: i64) -> Result<Found> {
 }
 
 /// The detail ladder as its lowercase name.
-fn level_name(level: ReplicaLevel) -> &'static str {
+fn level_name(level: PimdirLevel) -> &'static str {
     match level {
-        ReplicaLevel::Probed => "probed",
-        ReplicaLevel::Meta => "meta",
-        ReplicaLevel::Full => "full",
+        PimdirLevel::Probed => "probed",
+        PimdirLevel::Meta => "meta",
+        PimdirLevel::Full => "full",
     }
 }
 
 /// The flag set as a sorted list of raw strings, never interpreted, or
 /// `None` while nothing has read them (spec §13, a `NULL` flags column).
-fn flag_list(flags: &ReplicaFlags) -> Option<Vec<String>> {
+fn flag_list(flags: &PimdirFlags) -> Option<Vec<String>> {
     Some(flags.known()?.iter().cloned().collect())
 }
 
@@ -572,8 +592,14 @@ pub struct ItemRow {
     pub object: Option<String>,
     /// The body's size, when known.
     pub size: Option<u64>,
-    /// The raw meta, verbatim.
-    pub meta: Option<String>,
+    /// The kind's ordering key, empty while unknown.
+    pub sort_key: String,
+    /// What a listing shows the item as: the summary's subject, name or
+    /// summary line, `null` while no summary was derived.
+    pub title: Option<String>,
+    /// The summary row and its addresses as stored, on the reads that join
+    /// them (`item show`, and a live listing).
+    pub summary: Option<Value>,
     /// When the last binding vanished, for a retained item.
     pub retained_at: Option<String>,
     /// The source whose removal retired the item.
@@ -592,7 +618,9 @@ impl ItemRow {
             level: level_name(item.level),
             object: item.object.as_ref().map(|hash| hash.0.clone()),
             size: retention.and_then(|retention| retention.size),
-            meta: item.meta.as_ref().map(|meta| meta.0.clone()),
+            sort_key: item.sort_key.clone(),
+            title: item.summary.as_ref().map(|s| s.title().to_string()),
+            summary: item.summary.as_ref().map(summary::json),
             retained_at: retention.map(|retention| retention.at.clone()),
             retained_by: retention.and_then(|retention| retention.by.clone()),
         }
@@ -603,7 +631,7 @@ impl ItemRow {
         if retained {
             self.seq.to_string()
         } else {
-            self.link_id.clone()
+            format!("{}:{}", self.seq, self.sort_key)
         }
     }
 }
@@ -629,16 +657,19 @@ impl fmt::Display for ItemsOutput {
         }
 
         let mut table = Table::new();
-        let mut header = vec![
-            Cell::new("SEQ"),
-            Cell::new("LINK ID"),
-            Cell::new("FLAGS"),
-            Cell::new("LEVEL"),
-            Cell::new("OBJECT"),
-        ];
+        let mut header = vec![Cell::new("SEQ")];
+        if self.retained {
+            header.push(Cell::new("LINK ID"));
+        } else {
+            header.push(Cell::new("TITLE"));
+        }
+        header.push(Cell::new("FLAGS"));
+        header.push(Cell::new("LEVEL"));
         if self.retained {
             header.push(Cell::new("RETAINED AT"));
             header.push(Cell::new("BY"));
+        } else {
+            header.push(Cell::new("SORT KEY"));
         }
 
         table
@@ -647,22 +678,27 @@ impl fmt::Display for ItemsOutput {
             .set_header(header);
 
         for item in &self.items {
-            let mut row = vec![
-                Cell::new(item.seq),
-                Cell::new(&item.link_id),
-                Cell::new(or_dash(
-                    item.flags
-                        .as_ref()
-                        .map(|flags| flags.join(" "))
-                        .filter(|f| !f.is_empty())
-                        .as_deref(),
-                )),
-                Cell::new(item.level),
-                Cell::new(or_dash(item.object.as_deref())),
-            ];
+            let mut row = vec![Cell::new(item.seq)];
+            if self.retained {
+                row.push(Cell::new(&item.link_id));
+            } else {
+                row.push(Cell::new(or_dash(item.title.as_deref())));
+            }
+            row.push(Cell::new(or_dash(
+                item.flags
+                    .as_ref()
+                    .map(|flags| flags.join(" "))
+                    .filter(|f| !f.is_empty())
+                    .as_deref(),
+            )));
+            row.push(Cell::new(item.level));
             if self.retained {
                 row.push(Cell::new(or_dash(item.retained_at.as_deref())));
                 row.push(Cell::new(or_dash(item.retained_by.as_deref())));
+            } else {
+                row.push(Cell::new(or_dash(
+                    Some(item.sort_key.as_str()).filter(|k| !k.is_empty()),
+                )));
             }
             table.add_row(row);
         }
@@ -712,7 +748,7 @@ pub struct BindingRow {
 
 impl BindingRow {
     /// One binding's row.
-    fn new(source: &ReplicaSourceId, binding: &ReplicaSourceBinding) -> Self {
+    fn new(source: &PimdirSourceId, binding: &PimdirBinding) -> Self {
         Self {
             source: source.0.clone(),
             handle: binding.handle.0.clone(),
@@ -786,7 +822,14 @@ impl fmt::Display for ItemShowOutput {
                     or_dash(item.retained_by.as_deref())
                 )?;
             }
-            writeln!(f, " - meta: {}", or_dash(item.meta.as_deref()))?;
+            match &item.summary {
+                Some(summary) => {
+                    for line in summary::lines(summary) {
+                        writeln!(f, "{line}")?;
+                    }
+                }
+                None => writeln!(f, " - summary: none")?,
+            }
 
             for binding in &placement.bindings {
                 writeln!(f, " - binding {}: {}", binding.source, binding.handle)?;

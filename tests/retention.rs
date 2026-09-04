@@ -2,61 +2,61 @@
 //! retained, not deleted, and only a purge takes it away.
 //!
 //! The load-hiding half is what makes it safe rather than a resurrection
-//! loop, so the quiescence tests here drive a real [`ReplicaClient`]
-//! against a fake source, mirroring `io-replica/tests/soft_delete.rs`.
+//! loop, so the quiescence tests here run the real sync verb against a
+//! fake source.
 
 use std::{collections::BTreeMap, convert::Infallible, path::Path};
 
-use io_pimdir::{PimdirStore, codec::PimdirAction};
-use io_replica::{
-    change::{ReplicaChange, ReplicaDropReason, ReplicaWriteOp},
-    client::{ReplicaClient, ReplicaRemote, ReplicaStorage},
-    collection::{ReplicaCheckpoint, ReplicaCollectionId},
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::{
+    change::{PimdirChange, PimdirDropReason, PimdirWriteOp},
+    client::PimdirStore,
+    codec::PimdirAction,
+    collection::{PimdirCheckpoint, PimdirCollectionId},
+    load::PimdirLoadScope,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
     remote::{
-        ReplicaFetchedBody, ReplicaFetchedItem, ReplicaPushResult, ReplicaRemoteItem,
-        ReplicaRemoteSnapshot, ReplicaTier,
+        PimdirFetchedBody, PimdirFetchedItem, PimdirPushResult, PimdirRemote, PimdirRemoteItem,
+        PimdirRemoteSnapshot, PimdirTier,
     },
-    storage::ReplicaLoadScope,
-    sync::{ReplicaSyncOptions, ReplicaSyncReport},
+    sync::{PimdirSyncOptions, PimdirSyncReport},
 };
 
-fn inbox() -> ReplicaCollectionId {
-    ReplicaCollectionId("INBOX".into())
+fn inbox() -> PimdirCollectionId {
+    PimdirCollectionId("INBOX".into())
 }
 
 /// A hydrated, linked placement with a matching base (so it projects clean).
-fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPlacement {
-    let flags = ReplicaFlags::from_iter(flags.iter().copied());
-    ReplicaPlacement {
+fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> PimdirPlacement {
+    let flags = PimdirFlags::from_iter(flags.iter().copied());
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
-        object: Some(ReplicaHash(hash.into())),
-        level: ReplicaLevel::Full,
-        meta: Some(ReplicaMeta("{\"v\":1}".into())),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
+        object: Some(PimdirHash(hash.into())),
+        level: PimdirLevel::Full,
+        summary: None,
         flags: flags.clone(),
-        status: ReplicaStatus::Clean,
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
+        base: Some(PimdirBase {
             flags,
             revision: None,
-            object: Some(ReplicaHash(hash.into())),
+            object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
     }
 }
 
-fn store_object(hash: &str, body: &[u8]) -> ReplicaWriteOp {
-    ReplicaWriteOp::StoreObject {
-        object: ReplicaObject {
-            hash: ReplicaHash(hash.into()),
+fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
+    PimdirWriteOp::StoreObject {
+        object: PimdirObject {
+            hash: PimdirHash(hash.into()),
             size: body.len(),
         },
         body: Some(body.to_vec()),
@@ -71,11 +71,11 @@ fn blob_exists(dir: &Path, hash: &str) -> bool {
         .exists()
 }
 
-fn drop_placement(handle: &str) -> ReplicaWriteOp {
-    ReplicaWriteOp::DropPlacement {
+fn drop_placement(handle: &str) -> PimdirWriteOp {
+    PimdirWriteOp::DropPlacement {
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
-        reason: ReplicaDropReason::Deleted,
+        handle: PimdirHandle(handle.into()),
+        reason: PimdirDropReason::Deleted,
     }
 }
 
@@ -99,7 +99,7 @@ fn an_expunge_retains_the_item_and_its_body() {
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
         ])
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
@@ -110,7 +110,7 @@ fn an_expunge_retains_the_item_and_its_body() {
     // gone from the sync seam and from the live reads
     assert!(
         store
-            .load(&inbox(), &ReplicaLoadScope::All)
+            .load(&inbox(), &PimdirLoadScope::All)
             .unwrap()
             .placements
             .is_empty()
@@ -125,9 +125,8 @@ fn an_expunge_retains_the_item_and_its_body() {
     assert_eq!(retained[0].seq, seq);
     assert_eq!(retained[0].link_id.0, "mid:a");
     assert!(retained[0].flags.contains("\\Seen"));
-    assert_eq!(retained[0].level, ReplicaLevel::Full);
-    assert_eq!(retained[0].meta, Some(ReplicaMeta("{\"v\":1}".into())));
-    assert_eq!(retained[0].object, Some(ReplicaHash("cafebabe".into())));
+    assert_eq!(retained[0].level, PimdirLevel::Full);
+    assert_eq!(retained[0].object, Some(PimdirHash("cafebabe".into())));
     let retention = retained[0].retention.as_ref().expect("a retained row");
     assert_eq!(retention.size, Some(3));
     assert_eq!(retention.by.as_deref(), Some("local"));
@@ -153,44 +152,56 @@ fn an_expunge_retains_the_item_and_its_body() {
 #[test]
 fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
     let dir = tempfile::tempdir().unwrap();
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut remote = MemRemote::default();
     remote.seed("1", "mid:a", b"body");
-    let mut client = ReplicaClient::new(store, remote);
 
-    client.sync("INBOX", ReplicaSyncOptions::default()).unwrap();
+    store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
     // a sync enumerates handles only, and the hydrate resolves the link
     // id and the body, so the probe becomes a persisted item
-    client
-        .upgrade("INBOX", vec![ReplicaHandle("1".into())], ReplicaTier::Full)
+    store
+        .upgrade(
+            "INBOX",
+            vec![PimdirHandle("1".into())],
+            PimdirTier::Full,
+            &mut remote,
+        )
         .unwrap();
-    assert_eq!(client.storage().count_items("INBOX").unwrap(), 1);
+    assert_eq!(store.count_items("INBOX").unwrap(), 1);
 
     // the source expunges the item and the sync observes the vanish
-    client.remote_mut().remove("1");
-    let report = client.sync("INBOX", ReplicaSyncOptions::default()).unwrap();
+    remote.remove("1");
+    let report = store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
     assert_eq!(report.pulled, 1, "the vanish is observed");
-    assert_eq!(client.storage().count_retained(&inbox()).unwrap(), 1);
+    assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
 
     // neither a delta nor a full resync re-derives against the hidden
     // row: the merge only sees what `load` returns
-    let delta = client.sync("INBOX", ReplicaSyncOptions::default()).unwrap();
-    assert_eq!(delta, ReplicaSyncReport::default(), "quiescent delta sync");
-    let full = client
+    let delta = store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+    assert_eq!(delta, PimdirSyncReport::default(), "quiescent delta sync");
+    let full = store
         .sync(
             "INBOX",
-            ReplicaSyncOptions {
+            PimdirSyncOptions {
                 full: true,
                 ..Default::default()
             },
+            &mut remote,
         )
         .unwrap();
-    assert_eq!(full, ReplicaSyncReport::default(), "quiescent full sync");
+    assert_eq!(full, PimdirSyncReport::default(), "quiescent full sync");
 
     // nothing was re-uploaded either, and the copy is still restorable
-    assert!(client.remote().is_empty(), "no resurrection push");
-    assert_eq!(client.storage().count_retained(&inbox()).unwrap(), 1);
-    assert_eq!(client.storage().count_items("INBOX").unwrap(), 0);
+    assert!(remote.is_empty(), "no resurrection push");
+    assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
+    assert_eq!(store.count_items("INBOX").unwrap(), 0);
 }
 
 #[test]
@@ -200,7 +211,7 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
         ])
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
@@ -210,7 +221,7 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     // the source hands the same link id back under a new handle, so the
     // retained row revives instead of colliding on the key
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "9",
             "mid:a",
             "cafebabe",
@@ -245,14 +256,15 @@ fn a_queued_add_restores_a_retained_item() {
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
         ])
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
     store.write(vec![drop_placement("1")]).unwrap();
 
     let retained = store.list_retained(&inbox(), None, 10).unwrap().remove(0);
-    let mut producer = io_pimdir::PimdirProducer::open(dir.path(), "pimdir").unwrap();
+    let mut producer =
+        io_pimdir::client::producer::PimdirProducer::open(dir.path(), "pimdir").unwrap();
     producer
         .enqueue(
             "INBOX",
@@ -260,11 +272,9 @@ fn a_queued_add_restores_a_retained_item() {
                 link_id: Some(retained.link_id.clone()),
                 flags: retained.flags.clone(),
                 object: retained.object.clone(),
-                meta: retained.meta.clone(),
                 handle: None,
             },
             None,
-            "2026-08-07T00:00:00Z",
         )
         .unwrap();
 
@@ -274,16 +284,16 @@ fn a_queued_add_restores_a_retained_item() {
     let items = store.list_items("INBOX", None, 10).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].seq, seq, "restored under its own id");
-    assert_eq!(items[0].object, Some(ReplicaHash("cafebabe".into())));
+    assert_eq!(items[0].object, Some(PimdirHash("cafebabe".into())));
     assert!(store.list_retained(&inbox(), None, 10).unwrap().is_empty());
 
     // staged as a local creation, so the next sync pushes it back
     let projected = store
-        .load(&inbox(), &ReplicaLoadScope::All)
+        .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
     assert_eq!(projected.len(), 1);
-    assert_ne!(projected[0].status, ReplicaStatus::Clean, "a pending push");
+    assert_ne!(projected[0].status, PimdirStatus::Clean, "a pending push");
 }
 
 #[test]
@@ -294,8 +304,8 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
         .write(vec![
             store_object("cafebabe", b"abc"),
             store_object("beef0000", b"defgh"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
-            ReplicaWriteOp::UpsertPlacement(placement("2", "mid:b", "beef0000", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("2", "mid:b", "beef0000", &[])),
         ])
         .unwrap();
     let live = store.list_items("INBOX", None, 10).unwrap();
@@ -331,9 +341,9 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
             store_object("cafebabe", b"old"),
             store_object("beef0000", b"edge"),
             store_object("d0d00000", b"recent"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:old", "cafebabe", &[])),
-            ReplicaWriteOp::UpsertPlacement(placement("2", "mid:edge", "beef0000", &[])),
-            ReplicaWriteOp::UpsertPlacement(placement("3", "mid:new", "d0d00000", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:old", "cafebabe", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("2", "mid:edge", "beef0000", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("3", "mid:new", "d0d00000", &[])),
         ])
         .unwrap();
     store
@@ -397,11 +407,11 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
 
     left.write(vec![
         store_object("cafebabe", b"abc"),
-        ReplicaWriteOp::UpsertPlacement(placement("L1", "mid:a", "cafebabe", &["\\Seen"])),
+        PimdirWriteOp::UpsertPlacement(placement("L1", "mid:a", "cafebabe", &["\\Seen"])),
     ])
     .unwrap();
     right
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "R1",
             "mid:a",
             "cafebabe",
@@ -413,11 +423,11 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     // is a tombstone rather than retained
     left.write(vec![drop_placement("L1")]).unwrap();
     let projected = right
-        .load(&inbox(), &ReplicaLoadScope::All)
+        .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
     assert_eq!(projected.len(), 1);
-    assert_eq!(projected[0].status, ReplicaStatus::Tombstone);
+    assert_eq!(projected[0].status, PimdirStatus::Tombstone);
     assert_eq!(
         left.count_retained(&inbox()).unwrap(),
         0,
@@ -427,15 +437,15 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     // right pushes the remove and drops its own binding, so nothing holds
     // it
     right
-        .write(vec![ReplicaWriteOp::DropPlacement {
+        .write(vec![PimdirWriteOp::DropPlacement {
             collection: inbox(),
-            handle: ReplicaHandle("R1".into()),
-            reason: ReplicaDropReason::Deleted,
+            handle: PimdirHandle("R1".into()),
+            reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
     assert!(
         right
-            .load(&inbox(), &ReplicaLoadScope::All)
+            .load(&inbox(), &PimdirLoadScope::All)
             .unwrap()
             .placements
             .is_empty()
@@ -460,9 +470,9 @@ fn the_retained_page_is_keyed_on_seq_and_exclusive() {
     store
         .write(vec![
             store_object("cafebabe", b"shared"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
-            ReplicaWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabe", &[])),
-            ReplicaWriteOp::UpsertPlacement(placement("3", "mid:c", "cafebabe", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabe", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("3", "mid:c", "cafebabe", &[])),
         ])
         .unwrap();
     store
@@ -488,23 +498,23 @@ fn the_retained_page_is_keyed_on_seq_and_exclusive() {
 }
 
 /// A minimal fake source: it reports everything it holds, serves the
-/// bodies and accepts every push. Enough to drive a real sync end to end
+/// bodies and accepts every push. Enough to run a real sync end to end
 /// and see whether a retained row provokes one.
 #[derive(Default)]
 struct MemRemote {
-    items: BTreeMap<ReplicaHandle, (ReplicaLinkId, Vec<u8>)>,
+    items: BTreeMap<PimdirHandle, (PimdirLinkId, Vec<u8>)>,
 }
 
 impl MemRemote {
     fn seed(&mut self, handle: &str, link: &str, body: &[u8]) {
         self.items.insert(
-            ReplicaHandle(handle.into()),
-            (ReplicaLinkId(link.into()), body.to_vec()),
+            PimdirHandle(handle.into()),
+            (PimdirLinkId(link.into()), body.to_vec()),
         );
     }
 
     fn remove(&mut self, handle: &str) {
-        self.items.remove(&ReplicaHandle(handle.into()));
+        self.items.remove(&PimdirHandle(handle.into()));
     }
 
     fn is_empty(&self) -> bool {
@@ -514,55 +524,55 @@ impl MemRemote {
 
 /// A stable, store-agnostic content hash for the fake bodies: the store
 /// is hash-agnostic, and only stability matters here.
-fn fake_hash(body: &[u8]) -> ReplicaHash {
+fn fake_hash(body: &[u8]) -> PimdirHash {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in body {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x1000_0000_01b3);
     }
-    ReplicaHash(format!("{hash:016x}"))
+    PimdirHash(format!("{hash:016x}"))
 }
 
-impl ReplicaRemote for MemRemote {
+impl PimdirRemote for MemRemote {
     type Error = Infallible;
 
     fn enumerate(
         &mut self,
-        _collection: &ReplicaCollectionId,
-        _cursor: Option<ReplicaCheckpoint>,
-    ) -> Result<ReplicaRemoteSnapshot, Infallible> {
-        Ok(ReplicaRemoteSnapshot {
+        _collection: &PimdirCollectionId,
+        _cursor: Option<PimdirCheckpoint>,
+    ) -> Result<PimdirRemoteSnapshot, Infallible> {
+        Ok(PimdirRemoteSnapshot {
             items: self
                 .items
                 .keys()
-                .map(|handle| ReplicaRemoteItem {
+                .map(|handle| PimdirRemoteItem {
                     handle: handle.clone(),
-                    flags: ReplicaFlags::default(),
+                    flags: PimdirFlags::default(),
                     revision: None,
                 })
                 .collect(),
             vanished: Vec::new(),
             complete: true,
-            checkpoint: ReplicaCheckpoint(vec![self.items.len() as u8]),
+            checkpoint: PimdirCheckpoint(vec![self.items.len() as u8]),
         })
     }
 
     fn fetch(
         &mut self,
-        _collection: &ReplicaCollectionId,
-        handles: Vec<ReplicaHandle>,
-        tier: ReplicaTier,
-    ) -> Result<Vec<ReplicaFetchedItem>, Infallible> {
+        _collection: &PimdirCollectionId,
+        handles: Vec<PimdirHandle>,
+        tier: PimdirTier,
+    ) -> Result<Vec<PimdirFetchedItem>, Infallible> {
         Ok(handles
             .into_iter()
             .filter_map(|handle| {
                 let (link, body) = self.items.get(&handle)?;
-                Some(ReplicaFetchedItem {
+                Some(PimdirFetchedItem {
                     sort_key: Default::default(),
                     handle,
                     link_id: link.clone(),
-                    meta: ReplicaMeta("{\"v\":1}".into()),
-                    body: matches!(tier, ReplicaTier::Full).then(|| ReplicaFetchedBody::Inline {
+                    summary: None,
+                    body: matches!(tier, PimdirTier::Full).then(|| PimdirFetchedBody::Inline {
                         hash: fake_hash(body),
                         bytes: body.clone(),
                     }),
@@ -574,9 +584,9 @@ impl ReplicaRemote for MemRemote {
 
     fn push(
         &mut self,
-        _collection: &ReplicaCollectionId,
-        changes: Vec<ReplicaChange>,
-    ) -> Result<Vec<ReplicaPushResult>, Infallible> {
+        _collection: &PimdirCollectionId,
+        changes: Vec<PimdirChange>,
+    ) -> Result<Vec<PimdirPushResult>, Infallible> {
         // NOTE: a retained item must provoke none of these, so a stray
         // push fails loudly rather than succeeding in silence.
         Ok(changes

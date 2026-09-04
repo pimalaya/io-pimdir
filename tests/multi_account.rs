@@ -7,30 +7,28 @@
 //! reads are the store's whole answer to "the same thing is in two
 //! accounts": they report it, and every merge policy is built on top.
 
-use io_pimdir::PimdirStore;
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::client::PimdirStore;
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaPlacement,
-        ReplicaStatus,
+        PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirStatus,
     },
 };
 
 /// One placement of `link_id` in `collection`, pointing at `hash`.
-fn placement(collection: &str, handle: &str, link_id: &str, hash: &str) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn placement(collection: &str, handle: &str, link_id: &str, hash: &str) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
-        collection: ReplicaCollectionId(collection.into()),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link_id.into())),
-        object: Some(ReplicaHash(hash.into())),
-        level: ReplicaLevel::Full,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        collection: PimdirCollectionId(collection.into()),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link_id.into())),
+        object: Some(PimdirHash(hash.into())),
+        level: PimdirLevel::Full,
+        summary: None,
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
         base: None,
@@ -40,16 +38,16 @@ fn placement(collection: &str, handle: &str, link_id: &str, hash: &str) -> Repli
 
 /// The placement plus the body it points at, in one batch: an object no
 /// placement references is swept at the end of that batch.
-fn batch(collection: &str, handle: &str, link_id: &str, hash: &str) -> Vec<ReplicaWriteOp> {
+fn batch(collection: &str, handle: &str, link_id: &str, hash: &str) -> Vec<PimdirWriteOp> {
     vec![
-        ReplicaWriteOp::StoreObject {
-            object: ReplicaObject {
-                hash: ReplicaHash(hash.into()),
+        PimdirWriteOp::StoreObject {
+            object: PimdirObject {
+                hash: PimdirHash(hash.into()),
                 size: 4,
             },
             body: Some(b"body".to_vec()),
         },
-        ReplicaWriteOp::UpsertPlacement(placement(collection, handle, link_id, hash)),
+        PimdirWriteOp::UpsertPlacement(placement(collection, handle, link_id, hash)),
     ]
 }
 
@@ -243,7 +241,7 @@ fn a_body_lookup_never_crosses_an_account() {
     home.ensure_collection("home/AB", "text/vcard").unwrap();
 
     let found = home
-        .lookup_objects(&[ReplicaLinkId("uid-collide".into())])
+        .lookup_objects(&[PimdirLinkId("uid-collide".into())])
         .unwrap();
     assert!(
         found.is_empty(),
@@ -253,7 +251,7 @@ fn a_body_lookup_never_crosses_an_account() {
     // the same lookup within the owning account still answers, which is
     // what the read exists for
     let found = work
-        .lookup_objects(&[ReplicaLinkId("uid-collide".into())])
+        .lookup_objects(&[PimdirLinkId("uid-collide".into())])
         .unwrap();
     assert_eq!(found.len(), 1);
 }
@@ -276,7 +274,7 @@ fn a_body_lookup_still_dedups_across_collections() {
         .unwrap();
 
     let found = store
-        .lookup_objects(&[ReplicaLinkId("<msg@x>".into())])
+        .lookup_objects(&[PimdirLinkId("<msg@x>".into())])
         .unwrap();
     assert_eq!(
         found.len(),

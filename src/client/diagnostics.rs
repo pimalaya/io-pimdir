@@ -1,3 +1,5 @@
+//! # Diagnostics
+//!
 //! What a consistency check asks about the index rather than through it.
 //!
 //! These reads observe invariants the store maintains: whether a refcount
@@ -12,6 +14,7 @@
 //! already holds, read-only or owning.
 
 use alloc::{format, string::String, vec::Vec};
+
 use std::collections::BTreeSet;
 
 use rusqlite::{OptionalExtension, named_params};
@@ -111,9 +114,10 @@ impl PimdirReader {
         Ok((count.max(0) as u64, bytes.max(0) as u64))
     }
 
-    /// Every hash the index knows, to diff against the blob directory: the
-    /// index half of what [`PimdirBlobs::files`](crate::client::PimdirBlobs::files)
-    /// reads from disk.
+    /// Every hash the index knows, to diff against the blob directory:
+    /// the index half of what [`PimdirBlobs::files`] reads from disk.
+    ///
+    /// [`PimdirBlobs::files`]: crate::client::blobs::PimdirBlobs::files
     pub fn indexed_hashes(&self) -> Result<BTreeSet<String>, PimdirError> {
         Ok(rows(&self.conn, sql::LIST_OBJECT_HASHES, [], |r| r.get(0))?
             .into_iter()
@@ -125,8 +129,9 @@ impl PimdirReader {
     /// The expected count is exactly what the write path maintains
     /// incrementally: an item's body, an item's conflict copy, each source's
     /// stored base, and each queue row pinning a body it enqueued.
-    /// [`recompute_refcounts`](crate::client::PimdirStore::recompute_refcounts) is what
-    /// settles what this reports.
+    /// [`recompute_refcounts`] settles what this reports.
+    ///
+    /// [`recompute_refcounts`]: crate::client::PimdirStore::recompute_refcounts
     pub fn refcount_drift(&self) -> Result<Vec<PimdirRefcountDrift>, PimdirError> {
         Ok(rows(&self.conn, sql::REFCOUNT_DRIFT, [], |r| {
             Ok(PimdirRefcountDrift {
@@ -156,8 +161,10 @@ impl PimdirReader {
     /// Every row pointing at something absent: a binding whose item is gone, an
     /// item or a queue row whose object is not indexed.
     ///
-    /// Only the first is repairable ([`clear_dangling_bindings`](crate::client::PimdirStore::clear_dangling_bindings));
-    /// the other two still hold data, so they are reported and left alone.
+    /// Only the first is repairable, by [`clear_dangling_bindings`]; the
+    /// other two still hold data, so they are reported and left alone.
+    ///
+    /// [`clear_dangling_bindings`]: crate::client::PimdirStore::clear_dangling_bindings
     pub fn dangling(&self) -> Result<Vec<PimdirDangling>, PimdirError> {
         let mut dangling = rows(&self.conn, sql::DANGLING_BINDINGS, [], |r| {
             Ok(PimdirDangling {

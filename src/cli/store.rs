@@ -4,7 +4,7 @@ use std::fmt;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use io_replica::collection::ReplicaCollectionId;
+use io_pimdir::collection::PimdirCollectionId;
 use pimalaya_cli::{
     printer::Printer,
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
@@ -30,10 +30,11 @@ impl StoreCommand {
 }
 
 /// Summarise the store: its schema version, the sources it syncs, its
-/// per-collection live and retained counts, and how many bytes its bodies
-/// weigh, split between the live ones and the ones retention is holding.
+/// per-collection live and retained counts, how many bytes its bodies weigh,
+/// and where its change feed stands.
 ///
-/// The retained bytes are what `item purge` would reclaim.
+/// The retained bytes are what `item purge` would reclaim. The change cursor
+/// is what a consumer deriving from the store (a search index) records.
 #[derive(Debug, Args)]
 pub struct StoreInfoCommand;
 
@@ -48,7 +49,7 @@ impl StoreInfoCommand {
         let mut retained = 0;
 
         for collection in read.list_collections().map_err(report)? {
-            let id = ReplicaCollectionId(collection.id.clone());
+            let id = PimdirCollectionId(collection.id.clone());
             let collection_live = read.count_items(&collection.id).map_err(report)?;
             let collection_retained = read.count_retained(&id).map_err(report)?.max(0) as u64;
             live += collection_live;
@@ -63,6 +64,7 @@ impl StoreInfoCommand {
         let objects = read.object_stats().map_err(report)?;
         let live_bytes = read.live_bytes().map_err(report)?;
         let retained_bytes = read.retained_bytes().map_err(report)?;
+        let cursor = read.change_cursor().map_err(report)?;
 
         printer.out(StoreInfoOutput {
             path,
@@ -76,6 +78,8 @@ impl StoreInfoCommand {
             object_bytes: objects.bytes,
             live_bytes,
             retained_bytes,
+            next_change: cursor.next_change,
+            purges: cursor.purges,
         })
     }
 }
@@ -116,6 +120,10 @@ pub struct StoreInfoOutput {
     pub live_bytes: u64,
     /// What retention is holding, and what a purge would reclaim.
     pub retained_bytes: u64,
+    /// The next change stamp the feed will draw.
+    pub next_change: i64,
+    /// How many rows left the store without a stamp.
+    pub purges: i64,
 }
 
 impl fmt::Display for StoreInfoOutput {
@@ -147,6 +155,11 @@ impl fmt::Display for StoreInfoOutput {
             bytes(self.object_bytes),
             bytes(self.live_bytes),
             bytes(self.retained_bytes)
+        )?;
+        writeln!(
+            f,
+            " - change feed: next stamp {}, {} purge(s)",
+            self.next_change, self.purges
         )?;
 
         if self.collections.is_empty() {

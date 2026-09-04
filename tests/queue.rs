@@ -6,55 +6,57 @@
 use std::{io::Write, path::Path};
 
 use io_pimdir::{
-    PimdirBlobs, PimdirError, PimdirProducer, PimdirReader, PimdirSourceStore, PimdirStore,
-    codec::PimdirAction, hash::PimdirHashAlgo, sql,
-};
-use io_replica::{
-    change::{ReplicaDropReason, ReplicaWriteOp},
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+    change::{PimdirDropReason, PimdirWriteOp},
+    collection::PimdirCollectionId,
+    load::PimdirLoadScope,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
-    storage::ReplicaLoadScope,
+};
+use io_pimdir::{
+    client::blobs::PimdirBlobs,
+    client::producer::PimdirProducer,
+    client::reader::PimdirReader,
+    client::{PimdirError, PimdirSourceStore, PimdirStore},
+    codec::PimdirAction,
+    hash::PimdirHashAlgo,
+    sql,
 };
 
-const NOW: &str = "2026-08-07T00:00:00Z";
-
-fn inbox() -> ReplicaCollectionId {
-    ReplicaCollectionId("INBOX".into())
+fn inbox() -> PimdirCollectionId {
+    PimdirCollectionId("INBOX".into())
 }
 
 /// A hydrated, linked placement with a matching base (so it projects clean).
-fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> ReplicaPlacement {
-    let flags = ReplicaFlags::from_iter(flags.iter().copied());
-    ReplicaPlacement {
+fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> PimdirPlacement {
+    let flags = PimdirFlags::from_iter(flags.iter().copied());
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
-        object: Some(ReplicaHash(hash.into())),
-        level: ReplicaLevel::Full,
-        meta: None,
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
+        object: Some(PimdirHash(hash.into())),
+        level: PimdirLevel::Full,
+        summary: None,
         flags: flags.clone(),
-        status: ReplicaStatus::Clean,
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
+        base: Some(PimdirBase {
             flags,
             revision: None,
-            object: Some(ReplicaHash(hash.into())),
+            object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
     }
 }
 
-fn store_object(hash: &str, body: &[u8]) -> ReplicaWriteOp {
-    ReplicaWriteOp::StoreObject {
-        object: ReplicaObject {
-            hash: ReplicaHash(hash.into()),
+fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
+    PimdirWriteOp::StoreObject {
+        object: PimdirObject {
+            hash: PimdirHash(hash.into()),
             size: body.len(),
         },
         body: Some(body.to_vec()),
@@ -72,10 +74,11 @@ fn blob_exists(dir: &Path, hash: &str) -> bool {
 /// Seeds a one-item INBOX and returns `(store, seq)` for the item.
 fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
     let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
         ])
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
@@ -88,7 +91,7 @@ fn write_blob(dir: &Path, hash: &str, body: &[u8]) -> u64 {
     let blobs = PimdirBlobs::open(dir, PimdirHashAlgo::default());
     let mut writer = blobs.writer().unwrap();
     writer.write_all(body).unwrap();
-    writer.commit(&ReplicaHash(hash.into())).unwrap()
+    writer.commit(&PimdirHash(hash.into())).unwrap()
 }
 
 #[test]
@@ -98,16 +101,15 @@ fn a_queued_add_round_trips_into_a_staged_item() {
 
     // the producer writes the blob durably first, then enqueues in one
     // transaction, and the pending action shows in its own reads
-    let size = write_blob(dir.path(), "beef0000", b"new body");
+    let size = write_blob(dir.path(), "beef0000", b"Subject: hi\r\n\r\nnew body");
     let mut producer = PimdirProducer::open(dir.path(), "smtp").unwrap();
     let add = PimdirAction::Add {
-        link_id: Some(ReplicaLinkId("mid:new".into())),
-        flags: ReplicaFlags::from_iter(["\\Draft"]),
-        object: Some(ReplicaHash("beef0000".into())),
-        meta: Some(ReplicaMeta("{\"subject\":\"hi\",\"v\":1}".into())),
-        handle: Some(ReplicaHandle("draft-1".into())),
+        link_id: Some(PimdirLinkId("mid:new".into())),
+        flags: PimdirFlags::from_iter(["\\Draft"]),
+        object: Some(PimdirHash("beef0000".into())),
+        handle: Some(PimdirHandle("draft-1".into())),
     };
-    producer.enqueue("INBOX", &add, Some(size), NOW).unwrap();
+    producer.enqueue("INBOX", &add, Some(size)).unwrap();
 
     let pending = producer.pending_actions("INBOX").unwrap();
     assert_eq!(pending.len(), 1);
@@ -123,25 +125,24 @@ fn a_queued_add_round_trips_into_a_staged_item() {
 
     let items = store.list_items("INBOX", None, 10).unwrap();
     let item = items.iter().find(|i| i.link_id.0 == "mid:new").unwrap();
-    assert_eq!(item.object, Some(ReplicaHash("beef0000".into())));
-    assert_eq!(item.level, ReplicaLevel::Full);
+    assert_eq!(item.object, Some(PimdirHash("beef0000".into())));
+    assert_eq!(item.level, PimdirLevel::Full);
     assert!(item.flags.contains("\\Draft"));
-    assert_eq!(
-        item.meta.as_ref().unwrap().0,
-        "{\"subject\":\"hi\",\"v\":1}"
-    );
+    // the owner derived the summary from the body the producer wrote
+    let read = store.get_item("INBOX", item.seq).unwrap().unwrap();
+    assert_eq!(read.summary.as_ref().unwrap().title(), "hi");
 
     // projected as a base-less pending push, the shape a staged
     // in-process Add projects
     let projected = store
-        .load(&inbox(), &ReplicaLoadScope::All)
+        .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
     let created = projected
         .iter()
         .find(|p| p.link_id.as_ref().is_some_and(|l| l.0 == "mid:new"))
         .unwrap();
-    assert_ne!(created.status, ReplicaStatus::Clean, "a pending push");
+    assert_ne!(created.status, PimdirStatus::Clean, "a pending push");
     assert!(created.base.is_none(), "no prior sync: an append push");
 }
 
@@ -152,13 +153,12 @@ fn a_duplicate_add_parks_instead_of_clobbering() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let add = PimdirAction::Add {
-        link_id: Some(ReplicaLinkId("mid:a".into())),
-        flags: ReplicaFlags::default(),
+        link_id: Some(PimdirLinkId("mid:a".into())),
+        flags: PimdirFlags::default(),
         object: None,
-        meta: None,
         handle: None,
     };
-    producer.enqueue("INBOX", &add, None, NOW).unwrap();
+    producer.enqueue("INBOX", &add, None).unwrap();
 
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (0, 1));
@@ -181,23 +181,23 @@ fn set_flags_is_absolute_and_reapplies_idempotently() {
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let set = PimdirAction::SetFlags {
         seq,
-        flags: ReplicaFlags::from_iter(["\\Flagged"]),
+        flags: PimdirFlags::from_iter(["\\Flagged"]),
     };
 
-    producer.enqueue("INBOX", &set, None, NOW).unwrap();
+    producer.enqueue("INBOX", &set, None).unwrap();
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
 
     // absolute replacement: the old flag is gone, not merged
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
-    assert_eq!(item.flags, ReplicaFlags::from_iter(["\\Flagged"]));
+    assert_eq!(item.flags, PimdirFlags::from_iter(["\\Flagged"]));
 
     // reapplying the same absolute set is a no-op, never an error
-    producer.enqueue("INBOX", &set, None, NOW).unwrap();
+    producer.enqueue("INBOX", &set, None).unwrap();
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
-    assert_eq!(item.flags, ReplicaFlags::from_iter(["\\Flagged"]));
+    assert_eq!(item.flags, PimdirFlags::from_iter(["\\Flagged"]));
 }
 
 #[test]
@@ -207,7 +207,7 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
 
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None, NOW)
+        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
         .unwrap();
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
@@ -215,14 +215,14 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
     // hidden from reads, kept as a tombstone for the sync to push
     assert!(store.get_item("INBOX", seq).unwrap().is_none());
     let projected = store
-        .load(&inbox(), &ReplicaLoadScope::All)
+        .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
-    assert_eq!(projected[0].status, ReplicaStatus::Tombstone);
+    assert_eq!(projected[0].status, PimdirStatus::Tombstone);
 
     // removing it again is success, not a park
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None, NOW)
+        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
         .unwrap();
     let report = store.drain_collection("INBOX").unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
@@ -237,8 +237,8 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
         .write(vec![
             store_object("cafebabe", b"a"),
             store_object("cafebabf", b"b"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
-            ReplicaWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabf", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabf", &[])),
         ])
         .unwrap();
     let seq_of = |store: &PimdirStore, link: &str| {
@@ -259,10 +259,9 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
             "INBOX",
             &PimdirAction::Copy {
                 seq: seq_a,
-                to: ReplicaCollectionId("Backup".into()),
+                to: PimdirCollectionId("Backup".into()),
             },
             None,
-            NOW,
         )
         .unwrap();
     producer
@@ -270,10 +269,9 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
             "INBOX",
             &PimdirAction::Move {
                 seq: seq_b,
-                to: ReplicaCollectionId("Archive".into()),
+                to: PimdirCollectionId("Archive".into()),
             },
             None,
-            NOW,
         )
         .unwrap();
 
@@ -308,11 +306,9 @@ fn update_repoints_the_body() {
             "INBOX",
             &PimdirAction::Update {
                 seq,
-                object: ReplicaHash("beef0000".into()),
-                meta: None,
+                object: PimdirHash("beef0000".into()),
             },
             Some(size),
-            NOW,
         )
         .unwrap();
 
@@ -320,16 +316,16 @@ fn update_repoints_the_body() {
     assert_eq!((report.applied, report.parked), (1, 0));
 
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
-    assert_eq!(item.object, Some(ReplicaHash("beef0000".into())));
+    assert_eq!(item.object, Some(PimdirHash("beef0000".into())));
     // the old body survives: the sync base still references it
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert!(blob_exists(dir.path(), "beef0000"));
     // projected dirty, so the next sync pushes the edit
     let projected = store
-        .load(&inbox(), &ReplicaLoadScope::All)
+        .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
-    assert_eq!(projected[0].status, ReplicaStatus::Dirty);
+    assert_eq!(projected[0].status, PimdirStatus::Dirty);
 }
 
 #[test]
@@ -340,7 +336,7 @@ fn a_parked_action_does_not_block_later_actions() {
 
     // an unappliable action, then a valid one behind it
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 9999 }, None, NOW)
+        .enqueue("INBOX", &PimdirAction::Remove { seq: 9999 }, None)
         .unwrap();
     // NOTE: remove-of-absent succeeds, so the parking case is set-flags.
     producer
@@ -348,10 +344,9 @@ fn a_parked_action_does_not_block_later_actions() {
             "INBOX",
             &PimdirAction::SetFlags {
                 seq: 9999,
-                flags: ReplicaFlags::default(),
+                flags: PimdirFlags::default(),
             },
             None,
-            NOW,
         )
         .unwrap();
     producer
@@ -359,10 +354,9 @@ fn a_parked_action_does_not_block_later_actions() {
             "INBOX",
             &PimdirAction::SetFlags {
                 seq,
-                flags: ReplicaFlags::from_iter(["\\Answered"]),
+                flags: PimdirFlags::from_iter(["\\Answered"]),
             },
             None,
-            NOW,
         )
         .unwrap();
 
@@ -396,14 +390,12 @@ fn gc_never_sweeps_a_queued_body() {
         .enqueue(
             "INBOX",
             &PimdirAction::Add {
-                link_id: Some(ReplicaLinkId("mid:new".into())),
-                flags: ReplicaFlags::default(),
-                object: Some(ReplicaHash("beef0000".into())),
-                meta: None,
-                handle: Some(ReplicaHandle("draft-1".into())),
+                link_id: Some(PimdirLinkId("mid:new".into())),
+                flags: PimdirFlags::default(),
+                object: Some(PimdirHash("beef0000".into())),
+                handle: Some(PimdirHandle("draft-1".into())),
             },
             Some(size),
-            NOW,
         )
         .unwrap();
 
@@ -419,10 +411,10 @@ fn gc_never_sweeps_a_queued_body() {
     // the owner retires and purges the seeded item, orphaning its body,
     // and collects: the queued body survives the sweep, pinned by its row
     store
-        .write(vec![ReplicaWriteOp::DropPlacement {
+        .write(vec![PimdirWriteOp::DropPlacement {
             collection: inbox(),
-            handle: ReplicaHandle("1".into()),
-            reason: ReplicaDropReason::Deleted,
+            handle: PimdirHandle("1".into()),
+            reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
     assert!(store.purge(&inbox(), seeded_seq).unwrap());
@@ -445,10 +437,10 @@ fn gc_never_sweeps_a_queued_body() {
     // no leaked queue pin
     let seq = store.seq_for_link("INBOX", "mid:new").unwrap().unwrap();
     store
-        .write(vec![ReplicaWriteOp::DropPlacement {
+        .write(vec![PimdirWriteOp::DropPlacement {
             collection: inbox(),
-            handle: ReplicaHandle("draft-1".into()),
-            reason: ReplicaDropReason::Deleted,
+            handle: PimdirHandle("draft-1".into()),
+            reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
     assert!(store.purge(&inbox(), seq).unwrap());
@@ -469,18 +461,17 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     let submit = PimdirAction::Unknown {
         kind: "submit".into(),
         payload: "{\"v\":1,\"object\":\"beef0000\",\"to\":[\"a@b.c\"]}".into(),
-        object_hash: Some(ReplicaHash("beef0000".into())),
+        object_hash: Some(PimdirHash("beef0000".into())),
     };
-    let id = producer.enqueue("INBOX", &submit, Some(size), NOW).unwrap();
+    let id = producer.enqueue("INBOX", &submit, Some(size)).unwrap();
     producer
         .enqueue(
             "INBOX",
             &PimdirAction::SetFlags {
                 seq,
-                flags: ReplicaFlags::from_iter(["\\Answered"]),
+                flags: PimdirFlags::from_iter(["\\Answered"]),
             },
             None,
-            NOW,
         )
         .unwrap();
 
@@ -527,10 +518,9 @@ fn an_acknowledged_action_releases_its_queued_body() {
             &PimdirAction::Unknown {
                 kind: "submit".into(),
                 payload: "{\"v\":1,\"object\":\"beef0000\"}".into(),
-                object_hash: Some(ReplicaHash("beef0000".into())),
+                object_hash: Some(PimdirHash("beef0000".into())),
             },
             Some(size),
-            NOW,
         )
         .unwrap();
     assert!(blob_exists(dir.path(), "beef0000"));
@@ -559,7 +549,7 @@ fn a_failed_action_retries_until_it_is_parked() {
     let (mut store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let id = producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None, NOW)
+        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
         .unwrap();
 
     store.fail_action(id, None).unwrap();
@@ -593,7 +583,7 @@ fn a_generation_bump_is_visible_to_a_reader() {
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
         ])
         .unwrap();
     assert_eq!(store.generation("INBOX").unwrap(), Some(1));
@@ -601,31 +591,28 @@ fn a_generation_bump_is_visible_to_a_reader() {
     // a rekey bumps it in the same transaction: the item is re-bound
     // under its new handle and the epoch advances together
     let mut rekeyed = placement("101", "mid:a", "cafebabe", &[]);
-    rekeyed.status = ReplicaStatus::Clean;
-    let generation = store
-        .write_rekeyed(
-            "INBOX",
-            vec![
-                ReplicaWriteOp::DropPlacement {
-                    collection: inbox(),
-                    handle: ReplicaHandle("1".into()),
-                    // NOTE: a rekey replaces the row rather than deleting
-                    // the item; the same batch upserts it under its new
-                    // handle.
-                    reason: ReplicaDropReason::Superseded,
-                },
-                ReplicaWriteOp::UpsertPlacement(rekeyed),
-            ],
-        )
+    rekeyed.status = PimdirStatus::Clean;
+    store
+        .write(vec![
+            PimdirWriteOp::DropPlacement {
+                collection: inbox(),
+                handle: PimdirHandle("1".into()),
+                // NOTE: a rekey replaces the row rather than deleting
+                // the item; the same batch upserts it under its new
+                // handle.
+                reason: PimdirDropReason::Rekeyed,
+            },
+            PimdirWriteOp::UpsertPlacement(rekeyed),
+        ])
         .unwrap();
-    assert_eq!(generation, 2);
+    assert_eq!(store.generation("INBOX").unwrap(), Some(2));
 
     // and the item came with it: without this, the drop and the upsert
     // read as one source reporting an identity under a second handle, so
     // the binding would keep the handle the server had just voided
-    let carried = store.load(&inbox(), &ReplicaLoadScope::All).unwrap();
+    let carried = store.load(&inbox(), &PimdirLoadScope::All).unwrap();
     assert_eq!(carried.placements.len(), 1);
-    assert_eq!(carried.placements[0].handle, ReplicaHandle("101".into()));
+    assert_eq!(carried.placements[0].handle, PimdirHandle("101".into()));
 
     // a second reader handle over the same files observes the new epoch
     let reader = PimdirStore::open(dir.path()).unwrap();
@@ -707,10 +694,9 @@ fn an_action_the_draining_source_cannot_place_is_skipped_not_parked() {
             "INBOX",
             &PimdirAction::SetFlags {
                 seq,
-                flags: ReplicaFlags::default(),
+                flags: PimdirFlags::default(),
             },
             None,
-            NOW,
         )
         .unwrap();
 
@@ -726,5 +712,5 @@ fn an_action_the_draining_source_cannot_place_is_skipped_not_parked() {
     assert_eq!((report.applied, report.skipped, report.parked), (1, 0, 0));
 
     let item = owner.get_item("INBOX", seq).unwrap().unwrap();
-    assert_eq!(item.flags, ReplicaFlags::default());
+    assert_eq!(item.flags, PimdirFlags::default());
 }

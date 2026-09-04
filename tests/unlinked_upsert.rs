@@ -7,39 +7,38 @@
 //! row for it hands the engine two placements for one handle, which is
 //! where a spurious `dup:` key comes from.
 
-use io_pimdir::{PimdirError, PimdirSourceStore, PimdirStore};
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
+use io_pimdir::client::{PimdirError, PimdirSourceStore, PimdirStore};
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    load::PimdirLoadScope,
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
-    storage::ReplicaLoadScope,
 };
 use tempfile::tempdir;
 
-fn inbox() -> ReplicaCollectionId {
-    ReplicaCollectionId("INBOX".into())
+fn inbox() -> PimdirCollectionId {
+    PimdirCollectionId("INBOX".into())
 }
 
 /// A linked placement, the shape a resolved item is written back in.
-fn placement(handle: &str, link: &str) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn placement(handle: &str, link: &str) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
         object: None,
-        level: ReplicaLevel::Meta,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        level: PimdirLevel::Meta,
+        summary: None,
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: Some("1".into()),
             object: None,
         }),
@@ -50,21 +49,21 @@ fn placement(handle: &str, link: &str) -> ReplicaPlacement {
 /// The freshly probed placement io-replica's `sync` builds for a remote
 /// item it has no local side for: a handle, flags and a revision, and no
 /// identity at all.
-fn probed(handle: &str, revision: &str) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn probed(handle: &str, revision: &str) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
+        handle: PimdirHandle(handle.into()),
         link_id: None,
         object: None,
-        level: ReplicaLevel::Probed,
-        meta: None,
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        level: PimdirLevel::Probed,
+        summary: None,
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: Some(revision.into()),
             object: None,
         }),
@@ -72,9 +71,9 @@ fn probed(handle: &str, revision: &str) -> ReplicaPlacement {
     }
 }
 
-fn projected(store: &PimdirSourceStore) -> Vec<ReplicaPlacement> {
+fn projected(store: &PimdirSourceStore) -> Vec<PimdirPlacement> {
     let mut placements = store
-        .load(&inbox(), &ReplicaLoadScope::All)
+        .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
     placements.sort_by(|a, b| a.handle.cmp(&b.handle));
@@ -95,13 +94,13 @@ fn an_unlinked_upsert_lands_on_the_binding_its_handle_holds() {
     let mut store = opened(dir.path());
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "u1", "msg-a",
         ))])
         .unwrap();
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(probed("u1", "2"))])
+        .write(vec![PimdirWriteOp::UpsertPlacement(probed("u1", "2"))])
         .unwrap();
 
     let placements = projected(&store);
@@ -110,10 +109,10 @@ fn an_unlinked_upsert_lands_on_the_binding_its_handle_holds() {
         1,
         "a bound handle answers with one placement, never two: {placements:?}",
     );
-    assert_eq!(placements[0].handle, ReplicaHandle("u1".into()));
+    assert_eq!(placements[0].handle, PimdirHandle("u1".into()));
     assert_eq!(
         placements[0].link_id,
-        Some(ReplicaLinkId("msg-a".into())),
+        Some(PimdirLinkId("msg-a".into())),
         "and it is the item the handle was already bound to",
     );
 }
@@ -127,27 +126,27 @@ fn a_resurrected_tombstone_stays_one_item() {
     let mut store = opened(dir.path());
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "u1", "msg-a",
         ))])
         .unwrap();
 
     let mut tombstone = placement("u1", "msg-a");
-    tombstone.status = ReplicaStatus::Tombstone;
+    tombstone.status = PimdirStatus::Tombstone;
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(tombstone)])
+        .write(vec![PimdirWriteOp::UpsertPlacement(tombstone)])
         .unwrap();
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(probed("u1", "2"))])
+        .write(vec![PimdirWriteOp::UpsertPlacement(probed("u1", "2"))])
         .unwrap();
 
     let placements = projected(&store);
     assert_eq!(placements.len(), 1, "{placements:?}");
-    assert_eq!(placements[0].link_id, Some(ReplicaLinkId("msg-a".into())));
+    assert_eq!(placements[0].link_id, Some(PimdirLinkId("msg-a".into())));
     assert_eq!(
         placements[0].status,
-        ReplicaStatus::Clean,
+        PimdirStatus::Clean,
         "the pull resurrects the item rather than adding a second one",
     );
 }
@@ -160,12 +159,12 @@ fn a_probe_of_an_unbound_handle_stays_unlinked() {
     let mut store = opened(dir.path());
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(probed("u1", "1"))])
+        .write(vec![PimdirWriteOp::UpsertPlacement(probed("u1", "1"))])
         .unwrap();
 
     let placements = projected(&store);
     assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].handle, ReplicaHandle("u1".into()));
+    assert_eq!(placements[0].handle, PimdirHandle("u1".into()));
     assert_eq!(
         placements[0].link_id, None,
         "a freshly probed row claims no identity",
@@ -181,15 +180,15 @@ fn an_unlinked_upsert_is_seen_by_the_rebind_guard() {
     let mut store = opened(dir.path());
 
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "u1", "msg-a",
         ))])
         .unwrap();
 
     let refused = store
         .write(vec![
-            ReplicaWriteOp::UpsertPlacement(probed("u1", "2")),
-            ReplicaWriteOp::UpsertPlacement(placement("u2", "msg-a")),
+            PimdirWriteOp::UpsertPlacement(probed("u1", "2")),
+            PimdirWriteOp::UpsertPlacement(placement("u2", "msg-a")),
         ])
         .unwrap_err();
 
@@ -201,5 +200,5 @@ fn an_unlinked_upsert_is_seen_by_the_rebind_guard() {
 
     let placements = projected(&store);
     assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].handle, ReplicaHandle("u1".into()));
+    assert_eq!(placements[0].handle, PimdirHandle("u1".into()));
 }

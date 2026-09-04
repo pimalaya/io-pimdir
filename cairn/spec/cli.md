@@ -14,8 +14,8 @@ questions the library has no reason to answer.
 ### Requirement: The CLI is an operator tool, never a client
 The `pimdir` binary SHALL be to a store what `sqlite3` is to a database: an
 inspection, repair and recovery tool. It SHALL NOT interpret item content. It
-prints `seq`, `link_id`, flags, level, the object hash and the **raw** meta
-string, and exports bodies as raw bytes. Rendering a message, a vCard or an
+prints `seq`, `link_id`, flags, level, the object hash and the summary row
+as stored (its columns and its address rows), and exports bodies as raw bytes. Rendering a message, a vCard or an
 event is a per-kind consumer's job (himalaya, cardamum), never this tool's,
 because a pimdir store is kind-agnostic and one binary cannot render every kind
 it may hold.
@@ -53,8 +53,9 @@ item SHALL report neither success nor silence, but point at the parked-action
 listing.
 
 `item restore` SHALL rebuild the item from the retained row's own values (link
-id, flags, meta, object hash) as an `add` action: the retained row still holds
-them, and the store's revive branch adopts them back onto the same row. The
+id, flags, object hash) as an `add` action: the retained row still holds them,
+the store's revive branch adopts them back onto the same row, and the owner
+derives the summary from the body again. The
 body is already indexed, so the enqueue references the existing object rather
 than re-writing a blob.
 
@@ -105,12 +106,14 @@ left out rather than return a shorter list.
 ### Requirement: The verb surface
 The CLI SHALL expose, at minimum:
 
-- `collection list`: id, kind, name, generation, live count and retained count.
-- `item list`: a collection's live items, or its retained ones with
-  `--retained`, keyset-paged with `--after` and `--limit`.
+- `collection list`: id, kind, name, generation, live count, probe count (the
+  handles enumerated but not yet identified) and retained count.
+- `item list`: a collection's live items in the kind's own order with the
+  summary's title, or its retained ones with `--retained`, keyset-paged with
+  `--after` and `--limit`.
 - `item show`: one item by its public `seq`, across every collection that holds
-  it, retained placements included, each with the bindings its sources hold it
-  under.
+  it, retained placements included, each with its summary row and addresses as
+  stored and the bindings its sources hold it under.
 - `item export`: an item's body as raw bytes on stdout, or to a file.
 - `item restore`: revive a retained item (see the enqueue-then-drain
   requirement above).
@@ -154,7 +157,8 @@ worse than a reported inconsistency, and reclaiming is not repairing: a body is
 ### Requirement: The dump carries metadata and bytes, nothing derived
 `export` SHALL write a manifest describing the store and its collections, one
 JSON-lines file of items per collection, and a copy of the blob tree. Items
-SHALL be dumped exactly as stored, and bodies byte for byte. Collection files
+SHALL be dumped exactly as stored, a live item's line carrying its summary
+columns and address rows, and bodies byte for byte. Collection files
 SHALL be numbered and mapped in the manifest rather than named after collection
 ids, since an id may hold anything a mailbox name may hold.
 

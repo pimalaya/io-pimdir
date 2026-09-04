@@ -8,48 +8,47 @@
 
 use std::fs;
 
-use io_pimdir::{PimdirStore, sql};
-use io_replica::{
-    change::{ReplicaDropReason, ReplicaWriteOp},
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::{
+    change::{PimdirDropReason, PimdirWriteOp},
+    collection::PimdirCollectionId,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
 };
+use io_pimdir::{client::PimdirStore, sql};
 
-fn inbox() -> ReplicaCollectionId {
-    ReplicaCollectionId("INBOX".into())
+fn inbox() -> PimdirCollectionId {
+    PimdirCollectionId("INBOX".into())
 }
 
-fn placement(handle: &str, link: &str, hash: &str) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn placement(handle: &str, link: &str, hash: &str) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
-        object: Some(ReplicaHash(hash.into())),
-        level: ReplicaLevel::Full,
-        meta: Some(ReplicaMeta("{\"v\":1}".into())),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
+        object: Some(PimdirHash(hash.into())),
+        level: PimdirLevel::Full,
+        summary: None,
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: None,
-            object: Some(ReplicaHash(hash.into())),
+            object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
     }
 }
 
-fn store_object(hash: &str, body: &[u8]) -> ReplicaWriteOp {
-    ReplicaWriteOp::StoreObject {
-        object: ReplicaObject {
-            hash: ReplicaHash(hash.into()),
+fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
+    PimdirWriteOp::StoreObject {
+        object: PimdirObject {
+            hash: PimdirHash(hash.into()),
             size: body.len(),
         },
         body: Some(body.to_vec()),
@@ -85,13 +84,13 @@ fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
 
     // batch two attaches one of them, both having survived
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "1", "mid:a", "cafebabe",
         ))])
         .unwrap();
     assert_eq!(
         store.list_items("INBOX", None, 10).unwrap()[0].object,
-        Some(ReplicaHash("cafebabe".into()))
+        Some(PimdirHash("cafebabe".into()))
     );
 
     // the one nothing attached is what a collection is for
@@ -115,7 +114,7 @@ fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
     store
         .write(vec![
             store_object("cafebabe", b"body"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
         ])
         .unwrap();
 
@@ -145,14 +144,14 @@ fn a_purge_retires_rows_and_the_collector_reclaims_the_bytes() {
     store
         .write(vec![
             store_object("cafebabe", b"body"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
         ])
         .unwrap();
     store
-        .write(vec![ReplicaWriteOp::DropPlacement {
+        .write(vec![PimdirWriteOp::DropPlacement {
             collection: inbox(),
-            handle: ReplicaHandle("1".into()),
-            reason: ReplicaDropReason::Deleted,
+            handle: PimdirHandle("1".into()),
+            reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
 
@@ -179,7 +178,7 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
     store
         .write(vec![
             store_object("cafebabe", b"body"),
-            ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
         ])
         .unwrap();
 
@@ -212,7 +211,7 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
 
     // and the statement is the canonical one, run against the real schema
     assert!(
-        sql::ALL
+        sql::CANONICAL
             .iter()
             .any(|(name, _)| *name == "RECOMPUTE_REFCOUNTS")
     );

@@ -21,7 +21,7 @@ use clap::Args;
 use pimalaya_cli::printer::Printer;
 use serde::Serialize;
 
-use io_pimdir::{PimdirDangling, PimdirMinted, PimdirRefcountDrift};
+use io_pimdir::client::diagnostics::{PimdirDangling, PimdirMinted, PimdirRefcountDrift};
 
 use crate::cli::{StoreFlags, bytes, report};
 

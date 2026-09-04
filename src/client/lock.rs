@@ -1,4 +1,6 @@
-//! The advisory locks the store's single-owner rule is made of (spec §8).
+//! # Locks
+//!
+//! The advisory locks the store's single-owner rule is made of (STORAGE §8).
 //!
 //! Two files sit beside `pimdir.db`, each locked by the handle that took it
 //! and released when that handle drops:

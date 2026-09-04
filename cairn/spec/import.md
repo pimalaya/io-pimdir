@@ -10,7 +10,7 @@ Not yet implemented. This is the reference mapping for the import scripts that
 turn an existing Maildir, m2dir or vdir tree into a valid pimdir store. It has no
 counterpart on-disk format: there is one store format (the pimdir SQLite store),
 and importing is a one-way, script-driven conversion *into* it. Kept here so the
-translation decisions — which are lossy and opinionated — are written down before
+translation decisions, which are lossy and opinionated, are written down before
 the code exists.
 
 ## Mapping

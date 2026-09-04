@@ -18,6 +18,7 @@ pub mod gc;
 pub mod item;
 pub mod queue;
 pub mod store;
+pub mod summary;
 
 use std::{
     io::{IsTerminal, stdin, stdout},
@@ -27,7 +28,9 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
-use io_pimdir::{PimdirBlobs, PimdirError, PimdirProducer, PimdirReader, PimdirStore};
+use io_pimdir::client::{
+    PimdirError, PimdirStore, blobs::PimdirBlobs, producer::PimdirProducer, reader::PimdirReader,
+};
 use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
 
 /// The producer name recorded on every queue row this tool appends, so an
@@ -168,6 +171,11 @@ pub fn report(err: PimdirError) -> anyhow::Error {
         PimdirError::Busy => {
             anyhow!(
                 "another writer holds the store lock (a sync is running?); retry once it releases"
+            )
+        }
+        PimdirError::Stale { table } => {
+            anyhow!(
+                "this store was written by an earlier draft of the format and lacks the {table} table: delete it and let it resync"
             )
         }
         err => anyhow!(err),

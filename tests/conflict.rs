@@ -4,7 +4,7 @@
 //! in `bindings.conflicted`, `bindings.conflict_revision` and
 //! `bindings.conflict_object`. Without it the merge re-derives on every run the
 //! push the remote already rejected, never converging, and a client cannot tell
-//! which items need a human — so this is about the state surviving a *reopen*,
+//! which items need a human, so this is about the state surviving a *reopen*,
 //! not just a round trip in memory.
 //!
 //! The body has a second requirement the revision does not: it has to outlive
@@ -12,22 +12,21 @@
 //! that found the divergence, and a body swept in between leaves a revision
 //! naming bytes nobody holds.
 
-use io_pimdir::{PimdirSourceStore, PimdirStore};
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    hub::ReplicaSourceId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::client::{PimdirSourceStore, PimdirStore};
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    hub::PimdirSourceId,
+    load::PimdirLoadScope,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
-    storage::ReplicaLoadScope,
 };
 
-fn contacts() -> ReplicaCollectionId {
-    ReplicaCollectionId("contacts".into())
+fn contacts() -> PimdirCollectionId {
+    PimdirCollectionId("contacts".into())
 }
 
 /// A placement of one card: the body it carries, where it sits, and the
@@ -43,35 +42,35 @@ fn card(
     handle: &str,
     link: &str,
     object: &str,
-    status: ReplicaStatus,
+    status: PimdirStatus,
     conflict_revision: Option<&str>,
     conflict_object: Option<&str>,
-) -> ReplicaPlacement {
-    ReplicaPlacement {
+) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
-        collection: ReplicaCollectionId(collection.into()),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
-        object: Some(ReplicaHash(object.into())),
-        level: ReplicaLevel::Full,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        flags: ReplicaFlags::default(),
+        collection: PimdirCollectionId(collection.into()),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
+        object: Some(PimdirHash(object.into())),
+        level: PimdirLevel::Full,
+        summary: None,
+        flags: PimdirFlags::default(),
         status,
         conflict_revision: conflict_revision.map(Into::into),
-        conflict_object: conflict_object.map(|hash| ReplicaHash(hash.into())),
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        conflict_object: conflict_object.map(|hash| PimdirHash(hash.into())),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: Some("r-base".into()),
-            object: Some(ReplicaHash("0rig".into())),
+            object: Some(PimdirHash("0rig".into())),
         }),
         origin: None,
     }
 }
 
-fn store_object(hash: &str, body: &[u8]) -> ReplicaWriteOp {
-    ReplicaWriteOp::StoreObject {
-        object: ReplicaObject {
-            hash: ReplicaHash(hash.into()),
+fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
+    PimdirWriteOp::StoreObject {
+        object: PimdirObject {
+            hash: PimdirHash(hash.into()),
             size: body.len(),
         },
         body: Some(body.to_vec()),
@@ -105,10 +104,10 @@ fn body_of(hash: &str) -> Vec<u8> {
 /// separately would leave the placement's foreign key dangling.
 fn card_batch(
     object: &str,
-    status: ReplicaStatus,
+    status: PimdirStatus,
     conflict_revision: Option<&str>,
     conflict_object: Option<&str>,
-) -> Vec<ReplicaWriteOp> {
+) -> Vec<PimdirWriteOp> {
     let mut batch = vec![
         store_object("0rig", b"old"),
         store_object(object, &body_of(object)),
@@ -118,7 +117,7 @@ fn card_batch(
         batch.push(store_object(hash, b"remote"));
     }
 
-    batch.push(ReplicaWriteOp::UpsertPlacement(card(
+    batch.push(PimdirWriteOp::UpsertPlacement(card(
         "contacts",
         "card1.vcf",
         "uid:a",
@@ -138,7 +137,7 @@ fn a_conflict_survives_a_reopen() {
     store
         .write(card_batch(
             "ed17",
-            ReplicaStatus::Conflict,
+            PimdirStatus::Conflict,
             Some("r-remote"),
             Some("rmte"),
         ))
@@ -148,9 +147,9 @@ fn a_conflict_survives_a_reopen() {
     // Reopened from disk: the merge must still see the conflict, or it
     // re-derives the push the remote already rejected.
     let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let loaded = store.load(&contacts(), &ReplicaLoadScope::All).unwrap();
+    let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
     assert_eq!(loaded.placements.len(), 1);
-    assert_eq!(loaded.placements[0].status, ReplicaStatus::Conflict);
+    assert_eq!(loaded.placements[0].status, PimdirStatus::Conflict);
     assert_eq!(
         loaded.placements[0].conflict_revision.as_deref(),
         Some("r-remote"),
@@ -158,7 +157,7 @@ fn a_conflict_survives_a_reopen() {
     );
     assert_eq!(
         loaded.placements[0].conflict_object,
-        Some(ReplicaHash("rmte".into())),
+        Some(PimdirHash("rmte".into())),
         "and the body at that revision is what it merges, with no remote to ask"
     );
 }
@@ -166,12 +165,12 @@ fn a_conflict_survives_a_reopen() {
 /// A resolution moves the item's body, and that is the half of it the
 /// store has to make durable.
 ///
-/// Clearing the flags is the visible half. io-replica's hub requires the
+/// Clearing the flags is the visible half. the hub requires the
 /// resolving edit to be adopted as the shared body too, because a binding
 /// cleared of its conflict while the item still holds the body the merge
 /// replaced leaves the next run pushing the unmerged body over the remote
 /// the merge was made against. That is `items.object_hash` moving, and
-/// this is the only place a resolution is driven through the store, so a
+/// this is the only place a resolution is run through the store, so a
 /// resolution written at the body the conflict was filed at would assert
 /// the flags and nothing else.
 #[test]
@@ -182,7 +181,7 @@ fn resolving_the_conflict_clears_it_and_adopts_the_merged_body() {
     store
         .write(card_batch(
             "ed17",
-            ReplicaStatus::Conflict,
+            PimdirStatus::Conflict,
             Some("r-remote"),
             Some("rmte"),
         ))
@@ -190,13 +189,13 @@ fn resolving_the_conflict_clears_it_and_adopts_the_merged_body() {
     // The consumer resolves with an ordinary edit, carrying the merged
     // card: no dedicated call, and a body neither side held before.
     store
-        .write(card_batch("mrgd", ReplicaStatus::Dirty, None, None))
+        .write(card_batch("mrgd", PimdirStatus::Dirty, None, None))
         .unwrap();
     drop(store);
 
     let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let loaded = store.load(&contacts(), &ReplicaLoadScope::All).unwrap();
-    assert_ne!(loaded.placements[0].status, ReplicaStatus::Conflict);
+    let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
+    assert_ne!(loaded.placements[0].status, PimdirStatus::Conflict);
     assert_eq!(
         loaded.placements[0].conflict_revision, None,
         "a resolved binding must not carry a stale revision forward"
@@ -208,87 +207,19 @@ fn resolving_the_conflict_clears_it_and_adopts_the_merged_body() {
 
     assert_eq!(
         loaded.placements[0].object,
-        Some(ReplicaHash("mrgd".into())),
+        Some(PimdirHash("mrgd".into())),
         "the merged card is what the store holds; keeping the pre-merge body \
          discards the resolution and pushes it over the remote next run"
     );
     assert_eq!(
-        store.blobs().get(&ReplicaHash("mrgd".into())).unwrap(),
+        store.blobs().get(&PimdirHash("mrgd".into())).unwrap(),
         Some(body_of("mrgd")),
         "and the hash it holds resolves to the merged bytes"
     );
     assert_eq!(
         store.list_items("contacts", None, 10).unwrap()[0].object,
-        Some(ReplicaHash("mrgd".into())),
+        Some(PimdirHash("mrgd".into())),
         "and the client read agrees with the seam about which body it is"
-    );
-}
-
-#[test]
-fn a_store_from_an_earlier_draft_of_v1_is_reconciled_on_open() {
-    // The draft allowance (spec §6): the three columns were folded into version
-    // 1 after it was published, so a store written by an earlier draft is
-    // stamped `user_version = 1` yet lacks them. It must be healed on open, not
-    // left to fail on the next query.
-    let dir = tempfile::tempdir().unwrap();
-    let store = PimdirStore::open(dir.path()).unwrap();
-    drop(store);
-
-    // Rewind the store to the earlier draft's shape. The two indexes go
-    // first: SQLite refuses to drop a column an index names, and a draft
-    // without the columns could not have carried them either.
-    let db = dir.path().join("pimdir.db");
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch("DROP INDEX bindings_conflicted")
-        .unwrap();
-    conn.execute_batch("DROP INDEX bindings_by_conflict_object")
-        .unwrap();
-    conn.execute_batch("ALTER TABLE bindings DROP COLUMN conflicted")
-        .unwrap();
-    conn.execute_batch("ALTER TABLE bindings DROP COLUMN conflict_revision")
-        .unwrap();
-    conn.execute_batch("ALTER TABLE bindings DROP COLUMN conflict_object")
-        .unwrap();
-    let version: i64 = conn
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, 1, "still stamped current, so nothing flags it");
-    drop(conn);
-
-    // Opening heals it, and the store works.
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    store.ensure_collection("contacts", "text/vcard").unwrap();
-    store
-        .write(card_batch(
-            "ed17",
-            ReplicaStatus::Conflict,
-            Some("r-remote"),
-            Some("rmte"),
-        ))
-        .unwrap();
-
-    let loaded = store.load(&contacts(), &ReplicaLoadScope::All).unwrap();
-    assert_eq!(loaded.placements[0].status, ReplicaStatus::Conflict);
-    assert_eq!(
-        loaded.placements[0].conflict_revision.as_deref(),
-        Some("r-remote")
-    );
-    assert_eq!(
-        loaded.placements[0].conflict_object,
-        Some(ReplicaHash("rmte".into())),
-        "the column is not just back, it holds what the sync wrote through it"
-    );
-
-    // Idempotent: a second open of a current store changes nothing.
-    drop(store);
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    assert_eq!(
-        store
-            .load(&contacts(), &ReplicaLoadScope::All)
-            .unwrap()
-            .placements[0]
-            .status,
-        ReplicaStatus::Conflict
     );
 }
 
@@ -306,7 +237,7 @@ fn a_conflict_body_outlives_a_collection() {
     store
         .write(card_batch(
             "ed17",
-            ReplicaStatus::Conflict,
+            PimdirStatus::Conflict,
             Some("r-remote"),
             Some("rmte"),
         ))
@@ -320,10 +251,10 @@ fn a_conflict_body_outlives_a_collection() {
         "the divergence a person has not looked at yet is still readable"
     );
 
-    let loaded = store.load(&contacts(), &ReplicaLoadScope::All).unwrap();
+    let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
     assert_eq!(
         loaded.placements[0].conflict_object,
-        Some(ReplicaHash("rmte".into()))
+        Some(PimdirHash("rmte".into()))
     );
 }
 
@@ -344,13 +275,13 @@ fn resolving_releases_the_pin_and_the_next_collection_takes_the_body() {
     store
         .write(card_batch(
             "ed17",
-            ReplicaStatus::Conflict,
+            PimdirStatus::Conflict,
             Some("r-remote"),
             Some("rmte"),
         ))
         .unwrap();
     store
-        .write(card_batch("mrgd", ReplicaStatus::Dirty, None, None))
+        .write(card_batch("mrgd", PimdirStatus::Dirty, None, None))
         .unwrap();
     assert!(
         store.refcount_drift().unwrap().is_empty(),
@@ -372,7 +303,7 @@ fn resolving_releases_the_pin_and_the_next_collection_takes_the_body() {
         "and the pre-merge body is released rather than pinned for ever"
     );
     assert_eq!(
-        store.blobs().get(&ReplicaHash("mrgd".into())).unwrap(),
+        store.blobs().get(&PimdirHash("mrgd".into())).unwrap(),
         Some(body_of("mrgd")),
         "the merged body is what survives the collection"
     );
@@ -397,7 +328,7 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
             "contacts",
             "card1.vcf",
             "uid:a",
-            ReplicaStatus::Conflict,
+            PimdirStatus::Conflict,
             Some("r-remote"),
             Some("rmte"),
         ),
@@ -405,7 +336,7 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
             "contacts",
             "card2.vcf",
             "uid:b",
-            ReplicaStatus::Clean,
+            PimdirStatus::Clean,
             None,
             None,
         ),
@@ -413,7 +344,7 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
             "calendar",
             "event1.ics",
             "uid:c",
-            ReplicaStatus::Conflict,
+            PimdirStatus::Conflict,
             Some("r-event"),
             Some("evnt"),
         ),
@@ -421,7 +352,7 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
             "calendar",
             "event2.ics",
             "uid:d",
-            ReplicaStatus::Clean,
+            PimdirStatus::Clean,
             None,
             None,
         ),
@@ -433,7 +364,7 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
         if let Some(hash) = object {
             batch.push(store_object(hash, b"remote"));
         }
-        batch.push(ReplicaWriteOp::UpsertPlacement(card(
+        batch.push(PimdirWriteOp::UpsertPlacement(card(
             collection, handle, link, "ed17", status, revision, object,
         )));
         store.write(batch).unwrap();
@@ -445,18 +376,18 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
     // Ordered by collection, so the calendar comes first.
     let event = &conflicts[0];
     assert_eq!(event.collection, "calendar");
-    assert_eq!(event.link_id, ReplicaLinkId("uid:c".into()));
-    assert_eq!(event.source, ReplicaSourceId("left".into()));
-    assert_eq!(event.handle, ReplicaHandle("event1.ics".into()));
+    assert_eq!(event.link_id, PimdirLinkId("uid:c".into()));
+    assert_eq!(event.source, PimdirSourceId("left".into()));
+    assert_eq!(event.handle, PimdirHandle("event1.ics".into()));
     assert_eq!(event.conflict_revision.as_deref(), Some("r-event"));
-    assert_eq!(event.conflict_object, Some(ReplicaHash("evnt".into())));
+    assert_eq!(event.conflict_object, Some(PimdirHash("evnt".into())));
 
     // The three bodies of a divergence, off one row: what the two sides last
     // agreed on, what this store holds, and what the remote holds.
     let card = &conflicts[1];
     assert_eq!(card.collection, "contacts");
-    assert_eq!(card.link_id, ReplicaLinkId("uid:a".into()));
-    assert_eq!(card.base_object, Some(ReplicaHash("0rig".into())));
-    assert_eq!(card.object, Some(ReplicaHash("ed17".into())));
-    assert_eq!(card.conflict_object, Some(ReplicaHash("rmte".into())));
+    assert_eq!(card.link_id, PimdirLinkId("uid:a".into()));
+    assert_eq!(card.base_object, Some(PimdirHash("0rig".into())));
+    assert_eq!(card.object, Some(PimdirHash("ed17".into())));
+    assert_eq!(card.conflict_object, Some(PimdirHash("rmte".into())));
 }

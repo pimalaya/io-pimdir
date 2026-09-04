@@ -4,13 +4,18 @@
 //! statements without serialising operations, so two owners could each read a
 //! consistent snapshot and then each act on it. An advisory lock on the store
 //! directory is what makes "at most one owner" a fact rather than a convention
-//! about who runs what, and the roles that are not owners — a reader, a
-//! producer appending to the queue — go on working while it is held.
+//! about who runs what, and the roles that are not owners, a reader or a
+//! producer appending to the queue, go on working while it is held.
 
 use std::{fs::File, fs::OpenOptions, path::Path};
 
 use fs4::FileExt;
-use io_pimdir::{PimdirError, PimdirProducer, PimdirReader, PimdirStore, codec::PimdirAction};
+use io_pimdir::{
+    client::producer::PimdirProducer,
+    client::reader::PimdirReader,
+    client::{PimdirError, PimdirStore},
+    codec::PimdirAction,
+};
 
 /// Creates the store, then lets go of it.
 fn create(dir: &Path) {
@@ -80,12 +85,7 @@ fn a_producer_appends_while_another_process_owns_the_store() {
     // the owner is mid-sync, and the owner drains it when it gets there.
     let id = PimdirProducer::open(dir.path(), "test")
         .unwrap()
-        .enqueue(
-            "INBOX",
-            &PimdirAction::Remove { seq: 1 },
-            None,
-            "2026-01-01T00:00:00.000Z",
-        )
+        .enqueue("INBOX", &PimdirAction::Remove { seq: 1 }, None)
         .unwrap();
     assert_eq!(id, 1);
 }

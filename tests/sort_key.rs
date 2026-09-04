@@ -7,30 +7,29 @@
 //! show fifty rows, and one that cannot rename forces a full re-download
 //! to change one string.
 
-use io_pimdir::{PimdirSourceStore, PimdirStore};
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
+use io_pimdir::client::{PimdirSourceStore, PimdirStore};
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    load::PimdirLoadScope,
     placement::{
-        ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta, ReplicaPlacement,
-        ReplicaSortKey, ReplicaStatus,
+        PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey,
+        PimdirStatus,
     },
-    storage::ReplicaLoadScope,
 };
 use tempfile::tempdir;
 
-fn placement(collection: &str, handle: &str, link_id: &str) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn placement(collection: &str, handle: &str, link_id: &str) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
-        collection: ReplicaCollectionId(collection.into()),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link_id.into())),
+        collection: PimdirCollectionId(collection.into()),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link_id.into())),
         object: None,
-        level: ReplicaLevel::Meta,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        level: PimdirLevel::Meta,
+        summary: None,
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
         base: None,
@@ -45,7 +44,7 @@ fn seed(store: &mut PimdirSourceStore, collection: &str, items: &[(&str, &str, &
     let ops = items
         .iter()
         .map(|(handle, link, _)| {
-            ReplicaWriteOp::UpsertPlacement(placement(collection, handle, link))
+            PimdirWriteOp::UpsertPlacement(placement(collection, handle, link))
         })
         .collect();
     store.write(ops).expect("stage the placements");
@@ -58,7 +57,7 @@ fn seed(store: &mut PimdirSourceStore, collection: &str, items: &[(&str, &str, &
 }
 
 /// The `(sort_key, seq)` cursor of a page's last item.
-fn cursor(page: &[io_pimdir::PimdirItem]) -> (String, i64) {
+fn cursor(page: &[io_pimdir::client::reader::PimdirItem]) -> (String, i64) {
     let last = page.last().expect("a non-empty page");
     (last.sort_key.clone(), last.seq)
 }
@@ -164,7 +163,7 @@ fn an_ordinary_write_does_not_reset_a_sort_key() {
 
     // a second write of the same placement, as a re-sync produces
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placement(
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "INBOX", "1", "a",
         ))])
         .expect("re-write the placement");
@@ -209,8 +208,8 @@ fn renaming_a_collection_carries_its_contents() {
     // every item as new and re-download the collection
     let loaded = store
         .load(
-            &ReplicaCollectionId("personal/INBOX".into()),
-            &ReplicaLoadScope::All,
+            &PimdirCollectionId("personal/INBOX".into()),
+            &PimdirLoadScope::All,
         )
         .expect("load the renamed collection");
     assert_eq!(loaded.placements.len(), 1);
@@ -227,9 +226,9 @@ fn a_key_written_by_a_placement_survives_a_later_write() {
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     let mut placed = placement("INBOX", "1", "a");
-    placed.sort_key = ReplicaSortKey::from("2026-08-01T10:00:00Z");
+    placed.sort_key = PimdirSortKey::from("2026-08-01T10:00:00Z");
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(placed.clone())])
+        .write(vec![PimdirWriteOp::UpsertPlacement(placed.clone())])
         .expect("stage the placement");
 
     let stored = store.list_items_page_desc("INBOX", None, 10).unwrap();
@@ -239,14 +238,14 @@ fn a_key_written_by_a_placement_survives_a_later_write() {
     // `load`, so the update rewrites what was there rather than blanking
     // it
     let loaded = store
-        .load(&ReplicaCollectionId("INBOX".into()), &ReplicaLoadScope::All)
+        .load(&PimdirCollectionId("INBOX".into()), &PimdirLoadScope::All)
         .expect("load the collection");
     store
         .write(
             loaded
                 .placements
                 .into_iter()
-                .map(ReplicaWriteOp::UpsertPlacement)
+                .map(PimdirWriteOp::UpsertPlacement)
                 .collect(),
         )
         .expect("re-write what was loaded");
@@ -270,9 +269,9 @@ fn a_write_carrying_a_new_sort_key_updates_the_stored_one() {
     seed(&mut store, "INBOX", &[("1", "a", "2026-08-01T10:00:00Z")]);
 
     let mut restated = placement("INBOX", "1", "a");
-    restated.sort_key = ReplicaSortKey::from("2026-08-01T12:00:00Z");
+    restated.sort_key = PimdirSortKey::from("2026-08-01T12:00:00Z");
     store
-        .write(vec![ReplicaWriteOp::UpsertPlacement(restated)])
+        .write(vec![PimdirWriteOp::UpsertPlacement(restated)])
         .expect("re-write the placement with a new key");
 
     let items = store.list_items_page_desc("INBOX", None, 10).unwrap();

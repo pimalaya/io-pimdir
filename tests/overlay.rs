@@ -4,39 +4,40 @@
 use std::fs::File;
 
 use fs4::FileExt;
-use io_pimdir::{PimdirError, PimdirReader, PimdirStore, codec::PimdirAction};
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaPlacement,
-        ReplicaSortKey, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirSortKey, PimdirStatus,
     },
 };
-
-const NOW: &str = "2026-08-27T00:00:00Z";
+use io_pimdir::{
+    client::reader::PimdirReader,
+    client::{PimdirError, PimdirStore},
+    codec::PimdirAction,
+};
 
 /// A hydrated, linked placement with a matching base, so it projects clean.
-fn placement(collection: &str, handle: &str, link: &str, key: &str) -> ReplicaPlacement {
-    let flags = ReplicaFlags::from_iter(["\\Seen"]);
-    ReplicaPlacement {
-        sort_key: ReplicaSortKey(key.into()),
-        collection: ReplicaCollectionId(collection.into()),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
-        object: Some(ReplicaHash("cafe".into())),
-        level: ReplicaLevel::Full,
-        meta: None,
+fn placement(collection: &str, handle: &str, link: &str, key: &str) -> PimdirPlacement {
+    let flags = PimdirFlags::from_iter(["\\Seen"]);
+    PimdirPlacement {
+        sort_key: PimdirSortKey(key.into()),
+        collection: PimdirCollectionId(collection.into()),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
+        object: Some(PimdirHash("cafe".into())),
+        level: PimdirLevel::Full,
+        summary: None,
         flags: flags.clone(),
-        status: ReplicaStatus::Clean,
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
+        base: Some(PimdirBase {
             flags,
             revision: None,
-            object: Some(ReplicaHash("cafe".into())),
+            object: Some(PimdirHash("cafe".into())),
         }),
         origin: None,
     }
@@ -52,16 +53,16 @@ fn store(dir: &std::path::Path) -> Vec<i64> {
         .unwrap();
     owner
         .write(vec![
-            ReplicaWriteOp::StoreObject {
-                object: ReplicaObject {
-                    hash: ReplicaHash("cafe".into()),
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: PimdirHash("cafe".into()),
                     size: 4,
                 },
                 body: Some(b"body".to_vec()),
             },
-            ReplicaWriteOp::UpsertPlacement(placement("INBOX", "1", "mid:a", "2026-01-01")),
-            ReplicaWriteOp::UpsertPlacement(placement("INBOX", "2", "mid:b", "2026-01-02")),
-            ReplicaWriteOp::UpsertPlacement(placement("INBOX", "3", "mid:c", "2026-01-03")),
+            PimdirWriteOp::UpsertPlacement(placement("INBOX", "1", "mid:a", "2026-01-01")),
+            PimdirWriteOp::UpsertPlacement(placement("INBOX", "2", "mid:b", "2026-01-02")),
+            PimdirWriteOp::UpsertPlacement(placement("INBOX", "3", "mid:c", "2026-01-03")),
         ])
         .unwrap();
 
@@ -76,8 +77,8 @@ fn store(dir: &std::path::Path) -> Vec<i64> {
 
 /// Stages one action against a collection, as a producer would.
 fn enqueue(dir: &std::path::Path, collection: &str, action: &PimdirAction) {
-    let mut producer = io_pimdir::PimdirProducer::open(dir, "test").unwrap();
-    producer.enqueue(collection, action, None, NOW).unwrap();
+    let mut producer = io_pimdir::client::producer::PimdirProducer::open(dir, "test").unwrap();
+    producer.enqueue(collection, action, None).unwrap();
 }
 
 #[test]
@@ -90,7 +91,7 @@ fn a_staged_flag_shows_on_the_overlaid_read_only() {
         "INBOX",
         &PimdirAction::SetFlags {
             seq: seqs[0],
-            flags: ReplicaFlags::from_iter(["\\Flagged"]),
+            flags: PimdirFlags::from_iter(["\\Flagged"]),
         },
     );
 
@@ -118,7 +119,7 @@ fn two_staged_actions_on_one_item_fold_in_append_order() {
         "INBOX",
         &PimdirAction::SetFlags {
             seq: seqs[0],
-            flags: ReplicaFlags::from_iter(["\\Flagged"]),
+            flags: PimdirFlags::from_iter(["\\Flagged"]),
         },
     );
     enqueue(
@@ -126,7 +127,7 @@ fn two_staged_actions_on_one_item_fold_in_append_order() {
         "INBOX",
         &PimdirAction::SetFlags {
             seq: seqs[0],
-            flags: ReplicaFlags::from_iter(["\\Answered"]),
+            flags: PimdirFlags::from_iter(["\\Answered"]),
         },
     );
 
@@ -168,7 +169,7 @@ fn a_staged_move_leaves_one_collection_and_enters_the_other() {
         "INBOX",
         &PimdirAction::Move {
             seq: seqs[2],
-            to: ReplicaCollectionId("Archive".into()),
+            to: PimdirCollectionId("Archive".into()),
         },
     );
 
@@ -180,7 +181,7 @@ fn a_staged_move_leaves_one_collection_and_enters_the_other() {
     // lets the overlay show it in the target without inventing one.
     let arrived = overlaid.get_item("Archive", seqs[2]).unwrap().unwrap();
     assert_eq!(arrived.seq, seqs[2]);
-    assert_eq!(arrived.link_id, ReplicaLinkId("mid:c".into()));
+    assert_eq!(arrived.link_id, PimdirLinkId("mid:c".into()));
     let listed: Vec<i64> = overlaid
         .list_items("Archive", None, 10)
         .unwrap()
@@ -201,7 +202,7 @@ fn a_staged_copy_enters_the_target_and_stays_in_the_source() {
         "INBOX",
         &PimdirAction::Copy {
             seq: seqs[0],
-            to: ReplicaCollectionId("Archive".into()),
+            to: PimdirCollectionId("Archive".into()),
         },
     );
 
@@ -224,7 +225,7 @@ fn a_sorted_page_stays_ordered_and_total_across_an_arrival() {
             "INBOX",
             &PimdirAction::Move {
                 seq,
-                to: ReplicaCollectionId("Archive".into()),
+                to: PimdirCollectionId("Archive".into()),
             },
         );
     }
@@ -261,10 +262,9 @@ fn a_staged_create_is_counted_and_never_listed() {
         dir.path(),
         "INBOX",
         &PimdirAction::Add {
-            link_id: Some(ReplicaLinkId("mid:draft".into())),
-            flags: ReplicaFlags::from_iter(["\\Draft"]),
+            link_id: Some(PimdirLinkId("mid:draft".into())),
+            flags: PimdirFlags::from_iter(["\\Draft"]),
             object: None,
-            meta: None,
             handle: None,
         },
     );
@@ -277,7 +277,10 @@ fn a_staged_create_is_counted_and_never_listed() {
 
     let creates = overlaid.pending_creates("INBOX").unwrap();
     assert_eq!(creates.len(), 1);
-    assert_eq!(creates[0].created_at, NOW);
+    assert!(
+        creates[0].created_at.ends_with('Z'),
+        "SQLite stamps the row"
+    );
     assert_eq!(creates[0].producer, "test");
     let _ = seqs;
 }
@@ -312,7 +315,7 @@ fn the_scoped_cancel_takes_the_owner_role_only_for_the_call() {
         "INBOX",
         &PimdirAction::SetFlags {
             seq: seqs[0],
-            flags: ReplicaFlags::from_iter(["\\Flagged"]),
+            flags: PimdirFlags::from_iter(["\\Flagged"]),
         },
     );
     let id = PimdirReader::open(dir.path())

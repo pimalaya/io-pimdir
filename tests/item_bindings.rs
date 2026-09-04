@@ -7,42 +7,44 @@
 //! placement diverged, has nowhere else to look, which is what
 //! `PimdirReader::item_bindings` answers.
 
-use io_pimdir::{PimdirReader, PimdirSourceStore, PimdirStore};
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    hub::ReplicaSourceId,
-    object::ReplicaHash,
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    hub::PimdirSourceId,
+    object::PimdirHash,
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
+};
+use io_pimdir::{
+    client::reader::PimdirReader,
+    client::{PimdirSourceStore, PimdirStore},
 };
 use tempfile::tempdir;
 
-fn contacts() -> ReplicaCollectionId {
-    ReplicaCollectionId("contacts".into())
+fn contacts() -> PimdirCollectionId {
+    PimdirCollectionId("contacts".into())
 }
 
 /// One card at `handle`, all sources agreeing on the same identity.
-fn card(handle: &str, status: ReplicaStatus) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn card(handle: &str, status: PimdirStatus) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: contacts(),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId("card-a".into())),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId("card-a".into())),
         object: None,
-        level: ReplicaLevel::Meta,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        flags: ReplicaFlags::default(),
+        level: PimdirLevel::Meta,
+        summary: None,
+        flags: PimdirFlags::default(),
         status,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: Some("etag-1".into()),
-            object: Some(ReplicaHash("body".into())),
+            object: Some(PimdirHash("body".into())),
         }),
         origin: None,
     }
@@ -60,14 +62,14 @@ fn a_binding_names_the_handle_and_the_base_its_source_agreed_on() {
     let mut store = seed(dir.path(), "carddav");
     store
         .write(vec![
-            ReplicaWriteOp::StoreObject {
-                object: io_replica::object::ReplicaObject {
-                    hash: ReplicaHash("body".into()),
+            PimdirWriteOp::StoreObject {
+                object: io_pimdir::object::PimdirObject {
+                    hash: PimdirHash("body".into()),
                     size: 3,
                 },
                 body: Some(b"vcf".to_vec()),
             },
-            ReplicaWriteOp::UpsertPlacement(card("card-a.vcf", ReplicaStatus::Clean)),
+            PimdirWriteOp::UpsertPlacement(card("card-a.vcf", PimdirStatus::Clean)),
         ])
         .unwrap();
     drop(store);
@@ -76,13 +78,13 @@ fn a_binding_names_the_handle_and_the_base_its_source_agreed_on() {
     let bindings = read.item_bindings("contacts", "card-a").unwrap();
 
     let binding = bindings
-        .get(&ReplicaSourceId("carddav".into()))
+        .get(&PimdirSourceId("carddav".into()))
         .expect("the source that wrote the item holds a binding");
-    assert_eq!(binding.handle, ReplicaHandle("card-a.vcf".into()));
+    assert_eq!(binding.handle, PimdirHandle("card-a.vcf".into()));
 
     let base = binding.base.as_ref().expect("a synced binding has a base");
     assert_eq!(base.revision.as_deref(), Some("etag-1"));
-    assert_eq!(base.object, Some(ReplicaHash("body".into())));
+    assert_eq!(base.object, Some(PimdirHash("body".into())));
 
     assert!(!binding.conflicted);
 }
@@ -95,19 +97,19 @@ fn a_minted_copy_names_the_resource_it_came_from() {
     let dir = tempdir().unwrap();
     let mut store = seed(dir.path(), "caldav");
 
-    let mut copy = card("event-a-copy.ics", ReplicaStatus::Clean);
-    copy.link_id = Some(ReplicaLinkId("dup:card-a#event-a-copy.ics".into()));
+    let mut copy = card("event-a-copy.ics", PimdirStatus::Clean);
+    copy.link_id = Some(PimdirLinkId("dup:card-a#event-a-copy.ics".into()));
     store
         .write(vec![
-            ReplicaWriteOp::StoreObject {
-                object: io_replica::object::ReplicaObject {
-                    hash: ReplicaHash("body".into()),
+            PimdirWriteOp::StoreObject {
+                object: io_pimdir::object::PimdirObject {
+                    hash: PimdirHash("body".into()),
                     size: 3,
                 },
                 body: Some(b"ics".to_vec()),
             },
-            ReplicaWriteOp::UpsertPlacement(card("event-a.ics", ReplicaStatus::Clean)),
-            ReplicaWriteOp::UpsertPlacement(copy),
+            PimdirWriteOp::UpsertPlacement(card("event-a.ics", PimdirStatus::Clean)),
+            PimdirWriteOp::UpsertPlacement(copy),
         ])
         .unwrap();
     drop(store);
@@ -115,8 +117,8 @@ fn a_minted_copy_names_the_resource_it_came_from() {
     let read = PimdirReader::open(dir.path()).unwrap();
     let held = read.item_bindings("contacts", "card-a").unwrap();
     assert_eq!(
-        held[&ReplicaSourceId("caldav".into())].handle,
-        ReplicaHandle("event-a.ics".into()),
+        held[&PimdirSourceId("caldav".into())].handle,
+        PimdirHandle("event-a.ics".into()),
         "the item holding the bare hint keeps the resource it was bound to",
     );
 
@@ -124,8 +126,8 @@ fn a_minted_copy_names_the_resource_it_came_from() {
         .item_bindings("contacts", "dup:card-a#event-a-copy.ics")
         .unwrap();
     assert_eq!(
-        minted[&ReplicaSourceId("caldav".into())].handle,
-        ReplicaHandle("event-a-copy.ics".into()),
+        minted[&PimdirSourceId("caldav".into())].handle,
+        PimdirHandle("event-a-copy.ics".into()),
         "and the minted copy has a binding of its own, naming the other resource",
     );
 }
@@ -138,23 +140,23 @@ fn every_source_holding_an_item_reports_its_own_binding() {
 
     let mut left = seed(dir.path(), "left");
     left.write(vec![
-        ReplicaWriteOp::StoreObject {
-            object: io_replica::object::ReplicaObject {
-                hash: ReplicaHash("body".into()),
+        PimdirWriteOp::StoreObject {
+            object: io_pimdir::object::PimdirObject {
+                hash: PimdirHash("body".into()),
                 size: 3,
             },
             body: Some(b"vcf".to_vec()),
         },
-        ReplicaWriteOp::UpsertPlacement(card("left-handle", ReplicaStatus::Clean)),
+        PimdirWriteOp::UpsertPlacement(card("left-handle", PimdirStatus::Clean)),
     ])
     .unwrap();
     drop(left);
 
     let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
-    let mut diverged = card("right-handle", ReplicaStatus::Conflict);
+    let mut diverged = card("right-handle", PimdirStatus::Conflict);
     diverged.conflict_revision = Some("etag-remote".into());
     right
-        .write(vec![ReplicaWriteOp::UpsertPlacement(diverged)])
+        .write(vec![PimdirWriteOp::UpsertPlacement(diverged)])
         .unwrap();
     drop(right);
 
@@ -167,16 +169,16 @@ fn every_source_holding_an_item_reports_its_own_binding() {
         "one binding per source, not one per item"
     );
     assert_eq!(
-        bindings[&ReplicaSourceId("left".into())].handle,
-        ReplicaHandle("left-handle".into()),
+        bindings[&PimdirSourceId("left".into())].handle,
+        PimdirHandle("left-handle".into()),
     );
 
-    let right = &bindings[&ReplicaSourceId("right".into())];
-    assert_eq!(right.handle, ReplicaHandle("right-handle".into()));
+    let right = &bindings[&PimdirSourceId("right".into())];
+    assert_eq!(right.handle, PimdirHandle("right-handle".into()));
     assert!(right.conflicted, "the divergence belongs to one side alone");
     assert_eq!(right.conflict_revision.as_deref(), Some("etag-remote"));
     assert!(
-        !bindings[&ReplicaSourceId("left".into())].conflicted,
+        !bindings[&PimdirSourceId("left".into())].conflicted,
         "and the other side is untouched by it",
     );
 }

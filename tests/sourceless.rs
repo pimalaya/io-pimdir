@@ -6,39 +6,38 @@
 //! is the store: a name invented to satisfy a constructor is a side that
 //! never synced anything, one write away from being recorded as one.
 
-use io_pimdir::{PimdirProducer, PimdirStore, codec::PimdirAction};
-use io_replica::{
-    change::{ReplicaDropReason, ReplicaWriteOp},
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::{
+    change::{PimdirDropReason, PimdirWriteOp},
+    collection::PimdirCollectionId,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
     },
 };
+use io_pimdir::{client::PimdirStore, client::producer::PimdirProducer, codec::PimdirAction};
 
-fn inbox() -> ReplicaCollectionId {
-    ReplicaCollectionId("INBOX".into())
+fn inbox() -> PimdirCollectionId {
+    PimdirCollectionId("INBOX".into())
 }
 
-fn placement(handle: &str, link: &str, hash: &str) -> ReplicaPlacement {
-    ReplicaPlacement {
+fn placement(handle: &str, link: &str, hash: &str) -> PimdirPlacement {
+    PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
-        object: Some(ReplicaHash(hash.into())),
-        level: ReplicaLevel::Full,
-        meta: Some(ReplicaMeta("{\"v\":1}".into())),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
+        object: Some(PimdirHash(hash.into())),
+        level: PimdirLevel::Full,
+        summary: None,
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: None,
-            object: Some(ReplicaHash(hash.into())),
+            object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
     }
@@ -53,33 +52,28 @@ fn a_source_less_handle_reads_purges_and_cancels() {
     // the one role that does name a side seeds the item, then retires it
     let mut sync = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     sync.write(vec![
-        ReplicaWriteOp::StoreObject {
-            object: ReplicaObject {
-                hash: ReplicaHash("cafebabe".into()),
+        PimdirWriteOp::StoreObject {
+            object: PimdirObject {
+                hash: PimdirHash("cafebabe".into()),
                 size: 4,
             },
             body: Some(b"body".to_vec()),
         },
-        ReplicaWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+        PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
     ])
     .unwrap();
     let seq = sync.list_items("INBOX", None, 10).unwrap()[0].seq;
-    sync.write(vec![ReplicaWriteOp::DropPlacement {
+    sync.write(vec![PimdirWriteOp::DropPlacement {
         collection: inbox(),
-        handle: ReplicaHandle("1".into()),
-        reason: ReplicaDropReason::Deleted,
+        handle: PimdirHandle("1".into()),
+        reason: PimdirDropReason::Deleted,
     }])
     .unwrap();
     drop(sync);
 
     let id = PimdirProducer::open(dir.path(), "test")
         .unwrap()
-        .enqueue(
-            "INBOX",
-            &PimdirAction::Remove { seq },
-            None,
-            "2026-01-01T00:00:00.000Z",
-        )
+        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
         .unwrap();
 
     let mut store = PimdirStore::open(dir.path()).unwrap();

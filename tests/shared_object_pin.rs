@@ -16,16 +16,15 @@
 
 use std::path::Path;
 
-use io_pimdir::{PimdirSourceStore, PimdirStore};
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    hub::ReplicaSourceId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::client::{PimdirSourceStore, PimdirStore};
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    hub::PimdirSourceId,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirSortKey, PimdirStatus,
     },
 };
 
@@ -38,9 +37,9 @@ fn store(dir: &Path, source: &str) -> PimdirSourceStore {
     store
 }
 
-fn body(store: &PimdirSourceStore, bytes: &[u8]) -> ReplicaWriteOp {
-    ReplicaWriteOp::StoreObject {
-        object: ReplicaObject {
+fn body(store: &PimdirSourceStore, bytes: &[u8]) -> PimdirWriteOp {
+    PimdirWriteOp::StoreObject {
+        object: PimdirObject {
             hash: store.hash(bytes),
             size: bytes.len(),
         },
@@ -55,21 +54,21 @@ fn card(
     handle: &str,
     object: &[u8],
     base: Option<&[u8]>,
-) -> ReplicaWriteOp {
-    ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
-        collection: ReplicaCollectionId(CONTACTS.into()),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(LINK.into())),
+) -> PimdirWriteOp {
+    PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+        collection: PimdirCollectionId(CONTACTS.into()),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(LINK.into())),
         object: Some(store.hash(object)),
-        level: ReplicaLevel::Full,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        sort_key: ReplicaSortKey("k".into()),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        level: PimdirLevel::Full,
+        summary: None,
+        sort_key: PimdirSortKey("k".into()),
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: base.map(|bytes| ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: base.map(|bytes| PimdirBase {
+            flags: PimdirFlags::default(),
             revision: Some("r".into()),
             object: Some(store.hash(bytes)),
         }),
@@ -78,17 +77,17 @@ fn card(
 }
 
 /// The agreement point one source's binding of the card currently holds.
-fn agreement(store: &PimdirSourceStore, source: &str) -> Option<ReplicaHash> {
+fn agreement(store: &PimdirSourceStore, source: &str) -> Option<PimdirHash> {
     store
         .item_bindings(CONTACTS, LINK)
         .unwrap()
         .into_iter()
-        .find(|(id, _)| id == &ReplicaSourceId(source.into()))
+        .find(|(id, _)| id == &PimdirSourceId(source.into()))
         .map(|(_, binding)| binding.shared_object)
         .unwrap()
 }
 
-fn blob_of(dir: &Path, hash: &ReplicaHash) -> std::path::PathBuf {
+fn blob_of(dir: &Path, hash: &PimdirHash) -> std::path::PathBuf {
     dir.join("objects")
         .join(&hash.0[0..2])
         .join(&hash.0[2..4])
@@ -189,20 +188,20 @@ fn the_conflict_body_is_pinned_where_the_agreement_point_is_not() {
     left.write(vec![
         body(&left, b"one"),
         body(&left, b"remote"),
-        ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
-            collection: ReplicaCollectionId(CONTACTS.into()),
-            handle: ReplicaHandle("left-1.vcf".into()),
-            link_id: Some(ReplicaLinkId(LINK.into())),
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            collection: PimdirCollectionId(CONTACTS.into()),
+            handle: PimdirHandle("left-1.vcf".into()),
+            link_id: Some(PimdirLinkId(LINK.into())),
             object: Some(left.hash(b"one")),
-            level: ReplicaLevel::Full,
-            meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-            sort_key: ReplicaSortKey("k".into()),
-            flags: ReplicaFlags::default(),
-            status: ReplicaStatus::Conflict,
+            level: PimdirLevel::Full,
+            summary: None,
+            sort_key: PimdirSortKey("k".into()),
+            flags: PimdirFlags::default(),
+            status: PimdirStatus::Conflict,
             conflict_revision: Some("r-remote".into()),
             conflict_object: Some(left.hash(b"remote")),
-            base: Some(ReplicaBase {
-                flags: ReplicaFlags::default(),
+            base: Some(PimdirBase {
+                flags: PimdirFlags::default(),
                 revision: Some("r".into()),
                 object: Some(left.hash(b"one")),
             }),

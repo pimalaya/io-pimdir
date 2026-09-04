@@ -21,16 +21,19 @@
 
 use std::{io::Write, path::Path};
 
-use io_pimdir::{PimdirError, PimdirProducer, PimdirSourceStore, PimdirStore, codec::PimdirAction};
-use io_replica::{
-    change::ReplicaWriteOp,
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::{
+    change::PimdirWriteOp,
+    collection::PimdirCollectionId,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirSortKey, PimdirStatus,
     },
+};
+use io_pimdir::{
+    client::producer::PimdirProducer,
+    client::{PimdirError, PimdirSourceStore, PimdirStore},
+    codec::PimdirAction,
 };
 
 const INBOX: &str = "INBOX";
@@ -41,7 +44,7 @@ fn store(dir: &Path) -> PimdirSourceStore {
     store
 }
 
-fn blob_of(dir: &Path, hash: &ReplicaHash) -> std::path::PathBuf {
+fn blob_of(dir: &Path, hash: &PimdirHash) -> std::path::PathBuf {
     dir.join("objects")
         .join(&hash.0[0..2])
         .join(&hash.0[2..4])
@@ -51,7 +54,7 @@ fn blob_of(dir: &Path, hash: &ReplicaHash) -> std::path::PathBuf {
 /// Writes one body to the blob tree and stops there: the first half of
 /// §14 step 1, and exactly what a process that dies before its
 /// transaction leaves behind.
-fn stage_body_only(store: &PimdirSourceStore, bytes: &[u8]) -> ReplicaHash {
+fn stage_body_only(store: &PimdirSourceStore, bytes: &[u8]) -> PimdirHash {
     let hash = store.hash(bytes);
     let blobs = store.blobs();
     let mut writer = blobs.writer().unwrap();
@@ -65,21 +68,21 @@ fn placement(
     handle: &str,
     link: &str,
     object: &[u8],
-) -> ReplicaPlacement {
-    ReplicaPlacement {
-        collection: ReplicaCollectionId(INBOX.into()),
-        handle: ReplicaHandle(handle.into()),
-        link_id: Some(ReplicaLinkId(link.into())),
+) -> PimdirPlacement {
+    PimdirPlacement {
+        collection: PimdirCollectionId(INBOX.into()),
+        handle: PimdirHandle(handle.into()),
+        link_id: Some(PimdirLinkId(link.into())),
         object: Some(store.hash(object)),
-        level: ReplicaLevel::Full,
-        meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-        sort_key: ReplicaSortKey("k".into()),
-        flags: ReplicaFlags::default(),
-        status: ReplicaStatus::Clean,
+        level: PimdirLevel::Full,
+        summary: None,
+        sort_key: PimdirSortKey("k".into()),
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
         conflict_revision: None,
         conflict_object: None,
-        base: Some(ReplicaBase {
-            flags: ReplicaFlags::default(),
+        base: Some(PimdirBase {
+            flags: PimdirFlags::default(),
             revision: None,
             object: Some(store.hash(object)),
         }),
@@ -95,7 +98,7 @@ fn rows_without_bodies(store: &PimdirSourceStore, dir: &Path) -> Vec<String> {
         .indexed_hashes()
         .unwrap()
         .into_iter()
-        .filter(|hash| !blob_of(dir, &ReplicaHash(hash.clone())).is_file())
+        .filter(|hash| !blob_of(dir, &PimdirHash(hash.clone())).is_file())
         .collect()
 }
 
@@ -121,14 +124,14 @@ fn a_body_written_before_its_row_survives_the_crash_and_the_reopen() {
     // Unrelated writes must not touch it either: no write reclaims.
     after
         .write(vec![
-            ReplicaWriteOp::StoreObject {
-                object: ReplicaObject {
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
                     hash: after.hash(b"other"),
                     size: 5,
                 },
                 body: Some(b"other".to_vec()),
             },
-            ReplicaWriteOp::UpsertPlacement(placement(&after, "1", "mid:a", b"other")),
+            PimdirWriteOp::UpsertPlacement(placement(&after, "1", "mid:a", b"other")),
         ])
         .unwrap();
     assert!(
@@ -140,14 +143,14 @@ fn a_body_written_before_its_row_survives_the_crash_and_the_reopen() {
     // it streamed earlier, carrying no bytes, and attaches it.
     after
         .write(vec![
-            ReplicaWriteOp::StoreObject {
-                object: ReplicaObject {
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
                     hash: hash.clone(),
                     size: b"streamed".len(),
                 },
                 body: None,
             },
-            ReplicaWriteOp::UpsertPlacement(placement(&after, "2", "mid:b", b"streamed")),
+            PimdirWriteOp::UpsertPlacement(placement(&after, "2", "mid:b", b"streamed")),
         ])
         .unwrap();
 
@@ -173,28 +176,28 @@ fn a_failed_batch_leaves_an_orphan_and_never_a_bodiless_row() {
 
     store
         .write(vec![
-            ReplicaWriteOp::StoreObject {
-                object: ReplicaObject {
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
                     hash: store.hash(b"first"),
                     size: 5,
                 },
                 body: Some(b"first".to_vec()),
             },
-            ReplicaWriteOp::UpsertPlacement(placement(&store, "1", "mid:a", b"first")),
+            PimdirWriteOp::UpsertPlacement(placement(&store, "1", "mid:a", b"first")),
         ])
         .unwrap();
 
     // The same identity under a second handle: refused whole, after the
     // batch's body has already reached the blob tree.
     let refused = store.write(vec![
-        ReplicaWriteOp::StoreObject {
-            object: ReplicaObject {
+        PimdirWriteOp::StoreObject {
+            object: PimdirObject {
                 hash: store.hash(b"second"),
                 size: 6,
             },
             body: Some(b"second".to_vec()),
         },
-        ReplicaWriteOp::UpsertPlacement(placement(&store, "9", "mid:a", b"second")),
+        PimdirWriteOp::UpsertPlacement(placement(&store, "9", "mid:a", b"second")),
     ]);
     assert!(matches!(refused, Err(PimdirError::Rebind { .. })));
 
@@ -241,14 +244,12 @@ fn a_producer_body_survives_with_and_without_the_row_that_pins_it() {
         .enqueue(
             INBOX,
             &PimdirAction::Add {
-                link_id: Some(ReplicaLinkId("mid:queued".into())),
-                flags: ReplicaFlags::default(),
+                link_id: Some(PimdirLinkId("mid:queued".into())),
+                flags: PimdirFlags::default(),
                 object: Some(pinned.clone()),
-                meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
                 handle: None,
             },
             Some(b"pinned".len() as u64),
-            "2026-08-29T00:00:00.000Z",
         )
         .unwrap();
     drop(producer);

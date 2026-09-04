@@ -23,16 +23,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use io_pimdir::{PimdirError, PimdirProducer, PimdirSourceStore, PimdirStore, codec::PimdirAction};
-use io_replica::{
-    change::{ReplicaDropReason, ReplicaWriteOp},
-    client::ReplicaStorage,
-    collection::ReplicaCollectionId,
-    object::{ReplicaHash, ReplicaObject},
+use io_pimdir::{
+    change::{PimdirDropReason, PimdirWriteOp},
+    collection::PimdirCollectionId,
+    object::{PimdirHash, PimdirObject},
     placement::{
-        ReplicaBase, ReplicaFlags, ReplicaHandle, ReplicaLevel, ReplicaLinkId, ReplicaMeta,
-        ReplicaPlacement, ReplicaSortKey, ReplicaStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirSortKey, PimdirStatus,
     },
+};
+use io_pimdir::{
+    client::producer::PimdirProducer,
+    client::{PimdirError, PimdirSourceStore, PimdirStore},
+    codec::PimdirAction,
 };
 use proptest::{
     prelude::*,
@@ -316,30 +319,30 @@ impl Harness {
         self.dir.path()
     }
 
-    fn hash(&self, body: usize) -> ReplicaHash {
+    fn hash(&self, body: usize) -> PimdirHash {
         self.sources[0].hash(BODIES[body])
     }
 
-    fn handle(&self, collection: usize, source: usize, link: usize) -> ReplicaHandle {
+    fn handle(&self, collection: usize, source: usize, link: usize) -> PimdirHandle {
         let generation = self
             .generations
             .get(&(collection, source, link))
             .copied()
             .unwrap_or(0);
-        ReplicaHandle(format!("h{generation}-{}", LINKS[link]))
+        PimdirHandle(format!("h{generation}-{}", LINKS[link]))
     }
 
     /// The `StoreObject` ops a placement's hashes need, bytes included, so
     /// every row this batch writes has its blob on disk first (spec §14).
-    fn bodies(&self, wanted: &[Option<usize>]) -> Vec<ReplicaWriteOp> {
+    fn bodies(&self, wanted: &[Option<usize>]) -> Vec<PimdirWriteOp> {
         let mut seen = BTreeSet::new();
         let mut ops = Vec::new();
         for body in wanted.iter().flatten() {
             if !seen.insert(*body) {
                 continue;
             }
-            ops.push(ReplicaWriteOp::StoreObject {
-                object: ReplicaObject {
+            ops.push(PimdirWriteOp::StoreObject {
+                object: PimdirObject {
                     hash: self.hash(*body),
                     size: BODIES[*body].len(),
                 },
@@ -370,30 +373,30 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             level,
         } => {
             let status = [
-                ReplicaStatus::Clean,
-                ReplicaStatus::Dirty,
-                ReplicaStatus::Created,
-                ReplicaStatus::Conflict,
-                ReplicaStatus::Tombstone,
+                PimdirStatus::Clean,
+                PimdirStatus::Dirty,
+                PimdirStatus::Created,
+                PimdirStatus::Conflict,
+                PimdirStatus::Tombstone,
             ][status];
-            let level = [ReplicaLevel::Probed, ReplicaLevel::Meta, ReplicaLevel::Full][level];
+            let level = [PimdirLevel::Probed, PimdirLevel::Meta, PimdirLevel::Full][level];
             let conflicted_before = is_conflicted(harness.path(), collection, source, link);
 
             let mut batch = harness.bodies(&[object, base_object.flatten(), conflict_object]);
-            batch.push(ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
-                collection: ReplicaCollectionId(COLLECTIONS[collection].into()),
+            batch.push(PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                collection: PimdirCollectionId(COLLECTIONS[collection].into()),
                 handle: harness.handle(collection, source, link),
-                link_id: Some(ReplicaLinkId(LINKS[link].into())),
+                link_id: Some(PimdirLinkId(LINKS[link].into())),
                 object: object.map(|body| harness.hash(body)),
                 level,
-                meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-                sort_key: ReplicaSortKey(format!("k-{}", LINKS[link])),
-                flags: ReplicaFlags::default(),
+                summary: None,
+                sort_key: PimdirSortKey(format!("k-{}", LINKS[link])),
+                flags: PimdirFlags::default(),
                 status,
-                conflict_revision: (status == ReplicaStatus::Conflict).then(|| "r".to_string()),
+                conflict_revision: (status == PimdirStatus::Conflict).then(|| "r".to_string()),
                 conflict_object: conflict_object.map(|body| harness.hash(body)),
-                base: base_object.map(|body| ReplicaBase {
-                    flags: ReplicaFlags::default(),
+                base: base_object.map(|body| PimdirBase {
+                    flags: PimdirFlags::default(),
                     revision: Some("r-base".into()),
                     object: body.map(|body| harness.hash(body)),
                 }),
@@ -425,12 +428,12 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             deleted,
         } => {
             let retained_before = retained_rows(harness.path());
-            let batch = vec![ReplicaWriteOp::DropPlacement {
-                collection: ReplicaCollectionId(COLLECTIONS[collection].into()),
+            let batch = vec![PimdirWriteOp::DropPlacement {
+                collection: PimdirCollectionId(COLLECTIONS[collection].into()),
                 handle: harness.handle(collection, source, link),
                 reason: match deleted {
-                    true => ReplicaDropReason::Deleted,
-                    false => ReplicaDropReason::Superseded,
+                    true => PimdirDropReason::Deleted,
+                    false => PimdirDropReason::Superseded,
                 },
             }];
             match harness.sources[source].write(batch) {
@@ -450,20 +453,20 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             let wanted: Vec<Option<usize>> = placements.iter().map(|(_, object)| *object).collect();
             let mut batch = harness.bodies(&wanted);
             for (link, object) in placements {
-                batch.push(ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
-                    collection: ReplicaCollectionId(COLLECTIONS[collection].into()),
+                batch.push(PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                    collection: PimdirCollectionId(COLLECTIONS[collection].into()),
                     handle: harness.handle(collection, source, *link),
-                    link_id: Some(ReplicaLinkId(LINKS[*link].into())),
+                    link_id: Some(PimdirLinkId(LINKS[*link].into())),
                     object: object.map(|body| harness.hash(body)),
-                    level: ReplicaLevel::Full,
-                    meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-                    sort_key: ReplicaSortKey(format!("k-{}", LINKS[*link])),
-                    flags: ReplicaFlags::default(),
-                    status: ReplicaStatus::Clean,
+                    level: PimdirLevel::Full,
+                    summary: None,
+                    sort_key: PimdirSortKey(format!("k-{}", LINKS[*link])),
+                    flags: PimdirFlags::default(),
+                    status: PimdirStatus::Clean,
                     conflict_revision: None,
                     conflict_object: None,
-                    base: Some(ReplicaBase {
-                        flags: ReplicaFlags::default(),
+                    base: Some(PimdirBase {
+                        flags: PimdirFlags::default(),
                         revision: None,
                         object: object.map(|body| harness.hash(body)),
                     }),
@@ -481,10 +484,10 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
         Op::Retire { collection, link } => {
             let retained_before = retained_rows(harness.path());
             for source in 0..SOURCES.len() {
-                let batch = vec![ReplicaWriteOp::DropPlacement {
-                    collection: ReplicaCollectionId(COLLECTIONS[collection].into()),
+                let batch = vec![PimdirWriteOp::DropPlacement {
+                    collection: PimdirCollectionId(COLLECTIONS[collection].into()),
                     handle: harness.handle(collection, source, link),
-                    reason: ReplicaDropReason::Deleted,
+                    reason: PimdirDropReason::Deleted,
                 }];
                 match harness.sources[source].write(batch) {
                     Ok(()) => {}
@@ -509,33 +512,33 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 .or_insert(0) += 1;
             let new = harness.handle(collection, source, link);
 
-            let mut batch = vec![ReplicaWriteOp::DropPlacement {
-                collection: ReplicaCollectionId(COLLECTIONS[collection].into()),
+            let mut batch = vec![PimdirWriteOp::DropPlacement {
+                collection: PimdirCollectionId(COLLECTIONS[collection].into()),
                 handle: old,
-                reason: ReplicaDropReason::Superseded,
+                reason: PimdirDropReason::Rekeyed,
             }];
             batch.extend(harness.bodies(&[object]));
-            batch.push(ReplicaWriteOp::UpsertPlacement(ReplicaPlacement {
-                collection: ReplicaCollectionId(COLLECTIONS[collection].into()),
+            batch.push(PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                collection: PimdirCollectionId(COLLECTIONS[collection].into()),
                 handle: new,
-                link_id: Some(ReplicaLinkId(LINKS[link].into())),
+                link_id: Some(PimdirLinkId(LINKS[link].into())),
                 object: object.map(|body| harness.hash(body)),
-                level: ReplicaLevel::Full,
-                meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-                sort_key: ReplicaSortKey(format!("k-{}", LINKS[link])),
-                flags: ReplicaFlags::default(),
-                status: ReplicaStatus::Clean,
+                level: PimdirLevel::Full,
+                summary: None,
+                sort_key: PimdirSortKey(format!("k-{}", LINKS[link])),
+                flags: PimdirFlags::default(),
+                status: PimdirStatus::Clean,
                 conflict_revision: None,
                 conflict_object: None,
-                base: Some(ReplicaBase {
-                    flags: ReplicaFlags::default(),
+                base: Some(PimdirBase {
+                    flags: PimdirFlags::default(),
                     revision: None,
                     object: object.map(|body| harness.hash(body)),
                 }),
                 origin: None,
             }));
 
-            match harness.sources[source].write_rekeyed(COLLECTIONS[collection], batch) {
+            match harness.sources[source].write(batch) {
                 Ok(_) => {}
                 Err(PimdirError::Rebind { .. }) => reached.rebind_refused += 1,
                 Err(err) => panic!("unexpected rekey error: {err}"),
@@ -568,21 +571,19 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 .map(|item| item.seq)
                 .collect();
             let seq = seqs.get(pick % seqs.len().max(1)).copied();
-            let elsewhere = ReplicaCollectionId(COLLECTIONS[(collection + 1) % 2].into());
+            let elsewhere = PimdirCollectionId(COLLECTIONS[(collection + 1) % 2].into());
 
             let action = match (kind, seq) {
                 (1, Some(seq)) => Some(PimdirAction::SetFlags {
                     seq,
-                    flags: ReplicaFlags::from_iter(["\\Seen"]),
+                    flags: PimdirFlags::from_iter(["\\Seen"]),
                 }),
                 (2, Some(seq)) => Some(PimdirAction::Remove { seq }),
                 (3, Some(seq)) => Some(PimdirAction::Move { seq, to: elsewhere }),
                 (4, Some(seq)) => Some(PimdirAction::Copy { seq, to: elsewhere }),
-                (5, Some(seq)) => hash.clone().map(|object| PimdirAction::Update {
-                    seq,
-                    object,
-                    meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
-                }),
+                (5, Some(seq)) => hash
+                    .clone()
+                    .map(|object| PimdirAction::Update { seq, object }),
                 // NOTE: an owner-defined intent this store cannot apply.
                 // Its drain skips the row, which must leave the pin the
                 // enqueue took exactly where it was.
@@ -592,10 +593,9 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     object_hash: hash.clone(),
                 }),
                 _ => Some(PimdirAction::Add {
-                    link_id: Some(ReplicaLinkId(LINKS[link].into())),
-                    flags: ReplicaFlags::default(),
+                    link_id: Some(PimdirLinkId(LINKS[link].into())),
+                    flags: PimdirFlags::default(),
                     object: hash.clone(),
-                    meta: Some(ReplicaMeta(r#"{"v":1}"#.into())),
                     handle: Some(harness.handle(collection, source, link)),
                 }),
             };
@@ -603,12 +603,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             if let Some(action) = action {
                 let mut producer = PimdirProducer::open(harness.path(), "proptest").unwrap();
                 producer
-                    .enqueue(
-                        COLLECTIONS[collection],
-                        &action,
-                        size,
-                        "2026-08-29T00:00:00.000Z",
-                    )
+                    .enqueue(COLLECTIONS[collection], &action, size)
                     .unwrap();
             }
         }
@@ -647,7 +642,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
         }
 
         Op::Purge { collection, pick } => {
-            let id = ReplicaCollectionId(COLLECTIONS[collection].into());
+            let id = PimdirCollectionId(COLLECTIONS[collection].into());
             let retained = harness.sources[0].list_retained(&id, Some(0), 64).unwrap();
             if !retained.is_empty() {
                 let seq = retained[pick % retained.len()].seq;

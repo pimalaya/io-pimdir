@@ -21,26 +21,32 @@ use std::{
 
 use anyhow::{Result, bail};
 use clap::Args;
-use io_pimdir::PimdirBlobs;
-use io_replica::{collection::ReplicaCollectionId, object::ReplicaHash};
+use io_pimdir::{
+    client::{blobs::PimdirBlobs, reader::PimdirReader},
+    collection::PimdirCollectionId,
+    object::PimdirHash,
+    placement::PimdirLevel,
+};
 use log::warn;
 use pimalaya_cli::printer::Printer;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::cli::{StoreFlags, bytes, now, report};
+use crate::cli::{StoreFlags, bytes, now, report, summary};
 
 /// How many items are read per page while dumping a collection.
 const PAGE: usize = 500;
 
-/// The dump format's own version, bumped when its shape changes.
-const FORMAT_VERSION: i64 = 1;
+/// The dump format's own version, bumped when its shape changes: 2 carries
+/// the summary columns and address rows where 1 carried a raw meta string.
+const FORMAT_VERSION: i64 = 2;
 
 /// Dump a store to a directory: a manifest, one JSON-lines file of items per
 /// collection, and a copy of every body.
 ///
 /// Items are dumped exactly as stored (public id, link id, flags, level, body
-/// hash and raw meta), so the dump carries no interpretation of any kind. Use
+/// hash, sort key, summary columns and address rows), so the dump carries no
+/// interpretation of any kind. Use
 /// it to snapshot a store before a risky operation, to move one between
 /// machines, or to look at a store with ordinary text tools.
 #[derive(Debug, Args)]
@@ -152,18 +158,22 @@ impl ExportCommand {
     /// Dumps a collection's live items, page by page, returning how many.
     fn dump_live(
         &self,
-        read: &io_pimdir::PimdirReader,
+        read: &PimdirReader,
         collection: &str,
         path: &Path,
         hashes: &mut BTreeSet<String>,
     ) -> Result<u64> {
         let mut file = BufWriter::new(File::create(path)?);
-        let mut after: Option<String> = None;
+        let mut after: Option<(String, i64)> = None;
         let mut count = 0;
 
         loop {
             let page = read
-                .list_items(collection, after.as_deref(), PAGE)
+                .list_summaries(
+                    collection,
+                    after.as_ref().map(|(key, seq)| (key.as_str(), *seq)),
+                    PAGE,
+                )
                 .map_err(report)?;
             if page.is_empty() {
                 break;
@@ -180,13 +190,14 @@ impl ExportCommand {
                     "flags": item.flags.known(),
                     "level": level(item.level),
                     "object": item.object.as_ref().map(|hash| hash.0.clone()),
-                    "meta": item.meta.as_ref().map(|meta| meta.0.clone()),
+                    "sort_key": item.sort_key,
+                    "summary": item.summary.as_ref().map(summary::json),
                 });
                 writeln!(file, "{line}")?;
                 count += 1;
             }
 
-            after = page.last().map(|item| item.link_id.0.clone());
+            after = page.last().map(|item| (item.sort_key.clone(), item.seq));
         }
 
         file.flush()?;
@@ -196,12 +207,12 @@ impl ExportCommand {
     /// Dumps a collection's retained items, page by page, returning how many.
     fn dump_retained(
         &self,
-        read: &io_pimdir::PimdirReader,
+        read: &PimdirReader,
         collection: &str,
         path: &Path,
         hashes: &mut BTreeSet<String>,
     ) -> Result<u64> {
-        let id = ReplicaCollectionId(collection.to_string());
+        let id = PimdirCollectionId(collection.to_string());
         let mut file = BufWriter::new(File::create(path)?);
         let mut after: Option<i64> = None;
         let mut count = 0;
@@ -224,7 +235,7 @@ impl ExportCommand {
                     "flags": item.flags.known(),
                     "level": level(item.level),
                     "object": item.object.as_ref().map(|hash| hash.0.clone()),
-                    "meta": item.meta.as_ref().map(|meta| meta.0.clone()),
+                    "sort_key": item.sort_key,
                     "retained_at": retention.map(|retention| retention.at.clone()),
                     "retained_by": retention.and_then(|retention| retention.by.clone()),
                 });
@@ -251,7 +262,7 @@ impl ExportCommand {
         let mut missing = Vec::new();
 
         for hash in hashes {
-            let Some(mut reader) = blobs.reader(&ReplicaHash(hash.clone()))? else {
+            let Some(mut reader) = blobs.reader(&PimdirHash(hash.clone()))? else {
                 warn!("the body of object {hash} is missing from the blob store");
                 missing.push(hash.clone());
                 continue;
@@ -283,11 +294,11 @@ impl ExportCommand {
 
 /// The detail ladder as its lowercase name (the dump never carries the column
 /// integer, which is an implementation detail of the schema).
-fn level(level: io_replica::placement::ReplicaLevel) -> &'static str {
+fn level(level: PimdirLevel) -> &'static str {
     match level {
-        io_replica::placement::ReplicaLevel::Probed => "probed",
-        io_replica::placement::ReplicaLevel::Meta => "meta",
-        io_replica::placement::ReplicaLevel::Full => "full",
+        PimdirLevel::Probed => "probed",
+        PimdirLevel::Meta => "meta",
+        PimdirLevel::Full => "full",
     }
 }
 

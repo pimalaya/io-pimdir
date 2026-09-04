@@ -7,12 +7,12 @@ status: current
 # Store
 
 A pimdir store is a SQLite index (`pimdir.db`, `STRICT` tables, schema version in
-`user_version`) plus a content-addressed blob directory. It implements
-io-replica's storage seam (`load` / `lookup_objects` / `write`) for one source,
-and is the portable, cross-implementation form of that seam (the pimdir spec).
+`user_version`) plus a content-addressed blob directory: the storage part of the
+pimdir standard, whose schema and statements it inlines verbatim. It services the
+engine's seam (`load` / `lookup_objects` / `write`) for one source (see [seam](seam.md)).
 
 ### Requirement: A write batch is one transaction
-`write` SHALL apply its `ReplicaWriteOp` batch as a single SQLite transaction:
+`write` SHALL apply its `PimdirWriteOp` batch as a single SQLite transaction:
 object bytes are written to the blob file (temp → fsync → rename) before the row
 that references them; placement upserts/drops fold into the collection's hub and
 are saved **by diffing the loaded hub against the absorbed one, touching only the
@@ -28,18 +28,18 @@ The write SHALL be O(changed rows), not O(collection size), so an incremental
 sync that changed a handful of items does not rewrite the whole mailbox.
 A crash SHALL leave at worst an orphan blob, never a row without its body.
 The transaction SHALL begin with `BEGIN IMMEDIATE`, taking the store's single
-writer lock (SPEC §8) up front: under WAL readers never block, concurrent writers
+writer lock (STORAGE §8) up front: under WAL readers never block, concurrent writers
 serialise on the busy timeout, and a writer that cannot acquire the lock within it
 SHALL fail with a clear `PimdirError::Busy` rather than a raw SQL error or a
 failure deep inside the batch. The busy timeout SHALL be generous enough (30s) to
-let a single process fan work across several same-source handles — one per worker,
-to overlap network while the writes serialise — without a burst of large writes
+let a single process fan work across several same-source handles, one per worker,
+to overlap network while the writes serialise, without a burst of large writes
 tripping `Busy`. Which process writes is not left to a convention: see the
 advisory lock below.
 
 ### Requirement: One owner, enforced, and failing fast
 A store SHALL have at most one owner process at a time, and every owning handle
-SHALL take an exclusive advisory lock on the store directory (SPEC §8) for its
+SHALL take an exclusive advisory lock on the store directory (STORAGE §8) for its
 lifetime. The lock lives on the open file description, so the kernel releases it
 when the process dies: a crashed owner leaves a lock file that locks nothing, and
 no stale-lock recovery is needed or offered.
@@ -72,9 +72,9 @@ immutable once written, so an identical body delivered twice is stored once.
 be read while the store is mutably borrowed to service a sync.
 
 ### Requirement: A handle names a source only where an operation acts as one
-`PimdirStore::open(dir)` and `PimdirStore::open_read_only(dir)` SHALL take no source. The handle they return serves what an operation means for the store as a whole: every client read, retention and its purges, the queue rows a cancellation or an acknowledgement removes, and the collection generations. None of those consult a source, and none SHALL require one to be named.
+`PimdirStore::open(dir)` and `PimdirReader::open(dir)` SHALL take no source. The handle they return serves what an operation means for the store as a whole: every client read, retention and its purges, the queue rows a cancellation or an acknowledgement removes, and the collection generations. None of those consult a source, and none SHALL require one to be named.
 
-`for_source(source)` SHALL yield the source-bound handle (`PimdirSourceStore`), which carries the io-replica storage seam (`load` / `lookup_objects` / `write`), the rekeyed write and the queue drain: the operations that mean "as this side". It SHALL dereference to the source-less handle, so the store-wide surface stays reachable through it, and a caller that named no source SHALL NOT be able to reach the source-bound one.
+`for_source(source)` SHALL yield the source-bound handle (`PimdirSourceStore`), which carries the seam (`load` / `lookup_objects` / `write`), the driver that runs the verbs against a `PimdirRemote`, and the queue drain: the operations that mean "as this side". It SHALL dereference to the source-less handle, so the store-wide surface stays reachable through it, and a caller that named no source SHALL NOT be able to reach the source-bound one.
 
 No API SHALL invent a source name to satisfy a constructor. A store an operator reads, sweeps and purges therefore records no source, and `distinct_sources` on it stays empty.
 
@@ -145,8 +145,8 @@ durability as a buffered write, so a large body is never held whole; and it SHAL
 expose a stored object as a readable stream for the same reason on the read side.
 
 ### Requirement: A byteless object write indexes an already-stored blob
-A `StoreObject` carrying no bytes — its blob already persisted by a streaming
-fetch under its content-addressed path — SHALL record the object row and refcount
+A `StoreObject` carrying no bytes, its blob already persisted by a streaming
+fetch under its content-addressed path, SHALL record the object row and refcount
 without writing bytes. Refcounting and garbage collection are unchanged.
 
 ### Requirement: The client read surface exposes accounts
@@ -171,20 +171,20 @@ store as a local backend, distinct from the sync seam's load-all:
 - `list_items` SHALL return a page of a collection's **live** items (`deleted =
   0`), keyset-paginated by `link_id` (`link_id > after`, ordered by `link_id`,
   at most `limit`), each carrying its public `seq`, its `link_id`, flags, raw
-  `meta`, object hash and detail `level`.
+  object hash and detail `level`; `list_summaries` and `get_item` join the kind's
+  summary row and its addresses.
 - `get_item` SHALL return one live item by its public id `(collection, seq)`, or
   nothing; `seq_for_link` SHALL resolve the inverse (`link_id` → `seq`).
 - `count_items` SHALL return a collection's live item count.
 
 Every item a read returns SHALL carry its `sort_key` alongside the columns above.
 
-These reads are kind-agnostic (raw `meta`, string flags, opaque object hash) and
-observe only — they never mutate; all writes remain io-replica `ReplicaWriteOp`s
+These reads observe only and never mutate; every write is a `PimdirWriteOp` batch
 through `write`.
 
 ### Requirement: A collection pages in its kind's own order
 `list_items_page_asc` and `list_items_page_desc` SHALL return a keyset page
-ordered by `(sort_key, seq)` (spec §9.3): ascending is A to Z for contacts and
+ordered by `(sort_key, seq)` (STORAGE §9.3): ascending is A to Z for contacts and
 earliest first for mail and calendars, descending is the reverse. `list_items`
 keeps its `link_id` ordering and is the sweep page, for a pass that must see
 every item exactly once.
@@ -208,8 +208,7 @@ would race its own sync indefinitely.
 
 `set_sort_key(collection, link_id, sort_key)` SHALL restate one item's key, for a
 store written before its kind had a convention, one whose convention changed, or
-a consumer whose sync engine does not carry the key inline and derives it from
-the `meta` it wrote itself.
+a consumer restating keys after a convention changed.
 
 ### Requirement: A collection can be renamed without losing its contents
 `rename_collection(collection, new_id)` SHALL give a collection a new id and
@@ -235,8 +234,8 @@ of the internal `link_id`. It is a property of the **message**, not the placemen
 a message filed in several mailboxes (the same `link_id`) SHALL keep the **same**
 `seq` in every one, so a merged / cross-mailbox view shows it once and ids never
 clash between mailboxes. The store SHALL assign a message's `seq` the first time it
-inserts an item with that `link_id` (in any collection) — drawing from the
-**store-global** `store_meta.next_seq` counter — and reuse it for every later
+inserts an item with that `link_id` (in any collection), drawing from the
+**store-global** `store_meta.next_seq` counter, and reuse it for every later
 placement of the same `link_id`. The counter only ever increases, so a `seq` is
 **never reused** even after the message is deleted everywhere. `(collection, seq)`
 SHALL be unique (one placement per message per collection). The sync seam still
@@ -248,7 +247,7 @@ thing.
 ### Requirement: A client can discover the store's sources
 The store SHALL expose the distinct source names it has synced against (across all
 collections) via `distinct_sources`, so a client can attribute its writes to a
-source without configuration — a store synced as a single source returns exactly
+source without configuration, a store synced as a single source returns exactly
 one. This is a kind-agnostic read; it never mutates.
 
 ### Requirement: The store has a reader role of its own
@@ -256,7 +255,7 @@ A consumer that only reads SHALL be able to hold a handle that can only read.
 `PimdirReader::open(dir)` SHALL open an existing store with
 `SQLITE_OPEN_READ_ONLY`: it never creates the schema (that is the owner's
 opening write), and refuses a schema version other than the current one with
-the version error. It takes no lock (spec §8), so any number of readers run
+the version error. It takes no lock (STORAGE §8), so any number of readers run
 against a store an owner is syncing and none of them waits.
 
 The handle SHALL carry the read surface alone: it SHALL NOT expose the drain,
@@ -275,14 +274,15 @@ probing the blob store, and can trigger a hydrate through the sync engine rather
 than treating the absence as data loss.
 
 ### Requirement: Schema version
-The store schema is version 1 (`user_version` 1) and includes the `queue` table
-and `collections.generation`: the spec is a draft, so there is no earlier schema
-and no upgrade path. An owner open creates the schema in a fresh database and
-refuses a store stamped with a higher `user_version` with `PimdirError::Version`;
-a draft store stamped otherwise is recreated, never migrated.
+The store schema is version 1 (`user_version` 1), migrations/storage/0001_init.sql
+verbatim: the spec is a draft, so there is no earlier schema and no upgrade path. An
+owner open creates the schema in a fresh database and refuses a store stamped with
+another `user_version` with `PimdirError::Version`. A store stamped 1 by an earlier
+draft, lacking a table the schema declares, is refused with `PimdirError::Stale`
+naming the table: the operator deletes it and lets it resync.
 
 ### Requirement: The two schema stamps must agree
-`PRAGMA user_version` and `store_meta.version` mirror one another (spec §4.2),
+`PRAGMA user_version` and `store_meta.version` mirror one another (STORAGE §4.2),
 so a store where they differ is corrupt rather than a store at either version.
 Both the owner open and the read-only open SHALL compare them and refuse a
 disagreement with `PimdirError::VersionMismatch`.
@@ -291,21 +291,8 @@ A store carrying no `store_meta` row SHALL be left alone: the row is seeded by
 whoever created the schema, and refusing there would make a missing stamp
 unrepairable.
 
-### Requirement: A store predating the rename cascades is refused
-Every foreign key onto a renamable parent carries `ON UPDATE CASCADE` (spec
-§14), which no `ALTER TABLE` can add to a store that lacks it. Reconciliation
-therefore cannot reach it, and spec §6's other branch applies: both opens SHALL
-check the cascade on every such key and refuse a store without it with
-`PimdirError::Unreconcilable`, naming the table.
-
-Refusing is what makes the limitation legible. Opened anyway, such a store works
-until something renames a collection, and then SQLite refuses the rename one
-dependent row down, so a server-side rename or an account rename can never be
-applied. Recreating the store costs a resync of what the format calls a derived
-cache.
-
 ### Requirement: An unknown flag set is stored as NULL
-The `flags` column keeps two absences apart (spec §13): `NULL` means nothing has
+The `flags` column keeps two absences apart (STORAGE §13): `NULL` means nothing has
 read the item's markers, `'[]'` means it is known to carry none. The store SHALL
 write `NULL` for an unknown set and decode `NULL` back to one, so a probed
 placement never claims to carry no markers.
@@ -392,12 +379,12 @@ early.
 ### Requirement: A binding's unresolved conflict is persisted
 The `bindings` table SHALL carry `conflicted` (INTEGER, `0`/`1`) and
 `conflict_revision` (TEXT, nullable), and the store SHALL round-trip both
-through `ReplicaSourceBinding`. `conflict_revision` SHALL be written and read as
+through `PimdirBinding`. `conflict_revision` SHALL be written and read as
 meaningful only while `conflicted` is set, so a resolved binding cannot hand a
 stale revision to the next sync.
 
 The table SHALL additionally carry `conflict_object` (TEXT, nullable,
-referencing `objects(hash)`), round-tripped through `ReplicaSourceBinding` and,
+referencing `objects(hash)`), round-tripped through `PimdirBinding` and,
 like `conflict_revision`, meaningful only while `conflicted` is set. It holds
 the diverging remote body at the revision beside it, so that resolution can read
 base, local and remote from the store alone.
@@ -413,32 +400,14 @@ every run, and never converges.
 - WHEN it is read back after a restart
 - THEN its base, its local body and its diverging body are all readable from the store
 
-### Requirement: A store from an earlier draft of the current version is reconciled on open
-While the pimdir spec is `draft`, a schema change MAY be folded into version 1
-rather than added as a new version (spec §6). A store written by an earlier
-draft is then stamped with the current `user_version` yet lacks the folded-in
-columns, so the version check alone cannot detect it.
-
-On open, the store SHALL reconcile its shape: every folded-in column found
-missing SHALL be added (`ALTER TABLE … ADD COLUMN`, which requires the column to
-be nullable or carry a constant default), guarded so the check is a no-op for an
-up-to-date store, together with any index over a folded-in column. The set of
-folded-in columns SHALL be kept complete as further columns are folded in;
-`items.sort_key` and its `items_by_sort` index are part of it. Failing a later
-query on a missing column is not acceptable. This requirement lapses when the
-spec leaves `draft` and versions are frozen.
-
-A column SHALL additionally be **backfilled** where `NULL` is not the value the
-existing rows already imply. `bindings.shared_object` SHALL be set from its
-item's own `object_hash`, so an upgraded store opens agreeing with the shared
-body rather than reading as never having folded: added empty, it would have the
-first absorb after the upgrade measure the cross-source axis from the sync base
-again, which is one silent false conflict for every item whose push is pending.
-
 ### Requirement: An item is retained, never deleted, when its last binding goes
 `items` SHALL carry `retained_at` (TEXT, RFC 3339, nullable) and `retained_by`
 (TEXT, nullable). When a write batch leaves an item held by no source, the store
-SHALL **retire** the row rather than delete it: `deleted` set, `retained_at`
+SHALL **retire** the row rather than delete it, unless another collection of the
+same account holds the identity live: that is a move, or one of two filings, and
+the row is retired then purged in the same transaction (`HELD_ELSEWHERE`,
+`PURGE_ITEM`, `release_pins`), the holder pinning the body and the purge counting
+in `store_meta.purges` (STORAGE §11). Otherwise the retirement is: `deleted` set, `retained_at`
 stamped by SQLite (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`, so the crate needs no
 clock), `retained_by` set to the source whose removal retired it, and
 `object_hash` kept. The item's now source-less bindings SHALL be deleted with it,
@@ -449,15 +418,15 @@ of a removal that has finished propagating.
 deleted the item (unknowable). A revive clears it, so restore-then-redelete
 restarts the clock.
 
-A retained row SHALL pin its bodies: retiring compensates the object references
-the hub diff released, so `object_hash` and `conflict_object` keep their
-refcount and garbage collection never sweeps a retained body. Revive and purge
-release that pin.
+A retained row SHALL keep its bodies pinned: the hub keeps an unbound item, so the
+diff releases only the bindings' references and the row's own stay counted, and
+garbage collection never sweeps a retained body. Revive and purge release the row's
+pins.
 
 ### Requirement: Retained rows are hidden from the sync seam
 `LOAD_ITEMS` SHALL exclude retained rows (`retained_at IS NULL`), so a retained
 item is absent from `load_hub`, from `load` and from every projection. This is
-io-replica's "hiding rows from load is safe": the merge reconciles only what
+SYNC §3's "a retained item is projected for nobody": the merge reconciles only what
 `load` returns, so a retained item is never re-derived, re-added or re-pushed,
 on a delta sync or a full resync. It is likewise absent from the live client
 read surface, which already filters `deleted`.
@@ -468,8 +437,8 @@ data:
 
 - `list_retained(collection, after, limit)` SHALL return a keyset page of a
   collection's retained items (`seq > after`, ordered by `seq`, at most `limit`),
-  each carrying its `seq`, `link_id`, flags, level, raw `meta`, object hash,
-  object size, `retained_at` and `retained_by`.
+  each carrying its `seq`, `link_id`, flags, level, object hash, object size,
+  `retained_at` and `retained_by`, and its summary and addresses.
 - `count_retained(collection)` SHALL count a collection's retained items, and
   `retained_bytes()` SHALL total the distinct object sizes the store's retained
   items hold, an upper bound on what a purge reclaims (a body a live item also
@@ -539,19 +508,9 @@ declaration order. Two statements MAY legitimately carry identical text under
 different names (`DELETE_ACTION` and `CANCEL_ACTION` are one delete under two
 intents), so text uniqueness SHALL NOT be asserted.
 
-### Requirement: The carried sort key is bound on write
-A placement's sort key SHALL be written on insert and on update, and SHALL be
-returned by `load`, so it survives the load-merge-save cycle. Dropping it from
-`load` while binding it on update would blank on every sync what the last one
-derived.
-
-This supersedes the earlier arrangement, where the key was preserved by the
-update never naming it: that held only while nothing upstream carried a key, and
-stopped holding the moment io-replica put one on the placement.
-
 ### Requirement: The store owns the content hash
-The crate SHALL implement the hashes the format admits (spec §4.3: `blake3`,
-recommended, and `sha256-128`) and encode them as spec §5 requires, in lowercase
+The crate SHALL implement the hashes the format admits (STORAGE §4.3: `blake3`,
+recommended, and `sha256-128`) and encode them as STORAGE §5 requires, in lowercase
 base32 (RFC 4648, no padding), since the hash is also a path component and a
 single-case, filesystem-safe alphabet is what keeps the blob path valid
 everywhere.
@@ -617,10 +576,18 @@ A binding pins one handle, so a write carrying a second one is either a rebuild 
 - WHEN a write carries the same `(collection, link_id, source)` under a different handle
 - THEN the write fails, the bound handle is unchanged, and no ambiguity is stored
 
-### Requirement: An unlinked upsert lands on the binding its handle holds
-An `UpsertPlacement` carrying no `link_id` SHALL be resolved against the binding its `(collection, source, handle)` holds (`LINK_FOR_HANDLE`) and folded through the hub as that item. Only a handle no binding holds SHALL stage unlinked, as the freshly probed row it is, awaiting the `Meta` upgrade that names it.
+### Requirement: A load by key answers with the rows the source binds
+`load` under `PimdirLoadScope::Links` SHALL return the placements this source binds under the named keys, and SHALL NOT return the `Created` placement the hub projects for an item the source lacks (hub.md, membership propagation). That projection is what the whole-collection load offers the merge so it derives the append; it is no row the source holds, and every verb reading by key asks who holds the key. An upgrade settling a fetched identity against it reads the sibling's copy as this source's holding and mints `dup:<hint>#<handle>` for the resource the source has always held, where SYNC §6 mints only when this source binds the hint under another handle; a copy or a move into the collection mints the same way and pushes a second copy beside the append the offer stages.
 
-A placement carries no link id because its identity has not been read, not because it has none. A handle the store has already bound has one, and staging a second row for it makes `load` answer with two placements for one handle, which is read one layer up as two items: the upgrade fetches the handle twice and mints a `dup:` key for a copy that does not exist, binding one source handle to two items no sync can converge. The write is ordinary, not exotic: a remote edit of a locally deleted item is pulled as a fresh probe of the handle the tombstone still binds (SPEC §10).
+#### Scenario: Two sources already holding one card
+- GIVEN an item one source has hydrated, and a probe of the same identity on a second source
+- WHEN the second source's probe is upgraded
+- THEN it is linked under the identity itself and binds the shared item, and no key is minted
+
+### Requirement: An unlinked upsert lands on the binding its handle holds
+An `UpsertPlacement` carrying no `link_id` SHALL be resolved against the binding its `(collection, source, handle)` holds (`LINK_FOR_HANDLE`) and folded through the hub as that item. Only a handle no binding holds SHALL be a probe: a `probes` row keyed `(collection, source, handle)` carrying the reported flags, loaded back as a level `Probed` placement with no base, and deleted in the transaction of the upsert that names it or the drop that removes it (STORAGE §4.3, SYNC §3).
+
+A placement carries no link id because its identity has not been read, not because it has none. A handle the store has already bound has one, and staging a second row for it makes `load` answer with two placements for one handle, which is read one layer up as two items: the upgrade fetches the handle twice and mints a `dup:` key for a copy that does not exist, binding one source handle to two items no sync can converge. The write is ordinary, not exotic: a remote edit of a locally deleted item is pulled as a fresh probe of the handle the tombstone still binds (STORAGE §10).
 
 Resolving before the fold is also what puts such an upsert under the identity floor: the rebind guard and the link set a batch folds into both read the placement's link id, and neither sees a placement that has none.
 
@@ -635,7 +602,7 @@ Resolving before the fold is also what puts such an upsert under the identity fl
 - THEN it stages unlinked and claims no identity
 
 ### Requirement: A minted link id is an ordinary key
-The store SHALL persist whatever `link_id` the engine assigns, SHALL NOT parse it, and SHALL NOT re-canonicalise one. A minted key (pimdir SPEC §9, `dup:<hint>#<handle>`) is subject to every rule a bare key is: `seq` allocation, retention and revival, dedup by object hash, the reader's pages, and the queue.
+The store SHALL persist whatever `link_id` the engine assigns, SHALL NOT parse it, and SHALL NOT re-canonicalise one. A minted key (pimdir STORAGE §9, `dup:<hint>#<handle>`) is subject to every rule a bare key is: `seq` allocation, retention and revival, dedup by object hash, the reader's pages, and the queue.
 
 The key is the store's, the hint is the format's, and the two are only equal by default. A store that treated a prefix as meaning something would make the engine's assignment reversible by accident and would change a `seq` a consumer has already shown.
 
@@ -644,15 +611,12 @@ The key is the store's, the hint is the format's, and the two are only equal by 
 - WHEN a write upserts a second item keyed `dup:<hint>#<handle>` for the same source under another handle
 - THEN both items exist with their own `seq`, their own binding and their own object reference
 
-### Requirement: A folded-in index is ensured on every open
-`ENSURE_INDEXES` SHALL run on open, not only when a column is missing. Most of these index columns that were always there: what changed is that a statement now needs them, and a store that kept the old plans would keep scanning where the schema says it seeks, silently and for good.
-
 ### Requirement: A store never collects itself
 No write SHALL reclaim. `write`, `write_rekeyed`, the queue drain, a cancelled
 action and both purges maintain the refcounts exactly as before and delete
 nothing: an object at refcount zero is unreferenced, not deleted, and its body
 stays. That is what lets a consumer index a body in one batch and attach it in a
-later one, which SPEC §14 invites and a sweep at the end of every write silently
+later one, which STORAGE §14 invites and a sweep at the end of every write silently
 broke, taking the bytes with it.
 
 `PimdirStore::collect_garbage` is the collector: it drops the object rows at
@@ -669,7 +633,7 @@ that bounded schedules the verb.
 
 ### Requirement: The store repairs what it can recompute
 `recompute_refcounts` SHALL settle every object's count from the five columns
-that pin one (SPEC §7), returning how many disagreed, and
+that pin one (STORAGE §7), returning how many disagreed, and
 `clear_dangling_bindings` SHALL delete the bindings whose item is gone, returning
 how many. Both recover a fact the store already holds.
 
@@ -679,7 +643,7 @@ intent somebody expressed, so deleting either would destroy data rather than
 repair it.
 
 ### Requirement: A superseded handle licenses its own rebind
-A write batch dropping a handle with `ReplicaDropReason::Superseded` SHALL let the binding holding it move to whatever handle the same batch upserts for that identity, by deleting the binding and inserting the new one (SPEC §10, §12). A batch dropping a handle for any other reason, or not dropping it at all, SHALL keep the bound handle and **refuse the write**.
+A write batch dropping a handle with `PimdirDropReason::Superseded` or `Rekeyed` SHALL let the binding holding it move to whatever handle the same batch upserts for that identity, by deleting the binding and inserting the new one (STORAGE §10, §12). A batch dropping a handle as `Deleted`, or not dropping it at all, SHALL keep the bound handle and **refuse the write**. A batch carrying a `Rekeyed` drop SHALL bump the collection's generation in the same transaction, the engine emitting no op for it.
 
 The two are indistinguishable from the rows: a rebuilt spine and a source reporting one identity under a second handle produce the same before and after, and only the drop's reason separates them. Reading a rebuild as a collision refuses every write of a renumbered collection, under handles the server has just voided.
 
@@ -690,19 +654,9 @@ The licence SHALL be per handle rather than per batch, so a rebuild carrying a g
 - WHEN the batch drops it and upserts the item under a new handle
 - THEN the binding follows the new handle and projects `Clean`
 
-### Requirement: An index whose columns moved is rebuilt
-A store opened against a schema whose index of the same name holds different
-columns SHALL have that index dropped and recreated. `CREATE INDEX IF NOT
-EXISTS` keys on the name, so the ensure batch cannot repair one: it finds an
-index already there and leaves the store planning the read the way the schema no
-longer says, silently and for good.
-
-The columns SHALL be compared rather than the index dropped unconditionally,
-rebuilding an index of a large store on every open being the cost this avoids.
-
 ### Requirement: A body is written before its transaction opens
 A write SHALL land the bodies its batch carries in the blob store before opening
-the transaction that indexes them (SPEC §14). A body is content-addressed and
+the transaction that indexes them (STORAGE §14). A body is content-addressed and
 immutable, so writing it early can only produce a file some later batch produces
 identically, and the worst a crash between the two leaves is an orphan for the
 collector; inside the transaction the same write holds SQLite's single writer
@@ -718,7 +672,7 @@ one existence check.
 ### Requirement: The collector asks about the file in front of it
 The collector SHALL resolve each blob file against the index with a point lookup
 on the primary key (`OBJECT_EXISTS`), never by reading every hash into memory
-first: a store of the size SPEC §1 promises holds hundreds of thousands of them,
+first: a store of the size STORAGE §1 promises holds hundreds of thousands of them,
 and the question is always about one file. `LIST_OBJECT_HASHES` remains for the
 diagnosis that visits every row anyway.
 
@@ -738,7 +692,7 @@ own.
 A strong count reaches zero before the description it named is closed, so a
 registry that let the two be observed apart would have the next handle open a
 second description and `flock` itself out of its own store, reporting `Owned`
-with no other process in it (SPEC §8).
+with no other process in it (STORAGE §8).
 
 #### Scenario: Handing the role over inside one process
 - GIVEN a store whose owner handles are taken and dropped concurrently
@@ -784,7 +738,7 @@ a question the store answers rather than one its callers assemble.
 
 ### Requirement: A binding persists what it last agreed with the hub on
 The `bindings` table SHALL carry `shared_object` (TEXT, nullable),
-round-tripped through `ReplicaSourceBinding`: the hub's shared body this source
+round-tripped through `PimdirBinding`: the hub's shared body this source
 last reconciled against, which is the base of the cross-source merge. It is
 meaningful on every binding, conflicted or not, and `NULL` only until the source
 has folded once, where the sync base stands in for it.
@@ -820,3 +774,15 @@ of the binding and buy nothing.
 - GIVEN a store whose single source edited an item offline, with the push still pending
 - WHEN the store is reopened and a second offline edit is absorbed
 - THEN the hub adopts it and the item holds the second body
+
+### Requirement: A summary and its addresses are written with the item
+A named placement carries its `PimdirSummary` (STORAGE Annex A), and the write SHALL persist it as the row of the kind's summary table and the `item_address` rows, in the item's transaction, only when it moved: the batch's load reads the summaries and addresses of the link ids it names, the diff compares them, and a summary that moved under unmoved item columns runs `stamp_item` so the change feed sees it (STORAGE §4.5). A summary of another variant deletes the old row; a placement carrying none deletes the stored row too.
+
+### Requirement: The change feed is the triggers'
+`items.changed` and `collections.changed` SHALL be stamped by the canonical triggers and never bound by a writer; a purge counts in `store_meta.purges`. The reader SHALL expose `change_cursor`, `items_changed_since` and `collections_changed_since` (STORAGE §4.5).
+
+### Requirement: The refcount floor is a constraint
+`objects.refcount` SHALL carry `CHECK (refcount >= 0)`, so a double release fails at the statement that caused it (STORAGE §7).
+
+### Requirement: The queue derives summaries from bodies
+A queued `add` or `update` SHALL carry no summary: the drain reads the body the producer wrote and derives the key, the summary and the sort key under Annex A for the collection's declared kind, parking an `add` that names no link id and derives none.
