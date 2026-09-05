@@ -514,7 +514,7 @@ fn the_meta_fetch_goes_in_chunks() {
                     .map(|h| {
                         fetched(
                             h.as_str(),
-                            &format!("m{}", &h.as_str()[3..].parse::<usize>().unwrap()),
+                            &format!("m{}", h.as_str()[3..].parse::<usize>().unwrap()),
                         )
                     })
                     .collect();
