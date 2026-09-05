@@ -16,6 +16,7 @@ use pimalaya_cli::{
     printer::Printer,
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
 };
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::cli::{StoreFlags, confirm, or_dash, report};
@@ -179,7 +180,8 @@ fn summary(action: &PimdirAction) -> String {
 }
 
 /// One queued action as the listing prints it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueRow {
     /// The row's append id.
     pub id: i64,
@@ -200,7 +202,8 @@ pub struct QueueRow {
 }
 
 /// The `queue list` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueOutput {
     /// Whether the listing shows parked actions.
     pub parked: bool,
@@ -269,7 +272,8 @@ impl fmt::Display for QueueOutput {
 }
 
 /// The `queue cancel` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueCancelOutput {
     /// The dropped action's id.
     pub id: i64,

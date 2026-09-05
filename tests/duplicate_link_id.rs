@@ -226,7 +226,7 @@ fn a_minted_key_round_trips_through_retention_and_revival() {
             reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
-    let retained = store.list_retained(&inbox(), None, 10).unwrap();
+    let retained = store.list_retained(inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].link_id, PimdirLinkId("dup:msg-a#u2".into()));
     let seq = retained[0].seq;

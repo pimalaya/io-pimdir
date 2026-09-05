@@ -15,6 +15,24 @@ A rekey SHALL match each member of the new handle space to the placement holding
 
 Identity is the only thing a handle-space change leaves intact, so it is the only thing the match may key on. Matching on anything derived from a handle would match nothing, and matching on content would pair two copies of one body.
 
+A pending create staged from this collection into another carries an origin naming a handle the rebuild voided. The store derives the origin anew on every load from the bindings by link id (SYNC §3), so such a create copies from the carried handle; a consumer keeping the staged origin sees it fall back to an upload when the store holds the body, and rejected until restaged otherwise.
+
+### Requirement: A rekey never writes a base it never reconciled
+A mutable member whose fetched revision differs from the one its old base held changed on the remote while the handles did (pimdir SYNC §8). The rekey SHALL carry it as the pull a sync would make, body dropped, level `Probed`, base object `None` at the fetched revision, or as a `Conflict` at the fetched revision with the base untouched and no `conflict_object` when the placement also holds a local edit, a body its base does not. A tombstone meeting one is carried as it is, base included, for the next sync to revive it on the ordinary edit-beats-delete path. A base claiming the fetched revision while holding the old body is the one thing the rekey MUST NOT write: the next sync would read the stale body as current, or push the local edit last-writer-wins.
+
+#### Scenario: A remote edit over a clean placement
+- GIVEN a placement clean at `r1` whose new handle the fetch reports at `r2`
+- WHEN the collection is rebuilt
+- THEN it lands on its new handle with no body, at `Probed`, its base at `r2` with no body
+
+#### Scenario: A remote edit over a local edit
+- GIVEN a placement edited locally over a base at `r1` whose new handle the fetch reports at `r2`
+- WHEN the collection is rebuilt
+- THEN it lands conflicted at `r2`, its base still `r1` and its old body, so nothing pushes last-writer-wins
+
+### Requirement: The meta fetch goes in chunks
+A rekey SHALL resolve the new spine's identities in `Meta` fetches of at most `PimdirRekey::FETCH_CHUNK` handles, so a `UIDVALIDITY` bump on a large mailbox issues bounded requests rather than one naming every member; the rebuild itself still lands in one batch with the checkpoint.
+
 ### Requirement: A rebuild's drops say the row is superseded
 Every drop a rebuild emits for a placement its own batch re-writes SHALL carry `PimdirDropReason::Rekeyed`, never `Deleted`. The item is not going anywhere: the same batch upserts it under its new handle, and a storage sharing one item across sources reads a `Deleted` drop as the item being gone and propagates a removal to sources nobody touched.
 

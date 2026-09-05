@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: show-the-bindings
-landed: 2026-08-28
+date: 2026-08-28
 ---
 
 # `item show` names the handles, and the first store it ran against answered a question

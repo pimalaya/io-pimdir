@@ -4,11 +4,11 @@ use std::fmt;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use io_pimdir::collection::PimdirCollectionId;
 use pimalaya_cli::{
     printer::Printer,
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
 };
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::cli::{StoreFlags, bytes, report};
@@ -29,12 +29,11 @@ impl StoreCommand {
     }
 }
 
-/// Summarise the store: its schema version, the sources it syncs, its
-/// per-collection live and retained counts, how many bytes its bodies weigh,
-/// and where its change feed stands.
+/// Summarise the store: schema version, sources, counts, bytes and change feed.
 ///
-/// The retained bytes are what `item purge` would reclaim. The change cursor
-/// is what a consumer deriving from the store (a search index) records.
+/// The counts are per collection, live and retained; the retained bytes are
+/// what `item purge` would reclaim. The change cursor is what a consumer
+/// deriving from the store (a search index) records.
 #[derive(Debug, Args)]
 pub struct StoreInfoCommand;
 
@@ -49,9 +48,9 @@ impl StoreInfoCommand {
         let mut retained = 0;
 
         for collection in read.list_collections().map_err(report)? {
-            let id = PimdirCollectionId(collection.id.clone());
             let collection_live = read.count_items(&collection.id).map_err(report)?;
-            let collection_retained = read.count_retained(&id).map_err(report)?.max(0) as u64;
+            let collection_retained =
+                read.count_retained(&collection.id).map_err(report)?.max(0) as u64;
             live += collection_live;
             retained += collection_retained;
             collections.push(StoreCollectionCount {
@@ -69,7 +68,6 @@ impl StoreInfoCommand {
         printer.out(StoreInfoOutput {
             path,
             schema_version: io_pimdir::sql::VERSION,
-            supported_schema_version: io_pimdir::sql::VERSION,
             sources: read.distinct_sources().map_err(report)?,
             collections,
             live_items: live,
@@ -85,7 +83,8 @@ impl StoreInfoCommand {
 }
 
 /// One collection's item counts.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct StoreCollectionCount {
     /// The collection id.
     pub id: String,
@@ -96,14 +95,14 @@ pub struct StoreCollectionCount {
 }
 
 /// The `store info` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct StoreInfoOutput {
     /// The store directory.
     pub path: String,
-    /// The schema version the store is stamped with.
+    /// The schema version: the one this build services, which the reader
+    /// verified the store to be stamped with, since it refuses any other.
     pub schema_version: i64,
-    /// The schema version this build services.
-    pub supported_schema_version: i64,
     /// The sources the store has synced against.
     pub sources: Vec<String>,
     /// Per-collection counts.
@@ -129,11 +128,7 @@ pub struct StoreInfoOutput {
 impl fmt::Display for StoreInfoOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Store at {}", self.path)?;
-        writeln!(
-            f,
-            " - schema version: {} (this build services {})",
-            self.schema_version, self.supported_schema_version
-        )?;
+        writeln!(f, " - schema version: {}", self.schema_version)?;
         writeln!(
             f,
             " - sources: {}",

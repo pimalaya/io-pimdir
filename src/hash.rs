@@ -20,8 +20,9 @@ use sha2::{Digest, Sha256};
 
 use crate::object::PimdirHash;
 
-/// The hash a store names its objects by, as `store_meta.hash_algo`
-/// records it.
+/// The hash a store names its objects by (STORAGE §5).
+///
+/// Recorded in `store_meta.hash_algo` when the store is created.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PimdirHashAlgo {
     /// BLAKE3, the whole 256-bit digest, which the spec recommends.
@@ -74,8 +75,10 @@ impl PimdirHashAlgo {
     }
 }
 
-/// An incremental hasher over a body's bytes (see
-/// [`hasher`](PimdirHashAlgo::hasher)).
+/// An incremental hasher over a body's bytes.
+///
+/// Made by [`hasher`](PimdirHashAlgo::hasher), for a body streamed into
+/// the blob store.
 pub enum PimdirHasher {
     /// A BLAKE3 digest in progress, boxed: its state is nearly two
     /// kilobytes, which would otherwise size every hasher this enum

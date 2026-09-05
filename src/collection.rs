@@ -10,6 +10,12 @@ crate::pimdir_id! {
     PimdirCollectionId, Ord, PartialOrd, Hash,
 }
 
+impl AsRef<str> for PimdirCollectionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// An opaque per-collection sync token.
 ///
 /// A QRESYNC pack, a JMAP state string or a WebDAV sync-token, never

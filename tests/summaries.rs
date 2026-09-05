@@ -9,7 +9,7 @@ use std::{fs, path::PathBuf};
 use io_pimdir::{
     hash::PimdirHashAlgo,
     placement::PimdirHandle,
-    summary::{self, PimdirAddressRole, PimdirSummary},
+    summary::{self, PimdirSummary},
 };
 use serde_json::{Map, Value, json};
 
@@ -132,7 +132,7 @@ fn addresses(summary: &PimdirSummary) -> Vec<Value> {
 #[test]
 fn every_summary_vector_derives() {
     let Some(spec) = spec_dir() else {
-        eprintln!("skipping: the pimdir spec checkout is not beside this crate");
+        eprintln!("skipped: no pimdir spec checkout beside this one");
         return;
     };
 
@@ -160,12 +160,11 @@ fn every_summary_vector_derives() {
         let derivation = summary::derive(case["kind"].as_str().unwrap(), &body)
             .unwrap_or_else(|| panic!("{label}: no conventions for the kind"));
 
-        match (
-            case.get("hint"),
-            case.get("handle"),
-            case["link_id"].as_str(),
-        ) {
-            (Some(hint), Some(handle), Some(expected)) => {
+        // NOTE: every case pins its key, the writer-derived hash: one
+        // included (STORAGE §16); a hint with a handle pins the minted one.
+        let expected = case["link_id"].as_str().unwrap();
+        match (case.get("hint"), case.get("handle")) {
+            (Some(hint), Some(handle)) => {
                 assert_eq!(
                     derivation.link_id.as_str(),
                     hint.as_str().unwrap(),
@@ -176,13 +175,7 @@ fn every_summary_vector_derives() {
                     .minted(&PimdirHandle::from(handle.as_str().unwrap()));
                 assert_eq!(minted.as_str(), expected, "{label}: minted key");
             }
-            (_, _, Some(expected)) => {
-                assert_eq!(derivation.link_id.as_str(), expected, "{label}: link id")
-            }
-            (_, _, None) => assert!(
-                derivation.link_id.as_str().contains(':'),
-                "{label}: a derived key is prefixed"
-            ),
+            _ => assert_eq!(derivation.link_id.as_str(), expected, "{label}: link id"),
         }
 
         let summary = derivation
@@ -202,6 +195,5 @@ fn every_summary_vector_derives() {
             case["sort_key"].as_str().unwrap_or(""),
             "{label}: sort key"
         );
-        let _ = PimdirAddressRole::From;
     }
 }

@@ -11,6 +11,7 @@ use std::fmt;
 use anyhow::Result;
 use clap::Args;
 use pimalaya_cli::printer::Printer;
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::cli::{StoreFlags, bytes, report};
@@ -38,7 +39,8 @@ impl GcCommand {
 }
 
 /// The `gc` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct GcOutput {
     /// Object rows dropped.
     pub objects: usize,

@@ -42,6 +42,13 @@ fn canonical(spec: &Path) -> String {
             path.display(),
         );
     }
+    out += "/// Every canonical migration in order, the runner of STORAGE §6 applying\n";
+    out += "/// each one above `user_version`.\n";
+    out += "pub const MIGRATIONS: &[&str] = &[\n";
+    for index in 0..migrations.len() {
+        out += &format!("    MIGRATION_{:04},\n", index + 1);
+    }
+    out += "];\n\n";
 
     let mut names = Vec::new();
     for profile in ["read", "queue", "owner"] {

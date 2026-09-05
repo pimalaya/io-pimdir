@@ -2,10 +2,11 @@
 //!
 //! Each module owns one group of subcommands ([`collection`], [`item`],
 //! [`queue`], [`store`], [`check`], [`gc`], [`export`]) and renders its
-//! own output as both text and JSON. This module holds what they share:
-//! the global store flags, the roles a verb may open the store with, the
-//! error mapping, the confirmation prompt guarding destructive verbs and
-//! the formatting helpers.
+//! own output as both text and JSON, with [`json_schema`] indexing every
+//! output type. This module holds what they share: the global store
+//! flags, the roles a verb may open the store with, the error mapping,
+//! the confirmation prompt guarding destructive verbs and the formatting
+//! helpers.
 //!
 //! The modules hang off the binary crate root rather than the library's
 //! `lib.rs`: the command structs are the binary's business, so the
@@ -16,6 +17,7 @@ pub mod collection;
 pub mod export;
 pub mod gc;
 pub mod item;
+pub mod json_schema;
 pub mod queue;
 pub mod store;
 pub mod summary;
@@ -28,9 +30,7 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
-use io_pimdir::client::{
-    PimdirError, PimdirStore, blobs::PimdirBlobs, producer::PimdirProducer, reader::PimdirReader,
-};
+use io_pimdir::client::{PimdirError, PimdirStore, producer::PimdirProducer, reader::PimdirReader};
 use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
 
 /// The producer name recorded on every queue row this tool appends, so an
@@ -111,18 +111,19 @@ impl StoreFlags {
     }
 
     /// The source a queued mutation is staged for: the flag when given, else
-    /// the store's own when it has exactly one.
+    /// the store's own when it has exactly one, read on the handle the verb
+    /// already holds.
     ///
     /// A store syncing several sources without `--source` is refused rather
     /// than guessed: creating an item for the wrong side would push it to the
     /// wrong server. A store that has synced no source at all is refused too,
     /// since there is no side to act as.
-    pub fn write_source(&self) -> Result<String> {
+    pub fn write_source(&self, read: &PimdirReader) -> Result<String> {
         if let Some(source) = &self.source {
             return Ok(source.clone());
         }
 
-        let sources = self.read()?.distinct_sources().map_err(report)?;
+        let sources = read.distinct_sources().map_err(report)?;
         match sources.len() {
             1 => Ok(sources.into_iter().next().unwrap()),
             0 => bail!("this store syncs no source yet: name the one to write as with --source"),
@@ -138,13 +139,6 @@ impl StoreFlags {
     pub fn producer(&self) -> Result<PimdirProducer> {
         self.ensure_store()?;
         PimdirProducer::open(&self.store, PRODUCER).map_err(report)
-    }
-
-    /// The blob directory handle, for reading a body back, bound to the hash
-    /// the store names its bodies by.
-    pub fn blobs(&self) -> Result<PimdirBlobs> {
-        let store = PimdirReader::open(&self.store).map_err(report)?;
-        Ok(store.blobs())
     }
 }
 

@@ -1,5 +1,5 @@
 ---
-cairn: change
+cairn: delta
 change: incremental-write-refcount
 ---
 

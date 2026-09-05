@@ -27,6 +27,7 @@ use io_pimdir::{
     object::{PimdirHash, PimdirObject},
     open::PimdirOpen,
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId, PimdirPlacement, PimdirStatus},
+    rekey::PimdirRekey,
     remote::{PimdirFetchedItem, PimdirPushResult, PimdirRemote, PimdirRemoteSnapshot, PimdirTier},
     sync::{PimdirSync, PimdirSyncOptions, PimdirSyncReport},
     upgrade::PimdirUpgrade,
@@ -129,7 +130,8 @@ proptest! {
             PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full),
             args.clone(),
         );
-        feed(PimdirSync::new("inbox", PimdirSyncOptions::default()), args);
+        feed(PimdirSync::new("inbox", PimdirSyncOptions::default()), args.clone());
+        feed(PimdirRekey::new("inbox"), args);
     }
 }
 
@@ -298,6 +300,11 @@ enum MutOp {
     LocalCopy(usize),
     /// Move the i-th live inbox placement into the archive.
     LocalMove(usize),
+    /// Move the i-th live inbox placement holding no body into the archive.
+    ///
+    /// Its create cannot upload, so the move delivers by relocation or by
+    /// the copy from its origin, and the arrival lands the create.
+    LocalMoveCold(usize),
     ServerSetFlags(usize, PimdirFlags),
     ServerRemove(usize),
     /// A server-side content edit: the revision advances.
@@ -324,6 +331,7 @@ fn arb_mut_op() -> impl Strategy<Value = MutOp> {
         4 => (any::<usize>(), any::<u8>()).prop_map(|(i, n)| MutOp::LocalEdit(i, n)),
         1 => any::<usize>().prop_map(MutOp::LocalCopy),
         1 => any::<usize>().prop_map(MutOp::LocalMove),
+        1 => any::<usize>().prop_map(MutOp::LocalMoveCold),
         1 => (any::<usize>(), arb_flags()).prop_map(|(i, f)| MutOp::ServerSetFlags(i, f)),
         1 => any::<usize>().prop_map(MutOp::ServerRemove),
         4 => (any::<usize>(), any::<u8>()).prop_map(|(i, n)| MutOp::ServerEdit(i, n)),
@@ -352,6 +360,25 @@ struct Ledger {
     copies: Vec<(PimdirHandle, Option<PimdirLinkId>)>,
     /// Staged moves: the source handle, its server link, and voided.
     moves: Vec<(PimdirHandle, Option<PimdirLinkId>, bool)>,
+    /// Moves of a body-less member whose link the archive did not hold:
+    /// the source handle, the link, and voided.
+    ///
+    /// Exactly one copy of the link must land across both collections.
+    cold_moves: Vec<(PimdirHandle, PimdirLinkId, bool)>,
+}
+
+/// Voids every staged move of `handle`, a later action having overtaken it.
+fn void_moves(ledger: &mut Ledger, handle: &PimdirHandle) {
+    for staged_move in &mut ledger.moves {
+        if &staged_move.0 == handle {
+            staged_move.2 = true;
+        }
+    }
+    for cold_move in &mut ledger.cold_moves {
+        if &cold_move.0 == handle {
+            cold_move.2 = true;
+        }
+    }
 }
 
 /// The live (non-tombstoned) named inbox placements.
@@ -371,8 +398,34 @@ fn hydrated(client: &Client) -> BTreeSet<PimdirHandle> {
         .collect()
 }
 
+/// The live named inbox placements holding no body: what only a copy from
+/// the origin or a relocation can deliver.
+fn cold(client: &Client) -> BTreeSet<PimdirHandle> {
+    client
+        .storage()
+        .rows("inbox")
+        .into_iter()
+        .filter(|p| {
+            p.status != PimdirStatus::Tombstone && p.link_id.is_some() && p.object.is_none()
+        })
+        .map(|p| p.handle)
+        .collect()
+}
+
 fn on_server(client: &Client, collection: &str) -> BTreeSet<PimdirHandle> {
     client.remote().handles(collection)
+}
+
+/// How many members of `collection` the server holds under `link`.
+fn link_count(client: &Client, collection: &str, link: &PimdirLinkId) -> usize {
+    client
+        .remote()
+        .items
+        .get(&collection.into())
+        .into_iter()
+        .flatten()
+        .filter(|(_, item)| &item.link_id == link)
+        .count()
 }
 
 fn server_link(client: &Client, handle: &PimdirHandle) -> Option<PimdirLinkId> {
@@ -491,9 +544,10 @@ fn collection_has_link(client: &Client, collection: &str, link: &PimdirLinkId) -
 /// Runs the mutable-content scenario, then the convergence and ledger laws.
 ///
 /// Every conflict left after quiescence is resolved with an edit.
-fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
+fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseError> {
     let mut remote = MemRemote::default();
     remote.mutable = true;
+    remote.cannot_relocate = !relocates;
     remote.seed("inbox", "m1", "l1", &[], b"one");
     remote.seed("inbox", "m2", "l2", &["seen"], b"two");
     remote.seed("inbox", "m3", "l3", &["flagged"], b"three");
@@ -552,11 +606,7 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
                         // NOTE: a pickable move source is one the engine
                         // resurrected, so deleting it is a later action
                         // voiding the move
-                        for staged_move in &mut ledger.moves {
-                            if staged_move.0 == handle {
-                                staged_move.2 = true;
-                            }
-                        }
+                        void_moves(&mut ledger, &handle);
                     }
                 }
             }
@@ -604,12 +654,62 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
                         },
                     );
                     if staged.is_ok() {
+                        // NOTE: a second copy of the link is asked for, so
+                        // a cold move of it no longer lands exactly one
+                        for cold_move in &mut ledger.cold_moves {
+                            if Some(&cold_move.1) == link.as_ref() {
+                                cold_move.2 = true;
+                            }
+                        }
                         ledger.copies.push((placeholder, link));
+                    }
+                }
+            }
+            MutOp::LocalMoveCold(i) => {
+                if let Some(handle) = nth(&cold(&client), i) {
+                    placeholders += 1;
+                    let link = server_link(&client, &handle);
+                    let doomed = inbox_row(&client, &handle)
+                        .and_then(|p| p.base)
+                        .and_then(|b| b.revision)
+                        != client
+                            .remote()
+                            .items
+                            .get(&"inbox".into())
+                            .and_then(|c| c.get(&handle))
+                            .map(|i| i.rev.to_string());
+                    // NOTE: a target already holding the identity, on its
+                    // server or as a pending create, gets a second copy
+                    let held = link.as_ref().is_some_and(|link| {
+                        collection_has_link(&client, "archive", link)
+                            || client.storage().rows("archive").iter().any(|p| {
+                                p.status != PimdirStatus::Tombstone
+                                    && p.link_id.as_ref() == Some(link)
+                            })
+                    });
+                    let staged = client.mutate(
+                        "inbox",
+                        PimdirMutation::Move {
+                            handle: handle.clone(),
+                            target: "archive".into(),
+                            placeholder: PimdirHandle::from(format!("move-{placeholders}")),
+                        },
+                    );
+                    if staged.is_ok() {
+                        ledger.edits.remove(&handle);
+                        ledger.flags.remove(&handle);
+                        ledger.moves.push((handle.clone(), link.clone(), doomed));
+                        if let Some(link) = link
+                            && !held
+                        {
+                            ledger.cold_moves.push((handle, link, doomed));
+                        }
                     }
                 }
             }
             MutOp::LocalMove(i) => {
                 if let Some(handle) = nth(&hydrated(&client), i) {
+                    placeholders += 1;
                     let link = server_link(&client, &handle);
                     let server_body = server_body(&client, &handle);
                     let doomed = inbox_row(&client, &handle)
@@ -627,10 +727,7 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
                         PimdirMutation::Move {
                             handle: handle.clone(),
                             target: "archive".into(),
-                            placeholder: PimdirHandle::from(format!(
-                                "move:archive:{}",
-                                handle.as_str()
-                            )),
+                            placeholder: PimdirHandle::from(format!("move-{placeholders}")),
                         },
                     );
                     if staged.is_ok() {
@@ -670,11 +767,7 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
                     client.remote_mut().remove("inbox", handle.as_str());
                     void_superseded_edits(&mut ledger, &client, &doomed);
                     ledger.flags.remove(&handle);
-                    for staged_move in &mut ledger.moves {
-                        if staged_move.0 == handle {
-                            staged_move.2 = true;
-                        }
-                    }
+                    void_moves(&mut ledger, &handle);
                 }
             }
             MutOp::ServerEdit(i, n) => {
@@ -689,11 +782,7 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
                     let body = format!("srv-edit-{n}").into_bytes();
                     client.remote_mut().edit("inbox", handle.as_str(), &body);
                     void_superseded_edits(&mut ledger, &client, &overwritten);
-                    for staged_move in &mut ledger.moves {
-                        if staged_move.0 == handle {
-                            staged_move.2 = true;
-                        }
-                    }
+                    void_moves(&mut ledger, &handle);
                 }
             }
             MutOp::ServerAdd(n) => {
@@ -727,9 +816,12 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
                 ledger
                     .moves
                     .retain(|(handle, _, _)| linked.contains(handle));
+                ledger
+                    .cold_moves
+                    .retain(|(handle, _, _)| linked.contains(handle));
 
                 let mapping = client.remote_mut().renumber("inbox", bumps);
-                let _ = client.rekey("inbox");
+                client.rekey("inbox").map_err(TestCaseError::fail)?;
 
                 ledger.flags = std::mem::take(&mut ledger.flags)
                     .into_iter()
@@ -740,21 +832,30 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
                         staged_move.0 = new.clone();
                     }
                 }
+                for cold_move in &mut ledger.cold_moves {
+                    if let Some(new) = mapping.get(&cold_move.0) {
+                        cold_move.0 = new.clone();
+                    }
+                }
             }
             MutOp::Sync => {
-                let _ = client.sync("inbox", opts);
+                client.sync("inbox", opts).map_err(TestCaseError::fail)?;
                 hydrate(&mut client, "inbox");
             }
             MutOp::SyncArchive => {
-                let _ = client.sync("archive", opts);
+                client.sync("archive", opts).map_err(TestCaseError::fail)?;
+                hydrate(&mut client, "archive");
             }
         }
     }
 
+    // NOTE: mirroring is a sync plus an upgrade (SYNC §9): the archive
+    // is hydrated too, so a relocated member's fetch lands its create
     for _ in 0..3 {
         client.sync("inbox", opts).unwrap();
         hydrate(&mut client, "inbox");
         client.sync("archive", opts).unwrap();
+        hydrate(&mut client, "archive");
     }
 
     for round in 0..3 {
@@ -809,16 +910,14 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
         client.sync("inbox", opts).unwrap();
         hydrate(&mut client, "inbox");
         client.sync("archive", opts).unwrap();
+        hydrate(&mut client, "archive");
     }
 
-    // NOTE: a copy whose source vanished can never land, so its
+    // NOTE: a create whose source vanished before it was hydrated holds
+    // neither an origin nor a body, so nothing can deliver it and its
     // placeholder staying visibly pending is the accounted end state
-    let inbox_server = on_server(&client, "inbox");
     let lingering = |p: &PimdirPlacement| {
-        p.status == PimdirStatus::Created
-            && p.origin
-                .as_ref()
-                .is_some_and(|o| !inbox_server.contains(&o.handle))
+        p.status == PimdirStatus::Created && p.object.is_none() && p.origin.is_none()
     };
 
     for collection in ["inbox", "archive"] {
@@ -872,20 +971,20 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
     // NOTE: a flag claim holds while its handle exists; a resurrect
     // re-keys it and ends the claim
     for (handle, (added, removed)) in &ledger.flags {
-        if let Some(items) = client.remote().items.get(&"inbox".into()) {
-            if let Some(item) = items.get(handle) {
-                for flag in added {
-                    prop_assert!(
-                        item.flags.contains(flag),
-                        "added flag {flag} on {handle:?} lost",
-                    );
-                }
-                for flag in removed {
-                    prop_assert!(
-                        !item.flags.contains(flag),
-                        "removed flag {flag} on {handle:?} came back",
-                    );
-                }
+        if let Some(items) = client.remote().items.get(&"inbox".into())
+            && let Some(item) = items.get(handle)
+        {
+            for flag in added {
+                prop_assert!(
+                    item.flags.contains(flag),
+                    "added flag {flag} on {handle:?} lost",
+                );
+            }
+            for flag in removed {
+                prop_assert!(
+                    !item.flags.contains(flag),
+                    "removed flag {flag} on {handle:?} came back",
+                );
             }
         }
     }
@@ -916,20 +1015,27 @@ fn check_mutable_model(ops: Vec<MutOp>) -> Result<(), TestCaseError> {
         );
     }
 
+    // NOTE: a move delivers exactly one copy (SYNC §5), by relocation or
+    // by the copy from its origin, the arrival landing the create
+    for (handle, link, voided) in &ledger.cold_moves {
+        if *voided {
+            continue;
+        }
+        let copies = link_count(&client, "inbox", link) + link_count(&client, "archive", link);
+        prop_assert_eq!(
+            copies,
+            1,
+            "the cold move of {:?} ({:?}) landed {} copies",
+            handle,
+            link,
+            copies,
+        );
+    }
+
     let report = client.sync("inbox", opts).unwrap();
     prop_assert_eq!(report, PimdirSyncReport::default());
-    let dead_placeholders = client
-        .storage()
-        .rows("archive")
-        .iter()
-        .filter(|p| lingering(p))
-        .count();
     let report = client.sync("archive", opts).unwrap();
-    let expected = PimdirSyncReport {
-        rejected: dead_placeholders,
-        ..Default::default()
-    };
-    prop_assert_eq!(report, expected);
+    prop_assert_eq!(report, PimdirSyncReport::default());
     Ok(())
 }
 
@@ -942,7 +1048,16 @@ proptest! {
     fn mutable_interleavings_converge_after_resolution(
         ops in proptest::collection::vec(arb_mut_op(), 0..25),
     ) {
-        check_mutable_model(ops)?;
+        check_mutable_model(ops, true)?;
+    }
+
+    /// A connector that cannot relocate rejects the remove rather than
+    /// delete (SYNC §4), so a move delivers through its create alone.
+    #[test]
+    fn mutable_interleavings_converge_over_a_remote_that_cannot_relocate(
+        ops in proptest::collection::vec(arb_mut_op(), 0..25),
+    ) {
+        check_mutable_model(ops, false)?;
     }
 }
 
@@ -952,13 +1067,16 @@ proptest! {
 /// read as a pending push.
 #[test]
 fn a_content_identical_edit_claims_nothing() {
-    check_mutable_model(vec![
-        MutOp::LocalEdit(1338203356464132091, 125),
-        MutOp::Sync,
-        MutOp::LocalRemove(1892733528096728582),
-        MutOp::ServerRemove(1245933664089759521),
-        MutOp::LocalEdit(11104427113558993974, 125),
-    ])
+    check_mutable_model(
+        vec![
+            MutOp::LocalEdit(1338203356464132091, 125),
+            MutOp::Sync,
+            MutOp::LocalRemove(1892733528096728582),
+            MutOp::ServerRemove(1245933664089759521),
+            MutOp::LocalEdit(11104427113558993974, 125),
+        ],
+        true,
+    )
     .unwrap();
 }
 
@@ -968,14 +1086,17 @@ fn a_content_identical_edit_claims_nothing() {
 /// would otherwise stay ahead of a replica reporting itself in sync.
 #[test]
 fn a_resolution_keeping_the_ancestor_reaches_the_remote() {
-    check_mutable_model(vec![
-        MutOp::Upgrade(14210287063717275722),
-        MutOp::LocalEdit(8823440174339698637, 0),
-        MutOp::ServerRemove(2473669229220409580),
-        MutOp::LocalSetFlags(0, PimdirFlags::from_iter(Vec::<String>::new())),
-        MutOp::Bump,
-        MutOp::ServerEdit(4132879379286324521, 0),
-    ])
+    check_mutable_model(
+        vec![
+            MutOp::Upgrade(14210287063717275722),
+            MutOp::LocalEdit(8823440174339698637, 0),
+            MutOp::ServerRemove(2473669229220409580),
+            MutOp::LocalSetFlags(0, PimdirFlags::from_iter(Vec::<String>::new())),
+            MutOp::Bump,
+            MutOp::ServerEdit(4132879379286324521, 0),
+        ],
+        true,
+    )
     .unwrap();
 }
 

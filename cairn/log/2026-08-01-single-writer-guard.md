@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: single-writer-guard
-landed: 2026-08-01
+date: 2026-08-01
 ---
 
 # Single-writer guard (BEGIN IMMEDIATE + loud busy)

@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: operator-cli
-landed: 2026-08-07
+date: 2026-08-07
 ---
 
 # The `pimdir` operator CLI

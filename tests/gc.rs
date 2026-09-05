@@ -119,7 +119,7 @@ fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
         .unwrap();
 
     // a body on disk that no batch ever indexed
-    let shard = dir.path().join("objects/de/adb");
+    let shard = dir.path().join("objects/de/ad");
     fs::create_dir_all(&shard).unwrap();
     fs::write(shard.join("deadbeef"), b"crashed").unwrap();
 

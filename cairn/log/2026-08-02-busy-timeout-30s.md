@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: busy-timeout-30s
-landed: 2026-08-02
+date: 2026-08-02
 ---
 
 # Raise the write busy timeout to 30s for same-source worker fan-out

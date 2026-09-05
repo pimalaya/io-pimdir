@@ -79,11 +79,11 @@ fn a_source_less_handle_reads_purges_and_cancels() {
     let mut store = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(store.list_collections().unwrap().len(), 1);
     assert!(store.list_items("INBOX", None, 10).unwrap().is_empty());
-    assert_eq!(store.list_retained(&inbox(), None, 10).unwrap().len(), 1);
+    assert_eq!(store.list_retained(inbox(), None, 10).unwrap().len(), 1);
     assert!(store.drop_action(id).unwrap());
     assert!(store.pending_actions("INBOX").unwrap().is_empty());
-    assert!(store.purge(&inbox(), seq).unwrap());
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 0);
+    assert!(store.purge(inbox(), seq).unwrap());
+    assert_eq!(store.count_retained(inbox()).unwrap(), 0);
 }
 
 /// A store an operator opened, read and swept still syncs no source.
@@ -94,7 +94,7 @@ fn an_operator_pass_records_no_source() {
     let mut store = PimdirStore::open(dir.path()).unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     assert!(store.list_items("INBOX", None, 10).unwrap().is_empty());
-    assert!(!store.purge(&inbox(), 1).unwrap());
+    assert!(!store.purge(inbox(), 1).unwrap());
     assert!(!store.drop_action(1).unwrap());
     assert_eq!(
         store

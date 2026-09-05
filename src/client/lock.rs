@@ -21,7 +21,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, PoisonError},
+    sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 // NOTE: std grew these locks in 1.89 and its inherent methods would
@@ -60,6 +60,8 @@ struct Owned {
     /// merely unreferenced.
     _file: File,
     handles: usize,
+    /// The lock the process's own writers and collector serialise on.
+    writers: Arc<RwLock<()>>,
 }
 
 /// An advisory lock on a store directory, held for as long as it lives.
@@ -73,6 +75,12 @@ pub struct PimdirLock {
     _file: Option<File>,
     /// The [`OWNED`] key whose count to drop on release.
     registered: Option<PathBuf>,
+    /// The owner lock excludes other processes and nothing inside its own
+    /// (STORAGE §8), so the handles sharing one also share this: a writer
+    /// holds it shared from blob staging through commit, the collector
+    /// exclusively across its row deletion and its file walk. Unused on a
+    /// staging lock.
+    writers: Arc<RwLock<()>>,
 }
 
 impl PimdirLock {
@@ -86,24 +94,31 @@ impl PimdirLock {
         let key = dir.canonicalize()?;
         let mut owned = OWNED.lock().unwrap_or_else(PoisonError::into_inner);
 
-        match owned.get_mut(&key) {
-            Some(entry) => entry.handles += 1,
+        let writers = match owned.get_mut(&key) {
+            Some(entry) => {
+                entry.handles += 1;
+                Arc::clone(&entry.writers)
+            }
             None => {
                 let file = open(&dir.join(OWNER))?;
                 FileExt::try_lock(&file).map_err(|_| PimdirError::Owned(dir.to_path_buf()))?;
+                let writers = Arc::default();
                 owned.insert(
                     key.clone(),
                     Owned {
                         _file: file,
                         handles: 1,
+                        writers: Arc::clone(&writers),
                     },
                 );
+                writers
             }
-        }
+        };
 
         Ok(Arc::new(Self {
             _file: None,
             registered: Some(key),
+            writers,
         }))
     }
 
@@ -121,6 +136,7 @@ impl PimdirLock {
         Ok(Self {
             _file: Some(file),
             registered: None,
+            writers: Arc::default(),
         })
     }
 
@@ -139,7 +155,22 @@ impl PimdirLock {
         Ok(Self {
             _file: Some(file),
             registered: None,
+            writers: Arc::default(),
         })
+    }
+
+    /// Holds the process's writer lock shared, for a write from its blob
+    /// staging through its commit: what keeps the collector out of the
+    /// window between a body and its row (STORAGE §8).
+    pub fn writing(&self) -> RwLockReadGuard<'_, ()> {
+        self.writers.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds the process's writer lock exclusively, for the collector's
+    /// row deletion and file walk: no writer of this process is between a
+    /// body and its row while it runs (STORAGE §5, §8).
+    pub fn collecting(&self) -> RwLockWriteGuard<'_, ()> {
+        self.writers.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

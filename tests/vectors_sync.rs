@@ -15,14 +15,19 @@ use io_pimdir::{
     client::{PimdirSourceStore, PimdirStore},
     collection::{PimdirCheckpoint, PimdirCollectionId},
     hash::PimdirHashAlgo,
-    placement::{PimdirFlags, PimdirHandle},
+    mutate::PimdirMutation,
+    object::{PimdirHash, PimdirObject},
+    placement::{PimdirFlags, PimdirHandle, PimdirLinkId},
     remote::{
         PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome, PimdirPushResult, PimdirRemote,
         PimdirRemoteItem, PimdirRemoteSnapshot, PimdirTier,
     },
     sql,
     summary::{self, PimdirSummary},
-    sync::{PimdirConflictPolicy, PimdirDeletePolicy, PimdirPushRights, PimdirSyncOptions},
+    sync::{
+        PimdirConflictPolicy, PimdirDeletePolicy, PimdirPushRights, PimdirSyncEvent,
+        PimdirSyncOptions,
+    },
 };
 use rusqlite::{Connection, named_params, params};
 use serde_json::{Map, Value, json};
@@ -34,9 +39,11 @@ fn spec_dir() -> Option<PathBuf> {
     dir.join("vectors/sync").is_dir().then_some(dir)
 }
 
-/// Bodies by label, the store rows name them by.
+/// Bodies by label, the store rows and the pushes name them by.
+#[derive(Clone)]
 struct Bodies {
     hashes: BTreeMap<String, String>,
+    bytes: BTreeMap<String, Vec<u8>>,
 }
 
 impl Bodies {
@@ -60,6 +67,17 @@ impl Bodies {
                 .unwrap_or_else(|| label.to_string())
         })
     }
+
+    /// The object and bytes a mutation carries for a labelled body.
+    fn object(&self, label: &Value) -> (PimdirObject, Vec<u8>) {
+        let label = label.as_str().expect("a body label");
+        let bytes = self.bytes[label].clone();
+        let object = PimdirObject {
+            hash: PimdirHash::from(self.hashes[label].clone()),
+            size: bytes.len(),
+        };
+        (object, bytes)
+    }
 }
 
 fn flags(value: &Value) -> PimdirFlags {
@@ -81,6 +99,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
     let owner = PimdirStore::open_with_hash(dir, Some(PimdirHashAlgo::Blake3)).unwrap();
     let blobs = owner.blobs();
     let mut hashes = BTreeMap::new();
+    let mut bytes = BTreeMap::new();
     for (label, object) in store["objects"].as_object().unwrap() {
         let body = fs::read(spec.join("vectors").join(object["body"].as_str().unwrap())).unwrap();
         let hash = blobs.hash(&body);
@@ -88,8 +107,9 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
         std::io::Write::write_all(&mut writer, &body).unwrap();
         writer.commit(&hash).unwrap();
         hashes.insert(label.clone(), hash.0.clone());
+        bytes.insert(label.clone(), body);
     }
-    let bodies = Bodies { hashes };
+    let bodies = Bodies { hashes, bytes };
     drop(owner);
 
     let conn = Connection::open(dir.join("pimdir.db")).unwrap();
@@ -159,6 +179,21 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
     conn.execute("UPDATE store_meta SET next_seq = ?1", params![next_seq])
         .unwrap();
     for binding in store["bindings"].as_array().unwrap() {
+        // NOTE: a case states no agreement point (STORAGE §10), and a
+        // binding whose source folded the item's body agrees with it: the
+        // store would have moved shared_object with the absorbed upsert.
+        let shared_object = match binding.get("shared_object") {
+            Some(stated) => bodies.hash(stated),
+            None => store["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["collection"] == binding["collection"]
+                        && item["link_id"] == binding["link_id"]
+                })
+                .and_then(|item| bodies.hash(&item["object"])),
+        };
         conn.execute(
             sql::INSERT_BINDING,
             named_params! {
@@ -173,7 +208,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":conflicted": binding["conflicted"].as_i64().unwrap_or(0),
                 ":conflict_revision": binding["conflict_revision"].as_str(),
                 ":conflict_object": bodies.hash(&binding["conflict_object"]),
-                ":shared_object": bodies.hash(&binding["shared_object"]),
+                ":shared_object": shared_object,
             },
         )
         .unwrap();
@@ -207,15 +242,72 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
 }
 
 /// The remote a case scripts: one snapshot, fetch answers by handle and
-/// tier, outcomes by handle, and every push it was handed.
+/// tier, outcomes by handle, and every push it was handed, recorded on
+/// the terms SYNC §11 compares a push on.
 struct Scripted {
     spec: PathBuf,
     kind: String,
     algo: PimdirHashAlgo,
+    bodies: Bodies,
     snapshot: Option<PimdirRemoteSnapshot>,
     fetch: Map<String, Value>,
     outcomes: Vec<Value>,
     pushes: Vec<Value>,
+}
+
+impl Scripted {
+    /// One push as the case's `expect.pushes` spells it.
+    fn record(&self, change: &PimdirChange) -> Value {
+        let handle = change.handle().0.clone();
+        let key = change.key.as_str();
+        let label =
+            |hash: &Option<PimdirHash>| self.bodies.label(hash.as_ref().map(|h| h.0.clone()));
+        match &change.kind {
+            PimdirChangeKind::SetFlags { flags, .. } => {
+                json!({ "kind": "SetFlags", "handle": handle, "key": key, "flags": flags.known() })
+            }
+            PimdirChangeKind::Remove {
+                to,
+                link_id,
+                if_match,
+                ..
+            } => json!({
+                "kind": "Remove",
+                "handle": handle,
+                "key": key,
+                "to": to.as_ref().map(|t| t.0.clone()),
+                "link_id": link_id.as_ref().map(|l| l.0.clone()),
+                "if_match": if_match,
+            }),
+            PimdirChangeKind::Update {
+                object, if_match, ..
+            } => json!({
+                "kind": "Update",
+                "handle": handle,
+                "key": key,
+                "object": label(&Some(object.clone())),
+                "if_match": if_match,
+            }),
+            PimdirChangeKind::Add {
+                link_id,
+                flags,
+                origin,
+                object,
+                ..
+            } => json!({
+                "kind": "Add",
+                "handle": handle,
+                "key": key,
+                "link_id": link_id.as_ref().map(|l| l.0.clone()),
+                "flags": flags.known(),
+                "origin": origin.as_ref().map(|o| json!({
+                    "collection": o.collection.0,
+                    "handle": o.handle.0,
+                })),
+                "object": label(object),
+            }),
+        }
+    }
 }
 
 impl PimdirRemote for Scripted {
@@ -285,17 +377,8 @@ impl PimdirRemote for Scripted {
     ) -> Result<Vec<PimdirPushResult>, String> {
         let mut results = Vec::new();
         for change in changes {
+            self.pushes.push(self.record(&change));
             let handle = change.handle().clone();
-            self.pushes.push(match &change.kind {
-                PimdirChangeKind::SetFlags { flags, .. } => {
-                    json!({ "kind": "SetFlags", "handle": handle.0, "flags": flags.known() })
-                }
-                PimdirChangeKind::Remove { to, .. } => {
-                    json!({ "kind": "Remove", "handle": handle.0, "to": to.as_ref().map(|t| t.0.clone()) })
-                }
-                PimdirChangeKind::Update { .. } => json!({ "kind": "Update", "handle": handle.0 }),
-                PimdirChangeKind::Add { .. } => json!({ "kind": "Add", "handle": handle.0 }),
-            });
             let scripted = self
                 .outcomes
                 .iter()
@@ -330,7 +413,8 @@ fn options(value: &Value) -> PimdirSyncOptions {
         },
         delete: match value["delete"].as_str() {
             Some("keep") => PimdirDeletePolicy::Keep,
-            _ => PimdirDeletePolicy::Revert,
+            Some("revert") => PimdirDeletePolicy::Revert,
+            _ => PimdirDeletePolicy::Auto,
         },
         conflict: match value["conflict"].as_str() {
             Some("prefer-local") => PimdirConflictPolicy::PreferLocal,
@@ -339,6 +423,62 @@ fn options(value: &Value) -> PimdirSyncOptions {
             _ => PimdirConflictPolicy::Manual,
         },
         full: false,
+    }
+}
+
+/// The mutation a `mutate` run carries (SYNC §7), bodies by label.
+fn mutation(value: &Value, kind: &str, bodies: &Bodies) -> PimdirMutation {
+    let handle = || PimdirHandle::from(value["handle"].as_str().unwrap());
+    let target = || PimdirCollectionId::from(value["target"].as_str().unwrap());
+    let placeholder = || PimdirHandle::from(value["placeholder"].as_str().unwrap());
+    let derived = |body: &[u8]| summary::derive(kind, body);
+
+    match value["kind"].as_str().unwrap() {
+        "SetFlags" => PimdirMutation::SetFlags {
+            handle: handle(),
+            flags: flags(&value["flags"]),
+        },
+        "Remove" => PimdirMutation::Remove(handle()),
+        "Edit" => {
+            let (object, body) = bodies.object(&value["object"]);
+            let derivation = derived(&body);
+            PimdirMutation::Edit {
+                handle: handle(),
+                object,
+                summary: derivation.as_ref().and_then(|d| d.summary.clone()),
+                sort_key: derivation.map(|d| d.sort_key),
+                body,
+            }
+        }
+        "Copy" => PimdirMutation::Copy {
+            handle: handle(),
+            target: target(),
+            placeholder: placeholder(),
+        },
+        "Move" => PimdirMutation::Move {
+            handle: handle(),
+            target: target(),
+            placeholder: placeholder(),
+        },
+        "Add" => {
+            let (object, body) = bodies.object(&value["object"]);
+            let derivation = derived(&body);
+            let link_id = value["link_id"]
+                .as_str()
+                .map(PimdirLinkId::from)
+                .or_else(|| derivation.as_ref().map(|d| d.link_id.clone()))
+                .expect("a link id, stated or derived");
+            PimdirMutation::Add {
+                handle: handle(),
+                link_id,
+                flags: flags(&value["flags"]),
+                object,
+                summary: derivation.as_ref().and_then(|d| d.summary.clone()),
+                sort_key: derivation.map(|d| d.sort_key).unwrap_or_default(),
+                body,
+            }
+        }
+        kind => panic!("unsupported mutation {kind}"),
     }
 }
 
@@ -358,12 +498,12 @@ fn run(
             .iter()
             .map(|event| {
                 let (kind, handle) = match event {
-                    io_pimdir::sync::PimdirSyncEvent::Added(h) => ("Added", h),
-                    io_pimdir::sync::PimdirSyncEvent::FlagsChanged(h) => ("FlagsChanged", h),
-                    io_pimdir::sync::PimdirSyncEvent::ContentChanged(h) => ("ContentChanged", h),
-                    io_pimdir::sync::PimdirSyncEvent::Vanished(h) => ("Vanished", h),
-                    io_pimdir::sync::PimdirSyncEvent::Conflicted(h) => ("Conflicted", h),
-                    io_pimdir::sync::PimdirSyncEvent::Created(h) => ("Created", h),
+                    PimdirSyncEvent::Added(h) => ("Added", h),
+                    PimdirSyncEvent::FlagsChanged(h) => ("FlagsChanged", h),
+                    PimdirSyncEvent::ContentChanged(h) => ("ContentChanged", h),
+                    PimdirSyncEvent::Vanished(h) => ("Vanished", h),
+                    PimdirSyncEvent::Conflicted(h) => ("Conflicted", h),
+                    PimdirSyncEvent::Created(h) => ("Created", h),
                 };
                 json!({ "kind": kind, "handle": handle.0 })
             })
@@ -381,6 +521,11 @@ fn run(
                 _ => PimdirTier::Meta,
             };
             store.upgrade(collection, handles, tier, remote).unwrap();
+            Vec::new()
+        }
+        "mutate" => {
+            let mutation = mutation(&run["mutation"], &remote.kind, &remote.bodies);
+            store.mutate(collection, mutation).unwrap();
             Vec::new()
         }
         "rekey" => {
@@ -566,10 +711,33 @@ fn assert_same_set(label: &str, table: &str, mut expected: Vec<Value>, mut actua
     );
 }
 
+/// The pushes in order, each projected onto the keys the case carries for
+/// it (SYNC §11): kind, handle, key, and what the kind carries.
+fn assert_same_pushes(label: &str, expected: &[Value], actual: &[Value]) {
+    assert_eq!(
+        expected.len(),
+        actual.len(),
+        "{label}: pushes differ\nexpected {expected:#?}\nactual {actual:#?}"
+    );
+    for (expected, actual) in expected.iter().zip(actual) {
+        let projected: Map<String, Value> = expected
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| (key.clone(), actual[key].clone()))
+            .collect();
+        assert_eq!(
+            expected,
+            &Value::Object(projected),
+            "{label}: push differs\nexpected {expected:#?}\nactual {actual:#?}"
+        );
+    }
+}
+
 #[test]
 fn every_sync_vector_reproduces() {
     let Some(spec) = spec_dir() else {
-        eprintln!("skipping: the pimdir spec checkout is not beside this crate");
+        println!("skipped: no pimdir spec checkout beside this one");
         return;
     };
 
@@ -588,6 +756,7 @@ fn every_sync_vector_reproduces() {
             path.file_name().unwrap().to_string_lossy(),
             case["label"].as_str().unwrap_or("")
         );
+        println!("{label}");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), &spec, &case["store"]);
 
@@ -631,6 +800,7 @@ fn every_sync_vector_reproduces() {
             spec: spec.clone(),
             kind,
             algo: PimdirHashAlgo::Blake3,
+            bodies: bodies.clone(),
             snapshot,
             fetch: case["remote"]["fetch"]
                 .as_object()
@@ -649,14 +819,11 @@ fn every_sync_vector_reproduces() {
         let (pushes, events) = run(&mut store, &case, &mut remote);
         drop(store);
 
-        assert_eq!(
-            case["expect"]["pushes"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-            pushes,
-            "{label}: pushes differ"
-        );
+        let expected_pushes = case["expect"]["pushes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_same_pushes(&label, &expected_pushes, &pushes);
         assert_eq!(
             case["expect"]["events"]
                 .as_array()

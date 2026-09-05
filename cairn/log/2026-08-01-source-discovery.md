@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: source-discovery
-landed: 2026-08-01
+date: 2026-08-01
 ---
 
 # Source discovery read

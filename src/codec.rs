@@ -86,8 +86,10 @@ pub fn conflict_from_str(value: &str) -> PimdirHubConflict {
     }
 }
 
-/// A queued mutation request (STORAGE §15.3): what a producer appends and
-/// the owner applies, existing items addressed by their public `seq`.
+/// A queued mutation request (STORAGE §15.3).
+///
+/// What a producer appends and the owner applies, existing items
+/// addressed by their public `seq`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirAction {
     /// Create an item, staged as a local creation for the sync to push.

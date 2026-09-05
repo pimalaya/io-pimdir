@@ -249,7 +249,10 @@ fn a_producer_body_survives_with_and_without_the_row_that_pins_it() {
                 object: Some(pinned.clone()),
                 handle: None,
             },
-            Some(b"pinned".len() as u64),
+            Some(&PimdirObject {
+                hash: pinned.clone(),
+                size: b"pinned".len(),
+            }),
         )
         .unwrap();
     drop(producer);

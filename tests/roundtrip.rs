@@ -12,8 +12,8 @@ use io_pimdir::{
     mutate::{PimdirMutate, PimdirMutation},
     object::{PimdirHash, PimdirObject},
     placement::{
-        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
-        PimdirStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
+        PimdirPlacement, PimdirStatus,
     },
 };
 use io_pimdir::{
@@ -173,13 +173,13 @@ fn single_source_write_reopen_lookup_and_gc() {
             .placements
             .is_empty()
     );
-    let retained = store.list_retained(&inbox(), None, 10).unwrap();
+    let retained = store.list_retained(inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert!(blob_exists(dir.path(), "cafebabe"), "the body is kept");
 
     // purging is what orphans the blob, and it stays until a collector
     // runs
-    assert!(store.purge(&inbox(), retained[0].seq).unwrap());
+    assert!(store.purge(inbox(), retained[0].seq).unwrap());
     assert!(blob_exists(dir.path(), "cafebabe"), "no write collects");
 
     let collected = store.collect_garbage().unwrap();
@@ -635,19 +635,19 @@ fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
             .placements
             .is_empty()
     );
-    let retained = store.list_retained(&inbox(), None, 10).unwrap();
+    let retained = store.list_retained(inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 2);
     assert!(blob_exists(dir.path(), "cafebabe"), "both rows pin it");
 
     // purging the first releases one reference, and the blob outlives it
-    assert!(store.purge(&inbox(), retained[0].seq).unwrap());
+    assert!(store.purge(inbox(), retained[0].seq).unwrap());
     assert!(
         blob_exists(dir.path(), "cafebabe"),
         "blob kept while the second retained row still references it"
     );
 
     // purging the last orphans it, and the collector unlinks it
-    let report = store.purge(&inbox(), retained[1].seq).unwrap();
+    let report = store.purge(inbox(), retained[1].seq).unwrap();
     assert!(report);
     assert!(blob_exists(dir.path(), "cafebabe"), "no purge collects");
 
@@ -791,6 +791,85 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
         archive_proj[0].base.is_none(),
         "no base yet: the sync appends it"
     );
+
+    // both halves are derived from the bindings (SYNC §3), so a reopen
+    // reads them the same: the create copies from the source member it
+    // still binds, the tombstone relocates into the pending create
+    let reopened = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let inbox_proj = reopened
+        .load(&inbox(), &PimdirLoadScope::All)
+        .unwrap()
+        .placements;
+    assert_eq!(
+        inbox_proj[0].origin,
+        Some(PimdirOrigin {
+            collection: PimdirCollectionId("Archive".into()),
+            handle: PimdirHandle("1".into()),
+        }),
+        "the tombstone's destination, under its own handle"
+    );
+    let archive_proj = reopened
+        .load(&PimdirCollectionId("Archive".into()), &PimdirLoadScope::All)
+        .unwrap()
+        .placements;
+    assert_eq!(
+        archive_proj[0].origin,
+        Some(PimdirOrigin {
+            collection: inbox(),
+            handle: PimdirHandle("1".into()),
+        }),
+        "the create's origin"
+    );
+    let by_key = reopened
+        .load(
+            &inbox(),
+            &PimdirLoadScope::Links(vec![PimdirLinkId("mid:a".into())]),
+        )
+        .unwrap()
+        .placements;
+    assert_eq!(by_key[0].origin, inbox_proj[0].origin, "whatever the scope");
+}
+
+#[test]
+fn a_handles_load_reads_only_its_own_probes() {
+    // STORAGE §14: the probes of a Handles load are the batch's, not
+    // every unnamed handle the source holds
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let probe = |handle: &str| PimdirPlacement {
+        collection: inbox(),
+        handle: PimdirHandle(handle.into()),
+        link_id: None,
+        object: None,
+        level: PimdirLevel::Probed,
+        summary: None,
+        sort_key: Default::default(),
+        flags: PimdirFlags::default(),
+        status: PimdirStatus::Clean,
+        conflict_revision: None,
+        conflict_object: None,
+        base: None,
+        origin: None,
+    };
+    store
+        .write(vec![
+            PimdirWriteOp::UpsertPlacement(probe("p1")),
+            PimdirWriteOp::UpsertPlacement(probe("p2")),
+        ])
+        .unwrap();
+
+    let all = store.load(&inbox(), &PimdirLoadScope::All).unwrap();
+    assert_eq!(all.placements.len(), 2);
+
+    let batch = store
+        .load(
+            &inbox(),
+            &PimdirLoadScope::Handles(vec![PimdirHandle("p2".into())]),
+        )
+        .unwrap();
+    assert_eq!(batch.placements.len(), 1);
+    assert_eq!(batch.placements[0].handle, PimdirHandle("p2".into()));
+    assert_eq!(batch.placements[0].level, PimdirLevel::Probed);
 }
 
 #[test]

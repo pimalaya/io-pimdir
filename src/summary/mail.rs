@@ -140,12 +140,10 @@ pub fn decode(raw: &str) -> String {
 /// One RFC 2047 `encoded-word` at the head of `text`, and its length.
 fn encoded_word(text: &str) -> Option<(String, usize)> {
     let inner = text.strip_prefix("=?")?;
-    let end = inner.find("?=")?;
-    let word = &inner[..end];
-    let mut parts = word.splitn(3, '?');
-    let charset = parts.next()?;
-    let encoding = parts.next()?;
-    let payload = parts.next()?;
+    let (charset, rest) = inner.split_once('?')?;
+    let (encoding, rest) = rest.split_once('?')?;
+    let end = rest.find("?=")?;
+    let payload = &rest[..end];
 
     let bytes = match encoding {
         "B" | "b" => base64(payload)?,
@@ -153,18 +151,39 @@ fn encoded_word(text: &str) -> Option<(String, usize)> {
         _ => return None,
     };
 
-    Some((charset_decode(charset, &bytes), end + 4))
+    let len = 2 + charset.len() + 1 + encoding.len() + 1 + end + 2;
+    Some((charset_decode(charset, &bytes), len))
 }
 
-/// Bytes under a MIME charset as text, `latin1` by the byte and the rest
-/// as UTF-8, replacing what does not decode (Annex A.0).
+/// Bytes under a MIME charset as text: `iso-8859-1` and `us-ascii` by
+/// the byte, `windows-1252` by its table, and every other charset as
+/// UTF-8, replacing what does not decode (Annex A.0). The crate carries
+/// no charset tables beyond these, so another 8-bit charset reads lossily.
 fn charset_decode(charset: &str, bytes: &[u8]) -> String {
     let charset = charset.split('*').next().unwrap_or_default().to_lowercase();
     match charset.as_str() {
-        "iso-8859-1" | "latin1" | "us-ascii" | "ascii" | "windows-1252" | "cp1252" => {
-            bytes.iter().map(|byte| *byte as char).collect()
+        "iso-8859-1" | "latin1" | "us-ascii" | "ascii" => {
+            bytes.iter().map(|byte| char::from(*byte)).collect()
         }
+        "windows-1252" | "cp1252" => bytes.iter().map(|byte| cp1252(*byte)).collect(),
         _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// One `windows-1252` byte as its code point: latin1 except for the
+/// 0x80 to 0x9F row, where five undefined bytes map to themselves.
+fn cp1252(byte: u8) -> char {
+    const ROW: [char; 32] = [
+        '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}',
+        '\u{8f}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}',
+        '\u{2014}', '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}',
+        '\u{178}',
+    ];
+
+    match byte {
+        0x80..=0x9f => ROW[usize::from(byte - 0x80)],
+        _ => char::from(byte),
     }
 }
 
@@ -549,6 +568,7 @@ mod tests {
     fn encoded_words_decode_in_both_encodings_and_join_across_whitespace() {
         assert_eq!(decode("=?UTF-8?B?UsOpdW5pb24=?="), "Réunion");
         assert_eq!(decode("=?ISO-8859-1?Q?Z=F6e_Br=FCck?="), "Zöe Brück");
+        assert_eq!(decode("=?windows-1252?Q?=80_=93quoted=94?="), "€ “quoted”");
         assert_eq!(decode("=?UTF-8?Q?a?= =?UTF-8?Q?b?="), "ab");
         assert_eq!(decode("plain =?UTF-8?Q?text?= here"), "plain text here");
         assert_eq!(decode("=?bad?="), "=?bad?=");
@@ -612,6 +632,15 @@ mod tests {
         let plain = b"Content-Type: text/plain\r\n\r\nhi\r\n";
         let (headers, rest) = split_headers(plain);
         assert!(!has_attachment(&header_fields(headers), rest));
+    }
+
+    #[test]
+    fn a_folded_header_keeps_its_whitespace() {
+        let derivation = derive(b"Subject: one\r\n\ttwo   three\r\nMessage-ID: <a@b>\r\n\r\n");
+        let PimdirSummary::Mail(mail) = derivation.summary.unwrap() else {
+            unreachable!("a message derives a mail summary");
+        };
+        assert_eq!(mail.subject, "one\ttwo   three");
     }
 
     #[test]

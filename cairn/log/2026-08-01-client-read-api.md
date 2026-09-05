@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: client-read-api
-landed: 2026-08-01
+date: 2026-08-01
 ---
 
 # Client read API (indexed, paginated reads)

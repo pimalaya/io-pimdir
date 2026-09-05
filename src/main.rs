@@ -10,9 +10,9 @@
 //!
 //! It never interprets item content. A pimdir store is kind-agnostic, so
 //! this binary prints the public id, the link id, the flags, the detail
-//! level and the raw meta, and exports bodies as raw bytes. Rendering a
-//! message or a vCard belongs to the per-kind clients (himalaya,
-//! cardamum), which know the kind they hold.
+//! level and the summary row as stored, and exports bodies as raw bytes.
+//! Rendering a message or a vCard belongs to the per-kind clients
+//! (himalaya, cardamum), which know the kind they hold.
 //!
 //! ## Roles
 //!
@@ -27,9 +27,9 @@
 //! ## Layout
 //!
 //! [`cli`] holds the command tree, one module per verb group, plus the
-//! shared store flags and the role handling. The library underneath is
-//! [`io_pimdir`], and this tool's specification lives in the
-//! repository's `cairn/spec/cli.md`.
+//! shared store flags, the role handling and the JSON Schema registry.
+//! The library underneath is [`io_pimdir`], and this tool's
+//! specification lives in the repository's cairn/spec/cli.md.
 
 mod cli;
 
@@ -38,9 +38,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use pimalaya_cli::{
     clap::{
         args::{JsonFlag, LogFlags},
-        commands::{CompletionCommand, ManualCommand},
+        commands::{CompletionCommand, JsonSchemaCommand, ManualCommand},
     },
     error::ErrorReport,
+    footer,
     log::Logger,
     long_version,
     printer::{Printer, StdoutPrinter},
@@ -48,7 +49,7 @@ use pimalaya_cli::{
 
 use crate::cli::{
     StoreFlags, check::CheckCommand, collection::CollectionCommand, export::ExportCommand,
-    gc::GcCommand, item::ItemCommand, queue::QueueCommand, store::StoreCommand,
+    gc::GcCommand, item::ItemCommand, json_schema, queue::QueueCommand, store::StoreCommand,
 };
 
 fn main() {
@@ -61,35 +62,42 @@ fn main() {
     ErrorReport::eval(&mut printer, result)
 }
 
+/// Top-level command-line interface parser.
 #[derive(Parser, Debug)]
 #[command(name = env!("CARGO_BIN_NAME"))]
 #[command(about = "CLI to inspect, repair and recover a pimdir store")]
 #[command(author, version, long_version = long_version!())]
+#[command(after_help = footer!())]
 #[command(propagate_version = true, infer_subcommands = true)]
 struct Cli {
+    /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
+    /// Where the store is and which source to act as.
     #[command(flatten)]
     pub store: StoreFlags,
+    /// The log level and format.
     #[command(flatten)]
     pub log: LogFlags,
+    /// Whether the output is rendered as JSON.
     #[command(flatten)]
     pub json: JsonFlag,
 }
 
+/// Top-level subcommands.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Inspect the store's collections (mailboxes, address books, calendars).
-    #[command(subcommand)]
+    #[command(subcommand, alias = "collections")]
     Collection(CollectionCommand),
     /// Inspect, restore and purge items.
-    #[command(subcommand)]
+    #[command(subcommand, alias = "items")]
     Item(ItemCommand),
     /// Inspect and prune the action queue.
-    #[command(subcommand)]
+    #[command(subcommand, alias = "queues")]
     Queue(QueueCommand),
     /// Inspect the store as a whole.
-    #[command(subcommand)]
+    #[command(subcommand, alias = "stores")]
     Store(StoreCommand),
     /// Check the store's internal consistency.
     Check(CheckCommand),
@@ -97,11 +105,16 @@ enum Command {
     Gc(GcCommand),
     /// Dump the store to a directory.
     Export(ExportCommand),
-    Completions(CompletionCommand),
-    Manuals(ManualCommand),
+    #[command(alias = "completions")]
+    Completion(CompletionCommand),
+    #[command(alias = "manuals")]
+    Manual(ManualCommand),
+    #[command(alias = "json-schemas")]
+    JsonSchema(JsonSchemaCommand),
 }
 
 impl Command {
+    /// Runs the selected subcommand against the store the flags name.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         match self {
             Self::Collection(cmd) => cmd.execute(printer, store),
@@ -111,8 +124,9 @@ impl Command {
             Self::Check(cmd) => cmd.execute(printer, store),
             Self::Gc(cmd) => cmd.execute(printer, store),
             Self::Export(cmd) => cmd.execute(printer, store),
-            Self::Completions(cmd) => cmd.execute(printer, Cli::command()),
-            Self::Manuals(cmd) => cmd.execute(printer, Cli::command()),
+            Self::Completion(cmd) => cmd.execute(printer, Cli::command()),
+            Self::Manual(cmd) => cmd.execute(printer, Cli::command()),
+            Self::JsonSchema(cmd) => cmd.execute(printer, json_schema::schemas()),
         }
     }
 }

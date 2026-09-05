@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: action-queue
-landed: 2026-08-07
+date: 2026-08-07
 ---
 
 # Action queue and collection generations

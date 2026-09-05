@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: not-mine-is-not-broken
-landed: 2026-08-28
+date: 2026-08-28
 ---
 
 # A source that cannot place an action no longer destroys it

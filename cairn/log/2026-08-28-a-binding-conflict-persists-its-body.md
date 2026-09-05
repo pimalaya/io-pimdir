@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: a-binding-conflict-persists-its-body
-landed: 2026-08-28
+date: 2026-08-28
 ---
 
 # A binding conflict persists its body, and the collector is told about it

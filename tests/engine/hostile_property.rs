@@ -282,7 +282,7 @@ proptest! {
         let remote = HostileRemote { inner, chaos };
         let mut client = Client::new(remote);
         let opts = PimdirSyncOptions::default();
-        let _ = client.sync("inbox", opts);
+        client.sync("inbox", opts).map_err(TestCaseError::fail)?;
         intact(&client, "after the seeding sync")?;
 
         let mut arrivals = 0usize;
@@ -338,22 +338,22 @@ proptest! {
                 }
                 HostileOp::Hydrate => {
                     let handles = every(&client, "inbox");
-                    let _ = client.upgrade("inbox", handles, PimdirTier::Full);
+                    client.upgrade("inbox", handles, PimdirTier::Full).map_err(TestCaseError::fail)?;
                 }
                 HostileOp::Summarise => {
                     let handles = every(&client, "inbox");
-                    let _ = client.upgrade("inbox", handles, PimdirTier::Meta);
+                    client.upgrade("inbox", handles, PimdirTier::Meta).map_err(TestCaseError::fail)?;
                 }
                 HostileOp::Sync => {
-                    let _ = client.sync("inbox", opts);
+                    client.sync("inbox", opts).map_err(TestCaseError::fail)?;
                 }
                 HostileOp::SyncArchive => {
-                    let _ = client.sync("archive", opts);
+                    client.sync("archive", opts).map_err(TestCaseError::fail)?;
                 }
                 HostileOp::Rekey => {
                     bumps += 1;
                     client.remote_mut().inner.renumber("inbox", bumps);
-                    let _ = client.rekey("inbox");
+                    client.rekey("inbox").map_err(TestCaseError::fail)?;
                 }
             }
 
@@ -361,8 +361,8 @@ proptest! {
         }
 
         for _ in 0..3 {
-            let _ = client.sync("inbox", opts);
-            let _ = client.sync("archive", opts);
+            client.sync("inbox", opts).map_err(TestCaseError::fail)?;
+            client.sync("archive", opts).map_err(TestCaseError::fail)?;
         }
         intact(&client, "after quiescence")?;
     }

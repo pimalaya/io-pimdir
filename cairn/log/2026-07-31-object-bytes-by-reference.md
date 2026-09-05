@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: object-bytes-by-reference
-landed: 2026-07-31
+date: 2026-07-31
 ---
 
 # Object bytes by reference (streaming blob I/O)

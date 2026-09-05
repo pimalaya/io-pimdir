@@ -15,7 +15,7 @@ status: current
 - `Remove`: tombstone a placement, kept until synced. Absorbed as a staged delete (the item is marked deleted, its binding kept), so the next sync pushes the remove.
 - `Edit`: store a new body and repoint the placement at it (full level), keeping the base so the next sync derives the push. An edit whose object is the one the base already holds stages nothing and SHALL leave the status where it found it, `PimdirPlacement::staged_edit` being the single reading of "there is a local content edit here"; every other edit marks the placement dirty. Editing a conflicted placement resolves it whatever body it carries, the base adopting the remote state observed at conflict time, both halves of it (see below), and editing a tombstoned one revives it (see below).
 - `Copy`: stage a `Created` placement in a target under a caller-supplied `placeholder`, carrying the source origin; the source is untouched.
-- `Move`: stage a `Created` placement in the target under a caller-supplied `placeholder` (carrying the source origin), **and** tombstone the source. A move is thus a copy into the target plus a remove from the source, both derived on the next sync; the source's tombstone and the target's create land in their respective collection hubs.
+- `Move`: stage a `Created` placement in the target under a caller-supplied `placeholder` (carrying the source origin), **and** tombstone the source. A move is thus a copy into the target plus a remove from the source, both derived on the next sync; the source's tombstone and the target's create land in their respective collection hubs. The destination the tombstone carries is what the store derives from the target's pending create on every load (pimdir SYNC §3); the one staged here serves a consumer keeping the placement as written.
 - `Add`: see below.
 
 A mutation SHALL touch the local replica only; the remote is reconciled by sync.
@@ -44,6 +44,13 @@ The read SHALL ask for the key a second copy would take beside the identity itse
 
 ### Requirement: An edit revives a tombstone, a flag change rides along
 An `Edit` staging a body on a tombstoned placement SHALL revive it, leaving it `Dirty`, and SHALL drop the move destination the tombstone carried: new content beats a delete, the same rule the merge applies when the remote edits what was deleted locally, and the move that destination belonged to is not happening any more. Left on the revived row it turns the member's next plain delete into a relocation nobody asked for.
+
+An `Edit` on a `Created` placement SHALL keep it `Created` and drop its origin: a server-side copy from the origin would deliver the body the edit replaced, so the create uploads the edited body instead (pimdir SYNC §7).
+
+#### Scenario: An edit on a pending copy
+- GIVEN a pending create staged by a copy, carrying its origin
+- WHEN it is edited
+- THEN it is still `Created`, points at the new body, and carries no origin
 
 A `SetFlags` on a tombstoned placement SHALL leave it tombstoned, the marker riding along with the delete. A flag change is not content, so it settles nothing about whether the item is going.
 

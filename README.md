@@ -2,9 +2,9 @@
 
 Rust implementation of the Pimdir standard: the store and the sync engine
 
-This library is composed of 3 feature-gated layers:
+This library is composed of 3 layers, the two upper ones feature-gated:
 
-- Low-level **I/O-free** core: no_std-compatible schema, encodings, per-kind summaries and the five sync verbs as coroutines, usable anywhere
+- Low-level **I/O-free** core: no_std-compatible schema, encodings, per-kind summaries and the five sync verbs as coroutines, usable anywhere (always built)
 - Mid-level **std client**: the three profiles the standard names, reader, producer and owner, as handles running the statements against SQLite and the blob files, the owner running the verbs against a connector you provide (requires the `client` feature, enabled by default)
 - High-level **CLI**: the `pimdir` binary, the operator tool over a store (requires the `cli` feature)
 
@@ -68,7 +68,7 @@ pimdir -s ~/mail queue list --parked
 pimdir -s ~/mail check
 ```
 
-Run `pimdir --help` for the full command tree and flags, and add `--json` to any command for machine-readable output. The CLI contract lives in [cairn/spec/cli.md](./cairn/spec/cli.md). The whole library API is documented on [docs.rs](https://docs.rs/io-pimdir/latest/io_pimdir).
+Run `pimdir --help` for the full command tree and flags, add `--json` to any command for machine-readable output, and `pimdir json-schema` describes that output. The CLI contract lives in [cairn/spec/cli.md](./cairn/spec/cli.md). The whole library API is documented on [docs.rs](https://docs.rs/io-pimdir/latest/io_pimdir).
 
 ## Examples
 

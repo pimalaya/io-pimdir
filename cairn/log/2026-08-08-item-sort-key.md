@@ -2,7 +2,6 @@
 cairn: log
 change: item-sort-key
 date: 2026-08-08
-landed: 2026-08-08
 ---
 
 # A collection can be ordered, and renamed

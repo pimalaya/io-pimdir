@@ -28,7 +28,6 @@ use rusqlite::{
 use crate::{
     client::{lock::PimdirLock, reader::PimdirReader},
     codec::{self, PimdirActionError},
-    collection::PimdirCollectionId,
     hash::PimdirHashAlgo,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
     sql,
@@ -46,13 +45,15 @@ pub use run::PimdirRunError;
 mod schema;
 mod write;
 
-/// A pimdir store held as its owner: the write surface over the read
-/// surface every role shares.
+/// A pimdir store held as its owner (STORAGE §8).
+///
+/// The write surface over the read surface every role shares.
 pub struct PimdirStore {
     reader: PimdirReader,
     /// The exclusive owner lock (§8), held for the handle's lifetime and
-    /// shared by every handle of this process.
-    _lock: Arc<PimdirLock>,
+    /// shared by every handle of this process, carrying the lock its
+    /// writers and collector serialise on.
+    pub(crate) lock: Arc<PimdirLock>,
     /// The account every collection this handle creates belongs to (§9.2).
     account: Option<String>,
 }
@@ -71,9 +72,10 @@ impl DerefMut for PimdirStore {
     }
 }
 
-/// A pimdir store acting as one source: the sync seam, where every
-/// operation means "as this side". Dereferences to the [`PimdirStore`]
-/// it was made from.
+/// A pimdir store acting as one source: the sync seam (STORAGE §14).
+///
+/// Every operation means "as this side". Dereferences to the
+/// [`PimdirStore`] it was made from.
 pub struct PimdirSourceStore {
     store: PimdirStore,
     source: PimdirSourceId,
@@ -117,8 +119,9 @@ impl PimdirStore {
     /// Takes the store's exclusive advisory lock (§8) and holds it until
     /// the handle drops; a store another process owns is
     /// [`PimdirError::Owned`] at once, never a wait. A fresh database is
-    /// created at the current version; one at another version, or from
-    /// an earlier draft, is refused and recreated by its owner.
+    /// created by running the migrations (§6); one above the current
+    /// version, or from an earlier draft, is refused and recreated by its
+    /// owner.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         Self::open_with_hash(dir, None)
     }
@@ -145,7 +148,7 @@ impl PimdirStore {
 
         Ok(Self {
             reader: PimdirReader::over(conn, dir.to_path_buf(), hash),
-            _lock: lock,
+            lock,
             account: None,
         })
     }
@@ -171,75 +174,96 @@ impl PimdirStore {
     }
 
     /// A collection's whole hub: every source's items and bindings.
-    pub fn load_hub(&self, collection: &str) -> Result<PimdirHub, PimdirError> {
-        write::read_hub(&self.conn, collection, None)
+    pub fn load_hub(&self, collection: impl AsRef<str>) -> Result<PimdirHub, PimdirError> {
+        write::read_hub(&self.conn, collection.as_ref(), None)
     }
 
     /// Declares a collection's media type, creating the row if absent
     /// (§14). The lazy creation inside a write never overwrites it.
-    pub fn ensure_collection(&self, collection: &str, kind: &str) -> Result<(), PimdirError> {
-        self.conn.execute(
-            sql::SET_COLLECTION_KIND,
-            named_params! {
-                ":collection": collection,
-                ":account": self.account.as_deref(),
-                ":kind": kind,
-            },
-        )?;
+    pub fn ensure_collection(
+        &self,
+        collection: impl AsRef<str>,
+        kind: &str,
+    ) -> Result<(), PimdirError> {
+        self.conn
+            .execute(
+                sql::SET_COLLECTION_KIND,
+                named_params! {
+                    ":collection": collection.as_ref(),
+                    ":account": self.account.as_deref(),
+                    ":kind": kind,
+                },
+            )
+            .map_err(busy_or_sql)?;
         Ok(())
     }
 
     /// Regroups a collection under `account`, or out of one with `None` (§9.2).
     pub fn set_collection_account(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         account: Option<&str>,
     ) -> Result<(), PimdirError> {
-        self.conn.execute(
-            sql::SET_COLLECTION_ACCOUNT,
-            named_params! { ":collection": collection, ":account": account },
-        )?;
+        self.conn
+            .execute(
+                sql::SET_COLLECTION_ACCOUNT,
+                named_params! { ":collection": collection.as_ref(), ":account": account },
+            )
+            .map_err(busy_or_sql)?;
         Ok(())
     }
 
     /// Sets a collection's cross-source conflict policy (SYNC §9).
     pub fn set_collection_conflict(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         policy: PimdirHubConflict,
     ) -> Result<(), PimdirError> {
-        self.conn.execute(
-            sql::SET_CONFLICT,
-            named_params! { ":collection": collection, ":conflict": codec::conflict_to_str(policy) },
-        )?;
+        self.conn
+            .execute(
+                sql::SET_CONFLICT,
+                named_params! {
+                    ":collection": collection.as_ref(),
+                    ":conflict": codec::conflict_to_str(policy),
+                },
+            )
+            .map_err(busy_or_sql)?;
         Ok(())
     }
 
     /// Restates one item's ordering key (§9.3), outside the write path.
     pub fn set_sort_key(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         link_id: &str,
         sort_key: &str,
     ) -> Result<(), PimdirError> {
-        self.conn.execute(
-            sql::SET_SORT_KEY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link_id,
-                ":sort_key": sort_key,
-            },
-        )?;
+        self.conn
+            .execute(
+                sql::SET_SORT_KEY,
+                named_params! {
+                    ":collection": collection.as_ref(),
+                    ":link_id": link_id,
+                    ":sort_key": sort_key,
+                },
+            )
+            .map_err(busy_or_sql)?;
         Ok(())
     }
 
     /// Gives a collection a new id, its contents following through the
     /// cascades (§14): the only safe way to change one.
-    pub fn rename_collection(&self, collection: &str, new_id: &str) -> Result<(), PimdirError> {
-        self.conn.execute(
-            sql::RENAME_COLLECTION,
-            named_params! { ":collection": collection, ":new_id": new_id },
-        )?;
+    pub fn rename_collection(
+        &self,
+        collection: impl AsRef<str>,
+        new_id: &str,
+    ) -> Result<(), PimdirError> {
+        self.conn
+            .execute(
+                sql::RENAME_COLLECTION,
+                named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
+            )
+            .map_err(busy_or_sql)?;
         Ok(())
     }
 }
@@ -248,11 +272,7 @@ impl PimdirStore {
 impl PimdirStore {
     /// Purges one retained item by its public id, reporting whether there
     /// was one; a live item is never reached.
-    pub fn purge(
-        &mut self,
-        collection: &PimdirCollectionId,
-        seq: i64,
-    ) -> Result<bool, PimdirError> {
+    pub fn purge(&mut self, collection: impl AsRef<str>, seq: i64) -> Result<bool, PimdirError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -261,7 +281,7 @@ impl PimdirStore {
         let pinned: Option<(Option<String>, Option<String>)> = tx
             .prepare(sql::PURGE_ITEM)?
             .query_row(
-                named_params! { ":collection": collection.0, ":seq": seq },
+                named_params! { ":collection": collection.as_ref(), ":seq": seq },
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -310,11 +330,14 @@ impl PimdirStore {
     /// Reclaims what nothing references: the object rows at refcount
     /// zero, their bodies, and the orphan blobs a crash left.
     ///
-    /// Takes the staging lock exclusively on an owning handle, so no
-    /// writer is between a body and the row that pins it. The rows go
-    /// inside a transaction and the files after it.
+    /// Takes the staging lock exclusively on an owning handle, and the
+    /// process's own writer lock exclusively across the rows and the
+    /// walk, so no writer is between a body and the row that pins it
+    /// (§8). The rows go inside a transaction and the files after it.
     pub fn collect_garbage(&mut self) -> Result<PimdirGcReport, PimdirError> {
         let _staging = PimdirLock::collect(&self.dir)?;
+        let lock = Arc::clone(&self.lock);
+        let _collecting = lock.collecting();
 
         let tx = self
             .conn
@@ -344,13 +367,17 @@ impl PimdirStore {
     /// Recomputes every refcount from the five pointer columns (§7),
     /// returning how many rows disagreed.
     pub fn recompute_refcounts(&self) -> Result<usize, PimdirError> {
-        Ok(self.conn.execute(sql::RECOMPUTE_REFCOUNTS, [])?)
+        self.conn
+            .execute(sql::RECOMPUTE_REFCOUNTS, [])
+            .map_err(busy_or_sql)
     }
 
     /// Deletes the bindings whose item is gone, returning how many: the
     /// one dangling row a repair clears without guessing.
     pub fn clear_dangling_bindings(&self) -> Result<usize, PimdirError> {
-        Ok(self.conn.execute(sql::DELETE_DANGLING_BINDINGS, [])?)
+        self.conn
+            .execute(sql::DELETE_DANGLING_BINDINGS, [])
+            .map_err(busy_or_sql)
     }
 }
 
@@ -390,18 +417,21 @@ impl PimdirStore {
     }
 
     /// Records a failed apply (§15.2): `None` bumps the attempts and
-    /// leaves the row pending, `Some(error)` parks it.
+    /// leaves the row pending, `Some(error)` parks it, the attempt counted.
     pub fn fail_action(&self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
         let Some(error) = error else {
             self.conn
-                .execute(sql::BUMP_ATTEMPTS, named_params! { ":id": id })?;
+                .execute(sql::BUMP_ATTEMPTS, named_params! { ":id": id })
+                .map_err(busy_or_sql)?;
             return Ok(());
         };
 
-        self.conn.execute(
-            sql::PARK_ACTION,
-            named_params! { ":id": id, ":error": error },
-        )?;
+        self.conn
+            .execute(
+                sql::PARK_ACTION,
+                named_params! { ":id": id, ":error": error },
+            )
+            .map_err(busy_or_sql)?;
         Ok(())
     }
 }

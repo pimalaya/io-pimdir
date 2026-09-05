@@ -88,11 +88,13 @@ DELETE_DANGLING_BINDINGS = r#"DELETE FROM bindings WHERE NOT EXISTS (
 
 #[cfg(test)]
 mod tests {
+    use alloc::collections::BTreeSet;
+
     use super::all;
 
     #[test]
     fn no_statement_is_empty_and_every_name_is_unique() {
-        let mut names = alloc::collections::BTreeSet::new();
+        let mut names = BTreeSet::new();
         for (name, sql) in all() {
             assert!(!sql.trim().is_empty(), "{name} is empty");
             assert!(names.insert(name), "{name} is declared twice");

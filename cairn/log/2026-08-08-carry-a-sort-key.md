@@ -2,7 +2,6 @@
 cairn: log
 change: carry-a-sort-key
 date: 2026-08-08
-landed: 2026-08-08
 ---
 
 # The store binds the sort key io-replica now carries

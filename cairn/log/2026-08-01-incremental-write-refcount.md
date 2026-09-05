@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: incremental-write-refcount
-landed: 2026-08-01
+date: 2026-08-01
 ---
 
 # Incremental hub save and refcount maintenance (kill the per-write O(N²))

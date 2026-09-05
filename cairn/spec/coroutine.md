@@ -23,9 +23,12 @@ A driver that resumes a coroutine with an arg not matching the pending yield, or
 `PimdirOpen`, `PimdirUpgrade`, `PimdirRekey` and `PimdirSync` SHALL return it directly: they read local state, ask for remote state and stage writes, and none of that can fail inside the engine. A verb with failures of its own (`PimdirMutate`) SHALL compose it beside them rather than restate its variants.
 
 ### Requirement: A completed coroutine does not resume
-Every coroutine SHALL hold a terminal state and answer a resume after completion with `PimdirArgError::UnexpectedArg`. Handing back a default output instead is worse than useless: an empty report or an `Ok(())` is exactly what a run that genuinely did nothing returns, so a driver with a loop bug is told it succeeded.
+Every coroutine SHALL hold a terminal state and answer any resume after completion, `None` included, with `PimdirArgError::UnexpectedArg`. Handing back a default output instead is worse than useless: an empty report or an `Ok(())` is exactly what a run that genuinely did nothing returns, so a driver with a loop bug is told it succeeded. `MissingArg` is for a yield still pending, not for a run that is over.
 
 #### Scenario: A driver resumes a finished run
 - GIVEN a coroutine that completed
-- WHEN the driver resumes it again
+- WHEN the driver resumes it again, with an arg or without
 - THEN it answers `UnexpectedArg` rather than an empty success
+
+### Requirement: A state is named for what the coroutine is doing
+Every coroutine's `State` SHALL name its variants in the present tense for what the coroutine is doing while it waits for the caller (`Loading`, `Enumerating`, `Fetching`, `Pushing`, `Writing`, `CheckingLinks`), never `Pending*` or `Await*`: a state is the coroutine's own activity, not the caller's obligation.

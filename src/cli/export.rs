@@ -23,12 +23,12 @@ use anyhow::{Result, bail};
 use clap::Args;
 use io_pimdir::{
     client::{blobs::PimdirBlobs, reader::PimdirReader},
-    collection::PimdirCollectionId,
     object::PimdirHash,
     placement::PimdirLevel,
 };
 use log::warn;
 use pimalaya_cli::printer::Printer;
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
@@ -41,14 +41,14 @@ const PAGE: usize = 500;
 /// the summary columns and address rows where 1 carried a raw meta string.
 const FORMAT_VERSION: i64 = 2;
 
-/// Dump a store to a directory: a manifest, one JSON-lines file of items per
-/// collection, and a copy of every body.
+/// Dump a store to a directory.
 ///
-/// Items are dumped exactly as stored (public id, link id, flags, level, body
-/// hash, sort key, summary columns and address rows), so the dump carries no
-/// interpretation of any kind. Use
-/// it to snapshot a store before a risky operation, to move one between
-/// machines, or to look at a store with ordinary text tools.
+/// The dump is a manifest, one JSON-lines file of items per collection, and a
+/// copy of every body. Items are dumped exactly as stored (public id, link id,
+/// flags, level, body hash, sort key, summary columns and address rows), so
+/// the dump carries no interpretation of any kind. Use it to snapshot a store
+/// before a risky operation, to move one between machines, or to look at a
+/// store with ordinary text tools.
 #[derive(Debug, Args)]
 pub struct ExportCommand {
     /// Directory to write the dump into (created if missing).
@@ -72,7 +72,7 @@ impl ExportCommand {
     /// Writes the dump.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         let read = store.read()?;
-        let blobs = store.blobs()?;
+        let blobs = read.blobs();
 
         let manifest_path = self.dir.join("manifest.json");
         if manifest_path.exists() && !self.force {
@@ -212,13 +212,14 @@ impl ExportCommand {
         path: &Path,
         hashes: &mut BTreeSet<String>,
     ) -> Result<u64> {
-        let id = PimdirCollectionId(collection.to_string());
         let mut file = BufWriter::new(File::create(path)?);
         let mut after: Option<i64> = None;
         let mut count = 0;
 
         loop {
-            let page = read.list_retained(&id, after, PAGE).map_err(report)?;
+            let page = read
+                .list_retained(collection, after, PAGE)
+                .map_err(report)?;
             if page.is_empty() {
                 break;
             }
@@ -303,7 +304,8 @@ fn level(level: PimdirLevel) -> &'static str {
 }
 
 /// The `export` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ExportOutput {
     /// Where the dump was written.
     pub dir: PathBuf,

@@ -102,4 +102,21 @@ Such a placement SHALL be fetched rather than linked from the object store, for 
 - THEN the fetched body lands as the conflict object and the local body is untouched
 
 ### Requirement: Naming a probe gives it a base
-A `Meta` fetch that names a placement holding no link id SHALL give it a base equal to what the source reported, the probe's flags and the fetched revision, since a probe carries none (pimdir SYNC §3) and naming it is what agrees with the source. Every fetch SHALL write the summary and addresses Annex A derives, carried on the placement as `PimdirSummary`, the fetched one replacing the stored one whether or not it is present.
+A `Meta` fetch that names a placement holding no link id SHALL give it a base equal to what the source reported, the probe's flags and the fetched revision, since a probe carries none (pimdir SYNC §3) and naming it is what agrees with the source, except when the hint is one a pending create of this source holds, which the fetch lands instead (below). Every fetch SHALL write the summary and addresses Annex A derives, carried on the placement as `PimdirSummary`, the fetched one replacing the stored one whether or not it is present.
+
+### Requirement: A pending create is landed by its arrival
+A fetch resolving a probe to a hint a pending create of the same source holds in the collection, a `Created` placement with no base under a provisional handle, SHALL land that create rather than mint a second copy (pimdir SYNC §6): the hint arrived by a relocation the source's remove made, by an accepted add whose record was lost, or by another client, and it is the create delivered. Only a hint a based binding holds is minted.
+
+Landing is a `Superseded` drop of the provisional handle, then the create upserted under the fetched handle in the same batch, with a base of the probe's flags, the fetched revision, and the fetched body at `Full` or else the create's own body. The flags, body, summary and sort key staged on the create stay, so an edit made on it still pushes: the status is `Clean` when they equal the base and `Dirty` otherwise, and the origin goes, there being nothing left to copy from. A create holding no body adopts a fetched one as its own.
+
+The `Links` load an upgrade makes for a fresh hint asks for the hint and its minted form, and a store answers with the placements the source binds (SYNC §10), a pending create being one, so the holder to land is in the batch whether or not the requested handles named it.
+
+#### Scenario: A relocated member arrives
+- GIVEN a pending create under `tmp-1` holding `m1`, and a probe `7` the enumeration listed
+- WHEN the `Meta` fetch of `7` resolves to `m1`
+- THEN `tmp-1` is dropped `Superseded` and the create is written under `7`, based on what the fetch reported, its body kept
+
+#### Scenario: A held hint is still minted
+- GIVEN a based binding holding `m1` under `u1`
+- WHEN a fetch of `7` resolves to `m1`
+- THEN `7` is linked under `dup:m1#7` and nothing is superseded

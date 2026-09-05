@@ -41,27 +41,30 @@ impl PimdirCoroutine for PimdirOpen {
         match (&self.state, arg) {
             (State::Start, None) => {
                 debug!("load collection from storage");
-                self.state = State::PendingLoad;
+                self.state = State::Loading;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                     collection: self.collection.clone(),
                     scope: PimdirLoadScope::All,
                 })
             }
-            (State::PendingLoad, Some(PimdirArg::Load(loaded))) => {
+            (State::Loading, Some(PimdirArg::Load(loaded))) => {
                 debug!("opened collection with {} items", loaded.placements.len());
                 trace!("loaded placements: {:?}", loaded.placements);
                 self.state = State::Done;
                 PimdirCoroutineState::Complete(Ok(loaded))
             }
-            (_, Some(_)) => PimdirCoroutineState::Complete(Err(PimdirArgError::UnexpectedArg)),
+            (State::Done, _) | (_, Some(_)) => {
+                PimdirCoroutineState::Complete(Err(PimdirArgError::UnexpectedArg))
+            }
             (_, None) => PimdirCoroutineState::Complete(Err(PimdirArgError::MissingArg)),
         }
     }
 }
 
+/// What the coroutine is doing while it waits for the caller.
 enum State {
     Start,
-    PendingLoad,
+    Loading,
     Done,
 }
 
@@ -131,6 +134,10 @@ mod tests {
         })));
 
         match open.resume(Some(PimdirArg::Write)) {
+            PimdirCoroutineState::Complete(Err(PimdirArgError::UnexpectedArg)) => {}
+            state => panic!("expected UnexpectedArg, got {state:?}"),
+        }
+        match open.resume(None) {
             PimdirCoroutineState::Complete(Err(PimdirArgError::UnexpectedArg)) => {}
             state => panic!("expected UnexpectedArg, got {state:?}"),
         }

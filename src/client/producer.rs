@@ -4,6 +4,8 @@
 //! enqueue transaction, and the owner's drain (§15.2), which stages each
 //! action through the mutate verb and deletes its row in one transaction.
 
+use core::slice;
+
 use alloc::{
     format,
     string::{String, ToString},
@@ -11,9 +13,11 @@ use alloc::{
     vec::Vec,
 };
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, named_params,
+};
 
 use crate::{
     change::PimdirWriteOp,
@@ -25,12 +29,12 @@ use crate::{
         reader::{PimdirItem, item_from_row},
         rows, schema, write,
     },
-    codec::{self, PimdirAction},
+    codec::{self, PimdirAction, PimdirActionError},
     collection::PimdirCollectionId,
     coroutine::*,
     hash::{PimdirHashAlgo, PimdirHasher},
     hub::PimdirSourceId,
-    load::PimdirLoaded,
+    load::{PimdirLoadScope, PimdirLoaded},
     mutate::{PimdirMutate, PimdirMutation},
     object::{PimdirHash, PimdirObject},
     placement::{
@@ -39,11 +43,12 @@ use crate::{
     sql, summary,
 };
 
-/// A pimdir store opened as a producer: a process that originates
-/// mutations without owning the store, whose sole write is the enqueue.
+/// A pimdir store opened as a producer (STORAGE §8, §15.1).
 ///
-/// It holds the staging lock shared for its lifetime, so a body it
-/// writes before enqueueing is never swept in between (§8).
+/// A process that originates mutations without owning the store, whose
+/// sole write is the enqueue. It holds the staging lock shared for its
+/// lifetime, so a body it writes before enqueueing is never swept in
+/// between.
 pub struct PimdirProducer {
     conn: Connection,
     _lock: PimdirLock,
@@ -55,9 +60,13 @@ pub struct PimdirProducer {
 impl PimdirProducer {
     /// Opens the store rooted at `dir` as producer `producer`, a
     /// diagnostic name recorded on each row. The store must exist at the
-    /// current version: a producer never creates one.
+    /// current version: a producer never creates one, and a directory
+    /// with no database is [`PimdirError::Uncreated`].
     pub fn open(dir: impl AsRef<Path>, producer: impl Into<String>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
+        if !dir.join("pimdir.db").is_file() {
+            return Err(PimdirError::Uncreated);
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -104,14 +113,16 @@ impl PimdirProducer {
     }
 
     /// Appends one action to a collection's queue (§15.1), returning the
-    /// row's id: `ensure_collection`, at most one object upsert for a body
-    /// the caller wrote through [`blobs`](Self::blobs) whose size it
-    /// passes, and the insert that pins it. SQLite stamps `created_at`.
+    /// row's id: `ensure_collection`, at most one object upsert for the
+    /// body the caller wrote through [`blobs`](Self::blobs) and passes as
+    /// `object`, hash and size together, and the insert that pins the hash
+    /// the action names. SQLite stamps `created_at`. A body the store
+    /// already indexes may be passed again or left out.
     pub fn enqueue(
         &mut self,
         collection: &str,
         action: &PimdirAction,
-        object_size: Option<u64>,
+        object: Option<&PimdirObject>,
     ) -> Result<i64, PimdirError> {
         let hash = action.object_hash().cloned();
 
@@ -123,10 +134,10 @@ impl PimdirProducer {
             sql::ENSURE_COLLECTION,
             named_params! { ":collection": collection, ":account": self.account.as_deref() },
         )?;
-        if let (Some(hash), Some(size)) = (&hash, object_size) {
+        if let Some(object) = object {
             tx.execute(
                 sql::STORE_OBJECT,
-                named_params! { ":hash": hash.0, ":size": size as i64 },
+                named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
             )?;
         }
         tx.execute(
@@ -175,8 +186,10 @@ pub struct PimdirPendingAction {
     pub attempts: i64,
 }
 
-/// One parked queue row: an action the owner judged permanently
-/// unappliable, left for operators (§15.2).
+/// One parked queue row (§15.2).
+///
+/// An action the owner judged permanently unappliable, left for
+/// operators.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirParkedAction {
     /// The row's global append id.
@@ -208,78 +221,98 @@ pub struct PimdirDrainReport {
     pub skipped: usize,
 }
 
-/// Reads a collection's pending rows, decoding each payload strictly.
+/// Reads a collection's pending rows, decoding each payload strictly: a
+/// malformed one is the read's error.
 pub(crate) fn pending_actions(
     conn: &Connection,
     collection: &str,
 ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
-    let pending = rows(
-        conn,
-        sql::LOAD_PENDING_ACTIONS,
-        named_params! { ":collection": collection },
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(6)?,
-            ))
-        },
-    )?;
-
     let mut actions = Vec::new();
-    for (id, created_at, producer, kind, payload, attempts) in pending {
-        actions.push(PimdirPendingAction {
-            id,
-            created_at,
-            producer,
-            action: codec::action_from_payload(&kind, &payload)?,
-            attempts,
-        });
+    for row in pending_rows(conn, collection)? {
+        actions.push(row.decode()?);
     }
     Ok(actions)
+}
+
+/// Reads a collection's pending rows for an overlay (§15.4): a row whose
+/// payload does not decode is left out, the drain being what parks it.
+pub(crate) fn overlaid_actions(
+    conn: &Connection,
+    collection: &str,
+) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+    Ok(pending_rows(conn, collection)?
+        .into_iter()
+        .filter_map(|row| row.decode().ok())
+        .collect())
 }
 
 /// One raw pending row, the payload undecoded so a malformed one parks
 /// rather than failing the pass.
 struct PimdirQueueRow {
     id: i64,
+    created_at: String,
+    producer: String,
     action: String,
     payload: String,
     object_hash: Option<String>,
+    attempts: i64,
 }
 
-/// Why a queued action was not staged (§15.2).
-enum PimdirRefusal {
-    /// It will never stage: the row parks with this reason.
-    Park(String),
-    /// It cannot stage against this source: the row stays pending, untouched.
-    Skip,
+impl PimdirQueueRow {
+    /// The row with its payload decoded.
+    fn decode(&self) -> Result<PimdirPendingAction, PimdirActionError> {
+        Ok(PimdirPendingAction {
+            id: self.id,
+            created_at: self.created_at.clone(),
+            producer: self.producer.clone(),
+            action: codec::action_from_payload(&self.action, &self.payload)?,
+            attempts: self.attempts,
+        })
+    }
+}
+
+/// A collection's pending rows in append order, undecoded.
+fn pending_rows(conn: &Connection, collection: &str) -> Result<Vec<PimdirQueueRow>, PimdirError> {
+    Ok(rows(
+        conn,
+        sql::LOAD_PENDING_ACTIONS,
+        named_params! { ":collection": collection },
+        |r| {
+            Ok(PimdirQueueRow {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                producer: r.get(2)?,
+                action: r.get(3)?,
+                payload: r.get(4)?,
+                object_hash: r.get(5)?,
+                attempts: r.get(6)?,
+            })
+        },
+    )?)
+}
+
+/// What a drain did with one row (§15.2).
+enum PimdirOutcome {
+    /// Applied and its row deleted.
+    Applied,
+    /// It will never apply: the row parks with this reason.
+    Parked(String),
+    /// Not this owner's, or not this transaction's: the row is left as found.
+    Skipped,
 }
 
 /// The owner's drain (§15.2).
 impl PimdirSourceStore {
     /// Drains a collection's pending actions in append order: each is
     /// applied as the mutation it names and its row deleted in one
-    /// transaction. A permanently unappliable action parks; one this
-    /// owner cannot perform, or cannot place on its source, is skipped;
-    /// a transient failure bumps the attempts and stops the pass.
+    /// transaction. A failure of the store (a refused rebind, a
+    /// constraint, a malformed payload) parks the row; one this owner
+    /// cannot perform, cannot place on its source, or lost the claim to,
+    /// is skipped; neither stops the rows behind it. A failure of the
+    /// environment (the database busy, a body unreadable) bumps the
+    /// attempts and stops the pass.
     pub fn drain_collection(&mut self, collection: &str) -> Result<PimdirDrainReport, PimdirError> {
-        let pending: Vec<PimdirQueueRow> = rows(
-            &self.store.reader.conn,
-            sql::LOAD_PENDING_ACTIONS,
-            named_params! { ":collection": collection },
-            |r| {
-                Ok(PimdirQueueRow {
-                    id: r.get(0)?,
-                    action: r.get(3)?,
-                    payload: r.get(4)?,
-                    object_hash: r.get(5)?,
-                })
-            },
-        )?;
+        let pending = pending_rows(&self.store.reader.conn, collection)?;
 
         let mut report = PimdirDrainReport::default();
         for row in pending {
@@ -296,17 +329,19 @@ impl PimdirSourceStore {
                 continue;
             }
             match self.apply_queued(collection, &row, &action) {
-                Ok(None) => report.applied += 1,
-                Ok(Some(PimdirRefusal::Skip)) => report.skipped += 1,
-                Ok(Some(PimdirRefusal::Park(reason))) => {
+                Ok(PimdirOutcome::Applied) => report.applied += 1,
+                Ok(PimdirOutcome::Skipped) => report.skipped += 1,
+                Ok(PimdirOutcome::Parked(reason)) => {
                     self.fail_action(row.id, Some(&reason))?;
                     report.parked += 1;
                 }
-                Err(err) => {
-                    self.store
-                        .conn
-                        .execute(sql::BUMP_ATTEMPTS, named_params! { ":id": row.id })?;
+                Err(err) if retryable(&err) => {
+                    self.fail_action(row.id, None)?;
                     return Err(err);
+                }
+                Err(err) => {
+                    self.fail_action(row.id, Some(&err.to_string()))?;
+                    report.parked += 1;
                 }
             }
         }
@@ -314,14 +349,17 @@ impl PimdirSourceStore {
     }
 
     /// Applies one action and deletes its row in one transaction, the
-    /// claim first (§15.2); `None` when applied, the refusal otherwise.
+    /// claim first (§15.2): a claim that deletes nothing is a row another
+    /// handle applied or a cancellation removed, and is skipped.
     fn apply_queued(
         &mut self,
         collection: &str,
         row: &PimdirQueueRow,
         action: &PimdirAction,
-    ) -> Result<Option<PimdirRefusal>, PimdirError> {
+    ) -> Result<PimdirOutcome, PimdirError> {
         let blobs = self.store.reader.blobs();
+        let lock = Arc::clone(&self.store.lock);
+        let _writing = lock.writing();
         let tx = self
             .store
             .reader
@@ -334,12 +372,12 @@ impl PimdirSourceStore {
             .query_row(named_params! { ":id": row.id }, |r| r.get::<_, i64>(0))
             .optional()?;
         if claimed.is_none() {
-            return Ok(None);
+            return Ok(PimdirOutcome::Skipped);
         }
 
         let ops = match stage_action(&tx, &blobs, &self.source, collection, row.id, action)? {
             Ok(ops) => ops,
-            Err(refusal) => return Ok(Some(refusal)),
+            Err(outcome) => return Ok(outcome),
         };
         write::apply(
             &tx,
@@ -355,7 +393,21 @@ impl PimdirSourceStore {
             )?;
         }
         tx.commit().map_err(busy_or_sql)?;
-        Ok(None)
+        Ok(PimdirOutcome::Applied)
+    }
+}
+
+/// Whether a failure is the environment's rather than the store's (§15.2):
+/// the database busy or a body unreadable is retried, everything else
+/// parks the row.
+fn retryable(err: &PimdirError) -> bool {
+    match err {
+        PimdirError::Busy | PimdirError::Io(_) => true,
+        PimdirError::Sql(rusqlite::Error::SqliteFailure(failure, _)) => matches!(
+            failure.code,
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+        ),
+        _ => false,
     }
 }
 
@@ -365,7 +417,9 @@ impl PimdirSourceStore {
 /// An `add` stages the `Created` placement the engine's `Add` stages,
 /// its summary derived from the body the producer wrote. Every other
 /// kind resolves its `seq` to this source's placement and runs the
-/// mutate verb, so the staging semantics stay the engine's.
+/// mutate verb, so the staging semantics stay the engine's. An absent
+/// item is a remove's success and parks anything else (§15.3); a live
+/// item this source does not bind is another source's, and skips.
 fn stage_action(
     tx: &Connection,
     blobs: &PimdirBlobs,
@@ -373,7 +427,7 @@ fn stage_action(
     collection: &str,
     row_id: i64,
     action: &PimdirAction,
-) -> Result<Result<Vec<PimdirWriteOp>, PimdirRefusal>, PimdirError> {
+) -> Result<Result<Vec<PimdirWriteOp>, PimdirOutcome>, PimdirError> {
     let collection_id = PimdirCollectionId(collection.to_string());
     let kind = write::kind_of(tx, collection)?;
 
@@ -394,7 +448,7 @@ fn stage_action(
             .clone()
             .or_else(|| derivation.as_ref().map(|d| d.link_id.clone()));
         let Some(link) = link else {
-            return Ok(Err(PimdirRefusal::Park(
+            return Ok(Err(PimdirOutcome::Parked(
                 "add carries no link id and none derives from its body".to_string(),
             )));
         };
@@ -406,7 +460,7 @@ fn stage_action(
             )
             .optional()?;
         if live.is_some() {
-            return Ok(Err(PimdirRefusal::Park(format!(
+            return Ok(Err(PimdirOutcome::Parked(format!(
                 "link id already present: {}",
                 link.0
             ))));
@@ -457,7 +511,7 @@ fn stage_action(
         return if removes {
             Ok(Ok(Vec::new()))
         } else {
-            Ok(Err(PimdirRefusal::Park(format!("unknown seq: {seq}"))))
+            Ok(Err(PimdirOutcome::Parked(format!("unknown seq: {seq}"))))
         };
     };
 
@@ -472,10 +526,8 @@ fn stage_action(
             |r| r.get::<_, String>(0),
         )
         .optional()?;
-    let handle = match handle {
-        Some(handle) => PimdirHandle(handle),
-        None if removes => return Ok(Ok(Vec::new())),
-        None => return Ok(Err(PimdirRefusal::Skip)),
+    let Some(handle) = handle.map(PimdirHandle) else {
+        return Ok(Err(PimdirOutcome::Skipped));
     };
 
     let mutation = match action {
@@ -522,7 +574,7 @@ fn stage_action(
     let mut mutate = PimdirMutate::new(collection_id.clone(), mutation);
     let _ = mutate.resume(None);
     let link: PimdirLinkId = item.link_id.clone();
-    let placements = write::read_hub(tx, collection, Some(core::slice::from_ref(&link.0)))?
+    let placements = write::read_hub(tx, collection, Some(slice::from_ref(&link.0)))?
         .project(&collection_id, source);
     let mut state = mutate.resume(Some(PimdirArg::Load(PimdirLoaded {
         placements,
@@ -532,9 +584,7 @@ fn stage_action(
     // NOTE: a copy or a move reads its target for the identity it carries.
     if let PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { collection, scope }) = state {
         let links = match &scope {
-            crate::load::PimdirLoadScope::Links(links) => {
-                links.iter().map(|l| l.0.clone()).collect::<Vec<_>>()
-            }
+            PimdirLoadScope::Links(links) => links.iter().map(|l| l.0.clone()).collect::<Vec<_>>(),
             _ => Vec::new(),
         };
         let placements =
@@ -553,8 +603,8 @@ fn stage_action(
                 .collect();
             Ok(Ok(ops))
         }
-        PimdirCoroutineState::Complete(Err(err)) => Ok(Err(PimdirRefusal::Park(err.to_string()))),
-        state => Ok(Err(PimdirRefusal::Park(format!(
+        PimdirCoroutineState::Complete(Err(err)) => Ok(Err(PimdirOutcome::Parked(err.to_string()))),
+        state => Ok(Err(PimdirOutcome::Parked(format!(
             "unexpected mutate state: {state:?}"
         )))),
     }

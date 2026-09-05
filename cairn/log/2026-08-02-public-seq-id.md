@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: public-seq-id
-landed: 2026-08-02
+date: 2026-08-02
 ---
 
 # A per-collection public id (`seq`)

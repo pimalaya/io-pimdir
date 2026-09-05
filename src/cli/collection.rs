@@ -4,11 +4,11 @@ use std::fmt;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use io_pimdir::collection::PimdirCollectionId;
 use pimalaya_cli::{
     printer::Printer,
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
 };
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::cli::{StoreFlags, or_dash, report};
@@ -32,13 +32,13 @@ impl CollectionCommand {
     }
 }
 
-/// List every collection: its id, declared media type, display name,
-/// handle-space generation, live, probed and retained item counts.
+/// List every collection with its counts.
 ///
-/// A probe is a handle a source enumerated whose identity is not read yet, so
-/// no listing can show it. The retained count is what a delete left behind:
-/// hidden from every read and from the sync, and only `item purge` destroys
-/// them.
+/// One row per collection: its id, declared media type, display name,
+/// handle-space generation, live, probed and retained item counts. A probe is
+/// a handle a source enumerated whose identity is not read yet, so no listing
+/// can show it. The retained count is what a delete left behind: hidden from
+/// every read and from the sync, and only `item purge` destroys them.
 #[derive(Debug, Args)]
 pub struct CollectionListCommand;
 
@@ -49,11 +49,10 @@ impl CollectionListCommand {
         let mut rows = Vec::new();
 
         for collection in store.list_collections().map_err(report)? {
-            let id = PimdirCollectionId(collection.id.clone());
             rows.push(CollectionRow {
                 live: store.count_items(&collection.id).map_err(report)?,
                 probes: store.count_probes(&collection.id).map_err(report)?,
-                retained: store.count_retained(&id).map_err(report)?.max(0) as u64,
+                retained: store.count_retained(&collection.id).map_err(report)?.max(0) as u64,
                 id: collection.id,
                 kind: collection.kind,
                 name: collection.name,
@@ -66,7 +65,8 @@ impl CollectionListCommand {
 }
 
 /// One collection as the listing shows it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CollectionRow {
     /// The stable collection id.
     pub id: String,
@@ -86,7 +86,7 @@ pub struct CollectionRow {
 }
 
 /// The `collection list` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct CollectionsOutput(pub Vec<CollectionRow>);
 

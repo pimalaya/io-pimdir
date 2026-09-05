@@ -19,9 +19,8 @@ use std::{collections::BTreeSet, fmt, path::PathBuf};
 use anyhow::Result;
 use clap::Args;
 use pimalaya_cli::printer::Printer;
+use schemars::JsonSchema;
 use serde::Serialize;
-
-use io_pimdir::client::diagnostics::{PimdirDangling, PimdirMinted, PimdirRefcountDrift};
 
 use crate::cli::{StoreFlags, bytes, report};
 
@@ -70,9 +69,35 @@ impl CheckCommand {
             .cloned()
             .collect();
 
-        let drift = read.refcount_drift().map_err(report)?;
-        let dangling = read.dangling().map_err(report)?;
-        let minted = read.minted_keys().map_err(report)?;
+        let drift: Vec<RefcountDrift> = read
+            .refcount_drift()
+            .map_err(report)?
+            .into_iter()
+            .map(|drift| RefcountDrift {
+                hash: drift.hash,
+                stored: drift.stored,
+                expected: drift.expected,
+            })
+            .collect();
+        let dangling: Vec<DanglingRow> = read
+            .dangling()
+            .map_err(report)?
+            .into_iter()
+            .map(|dangling| DanglingRow {
+                kind: dangling.kind.to_string(),
+                row: dangling.row,
+                target: dangling.target,
+            })
+            .collect();
+        let minted: Vec<MintedKeys> = read
+            .minted_keys()
+            .map_err(report)?
+            .into_iter()
+            .map(|minted| MintedKeys {
+                collection: minted.collection,
+                items: minted.items,
+            })
+            .collect();
 
         let mut repaired = 0;
         let mut cleared = 0;
@@ -108,7 +133,8 @@ impl CheckCommand {
 }
 
 /// One blob file no object row references.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct OrphanBlob {
     /// The hash its filename claims.
     pub hash: String,
@@ -118,8 +144,43 @@ pub struct OrphanBlob {
     pub path: PathBuf,
 }
 
+/// One object whose refcount disagrees with the references justifying it.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RefcountDrift {
+    /// The object's hash.
+    pub hash: String,
+    /// The refcount the row stores.
+    pub stored: i64,
+    /// The references actually pointing at it.
+    pub expected: i64,
+}
+
+/// One row pointing at something absent.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DanglingRow {
+    /// The table the row belongs to.
+    pub kind: String,
+    /// The row, as its key.
+    pub row: String,
+    /// What it points at.
+    pub target: String,
+}
+
+/// The minted keys one collection holds.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MintedKeys {
+    /// The collection.
+    pub collection: String,
+    /// How many of its items sit under a minted key.
+    pub items: i64,
+}
+
 /// The `check` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckOutput {
     /// Blob files no object row references.
     pub orphans: Vec<OrphanBlob>,
@@ -128,12 +189,12 @@ pub struct CheckOutput {
     /// Object rows whose blob file is missing.
     pub missing: Vec<String>,
     /// Objects whose refcount disagrees with their references.
-    pub drift: Vec<PimdirRefcountDrift>,
+    pub drift: Vec<RefcountDrift>,
     /// Rows pointing at something absent.
-    pub dangling: Vec<PimdirDangling>,
+    pub dangling: Vec<DanglingRow>,
     /// Minted keys per collection, the second copies of an identity a
     /// source holds twice. Informational, never a defect.
-    pub minted: Vec<PimdirMinted>,
+    pub minted: Vec<MintedKeys>,
     /// Refcounts `--fix` recomputed from the pointers justifying them.
     pub repaired: usize,
     /// Dangling bindings `--fix` cleared.

@@ -8,8 +8,8 @@ status: current
 
 The `pimdir` binary: the operator front-end over a pimdir store. It ships from
 this crate behind the `cli` feature and is built on the same public library
-surface a consumer uses, plus a read-only diagnostic connection for the
-questions the library has no reason to answer.
+surface a consumer uses, the diagnostics included: it opens no connection of
+its own.
 
 ### Requirement: The CLI is an operator tool, never a client
 The `pimdir` binary SHALL be to a store what `sqlite3` is to a database: an
@@ -122,8 +122,10 @@ The CLI SHALL expose, at minimum:
   the trash, it does not delete synced data.
 - `queue list`: pending actions, or parked ones with `--parked`.
 - `queue cancel`: drop one queue row by id.
-- `store info`: schema version, sources, per-collection live and retained
-  counts, object count and bytes live versus retained.
+- `store info`: the schema version (one figure: the reader verified the store
+  is stamped with the version this build services, refusing any other), sources,
+  per-collection live and retained counts, object count and bytes live versus
+  retained.
 - `check`: object rows whose body is missing, refcount drift, dangling
   references and orphan blob files, with `--fix` repairing the drift and the
   dangling bindings, plus an informational count of the minted keys each
@@ -133,7 +135,16 @@ The CLI SHALL expose, at minimum:
 - `export`: a portable dump of the store.
 
 Every command SHALL render as JSON under `--json`, write logs to stderr only,
-and carry its own `--help` text.
+and carry its own `--help` text. The one carve-out is `item export` to stdout, whose output is the body's raw bytes: it SHALL refuse `--json` unless `--output` names a file, and then reports the write as JSON.
+
+### Requirement: The JSON output is a contract
+Every data command SHALL hand the printer one output type deriving `Display`, `Serialize` and `JsonSchema`, with camelCase keys on it and on every nested row and status enum, and a `json-schema` subcommand SHALL list every command's output type by its dash-joined path (`pimdir-item-list`), so a consumer can validate what `--json` prints. The summary row is the one value printed with the store's own column names, since it is printed as stored.
+
+### Requirement: The toolkit verbs are singular
+`completion`, `manual` and `json-schema` SHALL be spelled singular, each with its plural as a hidden alias, as every Pimalaya CLI spells them.
+
+### Requirement: One handle per verb
+A verb SHALL open the store once, in the role it needs, and every helper it calls (the blob directory, the write source) SHALL take that handle rather than open another. Repair is the one case that holds two roles in sequence, dropping the reader before taking the owner.
 
 ### Requirement: Diagnostics are a library read
 `check` and the object figures of `store info` (object count, bytes, refcount
@@ -161,6 +172,8 @@ SHALL be dumped exactly as stored, a live item's line carrying its summary
 columns and address rows, and bodies byte for byte. Collection files
 SHALL be numbered and mapped in the manifest rather than named after collection
 ids, since an id may hold anything a mailbox name may hold.
+
+The manifest SHALL carry `format_version`, bumped whenever the dump's shape changes. Version 2 carries an item's summary columns and address rows where version 1 carried a raw meta string.
 
 ### Requirement: Import is not the CLI's job
 Converting a Maildir, m2dir or vdir tree into a store (`cairn/spec/import.md`)

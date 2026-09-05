@@ -24,8 +24,10 @@ use crate::{
     object::PimdirHash,
 };
 
-/// A handle over a store's blob directory, bound to the hash its bodies
-/// are named by. Cheap to clone: it wraps the objects/ path.
+/// A handle over a store's blob directory (STORAGE §5).
+///
+/// Bound to the hash its bodies are named by. Cheap to clone: it wraps
+/// the objects/ path.
 #[derive(Clone, Debug)]
 pub struct PimdirBlobs {
     root: PathBuf,
@@ -98,14 +100,39 @@ impl PimdirBlobs {
         })
     }
 
-    /// Every body the blob tree holds; a period-prefixed temporary file
-    /// belongs to a writer that has not committed and is skipped.
+    /// Every body the blob tree holds: the files sitting at the path §5
+    /// derives from their name. A period-prefixed temporary file belongs
+    /// to a writer that has not committed, and a file elsewhere than its
+    /// name's shard is not the store's (STORAGE §3); both are skipped.
     pub fn files(&self) -> io::Result<Vec<PimdirBlobFile>> {
         let mut files = Vec::new();
         if self.root.is_dir() {
-            walk(&self.root, &mut files)?;
+            self.walk(&self.root, &mut files)?;
         }
         Ok(files)
+    }
+
+    fn walk(&self, dir: &Path, files: &mut Vec<PimdirBlobFile>) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                self.walk(&entry.path(), files)?;
+            } else if metadata.is_file() && entry.path() == blob_path(&self.root, &name) {
+                files.push(PimdirBlobFile {
+                    hash: name,
+                    path: entry.path(),
+                    size: metadata.len(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Writes every body a batch carries, ahead of the transaction that
@@ -126,7 +153,8 @@ impl PimdirBlobs {
     }
 
     /// Writes a body atomically: temporary file, `fsync`, `rename`, then
-    /// `fsync` of the shard directory (§5). A present hash is left alone.
+    /// `fsync` of the shard directories the rename reached (§5). A present
+    /// hash is left alone.
     pub(crate) fn write(&self, hash: &PimdirHash, body: &[u8]) -> io::Result<()> {
         let path = self.path(hash);
         if path.exists() {
@@ -141,7 +169,7 @@ impl PimdirBlobs {
             file.sync_all()?;
         }
         fs::rename(&tmp, &path)?;
-        sync_dir(parent)
+        sync_shards(&self.root, &path)
     }
 }
 
@@ -154,29 +182,6 @@ pub struct PimdirBlobFile {
     pub path: PathBuf,
     /// Its size on disk.
     pub size: u64,
-}
-
-fn walk(dir: &Path, files: &mut Vec<PimdirBlobFile>) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            walk(&entry.path(), files)?;
-        } else if metadata.is_file() {
-            files.push(PimdirBlobFile {
-                hash: name,
-                path: entry.path(),
-                size: metadata.len(),
-            });
-        }
-    }
-
-    Ok(())
 }
 
 /// A per-process discriminator, so concurrent writers never share a
@@ -211,9 +216,7 @@ impl PimdirBlobWriter {
             fs::create_dir_all(parent)?;
         }
         fs::rename(&self.tmp, &path)?;
-        if let Some(parent) = path.parent() {
-            sync_dir(parent)?;
-        }
+        sync_shards(&self.root, &path)?;
         Ok(self.written)
     }
 }
@@ -248,9 +251,18 @@ fn blob_path(blobs: &Path, hash: &str) -> PathBuf {
     }
 }
 
-/// Flushes a directory entry, so a rename into it survives a power loss:
+/// Flushes every directory between a blob and the root, so the rename and
+/// the shard directories it may have created survive a power loss:
 /// syncing the file makes its bytes durable and says nothing about the
 /// name that reaches them (§5).
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
+fn sync_shards(root: &Path, blob: &Path) -> io::Result<()> {
+    let mut dir = blob.parent();
+    while let Some(shard) = dir {
+        fs::File::open(shard)?.sync_all()?;
+        if shard == root {
+            break;
+        }
+        dir = shard.parent();
+    }
+    Ok(())
 }

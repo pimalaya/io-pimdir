@@ -178,6 +178,9 @@ pub enum PimdirStatus {
     /// Locally changed since the base; a push is pending.
     Dirty,
     /// Locally deleted since the base; a remove is pending.
+    ///
+    /// The content is kept so an edit still beats the delete, and the
+    /// `origin` field carries the destination the store derives (SYNC §3).
     Tombstone,
     /// Content diverged on both sides, awaiting a resolving edit.
     Conflict,
@@ -187,13 +190,18 @@ pub enum PimdirStatus {
 
 /// Where a pending create's body already lives, for a server-side copy.
 ///
-/// `None` on the placement means a genuine append of content the server
-/// has never seen.
+/// Derived by the store from its bindings and never stored (SYNC §3).
+/// On a [`Created`](PimdirStatus::Created) placement it is the origin:
+/// `None` means a genuine append of content the server has never seen.
+/// On a [`Tombstone`](PimdirStatus::Tombstone) it is the destination,
+/// the collection where the same source holds a pending create of the
+/// identity, so the remove relocates rather than deletes; `handle` is
+/// then the tombstone's own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirOrigin {
-    /// The collection the source member lives in.
+    /// The collection the source member lives in, or the destination.
     pub collection: PimdirCollectionId,
-    /// The source member's handle.
+    /// The source member's handle, or the tombstone's own.
     pub handle: PimdirHandle,
 }
 
@@ -249,7 +257,8 @@ pub struct PimdirPlacement {
     pub conflict_object: Option<PimdirHash>,
     /// The last-synced base; `None` until first reconciled.
     pub base: Option<PimdirBase>,
-    /// Where a [`PimdirStatus::Created`] body lives, `None` for an append.
+    /// Where a [`PimdirStatus::Created`] body lives, `None` for an append;
+    /// on a [`PimdirStatus::Tombstone`] the destination its remove offers.
     pub origin: Option<PimdirOrigin>,
 }
 

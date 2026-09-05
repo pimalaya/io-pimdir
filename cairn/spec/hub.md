@@ -42,7 +42,7 @@ Projecting the same rule is what lets a store already written in that state heal
 - THEN the placement reads `Meta`, so the next upgrade refetches the body
 
 ### Requirement: The hub propagates a delete across sources
-`PimdirHubItem` SHALL carry a `deleted` flag. An item becomes deleted two ways, both feeding the same projection: when `absorb` sees a `DropPlacement` of a bound member (a member removed under the source's feet), it SHALL mark the item deleted and remove that source's binding; and when `absorb` sees an `UpsertPlacement` whose `status` is `Tombstone` (a client-staged `Remove`, or a `Move`'s source side), it SHALL mark the item deleted and **keep** the source's binding, its `handle` and `base`, so the projection knows the remote handle to push the remove against, without adopting the tombstone's content or clearing the delete. `project` SHALL then yield a `Tombstone` placement (keeping the content, so edit-beats-delete still applies) for every source that still holds the item, and nothing for a source that lacks it (a deleted item is never copied). Once no source holds the item it stays in the hub with no binding, projected for nobody, for the store to retain (pimdir STORAGE §11); the hub prunes nothing. A **live-status** upsert SHALL clear `deleted`, so a re-add or an edit-beats-delete resurrection brings the item back on every source.
+`PimdirHubItem` SHALL carry a `deleted` flag. An item becomes deleted two ways, both feeding the same projection: when `absorb` sees a `DropPlacement` of a bound member (a member removed under the source's feet), it SHALL mark the item deleted and remove that source's binding; and when `absorb` sees an `UpsertPlacement` whose `status` is `Tombstone` (a client-staged `Remove`, or a `Move`'s source side), it SHALL mark the item deleted and **keep** the source's binding, its `handle` and `base`, so the projection knows the remote handle to push the remove against, without adopting the tombstone's content or clearing the delete. The tombstone's known flags ride along into the shared item (pimdir SYNC §9), an unknown set erasing nothing. `project` SHALL then yield a `Tombstone` placement (keeping the content, so edit-beats-delete still applies) for every source that still holds the item, and nothing for a source that lacks it (a deleted item is never copied). Once no source holds the item it stays in the hub with no binding, projected for nobody, for the store to retain (pimdir STORAGE §11); the hub prunes nothing. A **live-status** upsert SHALL clear `deleted`, so a re-add or an edit-beats-delete resurrection brings the item back on every source.
 
 #### Scenario: A delete propagates as a tombstone
 - GIVEN two sources holding one item, and one source removing it
@@ -160,6 +160,16 @@ The three placements the hub projects (a bound member, a tombstone for one delet
 
 Stating the shared content once is what makes a field added to `PimdirPlacement` a change in one place: three hand-written projections make forgetting one a silent wrong answer rather than a compile error.
 
+### Requirement: A body-less item is no divergence
+`PimdirHub::project` SHALL read a bound source whose base holds a body while the item holds none as agreeing on the content axis, `Clean` when the flags agree too. The body went with another source's content pull, and this source owes nothing until a hydration gives the item a body again; read as a divergence, it projected `Dirty` on every load and the flag axis rewrote its row on every run.
+
+An upsert carrying no body while the item holds one is that pull, and `absorb` SHALL lower the shared level to the placement's with the body it drops (pimdir SYNC §5, vectors/sync/11) rather than merge it as a maximum: the item reads `Probed` for the upgrade to refetch, the summary kept as that of the body it dropped.
+
+#### Scenario: One source pulled a remote content change
+- GIVEN two sources agreeing on a body
+- WHEN one absorbs the pull dropping it
+- THEN the other projects `Clean` with no body, its base still naming the body its server holds
+
 ### Requirement: A binding with no base is a pending create
 `PimdirHub::project` SHALL read a bound item whose binding holds no base as `PimdirStatus::Created`, on the same condition `created_placement` applies to an unbound one: the hub holds the body. A binding's base is what its source last reconciled with its own remote, so a binding without one has never reached that source and the item is still the create it was staged as.
 
@@ -183,4 +193,4 @@ It follows that mirroring is a sync **plus** an upgrade. The hub offers a member
 - THEN the hub offers the member to the other source, which appends it
 
 ### Requirement: A created placement carries the origin the store knows
-`PimdirHub::project_with` SHALL take an origin resolver and set it on every `Created` placement it projects, bound or not, so the push is a server-side copy where the same source binds the identity in another collection with a base present and, when the placement has a body, that body as its base (pimdir SYNC §3). The hub holds one collection and cannot answer it; the store answers from its bindings. A bound placement with no base SHALL project `Created` whether or not a body is held.
+`PimdirHub::project_with` SHALL take a resolver and ask it for every `Created` placement it projects, bound or not, so the push is a server-side copy where the same source binds the identity in another collection with a base present and, when the placement has a body, that body as its base, and for every `Tombstone`, whose origin is its destination, the collection where the same source holds a pending create of the identity, so the remove relocates (pimdir SYNC §3). The resolver answers by the placement's status; the hub holds one collection and cannot, and the store answers from its bindings. A bound placement with no base SHALL project `Created` whether or not a body is held.

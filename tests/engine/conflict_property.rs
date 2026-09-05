@@ -118,14 +118,18 @@ impl Cluster {
     ///
     /// A pulled row carries no link id until a meta fetch resolves it,
     /// and a body the hub does not hold it cannot offer.
-    fn sync(&mut self, source: usize) -> Option<PimdirSyncReport> {
+    fn sync(&mut self, source: usize) -> Result<PimdirSyncReport, TestCaseError> {
         let client = &mut self.sources[source];
-        let report = client.sync("inbox", PimdirSyncOptions::default()).ok()?;
-        let opened = client.open("inbox").ok()?;
+        let report = client
+            .sync("inbox", PimdirSyncOptions::default())
+            .map_err(TestCaseError::fail)?;
+        let opened = client.open("inbox").map_err(TestCaseError::fail)?;
         let handles = opened.placements.iter().map(|p| p.handle.clone()).collect();
-        let _ = client.upgrade("inbox", handles, PimdirTier::Full);
+        client
+            .upgrade("inbox", handles, PimdirTier::Full)
+            .map_err(TestCaseError::fail)?;
 
-        Some(report)
+        Ok(report)
     }
 
     /// Rounds over every source until the hub stops changing.
@@ -133,7 +137,7 @@ impl Cluster {
         for round in 0..16 {
             let before = self.hub();
             for source in 0..SOURCES {
-                self.sync(source);
+                self.sync(source)?;
             }
             if self.hub() == before {
                 return Ok(());
@@ -382,11 +386,11 @@ fn resolve(
     let held = cluster.server_object(source, &handle);
     let current = cluster.server_revision(source, &handle);
     let (Some(observed), Some(current)) = (observed, current) else {
-        cluster.sync(source);
+        cluster.sync(source)?;
         return Ok(true);
     };
 
-    cluster.sync(source);
+    cluster.sync(source)?;
 
     if !cluster.live(link) {
         return Ok(true);
@@ -535,7 +539,7 @@ fn check_conflict_model(ops: Vec<ConflictOp>) -> Result<(), TestCaseError> {
             }
             ConflictOp::Sync(s) => {
                 let source = s % SOURCES;
-                cluster.sync(source);
+                cluster.sync(source)?;
                 folded(&mut ledger, source);
             }
         }
@@ -545,7 +549,7 @@ fn check_conflict_model(ops: Vec<ConflictOp>) -> Result<(), TestCaseError> {
 
     let mut reports = Vec::new();
     for source in 0..SOURCES {
-        reports.push(cluster.sync(source));
+        reports.push(cluster.sync(source)?);
     }
 
     let shared = cluster.hub();
@@ -558,7 +562,7 @@ fn check_conflict_model(ops: Vec<ConflictOp>) -> Result<(), TestCaseError> {
             let converged = cluster.server_object(source, &binding.handle) == item.object;
             let reported = item.conflicted
                 || binding.conflicted
-                || reports[source] != Some(PimdirSyncReport::default());
+                || reports[source] != PimdirSyncReport::default();
             prop_assert!(
                 converged || reported,
                 "s{source} silently diverges from the shared body of {link:?}: {binding:?}",

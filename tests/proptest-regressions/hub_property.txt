@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc da5de59bc4dc69ca720d6623a76861f104aaa2d0b6ce171b820bf8782f27a38d # shrinks to ops = [Add(0, 0), ServerRemove(0, 1792688585556109102), Add(0, 0), Add(0, 0), Edit(0, 10827880519352615486, 0)]
+cc 068a4434ee96ca0be60a922346d7e4cc67defefc35e043f427c7a35bdca7ddaf # shrinks to ops = [Add(0, 0), Add(0, 0), Edit(0, 16707159078106228657, 0), Remove(0, 11725463248809440832), ServerRemove(0, 13043848534599916342)]

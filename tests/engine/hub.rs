@@ -274,11 +274,12 @@ fn a_source_refusing_removes_holds_its_copy_under_keep() {
     );
 }
 
-/// Under the default `Revert` policy the same scenario resurrects the item.
+/// Under an explicit `Revert` policy the same scenario resurrects the item.
 ///
 /// The revert reads as add-beats-delete across sources, so the hub mirrors
 /// the item back to the source that deleted it. A hub-bound source wants
-/// `Keep`. Both readings are coherent, so this is pinned rather than fixed.
+/// `Keep`, which is what the default `Auto` resolves to beside another
+/// source. Both readings are coherent, so this is pinned rather than fixed.
 #[test]
 fn a_reverted_delete_resurrects_the_item_across_the_hub() {
     let mut mirror = Mirror::new();
@@ -293,6 +294,7 @@ fn a_reverted_delete_resurrects_the_item_across_the_hub() {
             remove: false,
             ..PimdirPushRights::all()
         },
+        delete: PimdirDeletePolicy::Revert,
         ..Default::default()
     };
     mirror.a.remote_mut().remove("inbox", "a1");

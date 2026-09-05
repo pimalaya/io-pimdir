@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: a-binding-persists-its-agreement-point
-landed: 2026-08-28
+date: 2026-08-28
 ---
 
 # A binding persists what it last agreed with the hub on

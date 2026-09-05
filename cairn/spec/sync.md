@@ -62,11 +62,11 @@ The sync SHALL emit a `PimdirSyncEvent` for each per-item outcome it produces (a
 - AND the local body is staged as a new `Created` member for the next sync to append
 
 ### Requirement: A move delivers exactly one copy
-A move is staged as a create in the target plus a remove of the source, each derived by its own collection's sync in whichever order the consumer runs them, and both halves can deliver the item on their own: the create by copying from its origin, the remove by relocating the member into its destination. `PimdirChange::Remove` carries the `link_id` its destination would receive, and a consumer SHALL relocate only while that destination does not already hold it; otherwise the create already delivered, and the remove is a plain delete of the source.
+A move is staged as a `Created` placement in the target plus a `Tombstone` in the source, each derived by its own collection's sync in whichever order the consumer runs them, and both halves can deliver the item on their own (pimdir SYNC §5). The create delivers by a server-side copy from its origin, or by uploading the body when the store holds it. The remove delivers by relocating the member into its destination, and is a plain delete once the destination holds the identity: `PimdirChange::Remove` carries the `link_id` its destination would receive, and a connector SHALL relocate only while that destination does not already hold it. A connector that cannot relocate SHALL reject a remove carrying a destination rather than delete (SYNC §4): the destination has not received the member, and a delete would take the only copy.
 
-Neither half may be dropped in favour of the other: the remove is what keeps a move safe when the target syncs last, since the source is relocated rather than deleted out from under a copy that never ran, and the create is what keeps a move working through a hub, whose bindings carry no origin. When the target syncs last its create finds its origin already relocated, so the push is rejected and the placeholder stays visibly pending: an add carries no key that separates a second copy the user asked for from one the remove already served.
+Origin and destination are what the store derives from its bindings, never columns of the engine's own (SYNC §3): a `Created` placement's origin is where the same source binds the identity with a base present and, when the placement has a body, that body as its base; a `Tombstone` placement's origin is its destination, the collection where the same source holds a pending create of the identity. The engine SHALL derive `Remove { to }` from a tombstone's origin and `Add { origin }` from a create's, and SHALL rely on nothing it staged itself surviving a store round trip.
 
-An item whose link id is not resolved yet has no such key, so `PimdirMutation::Move` stages the source half alone for it: the relocation delivers it, and the target picks it up on its next enumerate.
+A relocated member is listed by the target's next enumeration under a new handle, and the fetch naming it lands the create (upgrade.md) rather than minting a second copy. A create holding neither an origin nor a body cannot deliver: it stays visibly pending until the consumer restages it, and the engine derives no push for it. Neither half may be dropped in favour of the other. A mutation of a probe is refused (mutate.md), so every tombstone with a destination carries a link id.
 
 #### Scenario: The target syncs first
 - GIVEN a linked member moved into a target
@@ -74,14 +74,14 @@ An item whose link id is not resolved yet has no such key, so `PimdirMutation::M
 - THEN the destination already holds the link id, so the source is deleted rather than relocated, and the target holds exactly one member
 
 #### Scenario: The source syncs first
-- GIVEN the same move
+- GIVEN the same move, the target's member not hydrated
 - WHEN the source's sync runs first
-- THEN the member is relocated into the target, and the target's create finds its origin gone: it is rejected and stays visibly pending rather than delivering a second copy
+- THEN the remove relocates the member, the target's next enumeration lists it as a probe, and the `Meta` fetch naming it lands the pending create under the arrived handle: exactly one member
 
-#### Scenario: A never-fetched item
-- GIVEN a member whose link id is not resolved
-- WHEN it is moved
-- THEN only the source tombstone is staged, and the target holds exactly one member in either sync order
+#### Scenario: A connector that cannot relocate
+- GIVEN the same move over a connector answering no relocation
+- WHEN the source's sync runs first
+- THEN the remove is rejected and the tombstone stays; the target's sync copies from the origin, and the source's next remove, its destination no longer pending, is a plain delete
 
 ### Requirement: A lost push record can abandon a move
 Where a move's staged edit rides ahead of its remove, a crash between the update being serviced and the write recording it SHALL leave the move abandoned rather than half-applied: the next run enumerates a revision the tombstone's base does not name, and an enumerate carries a revision and no body, so the replayed echo is indistinguishable from a remote edit. Edit-beats-delete SHALL then win, replacing the tombstone with a fresh pull, and the member SHALL stay in the source collection, live and clean at the pushed revision.
@@ -108,10 +108,23 @@ What the revert undoes is the delete alone, and the placement lands on what it s
 ### Requirement: Both axes reconcile, every run
 The flag axis SHALL run for every placement present on both sides, including one whose content axis derived a push. A push result is matched by handle, so one handle yields at most one change: the flag axis withholds its own push in that case, but still merges and writes. Skipping it outright loses a remote flag change until some later run happens to list the item again, which an incremental enumerate may never do.
 
+A content push accepted in the same run SHALL rebase the placement the flag merge wrote, never the one read before it (pimdir SYNC §5): the engine keeps one pending entry per handle and the flag axis refreshes it whenever it writes the handle, so the row an acceptance lands is the last one the merge wrote and the pulled flag survives the rebase.
+
 #### Scenario: A remote flag change beside a local content edit
 - GIVEN a placement with a staged content edit whose remote also changed a flag
 - WHEN the sync derives the content push
 - THEN the merged flags are written in the same batch
+
+#### Scenario: The push is accepted
+- GIVEN the same placement
+- WHEN the content push is accepted
+- THEN the last row written for the handle holds the pulled flag and the pushed body as its base
+
+### Requirement: A re-listed probe is not a pull
+A probe the enumeration lists again with the flags the store holds for it SHALL derive no write, no event and no count: nothing changed. One listed with other flags adopts them, as a base-less placement takes the remote set. A probe a complete enumeration no longer lists, or a delta reports vanished, SHALL be dropped `Deleted` like any member, with its `Vanished` event: a base-less row holding no body and no `Created` status is a probe, and a probe nothing lists is gone. A base-less row holding a body, a create-collision conflict whose remote side went, SHALL be resurrected as a `Created` placement instead, as a based edit is: new content beats a delete.
+
+### Requirement: A rejection counts for a pushed handle only
+`PimdirSyncReport::rejected` SHALL count a `Rejected` outcome once per handle the chunk pushed, on the terms `pushed` counts an accepted one: a result naming a handle nobody pushed, or naming one twice, cannot inflate either.
 
 ### Requirement: A keep-both duplicate is a new item
 The duplicate a `KeepBoth` resolution stages SHALL carry a provisional handle derived from the decision it records, the placement it forked, the body it forked and the remote revision it forked against, and the minted key `dup:<hint>#<that handle>` (pimdir STORAGE §9, SYNC §5): a second copy of one identity, which `lookup_objects` never pairs with the original and which a store keying by link id keeps apart.
@@ -147,7 +160,7 @@ Only the handles of the chunk being serviced SHALL be resolved when its outcomes
 The checkpoint the enumerate reported SHALL land in the write that follows the final chunk, and SHALL stay the pre-push one, which is what makes the engine's own echo re-listed by the next delta enumeration. An intermediate chunk's write SHALL NOT carry it, so an interrupted run resumes from the same cursor rather than from one claiming its unrecorded pushes were seen.
 
 ### Requirement: Every change carries an idempotency key
-A `PimdirChange` SHALL be a `PimdirChangeKind` (what the remote is asked to do, the four verbs that were the change itself) plus the `PimdirChangeKey` naming it. The key SHALL be derived from the collection, the handle, the kind and the target state the change makes true: the flag set of a `SetFlags`, the body of an `Update`, the destination of a `Remove`, and the identity, markers, origin and body of an `Add`. The same derived change SHALL key the same on every run, and changes differing in any of those SHALL key differently.
+A `PimdirChange` SHALL be a `PimdirChangeKind` (what the remote is asked to do, the four verbs that were the change itself) plus the `PimdirChangeKey` naming it. The key SHALL be derived as pimdir SYNC §4 fixes it, so two engines over one store key one change alike and every vector's key reproduces: FNV-1a 64 bits over fields each followed by one `0x00` byte, rendered as sixteen lowercase hexadecimal digits; the fields being the collection id, the handle, the kind as `add`, `remove`, `set-flags` or `update`, then the kind's own, an optional value as the field `1` followed by the value or the field `0` alone, and a flag set as the field `unknown` or the field `known`, the count in decimal ASCII, then each flag in code point order. `add` folds the link id, the flags, the origin as `1`, its collection and its handle or `0` alone, then the object hash; `remove` the destination; `set-flags` the flags; `update` the object hash. The same derived change SHALL key the same on every run, and changes differing in any of those SHALL key differently.
 
 A precondition is deliberately not part of it: `if_match` states what the change was attempted against, not what it makes true, and a retry of one operation is one operation.
 
@@ -161,9 +174,9 @@ Recording the key is what makes the at-least-once contract actionable for every 
 - THEN it carries the same key, and the consumer recognises the replay
 
 ### Requirement: An enumeration is ordered by handle
-`PimdirRemoteSnapshot::items` SHALL be sorted by handle and SHALL list each handle at most once. The merge walks it beside the local placements in that order rather than indexing it, which is what keeps a whole-collection sync from copying both key spaces to join them; protocols hand it over sorted already, an IMAP SEARCH returning ascending UIDs.
+`PimdirRemoteSnapshot::items` SHALL be sorted by handle and SHALL list each handle at most once (pimdir SYNC §4). The merge walks it beside the local placements in that order rather than indexing it, which is what keeps a whole-collection sync from copying both key spaces to join them.
 
-The engine SHALL NOT depend on a consumer honouring this: a snapshot that arrives unsorted is sorted, and a handle listed twice is collapsed to its first item, so getting it wrong costs a pass rather than correctness.
+The engine SHALL NOT depend on a consumer honouring this: a snapshot that arrives unsorted is sorted, and a handle listed twice is collapsed to its first item, so getting it wrong costs a pass rather than correctness. `PimdirHandle` orders as bytes, so an IMAP SEARCH's ascending UIDs are not sorted under it (`"10"` sorts before `"9"`), and a connector handing them over numerically is one the engine sorts on every run.
 
 #### Scenario: An unordered enumeration
 - GIVEN a snapshot whose items arrive in any order
@@ -196,11 +209,11 @@ The checkpoint rule is unchanged and is what makes a partially merged run safe t
 
 Landing such a row `Clean` loses what the delete was not. The content axis derives a push from a dirty placement alone, so a staged body left clean is pushed by no later run and the replica keeps content the source has never heard of; an unresolved divergence left clean reads as an ordinary local body on the next run and is pushed over the remote it diverged from, deciding for the consumer the question they were asked; and a destination left on a settled row turns the next plain delete of that member into a relocation nobody asked for.
 
-`Revert` is the default. A held tombstone hides a member the source still holds, and hides it for good: an incremental enumeration never lists an untouched member again, so nothing brings it back. Holding is right only when the refusal is a policy that may lift, which is the consumer's knowledge, not the engine's.
+`Auto` is the default, which the engine SHALL read as `Revert`: a held tombstone hides a member the source still holds, and hides it for good, since an incremental enumeration never lists an untouched member again and nothing brings it back. Holding is right only when the refusal is a policy that may lift, or when the source is bound beside others, which is the consumer's knowledge, not the engine's: a consumer that knows the binding count SHALL resolve `Auto` to `Keep` for a source bound beside another and to `Revert` otherwise, before handing the options to the engine (pimdir SYNC §5; the std client does).
 
 Deletion is the only axis needing this. A refused flag or content change stays dirty and re-derives every run, but a refused delete has to be either undone or held.
 
-A source bound to a hub SHALL be given `Keep`. Reverting states that this source still holds the member, which the hub reads as the item being alive (add-beats-delete across sources): the deletion is cleared for every source and the item is mirrored back to the one it was deleted on. Both readings are coherent, and only the consumer knows which it means.
+A source bound to a hub SHALL be given `Keep`, which is what `Auto` resolves to there. Reverting states that this source still holds the member, which the hub reads as the item being alive (add-beats-delete across sources): the deletion is cleared for every source and the item is mirrored back to the one it was deleted on. Both readings are coherent, and only the consumer knows which it means.
 
 #### Scenario: The two refusals agree
 - GIVEN a tombstoned placement the source still holds
@@ -263,3 +276,6 @@ A sync's `PimdirSyncEvent`s SHALL report what was pulled (`Added`, `FlagsChanged
 
 ### Requirement: A pulled member is a probe
 A member the enumeration lists and the replica lacks SHALL be pulled as a placement with no link id and no base, at level `Probed`, carrying the reported flags (pimdir SYNC §3): the store files it as a probe row until a fetch names it. A remote edit past the base of a local tombstone revives the placement instead: identity and summary kept, body dropped, the base adopting what the remote reports, so the next upgrade refetches and nothing pushes.
+
+### Requirement: The merge is a module of its own
+`Join`, `Merge` and `Candidate`, the walk of both sides in handle order and the delta rule narrowing it, live in `sync/join.rs`; the unit tests of every verb live beside their module in a `tests.rs`. A module with code and submodules is `foo.rs` plus `foo/`.

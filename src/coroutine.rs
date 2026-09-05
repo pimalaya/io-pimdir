@@ -41,7 +41,8 @@ pub enum PimdirCoroutineState<Y, R> {
 /// verb, because it is one bug and it sits in the caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PimdirArgError {
-    /// An arg not matching the pending yield, or a resume after completion.
+    /// An arg not matching the pending yield, or any resume after
+    /// completion, `None` included.
     UnexpectedArg,
     /// The caller resumed without the arg the pending yield required.
     MissingArg,

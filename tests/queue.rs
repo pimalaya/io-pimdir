@@ -3,7 +3,7 @@
 //! refcount pinning of queued bodies, generation bumps, and the refusal
 //! of a store stamped with an unserviced schema version.
 
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, sync::mpsc, thread, time::Duration};
 
 use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
@@ -86,12 +86,16 @@ fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
 }
 
 /// Streams `body` into the blob store under `hash`, the producer's
-/// blob-first step, and returns its size.
-fn write_blob(dir: &Path, hash: &str, body: &[u8]) -> u64 {
+/// blob-first step, and returns the object the enqueue indexes.
+fn write_blob(dir: &Path, hash: &str, body: &[u8]) -> PimdirObject {
     let blobs = PimdirBlobs::open(dir, PimdirHashAlgo::default());
     let mut writer = blobs.writer().unwrap();
     writer.write_all(body).unwrap();
-    writer.commit(&PimdirHash(hash.into())).unwrap()
+    let size = writer.commit(&PimdirHash(hash.into())).unwrap();
+    PimdirObject {
+        hash: PimdirHash(hash.into()),
+        size: size as usize,
+    }
 }
 
 #[test]
@@ -101,7 +105,7 @@ fn a_queued_add_round_trips_into_a_staged_item() {
 
     // the producer writes the blob durably first, then enqueues in one
     // transaction, and the pending action shows in its own reads
-    let size = write_blob(dir.path(), "beef0000", b"Subject: hi\r\n\r\nnew body");
+    let object = write_blob(dir.path(), "beef0000", b"Subject: hi\r\n\r\nnew body");
     let mut producer = PimdirProducer::open(dir.path(), "smtp").unwrap();
     let add = PimdirAction::Add {
         link_id: Some(PimdirLinkId("mid:new".into())),
@@ -109,7 +113,7 @@ fn a_queued_add_round_trips_into_a_staged_item() {
         object: Some(PimdirHash("beef0000".into())),
         handle: Some(PimdirHandle("draft-1".into())),
     };
-    producer.enqueue("INBOX", &add, Some(size)).unwrap();
+    producer.enqueue("INBOX", &add, Some(&object)).unwrap();
 
     let pending = producer.pending_actions("INBOX").unwrap();
     assert_eq!(pending.len(), 1);
@@ -299,7 +303,7 @@ fn update_repoints_the_body() {
     let dir = tempfile::tempdir().unwrap();
     let (mut store, seq) = seeded(dir.path());
 
-    let size = write_blob(dir.path(), "beef0000", b"edited body");
+    let object = write_blob(dir.path(), "beef0000", b"edited body");
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     producer
         .enqueue(
@@ -308,7 +312,7 @@ fn update_repoints_the_body() {
                 seq,
                 object: PimdirHash("beef0000".into()),
             },
-            Some(size),
+            Some(&object),
         )
         .unwrap();
 
@@ -384,7 +388,7 @@ fn gc_never_sweeps_a_queued_body() {
     let (mut store, seeded_seq) = seeded(dir.path());
 
     // a producer stages a body and enqueues the add referencing it
-    let size = write_blob(dir.path(), "beef0000", b"queued body");
+    let object = write_blob(dir.path(), "beef0000", b"queued body");
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     producer
         .enqueue(
@@ -395,7 +399,7 @@ fn gc_never_sweeps_a_queued_body() {
                 object: Some(PimdirHash("beef0000".into())),
                 handle: Some(PimdirHandle("draft-1".into())),
             },
-            Some(size),
+            Some(&object),
         )
         .unwrap();
 
@@ -417,7 +421,7 @@ fn gc_never_sweeps_a_queued_body() {
             reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
-    assert!(store.purge(&inbox(), seeded_seq).unwrap());
+    assert!(store.purge(inbox(), seeded_seq).unwrap());
 
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.objects, collected.blobs), (1, 1));
@@ -443,7 +447,7 @@ fn gc_never_sweeps_a_queued_body() {
             reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
-    assert!(store.purge(&inbox(), seq).unwrap());
+    assert!(store.purge(inbox(), seq).unwrap());
     assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(!blob_exists(dir.path(), "beef0000"), "no refcount leak");
 }
@@ -457,13 +461,13 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     let (mut store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
 
-    let size = write_blob(dir.path(), "beef0000", b"a message to send");
+    let object = write_blob(dir.path(), "beef0000", b"a message to send");
     let submit = PimdirAction::Unknown {
         kind: "submit".into(),
         payload: "{\"v\":1,\"object\":\"beef0000\",\"to\":[\"a@b.c\"]}".into(),
         object_hash: Some(PimdirHash("beef0000".into())),
     };
-    let id = producer.enqueue("INBOX", &submit, Some(size)).unwrap();
+    let id = producer.enqueue("INBOX", &submit, Some(&object)).unwrap();
     producer
         .enqueue(
             "INBOX",
@@ -511,7 +515,7 @@ fn an_acknowledged_action_releases_its_queued_body() {
     let (mut store, _) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
 
-    let size = write_blob(dir.path(), "beef0000", b"sent already");
+    let object = write_blob(dir.path(), "beef0000", b"sent already");
     let id = producer
         .enqueue(
             "INBOX",
@@ -520,7 +524,7 @@ fn an_acknowledged_action_releases_its_queued_body() {
                 payload: "{\"v\":1,\"object\":\"beef0000\"}".into(),
                 object_hash: Some(PimdirHash("beef0000".into())),
             },
-            Some(size),
+            Some(&object),
         )
         .unwrap();
     assert!(blob_exists(dir.path(), "beef0000"));
@@ -667,8 +671,17 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
     }
 
     // a producer also refuses a store the owner has not created yet: it
-    // never creates the schema
+    // never creates the schema, and neither does a reader, a directory
+    // with no database at all included
     let fresh = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        PimdirProducer::open(fresh.path(), "test"),
+        Err(PimdirError::Uncreated)
+    ));
+    assert!(matches!(
+        PimdirReader::open(fresh.path()),
+        Err(PimdirError::Uncreated)
+    ));
     rusqlite::Connection::open(fresh.path().join("pimdir.db")).unwrap();
     match PimdirProducer::open(fresh.path(), "test") {
         Err(PimdirError::Uncreated) => {}
@@ -713,4 +726,242 @@ fn an_action_the_draining_source_cannot_place_is_skipped_not_parked() {
 
     let item = owner.get_item("INBOX", seq).unwrap().unwrap();
     assert_eq!(item.flags, PimdirFlags::default());
+}
+
+/// STORAGE §15.2: a failure of the store is permanent for the row and
+/// parks it, and neither it nor anything else stops the rows behind it.
+/// The refused rebind is the spec's own example: an add of an identity
+/// this source still binds, under another handle.
+#[test]
+fn a_store_failure_parks_the_row_and_the_pass_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq_a) = seeded(dir.path());
+    store
+        .write(vec![
+            store_object("cafebabf", b"b"),
+            PimdirWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabf", &[])),
+        ])
+        .unwrap();
+    let seq_b = store.seq_for_link("INBOX", "mid:b").unwrap().unwrap();
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+
+    // tombstone mid:a, which keeps its binding on handle 1 for the push
+    producer
+        .enqueue("INBOX", &PimdirAction::Remove { seq: seq_a }, None)
+        .unwrap();
+    assert_eq!(store.drain_collection("INBOX").unwrap().applied, 1);
+
+    // an add of mid:a under another handle resolves the binding to a
+    // second handle, which the store refuses (§10); a valid row follows
+    producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Add {
+                link_id: Some(PimdirLinkId("mid:a".into())),
+                flags: PimdirFlags::default(),
+                object: None,
+                handle: Some(PimdirHandle("X".into())),
+            },
+            None,
+        )
+        .unwrap();
+    producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::SetFlags {
+                seq: seq_b,
+                flags: PimdirFlags::from_iter(["\\Answered"]),
+            },
+            None,
+        )
+        .unwrap();
+
+    let report = store.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (1, 1, 0));
+
+    let parked = store.parked_actions().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].action, "add");
+    assert_eq!(parked[0].attempts, 1);
+    assert!(parked[0].error.contains("holds handle 1"), "{parked:?}");
+    let bindings = store.item_bindings("INBOX", "mid:a").unwrap();
+    assert_eq!(bindings.len(), 1, "the refused write recorded nothing");
+    assert!(
+        store
+            .get_item("INBOX", seq_b)
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains("\\Answered"),
+        "the row behind it applied"
+    );
+}
+
+/// STORAGE §15.3: already absent is a remove's success, but an item that
+/// is live and bound to another source is that source's to remove.
+#[test]
+fn a_remove_of_a_live_item_this_source_does_not_bind_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut owner, seq) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "frontend").unwrap();
+    producer
+        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
+        .unwrap();
+
+    let mut stranger = PimdirStore::open(dir.path()).unwrap().for_source("other");
+    let report = stranger.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 1));
+    assert!(owner.get_item("INBOX", seq).unwrap().is_some(), "untouched");
+    let pending = owner.pending_actions("INBOX").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attempts, 0);
+
+    let report = owner.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (1, 0, 0));
+    assert!(owner.get_item("INBOX", seq).unwrap().is_none());
+}
+
+/// STORAGE §15.2: the pending list is read outside any transaction, so a
+/// row it names may be gone by the time its turn comes; a claim that
+/// deletes nothing is not this transaction's to apply, and not applied.
+#[test]
+fn a_claim_that_deletes_nothing_is_not_counted_as_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let id = producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::SetFlags {
+                seq,
+                flags: PimdirFlags::from_iter(["\\Answered"]),
+            },
+            None,
+        )
+        .unwrap();
+
+    // another connection holds the write lock while the drain reads its
+    // pending list, then takes the row away before the drain can claim it
+    let db = dir.path().join("pimdir.db");
+    let (held, holding) = mpsc::channel();
+    let thief = thread::spawn(move || {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held.send(()).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        conn.execute("DELETE FROM queue WHERE id = ?1", [id])
+            .unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    holding.recv().unwrap();
+
+    let report = store.drain_collection("INBOX").unwrap();
+    thief.join().unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 1));
+    assert!(
+        !store
+            .get_item("INBOX", seq)
+            .unwrap()
+            .unwrap()
+            .flags
+            .contains("\\Answered"),
+        "nothing applied"
+    );
+    assert!(store.pending_actions("INBOX").unwrap().is_empty());
+}
+
+/// STORAGE §15.4: one row a reader cannot decode is the drain's to park,
+/// never a reason to fail every overlaid read.
+#[test]
+fn a_malformed_pending_row_is_skipped_by_the_overlay_and_parked_by_the_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute(
+        "INSERT INTO queue(created_at, producer, collection, action, payload) \
+         VALUES('2026-09-04T00:00:00.000Z', 'foreign', 'INBOX', 'set-flags', 'not json')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::SetFlags {
+                seq,
+                flags: PimdirFlags::from_iter(["\\Flagged"]),
+            },
+            None,
+        )
+        .unwrap();
+
+    // the overlay folds the row it can read and skips the other
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let items = reader.list_items("INBOX", None, 10).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].flags, PimdirFlags::from_iter(["\\Flagged"]));
+    assert_eq!(reader.count_items("INBOX").unwrap(), 1);
+    // the strict read still says the row is there and unreadable
+    assert!(matches!(
+        reader.pending_actions("INBOX"),
+        Err(PimdirError::Action(_))
+    ));
+
+    let report = store.drain_collection("INBOX").unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (1, 1, 0));
+    let parked = store.parked_actions().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].producer, "foreign");
+}
+
+/// STORAGE §15.1: the enqueue pins the hash the action names, so a body
+/// the store does not index yet has to come with its row.
+#[test]
+fn an_action_naming_an_unindexed_body_is_refused_at_the_enqueue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let add = PimdirAction::Add {
+        link_id: Some(PimdirLinkId("mid:new".into())),
+        flags: PimdirFlags::default(),
+        object: Some(PimdirHash("beef0000".into())),
+        handle: None,
+    };
+
+    assert!(matches!(
+        producer.enqueue("INBOX", &add, None),
+        Err(PimdirError::Sql(_))
+    ));
+    assert!(store.pending_actions("INBOX").unwrap().is_empty());
+
+    let object = write_blob(dir.path(), "beef0000", b"new body");
+    producer.enqueue("INBOX", &add, Some(&object)).unwrap();
+    assert_eq!(store.drain_collection("INBOX").unwrap().applied, 1);
+}
+
+/// STORAGE §6: a store lacking a canonical table is stale, `store_meta`
+/// included, and every role names the table rather than failing the read
+/// of its stamp.
+#[test]
+fn a_store_lacking_store_meta_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(PimdirStore::open(dir.path()).unwrap());
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch("DROP TABLE store_meta").unwrap();
+    drop(conn);
+
+    assert!(matches!(
+        PimdirStore::open(dir.path()),
+        Err(PimdirError::Stale {
+            table: "store_meta"
+        })
+    ));
+    assert!(matches!(
+        PimdirReader::open(dir.path()),
+        Err(PimdirError::Stale {
+            table: "store_meta"
+        })
+    ));
 }

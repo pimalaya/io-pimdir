@@ -8,7 +8,10 @@
 
 use alloc::{string::String, vec, vec::Vec};
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use rusqlite::{
     Connection, OptionalExtension, Row, TransactionBehavior, named_params, types::ToSql,
@@ -43,7 +46,9 @@ impl PimdirSourceStore {
     /// it names. A handle no binding holds is a probe, and a probe has
     /// no link id, so a `Links` scope yields none of them; nor does it
     /// yield the copy the hub offers for an item this source lacks, which
-    /// is no row the source holds under the key.
+    /// is no row the source holds under the key. A `Created` placement
+    /// carries its origin and a `Tombstone` its destination, both read
+    /// from this source's bindings elsewhere (SYNC §3).
     pub fn load(
         &self,
         collection: &PimdirCollectionId,
@@ -75,6 +80,11 @@ impl PimdirSourceStore {
         if let Some(err) = failed {
             return Err(err.into());
         }
+        for placement in &mut placements {
+            if placement.status == PimdirStatus::Tombstone {
+                placement.origin = destination_for(conn, &self.source, placement)?;
+            }
+        }
         if matches!(scope, PimdirLoadScope::Links(_)) {
             placements.retain(|placement| {
                 placement.link_id.as_ref().is_some_and(|link| {
@@ -84,12 +94,13 @@ impl PimdirSourceStore {
                 })
             });
         } else {
-            for (handle, flags) in probes(conn, &collection.0, &self.source)? {
-                if let PimdirLoadScope::Handles(handles) = scope
-                    && !handles.contains(&handle)
-                {
-                    continue;
+            let probes = match scope {
+                PimdirLoadScope::Handles(handles) => {
+                    probes_by_handle(conn, &collection.0, &self.source, handles)?
                 }
+                _ => probes(conn, &collection.0, &self.source)?,
+            };
+            for (handle, flags) in probes {
                 placements.push(PimdirPlacement {
                     collection: collection.clone(),
                     handle,
@@ -156,6 +167,8 @@ impl PimdirSourceStore {
     /// front so contention fails fast as [`PimdirError::Busy`].
     pub fn write(&mut self, ops: Vec<PimdirWriteOp>) -> Result<(), PimdirError> {
         let blobs = self.store.reader.blobs();
+        let lock = Arc::clone(&self.store.lock);
+        let _writing = lock.writing();
         blobs.stage(&ops)?;
 
         let tx = self
@@ -180,7 +193,9 @@ impl PimdirSourceStore {
 ///
 /// Objects and checkpoints are written as they come. A placement with
 /// no link id lands on the binding its handle holds (§10) or, when none
-/// does, as a probe; every other placement op folds into the hub per
+/// does, as a probe; a placement whose handle is bound to another link
+/// id retires that binding first, as a `Deleted` drop of the handle
+/// would (§10); every other placement op folds into the hub per
 /// collection, and the diff between the hub before and after is what
 /// reaches the rows.
 pub(crate) fn apply(
@@ -192,6 +207,7 @@ pub(crate) fn apply(
 ) -> Result<(), PimdirError> {
     let mut hub_ops: BTreeMap<String, Vec<PimdirWriteOp>> = BTreeMap::new();
     let mut licensed: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
+    let mut dropped: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
     let mut rekeyed: BTreeSet<String> = BTreeSet::new();
 
     for op in ops {
@@ -221,31 +237,37 @@ pub(crate) fn apply(
             }
             PimdirWriteOp::UpsertPlacement(mut placement) => {
                 ensure_collection(tx, &placement.collection.0, account)?;
+                let bound =
+                    link_for_handle(tx, &placement.collection.0, source, &placement.handle)?
+                        .map(PimdirLinkId);
                 if placement.link_id.is_none() {
-                    placement.link_id =
-                        link_for_handle(tx, &placement.collection.0, source, &placement.handle)?
-                            .map(PimdirLinkId);
+                    placement.link_id = bound.clone();
                 }
-                match &placement.link_id {
-                    None => {
-                        tx.execute(
-                            sql::UPSERT_PROBE,
-                            named_params! {
-                                ":collection": placement.collection.0,
-                                ":source": source.0,
-                                ":handle": placement.handle.0,
-                                ":flags": codec::flags_to_json(&placement.flags),
-                            },
-                        )?;
-                    }
-                    Some(_) => {
-                        delete_probe(tx, &placement.collection.0, source, &placement.handle)?;
-                        hub_ops
-                            .entry(placement.collection.0.clone())
-                            .or_default()
-                            .push(PimdirWriteOp::UpsertPlacement(placement));
-                    }
+                let Some(link) = &placement.link_id else {
+                    tx.execute(
+                        sql::UPSERT_PROBE,
+                        named_params! {
+                            ":collection": placement.collection.0,
+                            ":source": source.0,
+                            ":handle": placement.handle.0,
+                            ":flags": codec::flags_to_json(&placement.flags),
+                        },
+                    )?;
+                    continue;
+                };
+                delete_probe(tx, &placement.collection.0, source, &placement.handle)?;
+                let ops = hub_ops.entry(placement.collection.0.clone()).or_default();
+                let already_dropped = dropped
+                    .get(&placement.collection.0)
+                    .is_some_and(|handles| handles.contains(&placement.handle));
+                if bound.is_some_and(|bound| bound != *link) && !already_dropped {
+                    ops.push(PimdirWriteOp::DropPlacement {
+                        collection: placement.collection.clone(),
+                        handle: placement.handle.clone(),
+                        reason: PimdirDropReason::Deleted,
+                    });
                 }
+                ops.push(PimdirWriteOp::UpsertPlacement(placement));
             }
             PimdirWriteOp::DropPlacement {
                 collection,
@@ -253,6 +275,10 @@ pub(crate) fn apply(
                 reason,
             } => {
                 delete_probe(tx, &collection.0, source, &handle)?;
+                dropped
+                    .entry(collection.0.clone())
+                    .or_default()
+                    .insert(handle.clone());
                 if reason != PimdirDropReason::Deleted {
                     licensed
                         .entry(collection.0.clone())
@@ -331,13 +357,36 @@ fn probes(
         conn,
         sql::LOAD_PROBES,
         named_params! { ":collection": collection, ":source": source.0 },
-        |r| {
-            Ok((
-                PimdirHandle(r.get(0)?),
-                codec::flags_from_json(r.get::<_, Option<String>>(1)?.as_deref()),
-            ))
-        },
+        probe_from_row,
     )
+}
+
+/// The probes of a `Handles` load: the unnamed handles among those asked
+/// for (§14), bound as a JSON array.
+fn probes_by_handle(
+    conn: &Connection,
+    collection: &str,
+    source: &PimdirSourceId,
+    handles: &[PimdirHandle],
+) -> Result<Vec<(PimdirHandle, PimdirFlags)>, PimdirError> {
+    let handles: Vec<&str> = handles.iter().map(|handle| handle.0.as_str()).collect();
+    Ok(rows(
+        conn,
+        sql::LOAD_PROBES_BY_HANDLE,
+        named_params! {
+            ":collection": collection,
+            ":source": source.0,
+            ":handles": serde_json::to_string(&handles)?,
+        },
+        probe_from_row,
+    )?)
+}
+
+fn probe_from_row(row: &Row) -> rusqlite::Result<(PimdirHandle, PimdirFlags)> {
+    Ok((
+        PimdirHandle(row.get(0)?),
+        codec::flags_from_json(row.get::<_, Option<String>>(1)?.as_deref()),
+    ))
 }
 
 /// Refuses a batch binding one link id to two handles, unless a
@@ -426,8 +475,36 @@ fn origin_for(
     .optional()
 }
 
+/// Where this source holds a pending create of the placement's identity
+/// in another collection (SYNC §3): the destination a `Tombstone`
+/// carries, under its own handle, so its remove is a relocation.
+fn destination_for(
+    conn: &Connection,
+    source: &PimdirSourceId,
+    placement: &PimdirPlacement,
+) -> rusqlite::Result<Option<PimdirOrigin>> {
+    let Some(link) = &placement.link_id else {
+        return Ok(None);
+    };
+    conn.query_row(
+        sql::DESTINATION_FOR_LINK,
+        named_params! {
+            ":collection": placement.collection.0,
+            ":source": source.0,
+            ":link_id": link.0,
+        },
+        |r| {
+            Ok(PimdirOrigin {
+                collection: PimdirCollectionId(r.get(0)?),
+                handle: placement.handle.clone(),
+            })
+        },
+    )
+    .optional()
+}
+
 /// The link ids one batch touches: its upserts' and the ones its drops
-/// resolve to; a handle nothing binds is left out.
+/// and upserted handles resolve to; a handle nothing binds is left out.
 fn batch_links(
     conn: &Connection,
     collection: &str,
@@ -437,17 +514,17 @@ fn batch_links(
     let mut links: BTreeSet<String> = BTreeSet::new();
 
     for op in ops {
-        match op {
+        let handle = match op {
             PimdirWriteOp::UpsertPlacement(placement) => {
                 if let Some(link) = &placement.link_id {
                     links.insert(link.0.clone());
                 }
+                &placement.handle
             }
-            PimdirWriteOp::DropPlacement { handle, .. } => {
-                links.extend(link_for_handle(conn, collection, source, handle)?);
-            }
-            _ => {}
-        }
+            PimdirWriteOp::DropPlacement { handle, .. } => handle,
+            _ => continue,
+        };
+        links.extend(link_for_handle(conn, collection, source, handle)?);
     }
 
     Ok(links.into_iter().collect())
@@ -473,7 +550,7 @@ pub(crate) fn read_hub(
         hub.conflict = codec::conflict_from_str(&policy);
     }
 
-    let scope = links.map(|links| serde_json::to_string(links).unwrap_or_else(|_| "[]".into()));
+    let scope = links.map(serde_json::to_string).transpose()?;
     let (items_sql, bindings_sql) = match scope {
         Some(_) => (sql::LOAD_ITEMS_BY_LINK, sql::LOAD_BINDINGS_BY_LINK),
         None => (sql::LOAD_ITEMS, sql::LOAD_BINDINGS),
@@ -770,11 +847,15 @@ pub(crate) fn attach_address(
 /// Persists the change from `old` to `new` for a collection's hub by
 /// diffing the two and issuing only the writes that differ.
 ///
-/// An item no source holds any more is retained (§11), or purged when the
-/// account holds it live in another collection, `source` naming
-/// the side whose removal retired it. `licensed` carries the handles
-/// this batch superseded or rekeyed, the one thing the two hubs cannot
-/// say: a rebuilt spine and a duplicated identity produce the same diff.
+/// The bindings the diff releases go first, every item's, before any
+/// binding is inserted: a handle names one item per source (§10) and the
+/// index is unique, so a handle moving between two items in one batch
+/// has to leave before it arrives. An item no source holds any more is
+/// retained (§11), or purged when the account holds it live in another
+/// collection, `source` naming the side whose removal retired it.
+/// `licensed` carries the handles this batch superseded or rekeyed, the
+/// one thing the two hubs cannot say: a rebuilt spine and a duplicated
+/// identity produce the same diff.
 fn save_hub_diff(
     conn: &Connection,
     collection: &str,
@@ -783,6 +864,12 @@ fn save_hub_diff(
     new: &PimdirHub,
     licensed: &BTreeSet<PimdirHandle>,
 ) -> Result<(), PimdirError> {
+    for (link, item) in &new.items {
+        if let Some(prev) = old.items.get(link) {
+            release_bindings(conn, collection, link, prev, item, licensed)?;
+        }
+    }
+
     for (link, item) in &new.items {
         let prev = old.items.get(link);
         let unbound = item.sources.is_empty();
@@ -1118,9 +1205,46 @@ fn write_summary(
     Ok(true)
 }
 
-/// Diffs one item's bindings, refusing the one write no diff may
-/// express: a binding resolved to another handle (§10), unless the
-/// batch dropped the bound handle as superseded or rekeyed.
+/// Deletes the bindings one item's diff releases: a source that no
+/// longer binds it, and a binding moving to another handle under a
+/// `Superseded` or `Rekeyed` drop. A binding resolved to another handle
+/// without the licence is the one write no diff may express (§10) and
+/// is refused.
+fn release_bindings(
+    conn: &Connection,
+    collection: &str,
+    link: &PimdirLinkId,
+    old: &PimdirHubItem,
+    new: &PimdirHubItem,
+    licensed: &BTreeSet<PimdirHandle>,
+) -> Result<(), PimdirError> {
+    for (source, prev) in &old.sources {
+        let released = match new.sources.get(source) {
+            None => true,
+            Some(binding) if binding.handle == prev.handle => false,
+            Some(_) if licensed.contains(&prev.handle) => true,
+            Some(binding) => {
+                return Err(PimdirError::Rebind {
+                    collection: collection.into(),
+                    link_id: link.0.clone(),
+                    source: source.0.clone(),
+                    bound: prev.handle.0.clone(),
+                    incoming: binding.handle.0.clone(),
+                });
+            }
+        };
+        if released {
+            conn.execute(
+                sql::DELETE_BINDING,
+                named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Inserts and updates one item's bindings, the releases having gone
+/// first ([`release_bindings`]).
 fn save_bindings_diff(
     conn: &Connection,
     collection: &str,
@@ -1129,32 +1253,11 @@ fn save_bindings_diff(
     new: &PimdirHubItem,
     licensed: &BTreeSet<PimdirHandle>,
 ) -> Result<(), PimdirError> {
-    for source in old.sources.keys() {
-        if !new.sources.contains_key(source) {
-            conn.execute(
-                sql::DELETE_BINDING,
-                named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
-            )?;
-        }
-    }
     for (source, binding) in &new.sources {
         match old.sources.get(source) {
             None => insert_binding(conn, collection, link, source, binding)?,
             Some(prev) if binding.handle != prev.handle && licensed.contains(&prev.handle) => {
-                conn.execute(
-                    sql::DELETE_BINDING,
-                    named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
-                )?;
                 insert_binding(conn, collection, link, source, binding)?
-            }
-            Some(prev) if binding.handle != prev.handle => {
-                return Err(PimdirError::Rebind {
-                    collection: collection.into(),
-                    link_id: link.0.clone(),
-                    source: source.0.clone(),
-                    bound: prev.handle.0.clone(),
-                    incoming: binding.handle.0.clone(),
-                });
             }
             Some(prev) if prev != binding => {
                 update_binding(conn, collection, link, source, binding)?

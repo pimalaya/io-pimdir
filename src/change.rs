@@ -4,14 +4,16 @@
 //! the remote, and the inbound [`PimdirWriteOp`] it asks it to persist.
 //!
 //! A move is two halves, a create in the target and a remove of the
-//! source, each derived by its own collection's sync in either order.
-//! Both can deliver the item, so the remove carries the link id its
-//! destination receives and a consumer relocates only while it is absent.
+//! source, each derived by its own collection's sync in either order
+//! (SYNC §5). Both can deliver the item: the create by a copy from its
+//! origin or an upload of the stored body, the remove by relocating into
+//! the destination the store derives from the pending create. The remove
+//! carries the link id its destination receives, so a connector
+//! relocates only while the destination lacks it, and a relocated member
+//! lands the create when the target's fetch names it (SYNC §6).
 //!
-//! Neither half may be dropped for the other: the remove keeps a move safe
-//! when the target syncs last, and the create keeps it working through a
-//! [hub](crate::hub), whose bindings carry no origin. A create whose
-//! origin is already relocated is rejected and stays visibly pending.
+//! Neither half may be dropped for the other. A create holding neither an
+//! origin nor a body cannot deliver and stays visibly pending.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -82,14 +84,17 @@ pub enum PimdirChangeKind {
         /// The stored body to upload when there is no `origin`.
         object: Option<PimdirHash>,
     },
-    /// Remove a member, moving it into `to` when set.
+    /// Remove a member, relocating it into `to` when set.
     ///
-    /// The disposal of a plain delete (expunge, trash) is the consumer's
-    /// policy.
+    /// A connector that cannot relocate MUST reject the change rather
+    /// than delete (SYNC §4): the destination has not received the member
+    /// yet. The disposal of a plain delete (expunge, trash) is the
+    /// consumer's policy.
     Remove {
         /// The member to remove.
         handle: PimdirHandle,
-        /// The move destination, or `None` for a delete.
+        /// The destination the store derived for the tombstone (SYNC §3),
+        /// or `None` for a delete.
         to: Option<PimdirCollectionId>,
         /// The item identity when resolved, the delivery key of a move.
         ///
@@ -118,11 +123,12 @@ pub enum PimdirChangeKind {
 }
 
 impl PimdirChangeKind {
-    /// Derives this kind's idempotency key in `collection`.
+    /// Derives this kind's idempotency key in `collection` (SYNC §4).
     ///
-    /// The key covers the collection, the handle, the kind and the target
-    /// state the change makes true. A precondition is not part of it: a
-    /// retry of one operation is one operation.
+    /// The key covers the collection, the handle, the kind as `add`,
+    /// `remove`, `set-flags` or `update`, and the target state the change
+    /// makes true. A precondition is not part of it: a retry of one
+    /// operation is one operation.
     fn key(&self, collection: &PimdirCollectionId) -> PimdirChangeKey {
         let handle = match self {
             Self::Add { handle, .. } => handle,
@@ -185,8 +191,10 @@ crate::pimdir_id! {
 
 /// The digest a [`PimdirChangeKind`] is folded into to key it.
 ///
-/// FNV-1a, sixty-four bits: an idempotency key needs determinism, not
-/// resistance to a forged collision.
+/// FNV-1a, sixty-four bits, over fields each followed by one `0x00`
+/// byte, as SYNC §4 fixes it so two engines over one store key one
+/// change alike: an idempotency key needs determinism, not resistance
+/// to a forged collision.
 struct PimdirChangeDigest(u64);
 
 impl PimdirChangeDigest {
@@ -215,13 +223,15 @@ impl PimdirChangeDigest {
         }
     }
 
-    /// Folds a flag set in, length first, an unknown set apart from an empty.
+    /// Folds a flag set in: `unknown`, or `known`, the count in decimal
+    /// ASCII, then each flag in code point order (SYNC §4).
     fn flags(&mut self, flags: &PimdirFlags) -> &mut Self {
         let Some(flags) = flags.known() else {
             return self.field(b"unknown");
         };
 
-        self.field(b"known").field(&flags.len().to_le_bytes());
+        let count = format!("{}", flags.len());
+        self.field(b"known").field(count.as_bytes());
         for flag in flags {
             self.field(flag.as_bytes());
         }
@@ -408,6 +418,41 @@ mod tests {
 
         let distinct: BTreeSet<&PimdirChangeKey> = keys.iter().collect();
         assert_eq!(distinct.len(), keys.len(), "keys collided: {keys:?}");
+    }
+
+    /// The keys vectors/sync/02, 05 and 20 carry, derived from SYNC §4.
+    #[test]
+    fn the_derivation_reproduces_the_vectors_keys() {
+        let inbox = PimdirCollectionId::from("INBOX");
+
+        assert_eq!(
+            key(&inbox, set_flags("10", &["\\Flagged", "\\Seen"])),
+            PimdirChangeKey::from("33f66fc5223a52f4"),
+        );
+        assert_eq!(
+            key(
+                &inbox,
+                PimdirChangeKind::Remove {
+                    handle: PimdirHandle::from("10"),
+                    to: None,
+                    link_id: Some(PimdirLinkId::from("basic-1@example.org")),
+                    if_match: None,
+                },
+            ),
+            PimdirChangeKey::from("9b90204e8846afa8"),
+        );
+        assert_eq!(
+            key(
+                &inbox,
+                PimdirChangeKind::Remove {
+                    handle: PimdirHandle::from("10"),
+                    to: Some(PimdirCollectionId::from("Archive")),
+                    link_id: Some(PimdirLinkId::from("basic-1@example.org")),
+                    if_match: None,
+                },
+            ),
+            PimdirChangeKey::from("6dc3500bff3aa6fb"),
+        );
     }
 
     #[test]

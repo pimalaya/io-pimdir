@@ -201,7 +201,7 @@ impl Storage<'_> {
     /// The items retention holds for `collection`, the trash view.
     pub fn retained(&self, collection: &str) -> Vec<PimdirItem> {
         self.0
-            .list_retained(&collection.into(), None, usize::MAX)
+            .list_retained(collection, None, usize::MAX)
             .expect("the trash reads")
     }
 }
@@ -228,6 +228,9 @@ pub struct MemRemote {
     pub push_batches: Vec<usize>,
     /// Whether to report revisions and reject stale if_match, like WebDAV.
     pub mutable: bool,
+    /// Whether a `Remove` carrying a destination is rejected rather than
+    /// relocated, as a connector that cannot relocate must (SYNC §4).
+    pub cannot_relocate: bool,
     /// The identities this remote refuses to append.
     ///
     /// How a DAV server answers `no-uid-conflict` to a resource whose
@@ -552,7 +555,7 @@ impl PimdirRemote for MemRemote {
                             .is_some_and(|item| {
                                 if_match.as_deref() != Some(item.rev.to_string().as_str())
                             });
-                    if stale {
+                    if stale || (self.cannot_relocate && to.is_some()) {
                         rejected(handle)
                     } else {
                         let seq = self.bump();
@@ -648,8 +651,17 @@ impl PimdirRemote for MemRemote {
                             let seq = self.bump();
                             self.next_appended += 1;
                             let new = PimdirHandle::from(format!("app-{}", self.next_appended));
+                            // NOTE: a server derives the identity from the
+                            // body, so a minted key (STORAGE §9) reads as
+                            // the hint it was minted from.
                             let link = link_id
-                                .clone()
+                                .as_ref()
+                                .map(|link| match link.as_str().strip_prefix("dup:") {
+                                    Some(minted) => PimdirLinkId::from(
+                                        minted.rsplit_once('#').map_or(minted, |(hint, _)| hint),
+                                    ),
+                                    None => link.clone(),
+                                })
                                 .unwrap_or_else(|| PimdirLinkId::from(new.as_str()));
                             self.items.entry(collection.clone()).or_default().insert(
                                 new.clone(),

@@ -12,6 +12,7 @@ use core::cmp::Ordering;
 
 use alloc::{
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 
@@ -26,15 +27,14 @@ use crate::{
     client::{
         PimdirError,
         blobs::PimdirBlobs,
-        producer::{PimdirParkedAction, PimdirPendingAction, pending_actions},
+        producer::{PimdirParkedAction, PimdirPendingAction, overlaid_actions, pending_actions},
         rows, schema,
         write::{
-            PimdirSummaryTable, binding_from_row, kind_of, load_addresses, load_summaries,
-            tables_of,
+            PimdirSummaryTable, attach_address, binding_from_row, kind_of, load_addresses,
+            load_summaries, tables_of,
         },
     },
     codec::{self, PimdirAction},
-    collection::PimdirCollectionId,
     hash::{PimdirHashAlgo, PimdirHasher},
     hub::{PimdirBinding, PimdirSourceId},
     object::PimdirHash,
@@ -77,8 +77,9 @@ pub struct PimdirCollection {
     pub generation: i64,
 }
 
-/// One live item as a read reports it, its summary joined when the read
-/// carries one.
+/// One live item as a read reports it (STORAGE §14.1).
+///
+/// Its summary is joined on the reads that carry one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirItem {
     /// The public id (§9.1), the same in every collection the item is in.
@@ -110,8 +111,10 @@ pub struct PimdirRetention {
     pub size: Option<u64>,
 }
 
-/// Where one identity or one body sits (§9.2): one live placement with
-/// the collection and account it occurs in. A fact, not a verdict.
+/// Where one identity or one body sits (STORAGE §9.2).
+///
+/// One live placement with the collection and account it occurs in. A
+/// fact, not a verdict.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirItemLocation {
     /// The collection the placement sits in.
@@ -149,8 +152,10 @@ pub struct PimdirAddressPlacement {
     pub sort_key: String,
 }
 
-/// One binding waiting for a decision (§13), with the three bodies a
-/// resolver merges: the base, the item's own, and the remote's.
+/// One binding waiting for a decision (STORAGE §14.1).
+///
+/// Carries the three bodies a resolver merges: the base, the item's
+/// own, and the remote's.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirConflict {
     /// The collection the binding sits in.
@@ -214,9 +219,13 @@ pub struct PimdirChangeCursor {
 
 impl PimdirReader {
     /// Opens an existing store rooted at `dir` to read, refusing one no
-    /// owner has created and one at another version. Takes no lock.
+    /// owner has created ([`PimdirError::Uncreated`]) and one at another
+    /// version. Takes no lock.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
+        if !dir.join("pimdir.db").is_file() {
+            return Err(PimdirError::Uncreated);
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -279,8 +288,9 @@ impl PimdirReader {
     /// unknown collection, `Ok(Some(None))` for an ungrouped one.
     pub fn collection_account(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
     ) -> Result<Option<Option<String>>, PimdirError> {
+        let collection = collection.as_ref();
         Ok(self
             .conn
             .query_row(
@@ -293,7 +303,11 @@ impl PimdirReader {
 
     /// The declared media type of a collection, `None` for an unknown one
     /// and empty for one a sync created before any declaration.
-    pub fn collection_kind(&self, collection: &str) -> Result<Option<String>, PimdirError> {
+    pub fn collection_kind(
+        &self,
+        collection: impl AsRef<str>,
+    ) -> Result<Option<String>, PimdirError> {
+        let collection = collection.as_ref();
         Ok(self
             .conn
             .query_row(
@@ -333,7 +347,8 @@ impl PimdirReader {
     }
 
     /// A collection's handle-space epoch (§12), `None` for an unknown one.
-    pub fn generation(&self, collection: &str) -> Result<Option<i64>, PimdirError> {
+    pub fn generation(&self, collection: impl AsRef<str>) -> Result<Option<i64>, PimdirError> {
+        let collection = collection.as_ref();
         Ok(self
             .conn
             .query_row(
@@ -356,10 +371,11 @@ impl PimdirReader {
     /// every item once; `after` is the exclusive lower bound.
     pub fn list_items(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let collection = collection.as_ref();
         let after = after.unwrap_or("");
         self.overlaid(
             collection,
@@ -385,10 +401,11 @@ impl PimdirReader {
     /// `(sort_key, seq)`, `None` starting from the beginning.
     pub fn list_items_page_asc(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         after: Option<(&str, i64)>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let collection = collection.as_ref();
         let (key, seq) = after.unwrap_or(("", 0));
         self.sorted_page(
             sql::LIST_ITEMS_PAGE_ASC,
@@ -402,10 +419,11 @@ impl PimdirReader {
     /// The same page descending, `None` starting from the end.
     pub fn list_items_page_desc(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         after: Option<(&str, i64)>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let collection = collection.as_ref();
         self.sorted_page(sql::LIST_ITEMS_PAGE_DESC, collection, after, limit, true)
     }
 
@@ -416,28 +434,25 @@ impl PimdirReader {
     /// A collection whose kind was never declared pages without summaries.
     pub fn list_summaries(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         after: Option<(&str, i64)>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let collection = collection.as_ref();
         let kind = kind_of(&self.conn, collection)?;
         let tables = tables_of(&kind);
         let descending = kind.starts_with("message/rfc822");
-        let statements: Vec<(&str, PimdirSummaryTable)> = match kind
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-        {
-            "message/rfc822" => alloc::vec![(sql::LIST_MAIL_PAGE_DESC, PimdirSummaryTable::Mail)],
-            "text/vcard" => alloc::vec![(sql::LIST_CONTACTS_PAGE_ASC, PimdirSummaryTable::Contact)],
-            "text/calendar" => alloc::vec![
-                (sql::LIST_EVENTS_PAGE_ASC, PimdirSummaryTable::Event),
-                (sql::LIST_TASKS_PAGE_ASC, PimdirSummaryTable::Task),
-                (sql::LIST_JOURNALS_PAGE_ASC, PimdirSummaryTable::Journal),
-            ],
-            _ => return self.list_items_page_asc(collection, after, limit),
-        };
+        let statements: Vec<(&str, PimdirSummaryTable)> =
+            match kind.split(';').next().unwrap_or_default().trim() {
+                "message/rfc822" => vec![(sql::LIST_MAIL_PAGE_DESC, PimdirSummaryTable::Mail)],
+                "text/vcard" => vec![(sql::LIST_CONTACTS_PAGE_ASC, PimdirSummaryTable::Contact)],
+                "text/calendar" => vec![
+                    (sql::LIST_EVENTS_PAGE_ASC, PimdirSummaryTable::Event),
+                    (sql::LIST_TASKS_PAGE_ASC, PimdirSummaryTable::Task),
+                    (sql::LIST_JOURNALS_PAGE_ASC, PimdirSummaryTable::Journal),
+                ],
+                _ => return self.list_items_page_asc(collection, after, limit),
+            };
 
         let after = after.map(|(key, seq)| (key.to_string(), seq));
         let mut items = self.overlaid(
@@ -546,7 +561,12 @@ impl PimdirReader {
 
     /// One live item by its public id with its summary and addresses, or
     /// `None`; a tombstone reads as `None`.
-    pub fn get_item(&self, collection: &str, seq: i64) -> Result<Option<PimdirItem>, PimdirError> {
+    pub fn get_item(
+        &self,
+        collection: impl AsRef<str>,
+        seq: i64,
+    ) -> Result<Option<PimdirItem>, PimdirError> {
+        let collection = collection.as_ref();
         let item = self.committed_item(collection, seq)?;
         if !self.overlay {
             return Ok(item);
@@ -567,9 +587,10 @@ impl PimdirReader {
     /// just staged an add.
     pub fn seq_for_link(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         link_id: &str,
     ) -> Result<Option<i64>, PimdirError> {
+        let collection = collection.as_ref();
         Ok(self
             .conn
             .query_row(
@@ -583,9 +604,10 @@ impl PimdirReader {
     /// Every source's binding of one item, keyed by source (§13).
     pub fn item_bindings(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
         link_id: &str,
     ) -> Result<BTreeMap<PimdirSourceId, PimdirBinding>, PimdirError> {
+        let collection = collection.as_ref();
         Ok(rows(
             &self.conn,
             sql::LIST_ITEM_BINDINGS,
@@ -623,7 +645,8 @@ impl PimdirReader {
     }
 
     /// A collection's live item count.
-    pub fn count_items(&self, collection: &str) -> Result<u64, PimdirError> {
+    pub fn count_items(&self, collection: impl AsRef<str>) -> Result<u64, PimdirError> {
+        let collection = collection.as_ref();
         let count: i64 = self.conn.query_row(
             sql::COUNT_ITEMS,
             named_params! { ":collection": collection },
@@ -647,7 +670,8 @@ impl PimdirReader {
     }
 
     /// How many of a collection's handles no read can list yet.
-    pub fn count_probes(&self, collection: &str) -> Result<u64, PimdirError> {
+    pub fn count_probes(&self, collection: impl AsRef<str>) -> Result<u64, PimdirError> {
+        let collection = collection.as_ref();
         let count: i64 = self.conn.query_row(
             sql::COUNT_PROBES,
             named_params! { ":collection": collection },
@@ -697,29 +721,34 @@ impl PimdirReader {
     }
 
     /// Every live placement naming one address, store-wide, `role` `None`
-    /// for any role: the person axis (Annex A.6).
+    /// for any role: the person axis (Annex A.6). A row under a role the
+    /// format lacks is left out.
     pub fn address_placements(
         &self,
         address: &str,
         role: Option<PimdirAddressRole>,
     ) -> Result<Vec<PimdirAddressPlacement>, PimdirError> {
-        Ok(rows(
+        let placements = rows(
             &self.conn,
             sql::LIST_ADDRESS_PLACEMENTS,
             named_params! { ":address": address, ":role": role.map(|r| r.as_str()) },
             |r| {
-                Ok(PimdirAddressPlacement {
+                let Some(role) = PimdirAddressRole::parse(&r.get::<_, String>(0)?) else {
+                    return Ok(None);
+                };
+                Ok(Some(PimdirAddressPlacement {
                     address: address.to_string(),
-                    role: PimdirAddressRole::parse(&r.get::<_, String>(0)?)
-                        .unwrap_or(PimdirAddressRole::From),
+                    role,
                     collection: r.get(1)?,
                     account: r.get(2)?,
                     kind: r.get(3)?,
                     seq: r.get(4)?,
                     sort_key: r.get(5)?,
-                })
+                }))
             },
-        )?)
+        )?;
+
+        Ok(placements.into_iter().flatten().collect())
     }
 
     /// The same for one domain, by a scan.
@@ -728,23 +757,27 @@ impl PimdirReader {
         domain: &str,
         role: Option<PimdirAddressRole>,
     ) -> Result<Vec<PimdirAddressPlacement>, PimdirError> {
-        Ok(rows(
+        let placements = rows(
             &self.conn,
             sql::LIST_DOMAIN_PLACEMENTS,
             named_params! { ":domain": domain, ":role": role.map(|r| r.as_str()) },
             |r| {
-                Ok(PimdirAddressPlacement {
+                let Some(role) = PimdirAddressRole::parse(&r.get::<_, String>(1)?) else {
+                    return Ok(None);
+                };
+                Ok(Some(PimdirAddressPlacement {
                     address: r.get(0)?,
-                    role: PimdirAddressRole::parse(&r.get::<_, String>(1)?)
-                        .unwrap_or(PimdirAddressRole::From),
+                    role,
                     collection: r.get(2)?,
                     account: r.get(3)?,
                     kind: r.get(4)?,
                     seq: r.get(5)?,
                     sort_key: r.get(6)?,
-                })
+                }))
             },
-        )?)
+        )?;
+
+        Ok(placements.into_iter().flatten().collect())
     }
 }
 
@@ -753,29 +786,30 @@ impl PimdirReader {
     /// A keyset page of retained items (§11), cursor on `seq`, the trash view.
     pub fn list_retained(
         &self,
-        collection: &PimdirCollectionId,
+        collection: impl AsRef<str>,
         after: Option<i64>,
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let collection = collection.as_ref();
         let mut items = rows(
             &self.conn,
             sql::LIST_RETAINED_PAGE,
             named_params! {
-                ":collection": collection.0,
+                ":collection": collection,
                 ":after": after.unwrap_or(0),
                 ":limit": limit as i64,
             },
             item_from_row,
         )?;
-        self.attach_summaries(&collection.0, &mut items)?;
+        self.attach_summaries(collection, &mut items)?;
         Ok(items)
     }
 
     /// A collection's retained item count.
-    pub fn count_retained(&self, collection: &PimdirCollectionId) -> Result<i64, PimdirError> {
+    pub fn count_retained(&self, collection: impl AsRef<str>) -> Result<i64, PimdirError> {
         Ok(self.conn.query_row(
             sql::COUNT_RETAINED,
-            named_params! { ":collection": collection.0 },
+            named_params! { ":collection": collection.as_ref() },
             |r| r.get(0),
         )?)
     }
@@ -797,8 +831,9 @@ impl PimdirReader {
     /// A collection's pending actions in append order (§15.4).
     pub fn pending_actions(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
     ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+        let collection = collection.as_ref();
         pending_actions(&self.conn, collection)
     }
 
@@ -822,8 +857,9 @@ impl PimdirReader {
     /// create has no public id until the owner applies it.
     pub fn pending_creates(
         &self,
-        collection: &str,
+        collection: impl AsRef<str>,
     ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+        let collection = collection.as_ref();
         Ok(self
             .pending_actions(collection)?
             .into_iter()
@@ -832,7 +868,8 @@ impl PimdirReader {
     }
 
     /// How many creates a collection has queued.
-    pub fn count_pending_creates(&self, collection: &str) -> Result<usize, PimdirError> {
+    pub fn count_pending_creates(&self, collection: impl AsRef<str>) -> Result<usize, PimdirError> {
+        let collection = collection.as_ref();
         Ok(self.pending_creates(collection)?.len())
     }
 
@@ -1001,18 +1038,19 @@ impl PimdirReader {
                 .find(|item| item.link_id == link)
                 .and_then(|item| item.summary.as_mut())
             {
-                crate::client::write::attach_address(summary, role, address);
+                attach_address(summary, role, address);
             }
         }
         Ok(())
     }
 
     /// Folds the store's pending queue into what it changes about one
-    /// collection, walked in global append order.
+    /// collection, walked in global append order; a row whose payload
+    /// does not decode is skipped, the drain being what parks it.
     fn pending(&self, collection: &str) -> Result<PimdirPending, PimdirError> {
         let mut queued = Vec::new();
         for from in self.queued_collections()? {
-            for action in pending_actions(&self.conn, &from)? {
+            for action in overlaid_actions(&self.conn, &from)? {
                 queued.push((from.clone(), action));
             }
         }

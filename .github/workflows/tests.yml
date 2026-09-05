@@ -6,16 +6,16 @@ on:
 
 jobs:
   check:
-    name: fmt + clippy + test
+    name: fmt + clippy + deny + test
     runs-on: ubuntu-latest
     steps:
-      # NOTE: the spec is a sibling checkout, not a vendored copy, and three
-      # test files skip without it: the schema and statement fidelity suite
-      # (tests/spec_drift.rs), the object-naming vectors the format makes a
-      # MUST (tests/objects.rs) and the Annex A conventions
-      # (tests/conventions.rs). Checking it out is what makes them run, and
-      # drift between the two repositories is exactly what nothing else
-      # notices.
+      # NOTE: the spec is a sibling checkout, not a vendored copy, and the
+      # suites proving the crate against it (the schema and statement
+      # fidelity of tests/spec_drift.rs, the object-naming vectors of
+      # tests/objects.rs, the Annex A summaries of tests/summaries.rs and
+      # the sync vectors of tests/vectors_sync.rs) skip without it.
+      # Checking it out is what makes them run, and drift between the two
+      # repositories is exactly what nothing else notices.
       - uses: actions/checkout@v4
         with:
           path: io-pimdir
@@ -23,30 +23,31 @@ jobs:
         with:
           repository: pimalaya/pimdir
           path: pimdir
-      # NOTE: io-replica is a path dependency until the release carrying the
-      # duplicate-link-id freeze is published (see Cargo.toml), so it has to
-      # sit beside this checkout too.
-      - uses: actions/checkout@v4
-        with:
-          repository: pimalaya/io-replica
-          path: io-replica
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: io-pimdir/Cargo.toml
       - run: cargo fmt --all --check
         working-directory: io-pimdir
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-features --all-targets -- -D warnings
         working-directory: io-pimdir
       - run: cargo test --all-features
         working-directory: io-pimdir
-      # The three suites above skip silently when the spec is absent, so a
-      # green run proves nothing unless they actually ran.
+      # The integration tests need the client, so the no_std core is
+      # proven by its unit tests alone.
+      - run: cargo test --no-default-features --lib
+        working-directory: io-pimdir
+      # The spec suites skip silently when the spec is absent, so a green
+      # run proves nothing unless they actually ran.
       - name: The spec suites ran rather than skipped
         working-directory: io-pimdir
         run: |
           set -eu
-          for suite in spec_drift objects conventions; do
-            if cargo test --all-features --test "$suite" -- --nocapture 2>&1 | grep -q "skipped: no pimdir spec checkout"; then
+          for suite in spec_drift summaries vectors_sync objects; do
+            [ -f "tests/$suite.rs" ] || continue
+            if cargo test --all-features --test "$suite" -- --nocapture 2>&1 | grep -qE "skipped: no pimdir spec checkout beside this one|skipping: the pimdir spec checkout is not beside this crate"; then
               echo "::error::$suite skipped: the pimdir checkout was not found"
               exit 1
             fi

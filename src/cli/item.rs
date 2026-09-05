@@ -17,7 +17,6 @@ use clap::{ArgGroup, Args, Subcommand};
 use io_pimdir::{
     client::reader::{PimdirItem, PimdirReader},
     codec::PimdirAction,
-    collection::PimdirCollectionId,
     hub::{PimdirBinding, PimdirSourceId},
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel},
@@ -27,6 +26,7 @@ use pimalaya_cli::{
     printer::Printer,
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
 };
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -108,9 +108,8 @@ impl ItemListCommand {
                     anyhow::anyhow!("--after takes a seq with --retained, got {cursor:?}")
                 })?),
             };
-            let collection = PimdirCollectionId(self.collection.clone());
             store
-                .list_retained(&collection, after, probe)
+                .list_retained(&self.collection, after, probe)
                 .map_err(report)?
                 .into_iter()
                 .map(|item| ItemRow::new(&self.collection, &item))
@@ -251,7 +250,7 @@ impl ItemExportCommand {
             );
         };
 
-        let blobs = store.blobs()?;
+        let blobs = read.blobs();
         let Some(mut reader) = blobs.reader(&PimdirHash(hash.clone()))? else {
             bail!(
                 "the body of seq {} is missing from the blob store (hash {hash}); run `pimdir check`",
@@ -320,11 +319,10 @@ impl ItemRestoreCommand {
                 found.collection
             );
         }
-        drop(read);
-
         // NOTE: resolved before the enqueue, so an unresolvable write
         // source fails while nothing has been appended yet.
-        let source = store.write_source()?;
+        let source = store.write_source(&read)?;
+        drop(read);
 
         let action = PimdirAction::Add {
             link_id: Some(item.link_id.clone()),
@@ -466,8 +464,10 @@ impl ItemPurgeCommand {
             ),
         )?;
 
-        let collection = PimdirCollectionId(found.collection.clone());
-        let purged = store.owner()?.purge(&collection, seq).map_err(report)?;
+        let purged = store
+            .owner()?
+            .purge(&found.collection, seq)
+            .map_err(report)?;
 
         if !purged {
             let collection = &found.collection;
@@ -538,9 +538,8 @@ fn locate(store: &PimdirReader, seq: i64, collection: Option<&str>) -> Result<Ve
 /// for the single row after `seq - 1` either answers with `seq` itself or
 /// proves it is not retained here.
 fn retained(store: &PimdirReader, collection: &str, seq: i64) -> Result<Option<PimdirItem>> {
-    let collection = PimdirCollectionId(collection.to_string());
     let page = store
-        .list_retained(&collection, Some(seq - 1), 1)
+        .list_retained(collection, Some(seq - 1), 1)
         .map_err(report)?;
     Ok(page.into_iter().find(|item| item.seq == seq))
 }
@@ -576,7 +575,8 @@ fn flag_list(flags: &PimdirFlags) -> Option<Vec<String>> {
 }
 
 /// One item as every listing prints it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemRow {
     /// The collection holding this placement.
     pub collection: String,
@@ -637,7 +637,8 @@ impl ItemRow {
 }
 
 /// The `item list` output: one page, plus what it left out.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemsOutput {
     /// The listed collection.
     pub collection: String,
@@ -715,10 +716,12 @@ impl fmt::Display for ItemsOutput {
     }
 }
 
-/// One source's binding of an item: how that source addresses it, what the
-/// last sync agreed on, and the marker that says why it might have stopped
-/// moving.
-#[derive(Debug, Serialize)]
+/// One source's binding of an item.
+///
+/// How that source addresses it, what the last sync agreed on, and the marker
+/// that says why it might have stopped moving.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BindingRow {
     /// The source holding the binding.
     pub source: String,
@@ -772,8 +775,10 @@ impl BindingRow {
 }
 
 /// One placement of an item, with the bindings the sources hold it under.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemPlacement {
+    /// The item as this collection holds it.
     #[serde(flatten)]
     pub item: ItemRow,
     /// One entry per source holding this placement, ordered by source.
@@ -781,7 +786,8 @@ pub struct ItemPlacement {
 }
 
 /// The `item show` output: every placement of one public id.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemShowOutput {
     /// The public id looked up.
     pub seq: i64,
@@ -890,7 +896,8 @@ impl fmt::Display for ItemShowOutput {
 }
 
 /// The `item export --output` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemExportOutput {
     /// The exported item.
     pub seq: i64,
@@ -917,8 +924,8 @@ impl fmt::Display for ItemExportOutput {
 }
 
 /// What became of a restore.
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub enum RestoreStatus {
     /// The action was applied and the item is live again.
     Applied,
@@ -929,7 +936,8 @@ pub enum RestoreStatus {
 }
 
 /// The `item restore` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemRestoreOutput {
     /// The restored item.
     pub seq: i64,
@@ -966,7 +974,8 @@ impl fmt::Display for ItemRestoreOutput {
 }
 
 /// The `item purge` output.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemPurgeOutput {
     /// The cutoff a time-based purge used, `None` for a single item.
     pub cutoff: Option<String>,

@@ -557,11 +557,15 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             // it (spec §15.1), so it is staged here and the enqueue is
             // what takes the reference.
             let hash = object.map(|body| harness.hash(body));
-            let size = object.map(|body| {
+            let staged = object.map(|body| {
                 let blobs = harness.sources[0].blobs();
                 let mut writer = blobs.writer().unwrap();
                 std::io::Write::write_all(&mut writer, BODIES[body]).unwrap();
-                writer.commit(&harness.hash(body)).unwrap()
+                let size = writer.commit(&harness.hash(body)).unwrap();
+                PimdirObject {
+                    hash: harness.hash(body),
+                    size: size as usize,
+                }
             });
 
             let seqs: Vec<i64> = harness.sources[0]
@@ -603,7 +607,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             if let Some(action) = action {
                 let mut producer = PimdirProducer::open(harness.path(), "proptest").unwrap();
                 producer
-                    .enqueue(COLLECTIONS[collection], &action, size)
+                    .enqueue(COLLECTIONS[collection], &action, staged.as_ref())
                     .unwrap();
             }
         }

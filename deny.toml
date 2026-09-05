@@ -1,5 +1,4 @@
 [sources]
-allow-org.github = ["pimalaya"]
 unknown-git = "deny"
 unknown-registry = "deny"
 

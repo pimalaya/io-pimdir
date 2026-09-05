@@ -15,10 +15,13 @@
 //! The spec is a sibling checkout rather than a vendored copy, so the
 //! test skips when it is absent and runs when the two sit side by side.
 
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 use io_pimdir::object::PimdirHash;
-use io_pimdir::{client::blobs::PimdirBlobs, hash::PimdirHashAlgo};
+use io_pimdir::{
+    client::{PimdirStore, blobs::PimdirBlobs},
+    hash::PimdirHashAlgo,
+};
 use serde_json::Value;
 
 /// The canonical spec checkout, beside this one.
@@ -143,4 +146,37 @@ fn a_streamed_body_names_what_a_whole_one_names() {
             );
         }
     }
+}
+
+/// The collector owns a file by its position (STORAGE §3, §5): one sitting
+/// at the shard path its name derives is a body, and anything else under
+/// objects/ is a writer's temporary or somebody else's file, left alone.
+#[test]
+fn the_collector_unlinks_only_the_files_at_their_shard_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    let blobs = store.blobs();
+
+    // an orphan at its path: a body a crash left with no row
+    let mut writer = blobs.writer().unwrap();
+    writer.write_all(b"orphan").unwrap();
+    let orphan = writer.commit(&blobs.hash(b"orphan")).unwrap();
+    assert_eq!(orphan, 6);
+    let orphan = blobs.path(&blobs.hash(b"orphan"));
+
+    // a temporary, a foreign file at the root and one inside a shard
+    let objects = dir.path().join("objects");
+    let tmp = objects.join(".tmp-9-9");
+    fs::write(&tmp, b"in flight").unwrap();
+    let readme = objects.join("README");
+    fs::write(&readme, b"not a body").unwrap();
+    let stray = orphan.parent().unwrap().join("notes.txt");
+    fs::write(&stray, b"not a body either").unwrap();
+
+    assert_eq!(blobs.files().unwrap().len(), 1, "only the orphan is a body");
+    let report = store.collect_garbage().unwrap();
+    assert_eq!((report.objects, report.blobs, report.bytes), (0, 1, 6));
+    assert!(!orphan.is_file(), "the orphan is taken");
+    assert!(tmp.is_file(), "a writer's temporary is not");
+    assert!(readme.is_file() && stray.is_file(), "nor a foreign file");
 }

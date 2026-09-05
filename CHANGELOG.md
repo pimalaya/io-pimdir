@@ -6,40 +6,63 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Added the sync engine: the five verbs (`PimdirOpen`, `PimdirUpgrade`, `PimdirMutate`, `PimdirSync`, `PimdirRekey`) as I/O-free coroutines in the core, and `PimdirSourceStore::run`, `sync`, `upgrade`, `mutate`, `rekey` and `open_collection` driving them against a consumer's `PimdirRemote`.
-
-  io-replica folds into this crate: the engine is the sync part of the pimdir standard, the store its storage part, and one crate now implements both. `PimdirSourceStore::service` answers the storage yields for a driver of its own.
-
-- Added typed summaries (STORAGE Annex A): `summary::derive` yields the key, the kind's summary row with the people it names and the sort key, with RFC 2047 decoding, vCard and iCalendar unescaping, canonical addresses and an attachment walk; the rows land in the five summary tables and `item_address`, and every read that lists joins them (`list_summaries`, `get_item`, `address_placements`).
-
-- Added the probes table, the change feed (`change_cursor`, `items_changed_since`, `collections_changed_since`), the refcount floor and the 37 canonical statements the store lacked, so the schema is the specification's verbatim.
-
-- Added the conformance suites: vectors/sync/ runs against the real store through a scripted connector, vectors/summaries.json against the derivations.
+- Added the sync engine: the five verbs (`PimdirOpen`, `PimdirUpgrade`, `PimdirMutate`, `PimdirSync`, `PimdirRekey`) as I/O-free coroutines in the core, and `PimdirSourceStore::run`, `sync`, `upgrade`, `mutate`, `rekey`, `open_collection` and `service` running them against a consumer's `PimdirRemote`.
+- Added typed summaries (STORAGE Annex A): `summary::derive` yields the key, the kind's summary row with the people it names and the sort key; the rows land in the five summary tables and `item_address`, and every listing read joins them (`list_summaries`, `get_item`, `address_placements`).
+- Added the probes table, the change feed (`change_cursor`, `items_changed_since`, `collections_changed_since`), the refcount floor and every canonical statement the store lacked, so the schema is the specification's verbatim.
+- Added the conformance suites: vectors/sync/ runs against the real store through a scripted connector (pushes compared with their idempotency keys), vectors/summaries.json against the derivations.
+- Added `PimdirDeletePolicy::Auto`, the default: the engine reads it as `Revert`, the std client resolves it to `Keep` when the collection binds more than one source (SYNC §5).
+- Added the landing of a pending create by its arrival: an upgrade whose fetch resolves the hint a pending create holds supersedes the provisional handle instead of minting a second copy (SYNC §6).
+- Added a `Tombstone` placement's destination (`DESTINATION_FOR_LINK`), so a move's remove relocates through the reference store, and `LOAD_PROBES_BY_HANDLE` for a `Handles` load.
+- Added `sql::MIGRATIONS` and the migration runner of STORAGE §6 on the owner open.
+- Added `PimdirRekey::FETCH_CHUNK`: a rekey resolves the new spine in bounded `Meta` fetches.
+- Added the per-store writer lock serialising the collector against the process's own writers.
+- Added the `json-schema` subcommand listing the JSON Schema of every command's `--json` output, and hidden plural aliases (`completions`, `manuals`, `collections`, `items`, `queues`, `stores`) on the CLI verbs.
 
 ### Changed
 
-- Renamed every engine type from `Replica*` to `Pimdir*` (`ReplicaSourceBinding` is `PimdirBinding`, `ReplicaEvent` is `PimdirSyncEvent`), the read placement to `PimdirItemLocation`, and moved the client types under `client::{reader, producer, blobs, diagnostics}` with no crate-root re-export.
+- BREAKING: renamed every engine type from `Replica*` to `Pimdir*` (`ReplicaSourceBinding` is `PimdirBinding`, `ReplicaEvent` is `PimdirSyncEvent`), the read placement to `PimdirItemLocation`, and moved the client types under `client::{reader, producer, blobs, diagnostics}` with no crate-root re-export.
+- BREAKING: `conventions` is `summary`, and `PimdirDerivation` carries a typed summary instead of a meta string.
+- BREAKING: every collection parameter of the std client takes `impl AsRef<str>`; `PimdirCollectionId` implements `AsRef<str>`.
+- BREAKING: `PimdirProducer::enqueue` takes no timestamp and takes the body as `Option<&PimdirObject>` instead of a size; `PimdirAction::Add` and `Update` carry no summary, the owner deriving it from the body.
+- BREAKING: the change key is the derivation SYNC §4 fixes (FNV-1a 64 over NUL-terminated fields, a flag count in decimal ASCII), so every key changed.
+- BREAKING: coroutine states are named in the present tense, and a completed coroutine answers `UnexpectedArg` to every resume, `None` included.
+- BREAKING: `sql::ALL` is `sql::CANONICAL`, `sql::OWN` and `sql::all()`; the canonical SQL is vendored under spec/ byte for byte and its constants generated by build.rs, one per statement file.
+- BREAKING: every store from an earlier draft is refused with `PimdirError::Stale` and recreated.
+- BREAKING: renamed every `--json` key of the CLI output to camelCase, the `completions` and `manuals` commands to `completion` and `manual`, and replaced the `schema_version`/`supported_schema_version` pair of `store info` with one `schemaVersion`.
+- A drop carries three reasons: `Deleted`, `Superseded` (an accepted add's provisional handle, or one a landed arrival replaced) and `Rekeyed` (a rebuild), the last being what bumps the collection's generation.
+- A sync's events report what the remote changed and an accepted add only; a pushed flag, body or delete reports nothing.
+- A write retires the binding a handle held under another link id before inserting the new one, `bindings_by_handle` being unique (STORAGE §10), and purges a dropped item's row instead of retaining it when another collection of the same account holds the identity live (STORAGE §11).
+- A load by key (`PimdirLoadScope::Links`) answers with the rows the source binds, never the copy the hub offers for an item the source lacks.
+- A rekey carries a remote edit as a pull, a conflict over a local edit or a revived tombstone, never a base at a revision it never reconciled (SYNC §8).
+- The hub adopts a tombstone's known flags, lowers the shared level with a body a pull drops, and asks its resolver for `Tombstone` placements too.
+- `PimdirMutate` refuses a probe with `PimdirMutateError::Probed`; `client::PimdirRunError` is public.
+- A drain parks a store failure and retries only a busy or I/O one, skips a live `remove` the source does not bind and a lost claim, and never stops the rows behind a failure (STORAGE §15.2).
+- The collector unlinks only files at their shard path, and a blob write syncs every shard directory it created.
+- A reader or producer opening a directory with no database reports `Uncreated`; a store lacking a table is `Stale` before its stamp is read.
+- Bumped `rust-version` to 1.88 and the export dump `format_version` to 2 (items carry summary columns and address rows instead of a raw meta string).
+- The `cli` feature pulls pimalaya-cli through `dep:`, and .github/, cairn/ and tests/proptest-regressions/ are excluded from the package.
 
-- A drop carries three reasons: `Deleted`, `Superseded` (an accepted add's provisional handle) and `Rekeyed` (a rebuild), the last being what bumps the collection's generation; `write_rekeyed` is gone.
+### Fixed
 
-- A sync's events report what the remote changed and an accepted add only; a pushed flag, body or delete reports nothing. A pulled member is a probe with no base; a `KeepBoth` fork is keyed `dup:<hint>#<provisional handle>`; a `Created` placement carries the origin the store knows, where the origin's base holds the body the copy intends.
-
-- `PimdirMutate` refuses a probe with `PimdirMutateError::Probed`, a probe holding flags only; `client::PimdirRunError` is public.
-
-- The canonical SQL is vendored under spec/ byte for byte and its constants generated by build.rs, one per statement file; `sql::ALL` is `sql::CANONICAL`, `sql::OWN` and `sql::all()`, and the two page statements that substituted a NULL cursor are the specification's own text now. Thirteen statements the store needed were upstreamed to the specification, `cancel_action` returns the pin and `park_action` counts the attempt, so `OWN` holds the operator diagnostics alone.
-
-- A drop of an item's last binding purges the row instead of retaining it when another collection of the same account holds the identity live (STORAGE §11): a move leaves nothing in the source's trash.
-
-- A load by key (`PimdirLoadScope::Links`) answers with the rows the source binds and no longer with the copy the hub offers for an item the source lacks, so a second source hydrating its own resource of a shared identity binds the item instead of taking a minted key.
-
-- `PimdirProducer::enqueue` takes no timestamp, SQLite stamping the row; `PimdirAction::Add` and `Update` carry no summary, the owner deriving it from the body.
+- Fixed the `hash:` key using a wrong FNV-1a 64 prime, so no UID-less card or event keyed as the specification says.
+- Fixed an accepted content push rebasing the placement read before the flag merge, losing the flag it pulled in the same run (SYNC §5).
+- Fixed a re-listed probe with unchanged flags being rewritten and reported on every full sync, and a probe an enumeration no longer lists never being dropped.
+- Fixed `PimdirSyncReport::rejected` counting a rejection for a handle nobody pushed.
+- Fixed a bound source projecting dirty on every load after a sibling source pulled a content change.
+- Fixed an `Edit` on a pending copy keeping its origin, so the origin's body was copied instead of the edited one uploaded.
+- Fixed `windows-1252` decoded as latin1, folded header whitespace collapsed, and an encoded word whose payload starts with `=` failing to decode.
+- Fixed one malformed pending row failing every overlaid read.
+- Fixed single-statement owner writes surfacing SQLITE_BUSY as a raw SQL error, and unknown address roles reading as `from`.
+- Fixed the CLI opening a second reader behind the handle a verb already held.
+- Fixed CI checking out io-replica and a `conventions` suite that no longer exists; every spec suite is now proven to run.
+- Fixed the docs.rs feature badge missing on the `client` module.
 
 ### Removed
 
 - Removed `items.meta` and `ReplicaMeta`: the summary is typed.
-- Removed the draft reconcile (`FOLDED_IN`, `ENSURE_INDEXES`, `RESHAPED_INDEXES`) and `PimdirError::Unreconcilable`: a store from an earlier draft is refused with `PimdirError::Stale` and recreated, the draft offering no migration.
-- Removed `PimdirStore::open_read_only`, superseded by `PimdirReader::open`, and the in-memory residual of unnamed handles, superseded by the probes table.
-- Removed the `io-replica` dependency.
+- Removed the draft reconcile (`FOLDED_IN`, `ENSURE_INDEXES`, `RESHAPED_INDEXES`) and `PimdirError::Unreconcilable`.
+- Removed `PimdirStore::open_read_only`, superseded by `PimdirReader::open`, the in-memory residual of unnamed handles, superseded by the probes table, and `write_rekeyed`, superseded by the `Rekeyed` drop reason.
+- Removed the `io-replica` dependency, the accidental public `pimalaya-cli` feature, and the duplicated `fs4` and `rusqlite` dev-dependencies.
 
 ## [0.4.1] - 2026-09-02
 

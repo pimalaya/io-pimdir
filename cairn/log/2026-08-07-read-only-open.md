@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: read-only-open
-landed: 2026-08-07
+date: 2026-08-07
 ---
 
 # Read-only store open

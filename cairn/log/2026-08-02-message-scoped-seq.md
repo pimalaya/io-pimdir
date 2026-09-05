@@ -1,7 +1,7 @@
 ---
 cairn: log
 change: message-scoped-seq
-landed: 2026-08-02
+date: 2026-08-02
 ---
 
 # The public id is scoped to the message, not the mailbox

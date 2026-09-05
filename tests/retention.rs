@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, convert::Infallible, path::Path};
 
 use io_pimdir::{
     change::{PimdirChange, PimdirDropReason, PimdirWriteOp},
-    client::PimdirStore,
+    client::{PimdirError, PimdirStore},
     codec::PimdirAction,
     collection::{PimdirCheckpoint, PimdirCollectionId},
     load::PimdirLoadScope,
@@ -120,7 +120,7 @@ fn an_expunge_retains_the_item_and_its_body() {
     assert!(store.get_item("INBOX", seq).unwrap().is_none());
 
     // but kept whole, body included, under the id it always had
-    let retained = store.list_retained(&inbox(), None, 10).unwrap();
+    let retained = store.list_retained(inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].seq, seq);
     assert_eq!(retained[0].link_id.0, "mid:a");
@@ -135,7 +135,7 @@ fn an_expunge_retains_the_item_and_its_body() {
         "an RFC 3339 stamp: {}",
         retention.at
     );
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
+    assert_eq!(store.count_retained(inbox()).unwrap(), 1);
     assert_eq!(store.retained_bytes().unwrap(), 3);
     assert!(
         blob_exists(dir.path(), "cafebabe"),
@@ -145,7 +145,7 @@ fn an_expunge_retains_the_item_and_its_body() {
     // it survives a reopen as retained, not as a live item
     drop(store);
     let store = PimdirStore::open(dir.path()).unwrap();
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
+    assert_eq!(store.count_retained(inbox()).unwrap(), 1);
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
 }
 
@@ -178,7 +178,7 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
         .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
         .unwrap();
     assert_eq!(report.pulled, 1, "the vanish is observed");
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
+    assert_eq!(store.count_retained(inbox()).unwrap(), 1);
 
     // neither a delta nor a full resync re-derives against the hidden
     // row: the merge only sees what `load` returns
@@ -200,7 +200,7 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
 
     // nothing was re-uploaded either, and the copy is still restorable
     assert!(remote.is_empty(), "no resurrection push");
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
+    assert_eq!(store.count_retained(inbox()).unwrap(), 1);
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
 }
 
@@ -216,7 +216,7 @@ fn a_reappearing_link_id_revives_the_retained_row() {
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
     store.write(vec![drop_placement("1")]).unwrap();
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 1);
+    assert_eq!(store.count_retained(inbox()).unwrap(), 1);
 
     // the source hands the same link id back under a new handle, so the
     // retained row revives instead of colliding on the key
@@ -233,7 +233,7 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].seq, seq, "a restored item keeps its public id");
     assert!(items[0].flags.contains("\\Flagged"), "new content adopted");
-    assert!(store.list_retained(&inbox(), None, 10).unwrap().is_empty());
+    assert!(store.list_retained(inbox(), None, 10).unwrap().is_empty());
     assert_eq!(store.retained_bytes().unwrap(), 0);
     assert!(blob_exists(dir.path(), "cafebabe"));
 
@@ -241,7 +241,7 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     // more, and purging then reclaims it
     store.write(vec![drop_placement("9")]).unwrap();
     assert!(blob_exists(dir.path(), "cafebabe"));
-    assert!(store.purge(&inbox(), seq).unwrap());
+    assert!(store.purge(inbox(), seq).unwrap());
     assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(!blob_exists(dir.path(), "cafebabe"), "no refcount leak");
 }
@@ -262,7 +262,7 @@ fn a_queued_add_restores_a_retained_item() {
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
     store.write(vec![drop_placement("1")]).unwrap();
 
-    let retained = store.list_retained(&inbox(), None, 10).unwrap().remove(0);
+    let retained = store.list_retained(inbox(), None, 10).unwrap().remove(0);
     let mut producer =
         io_pimdir::client::producer::PimdirProducer::open(dir.path(), "pimdir").unwrap();
     producer
@@ -285,7 +285,7 @@ fn a_queued_add_restores_a_retained_item() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].seq, seq, "restored under its own id");
     assert_eq!(items[0].object, Some(PimdirHash("cafebabe".into())));
-    assert!(store.list_retained(&inbox(), None, 10).unwrap().is_empty());
+    assert!(store.list_retained(inbox(), None, 10).unwrap().is_empty());
 
     // staged as a local creation, so the next sync pushes it back
     let projected = store
@@ -312,12 +312,12 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
     let (seq_a, seq_b) = (live[0].seq, live[1].seq);
 
     // a live item is out of a purge's reach entirely
-    assert!(!store.purge(&inbox(), seq_a).unwrap());
+    assert!(!store.purge(inbox(), seq_a).unwrap());
     assert_eq!(store.count_items("INBOX").unwrap(), 2);
 
     store.write(vec![drop_placement("1")]).unwrap();
-    assert!(store.purge(&inbox(), seq_a).unwrap());
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 0);
+    assert!(store.purge(inbox(), seq_a).unwrap());
+    assert_eq!(store.count_retained(inbox()).unwrap(), 0);
     assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(
         !blob_exists(dir.path(), "cafebabe"),
@@ -329,7 +329,7 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
     assert!(store.get_item("INBOX", seq_b).unwrap().is_some());
 
     // purging what is already gone reports nothing to purge
-    assert!(!store.purge(&inbox(), seq_a).unwrap());
+    assert!(!store.purge(inbox(), seq_a).unwrap());
 }
 
 #[test]
@@ -365,7 +365,7 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
         .purge_retained_before("2020-01-01T00:00:00.000Z")
         .unwrap();
     assert_eq!(report.items, 0);
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 3);
+    assert_eq!(store.count_retained(inbox()).unwrap(), 3);
 
     // strictly before: the item retired exactly at the cutoff is kept
     let report = store.purge_retained_before(CUTOFF).unwrap();
@@ -374,7 +374,7 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     assert_eq!((collected.blobs, collected.bytes), (1, 3));
     assert!(!blob_exists(dir.path(), "cafebabe"));
     let kept: Vec<String> = store
-        .list_retained(&inbox(), None, 10)
+        .list_retained(inbox(), None, 10)
         .unwrap()
         .into_iter()
         .map(|item| item.link_id.0)
@@ -388,7 +388,7 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
         .purge_retained_before("2030-01-01T00:00:00.000Z")
         .unwrap();
     assert_eq!(report.items, 2);
-    assert_eq!(store.count_retained(&inbox()).unwrap(), 0);
+    assert_eq!(store.count_retained(inbox()).unwrap(), 0);
     assert_eq!(store.retained_bytes().unwrap(), 0);
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.blobs, collected.bytes), (2, 10));
@@ -429,7 +429,7 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     assert_eq!(projected.len(), 1);
     assert_eq!(projected[0].status, PimdirStatus::Tombstone);
     assert_eq!(
-        left.count_retained(&inbox()).unwrap(),
+        left.count_retained(inbox()).unwrap(),
         0,
         "the delete is still in flight"
     );
@@ -450,7 +450,7 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
             .placements
             .is_empty()
     );
-    let retained = right.list_retained(&inbox(), None, 10).unwrap();
+    let retained = right.list_retained(inbox(), None, 10).unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(
         retained[0]
@@ -480,17 +480,15 @@ fn the_retained_page_is_keyed_on_seq_and_exclusive() {
         .unwrap();
 
     // the live item never shows up in the trash, whatever the page
-    let page = store.list_retained(&inbox(), None, 1).unwrap();
+    let page = store.list_retained(inbox(), None, 1).unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].link_id.0, "mid:a");
-    let next = store
-        .list_retained(&inbox(), Some(page[0].seq), 10)
-        .unwrap();
+    let next = store.list_retained(inbox(), Some(page[0].seq), 10).unwrap();
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].link_id.0, "mid:c");
     assert!(
         store
-            .list_retained(&inbox(), Some(next[0].seq), 10)
+            .list_retained(inbox(), Some(next[0].seq), 10)
             .unwrap()
             .is_empty(),
         "the cursor is exclusive"
@@ -596,4 +594,71 @@ impl PimdirRemote for MemRemote {
             })
             .collect())
     }
+}
+
+#[test]
+fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
+    // STORAGE §9, §10: a hash: key names bytes, so a UID-less card edited
+    // on its server changes key under the same DAV resource. The write
+    // retires the old binding as a Deleted drop would, and the handle
+    // names one item per source throughout.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("dav");
+    store
+        .write(vec![
+            store_object("cafebabe", b"BEGIN:VCARD\r\nFN:A\r\nEND:VCARD\r\n"),
+            PimdirWriteOp::UpsertPlacement(placement("card.vcf", "hash:aaaa", "cafebabe", &[])),
+        ])
+        .unwrap();
+    let old_seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
+
+    store
+        .write(vec![
+            store_object("beef0000", b"BEGIN:VCARD\r\nFN:B\r\nEND:VCARD\r\n"),
+            PimdirWriteOp::UpsertPlacement(placement("card.vcf", "hash:bbbb", "beef0000", &[])),
+        ])
+        .unwrap();
+
+    // the new item is ordinary, under its own public id
+    let live = store.list_items("INBOX", None, 10).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].link_id.0, "hash:bbbb");
+    assert_ne!(live[0].seq, old_seq, "a derived key draws its own seq");
+    let projected = store
+        .load(&inbox(), &PimdirLoadScope::All)
+        .unwrap()
+        .placements;
+    assert_eq!(projected.len(), 1, "the handle names one item");
+    assert_eq!(projected[0].link_id, Some(PimdirLinkId("hash:bbbb".into())));
+    assert_eq!(projected[0].status, PimdirStatus::Clean);
+
+    // the old one is retained with no binding, its body still pinned
+    let retained = store.list_retained("INBOX", None, 10).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].link_id.0, "hash:aaaa");
+    assert_eq!(retained[0].seq, old_seq);
+    assert!(
+        store
+            .item_bindings("INBOX", "hash:aaaa")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.collect_garbage().unwrap().blobs, 0);
+    assert!(
+        blob_exists(dir.path(), "cafebabe"),
+        "retention pins the body"
+    );
+
+    // the other direction stays refused: the new key is bound to one
+    // handle, and a second handle carrying it is a collision (§10)
+    let collision = store.write(vec![PimdirWriteOp::UpsertPlacement(placement(
+        "other.vcf",
+        "hash:bbbb",
+        "beef0000",
+        &[],
+    ))]);
+    assert!(
+        matches!(collision, Err(PimdirError::Rebind { .. })),
+        "{collision:?}"
+    );
 }

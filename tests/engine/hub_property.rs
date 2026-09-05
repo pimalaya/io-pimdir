@@ -3,10 +3,12 @@
 //! Property-based safety net over the hub axis: generated op sequences
 //! over three sources bound to one shared store.
 //!
-//! Four laws are asserted: every source ends on one body, a source never
+//! Five laws are asserted: every source ends on one body, a source never
 //! diverges from itself, a genuine divergence between two sources is
-//! reported rather than silently resolved, and no staged body is lost
-//! without a strictly later action taking its place.
+//! reported rather than silently resolved, no staged body is lost without
+//! a strictly later action taking its place, and an edit beats a delete
+//! across sources: a server deleting a body it never held is offered the
+//! item back.
 
 use std::collections::BTreeMap;
 
@@ -246,12 +248,11 @@ struct Owed {
     /// Set when an edit landed on the item after that divergence.
     resolved: bool,
     /// Set by a delete, cleared by any later live write.
-    removed: bool,
-    /// Set when a server-side delete raced the item.
     ///
-    /// Whether the delete propagates or a staged edit resurrects it is
-    /// pinned by hand in hub.rs, so here only convergence speaks.
-    raced: bool,
+    /// A server-side delete sets it only when that server held the shared
+    /// body: a body it never saw is an edit, and an edit beats a delete
+    /// across sources, the deleting source being offered the item back.
+    removed: bool,
 }
 
 impl Owed {
@@ -449,10 +450,20 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 if cluster.server_object(source, &handle).is_none() {
                     continue;
                 }
+                let shared = cluster
+                    .hub()
+                    .items
+                    .get(&link)
+                    .and_then(|item| item.object.clone());
+                let agreed = shared.is_none() || cluster.synced_object(source, &link) == shared;
                 cluster.sources[source]
                     .remote_mut()
                     .remove("inbox", handle.as_str());
-                ledger.entry(link).or_default().raced = true;
+                // NOTE: a delete of a body the server never held is
+                // overtaken by the edit it missed, so it stands only when
+                // the server was up to date; a local delete already staged
+                // stands regardless
+                ledger.entry(link).or_default().removed |= agreed;
             }
             HubOp::Add(s, n) => {
                 authored += 1;
@@ -547,9 +558,6 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
 
     for (link, owed) in &ledger {
         let item = shared.items.get(link);
-        if owed.raced {
-            continue;
-        }
         if owed.removed {
             prop_assert!(
                 item.is_none_or(|item| item.deleted),
@@ -568,6 +576,10 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
             continue;
         };
         let item = item.expect("the edited item is still hubbed");
+        prop_assert!(
+            !item.deleted,
+            "the edit staged on {link:?} did not beat the delete: {item:?}",
+        );
         prop_assert_eq!(
             item.object.as_ref(),
             Some(staged),

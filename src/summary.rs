@@ -231,16 +231,19 @@ pub fn hash_key(body: &[u8]) -> PimdirLinkId {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in body {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
     }
 
     PimdirLinkId(format!("hash:{hash:016x}"))
 }
 
-/// Unfolds a body into its logical lines (RFC 5322 §2.2.3, RFC 5545 §3.1,
-/// RFC 6350 §3.2): a line beginning with a space or a tab continues the
-/// one before it. Invalid UTF-8 is replaced, never refused (Annex A.0).
-fn unfold(body: &[u8], keep_leading_space: bool) -> Vec<String> {
+/// Unfolds a body into its logical lines: a line beginning with a space
+/// or a tab continues the one before it. Unfolding a header removes the
+/// CRLF alone and keeps the whitespace (RFC 5322 §2.2.3); unfolding a
+/// vCard or iCalendar line takes the one leading character with it (RFC
+/// 5545 §3.1, RFC 6350 §3.2). Invalid UTF-8 is replaced, never refused
+/// (Annex A.0).
+fn unfold(body: &[u8], keep_whitespace: bool) -> Vec<String> {
     let text = String::from_utf8_lossy(body);
     let mut lines: Vec<String> = Vec::new();
 
@@ -249,10 +252,7 @@ fn unfold(body: &[u8], keep_leading_space: bool) -> Vec<String> {
         match line.strip_prefix([' ', '\t']) {
             Some(rest) if !lines.is_empty() => {
                 let last = lines.last_mut().expect("a line to continue");
-                if keep_leading_space {
-                    last.push(' ');
-                }
-                last.push_str(rest);
+                last.push_str(if keep_whitespace { line } else { rest });
             }
             _ => lines.push(String::from(line)),
         }

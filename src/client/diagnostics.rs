@@ -34,8 +34,10 @@ pub struct PimdirObjectStats {
     pub bytes: u64,
 }
 
-/// One object whose stored refcount disagrees with the references that
-/// justify it: items, conflict copies, per-source bases and queue pins.
+/// One object whose stored refcount disagrees with its references.
+///
+/// The references are the five pointer columns of STORAGE §5: items,
+/// conflict copies, per-source bases and queue pins.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PimdirRefcountDrift {
     /// The object's content hash.
@@ -46,9 +48,10 @@ pub struct PimdirRefcountDrift {
     pub expected: i64,
 }
 
-/// How many minted keys one collection holds: the second copies of
-/// identities a source hands over twice, each filed as an item of its own
-/// (spec §9).
+/// How many minted keys one collection holds (STORAGE §9).
+///
+/// The second copies of identities a source hands over twice, each
+/// filed as an item of its own.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PimdirMinted {
     /// The collection holding them.
