@@ -15,10 +15,12 @@ A rekey SHALL match each member of the new handle space to the placement holding
 
 Identity is the only thing a handle-space change leaves intact, so it is the only thing the match may key on. Matching on anything derived from a handle would match nothing, and matching on content would pair two copies of one body.
 
+The batch SHALL list every `Rekeyed` drop before every upsert (pimdir SYNC §8, §10): a new handle may be an old one another member held, and the drop is what licenses the store to move the binding. The hub keeps the dropped binding's base aside for the upsert that rebinds the source ([hub](hub.md)).
+
 A pending create staged from this collection into another carries an origin naming a handle the rebuild voided. The store derives the origin anew on every load from the bindings by link id (SYNC §3), so such a create copies from the carried handle; a consumer keeping the staged origin sees it fall back to an upload when the store holds the body, and rejected until restaged otherwise.
 
 ### Requirement: A rekey never writes a base it never reconciled
-A mutable member whose fetched revision differs from the one its old base held changed on the remote while the handles did (pimdir SYNC §8). The rekey SHALL carry it as the pull a sync would make, body dropped, level `Probed`, base object `None` at the fetched revision, or as a `Conflict` at the fetched revision with the base untouched and no `conflict_object` when the placement also holds a local edit, a body its base does not. A tombstone meeting one is carried as it is, base included, for the next sync to revive it on the ordinary edit-beats-delete path. A base claiming the fetched revision while holding the old body is the one thing the rekey MUST NOT write: the next sync would read the stale body as current, or push the local edit last-writer-wins.
+A mutable member whose fetched revision differs from the one its old base held changed on the remote while the handles did (pimdir SYNC §8). The rekey SHALL carry it as the pull a sync would make, body dropped, level `Probed`, base object `None` at the fetched revision, or as a `Conflict` at the fetched revision with the base untouched and no `conflict_object` when the placement also holds a local edit, a body its base does not. A tombstone meeting one is carried as it is, base included, for the next sync to revive it on the ordinary edit-beats-delete path. A `Conflict` the old handle held is carried as it is, revision and diverging body kept while the fetched revision is the one recorded; an item-level conflict ([hub](hub.md)), which records no revision, SHALL gain none unless the remote moved, since a binding conflict pinned at a revision the server never left holds that source's pushes for ever while the other sources settle the item. A base claiming the fetched revision while holding the old body is the one thing the rekey MUST NOT write: the next sync would read the stale body as current, or push the local edit last-writer-wins.
 
 #### Scenario: A remote edit over a clean placement
 - GIVEN a placement clean at `r1` whose new handle the fetch reports at `r2`
@@ -65,6 +67,8 @@ Carrying the old minted key is what the mint's own determinism rests on. The key
 Merging the two instead keeps one body, one summary and one set of pending edits for two resources the source holds, and loses the other at the write that noticed the problem.
 
 The keys of the pending creates a rebuild leaves untouched SHALL count as taken, those rows staying in the collection while the rebuild runs.
+
+Where one hint had several old copies, a member SHALL be matched first to the old copy whose base names its fetched revision, then to the one holding its body when the fetch carried one, and in handle order only among what neither tells apart (pimdir SYNC §8), so a renumbering that swapped two resources under one `UID` carries each one's flags and pending edit onto itself.
 
 #### Scenario: Two copies of one hint are carried apart
 - GIVEN a collection holding one hint twice, the second copy under a minted key

@@ -73,7 +73,8 @@ impl QueueListCommand {
                 });
             }
         } else {
-            for collection in store.queued_collections().map_err(report)? {
+            for collection in store.list_collections().map_err(report)? {
+                let collection = collection.id;
                 match store.pending_actions(&collection) {
                     Ok(actions) => {
                         for action in actions {
@@ -81,7 +82,7 @@ impl QueueListCommand {
                                 id: action.id,
                                 created_at: action.created_at,
                                 producer: action.producer,
-                                collection: collection.clone(),
+                                collection: action.collection,
                                 kind: action.action.kind().to_string(),
                                 summary: summary(&action.action),
                                 attempts: action.attempts,

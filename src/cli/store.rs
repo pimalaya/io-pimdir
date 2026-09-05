@@ -76,7 +76,7 @@ impl StoreInfoCommand {
             object_bytes: objects.bytes,
             live_bytes,
             retained_bytes,
-            next_change: cursor.next_change,
+            last_change: cursor.changed,
             purges: cursor.purges,
         })
     }
@@ -119,8 +119,8 @@ pub struct StoreInfoOutput {
     pub live_bytes: u64,
     /// What retention is holding, and what a purge would reclaim.
     pub retained_bytes: u64,
-    /// The next change stamp the feed will draw.
-    pub next_change: i64,
+    /// The last change stamp drawn, above which the feed is read.
+    pub last_change: i64,
     /// How many rows left the store without a stamp.
     pub purges: i64,
 }
@@ -153,8 +153,8 @@ impl fmt::Display for StoreInfoOutput {
         )?;
         writeln!(
             f,
-            " - change feed: next stamp {}, {} purge(s)",
-            self.next_change, self.purges
+            " - change feed: last stamp {}, {} purge(s)",
+            self.last_change, self.purges
         )?;
 
         if self.collections.is_empty() {

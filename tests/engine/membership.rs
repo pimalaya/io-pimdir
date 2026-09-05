@@ -59,7 +59,6 @@ fn stage_move(client: &mut Client) {
             PimdirMutation::Move {
                 handle: PimdirHandle::from("i1"),
                 target: "archive".into(),
-                placeholder: PimdirHandle::from("tmp-i1"),
             },
         )
         .unwrap();
@@ -109,7 +108,6 @@ fn a_copy_leaves_the_source_and_delivers_one_member() {
             PimdirMutation::Copy {
                 handle: PimdirHandle::from("i1"),
                 target: "archive".into(),
-                placeholder: PimdirHandle::from("tmp-i1"),
             },
         )
         .unwrap();

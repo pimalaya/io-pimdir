@@ -130,7 +130,8 @@ impl PimdirRekey {
     ///
     /// Drops the old spine and upserts one placement per new member,
     /// carried when an old placement resolves to the same item and fresh
-    /// otherwise.
+    /// otherwise. Every drop precedes every upsert (SYNC §8, §10): a new
+    /// handle may be an old one another member held.
     fn rebuild(&mut self) -> Vec<PimdirWriteOp> {
         let mut writes = Vec::new();
         let links = mem::take(&mut self.resolved);
@@ -161,7 +162,14 @@ impl PimdirRekey {
         for item in items {
             let resolved = links.get(&item.handle);
             let key = resolved.map(|resolved| {
-                Self::key_of(&resolved.link_id, &item.handle, &claimed, &old_by_link)
+                let revision = item.revision.as_deref().or(resolved.revision.as_deref());
+                Self::key_of(
+                    &resolved.link_id,
+                    &item.handle,
+                    revision,
+                    &claimed,
+                    &old_by_link,
+                )
             });
             let carried = key.as_ref().and_then(|key| old_by_link.remove(key));
             if let Some(key) = key.clone() {
@@ -219,6 +227,7 @@ impl PimdirRekey {
         // NOTE: never a handle this batch also upserts, or the storage's
         // apply order would decide. Rekeyed tells a storage sharing items
         // across sources that a renumbering is not a mass delete.
+        let mut drops = Vec::new();
         for placement in &old {
             if written.contains(&placement.handle) {
                 continue;
@@ -227,39 +236,63 @@ impl PimdirRekey {
                 true => PimdirDropReason::Rekeyed,
                 false => PimdirDropReason::Deleted,
             };
-            writes.push(PimdirWriteOp::DropPlacement {
+            drops.push(PimdirWriteOp::DropPlacement {
                 collection: self.collection.clone(),
                 handle: placement.handle.clone(),
                 reason,
             });
         }
 
-        writes.push(PimdirWriteOp::SetCheckpoint {
+        drops.append(&mut writes);
+        drops.push(PimdirWriteOp::SetCheckpoint {
             collection: self.collection.clone(),
             checkpoint: self.checkpoint.take().expect("an enumerated checkpoint"),
         });
 
-        writes
+        drops
     }
 
     /// The key a rebuilt member takes, and the old placement is found under.
     ///
-    /// The hint while unclaimed, else the minted key an old copy already
-    /// carries (the handle it was minted from is what the change took away),
-    /// else a mint of the member's own, for a copy with no old row to carry.
+    /// Where one hint had several old copies, the copy whose base holds the
+    /// member's revision first, so a renumbering that swapped two resources
+    /// under one identity carries each one's state onto itself (SYNC §8);
+    /// then the hint while unclaimed, then the minted key an old copy
+    /// carries in handle order (the handle it was minted from is what the
+    /// change took away), else a mint of the member's own, for a copy with
+    /// no old row to carry.
     fn key_of(
         hint: &PimdirLinkId,
         handle: &PimdirHandle,
+        revision: Option<&str>,
         claimed: &BTreeSet<PimdirLinkId>,
         old_by_link: &BTreeMap<PimdirLinkId, PimdirPlacement>,
     ) -> PimdirLinkId {
+        let copies = || {
+            old_by_link.values().filter(|old| {
+                old.link_id.as_ref() == Some(hint)
+                    || old.link_id.as_ref() == Some(&hint.minted(&old.handle))
+            })
+        };
+
+        if let Some(revision) = revision
+            && let Some(old) = copies().find(|old| {
+                old.base.as_ref().and_then(|b| b.revision.as_deref()) == Some(revision)
+                    && old
+                        .link_id
+                        .as_ref()
+                        .is_some_and(|key| !claimed.contains(key))
+            })
+        {
+            return old.link_id.clone().expect("a keyed copy");
+        }
+
         if !claimed.contains(hint) {
             return hint.clone();
         }
 
-        let minted = old_by_link
-            .values()
-            .filter(|old| old.link_id.as_ref() == Some(&hint.minted(&old.handle)))
+        let minted = copies()
+            .filter(|old| old.link_id.as_ref() != Some(hint))
             .min_by(|a, b| a.handle.cmp(&b.handle))
             .and_then(|old| old.link_id.clone());
 
@@ -325,9 +358,13 @@ impl PimdirRekey {
 
         let flags_pending = carried.flags != item.flags;
         match old.status {
+            // NOTE: an item-level conflict tracks no revision and stays so
+            // unless the remote moved under the rebuild too (SYNC §3).
             PimdirStatus::Conflict => {
                 carried.status = PimdirStatus::Conflict;
-                carried.conflict_revision = observed;
+                if old.conflict_revision.is_some() || remote_edited {
+                    carried.conflict_revision = observed;
+                }
                 // NOTE: the diverging body describes the revision recorded
                 // beside it, so a newer one drops it and the upgrade pass
                 // asks anew.

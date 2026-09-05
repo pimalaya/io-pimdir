@@ -216,7 +216,10 @@ a consumer restating keys after a convention changed.
 carry its items, bindings, sources, queue rows and child collections with it, by
 way of `ON UPDATE CASCADE` on every foreign key onto `collections(id)` **and** on
 `bindings(collection, link_id)`, which is a parent one level down and refuses the
-cascade without it.
+cascade without it. The rename SHALL also retarget the queued `move` and
+`copy` rows naming the old id (`RENAME_QUEUE_TARGETS`, STORAGE §15), in the same
+transaction, and the canonical trigger restamps the collection's items for the
+change feed.
 
 This SHALL be the only id change offered. Deleting a collection and recreating it
 under a new id destroys the cache, since `ON DELETE CASCADE` takes every item and
@@ -228,6 +231,13 @@ local changes.
 - WHEN it is renamed
 - THEN the items and their bindings follow, so the next sync is a delta rather
   than a re-download
+
+### Requirement: A collection can be deleted
+`delete_collection(collection)` SHALL remove a collection the operator no longer
+wants, `DELETE_COLLECTION` cascading over its items, bindings, sources and queue
+rows with retention not applying, then `RECOMPUTE_REFCOUNTS` in the same
+transaction, since the cascade releases pins no statement returns (STORAGE §14).
+It answers whether a row went.
 
 ### Requirement: Items carry a message-scoped public id
 Each item SHALL carry a `seq`: an integer id a consumer shows and accepts in place
@@ -311,7 +321,8 @@ set, and an unknown one must not read as a deliberate clearing of every flag.
 ### Requirement: Producers append, only the owner pops
 The store SHALL support the pimdir action queue: any process may act as a
 producer whose sole write is the single enqueue transaction (ensure_collection,
-at most one object upsert pinning a pre-written blob, one queue insert).
+the object upsert of a pre-written blob, `PIN_OBJECT`, the queue insert, in that
+order, so the refcount invariant holds at every statement, STORAGE §15.1).
 `enqueue` SHALL take the body the action names as a `PimdirObject`, hash and
 size together, so a first-seen body cannot be pinned without its row; a body
 the store already indexes MAY be left out. Only the owner SHALL read-and-remove
@@ -319,33 +330,36 @@ queue rows: each pending action is applied to items and bindings and its row
 deleted in the same transaction, so application is exactly-once and never
 partially visible.
 
-A drain has three outcomes per row (STORAGE §15.2). A failure of the store
-(a refused rebind, a constraint, a malformed payload) is permanent for the row
-and SHALL park it, `error` set, the attempt counted, the rows behind it
-proceeding. A failure of the environment (`PimdirError::Busy`, an I/O failure,
-SQLite busy or locked) SHALL bump `attempts`, leave the row pending and stop
-the pass. A `remove` of an item that is absent is success; one of a live item
-the draining source does not bind SHALL be skipped for the source that binds
-it. A claim that deletes nothing (`CLAIM_ACTION`) is a row another handle
-applied or a cancellation removed, and SHALL count as skipped, never as
-applied. Parked rows are queryable and never silently deleted.
+The drain is store-wide: `drain` reads `LIST_PENDING_ACTIONS` across every
+collection in append order (STORAGE §15.2), a per-collection drain breaking the
+order a `move` into one collection followed by an edit there relies on, and
+`PimdirPendingAction` names its `collection`. A drain has three outcomes per
+row. A failure of the store (a refused rebind, a constraint, a malformed
+payload, a `move` or `copy` into a collection of no declared kind) is permanent
+for the row and SHALL park it, `error` set, the attempt counted, the rows behind
+it proceeding. A failure of the environment (`PimdirError::Busy`, an I/O
+failure, SQLite busy or locked) SHALL bump `attempts`, leave the row pending and
+proceed to the next row, the report counting it `retried`; a row reaching
+`PimdirProducer::MAX_ATTEMPTS` is parked instead. The handle draining is not the
+source an action is for: an action against an existing item SHALL run as a
+source binding it, this handle's own where it does and else the first that
+does, and an `add` as a source syncing the collection (`COLLECTION_SOURCES`),
+this handle's own where nothing does yet, so a store-wide drain never binds a
+source to a collection it does not sync. A `remove` of an item that is absent
+is success. A claim that deletes nothing
+(`CLAIM_ACTION`) is a row another handle applied or a cancellation removed, and
+SHALL count as skipped, never as applied. Parked rows are queryable and never
+silently deleted.
 
 An action the owner cannot apply at all (a kind it does not recognise, or one it
 recognises but lacks the capability to perform) is **skipped and left pending**,
-never parked, so another owner can perform it. An action the owner cannot apply
-**as the source it is draining** SHALL be treated the same way: an existing
-item's action resolves that item's binding for the draining source, and a source
-holding no binding for it has nothing to mutate, which says nothing about
-whether another source can. Parking it would be terminal, no drain retrying a
-parked row and no verb clearing one, so the first source to reach an action it
-cannot place would destroy it for the source that could. Such a row SHALL be
-left pending with its `attempts` untouched and counted as skipped.
+never parked, so another owner can perform it.
 
-#### Scenario: A source that holds no binding leaves the row alone
-- GIVEN a queued action against an item bound to one source
-- WHEN another source drains that collection first
-- THEN the action is skipped, the row stays pending and unmarked, and the
-  binding's own source applies it on its turn
+#### Scenario: A drain by a source that holds no binding
+- GIVEN a queued flag change and a queued `add` on a collection one source binds
+- WHEN another source's handle drains the queue first
+- THEN both apply as the binding source, which binds the create, and the
+  draining source binds nothing there
 
 ### Requirement: Queued bodies are pinned
 An object referenced by a pending queue row's `object_hash` SHALL count as
@@ -364,7 +378,8 @@ checkpoint, and content changes never bump it.
 ### Requirement: Pending actions are readable
 The read surface SHALL expose a collection's pending (non-parked) actions in
 append order, so a frontend can overlay them on its item projection for
-read-your-writes.
+read-your-writes, and the store's as a whole (`list_pending_actions`), each
+naming its collection.
 
 ### Requirement: A reader may overlay a collection's pending actions
 A reader built with `with_pending` SHALL project a collection's pending actions
@@ -426,7 +441,8 @@ every run, and never converges.
 (TEXT, nullable). When a write batch leaves an item held by no source, the store
 SHALL **retire** the row rather than delete it, unless another collection of the
 same account holds the identity live: that is a move, or one of two filings, and
-the row is retired then purged in the same transaction (`HELD_ELSEWHERE`,
+the row is retired then purged in the same transaction (`HELD_ELSEWHERE` bound
+to the retiring body, so a holder of another body or none keeps the row,
 `PURGE_ITEM`, `release_pins`), the holder pinning the body and the purge counting
 in `store_meta.purges` (STORAGE §11). Otherwise the retirement is: `deleted` set, `retained_at`
 stamped by SQLite (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`, so the crate needs no
@@ -438,6 +454,11 @@ of a removal that has finished propagating.
 `retained_at` records when the **last binding vanished**, not when a server
 deleted the item (unknowable). A revive clears it, so restore-then-redelete
 restarts the clock.
+
+The trash (`list_retained`, `count_retained`) SHALL list every `deleted = 1`
+row, a tombstone a source that may not push still holds included, so a delete
+nothing can deliver is visible rather than lost (STORAGE §11); `PimdirRetention::at`
+is `None` until the last binding goes.
 
 A retained row SHALL keep its bodies pinned: the hub keeps an unbound item, so the
 diff releases only the bindings' references and the row's own stay counted, and
@@ -484,7 +505,10 @@ An item inserted while a retained row holds the primary key
 never reused). One branch serves both a source-side resurrection and a
 client-staged `add`, so restoring a retained item needs no new action kind: `Add`
 over the values the row still holds is a restore. A duplicate-link-id check on
-the apply path SHALL exempt retained rows.
+the apply path SHALL exempt retained rows. A revive over an incoming placement
+carrying no body SHALL keep the retained body at `Full`, an immutable kind's
+bases adopting it (STORAGE §11.1): a `Meta` fetch reviving a row must not
+discard what the store still holds.
 
 ### Requirement: An owner skips the actions it cannot apply
 An action kind the store does not recognise SHALL decode as an opaque action
@@ -565,7 +589,7 @@ The first descending page SHALL bind a `NULL` cursor rather than a key no real o
 - THEN both directions page every item
 
 ### Requirement: The drain claims a row before applying it
-`drain_collection` SHALL delete the queue row it is about to apply as the **first** statement of the applying transaction (`CLAIM_ACTION`), and skip the action when that delete returns nothing.
+`drain` SHALL delete the queue row it is about to apply as the **first** statement of the applying transaction (`CLAIM_ACTION`), and skip the action when that delete returns nothing.
 
 The pending rows are read outside any transaction, so a second owner may hold the same list; deleting at the end has both apply the row, and `add` and `copy` are not idempotent. Claiming first makes exactly-once a property of the statement rather than a convention about who runs the drain.
 
@@ -638,7 +662,11 @@ so the lock registry SHALL carry a per-store `RwLock` the process's writers
 hold shared from blob staging through commit, `write` and the drain alike, and
 the collector holds exclusively across its row deletion and its file walk.
 Together they let it reclaim with no grace window, since no writer is between
-a body and its row while it sweeps.
+a body and its row while it sweeps. It SHALL refuse with `PimdirError::InFlight`
+while a verb of this process runs (`run` holds a running count on the lock
+registry), never collecting between two chunks of an upgrade (STORAGE §5), and
+SHALL run `RECOMPUTE_REFCOUNTS` before `DELETE_GARBAGE_OBJECTS`, trusting no
+incremental count.
 
 The collector owns a file by its position (STORAGE §3, §5): it SHALL unlink
 only a file sitting at the shard path its name derives, and SHALL leave alone a
@@ -797,7 +825,7 @@ of the binding and buy nothing.
 A named placement carries its `PimdirSummary` (STORAGE Annex A), and the write SHALL persist it as the row of the kind's summary table and the `item_address` rows, in the item's transaction, only when it moved: the batch's load reads the summaries and addresses of the link ids it names, the diff compares them, and a summary that moved under unmoved item columns runs `stamp_item` so the change feed sees it (STORAGE §4.5). A summary of another variant deletes the old row; a placement carrying none deletes the stored row too.
 
 ### Requirement: The change feed is the triggers'
-`items.changed` and `collections.changed` SHALL be stamped by the canonical triggers and never bound by a writer; a purge counts in `store_meta.purges`. The reader SHALL expose `change_cursor`, `items_changed_since` and `collections_changed_since` (STORAGE §4.5).
+`items.changed` and `collections.changed` SHALL be stamped by the canonical triggers and never bound by a writer: `STAMP_ITEM` requests a stamp (`changed = -1`) the trigger draws, and a rename restamps the collection's items. A purge counts in `store_meta.purges`. The reader SHALL expose `change_cursor`, `items_changed_since` and `collections_changed_since` (STORAGE §4.5); `PimdirChangeCursor::changed` is the last stamp drawn, so a consumer resuming from it misses nothing and repeats nothing.
 
 ### Requirement: The refcount floor is a constraint
 `objects.refcount` SHALL carry `CHECK (refcount >= 0)`, so a double release fails at the statement that caused it (STORAGE §7).
@@ -824,5 +852,14 @@ A queued `add` or `update` SHALL carry no summary: the drain reads the body the 
 ### Requirement: The collection-id type is one
 Every read and write taking a collection SHALL take `impl AsRef<str>`, `PimdirCollectionId` implementing `AsRef<str>`, so a caller passes a `&str`, a `String` or the id type alike and no two methods spell the parameter apart. The address reads (`address_placements`, `domain_placements`) SHALL skip a row under a role the format lacks, never map it to `from`. Every single-statement owner write (`ensure_collection`, `set_collection_account`, `set_collection_conflict`, `set_sort_key`, `rename_collection`, `fail_action`, `recompute_refcounts`, `clear_dangling_bindings`) SHALL map SQLITE_BUSY and SQLITE_LOCKED to `PimdirError::Busy` as a transaction does. `read_hub` SHALL propagate a failure to serialise its link ids, never read the whole collection in its place.
 
-### Requirement: The delete policy `Auto` reads the binding count
-`PimdirSourceStore::sync` SHALL resolve `PimdirDeletePolicy::Auto` before handing the options to the engine (SYNC §5): `Keep` when `LIST_SOURCES` names a source other than this handle's, the store holding the collection beside other sources, where a revert reads as a resurrection; `Revert` when this source is alone.
+### Requirement: A refused delete is decided beside the collection's sources
+`PimdirSourceStore::sync` SHALL hand `PimdirSync::beside_other_sources` the answer of `COLLECTION_SOURCES`, the union of the collection's `sources` rows and its bindings' sources, this handle's own left out (SYNC §5): a checkpoint counts, since a source whose remote dropped its last member holds no binding and still syncs the collection. There is no configured delete policy.
+
+### Requirement: Conflicted items are listable
+`list_item_conflicts(account)` SHALL run `LIST_CONFLICTED_ITEMS` (STORAGE §14.1) and answer each item's collection, link id, `seq`, shared body and diverging body, so a consumer finds what waits for a cross-source decision without paging its collections.
+
+### Requirement: A lookup answers hash and size
+`lookup_objects` SHALL answer `PimdirObject`s, hash and size, `LOOKUP_OBJECTS` joining `objects`, for the size witness the upgrade applies before linking an immutable body (SYNC §6).
+
+### Requirement: The schema check covers the triggers
+`check` SHALL verify every table and every trigger the canonical migrations declare, `PimdirError::Stale { missing }` naming the first one absent, since the change feed and the collector's counts are the triggers' and a store lacking one corrupts silently.

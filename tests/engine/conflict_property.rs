@@ -371,16 +371,20 @@ fn resolve(
         !binding.conflicted,
         "the resolution of {link:?} left s{source} conflicted: {binding:?}",
     );
-    prop_assert_eq!(
-        binding.base.as_ref().and_then(|b| b.revision.clone()),
-        observed.clone(),
-        "the base of the resolution is not the revision it was computed against",
-    );
-    prop_assert_eq!(
-        binding.base.as_ref().and_then(|b| b.object.clone()),
-        diverging.clone(),
-        "the base of the resolution is not the body it was computed against",
-    );
+    // NOTE: a conflict the item carries rather than the binding (two
+    // sources disagreeing, SYNC §3) records no revision and moves no base.
+    if observed.is_some() {
+        prop_assert_eq!(
+            binding.base.as_ref().and_then(|b| b.revision.clone()),
+            observed.clone(),
+            "the base of the resolution is not the revision it was computed against",
+        );
+        prop_assert_eq!(
+            binding.base.as_ref().and_then(|b| b.object.clone()),
+            diverging.clone(),
+            "the base of the resolution is not the body it was computed against",
+        );
+    }
 
     // NOTE: read before the sync, since the push moves the revision itself
     let held = cluster.server_object(source, &handle);

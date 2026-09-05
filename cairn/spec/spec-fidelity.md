@@ -15,7 +15,7 @@ spec/migrations/storage/ and spec/queries/storage/ SHALL be identical to the spe
 build.rs SHALL emit one constant per statement file, named after the file in upper case, documented by the file's leading comment, plus one per migration, `MIGRATIONS` listing them in order and `VERSION` as their count, and `sql::CANONICAL` indexing the statements. `sql::OWN` indexes this crate's own statements, and `sql::all()` both. A canonical statement is therefore never substituted: the specification's text is the constant's.
 
 ### Requirement: A statement of the crate's own serves no profile
-`sql::OWN` SHALL hold only what the operator tool asks that no profile of the standard needs: the consistency diagnostics behind `pimdir check` and the figures behind `store info` (`OBJECT_SIZE`, `COUNT_RETAINED_BEFORE`), and the one repair the diagnostics justify, `DELETE_DANGLING_BINDINGS`. A statement a reader, a producer or an owner needs to meet the standard is upstreamed to the specification, never kept here.
+`sql::OWN` SHALL hold only what the operator tool asks that no profile of the standard needs: the consistency diagnostics behind `pimdir check` (`LIST_OBJECT_HASHES` for the orphan-file diff among them) and the figures behind `store info` (`OBJECT_SIZE`, `COUNT_RETAINED_BEFORE`), and the one repair the diagnostics justify, `DELETE_DANGLING_BINDINGS`. A statement a reader, a producer or an owner needs to meet the standard is upstreamed to the specification, never kept here: `collection_sources` went up on 2026-09-05, the day it was written.
 
 #### Scenario: A statement is added upstream
 - GIVEN a new file under the specification's queries/storage/

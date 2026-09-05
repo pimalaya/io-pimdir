@@ -19,7 +19,7 @@ A `WantsFetch` batch SHALL impose no ordering on its handles: the consumer MAY f
 A `Full` upgrade that resolves a placement's body from the object store instead of fetching it SHALL record that body as the placement's base content, exactly as the fetch path does. A placement holding a body its base does not is the shape of a staged local edit, so a storage projects it dirty and the consumer re-derives a change nobody made, on every sync, without ever converging.
 
 ### Requirement: A mutable body is fetched, never linked
-A placement whose base carries a revision SHALL be fetched rather than linked from the object store: its link id is left out of the lookup, and a hit on it is ignored. A link id says two copies are the same item, not that they hold the same bytes, and a source that rewrites bodies in place gives each copy its own revision, so linking one copy's body under another's would record content no fetch confirmed. Immutable content keeps the dedup, which is what it is for, and the object store deduplicates the bytes of a fetched body regardless.
+A placement whose base carries a revision SHALL be fetched rather than linked from the object store: its link id is left out of the lookup, and a hit on it is ignored. A link id says two copies are the same item, not that they hold the same bytes, and a source that rewrites bodies in place gives each copy its own revision, so linking one copy's body under another's would record content no fetch confirmed. Immutable content keeps the dedup, which is what it is for, and the object store deduplicates the bytes of a fetched body regardless. `PimdirArg::LookupObject` answers with `PimdirObject`s, hash and size, and a link SHALL be taken only where the placement's summary states no size or states the held body's (pimdir SYNC §6): a `Message-ID` names a message, not its bytes, and two servers may hold two spellings of one message.
 
 #### Scenario: The same message in two collections downloads once and reads clean
 - GIVEN a based placement with no revision whose link id the object store already holds a body for
@@ -96,10 +96,23 @@ An upgrade SHALL revisit a conflicted placement that holds no `conflict_object`,
 
 Such a placement SHALL be fetched rather than linked from the object store, for the reason a revision-carrying one is: a link id says two copies are the same item, and the conflict is about the bytes the remote alone holds.
 
+A fetched diverging body equal to the placement's own SHALL clear the conflict, the base adopting that body at the fetched revision: the push whose record was lost had landed, and there is nothing to decide (pimdir SYNC §5).
+
 #### Scenario: A conflicted placement without its diverging body
 - GIVEN a conflicted placement holding a local body and no conflict object
 - WHEN it is upgraded
 - THEN the fetched body lands as the conflict object and the local body is untouched
+
+### Requirement: A fetch moves the base
+A `Full` fetch over a placement holding no staged edit SHALL set the base to the fetched body and revision (pimdir SYNC §6, vectors/sync/30): a body the source just handed over is what the two agree on, and a base left behind it read every fetched body as an edit to push. Over a staged edit, a body its base does not hold, a fetch reporting the base's own revision keeps the local body and moves nothing; one reporting a revision the base never held is the both-changed case and SHALL mark a `Conflict` at the fetched revision with the fetched body as `conflict_object`, the local body kept.
+
+#### Scenario: A hydration is not an edit
+- GIVEN a clean placement at `r1` with no body
+- WHEN it is fetched at `Full`
+- THEN its base holds the fetched body at `r1` and the next sync pushes nothing
+
+### Requirement: A mutable member restating its hint is a new identity
+A fetch reporting, under a handle, a hint other than the link id the placement holds SHALL key the handle afresh where the kind is mutable, a revision on the fetch or the base: link id, body and base dropped, the storage retiring the old binding as a changed key (pimdir SYNC §6, STORAGE §10). A minted `dup:` key never equals its hint and stays, and an immutable kind is never re-identified, its tiers disagreeing on the link at times.
 
 ### Requirement: Naming a probe gives it a base
 A `Meta` fetch that names a placement holding no link id SHALL give it a base equal to what the source reported, the probe's flags and the fetched revision, since a probe carries none (pimdir SYNC §3) and naming it is what agrees with the source, except when the hint is one a pending create of this source holds, which the fetch lands instead (below). Every fetch SHALL write the summary and addresses Annex A derives, carried on the placement as `PimdirSummary`, the fetched one replacing the stored one whether or not it is present.

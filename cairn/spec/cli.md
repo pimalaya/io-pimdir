@@ -41,13 +41,13 @@ shows as a row rather than as a fact about an item.
 An item mutation requested from the CLI (today: `item restore`) SHALL be
 appended to the action queue through the producer role, exactly as any other
 non-owner process does. The CLI SHALL then attempt to take the owner role and
-drain that collection itself, reporting **applied** when the item is live again
+drain the queue itself, store-wide in append order, reporting **applied** when the item is live again
 and **queued, applies at next sync** when the owner role was unavailable. The
 mutation is never lost either way, and the CLI never applies a mutation behind
 the queue's back.
 
 The outcome SHALL be read from the store, not from the drain's own counters: a
-drain reports what it did to the whole collection's queue, so only the item
+drain reports what it did to the whole queue, so only the item
 itself proves that this action landed. A drain that ran without reviving the
 item SHALL report neither success nor silence, but point at the parked-action
 listing.
@@ -125,7 +125,7 @@ The CLI SHALL expose, at minimum:
 - `store info`: the schema version (one figure: the reader verified the store
   is stamped with the version this build services, refusing any other), sources,
   per-collection live and retained counts, object count and bytes live versus
-  retained.
+  retained, and the change cursor, the last stamp drawn.
 - `check`: object rows whose body is missing, refcount drift, dangling
   references and orphan blob files, with `--fix` repairing the drift and the
   dangling bindings, plus an informational count of the minted keys each

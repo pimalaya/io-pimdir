@@ -17,7 +17,7 @@ use crate::{
     change::{PimdirChange, PimdirWriteOp},
     collection::{PimdirCheckpoint, PimdirCollectionId},
     load::{PimdirLoadScope, PimdirLoaded},
-    object::PimdirHash,
+    object::PimdirObject,
     placement::{PimdirHandle, PimdirLinkId},
     remote::{PimdirFetchedItem, PimdirPushResult, PimdirRemoteSnapshot, PimdirTier},
 };
@@ -137,8 +137,10 @@ pub enum PimdirArg {
     Push(Vec<PimdirPushResult>),
     /// Reply to [`PimdirYield::WantsLoad`].
     Load(PimdirLoaded),
-    /// Reply to [`PimdirYield::WantsLookupObject`], the link ids found.
-    LookupObject(BTreeMap<PimdirLinkId, PimdirHash>),
+    /// Reply to [`PimdirYield::WantsLookupObject`], the link ids found
+    /// with the body each holds and its size, the witness the link needs
+    /// (SYNC §6).
+    LookupObject(BTreeMap<PimdirLinkId, PimdirObject>),
     /// Reply to [`PimdirYield::WantsWrite`].
     Write,
 }

@@ -153,7 +153,7 @@ fn single_source_write_reopen_lookup_and_gc() {
         .lookup_objects(&[PimdirLinkId("mid:a".into())])
         .unwrap();
     assert_eq!(
-        known.get(&PimdirLinkId("mid:a".into())),
+        known.get(&PimdirLinkId("mid:a".into())).map(|o| &o.hash),
         Some(&PimdirHash("cafebabe".into()))
     );
 
@@ -755,7 +755,6 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
         PimdirMutation::Move {
             handle: PimdirHandle("1".into()),
             target: PimdirCollectionId("Archive".into()),
-            placeholder: PimdirHandle("tmp-1".into()),
         },
     );
 

@@ -111,7 +111,6 @@ fn a_queued_add_round_trips_into_a_staged_item() {
         link_id: Some(PimdirLinkId("mid:new".into())),
         flags: PimdirFlags::from_iter(["\\Draft"]),
         object: Some(PimdirHash("beef0000".into())),
-        handle: Some(PimdirHandle("draft-1".into())),
     };
     producer.enqueue("INBOX", &add, Some(&object)).unwrap();
 
@@ -119,13 +118,13 @@ fn a_queued_add_round_trips_into_a_staged_item() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].action, add);
     assert_eq!(pending[0].producer, "smtp");
-    assert_eq!(store.queued_collections().unwrap(), ["INBOX"]);
+    assert_eq!(store.list_pending_actions().unwrap().len(), 1);
 
     // the owner drains: the item lands, staged as a pending push
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
     assert!(store.pending_actions("INBOX").unwrap().is_empty());
-    assert!(store.queued_collections().unwrap().is_empty());
+    assert!(store.list_pending_actions().unwrap().is_empty());
 
     let items = store.list_items("INBOX", None, 10).unwrap();
     let item = items.iter().find(|i| i.link_id.0 == "mid:new").unwrap();
@@ -160,11 +159,10 @@ fn a_duplicate_add_parks_instead_of_clobbering() {
         link_id: Some(PimdirLinkId("mid:a".into())),
         flags: PimdirFlags::default(),
         object: None,
-        handle: None,
     };
     producer.enqueue("INBOX", &add, None).unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (0, 1));
     let parked = store.parked_actions().unwrap();
     assert_eq!(parked.len(), 1);
@@ -189,7 +187,7 @@ fn set_flags_is_absolute_and_reapplies_idempotently() {
     };
 
     producer.enqueue("INBOX", &set, None).unwrap();
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
 
     // absolute replacement: the old flag is gone, not merged
@@ -198,7 +196,7 @@ fn set_flags_is_absolute_and_reapplies_idempotently() {
 
     // reapplying the same absolute set is a no-op, never an error
     producer.enqueue("INBOX", &set, None).unwrap();
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
     assert_eq!(item.flags, PimdirFlags::from_iter(["\\Flagged"]));
@@ -213,7 +211,7 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
     producer
         .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
         .unwrap();
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
 
     // hidden from reads, kept as a tombstone for the sync to push
@@ -228,7 +226,7 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
     producer
         .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
         .unwrap();
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
     assert!(store.parked_actions().unwrap().is_empty());
 }
@@ -237,6 +235,12 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
 fn copy_fills_the_target_and_move_also_empties_the_source() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    // NOTE: a move or a copy into a collection nothing declared parks
+    // (STORAGE §15.3), so the targets are declared first.
+    store.ensure_collection("Backup", "message/rfc822").unwrap();
+    store
+        .ensure_collection("Archive", "message/rfc822")
+        .unwrap();
     store
         .write(vec![
             store_object("cafebabe", b"a"),
@@ -279,7 +283,7 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
         )
         .unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (2, 0));
 
     // copy: the source keeps the item, the target gains it under the
@@ -316,7 +320,7 @@ fn update_repoints_the_body() {
         )
         .unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
 
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
@@ -324,12 +328,17 @@ fn update_repoints_the_body() {
     // the old body survives: the sync base still references it
     assert!(blob_exists(dir.path(), "cafebabe"));
     assert!(blob_exists(dir.path(), "beef0000"));
-    // projected dirty, so the next sync pushes the edit
+    // an immutable kind never owes a body (SYNC §9): the base follows the
+    // edit and nothing is left to push
     let projected = store
         .load(&inbox(), &PimdirLoadScope::All)
         .unwrap()
         .placements;
-    assert_eq!(projected[0].status, PimdirStatus::Dirty);
+    assert_eq!(projected[0].status, PimdirStatus::Clean);
+    assert_eq!(
+        projected[0].base.as_ref().and_then(|b| b.object.clone()),
+        Some(PimdirHash("beef0000".into())),
+    );
 }
 
 #[test]
@@ -364,7 +373,7 @@ fn a_parked_action_does_not_block_later_actions() {
         )
         .unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (2, 1));
 
     // the later action applied despite the parked one before it
@@ -377,7 +386,7 @@ fn a_parked_action_does_not_block_later_actions() {
     assert_eq!(parked[0].collection, "INBOX");
     assert_eq!(parked[0].action, "set-flags");
     assert!(parked[0].error.contains("unknown seq"), "{parked:?}");
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (0, 0));
     assert_eq!(store.parked_actions().unwrap().len(), 1, "never deleted");
 }
@@ -397,7 +406,6 @@ fn gc_never_sweeps_a_queued_body() {
                 link_id: Some(PimdirLinkId("mid:new".into())),
                 flags: PimdirFlags::default(),
                 object: Some(PimdirHash("beef0000".into())),
-                handle: Some(PimdirHandle("draft-1".into())),
             },
             Some(&object),
         )
@@ -432,7 +440,7 @@ fn gc_never_sweeps_a_queued_body() {
     );
 
     // draining hands the pin over to the applied item
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
     assert!(blob_exists(dir.path(), "beef0000"), "now the item pins it");
 
@@ -443,7 +451,7 @@ fn gc_never_sweeps_a_queued_body() {
     store
         .write(vec![PimdirWriteOp::DropPlacement {
             collection: inbox(),
-            handle: PimdirHandle("draft-1".into()),
+            handle: PimdirHandle("\u{1}mid:new".into()),
             reason: PimdirDropReason::Deleted,
         }])
         .unwrap();
@@ -479,7 +487,7 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
         )
         .unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 0, 1));
 
     // the action behind it applied all the same
@@ -502,7 +510,7 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     assert!(blob_exists(dir.path(), "beef0000"));
 
     // a second pass skips it again rather than accumulating attempts
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 1));
     assert_eq!(store.pending_actions("INBOX").unwrap()[0].attempts, 0);
 }
@@ -690,16 +698,16 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
     }
 }
 
-/// The spec's "cannot apply *here*" case, which is what neverest hit on a
-/// mail account also syncing contacts and calendar: its sources take turns
-/// draining, and the first one to reach a mail action holds no binding for
-/// the item it names. Parking there loses the action for the source that
-/// could have applied it, since a parked row is skipped by every later
-/// drain, so the refusal has to leave the row alone instead.
+/// STORAGE §15.2: the drain is store-wide, so the handle draining is not
+/// the source an action is for. An action against an existing item runs as
+/// the source binding it, and an add as a source syncing the collection,
+/// so a mail account also syncing contacts and calendar, whose sources take
+/// turns, never binds `caldav` to a mailbox or strands a mail action for
+/// `imap` to find.
 #[test]
-fn an_action_the_draining_source_cannot_place_is_skipped_not_parked() {
+fn a_drain_applies_an_action_as_the_source_of_its_collection() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut owner, seq) = seeded(dir.path());
+    let (owner, seq) = seeded(dir.path());
 
     let mut producer = PimdirProducer::open(dir.path(), "frontend").unwrap();
     producer
@@ -712,20 +720,38 @@ fn an_action_the_draining_source_cannot_place_is_skipped_not_parked() {
             None,
         )
         .unwrap();
+    producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Add {
+                link_id: Some(PimdirLinkId("mid:queued".into())),
+                flags: PimdirFlags::default(),
+                object: None,
+            },
+            None,
+        )
+        .unwrap();
 
     // A source with no binding in this collection drains first.
     let mut stranger = PimdirStore::open(dir.path()).unwrap().for_source("other");
-    let report = stranger.drain_collection("INBOX").unwrap();
-    assert_eq!((report.applied, report.skipped, report.parked), (0, 1, 0));
-    assert!(stranger.parked_actions().unwrap().is_empty());
-
-    // The row was left exactly as it was found, so the source that holds
-    // the item still applies it.
-    let report = owner.drain_collection("INBOX").unwrap();
-    assert_eq!((report.applied, report.skipped, report.parked), (1, 0, 0));
+    let report = stranger.drain().unwrap();
+    assert_eq!((report.applied, report.skipped, report.parked), (2, 0, 0));
 
     let item = owner.get_item("INBOX", seq).unwrap().unwrap();
-    assert_eq!(item.flags, PimdirFlags::default());
+    assert_eq!(item.flags, PimdirFlags::default(), "the flag change landed");
+    assert_eq!(
+        owner.collection_sources("INBOX").unwrap(),
+        vec!["local".to_string()],
+        "the create is the binding source's to push, the stranger binds nothing"
+    );
+    let created = owner
+        .load(&inbox(), &PimdirLoadScope::All)
+        .unwrap()
+        .placements
+        .into_iter()
+        .find(|p| p.status == PimdirStatus::Created)
+        .expect("the add staged for the binding source");
+    assert_eq!(created.handle.as_str(), "\u{1}mid:queued");
 }
 
 /// STORAGE §15.2: a failure of the store is permanent for the row and
@@ -749,7 +775,7 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
     producer
         .enqueue("INBOX", &PimdirAction::Remove { seq: seq_a }, None)
         .unwrap();
-    assert_eq!(store.drain_collection("INBOX").unwrap().applied, 1);
+    assert_eq!(store.drain().unwrap().applied, 1);
 
     // an add of mid:a under another handle resolves the binding to a
     // second handle, which the store refuses (§10); a valid row follows
@@ -760,7 +786,6 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
                 link_id: Some(PimdirLinkId("mid:a".into())),
                 flags: PimdirFlags::default(),
                 object: None,
-                handle: Some(PimdirHandle("X".into())),
             },
             None,
         )
@@ -776,7 +801,7 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
         )
         .unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 1, 0));
 
     let parked = store.parked_actions().unwrap();
@@ -797,28 +822,42 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
     );
 }
 
-/// STORAGE §15.3: already absent is a remove's success, but an item that
-/// is live and bound to another source is that source's to remove.
+/// STORAGE §15.3: a `remove` needs no placement of the draining source.
+/// It runs as the source binding the item, which tombstones it and pushes
+/// the delete on its next run; already absent is success.
 #[test]
-fn a_remove_of_a_live_item_this_source_does_not_bind_is_skipped() {
+fn a_remove_drained_by_a_stranger_tombstones_the_item_for_its_source() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut owner, seq) = seeded(dir.path());
+    let (owner, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "frontend").unwrap();
     producer
         .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
         .unwrap();
 
     let mut stranger = PimdirStore::open(dir.path()).unwrap().for_source("other");
-    let report = stranger.drain_collection("INBOX").unwrap();
-    assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 1));
-    assert!(owner.get_item("INBOX", seq).unwrap().is_some(), "untouched");
-    let pending = owner.pending_actions("INBOX").unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].attempts, 0);
-
-    let report = owner.drain_collection("INBOX").unwrap();
+    let report = stranger.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 0, 0));
-    assert!(owner.get_item("INBOX", seq).unwrap().is_none());
+    assert!(
+        owner.get_item("INBOX", seq).unwrap().is_none(),
+        "tombstoned"
+    );
+    assert!(owner.pending_actions("INBOX").unwrap().is_empty());
+
+    let projected = owner
+        .load(&inbox(), &PimdirLoadScope::All)
+        .unwrap()
+        .placements;
+    assert_eq!(projected[0].status, PimdirStatus::Tombstone);
+
+    producer
+        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
+        .unwrap();
+    let report = stranger.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked, report.skipped),
+        (1, 0, 0),
+        "already absent is success"
+    );
 }
 
 /// STORAGE §15.2: the pending list is read outside any transaction, so a
@@ -855,7 +894,7 @@ fn a_claim_that_deletes_nothing_is_not_counted_as_applied() {
     });
     holding.recv().unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     thief.join().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 1));
     assert!(
@@ -909,7 +948,7 @@ fn a_malformed_pending_row_is_skipped_by_the_overlay_and_parked_by_the_drain() {
         Err(PimdirError::Action(_))
     ));
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 1, 0));
     let parked = store.parked_actions().unwrap();
     assert_eq!(parked.len(), 1);
@@ -927,7 +966,6 @@ fn an_action_naming_an_unindexed_body_is_refused_at_the_enqueue() {
         link_id: Some(PimdirLinkId("mid:new".into())),
         flags: PimdirFlags::default(),
         object: Some(PimdirHash("beef0000".into())),
-        handle: None,
     };
 
     assert!(matches!(
@@ -938,7 +976,7 @@ fn an_action_naming_an_unindexed_body_is_refused_at_the_enqueue() {
 
     let object = write_blob(dir.path(), "beef0000", b"new body");
     producer.enqueue("INBOX", &add, Some(&object)).unwrap();
-    assert_eq!(store.drain_collection("INBOX").unwrap().applied, 1);
+    assert_eq!(store.drain().unwrap().applied, 1);
 }
 
 /// STORAGE §6: a store lacking a canonical table is stale, `store_meta`
@@ -955,13 +993,13 @@ fn a_store_lacking_store_meta_is_stale() {
     assert!(matches!(
         PimdirStore::open(dir.path()),
         Err(PimdirError::Stale {
-            table: "store_meta"
+            missing: "store_meta"
         })
     ));
     assert!(matches!(
         PimdirReader::open(dir.path()),
         Err(PimdirError::Stale {
-            table: "store_meta"
+            missing: "store_meta"
         })
     ));
 }

@@ -24,7 +24,7 @@ use crate::{
     collection::{PimdirCheckpoint, PimdirCollectionId},
     hub::{PimdirBinding, PimdirHub, PimdirHubItem, PimdirSourceId},
     load::{PimdirLoadScope, PimdirLoaded},
-    object::PimdirHash,
+    object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
         PimdirPlacement, PimdirSortKey, PimdirStatus,
@@ -136,11 +136,12 @@ impl PimdirSourceStore {
     }
 
     /// Resolves which link ids already hold a body, within this handle's
-    /// account (§14); a writer-derived key never matches (§9).
+    /// account (§14), each with its size, the witness a link is checked
+    /// against (SYNC §6); a writer-derived key never matches (§9).
     pub fn lookup_objects(
         &self,
         links: &[PimdirLinkId],
-    ) -> Result<BTreeMap<PimdirLinkId, PimdirHash>, PimdirError> {
+    ) -> Result<BTreeMap<PimdirLinkId, PimdirObject>, PimdirError> {
         let ids: Vec<&str> = links.iter().map(|l| l.0.as_str()).collect();
         let found = rows(
             &self.store.reader.conn,
@@ -152,7 +153,10 @@ impl PimdirSourceStore {
             |r| {
                 Ok((
                     PimdirLinkId(r.get::<_, String>(0)?),
-                    PimdirHash(r.get::<_, String>(1)?),
+                    PimdirObject {
+                        hash: PimdirHash(r.get::<_, String>(1)?),
+                        size: r.get::<_, i64>(2)?.max(0) as usize,
+                    },
                 ))
             },
         )?;
@@ -306,7 +310,7 @@ pub(crate) fn apply(
         let mut new = old.clone();
         new.absorb(source, &ops);
         let licensed = licensed.remove(&collection).unwrap_or_default();
-        save_hub_diff(tx, &collection, source, &old, &new, &licensed)?;
+        save_hub_diff(tx, &collection, source, &old, &mut new, &licensed)?;
         adjust_refcounts(tx, &object_refs(&old), &object_refs(&new))?;
     }
 
@@ -851,17 +855,19 @@ pub(crate) fn attach_address(
 /// binding is inserted: a handle names one item per source (§10) and the
 /// index is unique, so a handle moving between two items in one batch
 /// has to leave before it arrives. An item no source holds any more is
-/// retained (§11), or purged when the account holds it live in another
-/// collection, `source` naming the side whose removal retired it.
-/// `licensed` carries the handles this batch superseded or rekeyed, the
-/// one thing the two hubs cannot say: a rebuilt spine and a duplicated
-/// identity produce the same diff.
+/// retained (§11), or purged when the account holds it live with the
+/// same body in another collection, `source` naming the side whose
+/// removal retired it. A revive that keeps a retained body patches `new`
+/// with it, so the refcount diff counts what the row holds. `licensed`
+/// carries the handles this batch superseded or rekeyed, the one thing
+/// the two hubs cannot say: a rebuilt spine and a duplicated identity
+/// produce the same diff.
 fn save_hub_diff(
     conn: &Connection,
     collection: &str,
     source: &PimdirSourceId,
     old: &PimdirHub,
-    new: &PimdirHub,
+    new: &mut PimdirHub,
     licensed: &BTreeSet<PimdirHandle>,
 ) -> Result<(), PimdirError> {
     for (link, item) in &new.items {
@@ -870,7 +876,9 @@ fn save_hub_diff(
         }
     }
 
-    for (link, item) in &new.items {
+    let links: Vec<PimdirLinkId> = new.items.keys().cloned().collect();
+    for link in &links {
+        let item = new.items.get_mut(link).expect("a hub item");
         let prev = old.items.get(link);
         let unbound = item.sources.is_empty();
 
@@ -897,7 +905,6 @@ fn save_hub_diff(
                         sql::STAMP_ITEM,
                         named_params! { ":collection": collection, ":link_id": link.0 },
                     )?;
-                    conn.execute(sql::BUMP_NEXT_CHANGE, [])?;
                 }
                 save_bindings_diff(conn, collection, link, prev, item, licensed)?;
             }
@@ -912,7 +919,7 @@ fn save_hub_diff(
                 sql::DELETE_ITEM_BINDINGS,
                 named_params! { ":collection": collection, ":link_id": link.0 },
             )?;
-            if held_elsewhere(conn, collection, link)? {
+            if held_elsewhere(conn, collection, link, item.object.as_ref())? {
                 purge_retained(conn, collection, link)?;
             }
         }
@@ -921,15 +928,21 @@ fn save_hub_diff(
     Ok(())
 }
 
-/// Whether the same account holds `link` live in another collection (§11).
+/// Whether the same account holds `link` live in another collection with
+/// the retiring body, or any body when the retiring row has none (§11).
 fn held_elsewhere(
     conn: &Connection,
     collection: &str,
     link: &PimdirLinkId,
+    object: Option<&PimdirHash>,
 ) -> rusqlite::Result<bool> {
     conn.query_row(
         sql::HELD_ELSEWHERE,
-        named_params! { ":collection": collection, ":link_id": link.0 },
+        named_params! {
+            ":collection": collection,
+            ":link_id": link.0,
+            ":object": object.map(|hash| hash.0.as_str()),
+        },
         |_| Ok(()),
     )
     .optional()
@@ -974,7 +987,7 @@ fn insert_item(
     conn: &Connection,
     collection: &str,
     link: &PimdirLinkId,
-    item: &PimdirHubItem,
+    item: &mut PimdirHubItem,
 ) -> rusqlite::Result<()> {
     if revive_item(conn, collection, link, item)? {
         return Ok(());
@@ -1023,12 +1036,14 @@ fn insert_item(
 /// Revives the retained row holding `(collection, link)`, if any (§11):
 /// it stops being retained, adopts the incoming content and binds the
 /// sources, and the pins the retained row held are released as the
-/// caller's refcount diff takes the live ones.
+/// caller's refcount diff takes the live ones. An incoming placement
+/// carrying no body keeps the retained one, so a restore costs no
+/// network, and an immutable kind's binding takes it as its base.
 fn revive_item(
     conn: &Connection,
     collection: &str,
     link: &PimdirLinkId,
-    item: &PimdirHubItem,
+    item: &mut PimdirHubItem,
 ) -> rusqlite::Result<bool> {
     let pinned: Option<(Option<String>, Option<String>)> = conn
         .query_row(
@@ -1040,6 +1055,22 @@ fn revive_item(
     let Some((object, conflict_object)) = pinned else {
         return Ok(false);
     };
+
+    if item.object.is_none()
+        && let Some(kept) = &object
+    {
+        let kept = PimdirHash(kept.clone());
+        item.object = Some(kept.clone());
+        item.level = PimdirLevel::Full;
+        for binding in item.sources.values_mut() {
+            if let Some(base) = &mut binding.base
+                && base.revision.is_none()
+                && base.object.is_none()
+            {
+                base.object = Some(kept.clone());
+            }
+        }
+    }
 
     conn.execute(
         sql::REVIVE_ITEM,

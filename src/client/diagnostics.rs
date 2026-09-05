@@ -118,7 +118,8 @@ impl PimdirReader {
     }
 
     /// Every hash the index knows, to diff against the blob directory:
-    /// the index half of what [`PimdirBlobs::files`] reads from disk.
+    /// the index half of what [`PimdirBlobs::files`] reads from disk. A
+    /// diagnosis's read, the collector asking per file (STORAGE §5).
     ///
     /// [`PimdirBlobs::files`]: crate::client::blobs::PimdirBlobs::files
     pub fn indexed_hashes(&self) -> Result<BTreeSet<String>, PimdirError> {

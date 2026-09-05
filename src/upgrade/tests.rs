@@ -51,7 +51,13 @@ fn full_dedup_links_without_fetch() {
     assert_eq!(links, vec![PimdirLinkId::from("msg-a")]);
 
     let mut known = BTreeMap::new();
-    known.insert(PimdirLinkId::from("msg-a"), PimdirHash::from("h-a"));
+    known.insert(
+        PimdirLinkId::from("msg-a"),
+        PimdirObject {
+            hash: PimdirHash::from("h-a"),
+            size: 1,
+        },
+    );
 
     let ops = match up.resume(Some(PimdirArg::LookupObject(known))) {
         PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
@@ -817,7 +823,13 @@ fn full_mixes_dedup_hits_and_fetch_misses() {
     let _ = up.resume(Some(PimdirArg::Load(loaded)));
 
     let mut known = BTreeMap::new();
-    known.insert(PimdirLinkId::from("msg-a"), PimdirHash::from("h-a"));
+    known.insert(
+        PimdirLinkId::from("msg-a"),
+        PimdirObject {
+            hash: PimdirHash::from("h-a"),
+            size: 1,
+        },
+    );
 
     let handles = match up.resume(Some(PimdirArg::LookupObject(known))) {
         PimdirCoroutineState::Yielded(PimdirYield::WantsFetch { handles, .. }) => handles,
@@ -869,6 +881,10 @@ fn upgrade_with_lookup(
     placement: PimdirPlacement,
     known: BTreeMap<PimdirLinkId, PimdirHash>,
 ) -> PimdirCoroutineState<PimdirYield, Result<PimdirUpgradeReport, PimdirArgError>> {
+    let known: BTreeMap<PimdirLinkId, PimdirObject> = known
+        .into_iter()
+        .map(|(link, hash)| (link, PimdirObject { hash, size: 1 }))
+        .collect();
     let handle = placement.handle.clone();
     let loaded = PimdirLoaded {
         placements: vec![placement],

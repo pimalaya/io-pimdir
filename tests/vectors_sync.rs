@@ -24,10 +24,7 @@ use io_pimdir::{
     },
     sql,
     summary::{self, PimdirSummary},
-    sync::{
-        PimdirConflictPolicy, PimdirDeletePolicy, PimdirPushRights, PimdirSyncEvent,
-        PimdirSyncOptions,
-    },
+    sync::{PimdirConflictPolicy, PimdirPushRights, PimdirSyncEvent, PimdirSyncOptions},
 };
 use rusqlite::{Connection, named_params, params};
 use serde_json::{Map, Value, json};
@@ -411,26 +408,36 @@ fn options(value: &Value) -> PimdirSyncOptions {
             add: rights["add"].as_bool().unwrap_or(true),
             remove: rights["remove"].as_bool().unwrap_or(true),
         },
-        delete: match value["delete"].as_str() {
-            Some("keep") => PimdirDeletePolicy::Keep,
-            Some("revert") => PimdirDeletePolicy::Revert,
-            _ => PimdirDeletePolicy::Auto,
-        },
         conflict: match value["conflict"].as_str() {
             Some("prefer-local") => PimdirConflictPolicy::PreferLocal,
             Some("prefer-remote") => PimdirConflictPolicy::PreferRemote,
-            Some("keep-both") => PimdirConflictPolicy::KeepBoth,
             _ => PimdirConflictPolicy::Manual,
         },
         full: false,
     }
 }
 
-/// The mutation a `mutate` run carries (SYNC §7), bodies by label.
-fn mutation(value: &Value, kind: &str, bodies: &Bodies) -> PimdirMutation {
-    let handle = || PimdirHandle::from(value["handle"].as_str().unwrap());
+/// The mutation a `mutate` run carries (SYNC §7), bodies by label; the
+/// placement it names by `seq` resolves to this source's handle.
+fn mutation(
+    store: &PimdirSourceStore,
+    collection: &str,
+    value: &Value,
+    kind: &str,
+    bodies: &Bodies,
+) -> PimdirMutation {
+    let handle = || {
+        let seq = value["seq"].as_i64().expect("the item's seq");
+        let item = store
+            .get_item(collection, seq)
+            .unwrap()
+            .expect("a live item under that seq");
+        let bindings = store.item_bindings(collection, &item.link_id.0).unwrap();
+        bindings[&io_pimdir::hub::PimdirSourceId::from(store.source())]
+            .handle
+            .clone()
+    };
     let target = || PimdirCollectionId::from(value["target"].as_str().unwrap());
-    let placeholder = || PimdirHandle::from(value["placeholder"].as_str().unwrap());
     let derived = |body: &[u8]| summary::derive(kind, body);
 
     match value["kind"].as_str().unwrap() {
@@ -453,12 +460,10 @@ fn mutation(value: &Value, kind: &str, bodies: &Bodies) -> PimdirMutation {
         "Copy" => PimdirMutation::Copy {
             handle: handle(),
             target: target(),
-            placeholder: placeholder(),
         },
         "Move" => PimdirMutation::Move {
             handle: handle(),
             target: target(),
-            placeholder: placeholder(),
         },
         "Add" => {
             let (object, body) = bodies.object(&value["object"]);
@@ -469,7 +474,6 @@ fn mutation(value: &Value, kind: &str, bodies: &Bodies) -> PimdirMutation {
                 .or_else(|| derivation.as_ref().map(|d| d.link_id.clone()))
                 .expect("a link id, stated or derived");
             PimdirMutation::Add {
-                handle: handle(),
                 link_id,
                 flags: flags(&value["flags"]),
                 object,
@@ -524,7 +528,13 @@ fn run(
             Vec::new()
         }
         "mutate" => {
-            let mutation = mutation(&run["mutation"], &remote.kind, &remote.bodies);
+            let mutation = mutation(
+                store,
+                collection,
+                &run["mutation"],
+                &remote.kind,
+                &remote.bodies,
+            );
             store.mutate(collection, mutation).unwrap();
             Vec::new()
         }

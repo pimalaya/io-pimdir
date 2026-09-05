@@ -33,6 +33,17 @@ crate::pimdir_id! {
 }
 
 impl PimdirLinkId {
+    /// The provisional handle a create of this key is staged under:
+    /// `U+0001` followed by the key (SYNC §2), a name no protocol hands
+    /// out, so it never collides with a member the next enumeration lists
+    /// and two engines derive one create's change key alike.
+    pub fn provisional(&self) -> PimdirHandle {
+        let mut handle = String::from("\u{1}");
+        handle.push_str(self.as_str());
+
+        PimdirHandle(handle)
+    }
+
     /// The key a second copy of this identity takes in one collection.
     ///
     /// `dup:`, the hint, `#`, the handle verbatim: a form fixed by pimdir

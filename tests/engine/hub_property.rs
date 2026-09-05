@@ -477,7 +477,6 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 let staged = cluster.sources[source].mutate(
                     "inbox",
                     PimdirMutation::Add {
-                        handle: PimdirHandle::from(format!("tmp-{authored}")),
                         link_id: link.clone(),
                         flags: PimdirFlags::default(),
                         object: object.clone(),
@@ -534,7 +533,9 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
 
     let shared = cluster.hub();
     for (link, item) in &shared.items {
-        if item.deleted {
+        // NOTE: an item two sources disagree on holds every push until a
+        // person decides (SYNC §3), so it converges on nothing yet.
+        if item.deleted || item.conflicted {
             continue;
         }
         for (source, binding) in &item.sources {

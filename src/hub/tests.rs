@@ -513,6 +513,7 @@ fn content_hub(policy: PimdirHubConflict) -> PimdirHub {
         sources,
     };
     PimdirHub {
+        rebinding: Default::default(),
         items: [(PimdirLinkId::from("m1"), item)].into_iter().collect(),
         conflict: policy,
     }

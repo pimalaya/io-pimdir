@@ -162,7 +162,6 @@ fn add_stages_an_append_create() {
 
     let mutation = PimdirMutation::Add {
         sort_key: Default::default(),
-        handle: PimdirHandle::from("draft-1"),
         link_id: PimdirLinkId("mid:new".into()),
         flags: PimdirFlags::from_iter(["\\Draft"]),
         object: PimdirObject {
@@ -203,7 +202,6 @@ fn add_rejects_a_live_link_id_collision() {
 
     let mutation = PimdirMutation::Add {
         sort_key: Default::default(),
-        handle: PimdirHandle::from("draft-1"),
         link_id: PimdirLinkId("mid:dup".into()),
         flags: PimdirFlags::default(),
         object: PimdirObject {
@@ -234,7 +232,6 @@ fn add_over_a_tombstone_link_id_is_allowed() {
 
     let mutation = PimdirMutation::Add {
         sort_key: Default::default(),
-        handle: PimdirHandle::from("draft-1"),
         link_id: PimdirLinkId("mid:gone".into()),
         flags: PimdirFlags::default(),
         object: PimdirObject {
@@ -644,7 +641,6 @@ fn copy_stages_created_placement_in_target() {
     let mutation = PimdirMutation::Copy {
         handle: PimdirHandle::from("1"),
         target: "archive".into(),
-        placeholder: PimdirHandle::from("tmp-1"),
     };
     let mut mutate = PimdirMutate::new("inbox", mutation);
     let _ = mutate.resume(None);
@@ -656,7 +652,7 @@ fn copy_stages_created_placement_in_target() {
                 scope,
                 PimdirLoadScope::Links(vec![
                     PimdirLinkId::from("1"),
-                    PimdirLinkId::from("dup:1#tmp-1"),
+                    PimdirLinkId::from("dup:1#\u{1}1"),
                 ]),
             );
         }
@@ -668,7 +664,7 @@ fn copy_stages_created_placement_in_target() {
         panic!("expected UpsertPlacement, got {:?}", ops[0]);
     };
     assert_eq!(p.collection.as_str(), "archive");
-    assert_eq!(p.handle.as_str(), "tmp-1");
+    assert_eq!(p.handle.as_str(), "\u{1}1");
     assert_eq!(
         p.link_id,
         Some(PimdirLinkId::from("1")),
@@ -687,7 +683,6 @@ fn move_stages_target_create_and_source_tombstone() {
     let mutation = PimdirMutation::Move {
         handle: PimdirHandle::from("1"),
         target: "archive".into(),
-        placeholder: PimdirHandle::from("tmp-1"),
     };
     let mut mutate = PimdirMutate::new("inbox", mutation);
     let _ = mutate.resume(None);
@@ -698,7 +693,7 @@ fn move_stages_target_create_and_source_tombstone() {
         panic!("expected UpsertPlacement, got {:?}", ops[0]);
     };
     assert_eq!(create.collection.as_str(), "archive");
-    assert_eq!(create.handle.as_str(), "tmp-1");
+    assert_eq!(create.handle.as_str(), "\u{1}1");
     assert_eq!(create.status, PimdirStatus::Created);
     assert!(create.base.is_none());
     assert_eq!(
@@ -740,7 +735,6 @@ fn a_copy_into_a_collection_holding_the_identity_is_minted() {
     let mutation = PimdirMutation::Copy {
         handle: PimdirHandle::from("1"),
         target: "archive".into(),
-        placeholder: PimdirHandle::from("tmp-1"),
     };
     let mut mutate = PimdirMutate::new("inbox", mutation);
     let _ = mutate.resume(None);
@@ -754,7 +748,7 @@ fn a_copy_into_a_collection_holding_the_identity_is_minted() {
     let PimdirWriteOp::UpsertPlacement(copy) = &ops[0] else {
         panic!("expected UpsertPlacement, got {:?}", ops[0]);
     };
-    assert_eq!(copy.link_id, Some(PimdirLinkId::from("dup:1#tmp-1")));
+    assert_eq!(copy.link_id, Some(PimdirLinkId::from("dup:1#\u{1}1")));
 }
 
 /// A row on its way out holds no key against a create, as for an `Add`.
@@ -763,7 +757,6 @@ fn a_tombstoned_holder_does_not_block_a_copy() {
     let mutation = PimdirMutation::Copy {
         handle: PimdirHandle::from("1"),
         target: "archive".into(),
-        placeholder: PimdirHandle::from("tmp-1"),
     };
     let mut mutate = PimdirMutate::new("inbox", mutation);
     let _ = mutate.resume(None);
@@ -796,7 +789,6 @@ fn a_mutation_reads_only_what_it_edits() {
     }
 
     let add = PimdirMutation::Add {
-        handle: PimdirHandle::from("tmp"),
         link_id: PimdirLinkId::from("m1"),
         flags: PimdirFlags::default(),
         object: PimdirObject {

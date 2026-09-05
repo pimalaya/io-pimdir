@@ -12,25 +12,35 @@ status: current
 `PimdirMutation` SHALL stage a local edit to one collection offline, reconciled on the next sync:
 
 - `SetFlags`: replace a placement's flags and mark it dirty (a pending create stays `Created`, an unresolved conflict stays `Conflict`, a tombstone stays a tombstone; the flag change rides along).
-- `Remove`: tombstone a placement, kept until synced. Absorbed as a staged delete (the item is marked deleted, its binding kept), so the next sync pushes the remove.
+- `Remove`: tombstone a placement, kept until synced. Absorbed as a staged delete (the item is marked deleted, its binding kept), so the next sync pushes the remove. A `Remove` on a conflicted placement settles the conflict: the base adopts `conflict_revision` and the diverging body is dropped, so the delete pushes against what the remote holds (pimdir SYNC §7, vectors/sync/32); the item's own conflict clears when the tombstone is absorbed ([hub](hub.md)).
 - `Edit`: store a new body and repoint the placement at it (full level), keeping the base so the next sync derives the push. An edit whose object is the one the base already holds stages nothing and SHALL leave the status where it found it, `PimdirPlacement::staged_edit` being the single reading of "there is a local content edit here"; every other edit marks the placement dirty. Editing a conflicted placement resolves it whatever body it carries, the base adopting the remote state observed at conflict time, both halves of it (see below), and editing a tombstoned one revives it (see below).
-- `Copy`: stage a `Created` placement in a target under a caller-supplied `placeholder`, carrying the source origin; the source is untouched.
-- `Move`: stage a `Created` placement in the target under a caller-supplied `placeholder` (carrying the source origin), **and** tombstone the source. A move is thus a copy into the target plus a remove from the source, both derived on the next sync; the source's tombstone and the target's create land in their respective collection hubs. The destination the tombstone carries is what the store derives from the target's pending create on every load (pimdir SYNC §3); the one staged here serves a consumer keeping the placement as written.
+- `Copy`: stage a `Created` placement in a target under the identity's provisional handle (below), carrying the source origin; the source is untouched.
+- `Move`: stage a `Created` placement in the target under the identity's provisional handle (carrying the source origin), **and** tombstone the source. A move is thus a copy into the target plus a remove from the source, both derived on the next sync; the source's tombstone and the target's create land in their respective collection hubs. The destination the tombstone carries is what the store derives from the target's pending create on every load (pimdir SYNC §3); the one staged here serves a consumer keeping the placement as written.
 - `Add`: see below.
 
 A mutation SHALL touch the local replica only; the remote is reconciled by sync.
 
 ### Requirement: Add stages a locally-authored create
-`PimdirMutation::Add { handle, link_id, flags, object, body, summary, sort_key }` SHALL stage a brand-new item with no remote origin (compose, import): a `PimdirStatus::Created` placement in the coroutine's collection under the provisional `handle`, at `level = Full`, with `base = None` and `origin = None`, pointing at `object`; plus a `StoreObject` carrying `body`. Because the create has no origin, the next sync SHALL push it as `PimdirChange::Add { origin: None }`, an append that uploads the body rather than a server-side copy. `Add` SHALL NOT require an existing source placement, and SHALL fail (`PimdirMutateError::LinkExists`) rather than overwrite when a live (non-tombstone) placement already holds `link_id`; a tombstoned `link_id` does not block the create.
+`PimdirMutation::Add { link_id, flags, object, body, summary, sort_key }` SHALL stage a brand-new item with no remote origin (compose, import): a `PimdirStatus::Created` placement in the coroutine's collection under the link id's provisional handle, at `level = Full`, with `base = None` and `origin = None`, pointing at `object`; plus a `StoreObject` carrying `body`. Because the create has no origin, the next sync SHALL push it as `PimdirChange::Add { origin: None }`, an append that uploads the body rather than a server-side copy. `Add` SHALL NOT require an existing source placement, and SHALL fail (`PimdirMutateError::LinkExists`) rather than overwrite when a live (non-tombstone) placement already holds `link_id`; a tombstoned `link_id` does not block the create.
 
 A mutation naming a probe, a placement with no link id, SHALL fail with `PimdirMutateError::Probed`: the store holds a probe as flags only, so a status staged on it would be lost. A `Meta` upgrade names it first.
 
 > Seed spec (Cairn, 2026-08-01): captures the offline mutation vocabulary, retro-documented when `Add` was added.
 
+### Requirement: A provisional handle is the link id under U+0001
+Every create the engine stages, an `Add`, a `Copy`, a `Move`, a vanished edit re-staged ([sync](sync.md)) or the copy the hub offers ([hub](hub.md)), SHALL sit under `PimdirLinkId::provisional`, `U+0001` followed by the link id (pimdir SYNC §3): no remote handle starts with a control character, so the namespace never collides with a server's, and one identity has one pending create per collection at a time. A minted key's provisional handle is `U+0001` then `dup:<hint>#<handle>`. The caller supplies no placeholder.
+
+#### Scenario: Two clients stage the same copy
+- GIVEN two processes copying one identity into one target through the queue
+- WHEN both actions are applied
+- THEN they land on one provisional handle, the second upsert restating the first, and one add is pushed
+
 ### Requirement: A staged create never takes a key its target holds
 A `Copy` or a `Move` SHALL read the target collection for the identity it is carrying into it, and SHALL key the staged create under a minted key (upgrade.md) when a live placement there already holds that identity. Refusing is not the answer, the way it is for an `Add`: the caller is asking for the copy, and a target holding the identity already is a target holding two resources once the create lands.
 
 The read SHALL ask for the key a second copy would take beside the identity itself, and SHALL be made against the target rather than the collection the mutation reads, which cannot answer it. A source placement holding no identity yet stages its create without the read, having no key to collide with.
+
+A `Copy` or a `Move` of a placement holding neither a body nor a based binding SHALL fail with `PimdirMutateError::Undeliverable`: the create could neither upload nor server-copy, and would sit pending for ever (pimdir SYNC §7).
 
 #### Scenario: A copy into a collection that holds the identity
 - GIVEN a target collection holding a live placement under an identity

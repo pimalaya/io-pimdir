@@ -29,8 +29,8 @@ use crate::{
     coroutine::*,
     load::PimdirLoadScope,
     placement::{
-        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirPlacement, PimdirSortKey,
-        PimdirStatus,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirSortKey, PimdirStatus,
     },
     remote::{PimdirPushOutcome, PimdirPushResult, PimdirRemoteItem, PimdirRemoteSnapshot},
     sync::join::{Candidate, Join, Merge},
@@ -97,51 +97,21 @@ pub enum PimdirConflictPolicy {
     PreferLocal,
     /// Keep the remote edit, dropping the local one and pulling the remote.
     PreferRemote,
-    /// Keep both: pull the remote and stage the local body as a new member.
-    KeepBoth,
-}
-
-/// What becomes of a local delete the source will not take (SYNC §5).
-///
-/// A forbidden flag or content change stays dirty and re-derives, but a
-/// forbidden delete is either undone or held, and holding it hides a
-/// member the source still holds. Which is right depends on whether the
-/// source is bound beside others, which a consumer knows and the engine
-/// does not.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PimdirDeletePolicy {
-    /// Let the consumer decide from the binding count (the default).
-    ///
-    /// The engine reads it as [`Revert`](Self::Revert); a consumer that
-    /// knows how many sources bind the collection resolves it to
-    /// [`Keep`](Self::Keep) when there is more than one, a revert reading
-    /// as a resurrection there.
-    #[default]
-    Auto,
-    /// Undo it: the member comes back with what it had cached.
-    ///
-    /// The right reading for a source the replica does not own: an
-    /// incremental enumeration never lists an untouched member again, so
-    /// a held tombstone hides that member for good.
-    Revert,
-    /// Hold it: the tombstone stays pending until a later run may push it.
-    ///
-    /// The right reading when the refusal may lift, and the one a source
-    /// bound beside others wants: reverting says the source still holds
-    /// the member, which the [hub](crate::hub) reads as alive and mirrors
-    /// back.
-    Keep,
 }
 
 /// Tuning for one sync run: the push direction and the enumerate depth.
+///
+/// A local delete the source's rights forbid follows no option (SYNC §5):
+/// it is held when the item has another binding, whose source pushes the
+/// delete, and reverted when this binding is its last, which
+/// [`beside_other_sources`](PimdirSync::beside_other_sources) tells the
+/// coroutine from what the store knows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PimdirSyncOptions {
     /// The master push switch: when false the source is read-only.
     pub push: bool,
     /// Per-kind refinement of `push`, consulted only when `push` is true.
     pub rights: PimdirPushRights,
-    /// What becomes of a local delete this source will not take.
-    pub delete: PimdirDeletePolicy,
     /// How a content conflict is resolved.
     pub conflict: PimdirConflictPolicy,
     /// Whether to ignore the checkpoint and enumerate the whole remote.
@@ -157,7 +127,6 @@ impl Default for PimdirSyncOptions {
         Self {
             push: true,
             rights: PimdirPushRights::all(),
-            delete: PimdirDeletePolicy::default(),
             conflict: PimdirConflictPolicy::Manual,
             full: false,
         }
@@ -207,8 +176,14 @@ pub struct PimdirSyncReport {
 pub struct PimdirSync {
     collection: PimdirCollectionId,
     opts: PimdirSyncOptions,
+    /// Whether the collection is bound by other sources too, which decides
+    /// a refused delete (SYNC §5): held beside others, reverted alone.
+    beside_others: bool,
     local: BTreeMap<PimdirHandle, PimdirPlacement>,
     checkpoint: Option<PimdirCheckpoint>,
+    /// Whether the collection holds a probe of this source, at load or in
+    /// the enumeration: a create is not derived while it does (SYNC §5).
+    holds_probes: bool,
     /// The merge in progress, from the enumerate to the join's last candidate.
     merging: Option<Merge>,
     writes: Vec<PimdirWriteOp>,
@@ -261,8 +236,10 @@ impl PimdirSync {
         Self {
             collection,
             opts,
+            beside_others: false,
             local: BTreeMap::new(),
             checkpoint: None,
+            holds_probes: false,
             merging: None,
             writes: Vec::new(),
             pushes: Vec::new(),
@@ -272,6 +249,15 @@ impl PimdirSync {
             report: PimdirSyncReport::default(),
             state: State::Start,
         }
+    }
+
+    /// Tells the coroutine whether other sources bind the collection, so
+    /// a delete the rights forbid is held rather than reverted (SYNC §5):
+    /// reverted beside another source it would read as a resurrection
+    /// there. The std client answers it from the store's bindings.
+    pub fn beside_other_sources(mut self, beside: bool) -> Self {
+        self.beside_others = beside;
+        self
     }
 
     /// Yields the next push chunk, or the write recording the last one.
@@ -348,6 +334,12 @@ impl PimdirSync {
 
         let vanished: BTreeSet<PimdirHandle> = vanished.into_iter().collect();
         let local = mem::take(&mut self.local);
+
+        // NOTE: a probe may be a pending create's own arrival, so no
+        // create is pushed while one exists (SYNC §5): the ones loaded,
+        // and the members this enumeration lists that nothing binds yet.
+        self.holds_probes = local.values().any(is_probe)
+            || items.iter().any(|item| !local.contains_key(&item.handle));
 
         self.merging = Some(Merge {
             join: Join::new(local, items),
@@ -435,6 +427,26 @@ impl PimdirSync {
 
                 let base_revision = local.base.as_ref().and_then(|b| b.revision.clone());
                 if item.revision.is_some() && item.revision != base_revision {
+                    // NOTE: a tombstone holding a local edit too is the
+                    // both-changed case and follows the policy (SYNC §5);
+                    // one holding none is revived and pulled.
+                    if local.staged_edit().is_some() {
+                        let mut live = local;
+                        live.status = PimdirStatus::Dirty;
+                        live.origin = None;
+                        return match self.resolve_conflict(&live, item) {
+                            ContentOutcome::Push(change) => {
+                                self.reconcile_flags(&live, item, PushFlags::Withhold);
+                                Some(change)
+                            }
+                            ContentOutcome::Rewritten(rewritten) => {
+                                self.reconcile_flags(&rewritten, item, PushFlags::Derive)
+                            }
+                            ContentOutcome::Untouched => {
+                                self.reconcile_flags(&live, item, PushFlags::Derive)
+                            }
+                        };
+                    }
                     self.revive(&local, item);
                     self.report.pulled += 1;
                     self.emit(PimdirSyncEvent::Added(handle.clone()));
@@ -483,10 +495,10 @@ impl PimdirSync {
                         .as_ref()
                         .is_some_and(|b| local.object != b.object);
                 if edited {
-                    return self.resurrect(local);
+                    self.resurrect(local);
+                } else {
+                    self.drop(&handle, PimdirDropReason::Deleted);
                 }
-
-                self.drop(&handle, PimdirDropReason::Deleted);
                 self.report.pulled += 1;
                 self.emit(PimdirSyncEvent::Vanished(handle.clone()));
                 None
@@ -519,17 +531,31 @@ impl PimdirSync {
             }
             (true, false, false) => {
                 let local = local.expect("local present");
+                // NOTE: a pending create the item's own conflict projects
+                // as `Conflict` (SYNC §3) owes nothing until an edit
+                // settles it; it is neither gone nor a create to push.
+                if local.status == PimdirStatus::Conflict && local.conflict_revision.is_none() {
+                    return None;
+                }
                 if local.status != PimdirStatus::Created {
                     // NOTE: a base-less body is a create-collision whose
                     // remote side went, so the local body survives as a
                     // create; a base-less row holding none is a probe, and
                     // a probe the enumeration no longer lists is gone.
                     if local.object.is_some() {
-                        return self.resurrect(local);
+                        self.resurrect(local);
+                    } else {
+                        self.drop(&handle, PimdirDropReason::Deleted);
                     }
-                    self.drop(&handle, PimdirDropReason::Deleted);
                     self.report.pulled += 1;
                     self.emit(PimdirSyncEvent::Vanished(handle.clone()));
+                    return None;
+                }
+                if self.holds_probes {
+                    trace!(
+                        "holding the create {} while the collection holds probes",
+                        handle.as_str()
+                    );
                     return None;
                 }
                 let pushable = local.object.is_some() || local.origin.is_some();
@@ -550,34 +576,30 @@ impl PimdirSync {
         }
     }
 
-    /// Stages a body whose remote side went as a fresh create (SYNC §5).
+    /// Re-stages a body whose remote side went as a pending create (SYNC §5).
     ///
-    /// New content beats a delete: the placement is rewritten `Created`
-    /// with no base, no origin and no divergence, and appended when the
-    /// source takes adds.
-    fn resurrect(&mut self, local: PimdirPlacement) -> Option<PimdirChangeKind> {
-        let handle = local.handle.clone();
+    /// New content beats a delete: the binding moves to the provisional
+    /// handle its key derives, licensed by a `Superseded` drop of the one
+    /// the member had, and is rewritten `Created` with no base, no origin
+    /// and no divergence. The next run adds it; this one reports the
+    /// member vanished.
+    fn resurrect(&mut self, local: PimdirPlacement) {
         let mut resurrected = local;
+        let provisional = resurrected
+            .link_id
+            .as_ref()
+            .map(PimdirLinkId::provisional)
+            .unwrap_or_else(|| resurrected.handle.clone());
+        if provisional != resurrected.handle {
+            self.drop(&resurrected.handle, PimdirDropReason::Superseded);
+            resurrected.handle = provisional;
+        }
         resurrected.status = PimdirStatus::Created;
         resurrected.conflict_revision = None;
         resurrected.conflict_object = None;
         resurrected.base = None;
         resurrected.origin = None;
-        self.upsert(resurrected.clone());
-
-        if !(self.opts.push && self.opts.rights.add) {
-            return None;
-        }
-
-        let add = PimdirChangeKind::Add {
-            handle: handle.clone(),
-            link_id: resurrected.link_id.clone(),
-            flags: resurrected.flags.clone(),
-            origin: None,
-            object: resurrected.object.clone(),
-        };
-        self.pending.insert(handle, Pending::Create(resurrected));
-        Some(add)
+        self.upsert(resurrected);
     }
 
     /// Reconciles the content of a placement present on both sides.
@@ -600,7 +622,13 @@ impl PimdirSync {
         };
 
         if local.status == PimdirStatus::Conflict {
-            if item.revision.is_some() && item.revision != local.conflict_revision {
+            // NOTE: a `Conflict` the item carries rather than the binding
+            // (SYNC §3) records no revision here and is settled by an edit
+            // or a remove, never by this axis.
+            if local.conflict_revision.is_some()
+                && item.revision.is_some()
+                && item.revision != local.conflict_revision
+            {
                 let mut updated = local.clone();
                 updated.conflict_revision = item.revision.clone();
                 // NOTE: the stored diverging body described the old
@@ -665,10 +693,6 @@ impl PimdirSync {
                 }
                 self.push_content(local, item.revision.clone())
             }
-            PimdirConflictPolicy::KeepBoth => {
-                self.stage_conflict_dup(local, item);
-                ContentOutcome::Rewritten(self.pull_content(local, item))
-            }
         }
     }
 
@@ -690,43 +714,6 @@ impl PimdirSync {
         self.report.conflicts += 1;
         self.emit(PimdirSyncEvent::Conflicted(local.handle.clone()));
         ContentOutcome::Rewritten(conflicted)
-    }
-
-    /// Stages the local body as a fresh `Created` member for `KeepBoth`.
-    ///
-    /// The duplicate is a second copy of the identity under a key minted
-    /// from its provisional handle, which names the placement, body and
-    /// remote revision it forked, so a replay stages the same row.
-    fn stage_conflict_dup(&mut self, local: &PimdirPlacement, item: &PimdirRemoteItem) {
-        let object = local.object.clone().expect("a staged edited body");
-
-        let mut handle = local.handle.0.clone();
-        handle.push('\u{1}');
-        handle.push_str(object.as_str());
-        handle.push('\u{1}');
-        handle.push_str(item.revision.as_deref().unwrap_or_default());
-        let handle = PimdirHandle(handle);
-
-        // NOTE: a second copy of one identity, minted like any other
-        // (STORAGE §9), so lookup_objects never pairs it with the original.
-        let link = local.link_id.as_ref().map(|hint| hint.minted(&handle));
-
-        let dup = PimdirPlacement {
-            collection: self.collection.clone(),
-            handle,
-            link_id: link,
-            object: Some(object),
-            level: PimdirLevel::Full,
-            summary: local.summary.clone(),
-            sort_key: local.sort_key.clone(),
-            flags: local.flags.clone(),
-            status: PimdirStatus::Created,
-            conflict_revision: None,
-            conflict_object: None,
-            base: None,
-            origin: None,
-        };
-        self.upsert(dup);
     }
 
     /// Reconciles the flag sets of a placement present on both sides.
@@ -795,28 +782,29 @@ impl PimdirSync {
         }
     }
 
-    /// Settles a local delete the source refused, per [`PimdirDeletePolicy`].
+    /// Settles a local delete the source's rights refuse (SYNC §5): held
+    /// when another source binds the collection and pushes the delete,
+    /// reverted when this source is alone, since a held tombstone would
+    /// hide a member an incremental enumeration never lists again.
     fn refuse_delete(&mut self, local: PimdirPlacement) -> Option<PimdirChangeKind> {
-        match self.opts.delete {
-            PimdirDeletePolicy::Auto | PimdirDeletePolicy::Revert => {
-                debug!("reverting a delete {} will not take", local.handle.as_str());
-                let mut reverted = local;
-                // NOTE: only the delete is undone, a divergence or a staged
-                // edit is still owed.
-                reverted.status = match (&reverted.conflict_revision, reverted.staged_edit()) {
-                    (Some(_), _) => PimdirStatus::Conflict,
-                    (None, Some(_)) => PimdirStatus::Dirty,
-                    (None, None) => PimdirStatus::Clean,
-                };
-                // NOTE: left behind, the destination would turn the next
-                // plain delete of the member into a move.
-                reverted.origin = None;
-                self.upsert(reverted);
-            }
-            PimdirDeletePolicy::Keep => {
-                trace!("holding a delete {} will not take", local.handle.as_str());
-            }
+        if self.beside_others {
+            trace!("holding a delete {} will not take", local.handle.as_str());
+            return None;
         }
+
+        debug!("reverting a delete {} will not take", local.handle.as_str());
+        let mut reverted = local;
+        // NOTE: only the delete is undone, a divergence or a staged edit
+        // is still owed.
+        reverted.status = match (&reverted.conflict_revision, reverted.staged_edit()) {
+            (Some(_), _) => PimdirStatus::Conflict,
+            (None, Some(_)) => PimdirStatus::Dirty,
+            (None, None) => PimdirStatus::Clean,
+        };
+        // NOTE: left behind, the destination would turn the next plain
+        // delete of the member into a move.
+        reverted.origin = None;
+        self.upsert(reverted);
 
         None
     }
@@ -1130,6 +1118,14 @@ impl PimdirCoroutine for PimdirSync {
             (_, None) => PimdirCoroutineState::Complete(Err(PimdirArgError::MissingArg)),
         }
     }
+}
+
+/// Whether a placement is a probe: a handle enumerated and named by no
+/// fetch yet (SYNC §3), which a create staged without an identity is not.
+fn is_probe(placement: &PimdirPlacement) -> bool {
+    placement.link_id.is_none()
+        && placement.base.is_none()
+        && placement.status != PimdirStatus::Created
 }
 
 /// Whether the content axis still owes a push for this placement.

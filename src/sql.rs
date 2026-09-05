@@ -33,6 +33,10 @@ statements! {
 /// How many objects are indexed and what they weigh.
 OBJECT_STATS = r#"SELECT count(*), coalesce(sum(size), 0) FROM objects;"#;
 
+/// Every hash the index knows, for the diagnosis diffing it against the
+/// blob directory; the collector asks per file (STORAGE §5).
+LIST_OBJECT_HASHES = r#"SELECT hash FROM objects;"#;
+
 /// The bytes held by objects at least one live item binds.
 LIVE_BYTES = r#"SELECT coalesce(sum(size), 0) FROM objects WHERE hash IN
 (SELECT object_hash FROM items WHERE object_hash IS NOT NULL AND retained_at IS NULL);"#;

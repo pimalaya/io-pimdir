@@ -22,14 +22,14 @@ fn a_store_missing_a_canonical_table_is_refused_by_every_role() {
 
     assert!(matches!(
         PimdirStore::open(dir.path()),
-        Err(PimdirError::Stale { table: "probes" })
+        Err(PimdirError::Stale { missing: "probes" })
     ));
     assert!(matches!(
         PimdirReader::open(dir.path()),
-        Err(PimdirError::Stale { table: "probes" })
+        Err(PimdirError::Stale { missing: "probes" })
     ));
     assert!(matches!(
         PimdirProducer::open(dir.path(), "test"),
-        Err(PimdirError::Stale { table: "probes" })
+        Err(PimdirError::Stale { missing: "probes" })
     ));
 }

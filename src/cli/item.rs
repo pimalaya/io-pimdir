@@ -328,7 +328,6 @@ impl ItemRestoreCommand {
             link_id: Some(item.link_id.clone()),
             flags: item.flags.clone(),
             object: item.object.clone(),
-            handle: None,
         };
         // NOTE: no size, the body being already indexed: the retained row
         // kept its object alive, which is the point of retention.
@@ -345,7 +344,7 @@ impl ItemRestoreCommand {
             None => RestoreStatus::Queued,
             Some(owner) => {
                 let mut owner = owner.for_source(source);
-                match owner.drain_collection(&found.collection) {
+                match owner.drain() {
                     Err(io_pimdir::client::PimdirError::Busy) => RestoreStatus::Queued,
                     Err(err) => return Err(report(err)),
                     Ok(_) => match owner
@@ -621,7 +620,7 @@ impl ItemRow {
             sort_key: item.sort_key.clone(),
             title: item.summary.as_ref().map(|s| s.title().to_string()),
             summary: item.summary.as_ref().map(summary::json),
-            retained_at: retention.map(|retention| retention.at.clone()),
+            retained_at: retention.and_then(|retention| retention.at.clone()),
             retained_by: retention.and_then(|retention| retention.by.clone()),
         }
     }

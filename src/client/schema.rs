@@ -14,19 +14,24 @@ use crate::{
     sql,
 };
 
-/// The tables the canonical schema declares, which a store at the current
-/// version has to hold whole: the draft is edited in place (§6) and the
-/// version stamp alone cannot tell an earlier draft's store apart.
-const TABLES: [&str; 14] = [
+/// The tables and triggers the canonical schema declares, which a store
+/// at the current version has to hold whole: the draft is edited in place
+/// (§6) and the version stamp alone cannot tell an earlier draft's store
+/// apart. The triggers are named since the last drafts moved the feed
+/// into them, and a store lacking one stamps nothing.
+const SCHEMA: [&str; 17] = [
     "bindings",
     "collections",
+    "collections_restamp_items",
     "contact_summary",
     "event_summary",
     "item_address",
     "items",
+    "items_stamp_request",
     "journal_summary",
     "mail_summary",
     "objects",
+    "objects_count_collect",
     "probes",
     "queue",
     "sources",
@@ -79,15 +84,16 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
 /// draft with no migration path, so a store missing a table is recreated
 /// by its owner, never reconciled here.
 pub(crate) fn check(conn: &Connection) -> Result<(), PimdirError> {
-    let mut stmt = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")?;
-    let tables: Vec<String> = stmt
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_schema WHERE type IN ('table', 'trigger')")?;
+    let declared: Vec<String> = stmt
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    if let Some(table) = TABLES
+    if let Some(missing) = SCHEMA
         .iter()
-        .find(|table| !tables.iter().any(|t| t == *table))
+        .find(|name| !declared.iter().any(|d| d == *name))
     {
-        return Err(PimdirError::Stale { table });
+        return Err(PimdirError::Stale { missing });
     }
 
     let stamped: Option<i64> = conn

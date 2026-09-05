@@ -265,7 +265,6 @@ fn a_staged_create_is_counted_and_never_listed() {
             link_id: Some(PimdirLinkId("mid:draft".into())),
             flags: PimdirFlags::from_iter(["\\Draft"]),
             object: None,
-            handle: None,
         },
     );
 

@@ -286,7 +286,6 @@ proptest! {
         intact(&client, "after the seeding sync")?;
 
         let mut arrivals = 0usize;
-        let mut placeholders = 0usize;
         let mut bumps = 0usize;
 
         for op in ops {
@@ -310,11 +309,9 @@ proptest! {
                 }
                 HostileOp::Copy(i) => {
                     if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                        placeholders += 1;
                         let _ = client.mutate("inbox", PimdirMutation::Copy {
                             handle,
                             target: "archive".into(),
-                            placeholder: PimdirHandle::from(format!("copy-{placeholders}")),
                         });
                     }
                 }

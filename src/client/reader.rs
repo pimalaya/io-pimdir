@@ -100,11 +100,13 @@ pub struct PimdirItem {
     pub retention: Option<PimdirRetention>,
 }
 
-/// What retention holds about an item (§11), on the trash view's rows.
+/// What the trash view holds about a deleted item (§11): retained, or a
+/// tombstone a source still binds and cannot remove yet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirRetention {
-    /// The RFC 3339 instant the last binding vanished.
-    pub at: String,
+    /// The RFC 3339 instant the last binding vanished, `None` while a
+    /// source still binds the row.
+    pub at: Option<String>,
     /// The source whose removal retired the item; diagnostic.
     pub by: Option<String>,
     /// The body's size in bytes, `None` alongside an absent body.
@@ -150,6 +152,22 @@ pub struct PimdirAddressPlacement {
     pub seq: i64,
     /// The item's sort key.
     pub sort_key: String,
+}
+
+/// One item two sources disagree on (STORAGE §10, §14.1): the shared
+/// body kept and the diverging one recorded, for a resolver to read both.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirItemConflict {
+    /// The collection the item sits in.
+    pub collection: String,
+    /// The item's key.
+    pub link_id: PimdirLinkId,
+    /// The item's public id.
+    pub seq: i64,
+    /// The shared body, kept.
+    pub object: Option<PimdirHash>,
+    /// The diverging body the policy recorded.
+    pub conflict_object: Option<PimdirHash>,
 }
 
 /// One binding waiting for a decision (STORAGE §14.1).
@@ -208,12 +226,13 @@ pub struct PimdirCollectionChange {
     pub changed: i64,
 }
 
-/// The change feed's cursor (§4.5): the next stamp and the purge count.
+/// The change feed's cursor (§4.5): the last stamp drawn and the purge
+/// count, recorded beside what a consumer derives.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirChangeCursor {
-    /// Every stamp below this one is drawn.
-    pub next_change: i64,
-    /// How many rows left without a stamp.
+    /// The last stamp drawn: the next look asks for every stamp above it.
+    pub changed: i64,
+    /// How many rows left without a stamp: purged items and collected objects.
     pub purges: i64,
 }
 
@@ -362,6 +381,20 @@ impl PimdirReader {
     /// The distinct source names the store has synced against.
     pub fn distinct_sources(&self) -> Result<Vec<String>, PimdirError> {
         Ok(rows(&self.conn, sql::LIST_SOURCES, [], |r| r.get(0))?)
+    }
+
+    /// The sources binding one collection, which is what tells a sync
+    /// whether it runs beside others (SYNC §5).
+    pub fn collection_sources(
+        &self,
+        collection: impl AsRef<str>,
+    ) -> Result<Vec<String>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            sql::COLLECTION_SOURCES,
+            named_params! { ":collection": collection.as_ref() },
+            |r| r.get(0),
+        )?)
     }
 }
 
@@ -644,6 +677,28 @@ impl PimdirReader {
         )?)
     }
 
+    /// The items two sources disagree on across one account's collections
+    /// (§10); `None` lists an ungrouped store whole.
+    pub fn list_item_conflicts(
+        &self,
+        account: Option<&str>,
+    ) -> Result<Vec<PimdirItemConflict>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            sql::LIST_CONFLICTED_ITEMS,
+            named_params! { ":account": account },
+            |r| {
+                Ok(PimdirItemConflict {
+                    collection: r.get(0)?,
+                    link_id: PimdirLinkId(r.get(1)?),
+                    seq: r.get(2)?,
+                    object: r.get::<_, Option<String>>(3)?.map(PimdirHash),
+                    conflict_object: r.get::<_, Option<String>>(4)?.map(PimdirHash),
+                })
+            },
+        )?)
+    }
+
     /// A collection's live item count.
     pub fn count_items(&self, collection: impl AsRef<str>) -> Result<u64, PimdirError> {
         let collection = collection.as_ref();
@@ -783,7 +838,9 @@ impl PimdirReader {
 
 /// Retention, the queue and the change feed.
 impl PimdirReader {
-    /// A keyset page of retained items (§11), cursor on `seq`, the trash view.
+    /// A keyset page of the trash (§11), cursor on `seq`: every deleted
+    /// item, retained or still bound by a source that cannot remove it,
+    /// which [`PimdirRetention::at`] tells apart.
     pub fn list_retained(
         &self,
         collection: impl AsRef<str>,
@@ -805,7 +862,7 @@ impl PimdirReader {
         Ok(items)
     }
 
-    /// A collection's retained item count.
+    /// A collection's trash count, every deleted row.
     pub fn count_retained(&self, collection: impl AsRef<str>) -> Result<i64, PimdirError> {
         Ok(self.conn.query_row(
             sql::COUNT_RETAINED,
@@ -821,11 +878,10 @@ impl PimdirReader {
         Ok(bytes.max(0) as u64)
     }
 
-    /// The collections with pending queue work.
-    pub fn queued_collections(&self) -> Result<Vec<String>, PimdirError> {
-        Ok(rows(&self.conn, sql::LIST_QUEUED_COLLECTIONS, [], |r| {
-            r.get(0)
-        })?)
+    /// Every pending action store-wide in append order, the drain's order
+    /// (§15.2).
+    pub fn list_pending_actions(&self) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+        pending_actions(&self.conn, None)
     }
 
     /// A collection's pending actions in append order (§15.4).
@@ -834,7 +890,7 @@ impl PimdirReader {
         collection: impl AsRef<str>,
     ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
         let collection = collection.as_ref();
-        pending_actions(&self.conn, collection)
+        pending_actions(&self.conn, Some(collection))
     }
 
     /// Every parked action across the store, in append order.
@@ -877,7 +933,7 @@ impl PimdirReader {
     pub fn change_cursor(&self) -> Result<PimdirChangeCursor, PimdirError> {
         Ok(self.conn.query_row(sql::LOAD_CHANGE_CURSOR, [], |r| {
             Ok(PimdirChangeCursor {
-                next_change: r.get(0)?,
+                changed: r.get(0)?,
                 purges: r.get(1)?,
             })
         })?)
@@ -1048,16 +1104,9 @@ impl PimdirReader {
     /// collection, walked in global append order; a row whose payload
     /// does not decode is skipped, the drain being what parks it.
     fn pending(&self, collection: &str) -> Result<PimdirPending, PimdirError> {
-        let mut queued = Vec::new();
-        for from in self.queued_collections()? {
-            for action in overlaid_actions(&self.conn, &from)? {
-                queued.push((from.clone(), action));
-            }
-        }
-        queued.sort_by_key(|(_, action)| action.id);
-
         let mut pending = PimdirPending::default();
-        for (from, action) in queued {
+        for action in overlaid_actions(&self.conn)? {
+            let from = action.collection;
             let here = from == collection;
             match &action.action {
                 PimdirAction::SetFlags { seq, .. }

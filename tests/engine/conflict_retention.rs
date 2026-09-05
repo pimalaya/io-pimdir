@@ -103,9 +103,15 @@ fn a_conflicted_item_the_remote_deletes_never_reaches_the_retained_row_path() {
     client.remote_mut().remove("inbox", "m1");
 
     let report = client.sync("inbox", PimdirSyncOptions::default()).unwrap();
-
-    assert_eq!(report.pushed, 1, "the local body is re-uploaded");
+    assert_eq!(
+        report.pushed, 0,
+        "the edit is re-staged as a pending create"
+    );
     assert_eq!(report.conflicts, 0, "the divergence is over, not re-run");
+
+    let report = client.sync("inbox", PimdirSyncOptions::default()).unwrap();
+    assert_eq!(report.pushed, 1, "the local body is re-uploaded");
+    assert_eq!(report.conflicts, 0);
     assert_eq!(
         server(&client),
         vec![(

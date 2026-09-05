@@ -56,7 +56,7 @@ Reading unknown as empty would make it an opinion, since element-wise an empty s
 Absorbing an upsert whose flag set is unknown SHALL leave the shared set alone, on the same terms as an absent summary and an unknown sort key. A known set, empty or not, SHALL replace another known set: only unknown is inert.
 
 ### Requirement: A drop says whether the item is gone
-`PimdirWriteOp::DropPlacement` SHALL carry a `PimdirDropReason`: `Deleted` when the item itself is gone (a local delete the remote confirmed, a member that vanished upstream), `Superseded` when only this row is gone, replaced by the server-assigned handle an accepted add reconciled a provisional placeholder to, and `Rekeyed` when a rebuild renumbered it onto a new handle space (pimdir SYNC §10). Both license the binding to move; only `Rekeyed` is the store's signal to bump the collection's generation.
+`PimdirWriteOp::DropPlacement` SHALL carry a `PimdirDropReason`: `Deleted` when the item itself is gone (a local delete the remote confirmed, a member that vanished upstream), `Superseded` when only this row is gone, replaced by the server-assigned handle an accepted add reconciled a provisional handle to, or by the provisional handle a vanished edit is re-staged under ([sync](sync.md)), and `Rekeyed` when a rebuild renumbered it onto a new handle space (pimdir SYNC §10). Both license the binding to move; only `Rekeyed` is the store's signal to bump the collection's generation.
 
 This refines the retention decision point above rather than replacing it: a storage still chooses what a removal means for its rows, but a storage that shares one item across sources SHALL propagate a delete only for `Deleted`. Reading a superseded row as a delete turns housekeeping into data loss on every other source, and it is what made the drop-then-upsert order of a rebuilt spine load-bearing.
 
@@ -78,13 +78,13 @@ The scope is a floor, not a ceiling: a storage SHALL return at least the placeme
 - THEN it is served only the placement it names, and still produces the same writes
 
 ### Requirement: A write batch is applied in order
-The store's write SHALL apply the ops in the order they are listed, and atomically. Ordering is what a batch naming one handle twice rests on, which the engine does emit: a sync that resurrects a locally deleted item writes the placeholder, pushes it, and supersedes the same handle once the remote assigns one, and the drop is the answer.
+The store's write SHALL apply the ops in the order they are listed, and atomically. Ordering is what a batch naming one handle twice rests on, which the engine does emit: a sync that resurrects a locally deleted item writes the provisional row, pushes it, and supersedes the same handle once the remote assigns one, and the drop is the answer.
 
 A storage MAY NOT group the batch by op kind, or otherwise reorder it: what looks like an independent set of rows is not one.
 
-The engine SHALL NOT rely on the order where it can avoid emitting the pair at all. A rebuild in particular drops only the old handles no upsert of the same batch writes: a new handle space commonly reuses an old handle, and an unmatched staged edit is resurrected under the handle it already had, so the collision there is between ops far apart in a long list, and the reasoning that they are safe lives in neither of them.
+A rebuild relies on it outright: every `Rekeyed` drop precedes every upsert ([rekey](rekey.md)), the drop being what licenses a handle the new space reuses, and a store applying the batch out of order refuses the rebind.
 
 #### Scenario: A rebuilt spine reuses a handle
 - GIVEN a placement the old handle space held under a handle the new one reuses
 - WHEN the collection is rebuilt
-- THEN the batch writes that handle once, and does not also drop it
+- THEN the batch drops that handle `Rekeyed` first and writes it once after, the store bumping the generation

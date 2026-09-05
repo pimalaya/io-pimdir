@@ -247,7 +247,6 @@ fn a_producer_body_survives_with_and_without_the_row_that_pins_it() {
                 link_id: Some(PimdirLinkId("mid:queued".into())),
                 flags: PimdirFlags::default(),
                 object: Some(pinned.clone()),
-                handle: None,
             },
             Some(&PimdirObject {
                 hash: pinned.clone(),

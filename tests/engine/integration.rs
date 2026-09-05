@@ -185,11 +185,10 @@ fn offline_copy_creates_pushes_and_rekeys() {
             PimdirMutation::Copy {
                 handle: PimdirHandle::from("i2"),
                 target: "archive".into(),
-                placeholder: PimdirHandle::from("tmp-i2"),
             },
         )
         .unwrap();
-    let staged = client.storage().placement("archive", "tmp-i2");
+    let staged = client.storage().placement("archive", "\u{1}msg-b");
     assert_eq!(staged.status, PimdirStatus::Created);
     assert_eq!(
         staged.origin.as_ref().map(|o| o.handle.as_str()),
@@ -202,10 +201,24 @@ fn offline_copy_creates_pushes_and_rekeys() {
         "the copy source is untouched",
     );
 
+    // NOTE: the archive's first enumeration lists members nothing names
+    // yet, and a create waits for those probes (SYNC §5): naming them
+    // frees it.
+    let report = client.sync("archive", opts).unwrap();
+    assert_eq!(report.pushed, 0, "held behind the probes");
+    let probes: Vec<PimdirHandle> = client
+        .storage()
+        .rows("archive")
+        .into_iter()
+        .filter(|p| p.link_id.is_none())
+        .map(|p| p.handle)
+        .collect();
+    client.upgrade("archive", probes, PimdirTier::Meta).unwrap();
+
     let report = client.sync("archive", opts).unwrap();
     assert_eq!(report.pushed, 1);
     assert!(
-        !client.storage().contains("archive", "tmp-i2"),
+        !client.storage().contains("archive", "\u{1}msg-b"),
         "the placeholder is dropped once the copy is confirmed",
     );
     let real = client.storage().placement("archive", "i2-copy");

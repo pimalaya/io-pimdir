@@ -560,7 +560,6 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
     hydrate(&mut client, "inbox");
 
     let mut ledger = Ledger::default();
-    let mut placeholders = 0usize;
     let mut arrivals = 0usize;
     let mut bumps = 0usize;
 
@@ -642,15 +641,19 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
             }
             MutOp::LocalCopy(i) => {
                 if let Some(handle) = nth(&hydrated(&client), i) {
-                    placeholders += 1;
-                    let placeholder = PimdirHandle::from(format!("tmp-{placeholders}"));
                     let link = server_link(&client, &handle);
+                    // NOTE: the create sits under the provisional handle its key
+                    // derives; a target already holding the link keeps it, which
+                    // the check below accepts as landed.
+                    let placeholder = link
+                        .as_ref()
+                        .map(PimdirLinkId::provisional)
+                        .unwrap_or_else(|| PimdirHandle::from("\u{1}"));
                     let staged = client.mutate(
                         "inbox",
                         PimdirMutation::Copy {
                             handle,
                             target: "archive".into(),
-                            placeholder: placeholder.clone(),
                         },
                     );
                     if staged.is_ok() {
@@ -667,7 +670,6 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
             }
             MutOp::LocalMoveCold(i) => {
                 if let Some(handle) = nth(&cold(&client), i) {
-                    placeholders += 1;
                     let link = server_link(&client, &handle);
                     let doomed = inbox_row(&client, &handle)
                         .and_then(|p| p.base)
@@ -692,7 +694,6 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                         PimdirMutation::Move {
                             handle: handle.clone(),
                             target: "archive".into(),
-                            placeholder: PimdirHandle::from(format!("move-{placeholders}")),
                         },
                     );
                     if staged.is_ok() {
@@ -709,7 +710,6 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
             }
             MutOp::LocalMove(i) => {
                 if let Some(handle) = nth(&hydrated(&client), i) {
-                    placeholders += 1;
                     let link = server_link(&client, &handle);
                     let server_body = server_body(&client, &handle);
                     let doomed = inbox_row(&client, &handle)
@@ -727,7 +727,6 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                         PimdirMutation::Move {
                             handle: handle.clone(),
                             target: "archive".into(),
-                            placeholder: PimdirHandle::from(format!("move-{placeholders}")),
                         },
                     );
                     if staged.is_ok() {

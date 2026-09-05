@@ -98,7 +98,6 @@ enum Op {
     /// stored item the kinds addressing one act on.
     Enqueue {
         collection: usize,
-        source: usize,
         link: usize,
         object: Option<usize>,
         kind: usize,
@@ -115,8 +114,8 @@ enum Op {
     /// Drop an identity from every source at once, which is what leaves
     /// an item held by nobody and retires it (spec §11).
     Retire { collection: usize, link: usize },
-    /// Apply a collection's pending actions as one source.
-    Drain { collection: usize, source: usize },
+    /// Apply the pending actions as one source.
+    Drain { source: usize },
     /// Cancel one queued or parked row.
     CancelAction { pick: usize },
     /// Purge one retained item.
@@ -191,16 +190,14 @@ fn op() -> impl Strategy<Value = Op> {
             }),
         4 => (
             0..COLLECTIONS.len(),
-            0..SOURCES.len(),
             0..LINKS.len(),
             proptest::option::of(0..BODIES.len()),
             0usize..7,
             0usize..4,
         )
             .prop_map(
-                |(collection, source, link, object, kind, pick)| Op::Enqueue {
+                |(collection, link, object, kind, pick)| Op::Enqueue {
                     collection,
-                    source,
                     link,
                     object,
                     kind,
@@ -222,8 +219,7 @@ fn op() -> impl Strategy<Value = Op> {
             }),
         3 => (0..COLLECTIONS.len(), 0..LINKS.len())
             .prop_map(|(collection, link)| Op::Retire { collection, link }),
-        3 => (0..COLLECTIONS.len(), 0..SOURCES.len())
-            .prop_map(|(collection, source)| Op::Drain { collection, source }),
+        3 => (0..SOURCES.len()).prop_map(|source| Op::Drain { source }),
         1 => (0usize..4).prop_map(|pick| Op::CancelAction { pick }),
         2 => (0..COLLECTIONS.len(), 0usize..4)
             .prop_map(|(collection, pick)| Op::Purge { collection, pick }),
@@ -547,7 +543,6 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
 
         Op::Enqueue {
             collection,
-            source,
             link,
             object,
             kind,
@@ -600,7 +595,6 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     link_id: Some(PimdirLinkId(LINKS[link].into())),
                     flags: PimdirFlags::default(),
                     object: hash.clone(),
-                    handle: Some(harness.handle(collection, source, link)),
                 }),
             };
 
@@ -612,13 +606,11 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             }
         }
 
-        Op::Drain { collection, source } => {
-            match harness.sources[source].drain_collection(COLLECTIONS[collection]) {
-                Ok(report) => reached.drain_applied += usize::from(report.applied > 0),
-                Err(PimdirError::Rebind { .. }) => reached.rebind_refused += 1,
-                Err(err) => panic!("unexpected drain error: {err}"),
-            }
-        }
+        Op::Drain { source } => match harness.sources[source].drain() {
+            Ok(report) => reached.drain_applied += usize::from(report.applied > 0),
+            Err(PimdirError::Rebind { .. }) => reached.rebind_refused += 1,
+            Err(err) => panic!("unexpected drain error: {err}"),
+        },
 
         Op::CancelAction { pick } => {
             let mut ids: Vec<i64> = Vec::new();

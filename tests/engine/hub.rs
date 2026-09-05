@@ -14,7 +14,7 @@ use io_pimdir::{
     object::{PimdirHash, PimdirObject},
     placement::{PimdirHandle, PimdirLinkId, PimdirStatus},
     remote::PimdirTier,
-    sync::{PimdirDeletePolicy, PimdirPushRights, PimdirSyncOptions},
+    sync::{PimdirPushRights, PimdirSyncOptions},
 };
 
 use crate::common::{Client, MemRemote, hash};
@@ -249,7 +249,6 @@ fn a_source_refusing_removes_holds_its_copy_under_keep() {
             remove: false,
             ..PimdirPushRights::all()
         },
-        delete: PimdirDeletePolicy::Keep,
         ..Default::default()
     };
     mirror.a.remote_mut().remove("inbox", "a1");
@@ -271,46 +270,6 @@ fn a_source_refusing_removes_holds_its_copy_under_keep() {
         mirror.server('a').is_empty(),
         "and the source that deleted it does not get it back: {:?}",
         mirror.server('a'),
-    );
-}
-
-/// Under an explicit `Revert` policy the same scenario resurrects the item.
-///
-/// The revert reads as add-beats-delete across sources, so the hub mirrors
-/// the item back to the source that deleted it. A hub-bound source wants
-/// `Keep`, which is what the default `Auto` resolves to beside another
-/// source. Both readings are coherent, so this is pinned rather than fixed.
-#[test]
-fn a_reverted_delete_resurrects_the_item_across_the_hub() {
-    let mut mirror = Mirror::new();
-    mirror
-        .a
-        .remote_mut()
-        .seed("inbox", "a1", "msg-a", &[], b"body a");
-    mirror.quiesce(PimdirSyncOptions::default());
-
-    let no_removes = PimdirSyncOptions {
-        rights: PimdirPushRights {
-            remove: false,
-            ..PimdirPushRights::all()
-        },
-        delete: PimdirDeletePolicy::Revert,
-        ..Default::default()
-    };
-    mirror.a.remote_mut().remove("inbox", "a1");
-    for _ in 0..3 {
-        mirror.round_with(PimdirSyncOptions::default(), no_removes);
-    }
-
-    assert_eq!(
-        mirror.deleted("msg-a"),
-        Some(false),
-        "the revert cleared the deletion for every source",
-    );
-    assert_eq!(
-        mirror.server('a').len(),
-        1,
-        "so the item comes back to the source it was deleted on",
     );
 }
 
@@ -630,7 +589,6 @@ fn a_create_persisted_through_the_hub_still_reads_as_one() {
         .mutate(
             "inbox",
             PimdirMutation::Add {
-                handle: PimdirHandle::from("tmp-1"),
                 link_id: PimdirLinkId::from("msg-a"),
                 flags: Default::default(),
                 object,
@@ -683,10 +641,7 @@ fn a_member_a_rebuild_lost_is_deleted_across_the_hub() {
     mirror.a.remote_mut().remove("inbox", "a1");
     mirror.a.remote_mut().renumber("inbox", 1);
     mirror.a.rekey("inbox").unwrap();
-    mirror.quiesce(PimdirSyncOptions {
-        delete: PimdirDeletePolicy::Keep,
-        ..Default::default()
-    });
+    mirror.quiesce(PimdirSyncOptions::default());
 
     assert!(
         mirror.retained("msg-a"),

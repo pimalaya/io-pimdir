@@ -167,9 +167,9 @@ pub fn report(err: PimdirError) -> anyhow::Error {
                 "another writer holds the store lock (a sync is running?); retry once it releases"
             )
         }
-        PimdirError::Stale { table } => {
+        PimdirError::Stale { missing } => {
             anyhow!(
-                "this store was written by an earlier draft of the format and lacks the {table} table: delete it and let it resync"
+                "this store was written by an earlier draft of the format and lacks {missing}: delete it and let it resync"
             )
         }
         err => anyhow!(err),

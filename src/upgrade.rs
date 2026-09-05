@@ -31,6 +31,7 @@ use crate::{
         PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirStatus,
     },
     remote::{PimdirFetchedBody, PimdirFetchedItem, PimdirTier},
+    summary::PimdirSummary,
 };
 
 /// What an upgrade did.
@@ -139,15 +140,56 @@ impl PimdirUpgrade {
                     object,
                     body: bytes,
                 });
-                patched.conflict_object = Some(hash);
+                // NOTE: a diverging body equal to the placement's own is no
+                // divergence, the push whose record was lost having landed
+                // (SYNC §5): the base adopts it and the conflict clears.
+                if patched.object.as_ref() == Some(&hash) {
+                    patched.status = PimdirStatus::Clean;
+                    patched.conflict_revision = None;
+                    patched.conflict_object = None;
+                    patched.base = Some(PimdirBase {
+                        flags: patched
+                            .base
+                            .as_ref()
+                            .map(|base| base.flags.clone())
+                            .unwrap_or_else(|| patched.flags.clone()),
+                        revision: item.revision.clone(),
+                        object: Some(hash),
+                    });
+                } else {
+                    patched.conflict_object = Some(hash);
+                }
                 self.ops.push(PimdirWriteOp::UpsertPlacement(patched));
                 self.report.fetched += 1;
                 self.report.upgraded += 1;
                 continue;
             }
 
-            // NOTE: never re-identifies a linked item: tiers may disagree on
-            // the link, an ENVELOPE naming a Message-ID the body parser misses.
+            // NOTE: a mutable resource stating another hint under its handle
+            // is a new identity there (SYNC §6): keyed afresh, the storage
+            // retiring the old binding as a changed hash: key is. A minted
+            // key never equals its hint and stays.
+            let mutable = item.revision.is_some() || is_mutable(&patched);
+            let restated = patched
+                .link_id
+                .as_ref()
+                .is_some_and(|key| *key != item.link_id && !key.as_str().starts_with("dup:"));
+            if mutable && restated {
+                debug!(
+                    "handle {} states a new identity, keying it afresh",
+                    item.handle.as_str()
+                );
+                patched.link_id = None;
+                patched.object = None;
+                patched.base = None;
+                patched.status = PimdirStatus::Clean;
+                patched.conflict_revision = None;
+                patched.conflict_object = None;
+            }
+
+            // NOTE: never re-identifies a linked item of an immutable kind:
+            // tiers may disagree on the link, an ENVELOPE naming a
+            // Message-ID the body parser misses.
             if patched.link_id.is_none() {
                 if let Some(create) = self.take_pending_create(&item.link_id, &item.handle) {
                     claimed.insert(item.link_id.clone(), item.handle.clone());
@@ -182,12 +224,27 @@ impl PimdirUpgrade {
                         body: bytes,
                     });
 
-                    if let Some(base) = &mut patched.base {
-                        base.revision = item.revision.clone();
-                        base.object = Some(hash.clone());
+                    // NOTE: a fetch moves the base (SYNC §6). Over a local
+                    // edit it is the base's body when the revision stayed,
+                    // the local body kept, and the both-changed case when
+                    // the revision moved: the fetched body lands as the
+                    // diverging one and the placement conflicts.
+                    let edited = patched.staged_edit().is_some();
+                    let base_revision = patched.base.as_ref().and_then(|b| b.revision.clone());
+                    if edited && item.revision.is_some() && item.revision != base_revision {
+                        patched.status = PimdirStatus::Conflict;
+                        patched.conflict_revision = item.revision.clone();
+                        patched.conflict_object = Some(hash);
+                    } else {
+                        if let Some(base) = &mut patched.base {
+                            base.revision = item.revision.clone();
+                            base.object = Some(hash.clone());
+                        }
+                        if !edited {
+                            patched.object = Some(hash);
+                        }
                     }
 
-                    patched.object = Some(hash);
                     patched.level = PimdirLevel::Full;
                     self.report.fetched += 1;
                 }
@@ -374,11 +431,17 @@ impl PimdirCoroutine for PimdirUpgrade {
                     let Some(placement) = self.placements.get(&handle) else {
                         continue;
                     };
+                    // NOTE: linked only when the size the source served
+                    // agrees with the held body (SYNC §6): two messages
+                    // under one Message-ID with different bytes are the
+                    // wrong merge, and the summary's size is the witness.
                     let hit = placement
                         .link_id
                         .as_ref()
                         .filter(|_| !is_mutable(placement) && !is_conflicted(placement))
-                        .and_then(|link| known.get(link).cloned());
+                        .and_then(|link| known.get(link))
+                        .filter(|object| size_agrees(placement, object.size))
+                        .map(|object| object.hash.clone());
 
                     match hit {
                         Some(hash) => {
@@ -513,6 +576,15 @@ fn is_mutable(placement: &PimdirPlacement) -> bool {
         .base
         .as_ref()
         .is_some_and(|base| base.revision.is_some())
+}
+
+/// Whether a held body's size agrees with the size the source served in
+/// the placement's summary, a summary stating none agreeing with any.
+fn size_agrees(placement: &PimdirPlacement, size: usize) -> bool {
+    match &placement.summary {
+        Some(PimdirSummary::Mail(mail)) => mail.size.is_none_or(|served| served == size as u64),
+        _ => true,
+    }
 }
 
 /// What the coroutine is doing while it waits for the caller.

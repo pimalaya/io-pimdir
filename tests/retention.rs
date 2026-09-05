@@ -131,8 +131,8 @@ fn an_expunge_retains_the_item_and_its_body() {
     assert_eq!(retention.size, Some(3));
     assert_eq!(retention.by.as_deref(), Some("local"));
     assert!(
-        retention.at.ends_with('Z'),
-        "an RFC 3339 stamp: {}",
+        retention.at.as_deref().is_some_and(|at| at.ends_with('Z')),
+        "an RFC 3339 stamp: {:?}",
         retention.at
     );
     assert_eq!(store.count_retained(inbox()).unwrap(), 1);
@@ -272,13 +272,12 @@ fn a_queued_add_restores_a_retained_item() {
                 link_id: Some(retained.link_id.clone()),
                 flags: retained.flags.clone(),
                 object: retained.object.clone(),
-                handle: None,
             },
             None,
         )
         .unwrap();
 
-    let report = store.drain_collection("INBOX").unwrap();
+    let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 0, 0));
 
     let items = store.list_items("INBOX", None, 10).unwrap();
@@ -428,10 +427,12 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
         .placements;
     assert_eq!(projected.len(), 1);
     assert_eq!(projected[0].status, PimdirStatus::Tombstone);
+    let trash = left.list_retained(inbox(), None, 10).unwrap();
+    assert_eq!(trash.len(), 1, "the trash shows the tombstone");
     assert_eq!(
-        left.count_retained(inbox()).unwrap(),
-        0,
-        "the delete is still in flight"
+        trash[0].retention.as_ref().and_then(|r| r.at.clone()),
+        None,
+        "the delete is still in flight, so nothing is retained yet"
     );
 
     // right pushes the remove and drops its own binding, so nothing holds

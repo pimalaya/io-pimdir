@@ -42,7 +42,7 @@ Projecting the same rule is what lets a store already written in that state heal
 - THEN the placement reads `Meta`, so the next upgrade refetches the body
 
 ### Requirement: The hub propagates a delete across sources
-`PimdirHubItem` SHALL carry a `deleted` flag. An item becomes deleted two ways, both feeding the same projection: when `absorb` sees a `DropPlacement` of a bound member (a member removed under the source's feet), it SHALL mark the item deleted and remove that source's binding; and when `absorb` sees an `UpsertPlacement` whose `status` is `Tombstone` (a client-staged `Remove`, or a `Move`'s source side), it SHALL mark the item deleted and **keep** the source's binding, its `handle` and `base`, so the projection knows the remote handle to push the remove against, without adopting the tombstone's content or clearing the delete. The tombstone's known flags ride along into the shared item (pimdir SYNC §9), an unknown set erasing nothing. `project` SHALL then yield a `Tombstone` placement (keeping the content, so edit-beats-delete still applies) for every source that still holds the item, and nothing for a source that lacks it (a deleted item is never copied). Once no source holds the item it stays in the hub with no binding, projected for nobody, for the store to retain (pimdir STORAGE §11); the hub prunes nothing. A **live-status** upsert SHALL clear `deleted`, so a re-add or an edit-beats-delete resurrection brings the item back on every source.
+`PimdirHubItem` SHALL carry a `deleted` flag. An item becomes deleted two ways, both feeding the same projection: when `absorb` sees a `DropPlacement` of a bound member (a member removed under the source's feet), it SHALL mark the item deleted and remove that source's binding; and when `absorb` sees an `UpsertPlacement` whose `status` is `Tombstone` (a client-staged `Remove`, or a `Move`'s source side), it SHALL mark the item deleted and **keep** the source's binding, its `handle` and `base`, so the projection knows the remote handle to push the remove against, without adopting the tombstone's content or clearing the delete. The tombstone's known flags ride along into the shared item (pimdir SYNC §9), an unknown set erasing nothing. `project` SHALL then yield a `Tombstone` placement (keeping the content, so edit-beats-delete still applies) for every source that still holds the item, and nothing for a source that lacks it (a deleted item is never copied). Once no source holds the item it stays in the hub with no binding, projected for nobody, for the store to retain (pimdir STORAGE §11); the hub prunes nothing. A **live-status** upsert SHALL clear `deleted`, so a re-add or an edit-beats-delete resurrection brings the item back on every source. A `Tombstone` upsert SHALL also clear the item's cross-source conflict, `conflicted` and `conflict_object`: a `Remove` settles it (pimdir SYNC §7, vectors/sync/32).
 
 #### Scenario: A delete propagates as a tombstone
 - GIVEN two sources holding one item, and one source removing it
@@ -72,6 +72,10 @@ This is a second base, for the second axis, and the two cannot be one field. `ba
 ### Requirement: The hub resolves cross-source content conflicts by policy
 `PimdirHubItem` SHALL carry a `conflicted` flag and a `conflict_object`, and `PimdirHub` a `PimdirHubConflict` policy (`Manual`, `PreferIncoming`, `PreferExisting`; default `Manual`). On an upsert, the hub SHALL compare the incoming body against the source's own sync base and the hub's shared body against what that source last agreed with the hub on: a conflict is the source having changed its body **and** another source having moved the shared body, to different bodies. `Manual` SHALL flag it and record the diverging body, preserving both and keeping the shared body; `PreferIncoming` SHALL adopt the incoming body; `PreferExisting` SHALL keep the shared body. A clean fast-forward (only the source changed) SHALL adopt the incoming body, and an upsert carrying the shared body itself settles nothing either way.
 
+The three facts SHALL be read before the upsert lands and against the base the binding held, never the base the upsert carries (pimdir SYNC §9): read from the carried base, a source whose sync just moved its base onto the remote body reads as having said nothing, and an edit on two endpoints loses one silently. Whether the content is mutable SHALL be judged across every binding of the item and the placement's own base, any revision meaning mutable: judged on the upserting binding alone, a source whose base holds no revision yet resolved a divergence silently. An immutable kind never diverges: a based binding whose base holds a body while the item holds another SHALL adopt the item's body into its base, so a mail fetched at `Full` beside a linked copy of the same message reads `Clean` rather than `Dirty` for ever with nothing to push.
+
+Under `Manual` every binding of a conflicted item SHALL project `Conflict` carrying no `conflict_revision` (pimdir SYNC §3), and `absorb` SHALL clear `conflicted` and `conflict_object` when an upsert settles the item: a live upsert adopted as the shared body, or a tombstone.
+
 A source SHALL NOT diverge from itself. Its own body folded into the hub and not yet pushed leaves its sync base behind the shared body, which is the gap another source folding in also leaves, and reading the two as one drops the source's next edit: a second offline edit under `Manual`, or the edit that resolves a conflicted binding, whose merged body would then never be pushed.
 
 An upsert leaving a conflicted binding SHALL count as the source having changed its body whatever body it carries, read from the status rather than from the body alone. A resolution keeping the ancestor of the divergence restates the source's own sync base, so comparing bodies reads it as the source having said nothing, and the hub would keep the body the resolution discarded and hand every source a decision nobody took.
@@ -82,6 +86,11 @@ Flags are unaffected (element-wise, never conflicting), and immutable-content ba
 - GIVEN two sources agreeing on a body, then each editing it to a different body
 - WHEN both upserts are absorbed under `Manual`
 - THEN the item is `conflicted`, the shared body is kept, and the diverging body is recorded
+
+#### Scenario: Every binding projects the item's conflict
+- GIVEN an item flagged conflicted under `Manual`
+- WHEN any source's placements are projected
+- THEN each projects `Conflict` with no revision, and an edit through any of them settles the item for all
 
 #### Scenario: A clean fast-forward adopts the new body
 - GIVEN two sources agreeing on a body, then only one editing it
@@ -104,7 +113,7 @@ Flags are unaffected (element-wise, never conflicting), and immutable-content ba
 - THEN the ancestor becomes the shared body, the source having spoken even though its body is the one it last synced
 
 ### Requirement: A per-source content conflict round-trips through the hub
-`PimdirBinding` SHALL carry a `conflicted` flag and a `conflict_revision`, recording that **this source and its own remote** diverged and the merge left the placement `Conflict`. This is a distinct fact from the item-level cross-source conflict above, one saying "left and its server disagree" and the other "left and right disagree", and a two-source store needs both independently; neither SHALL set the other.
+`PimdirBinding` SHALL carry a `conflicted` flag and a `conflict_revision`, recording that **this source and its own remote** diverged and the merge left the placement `Conflict`. This is a distinct fact from the item-level cross-source conflict above, one saying "left and its server disagree" and the other "left and right disagree", and a two-source store needs both independently; neither SHALL set the other. The projection reads both, a binding's conflict carrying its revision and the item's carrying none, which is how a consumer tells them apart.
 
 `absorb` SHALL record both from the divergence an upsert carries (its `conflict_revision`) rather than from its status, the two agreeing everywhere but on a tombstone, and SHALL clear them for an upsert carrying none, which is what a resolving edit leaves: a consumer resolving the conflict with an ordinary edit needs no dedicated resolution call. That edit SHALL also be adopted as the shared body: a binding cleared of its conflict while the item still holds the body the merge replaced leaves the next run pushing the unmerged body over the remote the merge was made against. `project` SHALL yield `Conflict` for a conflicted binding **ahead of** the base comparison, carrying the stored `conflict_revision` back, so a conflict is never downgraded to `Clean` or `Dirty`.
 
@@ -170,6 +179,14 @@ An upsert carrying no body while the item holds one is that pull, and `absorb` S
 - WHEN one absorbs the pull dropping it
 - THEN the other projects `Clean` with no body, its base still naming the body its server holds
 
+### Requirement: A rebuild's drops keep the base the absorb compares against
+A rebuild lists every `Rekeyed` drop before every upsert ([rekey](rekey.md)), so by the time the upsert rebinding a source lands, `absorb` has removed the binding whose base the divergence test reads. `absorb` SHALL keep the binding a `Superseded` or `Rekeyed` drop removes aside, keyed by source and link id, and SHALL hand it back to the first upsert of the same batch that rebinds that source under the link, base and `shared_object` included, clearing what is left when the batch ends. A `Deleted` drop keeps nothing: the item is gone for that source.
+
+#### Scenario: A rebuilt source is not a stranger to its own item
+- GIVEN a source bound to an item, rebuilt onto a new handle space
+- WHEN the batch's drop and upsert are absorbed
+- THEN the source's base and agreement point survive the rebind, and the upsert is no divergence
+
 ### Requirement: A binding with no base is a pending create
 `PimdirHub::project` SHALL read a bound item whose binding holds no base as `PimdirStatus::Created`, on the same condition `created_placement` applies to an unbound one: the hub holds the body. A binding's base is what its source last reconciled with its own remote, so a binding without one has never reached that source and the item is still the create it was staged as.
 
@@ -193,4 +210,4 @@ It follows that mirroring is a sync **plus** an upgrade. The hub offers a member
 - THEN the hub offers the member to the other source, which appends it
 
 ### Requirement: A created placement carries the origin the store knows
-`PimdirHub::project_with` SHALL take a resolver and ask it for every `Created` placement it projects, bound or not, so the push is a server-side copy where the same source binds the identity in another collection with a base present and, when the placement has a body, that body as its base, and for every `Tombstone`, whose origin is its destination, the collection where the same source holds a pending create of the identity, so the remove relocates (pimdir SYNC §3). The resolver answers by the placement's status; the hub holds one collection and cannot, and the store answers from its bindings. A bound placement with no base SHALL project `Created` whether or not a body is held.
+`PimdirHub::project_with` SHALL take a resolver and ask it for every `Created` placement it projects, bound or not, so the push is a server-side copy where the same source binds the identity in another collection with a base present and, when the placement has a body, that body as its base, and for every `Tombstone`, whose origin is its destination, the collection where the same source holds a pending create of the identity, so the remove relocates (pimdir SYNC §3). The resolver answers by the placement's status; the hub holds one collection and cannot, and the store answers from its bindings. A bound placement with no base SHALL project `Created` whether or not a body is held. The copy the hub offers a source lacking the item SHALL sit under the link id's provisional handle (`PimdirLinkId::provisional`), the handle every staged create takes ([mutate](mutate.md)), so an accepted add supersedes the same handle a `Copy` or an `Add` would have used.

@@ -11,6 +11,8 @@ use core::{convert::Infallible, error, fmt};
 
 use alloc::vec::Vec;
 
+use std::sync::Arc;
+
 use crate::{
     client::{PimdirError, PimdirSourceStore},
     collection::{PimdirCheckpoint, PimdirCollectionId},
@@ -21,7 +23,7 @@ use crate::{
     placement::PimdirHandle,
     rekey::{PimdirRekey, PimdirRekeyReport},
     remote::{PimdirFetchedItem, PimdirPushResult, PimdirRemote, PimdirRemoteSnapshot, PimdirTier},
-    sync::{PimdirDeletePolicy, PimdirSync, PimdirSyncOptions, PimdirSyncReport},
+    sync::{PimdirSync, PimdirSyncOptions, PimdirSyncReport},
     upgrade::{PimdirUpgrade, PimdirUpgradeReport},
 };
 
@@ -111,6 +113,10 @@ impl PimdirSourceStore {
     }
 
     /// Runs a coroutine to completion through this store and `remote`.
+    ///
+    /// The verb counts as in flight for the whole run, so the collector
+    /// never takes a body one chunk streamed and the next attaches
+    /// (STORAGE §5).
     pub fn run<C, T, E, R>(
         &mut self,
         mut coroutine: C,
@@ -120,6 +126,8 @@ impl PimdirSourceStore {
         C: PimdirCoroutine<Yield = PimdirYield, Return = Result<T, E>>,
         R: PimdirRemote,
     {
+        let lock = Arc::clone(&self.store.lock);
+        let _running = lock.running();
         let mut arg: Option<PimdirArg> = None;
 
         loop {
@@ -191,27 +199,26 @@ impl PimdirSourceStore {
 
     /// Reconciles a collection with its remote (SYNC §5).
     ///
-    /// A delete policy of [`Auto`](PimdirDeletePolicy::Auto) is settled
-    /// here from what the store knows and the engine does not: a source
-    /// bound beside others is given `Keep`, a revert reading as a
-    /// resurrection there, and a lone source `Revert`.
+    /// Whether the collection is bound by other sources is settled here
+    /// from the store's bindings, what the engine cannot know: a delete
+    /// the rights refuse is then held rather than reverted, a revert
+    /// reading as a resurrection beside another source.
     pub fn sync<R: PimdirRemote>(
         &mut self,
         collection: impl Into<PimdirCollectionId>,
-        mut opts: PimdirSyncOptions,
+        opts: PimdirSyncOptions,
         remote: &mut R,
     ) -> Result<PimdirSyncReport, PimdirRunError<R::Error, PimdirArgError>> {
-        if opts.delete == PimdirDeletePolicy::Auto {
-            let sources = self.distinct_sources()?;
-            let beside_others = sources.iter().any(|source| *source != self.source.0);
-            opts.delete = if beside_others {
-                PimdirDeletePolicy::Keep
-            } else {
-                PimdirDeletePolicy::Revert
-            };
-        }
+        let collection = collection.into();
+        let beside_others = self
+            .collection_sources(&collection)?
+            .iter()
+            .any(|source| *source != self.source.0);
 
-        self.run(PimdirSync::new(collection, opts), remote)
+        self.run(
+            PimdirSync::new(collection, opts).beside_other_sources(beside_others),
+            remote,
+        )
     }
 
     /// Rebuilds a collection onto a new handle space, by link id (SYNC §8).

@@ -19,7 +19,7 @@ use io_pimdir::{
     object::PimdirObject,
     placement::{PimdirHandle, PimdirLinkId, PimdirPlacement, PimdirStatus},
     remote::PimdirTier,
-    sync::{PimdirConflictPolicy, PimdirSyncOptions},
+    sync::PimdirSyncOptions,
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
 
@@ -177,7 +177,6 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
     }
 
     let mut arrivals = 0usize;
-    let mut placeholders = 0usize;
     let mut bumps = 0usize;
 
     for op in ops {
@@ -197,37 +196,31 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
             }
             IdOp::Copy(i) => {
                 if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                    placeholders += 1;
                     let _ = client.mutate(
                         "inbox",
                         PimdirMutation::Copy {
                             handle,
                             target: "archive".into(),
-                            placeholder: PimdirHandle::from(format!("copy-{placeholders}")),
                         },
                     );
                 }
             }
             IdOp::Move(i) => {
                 if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                    placeholders += 1;
                     let _ = client.mutate(
                         "inbox",
                         PimdirMutation::Move {
                             handle,
                             target: "archive".into(),
-                            placeholder: PimdirHandle::from(format!("move-{placeholders}")),
                         },
                     );
                 }
             }
             IdOp::Add(which, n) => {
-                placeholders += 1;
                 let body = format!("authored-{n}").into_bytes();
                 let _ = client.mutate(
                     "inbox",
                     PimdirMutation::Add {
-                        handle: PimdirHandle::from(format!("add-{placeholders}")),
                         link_id: PimdirLinkId::from(hint(which)),
                         flags: Default::default(),
                         object: PimdirObject {
@@ -302,83 +295,5 @@ proptest! {
         ops in proptest::collection::vec(arb_id_op(), 0..20),
     ) {
         check_identity_model(ops)?;
-    }
-}
-
-/// One step of the keep-both model, where the merge forks rows itself.
-#[derive(Clone, Debug)]
-enum ForkOp {
-    /// Edit the i-th member to one of three bodies.
-    LocalEdit(usize, u8),
-    /// A server-side content change.
-    ServerEdit(usize, u8),
-    /// Sync the inbox.
-    Sync,
-}
-
-fn arb_fork_op() -> impl Strategy<Value = ForkOp> {
-    prop_oneof![
-        3 => (any::<usize>(), 0u8..3).prop_map(|(i, n)| ForkOp::LocalEdit(i, n)),
-        3 => (any::<usize>(), 0u8..3).prop_map(|(i, n)| ForkOp::ServerEdit(i, n)),
-        2 => Just(ForkOp::Sync),
-    ]
-}
-
-proptest! {
-    /// Two keep-both forks over one body in one run are two members.
-    ///
-    /// Keying the fork on the body alone would give them one key, and the
-    /// second fork would take the first's row.
-    #[test]
-    fn keep_both_forks_never_share_a_key(
-        ops in proptest::collection::vec(arb_fork_op(), 0..16),
-    ) {
-        let mut remote = MemRemote::default();
-        remote.mutable = true;
-        remote.seed("inbox", "u1", "msg-a", &[], b"one");
-        remote.seed("inbox", "u2", "msg-b", &[], b"two");
-        remote.seed("inbox", "u3", "msg-c", &[], b"three");
-
-        let mut client = Client::new(remote);
-        let opts = PimdirSyncOptions {
-            conflict: PimdirConflictPolicy::KeepBoth,
-            ..Default::default()
-        };
-        client.sync("inbox", opts).unwrap();
-        let handles = every(&client, "inbox");
-        client.upgrade("inbox", handles, PimdirTier::Full).unwrap();
-
-        for op in ops {
-            match op {
-                ForkOp::LocalEdit(i, n) => {
-                    if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                        let body = format!("local-{n}").into_bytes();
-                        let _ = client.mutate("inbox", PimdirMutation::Edit {
-                            handle,
-                            object: PimdirObject { hash: hash(&body), size: body.len() },
-                            body,
-                            summary: None,
-                            sort_key: None,
-                        });
-                    }
-                }
-                ForkOp::ServerEdit(i, n) => {
-                    if let Some(handle) = nth(&on_server(&client, "inbox"), i) {
-                        let body = format!("server-{n}").into_bytes();
-                        client.remote_mut().edit("inbox", handle.as_str(), &body);
-                    }
-                }
-                ForkOp::Sync => {
-                    client.sync("inbox", opts).unwrap();
-                }
-            }
-
-            one_key_per_row(&client, "mid-sequence")?;
-        }
-
-        for _ in 0..3 {
-            client.sync("inbox", opts).unwrap();
-        }
-        one_key_per_row(&client, "after quiescence")?;
     }
 }

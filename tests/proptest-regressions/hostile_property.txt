@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7931ca01a70451508c63a95e6ec64a794059264c6a32aa3095d6799b97603ad5 # shrinks to chaos = Chaos { unsorted: false, repeat: false, phantom_vanished: false, skip_fetch: false, ghost_fetch: false, one_identity: true, meta_body: false, ghost_push: false, repeat_push: false, silent_push: false, blind_flags: false }, ops = [Hydrate, Rekey, Rekey, Remove(4521257793473930058), Hydrate]

@@ -18,7 +18,7 @@ use crate::{
     collection::PimdirCollectionId,
     hub::PimdirHubConflict,
     object::PimdirHash,
-    placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId},
+    placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
 };
 
 /// A flag set as its canonical JSON array, or `None` for the column's
@@ -103,8 +103,6 @@ pub enum PimdirAction {
         flags: PimdirFlags,
         /// The body's hash, written durably by the producer before enqueueing.
         object: Option<PimdirHash>,
-        /// The provisional handle the create is staged under.
-        handle: Option<PimdirHandle>,
     },
     /// Replace the item's flag set, absolutely.
     SetFlags {
@@ -220,7 +218,6 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             link_id,
             flags,
             object,
-            handle,
         } => {
             if let Some(link) = link_id {
                 map.insert("link_id".into(), json!(link.0));
@@ -228,9 +225,6 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             map.insert("flags".into(), flags_to_value(flags));
             if let Some(object) = object {
                 map.insert("object".into(), json!(object.0));
-            }
-            if let Some(handle) = handle {
-                map.insert("handle".into(), json!(handle.0));
             }
         }
         PimdirAction::SetFlags { seq, flags } => {
@@ -270,7 +264,6 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
             link_id: get_string(map, "link_id")?.map(PimdirLinkId),
             flags: flags_from_value(map.get("flags")),
             object: get_string(map, "object")?.map(PimdirHash),
-            handle: get_string(map, "handle")?.map(PimdirHandle),
         }),
         "set-flags" => Ok(PimdirAction::SetFlags {
             seq: require_seq(map)?,
@@ -400,13 +393,11 @@ mod tests {
                 link_id: Some(PimdirLinkId("mid:new".into())),
                 flags: PimdirFlags::from_iter(["\\Draft"]),
                 object: Some(PimdirHash("cafebabe".into())),
-                handle: Some(PimdirHandle("draft-1".into())),
             },
             PimdirAction::Add {
                 link_id: None,
                 flags: PimdirFlags::default(),
                 object: None,
-                handle: None,
             },
             PimdirAction::SetFlags {
                 seq: 4,

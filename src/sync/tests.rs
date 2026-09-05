@@ -637,33 +637,33 @@ fn a_full_write_batch_is_handed_over_mid_merge() {
 
 /// A batch boundary falls between candidates, never inside one.
 ///
-/// A keep-both resolution writes the pulled placement and the staged
-/// body together, and losing either would lose a version.
+/// A vanished member holding a local edit is re-staged as a create: a
+/// drop of its handle and the create under the provisional one, and
+/// losing either would lose the edit or leave two rows.
 #[test]
 fn a_batch_never_cuts_through_one_candidate() {
     let fillers = PimdirSync::WRITE_CHUNK - 1;
     let items = (0..fillers)
         .map(|index| remote(&format!("{index:05}"), &[]))
-        .chain([remote_rev("zz", "r2")])
         .collect();
 
-    let mut sync = PimdirSync::new("inbox", with_conflict(PimdirConflictPolicy::KeepBoth));
+    let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
     let run = run_batches(&mut sync, vec![edited("zz")], full(items));
 
     let staged = run
         .batch_of(|op| matches!(op, PimdirWriteOp::UpsertPlacement(p) if p.status == PimdirStatus::Created))
-        .expect("a keep-both duplicate");
-    let pulled = run
-        .batch_of(|op| matches!(op, PimdirWriteOp::UpsertPlacement(p) if p.handle.as_str() == "zz"))
-        .expect("the pulled placement");
+        .expect("the re-staged create");
+    let dropped = run
+        .batch_of(|op| matches!(op, PimdirWriteOp::DropPlacement { handle, .. } if handle.as_str() == "zz"))
+        .expect("the vanished handle's drop");
 
     assert!(
         run.batches[0].len() > PimdirSync::WRITE_CHUNK,
-        "the boundary must fall on the resolution, not before it",
+        "the boundary must fall on the candidate, not before it",
     );
     assert_eq!(
-        staged, pulled,
-        "both versions of one candidate must land together: {:?}",
+        staged, dropped,
+        "both writes of one candidate must land together: {:?}",
         run.order,
     );
 }
@@ -749,7 +749,6 @@ fn read_only_keeps_local_dirty() {
     let opts = PimdirSyncOptions {
         push: false,
         rights: PimdirPushRights::all(),
-        delete: PimdirDeletePolicy::Revert,
         conflict: PimdirConflictPolicy::Manual,
         full: false,
     };
@@ -912,7 +911,6 @@ fn read_only_still_pulls_remote_changes() {
     let opts = PimdirSyncOptions {
         push: false,
         rights: PimdirPushRights::all(),
-        delete: PimdirDeletePolicy::Revert,
         conflict: PimdirConflictPolicy::Manual,
         full: false,
     };
@@ -1019,7 +1017,8 @@ fn remote_delete_in_full_drops() {
     );
 }
 
-/// A create-collision conflict whose remote side went keeps its body.
+/// A create-collision conflict whose remote side went keeps its body,
+/// re-staged as a pending create the next run adds (SYNC §5).
 #[test]
 fn a_base_less_body_absent_from_the_remote_resurrects_as_a_create() {
     let mut placement = synced("1", &[]);
@@ -1030,13 +1029,17 @@ fn a_base_less_body_absent_from_the_remote_resurrects_as_a_create() {
     placement.conflict_revision = Some("r9".into());
 
     let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
-    let (pushes, writes, _report) = run(&mut sync, vec![placement], vec![]);
+    let (pushes, writes, report) = run(&mut sync, vec![placement], vec![]);
 
-    assert!(matches!(
-        &pushes.expect("a push")[0].kind,
-        PimdirChangeKind::Add { origin: None, .. }
-    ));
-    let resurrected = upserted(&writes, "1").expect("a resurrected placement");
+    assert!(pushes.is_none(), "the next run adds it");
+    assert_eq!(report.events, [PimdirSyncEvent::Vanished("1".into())]);
+    assert!(
+        writes.iter().any(
+            |w| matches!(w, PimdirWriteOp::DropPlacement { handle, reason, .. } if handle.as_str() == "1" && *reason == PimdirDropReason::Superseded)
+        ),
+        "the vanished handle is superseded by the provisional one: {writes:?}",
+    );
+    let resurrected = upserted(&writes, "\u{1}1").expect("a re-staged create");
     assert_eq!(resurrected.status, PimdirStatus::Created);
     assert_eq!(resurrected.conflict_revision, None);
     assert_eq!(resurrected.object, Some(PimdirHash::from("h1")));
@@ -1180,7 +1183,6 @@ fn full_sync_ignores_checkpoint() {
         PimdirSyncOptions {
             push: true,
             rights: PimdirPushRights::all(),
-            delete: PimdirDeletePolicy::Revert,
             conflict: PimdirConflictPolicy::Manual,
             full: true,
         },
@@ -1566,9 +1568,16 @@ fn unlisted_conflict_keeps_its_observed_remote_revision() {
     );
 }
 
+/// A remote edit over a plain tombstone revives it and pulls (SYNC §5).
 #[test]
 fn remote_content_change_beats_a_local_delete() {
-    let mut placement = edited("1");
+    let mut placement = synced("1", &[]);
+    placement.base = Some(PimdirBase {
+        flags: PimdirFlags::default(),
+        revision: Some("r1".into()),
+        object: Some(PimdirHash::from("h1")),
+    });
+    placement.object = Some(PimdirHash::from("h1"));
     placement.status = PimdirStatus::Tombstone;
 
     let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
@@ -1635,22 +1644,30 @@ fn remove_carries_the_base_revision_as_precondition() {
     }
 }
 
+/// A vanished member holding a local edit is re-staged as a pending
+/// create under the provisional handle, which the next run adds (SYNC §5).
 #[test]
 fn remote_delete_with_staged_edit_resurrects_as_create() {
     let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
-    let (pushes, writes, _report) = run(&mut sync, vec![edited("1")], vec![]);
+    let (pushes, writes, report) = run(&mut sync, vec![edited("1")], vec![]);
 
-    match &pushes.expect("a push")[0].kind {
+    assert!(pushes.is_none(), "the next run adds it");
+    assert_eq!(report.events, [PimdirSyncEvent::Vanished("1".into())]);
+    let resurrected = upserted(&writes, "\u{1}1").expect("a re-staged create");
+    assert_eq!(resurrected.status, PimdirStatus::Created);
+    assert!(resurrected.base.is_none());
+    assert!(resurrected.origin.is_none(), "an append, not a copy");
+    assert_eq!(resurrected.object, Some(PimdirHash::from("h2")));
+
+    let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+    let (pushes, _writes, _report) = run(&mut sync, vec![resurrected.clone()], vec![]);
+    match &pushes.expect("the add")[0].kind {
         PimdirChangeKind::Add { object, origin, .. } => {
             assert_eq!(object, &Some(PimdirHash::from("h2")), "the edited body");
             assert!(origin.is_none(), "an append, not a copy");
         }
         other => panic!("expected an Add push, got {other:?}"),
     }
-    let resurrected = upserted(&writes, "1").expect("a resurrected placement");
-    assert_eq!(resurrected.status, PimdirStatus::Created);
-    assert!(resurrected.base.is_none());
-    assert_eq!(resurrected.object, Some(PimdirHash::from("h2")));
 }
 
 /// The remote side is gone, so the conflict is moot and the edit survives.
@@ -1663,11 +1680,8 @@ fn remote_delete_of_a_conflicted_placement_resurrects_the_edit() {
     let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
     let (pushes, writes, _report) = run(&mut sync, vec![placement], vec![]);
 
-    assert!(matches!(
-        &pushes.expect("a push")[0].kind,
-        PimdirChangeKind::Add { origin: None, .. }
-    ));
-    let resurrected = upserted(&writes, "1").expect("a resurrected placement");
+    assert!(pushes.is_none(), "the next run adds it");
+    let resurrected = upserted(&writes, "\u{1}1").expect("a re-staged create");
     assert_eq!(resurrected.status, PimdirStatus::Created);
     assert_eq!(resurrected.conflict_revision, None, "the conflict is moot");
     assert_eq!(
@@ -1683,7 +1697,6 @@ fn read_only_remote_delete_with_staged_edit_keeps_the_edit() {
     let opts = PimdirSyncOptions {
         push: false,
         rights: PimdirPushRights::all(),
-        delete: PimdirDeletePolicy::Revert,
         conflict: PimdirConflictPolicy::Manual,
         full: false,
     };
@@ -1691,7 +1704,7 @@ fn read_only_remote_delete_with_staged_edit_keeps_the_edit() {
     let (pushes, writes, _report) = run(&mut sync, vec![edited("1")], vec![]);
 
     assert!(pushes.is_none());
-    let resurrected = upserted(&writes, "1").expect("a resurrected placement");
+    let resurrected = upserted(&writes, "\u{1}1").expect("a re-staged create");
     assert_eq!(resurrected.status, PimdirStatus::Created);
     assert_eq!(resurrected.object, Some(PimdirHash::from("h2")));
 }
@@ -1703,7 +1716,6 @@ fn read_only_keeps_a_content_edit_dirty() {
         PimdirSyncOptions {
             push: false,
             rights: PimdirPushRights::all(),
-            delete: PimdirDeletePolicy::Revert,
             conflict: PimdirConflictPolicy::Manual,
             full: false,
         },
@@ -1726,7 +1738,6 @@ fn read_only_delete_is_reverted_rather_than_applied() {
     let opts = PimdirSyncOptions {
         push: false,
         rights: PimdirPushRights::all(),
-        delete: PimdirDeletePolicy::Revert,
         conflict: PimdirConflictPolicy::Manual,
         full: false,
     };
@@ -1832,15 +1843,10 @@ fn a_relisted_probe_with_the_same_flags_derives_nothing() {
     );
 }
 
-/// The engine reads the default policy as a revert; a consumer that knows
-/// the binding count resolves it before handing the options over.
+/// A source alone reverts a delete its rights refuse; the std client says
+/// when it is not alone.
 #[test]
-fn the_delete_policy_defaults_to_auto_read_as_revert() {
-    assert_eq!(
-        PimdirSyncOptions::default().delete,
-        PimdirDeletePolicy::Auto
-    );
-
+fn a_refused_delete_is_reverted_for_a_lone_source() {
     let mut local = synced("1", &["seen"]);
     local.status = PimdirStatus::Tombstone;
     let mut sync = PimdirSync::new("inbox", with_rights(true, true, true, false));
@@ -1916,9 +1922,10 @@ fn forbidding_remove_reverts_the_tombstone_by_default() {
     assert_eq!(report.pushed, 0);
 }
 
-/// Rights `none()` and `push = false` agree on what a refused delete does.
+/// Beside another source, rights `none()` and `push = false` agree on what
+/// a refused delete does: the tombstone is held, the other source pushing it.
 #[test]
-fn keeping_a_refused_delete_holds_the_tombstone_either_way() {
+fn a_refused_delete_beside_other_sources_holds_the_tombstone_either_way() {
     let mut local = synced("1", &["seen"]);
     local.status = PimdirStatus::Tombstone;
 
@@ -1927,17 +1934,15 @@ fn keeping_a_refused_delete_holds_the_tombstone_either_way() {
             remove: false,
             ..PimdirPushRights::all()
         },
-        delete: PimdirDeletePolicy::Keep,
         ..Default::default()
     };
     let read_only = PimdirSyncOptions {
         push: false,
-        delete: PimdirDeletePolicy::Keep,
         ..Default::default()
     };
 
     for opts in [forbidden, read_only] {
-        let mut sync = PimdirSync::new("inbox", opts);
+        let mut sync = PimdirSync::new("inbox", opts).beside_other_sources(true);
         let (pushes, writes, _report) =
             run(&mut sync, vec![local.clone()], vec![remote("1", &["seen"])]);
 
@@ -2103,99 +2108,47 @@ fn prefer_local_falls_back_to_conflict_when_it_cannot_push() {
     assert_eq!(report.conflicts, 1, "no push right, so it stays a conflict");
 }
 
+/// A pending create waits while the collection holds a probe of its
+/// source: the probe may be its own arrival (SYNC §5).
 #[test]
-fn keep_both_pulls_the_remote_and_stages_the_local_body() {
-    let mut sync = PimdirSync::new("inbox", with_conflict(PimdirConflictPolicy::KeepBoth));
-    let (pushes, writes, report) = run(&mut sync, vec![edited("1")], vec![remote_rev("1", "r2")]);
+fn a_create_waits_while_the_collection_holds_probes() {
+    let mut create = synced("\u{1}m1", &[]);
+    create.link_id = Some(PimdirLinkId::from("m1"));
+    create.object = Some(PimdirHash::from("h1"));
+    create.level = PimdirLevel::Full;
+    create.status = PimdirStatus::Created;
+    create.base = None;
 
+    let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+    let (pushes, _writes, _report) = run(&mut sync, vec![create.clone()], vec![remote("7", &[])]);
+    assert!(pushes.is_none(), "the listed member is a probe until named");
+
+    let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+    let (pushes, _writes, _report) = run(&mut sync, vec![create], vec![]);
     assert!(
-        pushes.is_none(),
-        "the duplicate is staged, pushed next sync"
-    );
-    assert_eq!(report.conflicts, 0);
-    assert_eq!(
-        report.refreshed, 1,
-        "the remote is pulled into the placement"
-    );
-    let dup = writes
-        .iter()
-        .find_map(|w| match w {
-            PimdirWriteOp::UpsertPlacement(p) if p.status == PimdirStatus::Created => Some(p),
-            _ => None,
-        })
-        .expect("a keep-both duplicate");
-    assert_eq!(
-        dup.object,
-        Some(PimdirHash::from("h2")),
-        "the duplicate carries the local body",
-    );
-    assert!(
-        dup.handle.as_str().contains("h2"),
-        "the handle is per forked body, so two resolutions never collide",
-    );
-    assert!(
-        dup.link_id.is_some(),
-        "the duplicate needs an identity: a link id is what makes a \
-         retried add idempotent and what a shared-item storage keys on",
+        matches!(
+            &pushes.expect("the add")[0].kind,
+            PimdirChangeKind::Add { .. }
+        ),
+        "with no probe left the create is pushed",
     );
 }
 
-/// Both are staged before either is pushed, so the handles must differ.
+/// A tombstone holding a local edit met by a remote edit is the
+/// both-changed case, not a blind revive (SYNC §5).
 #[test]
-fn two_keep_both_duplicates_of_one_handle_do_not_collide() {
-    let mut first = edited("1");
-    first.object = Some(PimdirHash::from("h2"));
-    let mut second = edited("1");
-    second.object = Some(PimdirHash::from("h3"));
+fn a_tombstoned_local_edit_over_a_remote_edit_follows_the_policy() {
+    let mut local = edited("1");
+    local.status = PimdirStatus::Tombstone;
 
-    let dup_of = |local: PimdirPlacement| {
-        let mut sync = PimdirSync::new("inbox", with_conflict(PimdirConflictPolicy::KeepBoth));
-        let (_pushes, writes, _report) = run(&mut sync, vec![local], vec![remote_rev("1", "r2")]);
-        writes
-            .iter()
-            .find_map(|w| match w {
-                PimdirWriteOp::UpsertPlacement(p) if p.status == PimdirStatus::Created => {
-                    Some(p.clone())
-                }
-                _ => None,
-            })
-            .expect("a keep-both duplicate")
-    };
+    let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+    let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote_rev("1", "r2")]);
 
-    let first = dup_of(first);
-    let second = dup_of(second);
-    assert_ne!(first.handle, second.handle);
-    assert_ne!(first.link_id, second.link_id);
-}
-
-/// Two placements forking one body in one run must not share a key.
-#[test]
-fn two_keep_both_duplicates_of_one_body_do_not_collide() {
-    let mut first = edited("1");
-    first.object = Some(PimdirHash::from("h2"));
-    let mut second = edited("2");
-    second.object = Some(PimdirHash::from("h2"));
-
-    let mut sync = PimdirSync::new("inbox", with_conflict(PimdirConflictPolicy::KeepBoth));
-    let (_pushes, writes, _report) = run(
-        &mut sync,
-        vec![first, second],
-        vec![remote_rev("1", "r2"), remote_rev("2", "r2")],
-    );
-
-    let dups: Vec<&PimdirPlacement> = writes
-        .iter()
-        .filter_map(|w| match w {
-            PimdirWriteOp::UpsertPlacement(p) if p.status == PimdirStatus::Created => Some(p),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(dups.len(), 2, "one fork per resolved placement");
-    assert_ne!(dups[0].handle, dups[1].handle);
-    assert_ne!(
-        dups[0].link_id, dups[1].link_id,
-        "the placement each fork came from names it, not just the body",
-    );
+    assert!(pushes.is_none());
+    assert_eq!(report.conflicts, 1);
+    let conflicted = upserted(&writes, "1").expect("the conflicted placement");
+    assert_eq!(conflicted.status, PimdirStatus::Conflict);
+    assert_eq!(conflicted.staged_edit(), Some(&PimdirHash::from("h2")));
 }
 
 /// A reverted delete undoes the delete alone: the rest is still owed.

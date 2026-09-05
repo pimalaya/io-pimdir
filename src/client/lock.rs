@@ -17,6 +17,8 @@
 //! promise that, and the escape hatch it needs for a stale one turns
 //! fail-fast into fail-always.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -60,8 +62,22 @@ struct Owned {
     /// merely unreferenced.
     _file: File,
     handles: usize,
-    /// The lock the process's own writers and collector serialise on.
-    writers: Arc<RwLock<()>>,
+    /// What the process's own writers, verbs and collector serialise on.
+    shared: Arc<Shared>,
+}
+
+/// What the handles of one owning process share (STORAGE §8): the owner
+/// lock excludes other processes and nothing inside its own.
+#[derive(Default)]
+struct Shared {
+    /// Held shared by a writer from blob staging through commit, and
+    /// exclusively by the collector across its row deletion and its file
+    /// walk.
+    writers: RwLock<()>,
+    /// How many verbs are between two of their chunks: a body streamed in
+    /// one chunk has no pointer until the next, so the collector does not
+    /// run while any is (STORAGE §5).
+    running: AtomicUsize,
 }
 
 /// An advisory lock on a store directory, held for as long as it lives.
@@ -75,12 +91,18 @@ pub struct PimdirLock {
     _file: Option<File>,
     /// The [`OWNED`] key whose count to drop on release.
     registered: Option<PathBuf>,
-    /// The owner lock excludes other processes and nothing inside its own
-    /// (STORAGE §8), so the handles sharing one also share this: a writer
-    /// holds it shared from blob staging through commit, the collector
-    /// exclusively across its row deletion and its file walk. Unused on a
+    /// What the handles sharing an owner lock serialise on. Unused on a
     /// staging lock.
-    writers: Arc<RwLock<()>>,
+    shared: Arc<Shared>,
+}
+
+/// A verb in flight, counted until it drops (STORAGE §5).
+pub struct PimdirRunning<'a>(&'a Shared);
+
+impl Drop for PimdirRunning<'_> {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl PimdirLock {
@@ -94,31 +116,31 @@ impl PimdirLock {
         let key = dir.canonicalize()?;
         let mut owned = OWNED.lock().unwrap_or_else(PoisonError::into_inner);
 
-        let writers = match owned.get_mut(&key) {
+        let shared = match owned.get_mut(&key) {
             Some(entry) => {
                 entry.handles += 1;
-                Arc::clone(&entry.writers)
+                Arc::clone(&entry.shared)
             }
             None => {
                 let file = open(&dir.join(OWNER))?;
                 FileExt::try_lock(&file).map_err(|_| PimdirError::Owned(dir.to_path_buf()))?;
-                let writers = Arc::default();
+                let shared = Arc::default();
                 owned.insert(
                     key.clone(),
                     Owned {
                         _file: file,
                         handles: 1,
-                        writers: Arc::clone(&writers),
+                        shared: Arc::clone(&shared),
                     },
                 );
-                writers
+                shared
             }
         };
 
         Ok(Arc::new(Self {
             _file: None,
             registered: Some(key),
-            writers,
+            shared,
         }))
     }
 
@@ -136,7 +158,7 @@ impl PimdirLock {
         Ok(Self {
             _file: Some(file),
             registered: None,
-            writers: Arc::default(),
+            shared: Arc::default(),
         })
     }
 
@@ -155,7 +177,7 @@ impl PimdirLock {
         Ok(Self {
             _file: Some(file),
             registered: None,
-            writers: Arc::default(),
+            shared: Arc::default(),
         })
     }
 
@@ -163,14 +185,32 @@ impl PimdirLock {
     /// staging through its commit: what keeps the collector out of the
     /// window between a body and its row (STORAGE §8).
     pub fn writing(&self) -> RwLockReadGuard<'_, ()> {
-        self.writers.read().unwrap_or_else(PoisonError::into_inner)
+        self.shared
+            .writers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Holds the process's writer lock exclusively, for the collector's
     /// row deletion and file walk: no writer of this process is between a
     /// body and its row while it runs (STORAGE §5, §8).
     pub fn collecting(&self) -> RwLockWriteGuard<'_, ()> {
-        self.writers.write().unwrap_or_else(PoisonError::into_inner)
+        self.shared
+            .writers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts a verb in flight until the guard drops, so the collector
+    /// knows a body may be streamed with no pointer yet (STORAGE §5).
+    pub fn running(&self) -> PimdirRunning<'_> {
+        self.shared.running.fetch_add(1, Ordering::AcqRel);
+        PimdirRunning(&self.shared)
+    }
+
+    /// Whether a verb of this process is between two of its chunks.
+    pub fn in_flight(&self) -> bool {
+        self.shared.running.load(Ordering::Acquire) > 0
     }
 }
 

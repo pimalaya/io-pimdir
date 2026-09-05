@@ -252,19 +252,47 @@ impl PimdirStore {
     }
 
     /// Gives a collection a new id, its contents following through the
-    /// cascades (§14): the only safe way to change one.
+    /// cascades and its items restamped (§14): the only safe way to change
+    /// one. A pending move or copy naming it as a target follows too, its
+    /// payload being what no cascade reaches.
     pub fn rename_collection(
-        &self,
+        &mut self,
         collection: impl AsRef<str>,
         new_id: &str,
     ) -> Result<(), PimdirError> {
-        self.conn
-            .execute(
-                sql::RENAME_COLLECTION,
-                named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
-            )
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
+        tx.execute(
+            sql::RENAME_QUEUE_TARGETS,
+            named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
+        )?;
+        tx.execute(
+            sql::RENAME_COLLECTION,
+            named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
+        )?;
+        tx.commit().map_err(busy_or_sql)?;
         Ok(())
+    }
+
+    /// Removes a collection with everything under it (§14), reporting
+    /// whether there was one. Retention does not apply: the operator
+    /// removed the collection itself. The pins the cascade drops are
+    /// settled by a recompute in the same transaction; the bodies fall to
+    /// the collector.
+    pub fn delete_collection(&mut self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let deleted = tx.execute(
+            sql::DELETE_COLLECTION,
+            named_params! { ":collection": collection.as_ref() },
+        )?;
+        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(deleted > 0)
     }
 }
 
@@ -333,8 +361,15 @@ impl PimdirStore {
     /// Takes the staging lock exclusively on an owning handle, and the
     /// process's own writer lock exclusively across the rows and the
     /// walk, so no writer is between a body and the row that pins it
-    /// (§8). The rows go inside a transaction and the files after it.
+    /// (§8). A verb of this process between two of its chunks refuses it
+    /// as [`PimdirError::InFlight`], a body it streamed having no pointer
+    /// yet (§5). The counts are recomputed first, so a count a writer left
+    /// behind never decides a delete; the rows go inside a transaction
+    /// and the files after it.
     pub fn collect_garbage(&mut self) -> Result<PimdirGcReport, PimdirError> {
+        if self.lock.in_flight() {
+            return Err(PimdirError::InFlight(self.dir.clone()));
+        }
         let _staging = PimdirLock::collect(&self.dir)?;
         let lock = Arc::clone(&self.lock);
         let _collecting = lock.collecting();
@@ -343,6 +378,7 @@ impl PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
+        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
         let objects = tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
 
@@ -528,12 +564,12 @@ pub enum PimdirError {
         /// The version its `store_meta` row records.
         store_meta: i64,
     },
-    /// The store was created by an earlier draft and lacks a table the
-    /// current schema declares (§6): recreate it, the draft offers no
-    /// migration.
+    /// The store was created by an earlier draft and lacks a table or a
+    /// trigger the current schema declares (§6): recreate it, the draft
+    /// offers no migration.
     Stale {
-        /// The first table found missing.
-        table: &'static str,
+        /// The first table or trigger found missing.
+        missing: &'static str,
     },
     /// The store's `hash_algo` is not one this crate computes, or not the
     /// one the caller declared (§5).
@@ -551,6 +587,9 @@ pub enum PimdirError {
     /// A producer is between its blob write and the enqueue that pins it
     /// (§8), so a collector cannot run.
     Staging(PathBuf),
+    /// A verb of this process is between two of its chunks (§5), so a
+    /// collector cannot run; retry once it has returned.
+    InFlight(PathBuf),
 }
 
 impl fmt::Display for PimdirError {
@@ -586,9 +625,9 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir store is corrupt: PRAGMA user_version is {user_version} but store_meta records {store_meta}"
             ),
-            Self::Stale { table } => write!(
+            Self::Stale { missing } => write!(
                 f,
-                "Pimdir store was written by an earlier draft and lacks the {table} table: delete the store and let it resync"
+                "Pimdir store was written by an earlier draft and lacks {missing}: delete the store and let it resync"
             ),
             Self::HashAlgo {
                 found,
@@ -613,6 +652,11 @@ impl fmt::Display for PimdirError {
             Self::Staging(store) => write!(
                 f,
                 "Pimdir store at {} has a producer staging a body",
+                store.display()
+            ),
+            Self::InFlight(store) => write!(
+                f,
+                "Pimdir store at {} has a verb between two of its chunks",
                 store.display()
             ),
         }

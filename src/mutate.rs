@@ -50,6 +50,11 @@ pub enum PimdirMutation {
         flags: PimdirFlags,
     },
     /// Mark a placement deleted, keeping it as a tombstone until synced.
+    ///
+    /// On a conflicted placement it is the decision: the base adopts the
+    /// revision the conflict recorded, so the remove pushes against what
+    /// the remote holds (SYNC §7). On a pending create it withdraws the
+    /// create, the binding going with the write.
     Remove(PimdirHandle),
     /// Replace a placement's body with locally edited content.
     ///
@@ -75,36 +80,35 @@ pub enum PimdirMutation {
     ///
     /// The next sync pushes a server-side copy, no body re-upload. The
     /// copy takes the source's identity where `target` has it free, and a
-    /// minted one where a live placement there already holds it.
+    /// minted one where a live placement there already holds it, staged
+    /// under the provisional handle that key derives (SYNC §2). Refused
+    /// for a source holding neither a body nor a based binding, since
+    /// nothing could deliver the create.
     Copy {
         /// The source placement to copy.
         handle: PimdirHandle,
         /// The collection to copy it into.
         target: PimdirCollectionId,
-        /// The provisional handle the copy is staged under in `target`.
-        placeholder: PimdirHandle,
     },
     /// Move a placement into `target`: a create there, a tombstone here.
     ///
     /// Whichever half syncs first delivers, the link id sparing a second
     /// copy as [`PimdirChange`](crate::change::PimdirChange) states: the
     /// tombstone's destination is the pending create the store derives
-    /// it from (SYNC §3). A held identity is minted.
+    /// it from (SYNC §3). A held identity is minted, and the create is
+    /// staged under the provisional handle its key derives.
     Move {
         /// The source placement to move.
         handle: PimdirHandle,
         /// The collection to move it into.
         target: PimdirCollectionId,
-        /// The provisional handle the move is staged under in `target`.
-        placeholder: PimdirHandle,
     },
     /// Create a locally-authored item with no remote origin (compose, import).
     ///
     /// Stages a pending create the next sync pushes as an append,
-    /// uploading the body. Reads no existing source.
+    /// uploading the body, under the provisional handle its key derives.
+    /// Reads no existing source.
     Add {
-        /// The provisional handle, rekeyed once the push reports the server's.
-        handle: PimdirHandle,
         /// The item's cross-source link id (a `Message-ID` header).
         link_id: PimdirLinkId,
         /// The initial flag set.
@@ -133,19 +137,10 @@ impl PimdirMutation {
         }
     }
 
-    /// The target and placeholder of a staged create, else `None`.
-    fn create_target(&self) -> Option<(&PimdirCollectionId, &PimdirHandle)> {
+    /// The target of a staged create, else `None`.
+    fn create_target(&self) -> Option<&PimdirCollectionId> {
         match self {
-            Self::Copy {
-                target,
-                placeholder,
-                ..
-            }
-            | Self::Move {
-                target,
-                placeholder,
-                ..
-            } => Some((target, placeholder)),
+            Self::Copy { target, .. } | Self::Move { target, .. } => Some(target),
             _ => None,
         }
     }
@@ -175,6 +170,9 @@ pub enum PimdirMutateError {
     Probed(String),
     /// An `Add` names a link id a live placement already holds.
     LinkExists(String),
+    /// A `Copy` or a `Move` names a placement with neither a body nor a
+    /// based binding, which no create could deliver (SYNC §7).
+    Undeliverable(String),
     /// The caller broke the coroutine contract.
     Arg(PimdirArgError),
 }
@@ -192,6 +190,12 @@ impl fmt::Display for PimdirMutateError {
                 write!(
                     f,
                     "Pimdir MUTATE failed: link id already present: {link_id}"
+                )
+            }
+            Self::Undeliverable(handle) => {
+                write!(
+                    f,
+                    "Pimdir MUTATE failed: handle {handle} holds neither a body nor a base to copy from"
                 )
             }
             Self::Arg(err) => write!(f, "{err}"),
@@ -239,9 +243,10 @@ impl PimdirMutate {
 
     /// Stages the writes for the loaded `source` placement.
     ///
-    /// `key` is the identity a staged create takes in its target. Flag
-    /// sets and removes rewrite the source in place; a copy leaves it
-    /// untouched and stages a pending create in the target.
+    /// `key` is the identity a staged create takes in its target, present
+    /// for a copy or a move only. Flag sets and removes rewrite the source
+    /// in place; a copy leaves it untouched and stages a pending create in
+    /// the target.
     fn writes(&self, mut source: PimdirPlacement, key: Option<PimdirLinkId>) -> Vec<PimdirWriteOp> {
         match &self.mutation {
             PimdirMutation::SetFlags { flags, .. } => {
@@ -253,6 +258,19 @@ impl PimdirMutate {
             }
             PimdirMutation::Remove(_) => {
                 source.status = PimdirStatus::Tombstone;
+                // NOTE: the decision on a divergence (SYNC §7): the base
+                // adopts the revision the conflict recorded, so the remove
+                // is gated on what the remote holds rather than on a
+                // stale base, and the diverging body's pin is released.
+                if let Some(revision) = source.conflict_revision.take() {
+                    source.conflict_object = None;
+                    let base = source.base.get_or_insert_with(|| PimdirBase {
+                        flags: source.flags.clone(),
+                        revision: None,
+                        object: None,
+                    });
+                    base.revision = Some(revision);
+                }
                 vec![PimdirWriteOp::UpsertPlacement(source)]
             }
             PimdirMutation::Edit {
@@ -309,23 +327,14 @@ impl PimdirMutate {
                     PimdirWriteOp::UpsertPlacement(source),
                 ]
             }
-            PimdirMutation::Copy {
-                target,
-                placeholder,
-                ..
-            } => {
-                let create = Self::staged_copy(&source, target, placeholder, key);
+            PimdirMutation::Copy { target, .. } => {
+                let key = key.expect("the key a staged create takes");
+                let create = Self::staged_copy(&source, target, key);
                 vec![PimdirWriteOp::UpsertPlacement(create)]
             }
-            PimdirMutation::Move {
-                target,
-                placeholder,
-                ..
-            } => {
-                let create = source
-                    .link_id
-                    .is_some()
-                    .then(|| Self::staged_copy(&source, target, placeholder, key));
+            PimdirMutation::Move { target, .. } => {
+                let key = key.expect("the key a staged create takes");
+                let create = Self::staged_copy(&source, target, key);
 
                 source.status = PimdirStatus::Tombstone;
                 source.origin = Some(PimdirOrigin {
@@ -333,11 +342,10 @@ impl PimdirMutate {
                     handle: source.handle.clone(),
                 });
 
-                create
-                    .map(PimdirWriteOp::UpsertPlacement)
-                    .into_iter()
-                    .chain([PimdirWriteOp::UpsertPlacement(source)])
-                    .collect()
+                vec![
+                    PimdirWriteOp::UpsertPlacement(create),
+                    PimdirWriteOp::UpsertPlacement(source),
+                ]
             }
             PimdirMutation::Add { .. } => self.create_writes(),
         }
@@ -347,12 +355,11 @@ impl PimdirMutate {
     ///
     /// It carries the source as its [`PimdirOrigin`], so the push is a
     /// server-side copy, and `key` as its identity there, the source's
-    /// own or a minted one.
+    /// own or a minted one, under the provisional handle that key derives.
     fn staged_copy(
         source: &PimdirPlacement,
         target: &PimdirCollectionId,
-        placeholder: &PimdirHandle,
-        key: Option<PimdirLinkId>,
+        key: PimdirLinkId,
     ) -> PimdirPlacement {
         let origin = Some(PimdirOrigin {
             collection: source.collection.clone(),
@@ -361,8 +368,8 @@ impl PimdirMutate {
 
         PimdirPlacement {
             collection: target.clone(),
-            handle: placeholder.clone(),
-            link_id: key,
+            handle: key.provisional(),
+            link_id: Some(key),
             object: source.object.clone(),
             level: source.level,
             summary: source.summary.clone(),
@@ -382,7 +389,6 @@ impl PimdirMutate {
     /// appends it rather than server-copying, plus its object.
     fn create_writes(&self) -> Vec<PimdirWriteOp> {
         let PimdirMutation::Add {
-            handle,
             link_id,
             flags,
             object,
@@ -396,7 +402,7 @@ impl PimdirMutate {
 
         let create = PimdirPlacement {
             collection: self.collection.clone(),
-            handle: handle.clone(),
+            handle: link_id.provisional(),
             link_id: Some(link_id.clone()),
             object: Some(object.hash.clone()),
             level: PimdirLevel::Full,
@@ -462,12 +468,22 @@ impl PimdirCoroutine for PimdirMutate {
                         return PimdirCoroutineState::Complete(Err(err));
                     }
 
-                    if let Some((target, placeholder)) = self.mutation.create_target()
+                    if let Some(target) = self.mutation.create_target()
                         && let Some(hint) = placement.link_id.clone()
                     {
+                        if placement.object.is_none() && placement.base.is_none() {
+                            let err = PimdirMutateError::Undeliverable(handle.as_str().into());
+                            return PimdirCoroutineState::Complete(Err(err));
+                        }
+
                         let collection = target.clone();
-                        let scope =
-                            PimdirLoadScope::Links(vec![hint.clone(), hint.minted(placeholder)]);
+                        // NOTE: a second copy in the target mints over the
+                        // provisional handle the bare key would take, so
+                        // that key is read too (STORAGE §9).
+                        let scope = PimdirLoadScope::Links(vec![
+                            hint.clone(),
+                            hint.minted(&hint.provisional()),
+                        ]);
 
                         debug!("read what {} holds of that identity", collection.as_str());
                         self.source = Some(placement);
@@ -489,10 +505,6 @@ impl PimdirCoroutine for PimdirMutate {
             }
             (State::LoadingTarget, Some(PimdirArg::Load(loaded))) => {
                 let source = self.source.take().expect("the source of a staged create");
-                let (_, placeholder) = self
-                    .mutation
-                    .create_target()
-                    .expect("a mutation staging a create");
                 let hint = source.link_id.clone().expect("a linked source");
                 let held: BTreeSet<PimdirLinkId> = loaded
                     .placements
@@ -501,7 +513,7 @@ impl PimdirCoroutine for PimdirMutate {
                     .filter_map(|p| p.link_id)
                     .collect();
 
-                let key = hint.claim(placeholder, |key| held.contains(key));
+                let key = hint.claim(&hint.provisional(), |key| held.contains(key));
                 let ops = self.writes(source, Some(key));
 
                 debug!("stage local change, {} write(s)", ops.len());

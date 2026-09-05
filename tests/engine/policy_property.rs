@@ -20,10 +20,7 @@ use io_pimdir::{
     object::PimdirObject,
     placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirPlacement, PimdirStatus},
     remote::PimdirTier,
-    sync::{
-        PimdirConflictPolicy, PimdirDeletePolicy, PimdirPushRights, PimdirSyncEvent,
-        PimdirSyncOptions,
-    },
+    sync::{PimdirConflictPolicy, PimdirPushRights, PimdirSyncEvent, PimdirSyncOptions},
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
 
@@ -72,21 +69,15 @@ fn arb_opts() -> impl Strategy<Value = PimdirSyncOptions> {
         any::<bool>(),
         arb_rights(),
         prop_oneof![
-            Just(PimdirDeletePolicy::Revert),
-            Just(PimdirDeletePolicy::Keep)
-        ],
-        prop_oneof![
             Just(PimdirConflictPolicy::Manual),
             Just(PimdirConflictPolicy::PreferLocal),
             Just(PimdirConflictPolicy::PreferRemote),
-            Just(PimdirConflictPolicy::KeepBoth),
         ],
         any::<bool>(),
     )
-        .prop_map(|(push, rights, delete, conflict, full)| PimdirSyncOptions {
+        .prop_map(|(push, rights, conflict, full)| PimdirSyncOptions {
             push,
             rights,
-            delete,
             conflict,
             full,
         })
@@ -215,7 +206,6 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
     well_formed(&client, "after the seeding sync")?;
 
     let mut arrivals = 0usize;
-    let mut placeholders = 0usize;
 
     for op in ops {
         match op {
@@ -267,13 +257,11 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
             }
             PolicyOp::Move(i) => {
                 if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                    placeholders += 1;
                     let _ = client.mutate(
                         "inbox",
                         PimdirMutation::Move {
                             handle,
                             target: "archive".into(),
-                            placeholder: PimdirHandle::from(format!("move-{placeholders}")),
                         },
                     );
                 }
