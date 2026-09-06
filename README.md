@@ -46,11 +46,20 @@ A client that only lists a store, or only queues an action, needs the reader or 
 
 ## Installation
 
-Install the `pimdir` binary from [crates.io](https://crates.io/crates/io-pimdir) with cargo:
+### Pre-built binary
+
+Every tag publishes a `pimdir` binary per platform, with its manual pages, completion scripts and JSON Schemas, under [releases](https://github.com/pimalaya/io-pimdir/releases); a build of the current master is in the *Artifacts* section of the [releases](https://github.com/pimalaya/io-pimdir/actions/workflows/releases.yml) workflow.
+
+> [!NOTE]
+> Those binaries carry `cli` and `vendored`, so each one holds the SQLite it was built with and needs none on the machine it lands on.
+
+### Cargo
 
 ```sh
 cargo install io-pimdir --locked --features cli
 ```
+
+This links the SQLite the machine provides; add `--features cli,vendored` to build one from source instead.
 
 To use io-pimdir as a library, add it to your Cargo.toml: the `cli` feature is not part of the defaults, so a library consumer never compiles the binary or its terminal dependencies.
 
