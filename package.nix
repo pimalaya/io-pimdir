@@ -23,7 +23,7 @@ in
 rustPlatform.buildRustPackage (finalAttrs: {
   __structuredAttrs = true;
 
-  inherit buildFeatures buildNoDefaultFeatures;
+  inherit buildNoDefaultFeatures;
 
   pname = "pimdir";
   version = "0.4.1";
@@ -46,6 +46,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
   ];
 
   buildInputs = lib.optional (!vendored) sqlite;
+
+  buildFeatures = [ "cli" ] ++ buildFeatures;
 
   postInstall =
     let
@@ -71,8 +73,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
         --zsh "$out"/share/completions/_${finalAttrs.pname}
     '';
 
-  # the spec suites need the pimdir checkout beside this one, which a nix
-  # build has not got; tests.yml is where they are proven
   cargoTestFlags = [ "--lib" ];
 
   meta = {

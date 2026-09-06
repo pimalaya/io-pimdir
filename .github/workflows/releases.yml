@@ -12,8 +12,5 @@ jobs:
     uses: pimalaya/nix/.github/workflows/releases.yml@master
     secrets: inherit
     with:
-      # the crate is io-pimdir, the binary it ships is pimdir, and this
-      # names the binary: it globs `result/bin/<project>*` and labels the
-      # release assets
       project: pimdir
       nixpkgs: nixos-25.11
