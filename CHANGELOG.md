@@ -21,6 +21,7 @@ All notable changes to this project are documented in this file. The format is b
 - Added `PimdirRekey::FETCH_CHUNK`: a rekey resolves the new spine in bounded `Meta` fetches.
 - Added the per-store writer lock serialising the collector against the process's own writers.
 - Added the `json-schema` subcommand listing the JSON Schema of every command's `--json` output, and hidden plural aliases (`completions`, `manuals`, `collections`, `items`, `queues`, `stores`) on the CLI verbs.
+- Added `PimdirSourceStore::set_collection_name` and the canonical `set_collection_name` behind it (STORAGE §14): `collections.name` was seeded from the id and never written again, so a namespaced id put its prefix in the label too and a DAV collection addressed by a UUID had no readable name at all.
 
 ### Changed
 

@@ -198,6 +198,31 @@ impl PimdirStore {
         Ok(())
     }
 
+    /// Records what a collection is called, creating the row if absent
+    /// (§14).
+    ///
+    /// The name is a label and the id is the address, so an owner
+    /// namespacing its ids records the bare name here and a reader
+    /// renders it without parsing a prefix it cannot know the shape of.
+    /// Nothing keys on it: moving it costs a label and never a re-sync.
+    pub fn set_collection_name(
+        &self,
+        collection: impl AsRef<str>,
+        name: &str,
+    ) -> Result<(), PimdirError> {
+        self.conn
+            .execute(
+                sql::SET_COLLECTION_NAME,
+                named_params! {
+                    ":collection": collection.as_ref(),
+                    ":account": self.account.as_deref(),
+                    ":name": name,
+                },
+            )
+            .map_err(busy_or_sql)?;
+        Ok(())
+    }
+
     /// Regroups a collection under `account`, or out of one with `None` (§9.2).
     pub fn set_collection_account(
         &self,

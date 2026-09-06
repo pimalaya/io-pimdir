@@ -863,3 +863,9 @@ Every read and write taking a collection SHALL take `impl AsRef<str>`, `PimdirCo
 
 ### Requirement: The schema check covers the triggers
 `check` SHALL verify every table and every trigger the canonical migrations declare, `PimdirError::Stale { missing }` naming the first one absent, since the change feed and the collector's counts are the triggers' and a store lacking one corrupts silently.
+
+### Requirement: SQLite is the system's unless `vendored` says otherwise
+The `client` feature SHALL take `rusqlite` with no features of its own, so the default build links the SQLite the machine provides through pkg-config and a store this crate writes is the one the system's `sqlite3` reads. A `vendored` feature, off by default, SHALL forward to `rusqlite/bundled` for a static target or a platform carrying no library, mirroring what `vendored` does for OpenSSL across the org. No other feature SHALL imply either choice.
+
+### Requirement: A collection's name is a label, never an address
+`collections.name` SHALL be writable independently of `collections.id`: `set_collection_name(collection, name)` moves the label and touches neither the id every foreign key cascades on, the declared kind, nor the account. An owner namespacing its ids SHALL record the bare name there, since the separator is its own convention and a reader cannot strip one it does not know. Nothing keys on the column, so moving it costs a label and never a re-sync; it is observable, so the collection takes a new `changed` stamp and a reader on the feed re-renders.
