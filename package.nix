@@ -17,9 +17,6 @@
 }:
 
 let
-  # `vendored` builds SQLite from source, so a binary carrying it needs no
-  # library on the machine it lands on; without it the store links the
-  # system one through pkg-config.
   vendored = builtins.elem "vendored" buildFeatures;
 
 in
@@ -39,19 +36,16 @@ rustPlatform.buildRustPackage (finalAttrs: {
     hash = "";
   };
 
+  # pkg-config hands the linker libsqlite3 but no rpath, leaving a binary that
+  # cannot find it: not in postInstall, which runs it, nor once installed.
+  env.NIX_LDFLAGS = lib.optionalString (!vendored) ("-rpath " + lib.getLib sqlite + "/lib");
+
   nativeBuildInputs = [
     pkg-config
     installShellFiles
   ];
 
   buildInputs = lib.optional (!vendored) sqlite;
-
-  # rustc hands the linker sqlite's `-L` and nix's wrapper writes no rpath
-  # for it, so a non-vendored binary loads nothing at run time. A vendored
-  # one links its own copy and needs none of this.
-  env = lib.optionalAttrs (!vendored) {
-    RUSTFLAGS = "-C link-arg=-Wl,-rpath,${lib.getLib sqlite}/lib";
-  };
 
   postInstall =
     let

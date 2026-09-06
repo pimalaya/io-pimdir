@@ -17,7 +17,7 @@ Two things make it not a copy of neverest's. The binary is `pimdir` while the cr
 
 - default.nix and package.nix, and `default = ./default.nix` on the flake, so `nix build .#default` and `nix build .#cross-<target>` produce the binary the shared workflow copies.
 - The derivation builds `cli,vendored` unless told otherwise: a released binary carries its own SQLite rather than needing one on the machine it lands on, which is also what makes the static and mingw targets buildable without a cross pkg-config.
-- A non-vendored build stays supported and gains the rpath it needs: rustc hands the linker sqlite's `-L` and nix's wrapper writes no rpath, so without it the binary loads nothing at run time.
+- A non-vendored build stays supported and gains the rpath it needs, through `env.NIX_LDFLAGS` as comodoro does for libdbus: pkg-config hands the linker the library and no rpath, so without it the binary loads nothing at run time.
 - postInstall generates the manual pages, the completion scripts for five shells and the twelve JSON Schemas into share/, which is the payload the release attaches beside the binary.
 - releases.yml on tags and master, release-on-demand.yml for one target and one feature set.
 
