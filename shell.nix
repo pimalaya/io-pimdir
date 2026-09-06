@@ -11,6 +11,7 @@ let
     cargo-deny
     cargo-llvm-cov
     cargo-tarpaulin
+    sqlite
     ;
 
   shell = pimalaya.mkShell {
@@ -24,9 +25,12 @@ let
 
 in
 shell.overrideAttrs (prev: {
+  LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ sqlite ];
+
   buildInputs = (prev.buildInputs or [ ]) ++ [
     cargo-deny
     cargo-llvm-cov
     cargo-tarpaulin
+    sqlite
   ];
 })
