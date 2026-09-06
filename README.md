@@ -40,7 +40,7 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 ## Specification
 
-io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard: the owner store STORAGE.md specifies, with its reader and producer profiles, and the engine SYNC.md describes. The canonical schema and statements are vendored under spec/ and generated into the crate at build time, the summaries follow Annex A, and the engine reproduces the sync vectors. The reference index of SEARCH.md is not implemented yet and will come in a later release.
+io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard: the owner store STORAGE.md specifies, with its reader and producer profiles, and the engine SYNC.md describes. This release implements pimdir draft-01: the canonical schema and statements of that text are vendored under spec/ byte for byte and generated into the crate at build time, the summaries follow Annex A, and the engine reproduces the sync vectors. The reference index of SEARCH.md is not implemented yet and will come in a later release.
 
 A client that only lists a store, or only queues an action, needs the reader or the producer handle and nothing of the engine; the standard's GUIDE.md §1 says what each profile owes, and this crate's handles meet it.
 
