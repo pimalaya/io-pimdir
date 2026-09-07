@@ -16,7 +16,7 @@ in
 pimalaya.mkDefault (
   {
     src = ./.;
-    version = "0.4.1";
+    version = "0.5.0";
     mkPackage = (
       {
         lib,
@@ -35,18 +35,7 @@ pimalaya.mkDefault (
         installShellCompletions = false;
         installManPages = false;
         buildNoDefaultFeatures = !defaultFeatures;
-        # The binary sits behind `cli`, which is deliberately not a default
-        # so a library consumer compiles no terminal dependency, and behind
-        # `vendored`, so a released binary carries its own SQLite instead of
-        # needing one on the machine it lands on.
-        buildFeatures =
-          if features == "" then
-            [
-              "cli"
-              "vendored"
-            ]
-          else
-            lib.splitString "," features;
+        buildFeatures = lib.splitString "," features;
       }
     );
   }
