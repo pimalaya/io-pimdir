@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed a server edit made while an item was in a cross-source conflict being dropped silently: the binding is now marked conflicted with the new revision, whatever the source's policy (pimdir draft-02, SYNC §5).
+- Fixed a `Remove` settling a conflict leaving a base that paired the old body with the new revision, so a later revival read the server as in sync (SYNC §7).
+
 ## [0.5.0] - 2026-09-07
 
 ### Added
@@ -383,6 +390,7 @@ All notable changes to this project are documented in this file. The format is b
 - Collection generations (spec §15): the handle-space epoch on PimdirCollection and generation(), bumped atomically with a rebuild batch by write_rekeyed().
 - Read-only store open (open_read_only): opens an existing store with SQLITE_OPEN_READ_ONLY, never creates anything, refuses any other schema version, and exposes the full read surface for frontend processes that must be unable to write.
 
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.5.0..HEAD
 [0.5.0]: https://github.com/pimalaya/io-pimdir/compare/v0.4.1..v0.5.0
 [0.4.1]: https://github.com/pimalaya/io-pimdir/compare/v0.4.0..v0.4.1
 [0.4.0]: https://github.com/pimalaya/io-pimdir/compare/v0.3.0..v0.4.0

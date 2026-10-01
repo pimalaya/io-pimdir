@@ -259,17 +259,19 @@ impl PimdirMutate {
             PimdirMutation::Remove(_) => {
                 source.status = PimdirStatus::Tombstone;
                 // NOTE: the decision on a divergence (SYNC §7): the base
-                // adopts the revision the conflict recorded, so the remove
-                // is gated on what the remote holds rather than on a
-                // stale base, and the diverging body's pin is released.
+                // adopts the revision and body the conflict recorded, as
+                // an edit does, so the remove is gated on what the remote
+                // holds; an unfetched body leaves the base's unknown,
+                // never the old one, so a revival reads `Dirty`.
                 if let Some(revision) = source.conflict_revision.take() {
-                    source.conflict_object = None;
+                    let settled = source.conflict_object.take();
                     let base = source.base.get_or_insert_with(|| PimdirBase {
                         flags: source.flags.clone(),
                         revision: None,
                         object: None,
                     });
                     base.revision = Some(revision);
+                    base.object = settled;
                 }
                 vec![PimdirWriteOp::UpsertPlacement(source)]
             }
@@ -1508,6 +1510,52 @@ mod tests {
             "measured against the remote state it settled",
         );
         assert_eq!(base.object, Some(PimdirHash::from("remote")));
+    }
+
+    fn remove_diverged(conflict_object: Option<PimdirHash>) -> PimdirPlacement {
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = PimdirStatus::Conflict;
+        loaded.placements[0].conflict_revision = Some("r2".into());
+        loaded.placements[0].conflict_object = conflict_object;
+        loaded.placements[0].base = Some(PimdirBase {
+            flags: PimdirFlags::default(),
+            revision: Some("r1".into()),
+            object: Some(PimdirHash::from("h1")),
+        });
+
+        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+        let ops = match mutate.resume(Some(PimdirArg::Load(loaded))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(p.status, PimdirStatus::Tombstone);
+        assert_eq!(p.conflict_revision, None, "the divergence is settled");
+        assert_eq!(p.conflict_object, None);
+        p.clone()
+    }
+
+    /// A remove settling a divergence adopts its fetched body as the base.
+    #[test]
+    fn a_remove_adopts_the_fetched_diverging_body() {
+        let p = remove_diverged(Some(PimdirHash::from("remote")));
+        let base = p.base.expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r2"));
+        assert_eq!(base.object, Some(PimdirHash::from("remote")));
+    }
+
+    /// An unfetched diverging body leaves the base's unknown, never the old.
+    #[test]
+    fn a_remove_never_pairs_the_old_body_with_the_new_revision() {
+        let p = remove_diverged(None);
+        let base = p.base.expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r2"));
+        assert_eq!(base.object, None, "h1 is not what the remote holds at r2");
     }
 
     /// A failure names its cause, a contract break riding as the source.

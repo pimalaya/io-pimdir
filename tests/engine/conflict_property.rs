@@ -622,3 +622,45 @@ fn a_delete_elsewhere_does_not_swallow_a_local_divergence() {
     ])
     .unwrap();
 }
+
+/// A server edit landing while the item is conflicted is recorded.
+///
+/// The placement projects the item's conflict with no revision of its own,
+/// and the delta lists the edited member once: skipping it there left the
+/// source diverged from its server with nothing reported (SYNC §5).
+#[test]
+fn an_item_conflict_does_not_hide_a_server_edit() {
+    check_conflict_model(vec![
+        ConflictOp::Edit(8089635574607175413, 5840897801265340469, 0),
+        ConflictOp::Sync(2252840766273600329),
+        ConflictOp::Edit(708511662345375018, 2425387062199730659, 1),
+        ConflictOp::ServerEdit(817242067714251277, 9561676652060422255, 0),
+        ConflictOp::Remove(0, 1187225718968202926),
+        ConflictOp::Sync(187819748482576969),
+        ConflictOp::Sync(320385055380388116),
+        ConflictOp::ServerEdit(1486278711845847894, 0, 0),
+        ConflictOp::Remove(0, 0),
+    ])
+    .unwrap();
+}
+
+/// A remove settling a divergence never pairs an old body with a new revision.
+///
+/// The base claimed the server held its old body at the observed revision,
+/// so once another source's edit revived the item the source read its
+/// server as in sync (SYNC §7).
+#[test]
+fn a_remove_settling_a_divergence_leaves_no_false_base() {
+    check_conflict_model(vec![
+        ConflictOp::Edit(16838380586123230907, 7364332625439662501, 234),
+        ConflictOp::Sync(15912438296197527623),
+        ConflictOp::Edit(15977273743644341664, 4044429169570956081, 238),
+        ConflictOp::ServerEdit(5805560717581819975, 15643808883992181873, 202),
+        ConflictOp::Remove(8941018803540869082, 1878029773367891722),
+        ConflictOp::Sync(8835900674930711871),
+        ConflictOp::Sync(11578306373923721664),
+        ConflictOp::ServerEdit(15408778193444608560, 3267151502060249558, 139),
+        ConflictOp::Remove(2569513160168011899, 4138144611257170816),
+    ])
+    .unwrap();
+}

@@ -624,7 +624,15 @@ impl PimdirSync {
         if local.status == PimdirStatus::Conflict {
             // NOTE: a `Conflict` the item carries rather than the binding
             // (SYNC §3) records no revision here and is settled by an edit
-            // or a remove, never by this axis.
+            // or a remove, never by this axis; a server edit meeting it is
+            // still recorded on the binding, whatever the policy, since a
+            // delta never lists the member again (SYNC §5).
+            if local.conflict_revision.is_none()
+                && item.revision.is_some()
+                && item.revision != base.revision
+            {
+                return self.mark_conflict(local, item);
+            }
             if local.conflict_revision.is_some()
                 && item.revision.is_some()
                 && item.revision != local.conflict_revision
@@ -2651,6 +2659,33 @@ mod tests {
         assert_eq!(
             tracked.conflict_object, None,
             "the body of the revision that moved is asked for anew"
+        );
+    }
+
+    /// A delta lists a server edit once, so the item's conflict cannot hide it.
+    #[test]
+    fn an_item_conflict_records_a_server_edit_whatever_the_policy() {
+        let mut placement = edited("1");
+        placement.status = PimdirStatus::Conflict;
+
+        let opts = PimdirSyncOptions {
+            conflict: PimdirConflictPolicy::PreferRemote,
+            ..Default::default()
+        };
+        let mut sync = PimdirSync::new("inbox", opts);
+        let (pushes, writes, report) = run(&mut sync, vec![placement], vec![remote_rev("1", "r2")]);
+
+        assert!(pushes.is_none(), "the item's conflict is still open");
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(report.events, [PimdirSyncEvent::Conflicted("1".into())]);
+        let conflicted = upserted(&writes, "1").expect("a conflicted binding");
+        assert_eq!(conflicted.status, PimdirStatus::Conflict);
+        assert_eq!(conflicted.conflict_revision.as_deref(), Some("r2"));
+        assert_eq!(conflicted.conflict_object, None, "the body is wanted");
+        assert_eq!(
+            conflicted.object,
+            Some(PimdirHash::from("h2")),
+            "nothing pulled"
         );
     }
 

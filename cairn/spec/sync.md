@@ -137,12 +137,17 @@ A `Created` placement SHALL derive no `Add` while the collection holds a probe, 
 - THEN nothing is pushed until those members are named, and the next sync appends the create
 
 ### Requirement: An item-level conflict is held, a binding conflict is reconciled
-`reconcile_content` SHALL take its conflict branch only for a placement carrying a `conflict_revision`, the divergence between this source and its own remote. A `Conflict` placement carrying none is the item's cross-source conflict projected onto this source ([hub](hub.md)) and SHALL derive nothing, a pending create under it included, until an `Edit` or a `Remove` settles the item (pimdir SYNC §3, §7).
+`reconcile_content` SHALL take its conflict branch for a placement carrying a `conflict_revision`, the divergence between this source and its own remote. A `Conflict` placement carrying none is the item's cross-source conflict projected onto this source ([hub](hub.md)): it SHALL derive no push, a pending create under it included, until an `Edit` or a `Remove` settles the item (pimdir SYNC §3, §7). A remote revision its base does not hold SHALL still be recorded, whatever the conflict policy: the binding is marked conflicted with that revision and its diverging body wanted, reported as `Conflicted`, since an incremental enumeration never lists the member again (pimdir SYNC §5, vectors/sync/33).
 
 #### Scenario: Two sources diverged under `manual`
 - GIVEN an item flagged conflicted by the hub, every binding projecting `Conflict` with no revision
-- WHEN either source is synced
+- WHEN either source is synced and its remote lists nothing new
 - THEN nothing is pushed and nothing is re-marked, until an edit through one source settles it
+
+#### Scenario: A server edit lands while the item is conflicted
+- GIVEN an item flagged conflicted by the hub, and one source's remote listing the member at a revision past that binding's base
+- WHEN that source is synced
+- THEN the binding is marked conflicted with the listed revision, its body wanted, and the run reports one conflict
 
 ### Requirement: A push is counted when it matched
 `PimdirSyncReport::pushed` SHALL count the changes this run derived and the remote accepted, not the results the consumer reported: a result naming a handle nobody pushed, or naming one twice, cannot inflate it.
