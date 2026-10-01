@@ -23,8 +23,8 @@ jobs:
         with:
           repository: pimalaya/pimdir
           path: pimdir
-      # The default build links the system SQLite; only `vendored` builds
-      # its own, so the library has to be there before anything compiles.
+      # The system link, the one Nix builds and consumers turning `vendored`
+      # off take, needs the library before anything compiles.
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,9 +38,9 @@ jobs:
         working-directory: io-pimdir
       - run: cargo test --all-features
         working-directory: io-pimdir
-      # --all-features turns `vendored` on, so the default link is proven
-      # on its own or it is never built here at all.
-      - run: cargo test --features cli
+      # The defaults and --all-features both turn `vendored` on, so the
+      # system link is proven on its own or it is never built here at all.
+      - run: cargo test --no-default-features --features cli
         working-directory: io-pimdir
       # The integration tests need the client, so the no_std core is
       # proven by its unit tests alone.
