@@ -51,7 +51,7 @@ A client that only lists a store, or only queues an action, needs the reader or 
 Every tag publishes a `pimdir` binary per platform, with its manual pages, completion scripts and JSON Schemas, under [releases](https://github.com/pimalaya/io-pimdir/releases); a build of the current master is in the *Artifacts* section of the [releases](https://github.com/pimalaya/io-pimdir/actions/workflows/releases.yml) workflow.
 
 > [!NOTE]
-> Those binaries are Nix builds, which leave the default `vendored` feature out and link the SQLite of the Nix store instead.
+> Those binaries are Nix builds, which leave the default `vendored` feature out and link the SQLite of the Nix store statically instead, so they need none on the machine either.
 
 ### Cargo
 
