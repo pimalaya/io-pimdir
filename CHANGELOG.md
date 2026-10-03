@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-03
+
 ### Added
 
 - Added capabilities (pimdir draft-03, STORAGE §15.6, Annex B): the `capability` module (the vocabulary, `PimdirSupport`, `PimdirCapability`, `required`, `required_by_content`, `check`), the `capabilities` and `performers` tables, created on open in a store written by 0.5, and `PimdirStore::declare`.
@@ -408,7 +410,8 @@ All notable changes to this project are documented in this file. The format is b
 - Collection generations (spec §15): the handle-space epoch on PimdirCollection and generation(), bumped atomically with a rebuild batch by write_rekeyed().
 - Read-only store open (open_read_only): opens an existing store with SQLITE_OPEN_READ_ONLY, never creates anything, refuses any other schema version, and exposes the full read surface for frontend processes that must be unable to write.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.5.1..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.6.0..HEAD
+[0.6.0]: https://github.com/pimalaya/io-pimdir/compare/v0.5.1..v0.6.0
 [0.5.1]: https://github.com/pimalaya/io-pimdir/compare/v0.5.0..v0.5.1
 [0.5.0]: https://github.com/pimalaya/io-pimdir/compare/v0.4.1..v0.5.0
 [0.4.1]: https://github.com/pimalaya/io-pimdir/compare/v0.4.0..v0.4.1
