@@ -26,14 +26,16 @@ use rusqlite::{
 };
 
 use crate::{
+    capability::{PimdirCapability, PimdirRefusal},
     client::{lock::PimdirLock, reader::PimdirReader},
-    codec::{self, PimdirActionError},
+    codec::{self, PimdirAction, PimdirActionError},
     hash::PimdirHashAlgo,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
     sql,
 };
 
 pub mod blobs;
+mod capability;
 pub mod diagnostics;
 pub mod producer;
 pub mod reader;
@@ -442,8 +444,26 @@ impl PimdirStore {
     }
 }
 
-/// The queue's owner side (§15): cancelling and recording failures.
+/// The queue's owner side (§15): declaring, cancelling and recording failures.
 impl PimdirStore {
+    /// Declares what `source` can do (§15.6), under the account this handle
+    /// is bound to, replacing its previous declaration in one transaction. A declaration writes every
+    /// capability of the kinds the source syncs, `none` included, so a
+    /// source with no row stays the undeclared one of an older owner.
+    pub fn declare(
+        &mut self,
+        source: &str,
+        capabilities: &[PimdirCapability],
+    ) -> Result<(), PimdirError> {
+        let account = self.account.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        capability::declare(&tx, account.as_deref(), source, capabilities)?;
+        tx.commit().map_err(busy_or_sql)
+    }
+
     /// Cancels one queue row as the store's owner, holding the role for
     /// the length of the call (§15.5); the store must exist already.
     pub fn cancel_action(dir: impl AsRef<Path>, id: i64) -> Result<bool, PimdirError> {
@@ -473,6 +493,54 @@ impl PimdirStore {
         };
 
         release_pins(&tx, hash.into_iter())?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(true)
+    }
+
+    /// Acknowledges the performed intent `id` by replacing it with the
+    /// store change it leaves behind, `action` on `collection` enqueued
+    /// under `producer` (§15.5): the change's body is pinned before the
+    /// intent's pin is released, in one transaction, so the change exists
+    /// only once the intent is performed. Reports whether the intent was
+    /// still queued; when it was not, nothing is enqueued.
+    pub fn replace_action(
+        &mut self,
+        id: i64,
+        producer: &str,
+        collection: &str,
+        action: &PimdirAction,
+    ) -> Result<bool, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+
+        let hash = action.object_hash().cloned();
+        if let Some(hash) = &hash {
+            tx.execute(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
+        }
+        tx.execute(
+            sql::ENQUEUE_ACTION,
+            named_params! {
+                ":producer": producer,
+                ":collection": collection,
+                ":action": action.kind(),
+                ":payload": codec::action_to_payload(action),
+                ":object_hash": hash.as_ref().map(|h| h.0.as_str()),
+            },
+        )?;
+
+        let pin: Option<Option<String>> = tx
+            .query_row(sql::CANCEL_ACTION, named_params! { ":id": id }, |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(pin) = pin else {
+            // NOTE: dropping the transaction rolls the enqueue back.
+            return Ok(false);
+        };
+
+        release_pins(&tx, pin.into_iter())?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(true)
     }
@@ -615,6 +683,22 @@ pub enum PimdirError {
     /// A verb of this process is between two of its chunks (§5), so a
     /// collector cannot run; retry once it has returned.
     InFlight(PathBuf),
+    /// A declared source does not support a capability the action needs
+    /// (§15.6), so it is not enqueued, or the owner parks it.
+    Unsupported(PimdirRefusal),
+    /// No source of the account declares the intent capability (§15.6).
+    NoPerformer {
+        /// The intent capability.
+        capability: String,
+    },
+    /// Several sources of the account could perform the intent and the user
+    /// has chosen none (§15.6): the producer does not pick.
+    Ambiguous {
+        /// The intent capability.
+        capability: String,
+        /// The sources declaring it.
+        candidates: Vec<String>,
+    },
 }
 
 impl fmt::Display for PimdirError {
@@ -684,6 +768,18 @@ impl fmt::Display for PimdirError {
                 "Pimdir store at {} has a verb between two of its chunks",
                 store.display()
             ),
+            Self::Unsupported(refusal) => write!(f, "{refusal}"),
+            Self::NoPerformer { capability } => {
+                write!(f, "No source of this account supports {capability}")
+            }
+            Self::Ambiguous {
+                capability,
+                candidates,
+            } => write!(
+                f,
+                "Several sources can perform {capability} ({}): choose one",
+                candidates.join(", ")
+            ),
         }
     }
 }
@@ -693,6 +789,12 @@ impl std::error::Error for PimdirError {}
 impl From<rusqlite::Error> for PimdirError {
     fn from(err: rusqlite::Error) -> Self {
         Self::Sql(err)
+    }
+}
+
+impl From<PimdirRefusal> for PimdirError {
+    fn from(refusal: PimdirRefusal) -> Self {
+        Self::Unsupported(refusal)
     }
 }
 

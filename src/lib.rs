@@ -89,6 +89,7 @@ macro_rules! pimdir_id {
 
 pub(crate) use pimdir_id;
 
+pub mod capability;
 pub mod change;
 pub mod codec;
 pub mod collection;

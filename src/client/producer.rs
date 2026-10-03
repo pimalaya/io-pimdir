@@ -20,11 +20,12 @@ use rusqlite::{
 };
 
 use crate::{
+    capability::{PimdirPartial, PimdirSourceCapabilities},
     change::PimdirWriteOp,
     client::{
         PimdirError, PimdirSourceStore,
         blobs::PimdirBlobs,
-        busy_or_sql,
+        busy_or_sql, capability,
         lock::PimdirLock,
         reader::{PimdirItem, item_from_row},
         rows, schema, write,
@@ -118,12 +119,19 @@ impl PimdirProducer {
     /// `object`, hash and size together, the pin of the hash the action
     /// names, and the insert. SQLite stamps `created_at`. A body the store
     /// already indexes may be passed again or left out.
+    ///
+    /// The action passes the gate of §15.6 first: one a declared source
+    /// does not support is [`PimdirError::Unsupported`] and nothing is
+    /// written, an intent without a performer [`PimdirError::NoPerformer`]
+    /// or [`PimdirError::Ambiguous`]. [`check`](Self::check) runs the
+    /// gate alone, for the partial supports worth showing.
     pub fn enqueue(
         &mut self,
         collection: &str,
         action: &PimdirAction,
         object: Option<&PimdirObject>,
     ) -> Result<i64, PimdirError> {
+        capability::gate(&self.conn, &self.blobs, collection, action)?;
         let hash = action.object_hash().cloned();
 
         let tx = self
@@ -156,6 +164,37 @@ impl PimdirProducer {
         let id = tx.last_insert_rowid();
         tx.commit().map_err(busy_or_sql)?;
         Ok(id)
+    }
+
+    /// Runs an action through the gate of §15.6 without enqueueing it,
+    /// returning the partial supports it passes with.
+    pub fn check(
+        &self,
+        collection: &str,
+        action: &PimdirAction,
+    ) -> Result<Vec<PimdirPartial>, PimdirError> {
+        capability::gate(&self.conn, &self.blobs, collection, action)
+    }
+
+    /// Resolves who performs an intent capability anchored on `collection`
+    /// (§15.6): `chosen` when the user named a candidate for this action,
+    /// else the single candidate, else the recorded choice. An intent
+    /// addressing an item is anchored on the item's collection.
+    pub fn performer(
+        &self,
+        collection: &str,
+        capability: &str,
+        chosen: Option<&str>,
+    ) -> Result<String, PimdirError> {
+        capability::resolve_performer(&self.conn, collection, capability, chosen)
+    }
+
+    /// What every source syncing `collection` can do there (§15.6).
+    pub fn capabilities(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
+        capability::at_collection(&self.conn, collection)
     }
 
     /// The collection's pending actions in append order, the producer's
@@ -404,6 +443,26 @@ impl PimdirSourceStore {
             return Ok(PimdirOutcome::Skipped);
         }
 
+        if let PimdirAction::SetPerformer { capability, source } = action {
+            match capability::set_performer(&tx, collection, capability, source.as_deref()) {
+                Err(PimdirError::Unsupported(refusal)) => {
+                    return Ok(PimdirOutcome::Parked(refusal.to_string()));
+                }
+                result => result?,
+            }
+            tx.commit().map_err(busy_or_sql)?;
+            return Ok(PimdirOutcome::Applied);
+        }
+
+        // NOTE: the owner's backstop (§15.6): what a producer should have
+        // refused is parked here rather than pushed and rejected later.
+        match capability::gate(&tx, &blobs, collection, action) {
+            Err(PimdirError::Unsupported(refusal)) => {
+                return Ok(PimdirOutcome::Parked(refusal.to_string()));
+            }
+            result => result?,
+        };
+
         let acting = acting_source(&tx, &self.source, collection)?;
         let (source, ops) = match stage_action(&tx, &blobs, &acting, collection, action)? {
             Ok(staged) => staged,
@@ -556,6 +615,7 @@ fn stage_action(
         | PimdirAction::Update { seq, .. } => (*seq, false),
         PimdirAction::Remove { seq } => (*seq, true),
         PimdirAction::Add { .. } => unreachable!("add staged above"),
+        PimdirAction::SetPerformer { .. } => unreachable!("set-performer applied above"),
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
     let item: Option<PimdirItem> = tx
@@ -641,6 +701,7 @@ fn stage_action(
             }
         }
         PimdirAction::Add { .. } => unreachable!("add staged above"),
+        PimdirAction::SetPerformer { .. } => unreachable!("set-performer applied above"),
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
 

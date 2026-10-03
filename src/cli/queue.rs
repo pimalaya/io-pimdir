@@ -174,6 +174,9 @@ fn summary(action: &PimdirAction) -> String {
         PimdirAction::Move { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Copy { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Update { seq, object } => format!("seq {seq}, object {}", object.0),
+        PimdirAction::SetPerformer { capability, source } => {
+            format!("{capability} -> {}", source.as_deref().unwrap_or("none"))
+        }
         // NOTE: an owner-defined intent this build has no semantics for,
         // so its payload is printed verbatim.
         PimdirAction::Unknown { payload, .. } => payload.clone(),

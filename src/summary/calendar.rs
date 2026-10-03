@@ -7,6 +7,7 @@
 //! the `VTIMEZONE` the resource itself carries and nothing else.
 
 use alloc::{
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -487,6 +488,67 @@ fn nth_weekday(year: i32, month: u32, ordinal: i32, weekday: u32) -> Option<u32>
     };
 
     (1..=length as i32).contains(&day).then_some(day as u32)
+}
+
+/// Whether a resource asks its source to notify its attendees (STORAGE
+/// Annex B.1): a component naming an `ATTENDEE` with some `ORGANIZER` or
+/// `ATTENDEE` not marked `SCHEDULE-AGENT=CLIENT` or `NONE`.
+pub fn scheduled(body: &[u8]) -> bool {
+    components(body).iter().any(|component| {
+        let people: Vec<&PimdirContentLine> = component
+            .lines
+            .iter()
+            .filter(|line| line.is("ATTENDEE") || line.is("ORGANIZER"))
+            .collect();
+        let server = |line: &&PimdirContentLine| {
+            !line.param("SCHEDULE-AGENT").is_some_and(|agent| {
+                agent.eq_ignore_ascii_case("CLIENT") || agent.eq_ignore_ascii_case("NONE")
+            })
+        };
+
+        people.iter().any(|line| line.is("ATTENDEE")) && people.iter().any(server)
+    })
+}
+
+/// The components carrying `RECURRENCE-ID`, `DTSTAMP` and `LAST-MODIFIED`
+/// aside, in an order two equal sets share, so an update changing an
+/// occurrence compares unequal (Annex B.1).
+pub fn occurrences(body: &[u8]) -> Vec<Vec<String>> {
+    let mut occurrences: Vec<Vec<String>> = components(body)
+        .iter()
+        .filter(|component| component.line("RECURRENCE-ID").is_some())
+        .map(|component| {
+            let mut lines: Vec<String> = component
+                .lines
+                .iter()
+                .filter(|line| !line.is("DTSTAMP") && !line.is("LAST-MODIFIED"))
+                .map(|line| format!("{}{:?}:{}", line.name, line.params, line.value))
+                .collect();
+            lines.sort();
+            lines
+        })
+        .collect();
+    occurrences.sort();
+    occurrences
+}
+
+/// Whether a component asks for an online meeting of the source's
+/// provider, `X-PIMDIR-ONLINE-MEETING:TRUE` (Annex B.1).
+pub fn online_meeting(body: &[u8]) -> bool {
+    components(body).iter().any(|component| {
+        component
+            .value("X-PIMDIR-ONLINE-MEETING")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("TRUE"))
+    })
+}
+
+/// Every component under the resource's `VCALENDAR`, time zones aside.
+fn components(body: &[u8]) -> Vec<Component> {
+    parse(&unfold(body, false))
+        .into_iter()
+        .flat_map(|root| root.children)
+        .filter(|child| child.name != "VTIMEZONE")
+        .collect()
 }
 
 /// One `BEGIN`/`END` block and what it holds.

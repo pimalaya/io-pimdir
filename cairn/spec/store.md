@@ -869,3 +869,23 @@ The `client` feature SHALL take `rusqlite` with no features of its own, so the d
 
 ### Requirement: A collection's name is a label, never an address
 `collections.name` SHALL be writable independently of `collections.id`: `set_collection_name(collection, name)` moves the label and touches neither the id every foreign key cascades on, the declared kind, nor the account. An owner namespacing its ids SHALL record the bare name there, since the separator is its own convention and a reader cannot strip one it does not know. Nothing keys on the column, so moving it costs a label and never a re-sync; it is observable, so the collection takes a new `changed` stamp and a reader on the feed re-renders.
+
+### Requirement: A producer's enqueue is gated on the declared capabilities
+`PimdirProducer::enqueue` SHALL refuse with `PimdirError::Unsupported`, naming capability, source and detail, an action a declared source concerned does not support (pimdir STORAGE §15.6, Annex B.1), reading a calendar write's new and current resources from the blob store for scheduling, occurrence changes and online meetings; an undeclared source gates nothing. `PimdirProducer::check` SHALL run the same gate without enqueueing and answer the partial supports, whose detail a producer shows. An intent with no resolvable performer SHALL be `NoPerformer` or `Ambiguous`, checked once its account has declared anything.
+
+#### Scenario: A scheduled event on a source that notifies nobody
+- **GIVEN** a calendar source declaring `calendar.scheduling` `none`
+- **WHEN** a producer enqueues an event naming an attendee with no `SCHEDULE-AGENT`
+- **THEN** it is refused with `calendar.scheduling`, and the same event marked `SCHEDULE-AGENT=NONE` is queued
+
+### Requirement: The drain parks what a declared source does not support
+The drain SHALL run the gate again before applying an action and park one a declared source does not support, the capability named in the error, and SHALL apply `set-performer` as `set_performer` or `delete_performer` for the account of its anchor.
+
+### Requirement: An intent's candidates are read at its anchor
+The candidates of an intent SHALL be the account's sources whose row at the anchor collection, its own or else the source-wide one, has some support (`list_capability_sources`). With several, the performer is the latest `set-performer` still queued for the account and capability, else the recorded one, while it is a candidate.
+
+### Requirement: A performed intent is replaced by the change it leaves
+`PimdirStore::replace_action` SHALL enqueue the change, pin its body, then cancel the intent and release the intent's pin, in one transaction, enqueueing nothing when the intent is gone (STORAGE §15.5).
+
+### Requirement: The capability tables reconcile on open
+Opening a store written before capabilities SHALL create `capabilities` and `performers` from the canonical migration, and a reader of a store lacking them SHALL read every source as undeclared.

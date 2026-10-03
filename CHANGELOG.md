@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Added capabilities (pimdir draft-03, STORAGE §15.6, Annex B): the `capability` module (the vocabulary, `PimdirSupport`, `PimdirCapability`, `required`, `required_by_content`, `check`), the `capabilities` and `performers` tables, created on open in a store written by 0.5, and `PimdirStore::declare`.
+- Added the producer's gate: `PimdirProducer::enqueue` refuses an action a declared source does not support with `PimdirError::Unsupported`, reading a calendar write's resources for scheduling, occurrence changes and online meetings, and `PimdirProducer::check` returns the partial supports to show.
+- Added performers: `PimdirAction::SetPerformer`, `PimdirProducer::performer`, `PimdirReader::performers`, `PimdirError::NoPerformer` and `PimdirError::Ambiguous`. A choice holds from the moment it is queued.
+- Added `PimdirStore::replace_action`, acknowledging a performed intent with the store change it leaves, such as the copy of a sent message.
+- Added `PimdirReader::capabilities` and `item_capabilities`, and `summary::calendar::scheduled`, `occurrences` and `online_meeting`.
+
+### Changed
+
+- Changed the drain to park an action a declared source does not support, naming the capability, and to apply `set-performer`.
+
 ## [0.5.1] - 2026-10-01
 
 ### Changed

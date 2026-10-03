@@ -4,7 +4,7 @@
 //! crate does not read: a newer version, disagreeing stamps, an earlier
 //! draft's shape, a foreign hash.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params};
 
@@ -73,7 +73,50 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
         tx.commit().map_err(busy_or_sql)?;
     }
 
+    reconcile(conn)?;
     check(conn)
+}
+
+/// The tables a later draft added to version 1 that a store from an earlier
+/// one can take as they are (§6): the owner creates them on open, from the
+/// canonical DDL, instead of refusing the store. Readers and producers
+/// read their absence as nothing declared.
+const RECONCILED: [&str; 2] = ["capabilities", "performers"];
+
+/// Creates the [`RECONCILED`] tables a store lacks, each with its key, in
+/// one transaction.
+fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(busy_or_sql)?;
+    for table in RECONCILED {
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            tx.execute_batch(&ddl(table))?;
+        }
+    }
+    tx.commit().map_err(busy_or_sql)
+}
+
+/// The canonical statements creating `table` and its key index, cut out
+/// of the first migration so they never drift from it.
+fn ddl(table: &str) -> String {
+    let schema = sql::MIGRATION_0001;
+    let cut = |start: &str, end: &str| {
+        let from = schema.find(start).expect("canonical DDL");
+        let to = from + schema[from..].find(end).expect("canonical DDL") + end.len();
+        String::from(&schema[from..to])
+    };
+    cut(&format!("CREATE TABLE {table} ("), ") STRICT;")
+        + "\n"
+        + &cut(&format!("CREATE UNIQUE INDEX {table}_key"), ";")
 }
 
 /// Refuses a store stamped at the current version that this crate does

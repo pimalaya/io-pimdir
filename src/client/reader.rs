@@ -24,9 +24,11 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params};
 
 use crate::{
+    capability::PimdirSourceCapabilities,
     client::{
         PimdirError,
         blobs::PimdirBlobs,
+        capability,
         producer::{PimdirParkedAction, PimdirPendingAction, overlaid_actions, pending_actions},
         rows, schema,
         write::{
@@ -891,6 +893,37 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
         let collection = collection.as_ref();
         pending_actions(&self.conn, Some(collection))
+    }
+
+    /// What every source syncing `collection` can do there (§15.6).
+    pub fn capabilities(
+        &self,
+        collection: impl AsRef<str>,
+    ) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
+        capability::at_collection(&self.conn, collection.as_ref())
+    }
+
+    /// What every source binding the item `seq` of `collection` can do
+    /// there (§15.6).
+    pub fn item_capabilities(
+        &self,
+        collection: impl AsRef<str>,
+        seq: i64,
+    ) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
+        capability::at_item(&self.conn, collection.as_ref(), seq)
+    }
+
+    /// The sources of `account` able to perform an intent capability, and
+    /// the one the user chose among them, if any (§15.6).
+    pub fn performers(
+        &self,
+        account: Option<&str>,
+        capability: &str,
+    ) -> Result<(Vec<String>, Option<String>), PimdirError> {
+        Ok((
+            capability::candidates(&self.conn, account, None, capability)?,
+            capability::chosen(&self.conn, account, capability)?,
+        ))
     }
 
     /// Every parked action across the store, in append order.

@@ -137,6 +137,15 @@ pub enum PimdirAction {
         /// The new body's hash, written durably by the producer before enqueueing.
         object: PimdirHash,
     },
+    /// Record the source performing an intent capability for the account
+    /// of the collection the action is anchored on (§15.6), or withdraw
+    /// the choice when `source` is `None`.
+    SetPerformer {
+        /// The intent capability (Annex B.2).
+        capability: String,
+        /// The source the user chose.
+        source: Option<String>,
+    },
     /// An application's own intent, which the store skips rather than parks.
     ///
     /// The owner that recognises the kind performs it out of band and
@@ -161,6 +170,7 @@ impl PimdirAction {
             Self::Move { .. } => "move",
             Self::Copy { .. } => "copy",
             Self::Update { .. } => "update",
+            Self::SetPerformer { .. } => "set-performer",
             Self::Unknown { kind, .. } => kind,
         }
     }
@@ -171,9 +181,11 @@ impl PimdirAction {
             Self::Add { object, .. } => object.as_ref(),
             Self::Update { object, .. } => Some(object),
             Self::Unknown { object_hash, .. } => object_hash.as_ref(),
-            Self::SetFlags { .. } | Self::Remove { .. } | Self::Move { .. } | Self::Copy { .. } => {
-                None
-            }
+            Self::SetFlags { .. }
+            | Self::Remove { .. }
+            | Self::Move { .. }
+            | Self::Copy { .. }
+            | Self::SetPerformer { .. } => None,
         }
     }
 }
@@ -242,6 +254,12 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             map.insert("seq".into(), json!(seq));
             map.insert("object".into(), json!(object.0));
         }
+        PimdirAction::SetPerformer { capability, source } => {
+            map.insert("capability".into(), json!(capability));
+            if let Some(source) = source {
+                map.insert("source".into(), json!(source));
+            }
+        }
         PimdirAction::Unknown { .. } => {}
     }
 
@@ -283,6 +301,10 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
         "update" => Ok(PimdirAction::Update {
             seq: require_seq(map)?,
             object: PimdirHash(require_string(map, "object")?),
+        }),
+        "set-performer" => Ok(PimdirAction::SetPerformer {
+            capability: require_string(map, "capability")?,
+            source: get_string(map, "source")?,
         }),
         other => Ok(PimdirAction::Unknown {
             kind: other.to_string(),
