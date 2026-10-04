@@ -888,4 +888,23 @@ The candidates of an intent SHALL be the account's sources whose row at the anch
 `PimdirStore::replace_action` SHALL enqueue the change, pin its body, then cancel the intent and release the intent's pin, in one transaction, enqueueing nothing when the intent is gone (STORAGE §15.5).
 
 ### Requirement: The capability tables reconcile on open
-Opening a store written before capabilities SHALL create `capabilities` and `performers` from the canonical migration, and a reader of a store lacking them SHALL read every source as undeclared.
+Opening a store written before capabilities SHALL create `capabilities`, `performers` and `receipts` from the canonical migration, and a reader of a store lacking them SHALL read every source as undeclared and keep no receipt.
+
+### Requirement: A collection-create is anchored on its parent and needs a declared performer
+The gate SHALL read a `collection-create` payload strictly (`PimdirCollectionCreate::from_payload`: `v: 1`, a non-blank `name` without control characters, an optional `parent`; pimdir Annex B.2), refuse one naming a `parent` other than the collection it is enqueued on, or anchored on a collection of no declared kind, with `PimdirActionError::Invalid`, and refuse it with `NoPerformer` on an account whose sources declare nothing, whose owner would skip it for ever. `PimdirProducer::enqueue_collection_create` SHALL anchor it on its parent, else on the collection given, resolve the performer as `performer` does and write it into the payload. `collection.create` SHALL be in the declaration list of every domain.
+
+#### Scenario: A parent that refuses children
+- **GIVEN** a mail source declaring `collection.create` `full` and `none` on Archive
+- **WHEN** a producer asks for a collection under Archive, then at the top level anchored on INBOX
+- **THEN** the first is `NoPerformer` and the second is queued naming the source
+
+### Requirement: An occurrence is gated beside its intent
+A `calendar-reply` or `calendar-cancel` naming `recurrence_id` SHALL be refused with `PimdirActionError::Invalid` unless the value is `YYYYMMDD` or `YYYYMMDDTHHMMSS[Z]`, with `Unsupported` unless its performer declares `calendar.reply.occurrence` or `calendar.cancel.occurrence` at the anchor, and with `Unsupported` on an account whose sources declare nothing, whose owner would answer or cancel the whole series. Without the field the intent is gated as before. `PimdirInvitation` SHALL build and read both payloads.
+
+### Requirement: An applied row leaves a receipt a producer follows
+The drain SHALL record a receipt (`record_receipt`) in the transaction applying a row, `seq` the item an `add` created (`seq_by_link` on the key it staged) and `None` for every other kind, and SHALL prune the receipts older than `RECEIPT_DAYS`, seven, once its pass is done, never before it reads the pending list. `action_status(id)`, on the producer and the reader, SHALL answer `Pending`, `Parked` with its error, `Applied` with the receipt, or `Unknown` for a row cancelled or applied before its receipt was pruned; a store lacking the table answers `Unknown` once the row is gone.
+
+#### Scenario: A draft saved offline
+- **GIVEN** a producer that enqueued an `add` and kept the id
+- **WHEN** the owner drains
+- **THEN** `action_status(id)` is `Applied` with the `seq` of the new item, and a second `add` of the same key reads `Parked`

@@ -122,6 +122,8 @@ The CLI SHALL expose, at minimum:
   the trash, it does not delete synced data.
 - `queue list`: pending actions, or parked ones with `--parked`.
 - `queue cancel`: drop one queue row by id.
+- `queue status`: where one queue row stands by id: pending, parked with its
+  error, applied with the item an add created, or unknown.
 - `store info`: the schema version (one figure: the reader verified the store
   is stamped with the version this build services, refusing any other), sources,
   per-collection live and retained counts, object count and bytes live versus

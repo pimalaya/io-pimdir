@@ -80,8 +80,8 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
 /// The tables a later draft added to version 1 that a store from an earlier
 /// one can take as they are (§6): the owner creates them on open, from the
 /// canonical DDL, instead of refusing the store. Readers and producers
-/// read their absence as nothing declared.
-const RECONCILED: [&str; 2] = ["capabilities", "performers"];
+/// read their absence as nothing declared, and no receipt kept.
+const RECONCILED: [&str; 3] = ["capabilities", "performers", "receipts"];
 
 /// Creates the [`RECONCILED`] tables a store lacks, each with its key, in
 /// one transaction.
@@ -105,18 +105,33 @@ fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     tx.commit().map_err(busy_or_sql)
 }
 
-/// The canonical statements creating `table` and its key index, cut out
-/// of the first migration so they never drift from it.
+/// The canonical statements creating `table` and its key index when it
+/// has one, cut out of the first migration so they never drift from it.
 fn ddl(table: &str) -> String {
     let schema = sql::MIGRATION_0001;
     let cut = |start: &str, end: &str| {
-        let from = schema.find(start).expect("canonical DDL");
-        let to = from + schema[from..].find(end).expect("canonical DDL") + end.len();
-        String::from(&schema[from..to])
+        let from = schema.find(start)?;
+        let to = from + schema[from..].find(end)? + end.len();
+        Some(String::from(&schema[from..to]))
     };
-    cut(&format!("CREATE TABLE {table} ("), ") STRICT;")
-        + "\n"
-        + &cut(&format!("CREATE UNIQUE INDEX {table}_key"), ";")
+    let create = cut(&format!("CREATE TABLE {table} ("), ") STRICT;").expect("canonical DDL");
+    match cut(&format!("CREATE UNIQUE INDEX {table}_key"), ";") {
+        Some(key) => create + "\n" + &key,
+        None => create,
+    }
+}
+
+/// Whether the store holds `table`: one of the [`RECONCILED`] ones is
+/// missing from a store whose owner predates it.
+pub(crate) fn has_table(conn: &Connection, table: &str) -> Result<bool, PimdirError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Refuses a store stamped at the current version that this crate does

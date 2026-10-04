@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Added the `collection-create` intent (pimdir draft-04, Annex B.2): `capability::COLLECTION_CREATE`, declared in every domain's list, the `intent` module's `PimdirCollectionCreate`, and `PimdirProducer::enqueue_collection_create`, which anchors it on its parent and names its performer.
+- Added occurrence replies and cancels: an optional `recurrence_id` in `calendar-reply` and `calendar-cancel`, gated on `capability::CALENDAR_REPLY_OCCURRENCE` and `CALENDAR_CANCEL_OCCURRENCE`; `PimdirInvitation`, `PimdirIntentItem` and `PimdirPartstat` build and read both payloads.
+- Added queue receipts (STORAGE §15.4): the drain records what each applied row became, the `seq` an `add` created included, and prunes them after seven days; `PimdirProducer::action_status` and `PimdirReader::action_status` follow a row by the id its enqueue answered; the `receipts` table is created on open in an older store; `pimdir queue status`.
+- Added `PimdirActionError::Invalid`, a payload field breaking its intent's rule.
+
 ## [0.6.0] - 2026-10-03
 
 ### Added

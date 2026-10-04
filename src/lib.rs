@@ -96,6 +96,7 @@ pub mod collection;
 pub mod coroutine;
 pub mod hash;
 pub mod hub;
+pub mod intent;
 pub mod load;
 pub mod mutate;
 pub mod object;

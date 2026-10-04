@@ -9,8 +9,9 @@ use io_pimdir::{
     capability::{self, PimdirCapability, PimdirSupport},
     change::PimdirWriteOp,
     client::{PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer},
-    codec::PimdirAction,
+    codec::{PimdirAction, PimdirActionError},
     collection::PimdirCollectionId,
+    intent::{self, PimdirCollectionCreate, PimdirIntentItem, PimdirInvitation, PimdirPartstat},
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -449,4 +450,172 @@ fn a_copy_is_asked_of_the_sender_and_filed_once_sent() {
 
     assert_eq!(store.drain().unwrap().applied, 1);
     assert_eq!(store.list_items("Archive", None, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_collection_is_created_by_a_source_that_declares_it_under_its_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = seeded(dir.path());
+    // the provider reserves children under its Archive
+    let mut imap = mail(&[]);
+    imap.push(PimdirCapability {
+        collection: Some("Archive".into()),
+        name: capability::COLLECTION_CREATE.into(),
+        support: PimdirSupport::None,
+        detail: Some("\\Noinferiors".into()),
+    });
+    store.declare("graph", &imap).unwrap();
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let id = producer
+        .enqueue_collection_create("INBOX", "Projects", None, None)
+        .unwrap();
+    let pending = producer.pending_actions("INBOX").unwrap();
+    let PimdirAction::Unknown { kind, payload, .. } = &pending[0].action else {
+        panic!("an intent travels as an unknown kind");
+    };
+    assert_eq!(pending[0].id, id);
+    assert_eq!(kind, intent::COLLECTION_CREATE);
+    assert_eq!(
+        PimdirCollectionCreate::from_payload(payload).unwrap(),
+        PimdirCollectionCreate {
+            source: Some("graph".into()),
+            name: "Projects".into(),
+            parent: None,
+        }
+    );
+
+    // anchored on its parent, whose own row refuses children there
+    let Err(PimdirError::NoPerformer { capability }) =
+        producer.enqueue_collection_create("INBOX", "2026", Some("Archive"), None)
+    else {
+        panic!("a parent refusing children has no performer");
+    };
+    assert_eq!(capability, capability::COLLECTION_CREATE);
+
+    // a payload anchored elsewhere than its parent, or nameless, is refused
+    let create = |payload: &str| PimdirAction::Unknown {
+        kind: intent::COLLECTION_CREATE.into(),
+        payload: payload.into(),
+        object_hash: None,
+    };
+    let Err(PimdirError::Action(PimdirActionError::Invalid {
+        field: "parent", ..
+    })) = producer.enqueue(
+        "INBOX",
+        &create(r#"{"v":1,"source":"graph","name":"a","parent":"Archive"}"#),
+        None,
+    )
+    else {
+        panic!("a parent is the anchor");
+    };
+    let Err(PimdirError::Action(PimdirActionError::MissingField("name"))) =
+        producer.enqueue("INBOX", &create(r#"{"v":1,"source":"graph"}"#), None)
+    else {
+        panic!("a collection needs a name");
+    };
+    let Err(PimdirError::Action(PimdirActionError::Invalid { .. })) = producer.enqueue(
+        "Nowhere",
+        &create(r#"{"v":1,"source":"graph","name":"a"}"#),
+        None,
+    ) else {
+        panic!("the anchor is a collection of a declared kind");
+    };
+}
+
+#[test]
+fn a_collection_create_needs_a_declared_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = seeded(dir.path());
+    drop(store);
+
+    // an owner declaring nothing predates the intent and would skip it
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let Err(PimdirError::NoPerformer { .. }) =
+        producer.enqueue_collection_create("INBOX", "Projects", None, None)
+    else {
+        panic!("nobody performs a collection-create");
+    };
+
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store
+        .declare("graph", &mail(&[capability::COLLECTION_CREATE]))
+        .unwrap();
+    drop(store);
+    let Err(PimdirError::NoPerformer { .. }) =
+        producer.enqueue_collection_create("INBOX", "Projects", None, None)
+    else {
+        panic!("a source declaring none performs nothing");
+    };
+}
+
+#[test]
+fn an_occurrence_is_answered_only_by_a_performer_declaring_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let seq = seeded_event(dir.path(), "dav", "work", "m0");
+    let invitation = |kind: &str, recurrence_id: Option<&str>| {
+        PimdirInvitation {
+            source: Some("dav".into()),
+            item: PimdirIntentItem::Seq(seq),
+            partstat: (kind == intent::CALENDAR_REPLY).then_some(PimdirPartstat::Accepted),
+            comment: None,
+            recurrence_id: recurrence_id.map(String::from),
+        }
+        .to_action()
+        .unwrap()
+    };
+
+    // an owner declaring nothing would widen the occurrence to the series
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let Err(PimdirError::Unsupported(refusal)) = producer.enqueue(
+        "work",
+        &invitation(intent::CALENDAR_CANCEL, Some("20261010T090000Z")),
+        None,
+    ) else {
+        panic!("an undeclared owner gets no occurrence");
+    };
+    assert_eq!(refusal.capability, capability::CALENDAR_CANCEL_OCCURRENCE);
+    producer
+        .enqueue("work", &invitation(intent::CALENDAR_CANCEL, None), None)
+        .unwrap();
+
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store
+        .declare("dav", &calendar(&[capability::CALENDAR_REPLY_OCCURRENCE]))
+        .unwrap();
+    drop(store);
+
+    let Err(PimdirError::Unsupported(refusal)) = producer.enqueue(
+        "work",
+        &invitation(intent::CALENDAR_REPLY, Some("20261010T090000Z")),
+        None,
+    ) else {
+        panic!("a performer not declaring the occurrence is refused it");
+    };
+    assert_eq!(refusal.capability, capability::CALENDAR_REPLY_OCCURRENCE);
+    assert_eq!(refusal.source, "dav");
+    producer
+        .enqueue("work", &invitation(intent::CALENDAR_REPLY, None), None)
+        .unwrap();
+    producer
+        .enqueue(
+            "work",
+            &invitation(intent::CALENDAR_CANCEL, Some("20261010T090000Z")),
+            None,
+        )
+        .unwrap();
+
+    let malformed = PimdirAction::Unknown {
+        kind: intent::CALENDAR_CANCEL.into(),
+        payload: format!(r#"{{"v":1,"source":"dav","seq":{seq},"recurrence_id":"tomorrow"}}"#),
+        object_hash: None,
+    };
+    let Err(PimdirError::Action(PimdirActionError::Invalid {
+        field: "recurrence_id",
+        ..
+    })) = producer.enqueue("work", &malformed, None)
+    else {
+        panic!("a malformed occurrence is refused");
+    };
 }

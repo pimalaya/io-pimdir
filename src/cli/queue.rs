@@ -10,7 +10,7 @@ use std::fmt;
 
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
-use io_pimdir::codec::PimdirAction;
+use io_pimdir::{client::producer::PimdirActionStatus, codec::PimdirAction};
 use log::warn;
 use pimalaya_cli::{
     printer::Printer,
@@ -28,6 +28,8 @@ pub enum QueueCommand {
     List(QueueListCommand),
     /// Drop one queued action by its id.
     Cancel(QueueCancelCommand),
+    /// Show where one action stands, by the id its enqueue answered.
+    Status(QueueStatusCommand),
 }
 
 impl QueueCommand {
@@ -36,6 +38,7 @@ impl QueueCommand {
         match self {
             Self::List(cmd) => cmd.execute(printer, store),
             Self::Cancel(cmd) => cmd.execute(printer, store),
+            Self::Status(cmd) => cmd.execute(printer, store),
         }
     }
 }
@@ -142,6 +145,124 @@ impl QueueCancelCommand {
         }
 
         printer.out(QueueCancelOutput { id: self.id })
+    }
+}
+
+/// Show where one action stands, by the id its enqueue answered.
+///
+/// Pending or parked while its row is queued; once the owner applied it,
+/// its receipt says so and, for an add, names the seq of the item it
+/// created. A receipt is kept a week at least; an id found nowhere was
+/// cancelled, or applied before that.
+#[derive(Debug, Args)]
+pub struct QueueStatusCommand {
+    /// Id of the action, as the enqueue answered or `queue list` prints it.
+    #[arg(value_name = "ID")]
+    pub id: i64,
+}
+
+impl QueueStatusCommand {
+    /// Prints the action's status.
+    pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
+        let status = store.read()?.action_status(self.id).map_err(report)?;
+        let output = match status {
+            PimdirActionStatus::Pending {
+                collection,
+                kind,
+                attempts,
+            } => QueueStatusOutput {
+                id: self.id,
+                status: "pending",
+                collection: Some(collection),
+                kind: Some(kind),
+                attempts: Some(attempts),
+                ..Default::default()
+            },
+            PimdirActionStatus::Parked {
+                collection,
+                kind,
+                attempts,
+                error,
+            } => QueueStatusOutput {
+                id: self.id,
+                status: "parked",
+                collection: Some(collection),
+                kind: Some(kind),
+                attempts: Some(attempts),
+                error: Some(error),
+                ..Default::default()
+            },
+            PimdirActionStatus::Applied {
+                applied_at,
+                collection,
+                seq,
+            } => QueueStatusOutput {
+                id: self.id,
+                status: "applied",
+                collection: Some(collection),
+                applied_at: Some(applied_at),
+                seq,
+                ..Default::default()
+            },
+            PimdirActionStatus::Unknown => QueueStatusOutput {
+                id: self.id,
+                status: "unknown",
+                ..Default::default()
+            },
+        };
+        printer.out(output)
+    }
+}
+
+/// The `queue status` output.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueStatusOutput {
+    /// The action's id.
+    pub id: i64,
+    /// `pending`, `parked`, `applied` or `unknown` (cancelled, or applied
+    /// before its receipt was pruned).
+    pub status: &'static str,
+    /// The collection it was queued on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    /// The action kind, while queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Apply attempts so far, while queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i64>,
+    /// The failure that parked it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the owner applied it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+    /// The item an applied add created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+}
+
+impl fmt::Display for QueueStatusOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id = self.id;
+        let collection = or_dash(self.collection.as_deref());
+        match self.status {
+            "pending" => writeln!(f, "Action {id} is pending on {collection}"),
+            "parked" => writeln!(
+                f,
+                "Action {id} is parked on {collection}: {}",
+                or_dash(self.error.as_deref())
+            ),
+            "applied" => match self.seq {
+                Some(seq) => writeln!(f, "Action {id} was applied: item {seq} in {collection}"),
+                None => writeln!(f, "Action {id} was applied on {collection}"),
+            },
+            _ => writeln!(
+                f,
+                "Action {id} is neither queued nor applied recently: cancelled, or applied before its receipt was pruned"
+            ),
+        }
     }
 }
 

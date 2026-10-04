@@ -29,7 +29,10 @@ use crate::{
         PimdirError,
         blobs::PimdirBlobs,
         capability,
-        producer::{PimdirParkedAction, PimdirPendingAction, overlaid_actions, pending_actions},
+        producer::{
+            PimdirActionStatus, PimdirParkedAction, PimdirPendingAction, action_status,
+            overlaid_actions, pending_actions,
+        },
         rows, schema,
         write::{
             PimdirSummaryTable, attach_address, binding_from_row, kind_of, load_addresses,
@@ -884,6 +887,12 @@ impl PimdirReader {
     /// (§15.2).
     pub fn list_pending_actions(&self) -> Result<Vec<PimdirPendingAction>, PimdirError> {
         pending_actions(&self.conn, None)
+    }
+
+    /// Where the queue row `id` stands (§15.4): pending, parked, applied
+    /// with the item an `add` created, or found nowhere.
+    pub fn action_status(&self, id: i64) -> Result<PimdirActionStatus, PimdirError> {
+        action_status(&self.conn, id)
     }
 
     /// A collection's pending actions in append order (§15.4).

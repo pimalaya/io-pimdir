@@ -20,7 +20,7 @@ use rusqlite::{
 };
 
 use crate::{
-    capability::{PimdirPartial, PimdirSourceCapabilities},
+    capability::{COLLECTION_CREATE, PimdirPartial, PimdirSourceCapabilities},
     change::PimdirWriteOp,
     client::{
         PimdirError, PimdirSourceStore,
@@ -35,6 +35,7 @@ use crate::{
     coroutine::*,
     hash::{PimdirHashAlgo, PimdirHasher},
     hub::PimdirSourceId,
+    intent::PimdirCollectionCreate,
     load::{PimdirLoadScope, PimdirLoaded},
     mutate::{PimdirMutate, PimdirMutation},
     object::{PimdirHash, PimdirObject},
@@ -205,6 +206,121 @@ impl PimdirProducer {
     ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
         pending_actions(&self.conn, Some(collection))
     }
+
+    /// Where the row `id`, the one [`enqueue`](Self::enqueue) answered,
+    /// stands (§15.4): pending, parked, applied with the item an `add`
+    /// created, or found nowhere.
+    pub fn action_status(&self, id: i64) -> Result<PimdirActionStatus, PimdirError> {
+        action_status(&self.conn, id)
+    }
+
+    /// Enqueues a `collection-create` (Annex B.2): a collection `name`
+    /// created on the performer's server under `parent`, or at the top
+    /// level anchored on `anchor`, a collection of the account and kind
+    /// the new one takes. The performer is `chosen` when the user named a
+    /// candidate, else resolved as [`performer`](Self::performer) does,
+    /// and written into the payload. Returns the row's id; the collection
+    /// arrives with the performer's next sync, labelled `name`.
+    pub fn enqueue_collection_create(
+        &mut self,
+        anchor: &str,
+        name: &str,
+        parent: Option<&str>,
+        chosen: Option<&str>,
+    ) -> Result<i64, PimdirError> {
+        let mut create = PimdirCollectionCreate {
+            source: None,
+            name: name.to_string(),
+            parent: parent.map(PimdirCollectionId::from),
+        };
+        create.validate()?;
+        let anchor = create.anchor(anchor).to_string();
+        create.source = Some(self.performer(&anchor, COLLECTION_CREATE, chosen)?);
+        let action = create.to_action()?;
+        self.enqueue(&anchor, &action, None)
+    }
+}
+
+/// Where one queue row stands (§15.4), read by the id its enqueue
+/// answered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PimdirActionStatus {
+    /// Waiting for the owner's next drain.
+    Pending {
+        /// The collection it was queued on.
+        collection: String,
+        /// The raw action kind.
+        kind: String,
+        /// Apply attempts so far.
+        attempts: i64,
+    },
+    /// Refused by the owner, kept with its error until somebody cancels it.
+    Parked {
+        /// The collection it was queued on.
+        collection: String,
+        /// The raw action kind.
+        kind: String,
+        /// Apply attempts before parking.
+        attempts: i64,
+        /// The failure that parked it.
+        error: String,
+    },
+    /// Applied by the owner, its receipt kept.
+    Applied {
+        /// The RFC 3339 instant it was applied at.
+        applied_at: String,
+        /// The collection it was queued on.
+        collection: String,
+        /// The item an `add` created, `None` for every other kind.
+        seq: Option<i64>,
+    },
+    /// In neither the queue nor the receipts: cancelled, an acknowledged
+    /// intent included, or applied before its receipt was pruned.
+    Unknown,
+}
+
+/// Reads where the row `id` stands: `load_action`, then `load_receipt`.
+pub(crate) fn action_status(conn: &Connection, id: i64) -> Result<PimdirActionStatus, PimdirError> {
+    let queued = conn
+        .query_row(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
+            Ok((
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .optional()?;
+    if let Some((collection, kind, attempts, error)) = queued {
+        return Ok(match error {
+            None => PimdirActionStatus::Pending {
+                collection,
+                kind,
+                attempts,
+            },
+            Some(error) => PimdirActionStatus::Parked {
+                collection,
+                kind,
+                attempts,
+                error,
+            },
+        });
+    }
+
+    // NOTE: a store whose owner predates receipts keeps none.
+    if !schema::has_table(conn, "receipts")? {
+        return Ok(PimdirActionStatus::Unknown);
+    }
+    let receipt = conn
+        .query_row(sql::LOAD_RECEIPT, named_params! { ":id": id }, |r| {
+            Ok(PimdirActionStatus::Applied {
+                applied_at: r.get(0)?,
+                collection: r.get(1)?,
+                seq: r.get(2)?,
+            })
+        })
+        .optional()?;
+    Ok(receipt.unwrap_or(PimdirActionStatus::Unknown))
 }
 
 /// One pending queue row, in append order (§15.4).
@@ -367,6 +483,10 @@ impl PimdirSourceStore {
     /// wearing another name.
     pub const MAX_ATTEMPTS: i64 = 5;
 
+    /// How long a receipt is kept after its row was applied (§15.4): the
+    /// spec's floor, after which a drain prunes it.
+    pub const RECEIPT_DAYS: i64 = 7;
+
     /// Drains the pending actions store-wide in append order, the order a
     /// producer relied on when it queued a move and then an edit of the
     /// item where it landed: each is applied as the mutation it names and
@@ -376,6 +496,8 @@ impl PimdirSourceStore {
     /// failure of the environment (the
     /// database busy, a body unreadable) bumps the attempts and parks past
     /// [`MAX_ATTEMPTS`](Self::MAX_ATTEMPTS). None stops the rows behind it.
+    /// Each applied row leaves a receipt, and the pass ends by pruning the
+    /// receipts past [`RECEIPT_DAYS`](Self::RECEIPT_DAYS) (§15.4).
     pub fn drain(&mut self) -> Result<PimdirDrainReport, PimdirError> {
         let pending = pending_rows(&self.store.reader.conn, None)?;
 
@@ -413,12 +535,29 @@ impl PimdirSourceStore {
                 }
             }
         }
+        // NOTE: after the pass, so the pending list is read before any
+        // write of this drain (§15.2).
+        self.prune_receipts()?;
         Ok(report)
+    }
+
+    /// Drops the receipts older than [`RECEIPT_DAYS`](Self::RECEIPT_DAYS)
+    /// (§15.4), returning how many went.
+    pub fn prune_receipts(&mut self) -> Result<usize, PimdirError> {
+        let conn = &self.store.reader.conn;
+        let before: String = conn.query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', :age)",
+            named_params! { ":age": format!("-{} days", Self::RECEIPT_DAYS) },
+            |r| r.get(0),
+        )?;
+        conn.execute(sql::PRUNE_RECEIPTS, named_params! { ":before": before })
+            .map_err(busy_or_sql)
     }
 
     /// Applies one action and deletes its row in one transaction, the
     /// claim first (§15.2): a claim that deletes nothing is a row another
-    /// handle applied or a cancellation removed, and is skipped.
+    /// handle applied or a cancellation removed, and is skipped. The same
+    /// transaction records the row's receipt (§15.4).
     fn apply_queued(
         &mut self,
         row: &PimdirQueueRow,
@@ -450,6 +589,7 @@ impl PimdirSourceStore {
                 }
                 result => result?,
             }
+            record_receipt(&tx, row, None)?;
             tx.commit().map_err(busy_or_sql)?;
             return Ok(PimdirOutcome::Applied);
         }
@@ -468,6 +608,15 @@ impl PimdirSourceStore {
             Ok(staged) => staged,
             Err(outcome) => return Ok(outcome),
         };
+        // NOTE: an add's item is the one its staged key names once the
+        // write lands, read back for the receipt (§15.2).
+        let created = match action {
+            PimdirAction::Add { .. } => ops.iter().find_map(|op| match op {
+                PimdirWriteOp::UpsertPlacement(placement) => placement.link_id.clone(),
+                _ => None,
+            }),
+            _ => None,
+        };
         write::apply(&tx, &blobs, &source, self.store.account.as_deref(), ops)?;
         if let Some(hash) = &row.object_hash {
             tx.execute(
@@ -475,9 +624,34 @@ impl PimdirSourceStore {
                 named_params! { ":delta": -1, ":hash": hash },
             )?;
         }
+        let seq = match created {
+            Some(link) => tx
+                .query_row(
+                    sql::SEQ_BY_LINK,
+                    named_params! { ":collection": collection, ":link_id": link.0 },
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        record_receipt(&tx, row, seq)?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(PimdirOutcome::Applied)
     }
+}
+
+/// Records what an applied row became (`record_receipt`, §15.2), in the
+/// transaction applying it.
+fn record_receipt(
+    tx: &Connection,
+    row: &PimdirQueueRow,
+    seq: Option<i64>,
+) -> Result<(), PimdirError> {
+    tx.execute(
+        sql::RECORD_RECEIPT,
+        named_params! { ":id": row.id, ":collection": row.collection, ":seq": seq },
+    )?;
+    Ok(())
 }
 
 /// Whether a failure is the environment's rather than the store's (§15.2):

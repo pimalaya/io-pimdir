@@ -37,6 +37,11 @@ pub const MAIL_SUBMIT: &str = "mail.submit";
 /// Filing the copy a `submit` asks for once the message is sent.
 pub const MAIL_SUBMIT_COPY: &str = "mail.submit.copy";
 
+/// Creating a collection on the source's server, the `collection-create`
+/// intent (Annex B.2): the one capability without a domain, declared for
+/// every kind.
+pub const COLLECTION_CREATE: &str = "collection.create";
+
 /// Every Annex B capability of the mail domain, what a declaration of a
 /// mail source writes whole (§15.6).
 pub const MAIL: &[&str] = &[
@@ -51,6 +56,7 @@ pub const MAIL: &[&str] = &[
     MAIL_FLAGS_KEYWORDS,
     MAIL_SUBMIT,
     MAIL_SUBMIT_COPY,
+    COLLECTION_CREATE,
 ];
 
 /// Adding a card to an address book.
@@ -71,6 +77,7 @@ pub const CONTACTS: &[&str] = &[
     CONTACTS_CARD_REMOVE,
     CONTACTS_CARD_MOVE,
     CONTACTS_CARD_COPY,
+    COLLECTION_CREATE,
 ];
 
 /// Adding a calendar resource.
@@ -93,6 +100,10 @@ pub const CALENDAR_ONLINE_MEETING: &str = "calendar.online-meeting";
 pub const CALENDAR_REPLY: &str = "calendar.reply";
 /// Cancelling an event the account organises, the `calendar-cancel` intent.
 pub const CALENDAR_CANCEL: &str = "calendar.cancel";
+/// Replying for one occurrence, a `calendar-reply` naming `recurrence_id`.
+pub const CALENDAR_REPLY_OCCURRENCE: &str = "calendar.reply.occurrence";
+/// Cancelling one occurrence, a `calendar-cancel` naming `recurrence_id`.
+pub const CALENDAR_CANCEL_OCCURRENCE: &str = "calendar.cancel.occurrence";
 
 /// Every Annex B capability of the calendar domain.
 pub const CALENDAR: &[&str] = &[
@@ -106,6 +117,9 @@ pub const CALENDAR: &[&str] = &[
     CALENDAR_ONLINE_MEETING,
     CALENDAR_REPLY,
     CALENDAR_CANCEL,
+    CALENDAR_REPLY_OCCURRENCE,
+    CALENDAR_CANCEL_OCCURRENCE,
+    COLLECTION_CREATE,
 ];
 
 /// How well a source supports a capability (STORAGE §13).
@@ -222,6 +236,7 @@ pub fn intent_capability(kind: &str) -> Option<&'static str> {
         "submit" => Some(MAIL_SUBMIT),
         "calendar-reply" => Some(CALENDAR_REPLY),
         "calendar-cancel" => Some(CALENDAR_CANCEL),
+        "collection-create" => Some(COLLECTION_CREATE),
         _ => None,
     }
 }

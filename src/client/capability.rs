@@ -15,11 +15,13 @@ use rusqlite::{Connection, OptionalExtension, named_params};
 
 use crate::{
     capability::{
-        self, MAIL_SUBMIT, MAIL_SUBMIT_COPY, PimdirCapability, PimdirPartial, PimdirRefusal,
-        PimdirSourceCapabilities, PimdirSupport,
+        self, CALENDAR_CANCEL, CALENDAR_CANCEL_OCCURRENCE, CALENDAR_REPLY,
+        CALENDAR_REPLY_OCCURRENCE, COLLECTION_CREATE, MAIL_SUBMIT, MAIL_SUBMIT_COPY,
+        PimdirCapability, PimdirPartial, PimdirRefusal, PimdirSourceCapabilities, PimdirSupport,
     },
     client::{PimdirError, blobs::PimdirBlobs, rows, write},
-    codec::{self, PimdirAction},
+    codec::{self, PimdirAction, PimdirActionError},
+    intent::{self, PimdirCollectionCreate},
     object::PimdirHash,
     placement::PimdirFlags,
     sql,
@@ -248,23 +250,58 @@ fn gate_by_kind(
             let Some(capability) = capability::intent_capability(kind) else {
                 return Ok(Vec::new());
             };
+
+            // NOTE: what an intent reads beside its own capability, from
+            // the same performer (Annex B.2), checked before the account's
+            // declaration since an undeclared one cannot carry it.
+            let option = match capability {
+                COLLECTION_CREATE => {
+                    let create = PimdirCollectionCreate::from_payload(payload)?;
+                    collection_create_anchor(conn, collection, &create)?;
+                    None
+                }
+                MAIL_SUBMIT => intent_copy(payload).map(|_| MAIL_SUBMIT_COPY),
+                CALENDAR_REPLY => {
+                    intent::recurrence_id(payload)?.map(|_| CALENDAR_REPLY_OCCURRENCE)
+                }
+                CALENDAR_CANCEL => {
+                    intent::recurrence_id(payload)?.map(|_| CALENDAR_CANCEL_OCCURRENCE)
+                }
+                _ => None,
+            };
+
             // NOTE: an account whose sources declare nothing predates §15.6,
-            // and its owner picks the performer as it always did.
+            // and its owner picks the performer as it always did; but it
+            // would widen an occurrence to the whole series, and knows no
+            // collection-create (Annex B.2).
             let account = account_of(conn, collection)?;
+            let named = intent_source(payload);
             if !account_declared(conn, account.as_deref())? {
+                if capability == COLLECTION_CREATE {
+                    return Err(PimdirError::NoPerformer {
+                        capability: capability.to_string(),
+                    });
+                }
+                if let Some(option @ (CALENDAR_REPLY_OCCURRENCE | CALENDAR_CANCEL_OCCURRENCE)) =
+                    option
+                {
+                    return Err(PimdirError::Unsupported(PimdirRefusal {
+                        capability: option.to_string(),
+                        source: named.unwrap_or_default(),
+                        detail: Some("the account's owner declares no capability".to_string()),
+                    }));
+                }
                 return Ok(Vec::new());
             }
-            let named = intent_source(payload);
             let performer = resolve_performer(conn, collection, capability, named.as_deref())?;
 
-            // NOTE: a copy asked for is filed by the same performer, which
-            // has to declare it beside the send (Annex B.2).
-            if capability == MAIL_SUBMIT && intent_copy(payload).is_some() {
-                let able =
-                    candidates(conn, account.as_deref(), Some(collection), MAIL_SUBMIT_COPY)?;
+            // NOTE: a copy or an occurrence asked for is the same
+            // performer's, which has to declare it beside the intent.
+            if let Some(option) = option {
+                let able = candidates(conn, account.as_deref(), Some(collection), option)?;
                 if !able.contains(&performer) {
                     return Err(PimdirError::Unsupported(PimdirRefusal {
-                        capability: MAIL_SUBMIT_COPY.to_string(),
+                        capability: option.to_string(),
                         source: performer,
                         detail: None,
                     }));
@@ -387,6 +424,35 @@ fn account_declared(conn: &Connection, account: Option<&str>) -> Result<bool, Pi
         )
         .optional()?
         .is_some())
+}
+
+/// Checks a `collection-create` is anchored where Annex B.2 says: on its
+/// `parent` when it names one, and on a collection of a declared kind,
+/// the one the new collection takes.
+fn collection_create_anchor(
+    conn: &Connection,
+    collection: &str,
+    create: &PimdirCollectionCreate,
+) -> Result<(), PimdirError> {
+    if create
+        .parent
+        .as_ref()
+        .is_some_and(|parent| parent.as_str() != collection)
+    {
+        return Err(PimdirActionError::Invalid {
+            field: "parent",
+            reason: "a collection-create naming a parent is anchored on it",
+        }
+        .into());
+    }
+    if write::kind_of(conn, collection)?.is_empty() {
+        return Err(PimdirActionError::Invalid {
+            field: "parent",
+            reason: "a collection-create is anchored on a collection of a declared kind",
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// The collection a `submit` asks its copy filed in, `None` when it asks

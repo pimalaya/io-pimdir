@@ -199,6 +199,13 @@ pub enum PimdirActionError {
     UnknownVersion(Option<i64>),
     /// A required field is missing or has the wrong shape.
     MissingField(&'static str),
+    /// A field breaks a rule of its intent (Annex B.2).
+    Invalid {
+        /// The field.
+        field: &'static str,
+        /// The rule it breaks.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for PimdirActionError {
@@ -209,6 +216,12 @@ impl fmt::Display for PimdirActionError {
             Self::UnknownVersion(None) => write!(f, "Pimdir action payload misses its version"),
             Self::MissingField(field) => {
                 write!(f, "Pimdir action payload misses field: {field}")
+            }
+            Self::Invalid { field, reason } => {
+                write!(
+                    f,
+                    "Pimdir action payload field {field} is invalid: {reason}"
+                )
             }
         }
     }
