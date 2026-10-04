@@ -151,9 +151,9 @@ impl QueueCancelCommand {
 /// Show where one action stands, by the id its enqueue answered.
 ///
 /// Pending or parked while its row is queued; once the owner applied it,
-/// its receipt says so and, for an add, names the seq of the item it
-/// created. A receipt is kept a week at least; an id found nowhere was
-/// cancelled, or applied before that.
+/// or performed and acknowledged an intent, its receipt says so and, for
+/// an add, names the seq of the item it created. A receipt is kept a week
+/// at least; an id found nowhere was cancelled, or applied before that.
 #[derive(Debug, Args)]
 pub struct QueueStatusCommand {
     /// Id of the action, as the enqueue answered or `queue list` prints it.

@@ -10,6 +10,7 @@ All notable changes to this project are documented in this file. The format is b
 - Added occurrence replies and cancels: an optional `recurrence_id` in `calendar-reply` and `calendar-cancel`, gated on `capability::CALENDAR_REPLY_OCCURRENCE` and `CALENDAR_CANCEL_OCCURRENCE`; `PimdirInvitation`, `PimdirIntentItem` and `PimdirPartstat` build and read both payloads.
 - Added queue receipts (STORAGE §15.4): the drain records what each applied row became, the `seq` an `add` created included, and prunes them after seven days; `PimdirProducer::action_status` and `PimdirReader::action_status` follow a row by the id its enqueue answered; the `receipts` table is created on open in an older store; `pimdir queue status`.
 - Added `PimdirActionError::Invalid`, a payload field breaking its intent's rule.
+- Added `PimdirStore::acknowledge_action(id, seq)`: an intent its owner performed is removed with its pin released and its receipt recorded, so `action_status` answers `Applied` rather than `Unknown`; `replace_action` records the replaced intent's receipt too. `drop_action` stays the withdrawal, without a receipt.
 
 ## [0.6.0] - 2026-10-03
 

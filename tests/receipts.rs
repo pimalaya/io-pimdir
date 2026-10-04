@@ -1,7 +1,8 @@
 //! Receipts (STORAGE §15.2, §15.4): a producer follows the row its
 //! enqueue answered from pending to parked or applied, learning the seq
 //! its `add` created once the row is gone, and a store whose owner
-//! predates receipts gains the table on open.
+//! predates receipts gains the table on open. An intent its performer
+//! acknowledges leaves one too (§15.5), a withdrawn row none.
 
 use std::{io::Write, path::Path};
 
@@ -221,5 +222,121 @@ fn a_store_from_an_older_owner_gains_the_receipts_on_open() {
     let PimdirActionStatus::Applied { seq: Some(_), .. } = producer.action_status(id).unwrap()
     else {
         panic!("the reconciled store keeps receipts");
+    };
+}
+
+/// A `submit` intent of `body`, which the drain leaves to its performer.
+fn submit(producer: &PimdirProducer, body: &str) -> (PimdirAction, PimdirObject) {
+    let (_, object) = add(producer, body);
+    let action = PimdirAction::Unknown {
+        kind: "submit".into(),
+        payload: "{\"v\":1,\"from\":\"a@example.org\",\"rcpts\":[\"b@example.org\"]}".into(),
+        object_hash: Some(object.hash.clone()),
+    };
+    (action, object)
+}
+
+fn refcount(dir: &Path, object: &PimdirObject) -> i64 {
+    Connection::open(dir.join("pimdir.db"))
+        .unwrap()
+        .query_row(
+            "SELECT refcount FROM objects WHERE hash = ?1",
+            [&object.hash.0],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn an_acknowledged_intent_reads_applied_and_a_dropped_one_nowhere() {
+    let dir = tempfile::tempdir().unwrap();
+    store(dir.path());
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = submit(&producer, DRAFT);
+    let sent = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+    let withdrawn = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+    assert_eq!(refcount(dir.path(), &object), 2);
+
+    // the drain leaves intents to their performer
+    drain(dir.path());
+    let PimdirActionStatus::Pending { .. } = producer.action_status(sent).unwrap() else {
+        panic!("the drain leaves a submit pending");
+    };
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    assert!(owner.acknowledge_action(sent, None).unwrap());
+    assert!(!owner.acknowledge_action(sent, None).unwrap());
+    assert!(owner.drop_action(withdrawn).unwrap());
+    drop(owner);
+
+    let PimdirActionStatus::Applied {
+        collection, seq, ..
+    } = producer.action_status(sent).unwrap()
+    else {
+        panic!("an acknowledged intent reads as applied");
+    };
+    assert_eq!(collection, "INBOX");
+    assert_eq!(seq, None);
+    assert_eq!(
+        producer.action_status(withdrawn).unwrap(),
+        PimdirActionStatus::Unknown
+    );
+    assert_eq!(refcount(dir.path(), &object), 0);
+}
+
+#[test]
+fn a_parked_intent_is_acknowledged_too() {
+    let dir = tempfile::tempdir().unwrap();
+    store(dir.path());
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = submit(&producer, DRAFT);
+    let id = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    owner.fail_action(id, Some("refused")).unwrap();
+    let PimdirActionStatus::Parked { .. } = producer.action_status(id).unwrap() else {
+        panic!("the failure parks the intent");
+    };
+    assert!(owner.acknowledge_action(id, Some(7)).unwrap());
+    let PimdirActionStatus::Applied { seq: Some(7), .. } = producer.action_status(id).unwrap()
+    else {
+        panic!("a parked intent performed after all reads as applied, naming what it left");
+    };
+}
+
+#[test]
+fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    store(dir.path());
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = submit(&producer, DRAFT);
+    let id = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let copy = PimdirAction::Add {
+        link_id: None,
+        flags: PimdirFlags::from_iter(["\\Seen"]),
+        object: Some(object.hash.clone()),
+    };
+    assert!(owner.replace_action(id, "owner", "Drafts", &copy).unwrap());
+    assert!(!owner.replace_action(id, "owner", "Drafts", &copy).unwrap());
+    let change = owner.list_pending_actions().unwrap()[0].id;
+    drop(owner);
+
+    let PimdirActionStatus::Applied {
+        collection, seq, ..
+    } = producer.action_status(id).unwrap()
+    else {
+        panic!("a replaced intent reads as applied");
+    };
+    assert_eq!((collection.as_str(), seq), ("INBOX", None));
+
+    drain(dir.path());
+    let PimdirActionStatus::Applied { seq: Some(_), .. } = producer.action_status(change).unwrap()
+    else {
+        panic!("the copy is followed by its own id");
     };
 }

@@ -476,21 +476,46 @@ impl PimdirStore {
     }
 
     /// Removes one queue row by request, pending or parked, releasing its
-    /// body pin in the same transaction; reports whether it existed.
+    /// body pin in the same transaction; reports whether it existed. It
+    /// records no receipt, so a producer reads the row as withdrawn
+    /// (§15.4): an intent its owner performed is
+    /// [`acknowledge_action`](Self::acknowledge_action)'s.
     pub fn drop_action(&mut self, id: i64) -> Result<bool, PimdirError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
 
-        let hash: Option<Option<String>> = tx
-            .query_row(sql::CANCEL_ACTION, named_params! { ":id": id }, |r| {
-                r.get(0)
-            })
-            .optional()?;
-        let Some(hash) = hash else {
+        let Some(hash) = cancel_queued(&tx, id)? else {
             return Ok(false);
         };
+
+        release_pins(&tx, hash.into_iter())?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(true)
+    }
+
+    /// Acknowledges the intent `id` its owner performed out of band
+    /// (§15.5): deletes the row, pending or parked, releases its body pin
+    /// and records its receipt in one transaction, so a producer reads it
+    /// `Applied` rather than gone (§15.4). `seq` is the item the intent's
+    /// effect left in the store when the performer knows it, `None`
+    /// otherwise (a collection created, a message sent whose copy arrives
+    /// with a later sync). Reports whether the row existed; when it did
+    /// not, nothing is recorded.
+    pub fn acknowledge_action(&mut self, id: i64, seq: Option<i64>) -> Result<bool, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+
+        let Some(collection) = queued_collection(&tx, id)? else {
+            return Ok(false);
+        };
+        let Some(hash) = cancel_queued(&tx, id)? else {
+            return Ok(false);
+        };
+        record_receipt(&tx, id, &collection, seq)?;
 
         release_pins(&tx, hash.into_iter())?;
         tx.commit().map_err(busy_or_sql)?;
@@ -500,9 +525,11 @@ impl PimdirStore {
     /// Acknowledges the performed intent `id` by replacing it with the
     /// store change it leaves behind, `action` on `collection` enqueued
     /// under `producer` (§15.5): the change's body is pinned before the
-    /// intent's pin is released, in one transaction, so the change exists
-    /// only once the intent is performed. Reports whether the intent was
-    /// still queued; when it was not, nothing is enqueued.
+    /// intent's pin is released and the intent's receipt recorded with no
+    /// `seq`, in one transaction, so the change exists only once the
+    /// intent is performed and a producer reads the intent `Applied`
+    /// (§15.4). Reports whether the intent was still queued; when it was
+    /// not, nothing is enqueued.
     pub fn replace_action(
         &mut self,
         id: i64,
@@ -515,6 +542,9 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
 
+        let Some(queued) = queued_collection(&tx, id)? else {
+            return Ok(false);
+        };
         let hash = action.object_hash().cloned();
         if let Some(hash) = &hash {
             tx.execute(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
@@ -530,15 +560,11 @@ impl PimdirStore {
             },
         )?;
 
-        let pin: Option<Option<String>> = tx
-            .query_row(sql::CANCEL_ACTION, named_params! { ":id": id }, |r| {
-                r.get(0)
-            })
-            .optional()?;
-        let Some(pin) = pin else {
+        let Some(pin) = cancel_queued(&tx, id)? else {
             // NOTE: dropping the transaction rolls the enqueue back.
             return Ok(false);
         };
+        record_receipt(&tx, id, &queued, None)?;
 
         release_pins(&tx, pin.into_iter())?;
         tx.commit().map_err(busy_or_sql)?;
@@ -586,6 +612,41 @@ pub(crate) fn rows<T>(
     map: impl FnMut(&Row) -> rusqlite::Result<T>,
 ) -> rusqlite::Result<Vec<T>> {
     conn.prepare(sql)?.query_map(params, map)?.collect()
+}
+
+/// Deletes one queue row by id (`cancel_action`, §15.5), answering the
+/// pin it held, `None` when no row had that id.
+fn cancel_queued(conn: &Connection, id: i64) -> Result<Option<Option<String>>, PimdirError> {
+    Ok(conn
+        .query_row(sql::CANCEL_ACTION, named_params! { ":id": id }, |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// The collection the queue row `id` was queued on (`load_action`),
+/// `None` when no row has that id.
+fn queued_collection(conn: &Connection, id: i64) -> Result<Option<String>, PimdirError> {
+    Ok(conn
+        .query_row(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
+            r.get::<_, String>(3)
+        })
+        .optional()?)
+}
+
+/// Records what the removed queue row `id` became (`record_receipt`,
+/// §15.2, §15.5), in the caller's transaction.
+pub(crate) fn record_receipt(
+    conn: &Connection,
+    id: i64,
+    collection: &str,
+    seq: Option<i64>,
+) -> Result<(), PimdirError> {
+    conn.execute(
+        sql::RECORD_RECEIPT,
+        named_params! { ":id": id, ":collection": collection, ":seq": seq },
+    )?;
+    Ok(())
 }
 
 /// Releases the pins a deleted row held, set-based, in the caller's

@@ -28,7 +28,7 @@ use crate::{
         busy_or_sql, capability,
         lock::PimdirLock,
         reader::{PimdirItem, item_from_row},
-        rows, schema, write,
+        record_receipt, rows, schema, write,
     },
     codec::{self, PimdirAction, PimdirActionError},
     collection::PimdirCollectionId,
@@ -265,17 +265,19 @@ pub enum PimdirActionStatus {
         /// The failure that parked it.
         error: String,
     },
-    /// Applied by the owner, its receipt kept.
+    /// Applied by the owner, or an intent it performed and acknowledged,
+    /// its receipt kept.
     Applied {
         /// The RFC 3339 instant it was applied at.
         applied_at: String,
         /// The collection it was queued on.
         collection: String,
-        /// The item an `add` created, `None` for every other kind.
+        /// The item an `add` created, or an acknowledged intent left when
+        /// its performer knew it; `None` otherwise.
         seq: Option<i64>,
     },
-    /// In neither the queue nor the receipts: cancelled, an acknowledged
-    /// intent included, or applied before its receipt was pruned.
+    /// In neither the queue nor the receipts: withdrawn by request, or
+    /// applied or performed before its receipt was pruned.
     Unknown,
 }
 
@@ -589,7 +591,7 @@ impl PimdirSourceStore {
                 }
                 result => result?,
             }
-            record_receipt(&tx, row, None)?;
+            record_receipt(&tx, row.id, &row.collection, None)?;
             tx.commit().map_err(busy_or_sql)?;
             return Ok(PimdirOutcome::Applied);
         }
@@ -634,24 +636,10 @@ impl PimdirSourceStore {
                 .optional()?,
             None => None,
         };
-        record_receipt(&tx, row, seq)?;
+        record_receipt(&tx, row.id, &row.collection, seq)?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(PimdirOutcome::Applied)
     }
-}
-
-/// Records what an applied row became (`record_receipt`, §15.2), in the
-/// transaction applying it.
-fn record_receipt(
-    tx: &Connection,
-    row: &PimdirQueueRow,
-    seq: Option<i64>,
-) -> Result<(), PimdirError> {
-    tx.execute(
-        sql::RECORD_RECEIPT,
-        named_params! { ":id": row.id, ":collection": row.collection, ":seq": seq },
-    )?;
-    Ok(())
 }
 
 /// Whether a failure is the environment's rather than the store's (§15.2):

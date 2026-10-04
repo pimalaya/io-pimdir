@@ -525,8 +525,12 @@ parks.
 ### Requirement: A queued action can be cancelled or acknowledged
 `drop_action(id)` SHALL delete one queue row, pending or parked, releasing its
 object pin in the same transaction, and report whether the row existed. It
-serves both cancelling a queued action and acknowledging an intent an owner
-performed out of band. `fail_action(id, error)` SHALL record a failed attempt:
+withdraws a row by request and records no receipt.
+`acknowledge_action(id, seq)` SHALL acknowledge an intent an owner performed
+out of band: delete the row, pending or parked, release its pin and record its
+receipt (`record_receipt`: the row's id, the collection it was queued on,
+`seq` the item it left when the performer knows it), in one transaction,
+recording nothing when the row is gone (STORAGE §15.5). `fail_action(id, error)` SHALL record a failed attempt:
 `None` bumps `attempts` and leaves the row pending (transient), `Some(error)`
 parks it (permanent). A collection's pending actions SHALL expose each row's
 `id`, since callers act on rows by id.
@@ -885,7 +889,7 @@ The drain SHALL run the gate again before applying an action and park one a decl
 The candidates of an intent SHALL be the account's sources whose row at the anchor collection, its own or else the source-wide one, has some support (`list_capability_sources`). With several, the performer is the latest `set-performer` still queued for the account and capability, else the recorded one, while it is a candidate.
 
 ### Requirement: A performed intent is replaced by the change it leaves
-`PimdirStore::replace_action` SHALL enqueue the change, pin its body, then cancel the intent and release the intent's pin, in one transaction, enqueueing nothing when the intent is gone (STORAGE §15.5).
+`PimdirStore::replace_action` SHALL enqueue the change, pin its body, then cancel the intent, record its receipt with no `seq` and release the intent's pin, in one transaction, enqueueing nothing when the intent is gone (STORAGE §15.5).
 
 ### Requirement: The capability tables reconcile on open
 Opening a store written before capabilities SHALL create `capabilities`, `performers` and `receipts` from the canonical migration, and a reader of a store lacking them SHALL read every source as undeclared and keep no receipt.
@@ -902,7 +906,7 @@ The gate SHALL read a `collection-create` payload strictly (`PimdirCollectionCre
 A `calendar-reply` or `calendar-cancel` naming `recurrence_id` SHALL be refused with `PimdirActionError::Invalid` unless the value is `YYYYMMDD` or `YYYYMMDDTHHMMSS[Z]`, with `Unsupported` unless its performer declares `calendar.reply.occurrence` or `calendar.cancel.occurrence` at the anchor, and with `Unsupported` on an account whose sources declare nothing, whose owner would answer or cancel the whole series. Without the field the intent is gated as before. `PimdirInvitation` SHALL build and read both payloads.
 
 ### Requirement: An applied row leaves a receipt a producer follows
-The drain SHALL record a receipt (`record_receipt`) in the transaction applying a row, `seq` the item an `add` created (`seq_by_link` on the key it staged) and `None` for every other kind, and SHALL prune the receipts older than `RECEIPT_DAYS`, seven, once its pass is done, never before it reads the pending list. `action_status(id)`, on the producer and the reader, SHALL answer `Pending`, `Parked` with its error, `Applied` with the receipt, or `Unknown` for a row cancelled or applied before its receipt was pruned; a store lacking the table answers `Unknown` once the row is gone.
+The drain SHALL record a receipt (`record_receipt`) in the transaction applying a row, `seq` the item an `add` created (`seq_by_link` on the key it staged) and `None` for every other kind, and SHALL prune the receipts older than `RECEIPT_DAYS`, seven, once its pass is done, never before it reads the pending list. `action_status(id)`, on the producer and the reader, SHALL answer `Pending`, `Parked` with its error, `Applied` with the receipt (an acknowledged or replaced intent included), or `Unknown` for a row withdrawn by request or applied before its receipt was pruned; a store lacking the table answers `Unknown` once the row is gone.
 
 #### Scenario: A draft saved offline
 - **GIVEN** a producer that enqueued an `add` and kept the id
