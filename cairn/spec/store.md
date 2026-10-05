@@ -912,3 +912,11 @@ The drain SHALL record a receipt (`record_receipt`) in the transaction applying 
 - **GIVEN** a producer that enqueued an `add` and kept the id
 - **WHEN** the owner drains
 - **THEN** `action_status(id)` is `Applied` with the `seq` of the new item, and a second `add` of the same key reads `Parked`
+
+### Requirement: A collection keeps the role its source states
+`PimdirStore::set_collection_role(collection, role)` SHALL set or clear `collections.role` on a declared collection (pimdir STORAGE §14), a value outside its kind's vocabulary refused by the schema, the old holder of the role in the account losing it in the same statement (`collections_role_moves`), both collections stamped in the feed. `PimdirCollection::role` SHALL carry it on `list_collections` and `list_collections_by_account`. Opening a store as its owner SHALL add the column, `collections_by_role` and `collections_role_moves` when absent and recreate a `collections_stamp_update` that predates the column, in one transaction; a reader of a store its owner has not reconciled SHALL read every role as `None`.
+
+#### Scenario: A server moves its Sent folder
+- **GIVEN** `imap/Sent` holding `sent`
+- **WHEN** the owner sets `sent` on `imap/Sent Items`
+- **THEN** `imap/Sent` holds no role, `imap/Sent Items` holds `sent`, and both are above the reader's cursor

@@ -80,6 +80,12 @@ pub struct PimdirCollection {
     pub sort_order: Option<i64>,
     /// The handle-space epoch (§12), starting at 1.
     pub generation: i64,
+    /// What the source states the collection is for (§14): a mail role
+    /// (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`, `all`,
+    /// `flagged`, `important`), `default` for a calendar or an address
+    /// book, `None` when the source states nothing or the store predates
+    /// the column.
+    pub role: Option<String>,
 }
 
 /// One live item as a read reports it (STORAGE §14.1).
@@ -346,7 +352,7 @@ impl PimdirReader {
     pub fn list_collections(&self) -> Result<Vec<PimdirCollection>, PimdirError> {
         Ok(rows(
             &self.conn,
-            sql::LIST_COLLECTIONS,
+            &self.collections_sql(sql::LIST_COLLECTIONS)?,
             [],
             collection_from_row,
         )?)
@@ -359,10 +365,20 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirCollection>, PimdirError> {
         Ok(rows(
             &self.conn,
-            sql::LIST_COLLECTIONS_BY_ACCOUNT,
+            &self.collections_sql(sql::LIST_COLLECTIONS_BY_ACCOUNT)?,
             named_params! { ":account": account },
             collection_from_row,
         )?)
+    }
+
+    /// A collection listing as the store can answer it: one whose owner has
+    /// not reconciled `collections.role` yet reads it as `NULL` (§6).
+    fn collections_sql(&self, statement: &'static str) -> Result<String, PimdirError> {
+        Ok(if schema::has_column(&self.conn, "collections", "role")? {
+            String::from(statement)
+        } else {
+            statement.replace("generation, role", "generation, NULL AS role")
+        })
     }
 
     /// The accounts owning at least one collection; not a configured roster.
@@ -1259,6 +1275,7 @@ fn collection_from_row(r: &Row<'_>) -> rusqlite::Result<PimdirCollection> {
         description: r.get(6)?,
         sort_order: r.get(7)?,
         generation: r.get(8)?,
+        role: r.get(9)?,
     })
 }
 

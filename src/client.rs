@@ -225,6 +225,29 @@ impl PimdirStore {
         Ok(())
     }
 
+    /// Records what the source states a collection is for, or clears it
+    /// with `None` (§14): a mail role (`inbox`, `sent`, `drafts`, `trash`,
+    /// `junk`, `archive`, `all`, `flagged`, `important`), or `default` for
+    /// a calendar or an address book.
+    ///
+    /// Only from what a source states, never guessed from a name. The
+    /// collection holding the role in the account loses it in the same
+    /// statement. The collection must be declared: a role outside its
+    /// kind's vocabulary is refused by the schema.
+    pub fn set_collection_role(
+        &self,
+        collection: impl AsRef<str>,
+        role: Option<&str>,
+    ) -> Result<(), PimdirError> {
+        self.conn
+            .execute(
+                sql::SET_COLLECTION_ROLE,
+                named_params! { ":collection": collection.as_ref(), ":role": role },
+            )
+            .map_err(busy_or_sql)?;
+        Ok(())
+    }
+
     /// Regroups a collection under `account`, or out of one with `None` (§9.2).
     pub fn set_collection_account(
         &self,

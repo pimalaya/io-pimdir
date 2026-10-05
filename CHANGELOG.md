@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file. The format is b
 - Added queue receipts (STORAGE §15.4): the drain records what each applied row became, the `seq` an `add` created included, and prunes them after seven days; `PimdirProducer::action_status` and `PimdirReader::action_status` follow a row by the id its enqueue answered; the `receipts` table is created on open in an older store; `pimdir queue status`.
 - Added `PimdirActionError::Invalid`, a payload field breaking its intent's rule.
 - Added `PimdirStore::acknowledge_action(id, seq)`: an intent its owner performed is removed with its pin released and its receipt recorded, so `action_status` answers `Applied` rather than `Unknown`; `replace_action` records the replaced intent's receipt too. `drop_action` stays the withdrawal, without a receipt.
+- Added collection roles (pimdir draft-04, STORAGE §14): `PimdirStore::set_collection_role`, `PimdirCollection::role`, the `ROLE` column of `pimdir collection list`; `collections.role`, its index and its triggers are added on open to a store written by 0.6, and a reader of one not reconciled yet reads `None`.
 
 ## [0.6.0] - 2026-10-03
 

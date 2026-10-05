@@ -57,6 +57,7 @@ impl CollectionListCommand {
                 kind: collection.kind,
                 name: collection.name,
                 generation: collection.generation,
+                role: collection.role,
             });
         }
 
@@ -77,6 +78,9 @@ pub struct CollectionRow {
     pub name: String,
     /// The handle-space epoch.
     pub generation: i64,
+    /// What the source states the collection is for (`sent`, `default`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Live items.
     pub live: u64,
     /// Handles enumerated but not yet identified.
@@ -104,6 +108,7 @@ impl fmt::Display for CollectionsOutput {
                 Cell::new("ID"),
                 Cell::new("KIND"),
                 Cell::new("NAME"),
+                Cell::new("ROLE"),
                 Cell::new("GEN"),
                 Cell::new("LIVE"),
                 Cell::new("PROBED"),
@@ -115,6 +120,7 @@ impl fmt::Display for CollectionsOutput {
                 Cell::new(&row.id),
                 Cell::new(or_dash(Some(row.kind.as_str()).filter(|k| !k.is_empty()))),
                 Cell::new(&row.name),
+                Cell::new(or_dash(row.role.as_deref())),
                 Cell::new(row.generation),
                 Cell::new(row.live),
                 Cell::new(row.probes),

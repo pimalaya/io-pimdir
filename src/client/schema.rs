@@ -83,8 +83,9 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
 /// read their absence as nothing declared, and no receipt kept.
 const RECONCILED: [&str; 3] = ["capabilities", "performers", "receipts"];
 
-/// Creates the [`RECONCILED`] tables a store lacks, each with its key, in
-/// one transaction.
+/// Creates the [`RECONCILED`] tables a store lacks, each with its key, and
+/// adds `collections.role` with its index and triggers ([`reconcile_role`]),
+/// in one transaction.
 fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -102,7 +103,48 @@ fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
             tx.execute_batch(&ddl(table))?;
         }
     }
+    reconcile_role(&tx)?;
     tx.commit().map_err(busy_or_sql)
+}
+
+/// The role a source states (§14), added to version 1 by a later draft: the
+/// column with its `CHECK`, the index keeping one holder, the trigger moving
+/// a role, and the stamp trigger watching it, recreated when its body
+/// predates the column (§6). All cut out of the canonical DDL.
+fn reconcile_role(conn: &Connection) -> Result<(), PimdirError> {
+    let schema = sql::MIGRATION_0001;
+    let cut = |start: &str, end: &str| {
+        let from = schema.find(start).expect("canonical DDL");
+        let to = from + schema[from..].find(end).expect("canonical DDL") + end.len();
+        &schema[from..to]
+    };
+
+    if !has_column(conn, "collections", "role")? {
+        let column = cut("role        TEXT CHECK", "'default'))");
+        conn.execute_batch(&format!("ALTER TABLE collections ADD COLUMN {column};"))?;
+    }
+
+    let declared = |name: &str| -> Result<Option<String>, PimdirError> {
+        Ok(conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?)
+    };
+    if declared("collections_by_role")?.is_none() {
+        conn.execute_batch(cut("CREATE UNIQUE INDEX collections_by_role", ";"))?;
+    }
+    if declared("collections_role_moves")?.is_none() {
+        conn.execute_batch(cut("CREATE TRIGGER collections_role_moves", "END;"))?;
+    }
+    if declared("collections_stamp_update")?.is_some_and(|sql| !sql.contains("role")) {
+        conn.execute_batch("DROP TRIGGER collections_stamp_update;")?;
+        conn.execute_batch(cut("CREATE TRIGGER collections_stamp_update", "END;"))?;
+    }
+
+    Ok(())
 }
 
 /// The canonical statements creating `table` and its key index when it
@@ -134,6 +176,23 @@ pub(crate) fn has_table(conn: &Connection, table: &str) -> Result<bool, PimdirEr
         .is_some())
 }
 
+/// Whether `table` has `column`: `collections.role` is missing from a
+/// store its owner has not reconciled yet (§6), which a reader reads as
+/// `NULL`.
+pub(crate) fn has_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, PimdirError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+            [table, column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
 /// Refuses a store stamped at the current version that this crate does
 /// not read: an earlier draft's shape, or disagreeing stamps (§4.2).
 ///
