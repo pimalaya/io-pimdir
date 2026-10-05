@@ -180,6 +180,19 @@ impl Cluster {
             .is_some_and(|binding| binding.base.is_some())
     }
 
+    /// Whether some binding of `link` carries a base with a revision, the
+    /// only sign the hub reads that its content is mutable (SYNC §9).
+    fn revised(&self, link: &PimdirLinkId) -> bool {
+        self.hub().items.get(link).is_some_and(|item| {
+            item.sources.values().any(|binding| {
+                binding
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| base.revision.is_some())
+            })
+        })
+    }
+
     /// The body a source last synced with its own server for `link`.
     ///
     /// An edit restating it stages nothing at all.
@@ -338,7 +351,12 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 };
                 let owed = ledger.entry(link.clone()).or_default();
                 let stages = cluster.synced_object(source, &link) != Some(object.hash.clone());
+                // NOTE: a divergence needs the content known to be mutable, a
+                // revision on some base saying so (SYNC §9); an item every
+                // source holds as a pending create shows none and fast-forwards
+                let observable = cluster.revised(&link);
                 let diverging = stages
+                    && observable
                     && !owed.seen(source)
                     && owed.body.as_ref().is_some_and(|held| held != &object.hash);
                 let first = owed.diverged;
@@ -516,11 +534,25 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
             }
             HubOp::Sync(s) => {
                 let source = s % SOURCES;
+                let pending = |cluster: &Cluster, link: &PimdirLinkId| {
+                    cluster.handle(source, link).is_some() && !cluster.synced(source, link)
+                };
+                let waiting: Vec<PimdirLinkId> = cluster
+                    .links()
+                    .into_iter()
+                    .filter(|link| pending(&cluster, link))
+                    .collect();
                 cluster.sync(source);
+                // NOTE: a pass may pull and leave its pushes to the next one, so
+                // a pending create it neither pushed nor rewrote has not seen
+                // what the hub shares for it, and moves no agreement point; one
+                // the pass resurrected holds the shared body
                 let live: Vec<PimdirLinkId> = cluster
                     .links()
                     .into_iter()
-                    .filter(|link| live(&cluster, link))
+                    .filter(|link| {
+                        live(&cluster, link) && !(waiting.contains(link) && pending(&cluster, link))
+                    })
                     .collect();
                 for link in live {
                     ledger.entry(link).or_default().agree(source);
@@ -653,6 +685,62 @@ fn a_bump_resurrecting_a_shared_body_agrees_with_it() {
         HubOp::ServerRemove(3602211543412188046, 11828013346212412693),
         HubOp::Bump(5310140231620834954),
         HubOp::Edit(5787938633598682036, 1166168132446768777, 1),
+    ])
+    .unwrap();
+}
+
+/// An item every source holds as a pending create shows no revision, so
+/// the hub cannot tell its content mutable and an edit fast-forwards it
+/// rather than diverging (SYNC §9): s2's server lost its copy, its edit
+/// resurrected it as a create, and s0 never pushed its own.
+///
+/// Found by the property above (CI, 2026-10-05).
+#[test]
+fn an_item_held_only_as_pending_creates_fast_forwards() {
+    check_hub_model(vec![
+        HubOp::Add(1687685752357824780, 0),
+        HubOp::Sync(8561999987160879029),
+        HubOp::ServerRemove(2324896742821340957, 15034154132652685147),
+        HubOp::Edit(3926534748294920033, 217181904965524191, 0),
+        HubOp::Sync(11656597507083011498),
+        HubOp::Edit(1194601404005001480, 6039659184529242179, 1),
+    ])
+    .unwrap();
+}
+
+/// A pass that pulls leaves its pushes to the next one: a pending create
+/// it did not push has not seen the edit another source made meanwhile,
+/// so its own edit is a divergence.
+///
+/// Found by the property above (2026-10-05).
+#[test]
+fn a_pending_create_a_pass_did_not_push_has_not_seen_the_shared_body() {
+    check_hub_model(vec![
+        HubOp::ServerAdd(6501570253230434405, 0),
+        HubOp::ServerAdd(180963957262262270, 0),
+        HubOp::ServerAdd(10772528641987473556, 0),
+        HubOp::Add(455757924496014920, 0),
+        HubOp::Sync(5220255276639050808),
+        HubOp::Sync(12044391786063602446),
+        HubOp::Edit(36863049695268984, 16789309472799225104, 0),
+        HubOp::Sync(5818256216609061155),
+        HubOp::Edit(3721809188518345484, 2239797688325439822, 1),
+    ])
+    .unwrap();
+}
+
+/// A pass resurrecting an item its server deleted under another source's
+/// edit leaves a pending create holding the shared body: the source has
+/// seen it, and its next edit fast-forwards.
+///
+/// Found by the property above (2026-10-05).
+#[test]
+fn a_pending_create_a_pass_resurrected_has_seen_the_shared_body() {
+    check_hub_model(vec![
+        HubOp::ServerRemove(5970939664238849758, 616763452281999743),
+        HubOp::Edit(9816735302857054406, 9036474761209627742, 0),
+        HubOp::Sync(3335670512669512177),
+        HubOp::Edit(8995993545065033104, 2352264232938290138, 1),
     ])
     .unwrap();
 }
