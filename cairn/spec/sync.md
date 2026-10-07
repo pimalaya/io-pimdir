@@ -308,12 +308,17 @@ Every page SHALL land in one write: its members named and merged, the handles it
 - THEN it asks for the round from `p1`, and the last page closes it with the coverage of its scope
 
 ### Requirement: Absence means deleted in scope only
-The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope or is unknown, read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
+The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope or is unknown (`NULL`, an empty `date` a connector hands being stored as `NULL`, so a round resumed in a later run and one opened and closed in the same run find the same members absent), read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
 
 #### Scenario: A message older than the scope
 - GIVEN a bound member dated August and an undated one, both unlisted, under a scope since September
 - WHEN the round's last page lands
 - THEN the August member stays as it was, and the undated one is dropped `Deleted`
+
+#### Scenario: An empty date on a resumed round
+- GIVEN a bound member whose summary carries an empty `date`, unlisted by a round that an earlier run opened
+- WHEN the resumed round's last page lands
+- THEN the member is dropped `Deleted`, as it is by a round opened and closed in one run
 
 ### Requirement: A scope bounds mail only
 `PimdirSyncOptions::scope` is unbounded by default. `PimdirSourceStore::sync` and `prepare_sync` SHALL refuse a bounded scope on a collection whose kind is not `message/rfc822`, naming the kind (`PimdirError::Scope`).

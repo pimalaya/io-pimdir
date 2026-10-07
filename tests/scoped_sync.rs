@@ -509,3 +509,104 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
         "a level 0 claim the next Meta upgrade revisits"
     );
 }
+
+/// A based member with no usable date is in every scope (SYNC §5): a
+/// complete round that does not list it finds it deleted, whether the
+/// round opens and closes in one run or resumes one an earlier run
+/// opened, and whatever leaves it undated: no `Date`, an empty one, or
+/// no summary at all.
+#[test]
+fn an_undated_member_unlisted_by_a_round_is_dropped() {
+    let undated = |shape: &str| {
+        let mut item = member(
+            "1",
+            &[],
+            &message("undated@x", "When", "someday", "text/plain"),
+        );
+        match (shape, &mut item.meta.summary) {
+            ("empty", Some(io_pimdir::summary::PimdirSummary::Mail(mail))) => {
+                mail.date = Some(String::new())
+            }
+            ("none", summary) => *summary = None,
+            _ => (),
+        }
+        item
+    };
+    let old = message(
+        "old@x",
+        "Old",
+        "Sat, 1 Aug 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let recent = message(
+        "new@x",
+        "New",
+        "Mon, 5 Oct 2026 10:00:00 +0000",
+        "text/plain",
+    );
+
+    for shape in ["no date", "empty", "none"] {
+        for resumed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+            store.ensure_collection("INBOX", "message/rfc822").unwrap();
+            let mut remote = Paged {
+                pages: vec![page(
+                    vec![
+                        undated(shape),
+                        member("2", &[], &old),
+                        member("3", &[], &recent),
+                    ],
+                    None,
+                )],
+                ..Default::default()
+            };
+            store
+                .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+                .unwrap();
+            assert_eq!(store.count_items("INBOX").unwrap(), 3);
+
+            // NOTE: a full run opens a round over the narrower scope the
+            // unbounded coverage would serve by a delta.
+            let full = PimdirSyncOptions {
+                full: true,
+                ..since("2026-09-01T00:00:00Z")
+            };
+            match resumed {
+                false => {
+                    remote.pages = vec![page(vec![member("3", &[], &recent)], None)];
+                    store.sync("INBOX", full, &mut remote).unwrap();
+                }
+                true => {
+                    remote.pages = vec![page(vec![member("3", &[], &recent)], Some("p1"))];
+                    let interrupted = store.sync("INBOX", full, &mut remote);
+                    assert!(matches!(interrupted, Err(PimdirRunError::Remote(_))));
+                    remote.pages = vec![page(Vec::new(), None)];
+                    store
+                        .sync("INBOX", since("2026-09-01T00:00:00Z"), &mut remote)
+                        .unwrap();
+                    assert_eq!(
+                        remote.requests.last().and_then(|request| request.cursor()),
+                        Some(&PimdirCursor(b"p1".to_vec())),
+                        "the round resumed from its cursor",
+                    );
+                }
+            }
+
+            let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+            let mut live = conn
+                .prepare("SELECT link_id FROM items WHERE deleted = 0 ORDER BY link_id")
+                .unwrap();
+            let live: Vec<String> = live
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                live,
+                ["new@x", "old@x"],
+                "{shape}, resumed={resumed}: the undated is in scope, the old one out of it",
+            );
+        }
+    }
+}

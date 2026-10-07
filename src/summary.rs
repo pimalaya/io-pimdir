@@ -53,6 +53,18 @@ impl PimdirSummary {
         }
     }
 
+    /// The summary as the store keeps it (Annex A.1): a mail `date` left
+    /// empty is no usable date, `NULL` as an unparseable one, so a scope
+    /// reads it in every scope on every path (SYNC §5).
+    pub fn stored(mut self) -> Self {
+        if let Self::Mail(mail) = &mut self
+            && mail.date.as_deref() == Some("")
+        {
+            mail.date = None;
+        }
+        self
+    }
+
     /// What a listing shows the item as: its subject, name or summary.
     pub fn title(&self) -> &str {
         match self {

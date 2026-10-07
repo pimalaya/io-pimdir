@@ -378,8 +378,8 @@ impl PimdirHub {
         if !placement.flags.is_unknown() {
             item.flags = placement.flags.clone();
         }
-        if placement.summary.is_some() {
-            item.summary = placement.summary.clone();
+        if let Some(summary) = &placement.summary {
+            item.summary = Some(summary.clone().stored());
         }
         if !placement.sort_key.is_unknown() {
             item.sort_key = placement.sort_key.clone();
