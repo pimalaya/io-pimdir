@@ -434,8 +434,9 @@ fn the_mail_readers_count_page_and_search_across_collections() {
 
 /// A store an earlier draft wrote (probes, no coverage, rows at level 0)
 /// is read by a reader as it is and reconciled by its owner on open
-/// (STORAGE §6): the columns added, the trigger created, the probes
-/// dropped, and a level-0 row read as a `Meta` claim to revisit.
+/// (STORAGE §6): the columns, the trigger and the global order's index
+/// added, the probes dropped, and a level-0 row read as a `Meta` claim
+/// to revisit.
 #[test]
 fn an_earlier_draft_store_is_reconciled_on_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -465,6 +466,7 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
          CREATE TABLE probes (collection TEXT NOT NULL, source TEXT NOT NULL,
              handle TEXT NOT NULL, flags TEXT, PRIMARY KEY (collection, source, handle)) STRICT;
          INSERT INTO probes VALUES ('INBOX', 'imap', '2', NULL);
+         DROP INDEX items_by_sort_global;
          UPDATE items SET level = 0;",
     )
     .unwrap();
@@ -474,6 +476,10 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
     let collections = reader.list_collections().unwrap();
     assert_eq!(collections[0].coverage, None, "read as NULL, unreconciled");
     assert!(reader.list_coverage("INBOX").unwrap().is_empty());
+    let page = reader
+        .list_mail_page_filtered(&["INBOX"], PimdirMailFilter::default(), None, 10)
+        .unwrap();
+    assert_eq!(page.len(), 1, "paged without the global order's index");
     drop(reader);
 
     let store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
@@ -502,6 +508,14 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
         )
         .unwrap();
     assert_eq!(band, 1, "the band column is added");
+    let index: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'items_by_sort_global'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(index, 1, "the global order's index is created");
 
     let loaded = store
         .load(
@@ -726,5 +740,54 @@ fn a_band_round_keeps_an_undated_member_it_does_not_list() {
                 .unwrap();
             assert_eq!(band, 0, "closing clears the band");
         }
+    }
+}
+
+/// A page over a set of collections walks `items_by_sort_global` (STORAGE
+/// §9.3) rather than reading every live row of the set and sorting it,
+/// on a store without statistics as every writer leaves one: the plan of
+/// both mail pages over two collections, by `EXPLAIN QUERY PLAN`.
+#[test]
+fn a_page_across_collections_walks_the_global_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    for (name, statement) in [
+        (
+            "list_mail_page_filtered",
+            io_pimdir::sql::LIST_MAIL_PAGE_FILTERED,
+        ),
+        ("search_mail", io_pimdir::sql::SEARCH_MAIL),
+    ] {
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+            .unwrap();
+        for (parameter, value) in [
+            (":collections", r#"["INBOX","Archive"]"#),
+            (":pattern", "%a%"),
+        ] {
+            if let Some(index) = plan.parameter_index(parameter).unwrap() {
+                plan.raw_bind_parameter(index, value).unwrap();
+            }
+        }
+        let mut rows = plan.raw_query();
+        let mut steps = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            steps.push(row.get::<_, String>(3).unwrap());
+        }
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("USING INDEX items_by_sort_global")),
+            "{name} walks the global order: {steps:?}"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.contains("TEMP B-TREE FOR ORDER BY")),
+            "{name} sorts nothing: {steps:?}"
+        );
     }
 }

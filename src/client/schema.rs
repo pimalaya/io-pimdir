@@ -82,10 +82,16 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
 /// read their absence as nothing declared, and no receipt kept.
 const RECONCILED: [&str; 3] = ["capabilities", "performers", "receipts"];
 
+/// The indexes a later draft added to version 1 over tables a store from an
+/// earlier one already holds (§6), created on open when absent from the
+/// canonical DDL. A reader of a store lacking one reads as before, slower:
+/// `items_by_sort_global` orders a page across collections (§9.3).
+const RECONCILED_INDEXES: [&str; 1] = ["items_by_sort_global"];
+
 /// Creates the [`RECONCILED`] tables a store lacks, each with its key, and
-/// adds `collections.role` with its index and triggers ([`reconcile_role`])
-/// and the coverage and round columns ([`reconcile_rounds`]), in one
-/// transaction.
+/// adds `collections.role` with its index and triggers ([`reconcile_role`]),
+/// the coverage and round columns ([`reconcile_rounds`]) and the
+/// [`RECONCILED_INDEXES`] ([`reconcile_indexes`]), in one transaction.
 fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -105,6 +111,7 @@ fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     }
     reconcile_role(&tx)?;
     reconcile_rounds(&tx)?;
+    reconcile_indexes(&tx)?;
     tx.commit().map_err(busy_or_sql)
 }
 
@@ -210,6 +217,29 @@ fn reconcile_rounds(conn: &Connection) -> Result<(), PimdirError> {
     }
 
     conn.execute_batch("DROP TABLE IF EXISTS probes;")?;
+    Ok(())
+}
+
+/// Creates the [`RECONCILED_INDEXES`] a store lacks, each cut out of the
+/// canonical DDL.
+fn reconcile_indexes(conn: &Connection) -> Result<(), PimdirError> {
+    let schema = sql::MIGRATION_0001;
+    for index in RECONCILED_INDEXES {
+        let declared = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                [index],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !declared {
+            let start = format!("CREATE INDEX {index} ");
+            let from = schema.find(&start).expect("canonical DDL");
+            let to = from + schema[from..].find(';').expect("canonical DDL") + 1;
+            conn.execute_batch(&schema[from..to])?;
+        }
+    }
     Ok(())
 }
 
