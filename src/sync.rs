@@ -354,6 +354,7 @@ impl PimdirSync {
 
         if let Some(round) = round
             && round.scope == scope
+            && round.band == banded
             && !self.opts.full
         {
             debug!("resume the round over {:?}", round.scope);
@@ -560,14 +561,15 @@ impl PimdirSync {
         let opening = match &mut self.plan {
             Plan::Round(round) if page.kind != PageKind::Delta && round.open => {
                 round.open = false;
-                Some(round.scope.clone())
+                Some((round.scope.clone(), round.band))
             }
             _ => None,
         };
-        if let Some(scope) = &opening {
+        if let Some((scope, band)) = &opening {
             self.writes.push(PimdirWriteOp::OpenRound {
                 collection: self.collection.clone(),
                 scope: scope.clone(),
+                band: *band,
             });
             self.round_open = true;
         }
@@ -579,13 +581,14 @@ impl PimdirSync {
         if let (PageKind::Last, Plan::Round(round)) = (page.kind, &self.plan) {
             // NOTE: a round this very page opened stamped nothing yet, so
             // what it found absent is every based binding in scope it did
-            // not list; one opened before reads the store's own stamps.
+            // not list, by the rule `list_unstamped_bindings` applies to
+            // the store's own stamps for one opened before.
             let absent: Vec<PimdirHandle> = match opening.is_some() {
                 true => self
                     .local
                     .values()
                     .filter(|p| p.base.is_some() && !listed.contains(&p.handle))
-                    .filter(|p| round.scope.contains(date_of(p)))
+                    .filter(|p| round.finds_absent(date_of(p)))
                     .map(|p| p.handle.clone())
                     .collect(),
                 false => self
@@ -1821,6 +1824,19 @@ struct RoundPlan {
     open: bool,
 }
 
+impl RoundPlan {
+    /// Whether the round finds a member dated `date` absent when no page
+    /// listed it (SYNC §5): in its scope, and undated only when it lists
+    /// its whole scope, a band's date filter never returning undated
+    /// mail.
+    fn finds_absent(&self, date: Option<&str>) -> bool {
+        match date.filter(|date| !date.is_empty()) {
+            Some(date) => self.scope.contains(Some(date)),
+            None => !self.band,
+        }
+    }
+}
+
 /// What a page is to the merge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PageKind {
@@ -3054,6 +3070,138 @@ mod tests {
         )));
     }
 
+    /// Widens a scope covered since 2026-09-01 to 2026-07-01 over three
+    /// based members (1 dated in the band, 2 above it, 3 undated) whose
+    /// listing returns none of them, in one page, and answers the events
+    /// and the round the page opened.
+    fn widen(scope_bound: bool) -> (Vec<PimdirSyncEvent>, Vec<PimdirWriteOp>) {
+        crate::testlog::init();
+        let dated = |handle: &str, date: &str| {
+            let mut placement = synced(handle, &[]);
+            placement.summary = Some(PimdirSummary::Mail(
+                crate::summary::mail::PimdirMailSummary {
+                    date: Some(date.into()),
+                    ..Default::default()
+                },
+            ));
+            placement
+        };
+        let local = vec![
+            dated("1", "2026-08-01T10:00:00Z"),
+            dated("2", "2026-10-01T10:00:00Z"),
+            synced("3", &[]),
+        ];
+        let mut sync =
+            PimdirSync::new("inbox", scoped("2026-07-01T00:00:00Z")).scope_bound(scope_bound);
+        let _ = sync.resume(None);
+        let state = sync.resume(Some(PimdirArg::Load(PimdirLoaded {
+            checkpoint: Some(PimdirCheckpoint(b"c1".to_vec())),
+            coverage: coverage(PimdirScope::since("2026-09-01T00:00:00Z")),
+            ..Default::default()
+        })));
+        assert!(matches!(
+            state,
+            PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { .. })
+        ));
+        let _ = sync.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(full(
+            vec![],
+        )))));
+        let writes = match sync.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: local,
+            ..Default::default()
+        }))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => writes,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let report = match sync.resume(Some(PimdirArg::Write)) {
+            PimdirCoroutineState::Complete(Ok(report)) => report,
+            state => panic!("expected Complete(Ok), got {state:?}"),
+        };
+        (report.events, writes)
+    }
+
+    /// A band round lists by a date filter, which never returns undated
+    /// mail, so its absence infers no delete of an undated member, in the
+    /// round a run opens on its last page as in one resumed from the
+    /// store's stamps (SYNC §5).
+    #[test]
+    fn a_band_round_finds_no_undated_member_absent() {
+        let (events, writes) = widen(false);
+        assert_eq!(
+            events,
+            [PimdirSyncEvent::Vanished("1".into())],
+            "the undated member stays, the one above the band too"
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|w| matches!(w, PimdirWriteOp::OpenRound { band: true, .. })),
+            "the round is recorded as a band round: {writes:?}"
+        );
+    }
+
+    /// The counterpart: a connector bound to its scope lists the whole
+    /// scope, undated mail included, so an undated member it does not
+    /// list is absent (SYNC §5).
+    #[test]
+    fn a_whole_scope_round_finds_an_undated_member_absent() {
+        let (events, writes) = widen(true);
+        assert_eq!(
+            events,
+            [
+                PimdirSyncEvent::Vanished("1".into()),
+                PimdirSyncEvent::Vanished("2".into()),
+                PimdirSyncEvent::Vanished("3".into()),
+            ],
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|w| matches!(w, PimdirWriteOp::OpenRound { band: false, .. }))
+        );
+    }
+
+    /// An open round resumes only as the kind of round it opened as, so a
+    /// round a store reconciled from an earlier build reads as listing
+    /// the whole scope is restarted by a run listing that scope as a band
+    /// (SYNC §5).
+    #[test]
+    fn an_open_round_of_the_other_kind_restarts() {
+        let band = PimdirScope {
+            since: Some("2026-07-01T00:00:00Z".into()),
+            until: Some("2026-09-01T00:00:00Z".into()),
+        };
+        let open = |band_round: bool| PimdirRound {
+            scope: band.clone(),
+            cursor: Some(PimdirCursor(b"p1".to_vec())),
+            checkpoint: None,
+            started_at: "2026-10-07T00:00:00.000Z".into(),
+            band: band_round,
+        };
+
+        for (band_round, resumed) in [(true, true), (false, false)] {
+            let mut sync =
+                PimdirSync::new("inbox", scoped("2026-07-01T00:00:00Z")).scope_bound(false);
+            let request = listing(
+                &mut sync,
+                PimdirLoaded {
+                    checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+                    coverage: coverage(PimdirScope::since("2026-09-01T00:00:00Z")),
+                    round: Some(open(band_round)),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(request.scope, band);
+            assert_eq!(
+                request.listing,
+                PimdirListing::Round {
+                    cursor: resumed.then(|| PimdirCursor(b"p1".to_vec())),
+                    band: true
+                },
+            );
+        }
+    }
+
     /// The Add carries the origin (copy, not re-upload) and the flag set.
     #[test]
     fn created_placement_pushes_add() {
@@ -3296,6 +3444,7 @@ mod tests {
             cursor: Some(PimdirCursor(b"p1".to_vec())),
             checkpoint: None,
             started_at: "2026-10-07T00:00:00.000Z".into(),
+            band: false,
         };
 
         let request = listing(
@@ -3420,6 +3569,7 @@ mod tests {
                 cursor: Some(PimdirCursor(b"p1".to_vec())),
                 checkpoint: None,
                 started_at: "2026-10-07T00:00:00.000Z".into(),
+                band: false,
             }),
             ..Default::default()
         })));

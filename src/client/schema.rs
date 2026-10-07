@@ -177,6 +177,7 @@ fn reconcile_rounds(conn: &Connection) -> Result<(), PimdirError> {
         "round_cursor",
         "round_checkpoint",
         "round_started_at",
+        "round_band",
     ] {
         if !has_column(conn, "sources", name)? {
             conn.execute_batch(&format!(

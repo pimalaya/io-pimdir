@@ -223,7 +223,11 @@ pub(crate) fn apply(
                     },
                 )?;
             }
-            PimdirWriteOp::OpenRound { collection, scope } => {
+            PimdirWriteOp::OpenRound {
+                collection,
+                scope,
+                band,
+            } => {
                 ensure_collection(tx, &collection.0, account)?;
                 tx.execute(
                     sql::OPEN_ROUND,
@@ -232,6 +236,7 @@ pub(crate) fn apply(
                         ":source": source.0,
                         ":since": scope.since,
                         ":until": scope.until,
+                        ":band": band,
                     },
                 )?;
             }
@@ -433,6 +438,7 @@ pub(crate) fn sync_state(
                     },
                     cursor: r.get::<_, Option<Vec<u8>>>(4)?.map(PimdirCursor),
                     checkpoint: r.get::<_, Option<Vec<u8>>>(5)?.map(PimdirCheckpoint),
+                    band: r.get(6)?,
                 })
             }))
         })

@@ -304,6 +304,9 @@ pub enum PimdirWriteOp {
         collection: PimdirCollectionId,
         /// The scope it lists.
         scope: PimdirScope,
+        /// Whether it lists only the band a coverage lacks, which infers
+        /// no delete of an undated member (SYNC §5).
+        band: bool,
     },
     /// Stamp the bindings of the handles a page listed with the open
     /// round's id, after the page's upserts, so the round's last page

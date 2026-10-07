@@ -281,7 +281,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
         conn.execute(
             "UPDATE sources SET round = ?1, round_since = ?2, round_until = ?3, round_cursor = ?4,
                 round_checkpoint = ?5, round_started_at = ?6, covered_since = ?7,
-                covered_until = ?8, covered_at = ?9
+                covered_until = ?8, covered_at = ?9, round_band = ?12
              WHERE collection = ?10 AND source = ?11",
             params![
                 source["round"].as_i64().unwrap_or(0),
@@ -295,6 +295,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 instant(&source["covered"]),
                 source["collection"].as_str().unwrap(),
                 source["source"].as_str().unwrap(),
+                source["round_band"].as_bool().unwrap_or(false),
             ],
         )
         .unwrap();
@@ -748,7 +749,7 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
             "SELECT collection, link_id, source, handle, base_flags, base_object, base_revision, base_present, conflicted, conflict_revision, conflict_object, shared_object, round FROM bindings ORDER BY collection, link_id, source"
         }
         "sources" => {
-            "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until FROM sources ORDER BY collection, source"
+            "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until, round_band FROM sources ORDER BY collection, source"
         }
         "collections" => {
             "SELECT id, account, kind, conflict, generation FROM collections ORDER BY id"
@@ -824,6 +825,7 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
                     get("covered", json!(row.get::<_, Option<String>>(9)?.is_some()));
                     get("covered_since", json!(row.get::<_, Option<String>>(10)?));
                     get("covered_until", json!(row.get::<_, Option<String>>(11)?));
+                    get("round_band", json!(row.get::<_, bool>(12)?));
                 }
                 "collections" => {
                     get("id", json!(row.get::<_, String>(0)?));

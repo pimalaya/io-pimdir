@@ -26,6 +26,7 @@ All notable changes to this project are documented in this file. The format is b
 - Changed `PimdirSyncOptions` to `Clone` without `Copy`, the scope holding strings.
 - Changed a write to refuse an unnamed upsert of an unbound handle (`PimdirError::Unnamed`), and the items a batch inserts to draw their public ids in batch order.
 - Changed a level of 0, an earlier draft's, to load as `Meta` with no summary, which a `Meta` upgrade revisits; `PimdirMutateError::Probed` is `Unnamed`.
+- Changed a band round to infer no delete of an undated member, a band being listed by a date filter that never returns one (pimdir SYNC §5): `PimdirWriteOp::OpenRound` and `PimdirRound` carry `band`, recorded in `sources.round_band` (added on open to an older store), and an open round resumes only as the kind of round it opened as.
 
 ### Removed
 

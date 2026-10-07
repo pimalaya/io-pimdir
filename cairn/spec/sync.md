@@ -292,12 +292,17 @@ Every member a page lists SHALL be named in the page's write from its `PimdirRem
 `Join`, `Merge` and `Candidate`, the walk of both sides in handle order and the delta rule narrowing it, live in `sync/join.rs`; the unit tests of every verb live beside their module in a `tests.rs`. A module with code and submodules is `foo.rs` plus `foo/`.
 
 ### Requirement: A run chooses its listing from the coverage
-A sync SHALL read the source's checkpoint, coverage and round first, a `Handles` load naming none, and ask for one listing (`PimdirEnumerate`: a `PimdirListing` and a `PimdirScope`, pimdir SYNC §5): the open round resumed from its cursor when it lists the scope asked for; else a round, opened in the write of its first page, when no round ever closed (a store from an earlier draft included), a round is open over another scope, `full` is set, or the scope reaches outside the coverage, over the band alone when the connector's checkpoint is bound to no scope (`PimdirRemote::scope_bound`, `PimdirSync::scope_bound`) and the band adjoins the coverage; else a delta from the checkpoint, recording the narrower coverage (`SetCoverage`) when the scope lies strictly inside it. A connector answering a round to a delta request has one opened over the scope; one answering a delta to a round request is merged as a delta. A cursor the source rejects (`PimdirEnumerated::CursorRejected`) restarts the round under a new id; a rejected delta checkpoint opens a round.
+A sync SHALL read the source's checkpoint, coverage and round first, a `Handles` load naming none, and ask for one listing (`PimdirEnumerate`: a `PimdirListing` and a `PimdirScope`, pimdir SYNC §5): the open round resumed from its cursor when it lists the scope asked for and is a band round exactly when this run would list a band (`PimdirRound::band`); else a round, opened in the write of its first page, when no round ever closed (a store from an earlier draft included), a round is open over another scope or of the other kind, `full` is set, or the scope reaches outside the coverage, over the band alone when the connector's checkpoint is bound to no scope (`PimdirRemote::scope_bound`, `PimdirSync::scope_bound`) and the band adjoins the coverage; else a delta from the checkpoint, recording the narrower coverage (`SetCoverage`) when the scope lies strictly inside it. A connector answering a round to a delta request has one opened over the scope; one answering a delta to a round request is merged as a delta. A cursor the source rejects (`PimdirEnumerated::CursorRejected`) restarts the round under a new id; a rejected delta checkpoint opens a round.
 
 #### Scenario: A widening on IMAP
 - GIVEN a coverage since September and a connector bound to no scope
 - WHEN the scope widens to July
 - THEN the round lists July to September alone, hands no checkpoint, and closes with the coverage since July, the checkpoint kept
+
+#### Scenario: A band round open in a store an earlier build reconciled
+- GIVEN a round open over the band July to September that the store reads as no band round, its column added on open
+- WHEN a sync bound to no scope widens to July
+- THEN it restarts the round as a band round rather than resuming it from its cursor
 
 ### Requirement: A round lands page by page
 Every page SHALL land in one write: its members named and merged, the handles it listed stamped with the round's id after its upserts (`Stamp`), and, in the write after its last push chunk, its cursor with any checkpoint it carries (`SetRoundCursor`) or, on its last page, the round closed (`CloseRound`) with the checkpoint that page carried, else the one an earlier page carried, else the source's own, and the coverage of its scope or of the band's span; `OpenRound` leads the batch of the round's first page. A page before the last merges its members and vanished handles alone; a delta and a round's last page merge as a delta. A round interrupted between pages keeps what landed, and `PimdirSync::report` answers what those pages did.
@@ -308,12 +313,17 @@ Every page SHALL land in one write: its members named and merged, the handles it
 - THEN it asks for the round from `p1`, and the last page closes it with the coverage of its scope
 
 ### Requirement: Absence means deleted in scope only
-The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope or is unknown (`NULL`, an empty `date` a connector hands being stored as `NULL`, so a round resumed in a later run and one opened and closed in the same run find the same members absent), read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
+The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope, or is unknown and the round is no band round (`NULL`, an empty `date` a connector hands being stored as `NULL`, so a round resumed in a later run and one opened and closed in the same run find the same members absent), read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A band round (`OpenRound { band: true }`, `sources.round_band`) SHALL infer no delete of an undated member: its date filter never returns undated mail, so the member is left to rounds over a whole scope and to deltas, and a vanished handle still applies to it; the in-memory rule (`RoundPlan::finds_absent`) and `list_unstamped_bindings` agree. A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
 
 #### Scenario: A message older than the scope
 - GIVEN a bound member dated August and an undated one, both unlisted, under a scope since September
 - WHEN the round's last page lands
 - THEN the August member stays as it was, and the undated one is dropped `Deleted`
+
+#### Scenario: A band round and an undated member
+- GIVEN a coverage since September, a bound member dated August and an undated one, both unlisted, and a connector bound to no scope
+- WHEN the band round widening to July lands its last page, in the run that opened it or in a later one resuming it
+- THEN the August member is dropped `Deleted` and the undated one stays as it was
 
 #### Scenario: An empty date on a resumed round
 - GIVEN a bound member whose summary carries an empty `date`, unlisted by a round that an earlier run opened

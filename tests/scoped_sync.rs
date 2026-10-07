@@ -494,6 +494,14 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
         )
         .unwrap();
     assert_eq!(trigger, 1);
+    let band: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('sources') WHERE name = 'round_band'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(band, 1, "the band column is added");
 
     let loaded = store
         .load(
@@ -607,6 +615,116 @@ fn an_undated_member_unlisted_by_a_round_is_dropped() {
                 ["new@x", "old@x"],
                 "{shape}, resumed={resumed}: the undated is in scope, the old one out of it",
             );
+        }
+    }
+}
+
+/// A band round, the widening a connector bound to no scope lists, finds
+/// absent only what is dated inside the band (SYNC §5): its date filter
+/// never returns undated mail, so an undated member it does not list
+/// stays, whether the round opens and closes in one run or resumes one
+/// an earlier run opened, and whatever leaves it undated. The member
+/// dated in the band is dropped, the one above it left alone.
+#[test]
+fn a_band_round_keeps_an_undated_member_it_does_not_list() {
+    let undated = |shape: &str| {
+        let mut item = member(
+            "1",
+            &[],
+            &message("undated@x", "When", "someday", "text/plain"),
+        );
+        match (shape, &mut item.meta.summary) {
+            ("empty", Some(io_pimdir::summary::PimdirSummary::Mail(mail))) => {
+                mail.date = Some(String::new())
+            }
+            ("none", summary) => *summary = None,
+            _ => (),
+        }
+        item
+    };
+    let old = message(
+        "old@x",
+        "Old",
+        "Sat, 1 Aug 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let recent = message(
+        "new@x",
+        "New",
+        "Mon, 5 Oct 2026 10:00:00 +0000",
+        "text/plain",
+    );
+
+    for shape in ["no date", "empty", "none"] {
+        for resumed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+            store.ensure_collection("INBOX", "message/rfc822").unwrap();
+            // NOTE: the first round over 2026-09-01 lists the old member
+            // too, a page naming every member it carries.
+            let mut remote = Paged {
+                pages: vec![page(
+                    vec![
+                        undated(shape),
+                        member("2", &[], &old),
+                        member("3", &[], &recent),
+                    ],
+                    None,
+                )],
+                ..Default::default()
+            };
+            store
+                .sync("INBOX", since("2026-09-01T00:00:00Z"), &mut remote)
+                .unwrap();
+            assert_eq!(store.count_items("INBOX").unwrap(), 3);
+
+            let wider = since("2026-07-01T00:00:00Z");
+            match resumed {
+                false => {
+                    remote.pages = vec![page(Vec::new(), None)];
+                    store.sync("INBOX", wider, &mut remote).unwrap();
+                }
+                true => {
+                    remote.pages = vec![page(Vec::new(), Some("p1"))];
+                    let interrupted = store.sync("INBOX", wider.clone(), &mut remote);
+                    assert!(matches!(interrupted, Err(PimdirRunError::Remote(_))));
+                    remote.pages = vec![page(Vec::new(), None)];
+                    store.sync("INBOX", wider, &mut remote).unwrap();
+                    assert_eq!(
+                        remote.requests.last().and_then(|request| request.cursor()),
+                        Some(&PimdirCursor(b"p1".to_vec())),
+                        "the band round resumed from its cursor",
+                    );
+                }
+            }
+            assert!(
+                remote.requests[1..].iter().all(|request| request.scope
+                    == PimdirScope {
+                        since: Some("2026-07-01T00:00:00Z".into()),
+                        until: Some("2026-09-01T00:00:00Z".into()),
+                    }),
+                "the widening lists the band alone: {:?}",
+                remote.requests,
+            );
+
+            let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+            let mut live = conn
+                .prepare("SELECT link_id FROM items WHERE deleted = 0 ORDER BY link_id")
+                .unwrap();
+            let live: Vec<String> = live
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                live,
+                ["new@x", "undated@x"],
+                "{shape}, resumed={resumed}: the undated member stays, the one dated in the band goes",
+            );
+            let band: i64 = conn
+                .query_row("SELECT round_band FROM sources", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(band, 0, "closing clears the band");
         }
     }
 }

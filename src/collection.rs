@@ -179,6 +179,9 @@ pub struct PimdirRound {
     pub checkpoint: Option<PimdirCheckpoint>,
     /// When the round opened, an RFC 3339 instant stamped by SQLite.
     pub started_at: String,
+    /// Whether it lists only the band its coverage lacks, whose absence
+    /// infers no delete of an undated member (SYNC §5).
+    pub band: bool,
 }
 
 #[cfg(test)]
