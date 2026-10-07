@@ -19,8 +19,8 @@ use io_pimdir::{
         PimdirStatus,
     },
     remote::{
-        PimdirFetchedBody, PimdirFetchedItem, PimdirPushResult, PimdirRemote, PimdirRemoteItem,
-        PimdirRemoteSnapshot, PimdirTier,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushResult,
+        PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot, PimdirTier,
     },
     sync::{PimdirSyncOptions, PimdirSyncReport},
 };
@@ -160,8 +160,8 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
     store
         .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
         .unwrap();
-    // a sync enumerates handles only, and the hydrate resolves the link
-    // id and the body, so the probe becomes a persisted item
+    // a sync names the member from its listing, and the hydrate fetches
+    // the body
     store
         .upgrade(
             "INBOX",
@@ -538,22 +538,25 @@ impl PimdirRemote for MemRemote {
     fn enumerate(
         &mut self,
         _collection: &PimdirCollectionId,
-        _cursor: Option<PimdirCheckpoint>,
-    ) -> Result<PimdirRemoteSnapshot, Infallible> {
-        Ok(PimdirRemoteSnapshot {
-            items: self
-                .items
-                .keys()
-                .map(|handle| PimdirRemoteItem {
+        _request: PimdirEnumerate,
+    ) -> Result<PimdirEnumerated, Infallible> {
+        Ok(PimdirEnumerated::Page(PimdirRemoteSnapshot::round(
+            self.items
+                .iter()
+                .map(|(handle, (link, _))| PimdirRemoteItem {
                     handle: handle.clone(),
                     flags: PimdirFlags::default(),
                     revision: None,
+                    meta: PimdirRemoteMeta {
+                        link_id: link.clone(),
+                        summary: None,
+                        sort_key: Default::default(),
+                        body: None,
+                    },
                 })
                 .collect(),
-            vanished: Vec::new(),
-            complete: true,
-            checkpoint: PimdirCheckpoint(vec![self.items.len() as u8]),
-        })
+            Some(PimdirCheckpoint(vec![self.items.len() as u8])),
+        )))
     }
 
     fn fetch(

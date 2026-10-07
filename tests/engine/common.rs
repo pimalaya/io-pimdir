@@ -28,8 +28,9 @@ use io_pimdir::{
     },
     rekey::PimdirRekeyReport,
     remote::{
-        PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome, PimdirPushResult, PimdirRemote,
-        PimdirRemoteItem, PimdirRemoteSnapshot, PimdirTier,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome,
+        PimdirPushResult, PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot,
+        PimdirTier,
     },
     summary::{PimdirSummary, mail::PimdirMailSummary},
     sync::{PimdirSyncOptions, PimdirSyncReport},
@@ -252,6 +253,26 @@ impl MemRemote {
         self.mutable.then(|| rev.to_string())
     }
 
+    /// A member as a listing carries it, named by its meta (SYNC §4):
+    /// with its body when the remote is mutable, as a DAV listing fetches
+    /// each page's bodies, its meta being the body.
+    fn listed(&self, handle: &PimdirHandle, item: &ServerItem) -> PimdirRemoteItem {
+        PimdirRemoteItem {
+            handle: handle.clone(),
+            flags: item.flags.clone(),
+            revision: self.revision(item.rev),
+            meta: PimdirRemoteMeta {
+                link_id: item.link_id.clone(),
+                summary: Some(summary_of(handle)),
+                sort_key: Default::default(),
+                body: self.mutable.then(|| PimdirFetchedBody::Inline {
+                    hash: hash(&item.body),
+                    bytes: item.body.clone(),
+                }),
+            },
+        }
+    }
+
     pub fn seed(
         &mut self,
         collection: &str,
@@ -414,13 +435,13 @@ impl PimdirRemote for MemRemote {
     fn enumerate(
         &mut self,
         collection: &PimdirCollectionId,
-        cursor: Option<PimdirCheckpoint>,
-    ) -> Result<PimdirRemoteSnapshot, Infallible> {
+        request: PimdirEnumerate,
+    ) -> Result<PimdirEnumerated, Infallible> {
         self.calls += 1;
         let checkpoint = PimdirCheckpoint(self.seq.to_string().into_bytes());
 
-        let since = cursor
-            .as_ref()
+        let since = request
+            .checkpoint()
             .and_then(|c| std::str::from_utf8(&c.0).ok())
             .and_then(|s| s.parse::<usize>().ok());
 
@@ -432,11 +453,7 @@ impl PimdirRemote for MemRemote {
                     .into_iter()
                     .flatten()
                     .filter(|(_, item)| item.seq > since)
-                    .map(|(handle, item)| PimdirRemoteItem {
-                        handle: handle.clone(),
-                        flags: item.flags.clone(),
-                        revision: self.revision(item.rev),
-                    })
+                    .map(|(handle, item)| self.listed(handle, item))
                     .collect();
                 // NOTE: a handle listed again is not vanished, the fake
                 // reporting current truth where a server never reuses one.
@@ -456,22 +473,20 @@ impl PimdirRemote for MemRemote {
                 let items = members
                     .into_iter()
                     .flatten()
-                    .map(|(handle, item)| PimdirRemoteItem {
-                        handle: handle.clone(),
-                        flags: item.flags.clone(),
-                        revision: self.revision(item.rev),
-                    })
+                    .map(|(handle, item)| self.listed(handle, item))
                     .collect();
                 (items, Vec::new(), true)
             }
         };
 
-        Ok(PimdirRemoteSnapshot {
+        Ok(PimdirEnumerated::Page(PimdirRemoteSnapshot {
             items,
             vanished,
             complete,
-            checkpoint,
-        })
+            last: true,
+            cursor: None,
+            checkpoint: Some(checkpoint),
+        }))
     }
 
     fn fetch(

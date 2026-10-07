@@ -20,7 +20,7 @@ use std::{
 
 use io_pimdir::{
     change::PimdirChange,
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::PimdirCollectionId,
     coroutine::{PimdirArg, PimdirCoroutine, PimdirCoroutineState},
     load::PimdirLoaded,
     mutate::{PimdirMutate, PimdirMutation},
@@ -28,7 +28,10 @@ use io_pimdir::{
     open::PimdirOpen,
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId, PimdirPlacement, PimdirStatus},
     rekey::PimdirRekey,
-    remote::{PimdirFetchedItem, PimdirPushResult, PimdirRemote, PimdirRemoteSnapshot, PimdirTier},
+    remote::{
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirRemote,
+        PimdirRemoteSnapshot, PimdirTier,
+    },
     sync::{PimdirSync, PimdirSyncOptions, PimdirSyncReport},
     upgrade::PimdirUpgrade,
 };
@@ -100,12 +103,10 @@ fn arb_arg() -> impl Strategy<Value = Option<PimdirArg>> {
         Just(Some(PimdirArg::Fetch(vec![]))),
         Just(Some(PimdirArg::LookupObject(Default::default()))),
         Just(Some(PimdirArg::Load(PimdirLoaded::default()))),
-        Just(Some(PimdirArg::Enumerate(PimdirRemoteSnapshot {
-            items: vec![],
-            vanished: vec![],
-            complete: true,
-            checkpoint: Default::default(),
-        }))),
+        Just(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(
+            PimdirRemoteSnapshot::round(vec![], None)
+        )))),
+        Just(Some(PimdirArg::Enumerate(PimdirEnumerated::CursorRejected))),
     ]
 }
 
@@ -217,7 +218,7 @@ proptest! {
         client.remote_mut().seed("inbox", "m4", "l4", &["seen", "draft"], b"four");
         client.remote_mut().seed("inbox", "m5", "l5", &[], b"five");
         let opts = PimdirSyncOptions::default();
-        client.sync("inbox", opts).unwrap();
+        client.sync("inbox", opts.clone()).unwrap();
         hydrate(&mut client, "inbox");
 
         for op in ops {
@@ -253,14 +254,14 @@ proptest! {
                     client.remote_mut().seed("inbox", &handle, &link, &[], b"new");
                 }
                 Op::Sync => {
-                    client.sync("inbox", opts).unwrap();
+                    client.sync("inbox", opts.clone()).unwrap();
                     hydrate(&mut client, "inbox");
                 }
             }
         }
 
-        client.sync("inbox", opts).unwrap();
-        client.sync("inbox", opts).unwrap();
+        client.sync("inbox", opts.clone()).unwrap();
+        client.sync("inbox", opts.clone()).unwrap();
 
         let placements = client.open("inbox").unwrap().placements;
         let local: BTreeSet<PimdirHandle> = placements.iter().map(|p| p.handle.clone()).collect();
@@ -280,7 +281,7 @@ proptest! {
             prop_assert_eq!(&placement.flags, server_flags, "flags converged");
         }
 
-        let report = client.sync("inbox", opts).unwrap();
+        let report = client.sync("inbox", opts.clone()).unwrap();
         prop_assert_eq!(report, PimdirSyncReport::default());
     }
 }
@@ -556,7 +557,7 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
 
     let mut client = Client::new(remote);
     let opts = PimdirSyncOptions::default();
-    let _ = client.sync("inbox", opts);
+    let _ = client.sync("inbox", opts.clone());
     hydrate(&mut client, "inbox");
 
     let mut ledger = Ledger::default();
@@ -838,11 +839,15 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                 }
             }
             MutOp::Sync => {
-                client.sync("inbox", opts).map_err(TestCaseError::fail)?;
+                client
+                    .sync("inbox", opts.clone())
+                    .map_err(TestCaseError::fail)?;
                 hydrate(&mut client, "inbox");
             }
             MutOp::SyncArchive => {
-                client.sync("archive", opts).map_err(TestCaseError::fail)?;
+                client
+                    .sync("archive", opts.clone())
+                    .map_err(TestCaseError::fail)?;
                 hydrate(&mut client, "archive");
             }
         }
@@ -851,9 +856,9 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
     // NOTE: mirroring is a sync plus an upgrade (SYNC §9): the archive
     // is hydrated too, so a relocated member's fetch lands its create
     for _ in 0..3 {
-        client.sync("inbox", opts).unwrap();
+        client.sync("inbox", opts.clone()).unwrap();
         hydrate(&mut client, "inbox");
-        client.sync("archive", opts).unwrap();
+        client.sync("archive", opts.clone()).unwrap();
         hydrate(&mut client, "archive");
     }
 
@@ -900,15 +905,15 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                 )
                 .unwrap();
         }
-        client.sync("inbox", opts).unwrap();
-        client.sync("inbox", opts).unwrap();
+        client.sync("inbox", opts.clone()).unwrap();
+        client.sync("inbox", opts.clone()).unwrap();
         hydrate(&mut client, "inbox");
     }
 
     for _ in 0..2 {
-        client.sync("inbox", opts).unwrap();
+        client.sync("inbox", opts.clone()).unwrap();
         hydrate(&mut client, "inbox");
-        client.sync("archive", opts).unwrap();
+        client.sync("archive", opts.clone()).unwrap();
         hydrate(&mut client, "archive");
     }
 
@@ -1031,9 +1036,9 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
         );
     }
 
-    let report = client.sync("inbox", opts).unwrap();
+    let report = client.sync("inbox", opts.clone()).unwrap();
     prop_assert_eq!(report, PimdirSyncReport::default());
-    let report = client.sync("archive", opts).unwrap();
+    let report = client.sync("archive", opts.clone()).unwrap();
     prop_assert_eq!(report, PimdirSyncReport::default());
     Ok(())
 }
@@ -1109,9 +1114,9 @@ impl PimdirRemote for SharedRemote {
     fn enumerate(
         &mut self,
         collection: &PimdirCollectionId,
-        cursor: Option<PimdirCheckpoint>,
-    ) -> Result<PimdirRemoteSnapshot, Infallible> {
-        self.0.borrow_mut().enumerate(collection, cursor)
+        request: PimdirEnumerate,
+    ) -> Result<PimdirEnumerated, Infallible> {
+        self.0.borrow_mut().enumerate(collection, request)
     }
 
     fn fetch(
@@ -1185,9 +1190,9 @@ proptest! {
         let delta_opts = PimdirSyncOptions::default();
         let mut a = Client::new(SharedRemote(server.clone()));
         let mut b = Client::new(SharedRemote(server.clone()));
-        a.sync("inbox", full_opts).unwrap();
+        a.sync("inbox", full_opts.clone()).unwrap();
         hydrate(&mut a, "inbox");
-        b.sync("inbox", delta_opts).unwrap();
+        b.sync("inbox", delta_opts.clone()).unwrap();
         hydrate(&mut b, "inbox");
 
         let on_server = || -> BTreeSet<PimdirHandle> { server.borrow().handles("inbox") };
@@ -1227,20 +1232,20 @@ proptest! {
                     server.borrow_mut().seed("inbox", &handle, &link, &[], b"new");
                 }
                 PairOp::SyncA => {
-                    a.sync("inbox", full_opts).unwrap();
+                    a.sync("inbox", full_opts.clone()).unwrap();
                     hydrate(&mut a, "inbox");
                 }
                 PairOp::SyncB => {
-                    b.sync("inbox", delta_opts).unwrap();
+                    b.sync("inbox", delta_opts.clone()).unwrap();
                     hydrate(&mut b, "inbox");
                 }
             }
         }
 
         for _ in 0..3 {
-            a.sync("inbox", full_opts).unwrap();
+            a.sync("inbox", full_opts.clone()).unwrap();
             hydrate(&mut a, "inbox");
-            b.sync("inbox", delta_opts).unwrap();
+            b.sync("inbox", delta_opts.clone()).unwrap();
             hydrate(&mut b, "inbox");
         }
 
@@ -1350,7 +1355,7 @@ fn duo_resolve(client: &mut Replica, tag: &str) -> bool {
 
 /// Syncs one replica and names what it pulled.
 fn duo_sync(client: &mut Replica, opts: PimdirSyncOptions) {
-    client.sync("inbox", opts).unwrap();
+    client.sync("inbox", opts.clone()).unwrap();
     hydrate(client, "inbox");
 }
 
@@ -1373,8 +1378,8 @@ proptest! {
         let opts = PimdirSyncOptions::default();
         let mut a = Client::new(SharedRemote(server.clone()));
         let mut b = Client::new(SharedRemote(server.clone()));
-        duo_sync(&mut a, opts);
-        duo_sync(&mut b, opts);
+        duo_sync(&mut a, opts.clone());
+        duo_sync(&mut b, opts.clone());
 
         let mut arrivals = 0usize;
         for op in ops {
@@ -1402,38 +1407,38 @@ proptest! {
                     let body = format!("new-{n}").into_bytes();
                     server.borrow_mut().seed("inbox", &handle, &link, &[], &body);
                 }
-                DuoOp::SyncA => duo_sync(&mut a, opts),
-                DuoOp::SyncB => duo_sync(&mut b, opts),
+                DuoOp::SyncA => duo_sync(&mut a, opts.clone()),
+                DuoOp::SyncB => duo_sync(&mut b, opts.clone()),
             }
         }
 
         // NOTE: one resolution can conflict with the other, so the rounds
         // ping-pong at most once before settling
         for _ in 0..4 {
-            duo_sync(&mut a, opts);
-            duo_sync(&mut b, opts);
+            duo_sync(&mut a, opts.clone());
+            duo_sync(&mut b, opts.clone());
         }
         for round in 0..4 {
             let unresolved_a = duo_resolve(&mut a, "a");
             if unresolved_a {
-                duo_sync(&mut a, opts);
-                duo_sync(&mut a, opts);
+                duo_sync(&mut a, opts.clone());
+                duo_sync(&mut a, opts.clone());
             }
             let unresolved_b = duo_resolve(&mut b, "b");
             if unresolved_b {
-                duo_sync(&mut b, opts);
-                duo_sync(&mut b, opts);
+                duo_sync(&mut b, opts.clone());
+                duo_sync(&mut b, opts.clone());
             }
             if !unresolved_a && !unresolved_b {
                 break;
             }
             prop_assert!(round < 3, "conflict resolution must terminate");
-            duo_sync(&mut a, opts);
-            duo_sync(&mut b, opts);
+            duo_sync(&mut a, opts.clone());
+            duo_sync(&mut b, opts.clone());
         }
         for _ in 0..2 {
-            duo_sync(&mut a, opts);
-            duo_sync(&mut b, opts);
+            duo_sync(&mut a, opts.clone());
+            duo_sync(&mut b, opts.clone());
         }
 
         let on_server: BTreeSet<PimdirHandle> = server.borrow().handles("inbox");
@@ -1470,9 +1475,9 @@ proptest! {
             }
         }
 
-        let report = a.sync("inbox", opts).unwrap();
+        let report = a.sync("inbox", opts.clone()).unwrap();
         prop_assert_eq!(report, PimdirSyncReport::default());
-        let report = b.sync("inbox", opts).unwrap();
+        let report = b.sync("inbox", opts.clone()).unwrap();
         prop_assert_eq!(report, PimdirSyncReport::default());
     }
 }

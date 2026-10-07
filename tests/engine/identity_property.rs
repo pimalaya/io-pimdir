@@ -173,7 +173,7 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
         ..Default::default()
     };
     for collection in COLLECTIONS {
-        client.sync(collection, opts).unwrap();
+        client.sync(collection, opts.clone()).unwrap();
     }
 
     let mut arrivals = 0usize;
@@ -244,7 +244,7 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
                 client.rekey("inbox").unwrap();
             }
             IdOp::Sync(second) => {
-                client.sync(collection(second), opts).unwrap();
+                client.sync(collection(second), opts.clone()).unwrap();
             }
         }
 
@@ -254,7 +254,7 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
 
     for _ in 0..3 {
         for collection in COLLECTIONS {
-            client.sync(collection, opts).unwrap();
+            client.sync(collection, opts.clone()).unwrap();
             let handles = every(&client, collection);
             let _ = client.upgrade(collection, handles, PimdirTier::Full);
         }

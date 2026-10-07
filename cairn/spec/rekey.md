@@ -20,20 +20,20 @@ The batch SHALL list every `Rekeyed` drop before every upsert (pimdir SYNC §8, 
 A pending create staged from this collection into another carries an origin naming a handle the rebuild voided. The store derives the origin anew on every load from the bindings by link id (SYNC §3), so such a create copies from the carried handle; a consumer keeping the staged origin sees it fall back to an upload when the store holds the body, and rejected until restaged otherwise.
 
 ### Requirement: A rekey never writes a base it never reconciled
-A mutable member whose fetched revision differs from the one its old base held changed on the remote while the handles did (pimdir SYNC §8). The rekey SHALL carry it as the pull a sync would make, body dropped, level `Probed`, base object `None` at the fetched revision, or as a `Conflict` at the fetched revision with the base untouched and no `conflict_object` when the placement also holds a local edit, a body its base does not. A tombstone meeting one is carried as it is, base included, for the next sync to revive it on the ordinary edit-beats-delete path. A `Conflict` the old handle held is carried as it is, revision and diverging body kept while the fetched revision is the one recorded; an item-level conflict ([hub](hub.md)), which records no revision, SHALL gain none unless the remote moved, since a binding conflict pinned at a revision the server never left holds that source's pushes for ever while the other sources settle the item. A base claiming the fetched revision while holding the old body is the one thing the rekey MUST NOT write: the next sync would read the stale body as current, or push the local edit last-writer-wins.
+A mutable member whose listed revision differs from the one its old base held changed on the remote while the handles did (pimdir SYNC §8). The rekey SHALL carry it as the pull a sync would make, body dropped, level `Meta`, base object `None` at the fetched revision, or as a `Conflict` at the fetched revision with the base untouched and no `conflict_object` when the placement also holds a local edit, a body its base does not. A tombstone meeting one is carried as it is, base included, for the next sync to revive it on the ordinary edit-beats-delete path. A `Conflict` the old handle held is carried as it is, revision and diverging body kept while the fetched revision is the one recorded; an item-level conflict ([hub](hub.md)), which records no revision, SHALL gain none unless the remote moved, since a binding conflict pinned at a revision the server never left holds that source's pushes for ever while the other sources settle the item. A base claiming the fetched revision while holding the old body is the one thing the rekey MUST NOT write: the next sync would read the stale body as current, or push the local edit last-writer-wins.
 
 #### Scenario: A remote edit over a clean placement
-- GIVEN a placement clean at `r1` whose new handle the fetch reports at `r2`
+- GIVEN a placement clean at `r1` whose new handle the listing reports at `r2`
 - WHEN the collection is rebuilt
-- THEN it lands on its new handle with no body, at `Probed`, its base at `r2` with no body
+- THEN it lands on its new handle with no body, at `Meta`, its base at `r2` with no body
 
 #### Scenario: A remote edit over a local edit
-- GIVEN a placement edited locally over a base at `r1` whose new handle the fetch reports at `r2`
+- GIVEN a placement edited locally over a base at `r1` whose new handle the listing reports at `r2`
 - WHEN the collection is rebuilt
 - THEN it lands conflicted at `r2`, its base still `r1` and its old body, so nothing pushes last-writer-wins
 
-### Requirement: The meta fetch goes in chunks
-A rekey SHALL resolve the new spine's identities in `Meta` fetches of at most `PimdirRekey::FETCH_CHUNK` handles, so a `UIDVALIDITY` bump on a large mailbox issues bounded requests rather than one naming every member; the rebuild itself still lands in one batch with the checkpoint.
+### Requirement: A rebuild reads every page before its one batch
+A rekey SHALL list a round over the whole collection whatever the scope, every page read before its one batch is written, a rejected cursor relisting it from the start, and name each member from its meta, fetching nothing (pimdir SYNC §8): the old handles being void, it is the one listing whose absence covers every member. The batch lands the last checkpoint a page carried, none keeping the old one, and leaves the coverage as it was.
 
 ### Requirement: A rebuild's drops say the row is superseded
 Every drop a rebuild emits for a placement its own batch re-writes SHALL carry `PimdirDropReason::Rekeyed`, never `Deleted`. The item is not going anywhere: the same batch upserts it under its new handle, and a storage sharing one item across sources reads a `Deleted` drop as the item being gone and propagates a removal to sources nobody touched.
@@ -60,9 +60,9 @@ A drop for a row the rebuild carried nothing for SHALL carry `PimdirDropReason::
 - THEN the item is deleted across the hub rather than mirrored back to the source it left
 
 ### Requirement: A rebuild keys two copies of one hint apart
-A rebuild SHALL walk the new members in handle order and give each the identity its `Meta` fetch resolved while the rebuild has not handed that identity out; a member resolving to one already taken SHALL be keyed under the minted key an old copy of that hint carries, and failing that under a mint of its own handle.
+A rebuild SHALL walk the new members in handle order and give each the identity its meta names while the rebuild has not handed that identity out; a member resolving to one already taken SHALL be keyed under the minted key an old copy of that hint carries, and failing that under a mint of its own handle.
 
-Carrying the old minted key is what the mint's own determinism rests on. The key is derived from the hint and the handle it was minted from, and a handle-space change is exactly what takes that handle away, so a rebuild carries the key rather than re-deriving it. What the source reports for both copies is the hint they share, the minted key being the replica's own and never a thing a fetch returns.
+Carrying the old minted key is what the mint's own determinism rests on. The key is derived from the hint and the handle it was minted from, and a handle-space change is exactly what takes that handle away, so a rebuild carries the key rather than re-deriving it. What the source reports for both copies is the hint they share, the minted key being the replica's own and never a thing a listing or a fetch returns.
 
 Merging the two instead keeps one body, one summary and one set of pending edits for two resources the source holds, and loses the other at the write that noticed the problem.
 

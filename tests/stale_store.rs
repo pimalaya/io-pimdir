@@ -13,7 +13,7 @@ fn a_store_missing_a_canonical_table_is_refused_by_every_role() {
     drop(PimdirStore::open(dir.path()).unwrap());
 
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch("DROP TABLE probes").unwrap();
+    conn.execute_batch("DROP TABLE item_address").unwrap();
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
@@ -22,14 +22,20 @@ fn a_store_missing_a_canonical_table_is_refused_by_every_role() {
 
     assert!(matches!(
         PimdirStore::open(dir.path()),
-        Err(PimdirError::Stale { missing: "probes" })
+        Err(PimdirError::Stale {
+            missing: "item_address"
+        })
     ));
     assert!(matches!(
         PimdirReader::open(dir.path()),
-        Err(PimdirError::Stale { missing: "probes" })
+        Err(PimdirError::Stale {
+            missing: "item_address"
+        })
     ));
     assert!(matches!(
         PimdirProducer::open(dir.path(), "test"),
-        Err(PimdirError::Stale { missing: "probes" })
+        Err(PimdirError::Stale {
+            missing: "item_address"
+        })
     ));
 }

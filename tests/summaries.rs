@@ -9,7 +9,7 @@ use std::{fs, path::PathBuf};
 use io_pimdir::{
     hash::PimdirHashAlgo,
     placement::PimdirHandle,
-    summary::{self, PimdirSummary},
+    summary::{self, PimdirSummary, mail},
 };
 use serde_json::{Map, Value, json};
 
@@ -195,5 +195,32 @@ fn every_summary_vector_derives() {
             case["sort_key"].as_str().unwrap_or(""),
             "{label}: sort key"
         );
+
+        // NOTE: the mark without the body (Annex A.1): the same row read
+        // off the header block alone agrees on every column but the mark,
+        // which the top-level Content-Type gives.
+        if let Some(mark) = case.get("meta_attachment") {
+            let meta = mail::derive_meta(&body, Some(body.len() as u64), None);
+            let Some(PimdirSummary::Mail(read)) = &meta.summary else {
+                panic!("{label}: a message derives a mail summary");
+            };
+            assert_eq!(
+                read.attachment.map(i64::from),
+                mark.as_i64(),
+                "{label}: meta_attachment"
+            );
+
+            let mut walked = summary.clone();
+            if let PimdirSummary::Mail(walked) = &mut walked {
+                walked.attachment = read.attachment;
+            }
+            assert_eq!(
+                meta.summary.as_ref(),
+                Some(&walked),
+                "{label}: meta summary"
+            );
+            assert_eq!(meta.link_id, derivation.link_id, "{label}: meta link id");
+            assert_eq!(meta.sort_key, derivation.sort_key, "{label}: meta sort key");
+        }
     }
 }

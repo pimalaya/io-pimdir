@@ -42,7 +42,7 @@ fn conflicted_client() -> Client {
 
     let mut client = Client::new(remote);
     let opts = PimdirSyncOptions::default();
-    client.sync("inbox", opts).unwrap();
+    client.sync("inbox", opts.clone()).unwrap();
     client
         .upgrade(
             "inbox",
@@ -53,7 +53,7 @@ fn conflicted_client() -> Client {
 
     edit(&mut client, "m1", LOCAL);
     client.remote_mut().edit("inbox", "m1", REMOTE);
-    client.sync("inbox", opts).unwrap();
+    client.sync("inbox", opts.clone()).unwrap();
 
     // NOTE: the engine fetches nothing itself, so the upgrade supplies the
     // diverging body a resolver reads.

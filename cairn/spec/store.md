@@ -279,7 +279,7 @@ A reader or a producer opening a directory holding no pimdir.db SHALL report
 creates the schema, and a missing file is not a SQLite failure to relay.
 
 ### Requirement: Reads are availability-aware
-A read result SHALL carry each item's detail `level` (`Probed`/`Meta`/`Full`), so
+A read result SHALL carry each item's detail `level` (`Meta`/`Full`), so
 a caller knows a body is not local (`level < Full`, `object` absent) without
 probing the blob store, and can trigger a hydrate through the sync engine rather
 than treating the absence as data loss.
@@ -311,8 +311,8 @@ unrepairable.
 ### Requirement: An unknown flag set is stored as NULL
 The `flags` column keeps two absences apart (STORAGE §13): `NULL` means nothing has
 read the item's markers, `'[]'` means it is known to carry none. The store SHALL
-write `NULL` for an unknown set and decode `NULL` back to one, so a probed
-placement never claims to carry no markers.
+write `NULL` for an unknown set and decode `NULL` back to one, so a placement
+whose markers were never read never claims to carry none.
 
 In a queue payload an unknown set SHALL encode as `null` rather than `[]`, since
 an action states an intent: every payload the format defines carries a known
@@ -617,26 +617,26 @@ A binding pins one handle, so a write carrying a second one is either a rebuild 
 `load` under `PimdirLoadScope::Links` SHALL return the placements this source binds under the named keys, and SHALL NOT return the `Created` placement the hub projects for an item the source lacks (hub.md, membership propagation). That projection is what the whole-collection load offers the merge so it derives the append; it is no row the source holds, and every verb reading by key asks who holds the key. An upgrade settling a fetched identity against it reads the sibling's copy as this source's holding and mints `dup:<hint>#<handle>` for the resource the source has always held, where SYNC §6 mints only when this source binds the hint under another handle; a copy or a move into the collection mints the same way and pushes a second copy beside the append the offer stages.
 
 #### Scenario: Two sources already holding one card
-- GIVEN an item one source has hydrated, and a probe of the same identity on a second source
-- WHEN the second source's probe is upgraded
+- GIVEN an item one source has hydrated, and a member of the same identity a second source lists
+- WHEN the second source's page names it
 - THEN it is linked under the identity itself and binds the shared item, and no key is minted
 
 ### Requirement: An unlinked upsert lands on the binding its handle holds
-An `UpsertPlacement` carrying no `link_id` SHALL be resolved against the binding its `(collection, source, handle)` holds (`LINK_FOR_HANDLE`) and folded through the hub as that item. Only a handle no binding holds SHALL be a probe: a `probes` row keyed `(collection, source, handle)` carrying the reported flags, loaded back as a level `Probed` placement with no base, and deleted in the transaction of the upsert that names it or the drop that removes it (STORAGE §4.3, SYNC §3).
+An `UpsertPlacement` carrying no `link_id` SHALL be resolved against the binding its `(collection, source, handle)` holds (`LINK_FOR_HANDLE`) and folded through the hub as that item. One for a handle no binding holds SHALL be refused (`PimdirError::Unnamed`): nothing reaches the store unnamed, every member a listing carries arriving with its meta (STORAGE §14, SYNC §10).
 
-A placement carries no link id because its identity has not been read, not because it has none. A handle the store has already bound has one, and staging a second row for it makes `load` answer with two placements for one handle, which is read one layer up as two items: the upgrade fetches the handle twice and mints a `dup:` key for a copy that does not exist, binding one source handle to two items no sync can converge. The write is ordinary, not exotic: a remote edit of a locally deleted item is pulled as a fresh probe of the handle the tombstone still binds (STORAGE §10).
+A placement carries no link id because its identity has not been read, not because it has none. A handle the store has already bound has one, and staging a second row for it makes `load` answer with two placements for one handle, which is read one layer up as two items: the upgrade fetches the handle twice and mints a `dup:` key for a copy that does not exist, binding one source handle to two items no sync can converge. The write is ordinary, not exotic: an earlier engine pulled a remote edit of a locally deleted item as an unnamed row of the handle the tombstone still binds (STORAGE §10).
 
 Resolving before the fold is also what puts such an upsert under the identity floor: the rebind guard and the link set a batch folds into both read the placement's link id, and neither sees a placement that has none.
 
-#### Scenario: A reprobed handle stays one item
+#### Scenario: A bound handle written unnamed stays one item
 - GIVEN a handle bound to an item
 - WHEN a write upserts a placement for that handle carrying no link id
 - THEN it folds into the bound item and the handle answers with one placement
 
-#### Scenario: A handle nothing holds is still a probe
+#### Scenario: A handle nothing holds is refused unnamed
 - GIVEN a handle no binding holds
 - WHEN a write upserts a placement for it carrying no link id
-- THEN it stages unlinked and claims no identity
+- THEN the write is refused with `PimdirError::Unnamed` and nothing is stored
 
 ### Requirement: A minted link id is an ordinary key
 The store SHALL persist whatever `link_id` the engine assigns, SHALL NOT parse it, and SHALL NOT re-canonicalise one. A minted key (pimdir STORAGE §9, `dup:<hint>#<handle>`) is subject to every rule a bare key is: `seq` allocation, retention and revival, dedup by object hash, the reader's pages, and the queue.
@@ -837,8 +837,8 @@ A named placement carries its `PimdirSummary` (STORAGE Annex A), and the write S
 ### Requirement: The queue derives summaries from bodies
 A queued `add` or `update` SHALL carry no summary: the drain reads the body the producer wrote and derives the key, the summary and the sort key under Annex A for the collection's declared kind, parking an `add` that names no link id and derives none.
 
-### Requirement: A load derives a tombstone's destination and reads its own probes
-`load` SHALL set a `Tombstone` placement's origin to the collection `DESTINATION_FOR_LINK` names, the same source's base-less binding of the same link id elsewhere, under the tombstone's own handle, so the engine derives `Remove { to }` from it (SYNC §3); a `Created` placement's origin stays `ORIGIN_FOR_LINK`'s. Both are derived from the bindings and never stored, so they read the same after a reopen and under every scope. A `Handles` scope SHALL read its probes with `LOAD_PROBES_BY_HANDLE` bound to a JSON array of the handles asked for, the other scopes with `LOAD_PROBES` (STORAGE §14).
+### Requirement: A load derives a tombstone's destination and reads its sync state
+`load` SHALL set a `Tombstone` placement's origin to the collection `DESTINATION_FOR_LINK` names, the same source's base-less binding of the same link id elsewhere, under the tombstone's own handle, so the engine derives `Remove { to }` from it (SYNC §3); a `Created` placement's origin stays `ORIGIN_FOR_LINK`'s. Both are derived from the bindings and never stored, so they read the same after a reopen and under every scope. Every scope SHALL read the source's checkpoint with its coverage (`LOAD_CHECKPOINT`) and its round under way (`LOAD_ROUND`), and an `All` scope while a round is open the bindings it has not stamped in its scope (`LIST_UNSTAMPED_BINDINGS`, STORAGE §14).
 
 #### Scenario: A staged move survives a reopen
 - GIVEN a move staged as a target create and a source tombstone
@@ -920,3 +920,20 @@ The drain SHALL record a receipt (`record_receipt`) in the transaction applying 
 - **GIVEN** `imap/Sent` holding `sent`
 - **WHEN** the owner sets `sent` on `imap/Sent Items`
 - **THEN** `imap/Sent` holds no role, `imap/Sent Items` holds `sent`, and both are above the reader's cursor
+
+### Requirement: The store holds coverage and rounds per source
+`write` SHALL apply `OpenRound`, `SetRoundCursor`, `CloseRound` and `SetCoverage` with the canonical statements (`open_round`, `set_round_cursor`, `close_round`, `set_coverage`), the first in its batch after `ensure_collection`, and `Stamp` (`stamp_bindings`) after the batch's upserts, so a binding the batch inserted is stamped too (STORAGE §4.3, SYNC §5). The items a batch inserts SHALL draw their public ids in the order the batch upserts them, a page's members numbered in the order it names them. Open SHALL reconcile a store an earlier draft wrote, in one transaction: the coverage and round columns of `sources` and `bindings.round` added by `ALTER TABLE`, each cut out of the canonical DDL, `sources_stamp_coverage` created, and the `probes` table dropped, its handles named again by the next round (STORAGE §6). A reader of a store not reconciled yet reads no coverage. A row an earlier draft wrote at level `0` SHALL load as `Meta` with no summary offered, a claim the next `Meta` upgrade revisits (STORAGE §13).
+
+#### Scenario: An earlier draft's store
+- GIVEN a store holding a `probes` table, no coverage columns and items at level `0`
+- WHEN its owner opens it
+- THEN the columns and the trigger are added, `probes` is dropped, and the items load at `Meta` without their summary
+
+### Requirement: A collection is listed with its coverage
+`PimdirCollection::coverage` SHALL be the narrowest coverage of the collection's sources (the latest floor, the earliest ceiling, the oldest closing), `None` while one of them never closed a round (STORAGE §14.1); `list_coverage(collection)` SHALL answer it per source, with the scope and start of the round each has under way. A coverage moving restamps its collection (`sources_stamp_coverage`).
+
+### Requirement: The owner collects below a date
+`PimdirStore::collect_before(collection, before)` SHALL run `collect_before` and `recompute_refcounts` in one transaction and answer the public ids collected (STORAGE §11.3): every live mail item older than `before` that owes nothing, an item conflicted, pending, or holding unpushed flags staying, an undated one too. It is no delete: no tombstone, no push, the remote keeps every member a later widening names again. It SHALL refuse to run while a verb of the process is between two chunks (`PimdirError::InFlight`).
+
+### Requirement: The mail reads count, page and search across collections
+The reader SHALL answer, over a set of collections and under `PimdirMailFilter` (the read and attachment chips, `None` for either), `count_mail`, `count_mail_by_day` (per day of the `Date`, a SQLite modifier moving it to the reader's clock), `count_unread` (per collection), `list_mail_page_filtered` and `search_mail` (newest first on `PimdirMailCursor`, `(sort_key, seq, collection)`, with summaries and addresses), from the committed rows (STORAGE §14.1). `like_pattern` SHALL build `search_mail`'s pattern from the words searched, `%` around them and `%`, `_` and `\` escaped.

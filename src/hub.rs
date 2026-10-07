@@ -299,8 +299,8 @@ impl PimdirHub {
     ///
     /// An upsert adopts the reconciled content and refreshes the source's
     /// binding, and a drop removes the binding. An item left with no
-    /// binding stays, for the store to retain (STORAGE §11). `StoreObject`
-    /// and `SetCheckpoint` are the storage's.
+    /// binding stays, for the store to retain (STORAGE §11). `StoreObject`,
+    /// the checkpoint and the round ops are the storage's.
     pub fn absorb(&mut self, source: &PimdirSourceId, writes: &[PimdirWriteOp]) {
         for op in writes {
             match op {
@@ -308,7 +308,14 @@ impl PimdirHub {
                 PimdirWriteOp::DropPlacement { handle, reason, .. } => {
                     self.absorb_drop(source, handle, *reason)
                 }
-                PimdirWriteOp::StoreObject { .. } | PimdirWriteOp::SetCheckpoint { .. } => {}
+                // NOTE: the sync state is the storage's, by source.
+                PimdirWriteOp::StoreObject { .. }
+                | PimdirWriteOp::SetCheckpoint { .. }
+                | PimdirWriteOp::OpenRound { .. }
+                | PimdirWriteOp::Stamp { .. }
+                | PimdirWriteOp::SetRoundCursor { .. }
+                | PimdirWriteOp::CloseRound { .. }
+                | PimdirWriteOp::SetCoverage { .. } => {}
             }
         }
         self.rebinding.clear();
@@ -1467,7 +1474,7 @@ mod tests {
 
         let mut pulled = placements(&hub, "left").pop().unwrap();
         pulled.object = None;
-        pulled.level = PimdirLevel::Probed;
+        pulled.level = PimdirLevel::Meta;
         pulled.base = Some(PimdirBase {
             flags: PimdirFlags::default(),
             revision: Some("r1".into()),
@@ -1552,7 +1559,7 @@ mod tests {
             assert_eq!(projected[0].sort_key.0, "2026-08-01T10:00:00Z");
         }
 
-        /// A source that only probed the item must not un-sort it.
+        /// A source that read no sort key must not un-sort the item.
         #[test]
         fn an_unknown_key_does_not_erase_a_known_one() {
             let mut hub = PimdirHub::default();
@@ -1610,7 +1617,7 @@ mod tests {
             })
         }
 
-        /// A source that only probed the item must not clear its markers.
+        /// A source that read no markers must not clear the item's.
         #[test]
         fn an_unknown_set_does_not_erase_a_known_one() {
             let mut hub = PimdirHub::default();
@@ -1674,8 +1681,8 @@ mod tests {
         }
 
         /// The merge dropped the stale body, so the level falls with it: the
-        /// pull lowers it to `Probed` (SYNC §5, vectors/sync/11) for the
-        /// upgrade to refetch, the summary kept as that of the body it dropped.
+        /// pull lowers it to `Meta` (SYNC §5, vectors/sync/11) for the
+        /// upgrade to refetch, the summary kept when the member carried none.
         #[test]
         fn a_refreshed_item_stops_claiming_the_body_it_lost() {
             let mut hub = PimdirHub::default();
@@ -1685,15 +1692,15 @@ mod tests {
                 &left,
                 &[upsert(PimdirLevel::Full, Some("body1"), Some("body1"))],
             );
-            hub.absorb(&left, &[upsert(PimdirLevel::Probed, None, None)]);
+            hub.absorb(&left, &[upsert(PimdirLevel::Meta, None, None)]);
 
             let item = &hub.items[&PimdirLinkId::from("uid:card-1")];
             assert_eq!(item.object, None, "the stale body is gone");
-            assert_eq!(item.level, PimdirLevel::Probed, "and the level with it");
+            assert_eq!(item.level, PimdirLevel::Meta, "and the level with it");
             assert!(item.summary.is_some(), "the stale summary stays");
 
             let projected = hub.project(&PimdirCollectionId::from("contacts"), &left);
-            assert_eq!(projected[0].level, PimdirLevel::Probed);
+            assert_eq!(projected[0].level, PimdirLevel::Meta);
         }
 
         /// An upgrade reads the projection, which heals a store predating the rule.

@@ -106,8 +106,9 @@ left out rather than return a shorter list.
 ### Requirement: The verb surface
 The CLI SHALL expose, at minimum:
 
-- `collection list`: id, kind, name, generation, live count, probe count (the
-  handles enumerated but not yet identified) and retained count.
+- `collection list`: id, kind, name, role, generation, coverage (`all`,
+  `since …` or `-` while a source never closed a round; `coveredSince`,
+  `coveredUntil`, `coveredAt` in JSON), live count and retained count.
 - `item list`: a collection's live items in the kind's own order with the
   summary's title, or its retained ones with `--retained`, keyset-paged with
   `--after` and `--limit`.

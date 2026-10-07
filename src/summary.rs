@@ -237,6 +237,29 @@ pub fn hash_key(body: &[u8]) -> PimdirLinkId {
     PimdirLinkId(format!("hash:{hash:016x}"))
 }
 
+/// The summary a listing or a fetch carrying no body brings over a held
+/// one (STORAGE Annex A.1, SYNC §6): the incoming one, keeping the held
+/// attachment mark when the row holds its body, a mark the walk of the
+/// parts gave never being replaced by one read without it; an incoming
+/// `None` leaves the held summary.
+pub(crate) fn without_body(
+    held: Option<&PimdirSummary>,
+    incoming: Option<PimdirSummary>,
+    holds_body: bool,
+) -> Option<PimdirSummary> {
+    let Some(mut incoming) = incoming else {
+        return held.cloned();
+    };
+    if holds_body
+        && let (PimdirSummary::Mail(incoming), Some(PimdirSummary::Mail(held))) =
+            (&mut incoming, held)
+    {
+        incoming.attachment = held.attachment;
+    }
+
+    Some(incoming)
+}
+
 /// Unfolds a body into its logical lines: a line beginning with a space
 /// or a tab continues the one before it. Unfolding a header removes the
 /// CRLF alone and keeps the whitespace (RFC 5322 §2.2.3); unfolding a

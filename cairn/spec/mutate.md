@@ -23,7 +23,7 @@ A mutation SHALL touch the local replica only; the remote is reconciled by sync.
 ### Requirement: Add stages a locally-authored create
 `PimdirMutation::Add { link_id, flags, object, body, summary, sort_key }` SHALL stage a brand-new item with no remote origin (compose, import): a `PimdirStatus::Created` placement in the coroutine's collection under the link id's provisional handle, at `level = Full`, with `base = None` and `origin = None`, pointing at `object`; plus a `StoreObject` carrying `body`. Because the create has no origin, the next sync SHALL push it as `PimdirChange::Add { origin: None }`, an append that uploads the body rather than a server-side copy. `Add` SHALL NOT require an existing source placement, and SHALL fail (`PimdirMutateError::LinkExists`) rather than overwrite when a live (non-tombstone) placement already holds `link_id`; a tombstoned `link_id` does not block the create.
 
-A mutation naming a probe, a placement with no link id, SHALL fail with `PimdirMutateError::Probed`: the store holds a probe as flags only, so a status staged on it would be lost. A `Meta` upgrade names it first.
+A mutation naming a placement no link id names SHALL fail with `PimdirMutateError::Unnamed`: nothing keys a status staged on it. Every member a listing carries arrives named (pimdir SYNC §4), so only a store an earlier engine wrote holds such a row.
 
 > Seed spec (Cairn, 2026-08-01): captures the offline mutation vocabulary, retro-documented when `Add` was added.
 

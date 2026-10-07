@@ -46,7 +46,7 @@ impl Mirror {
     fn quiesce(&mut self, opts: PimdirSyncOptions) {
         for round in 0..8 {
             let before = self.hub();
-            self.round(opts);
+            self.round(opts.clone());
             if self.hub() == before {
                 return;
             }
@@ -56,7 +56,7 @@ impl Mirror {
 
     /// One pass over both sources: sync, then hydrate every row it left.
     fn round(&mut self, opts: PimdirSyncOptions) {
-        self.round_with(opts, opts);
+        self.round_with(opts.clone(), opts);
     }
 
     /// A pass with each source tuned differently, the point of a hub.
@@ -66,7 +66,7 @@ impl Mirror {
                 'a' => &mut self.a,
                 _ => &mut self.b,
             };
-            client.sync("inbox", opts).unwrap();
+            client.sync("inbox", opts.clone()).unwrap();
 
             let handles: Vec<PimdirHandle> = client
                 .open("inbox")
@@ -253,7 +253,7 @@ fn a_source_refusing_removes_holds_its_copy_under_keep() {
     };
     mirror.a.remote_mut().remove("inbox", "a1");
     for _ in 0..3 {
-        mirror.round_with(PimdirSyncOptions::default(), no_removes);
+        mirror.round_with(PimdirSyncOptions::default(), no_removes.clone());
     }
 
     assert_eq!(
@@ -287,7 +287,7 @@ fn a_read_only_source_receives_nothing_it_cannot_push() {
         ..Default::default()
     };
     for _ in 0..3 {
-        mirror.round_with(PimdirSyncOptions::default(), read_only);
+        mirror.round_with(PimdirSyncOptions::default(), read_only.clone());
     }
 
     assert!(

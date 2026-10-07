@@ -70,8 +70,8 @@ fn a_move_synced_target_first_delivers_exactly_one_copy() {
     let opts = PimdirSyncOptions::default();
     stage_move(&mut client);
 
-    client.sync("archive", opts).unwrap();
-    client.sync("inbox", opts).unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    client.sync("inbox", opts.clone()).unwrap();
 
     assert_eq!(
         remote_members(&client, "archive").len(),
@@ -111,8 +111,8 @@ fn a_copy_leaves_the_source_and_delivers_one_member() {
             },
         )
         .unwrap();
-    client.sync("archive", opts).unwrap();
-    client.sync("inbox", opts).unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    client.sync("inbox", opts.clone()).unwrap();
 
     assert_eq!(remote_members(&client, "archive").len(), 1);
     assert_eq!(

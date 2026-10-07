@@ -31,7 +31,7 @@ use crate::{
         PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirStatus,
     },
     remote::{PimdirFetchedBody, PimdirFetchedItem, PimdirTier},
-    summary::PimdirSummary,
+    summary::{self, PimdirSummary},
 };
 
 /// What an upgrade did.
@@ -94,7 +94,7 @@ impl PimdirUpgrade {
             .iter()
             .filter(|h| match self.placements.get(h) {
                 Some(p) => match self.tier {
-                    PimdirTier::Meta => p.level < PimdirLevel::Meta || p.summary.is_none(),
+                    PimdirTier::Meta => p.summary.is_none(),
                     PimdirTier::Full => match is_conflicted(p) {
                         true => p.conflict_object.is_none(),
                         false => p.level < PimdirLevel::Full || p.object.is_none(),
@@ -202,15 +202,18 @@ impl PimdirUpgrade {
                     .claim(&item.handle, |key| claimed.contains_key(key));
                 claimed.insert(link_id.clone(), item.handle.clone());
                 patched.link_id = Some(link_id);
-                // NOTE: a probe carries no base (SYNC §3); naming it is
-                // what agrees with the source on what it reported.
+                // NOTE: a row named by no listing yet carries no base;
+                // naming it is what agrees with the source on what it
+                // reported.
                 patched.base.get_or_insert_with(|| PimdirBase {
                     flags: patched.flags.clone(),
                     revision: item.revision.clone(),
                     object: None,
                 });
             }
-            patched.summary = item.summary;
+            let holds_body = item.body.is_none() && patched.object.is_some();
+            patched.summary =
+                summary::without_body(patched.summary.as_ref(), item.summary, holds_body);
             // NOTE: unlike the link id, the sort key is a projection of the
             // content, not an identity, so the latest derivation wins.
             patched.sort_key = item.sort_key;
@@ -297,10 +300,10 @@ impl PimdirUpgrade {
     ///
     /// A `Superseded` drop of the provisional handle, then the create
     /// moved onto the fetched one with a base of what the fetch reported:
-    /// the probe's flags, the revision, and the body at `Full` or else the
+    /// the flags it reported, the revision, and the body at `Full` or else the
     /// create's own. The flags, body, summary and sort key staged on the
     /// create stay, so an edit made on it still pushes (SYNC §6).
-    fn land(&mut self, create: PimdirPlacement, probe: &PimdirPlacement, item: PimdirFetchedItem) {
+    fn land(&mut self, create: PimdirPlacement, named: &PimdirPlacement, item: PimdirFetchedItem) {
         debug!(
             "land the pending create {} under {}",
             create.handle.as_str(),
@@ -338,7 +341,7 @@ impl PimdirUpgrade {
             None => PimdirLevel::Meta,
         };
         landed.base = Some(PimdirBase {
-            flags: probe.flags.clone(),
+            flags: named.flags.clone(),
             revision: item.revision,
             object: base_object,
         });
@@ -618,7 +621,7 @@ mod tests {
         })
     }
 
-    fn probed(handle: &str, link: Option<&str>, level: PimdirLevel) -> PimdirPlacement {
+    fn row(handle: &str, link: Option<&str>, level: PimdirLevel) -> PimdirPlacement {
         PimdirPlacement {
             sort_key: Default::default(),
             collection: "inbox".into(),
@@ -640,8 +643,9 @@ mod tests {
     fn full_dedup_links_without_fetch() {
         crate::testlog::init();
         let loaded = PimdirLoaded {
-            placements: vec![probed("2", Some("msg-a"), PimdirLevel::Meta)],
+            placements: vec![row("2", Some("msg-a"), PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("2")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -682,8 +686,9 @@ mod tests {
     #[test]
     fn full_miss_fetches_and_stores() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", Some("msg-b"), PimdirLevel::Meta)],
+            placements: vec![row("1", Some("msg-b"), PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -727,10 +732,11 @@ mod tests {
     fn fetch_results_are_matched_by_handle_not_order() {
         let loaded = PimdirLoaded {
             placements: vec![
-                probed("1", Some("msg-a"), PimdirLevel::Meta),
-                probed("2", Some("msg-b"), PimdirLevel::Meta),
+                row("1", Some("msg-a"), PimdirLevel::Meta),
+                row("2", Some("msg-b"), PimdirLevel::Meta),
             ],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new(
             "inbox",
@@ -785,8 +791,9 @@ mod tests {
     #[test]
     fn a_full_fetch_keeps_an_already_resolved_link_id() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", Some("mid:real"), PimdirLevel::Meta)],
+            placements: vec![row("1", Some("mid:real"), PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -826,8 +833,9 @@ mod tests {
     #[test]
     fn a_meta_fetch_still_sets_the_link_of_an_unlinked_item() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", None, PimdirLevel::Probed)],
+            placements: vec![row("1", None, PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Meta);
         let _ = up.resume(None);
@@ -869,7 +877,7 @@ mod tests {
         assert_eq!(
             placement.link_id,
             Some(PimdirLinkId::from("mid:resolved")),
-            "a probed item takes the fetched link"
+            "an unnamed row takes the fetched link"
         );
     }
 
@@ -901,6 +909,7 @@ mod tests {
         let _ = up.resume(Some(PimdirArg::Load(PimdirLoaded {
             placements: loaded,
             checkpoint: None,
+            ..Default::default()
         })));
 
         let items = handles
@@ -929,6 +938,7 @@ mod tests {
             None => match up.resume(Some(PimdirArg::Load(PimdirLoaded {
                 placements: stored,
                 checkpoint: None,
+                ..Default::default()
             }))) {
                 PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
                 state => panic!("expected WantsWrite, got {state:?}"),
@@ -943,8 +953,8 @@ mod tests {
             &["u1", "u2"],
             "m1",
             vec![
-                probed("u1", None, PimdirLevel::Probed),
-                probed("u2", None, PimdirLevel::Probed),
+                row("u1", None, PimdirLevel::Meta),
+                row("u2", None, PimdirLevel::Meta),
             ],
             Vec::new(),
         );
@@ -963,8 +973,8 @@ mod tests {
         let ops = upgrade_twins(
             &["u2"],
             "m1",
-            vec![probed("u2", None, PimdirLevel::Probed)],
-            vec![probed("u1", Some("m1"), PimdirLevel::Meta)],
+            vec![row("u2", None, PimdirLevel::Meta)],
+            vec![row("u1", Some("m1"), PimdirLevel::Meta)],
         );
 
         assert_eq!(
@@ -979,8 +989,8 @@ mod tests {
         let ops = upgrade_twins(
             &["u2"],
             "m1",
-            vec![probed("u2", Some("dup:m1#u2"), PimdirLevel::Probed)],
-            vec![probed("u1", Some("m1"), PimdirLevel::Meta)],
+            vec![row("u2", Some("dup:m1#u2"), PimdirLevel::Meta)],
+            vec![row("u1", Some("m1"), PimdirLevel::Meta)],
         );
 
         assert_eq!(
@@ -992,7 +1002,7 @@ mod tests {
 
     /// A pending create of `link` under a provisional handle, body `h-c`.
     fn pending_create(handle: &str, link: &str, flags: &[&str]) -> PimdirPlacement {
-        let mut create = probed(handle, Some(link), PimdirLevel::Full);
+        let mut create = row(handle, Some(link), PimdirLevel::Full);
         create.object = Some(PimdirHash::from("h-c"));
         create.flags = PimdirFlags::from_iter(flags.iter().copied());
         create.summary = Some(crate::summary::stub("staged"));
@@ -1011,12 +1021,12 @@ mod tests {
     /// while the staged flags and body stay.
     #[test]
     fn a_fetched_hint_held_by_a_pending_create_lands_it() {
-        let mut probe = probed("7", None, PimdirLevel::Probed);
-        probe.flags = PimdirFlags::from_iter(["seen"]);
+        let mut unnamed = row("7", None, PimdirLevel::Meta);
+        unnamed.flags = PimdirFlags::from_iter(["seen"]);
         let ops = upgrade_twins(
             &["7"],
             "m1",
-            vec![probe],
+            vec![unnamed],
             vec![pending_create("tmp-1", "m1", &["seen"])],
         );
 
@@ -1052,12 +1062,12 @@ mod tests {
     /// The flags and body staged on the create still push after landing.
     #[test]
     fn a_landed_create_keeps_its_staged_edit_pending() {
-        let mut probe = probed("7", None, PimdirLevel::Probed);
-        probe.flags = PimdirFlags::from_iter(["seen"]);
+        let mut unnamed = row("7", None, PimdirLevel::Meta);
+        unnamed.flags = PimdirFlags::from_iter(["seen"]);
         let ops = upgrade_twins(
             &["7"],
             "m1",
-            vec![probe],
+            vec![unnamed],
             vec![pending_create("tmp-1", "m1", &["seen", "flagged"])],
         );
 
@@ -1077,7 +1087,7 @@ mod tests {
         let ops = upgrade_twins(
             &["7"],
             "m1",
-            vec![probed("7", None, PimdirLevel::Probed)],
+            vec![row("7", None, PimdirLevel::Meta)],
             vec![based("u1", "m1", None)],
         );
 
@@ -1095,10 +1105,10 @@ mod tests {
         let ops = upgrade_twins(
             &["u2"],
             "m1",
-            vec![probed("u2", None, PimdirLevel::Probed)],
+            vec![row("u2", None, PimdirLevel::Meta)],
             vec![
-                probed("u1", Some("m1"), PimdirLevel::Meta),
-                probed("u3", Some("dup:m1#u2"), PimdirLevel::Meta),
+                row("u1", Some("m1"), PimdirLevel::Meta),
+                row("u3", Some("dup:m1#u2"), PimdirLevel::Meta),
             ],
         );
 
@@ -1111,11 +1121,12 @@ mod tests {
 
     #[test]
     fn a_meta_fetch_keeps_a_body_holding_row_full() {
-        let mut stored = probed("1", Some("msg-a"), PimdirLevel::Full);
+        let mut stored = row("1", Some("msg-a"), PimdirLevel::Full);
         stored.object = Some(PimdirHash::from("h1"));
         let loaded = PimdirLoaded {
             placements: vec![stored],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Meta);
         let _ = up.resume(None);
@@ -1148,8 +1159,9 @@ mod tests {
     #[test]
     fn a_persisted_body_stores_the_object_without_bytes() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", Some("msg-b"), PimdirLevel::Meta)],
+            placements: vec![row("1", Some("msg-b"), PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -1188,7 +1200,7 @@ mod tests {
 
     #[test]
     fn full_fetch_stamps_the_base_revision_and_object() {
-        let mut placement = probed("1", Some("msg-b"), PimdirLevel::Meta);
+        let mut placement = row("1", Some("msg-b"), PimdirLevel::Meta);
         placement.base = Some(PimdirBase {
             flags: PimdirFlags::default(),
             revision: None,
@@ -1197,6 +1209,7 @@ mod tests {
         let loaded = PimdirLoaded {
             placements: vec![placement],
             checkpoint: None,
+            ..Default::default()
         };
 
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
@@ -1236,8 +1249,9 @@ mod tests {
     #[test]
     fn meta_upgrade_fetches_headers() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", None, PimdirLevel::Probed)],
+            placements: vec![row("1", None, PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Meta);
         let _ = up.resume(None);
@@ -1252,11 +1266,12 @@ mod tests {
 
     #[test]
     fn already_full_completes_without_work() {
-        let mut placement = probed("1", Some("x"), PimdirLevel::Full);
+        let mut placement = row("1", Some("x"), PimdirLevel::Full);
         placement.object = Some(PimdirHash::from("h1"));
         let loaded = PimdirLoaded {
             placements: vec![placement],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -1271,8 +1286,9 @@ mod tests {
     #[test]
     fn a_full_row_holding_no_body_is_upgraded_again() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", None, PimdirLevel::Full)],
+            placements: vec![row("1", None, PimdirLevel::Full)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -1288,8 +1304,9 @@ mod tests {
     #[test]
     fn a_meta_row_holding_no_summary_is_upgraded_again() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", None, PimdirLevel::Meta)],
+            placements: vec![row("1", None, PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Meta);
         let _ = up.resume(None);
@@ -1315,11 +1332,12 @@ mod tests {
     /// An empty report would pass for a run that did nothing.
     #[test]
     fn a_completed_upgrade_does_not_resume() {
-        let mut placement = probed("1", Some("x"), PimdirLevel::Full);
+        let mut placement = row("1", Some("x"), PimdirLevel::Full);
         placement.object = Some(PimdirHash::from("h1"));
         let loaded = PimdirLoaded {
             placements: vec![placement],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -1348,8 +1366,9 @@ mod tests {
     #[test]
     fn unknown_handle_completes_without_work() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", None, PimdirLevel::Probed)],
+            placements: vec![row("1", None, PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up =
             PimdirUpgrade::new("inbox", vec![PimdirHandle::from("nope")], PimdirTier::Meta);
@@ -1364,8 +1383,9 @@ mod tests {
     #[test]
     fn full_without_link_ids_fetches_directly() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", None, PimdirLevel::Probed)],
+            placements: vec![row("1", None, PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Full);
         let _ = up.resume(None);
@@ -1382,8 +1402,9 @@ mod tests {
     #[test]
     fn fetched_unknown_handle_is_skipped() {
         let loaded = PimdirLoaded {
-            placements: vec![probed("1", None, PimdirLevel::Probed)],
+            placements: vec![row("1", None, PimdirLevel::Meta)],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("1")], PimdirTier::Meta);
         let _ = up.resume(None);
@@ -1414,10 +1435,11 @@ mod tests {
         crate::testlog::init();
         let loaded = PimdirLoaded {
             placements: vec![
-                probed("1", Some("msg-a"), PimdirLevel::Meta),
-                probed("2", Some("msg-b"), PimdirLevel::Meta),
+                row("1", Some("msg-a"), PimdirLevel::Meta),
+                row("2", Some("msg-b"), PimdirLevel::Meta),
             ],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new(
             "inbox",
@@ -1470,7 +1492,7 @@ mod tests {
 
     /// A placement reconciled once: based, summarised, at `revision`.
     fn based(handle: &str, link: &str, revision: Option<&str>) -> PimdirPlacement {
-        let mut placement = probed(handle, Some(link), PimdirLevel::Meta);
+        let mut placement = row(handle, Some(link), PimdirLevel::Meta);
         placement.base = Some(PimdirBase {
             flags: PimdirFlags::default(),
             revision: revision.map(String::from),
@@ -1494,6 +1516,7 @@ mod tests {
         let loaded = PimdirLoaded {
             placements: vec![placement],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![handle], PimdirTier::Full);
         let _ = up.resume(None);
@@ -1565,6 +1588,7 @@ mod tests {
         let loaded = PimdirLoaded {
             placements: vec![placement],
             checkpoint: None,
+            ..Default::default()
         };
         let mut up = PimdirUpgrade::new("inbox", vec![handle], PimdirTier::Full);
         let _ = up.resume(None);

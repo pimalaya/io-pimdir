@@ -15,11 +15,11 @@ use alloc::{collections::BTreeMap, vec::Vec};
 
 use crate::{
     change::{PimdirChange, PimdirWriteOp},
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::PimdirCollectionId,
     load::{PimdirLoadScope, PimdirLoaded},
     object::PimdirObject,
     placement::{PimdirHandle, PimdirLinkId},
-    remote::{PimdirFetchedItem, PimdirPushResult, PimdirRemoteSnapshot, PimdirTier},
+    remote::{PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirTier},
 };
 
 /// State yielded by an [`PimdirCoroutine::resume`] step.
@@ -88,8 +88,8 @@ pub enum PimdirYield {
     WantsEnumerate {
         /// The collection to enumerate.
         collection: PimdirCollectionId,
-        /// The last checkpoint to delta from, if any.
-        cursor: Option<PimdirCheckpoint>,
+        /// What to list: a delta or a round, and the scope.
+        request: PimdirEnumerate,
     },
     /// Fetch each handle at `tier`, answered by [`PimdirArg::Fetch`].
     WantsFetch {
@@ -130,7 +130,7 @@ pub enum PimdirYield {
 #[derive(Clone, Debug)]
 pub enum PimdirArg {
     /// Reply to [`PimdirYield::WantsEnumerate`].
-    Enumerate(PimdirRemoteSnapshot),
+    Enumerate(PimdirEnumerated),
     /// Reply to [`PimdirYield::WantsFetch`].
     Fetch(Vec<PimdirFetchedItem>),
     /// Reply to [`PimdirYield::WantsPush`].

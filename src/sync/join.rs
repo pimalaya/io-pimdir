@@ -1,41 +1,63 @@
 //! # The merge's join
 //!
-//! The walk of local placements beside remote items in handle order, one
-//! candidate per handle, and the delta rule narrowing it (SYNC §5).
+//! The walk of local placements beside listed members in handle order,
+//! one candidate per handle, and the rules narrowing it (SYNC §5): a
+//! delta's, and a page's before the last of its round.
 
 use core::{cmp::Ordering, iter::Peekable};
 
 use alloc::{
     collections::{BTreeMap, BTreeSet, btree_map::IntoIter},
+    string::String,
     vec::{IntoIter as VecIntoIter, Vec},
 };
 
-use crate::{
-    collection::PimdirCheckpoint,
-    placement::{PimdirHandle, PimdirPlacement, PimdirStatus},
-    remote::PimdirRemoteItem,
-};
+use crate::placement::{PimdirFlags, PimdirHandle, PimdirPlacement, PimdirStatus};
 
-/// The merge in progress: the enumerate's report and how far the join walked.
+/// The remote side of a candidate: what a page listed for a handle, or
+/// what the base stands in for when the listing did not name it.
+///
+/// The member's meta is held apart, by handle, so a synthesized side
+/// needs none.
+#[derive(Clone, Debug)]
+pub(super) struct Remote {
+    pub(super) handle: PimdirHandle,
+    pub(super) flags: PimdirFlags,
+    pub(super) revision: Option<String>,
+}
+
+/// How a page narrows the join to its candidates (SYNC §5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Narrowing {
+    /// A delta, or the last page of a round: the listed and vanished
+    /// handles, plus every placement that is not clean, whose pending
+    /// push the listing would never revisit.
+    Delta,
+    /// A page before the last: its members and vanished handles alone.
+    Page,
+}
+
+/// The merge in progress: the page and how far the join walked.
 ///
 /// Held across yields, because the merge is bounded like the pushes are:
 /// it stops at a full write batch and picks up where it left off.
 pub(super) struct Merge {
     pub(super) join: Join,
-    /// The handles the delta reported gone, as a set the delta rule consults.
+    /// The handles merged against no remote state: the ones the source
+    /// states removed and, on a round's last page, the ones it found
+    /// absent in scope.
     pub(super) vanished: BTreeSet<PimdirHandle>,
-    /// Whether the snapshot is the whole remote, so an omission is a removal.
-    pub(super) complete: bool,
-    /// The cursor checkpointed once every candidate and push is recorded.
-    pub(super) checkpoint: PimdirCheckpoint,
+    pub(super) narrowing: Narrowing,
 }
 
 impl Merge {
-    /// Narrows a joined handle to a delta candidate, or drops it as untouched.
+    /// Narrows a joined handle to a candidate, or drops it as untouched.
     ///
     /// A vanished handle merges against no remote state, a listed one
-    /// against what was listed. An unlisted non-clean one is unchanged
-    /// upstream, so its base stands in and its pending push derives.
+    /// against what was listed. Under [`Narrowing::Delta`] an unlisted
+    /// non-clean one is unchanged upstream, so its base stands in and its
+    /// pending push derives; under [`Narrowing::Page`] it waits for the
+    /// round's last page.
     pub(super) fn narrow(&self, candidate: Candidate) -> Option<Candidate> {
         if self.vanished.contains(&candidate.handle) {
             return Some(Candidate {
@@ -46,6 +68,9 @@ impl Merge {
         if candidate.remote.is_some() {
             return Some(candidate);
         }
+        if self.narrowing == Narrowing::Page {
+            return None;
+        }
 
         let local = candidate.local.as_ref()?;
         if local.status == PimdirStatus::Clean {
@@ -53,8 +78,8 @@ impl Merge {
         }
 
         // NOTE: a staged create has no base to synthesize a remote from,
-        // and is still a candidate: its add is what a delta never lists.
-        let remote = local.base.as_ref().map(|base| PimdirRemoteItem {
+        // and is still a candidate: its add is what a listing never names.
+        let remote = local.base.as_ref().map(|base| Remote {
             handle: candidate.handle.clone(),
             flags: base.flags.clone(),
             // NOTE: a conflicted placement has observed a revision past its
@@ -76,25 +101,21 @@ impl Merge {
 pub(super) struct Candidate {
     pub(super) handle: PimdirHandle,
     pub(super) local: Option<PimdirPlacement>,
-    pub(super) remote: Option<PimdirRemoteItem>,
+    pub(super) remote: Option<Remote>,
 }
 
-/// Walks local placements and remote items in handle order, pairing them.
+/// Walks local placements and remote members in handle order, pairing them.
 ///
-/// Both sides are ordered already, the `BTreeMap` by nature and the
-/// snapshot by the sort the merge gave it, so the union is a two-pointer
-/// walk. Owning both lets the merge take a placement rather than clone
-/// one.
+/// Both sides are ordered already, the `BTreeMap` by nature and the page
+/// by the sort the merge gave it, so the union is a two-pointer walk.
+/// Owning both lets the merge take a placement rather than clone one.
 pub(super) struct Join {
     local: Peekable<IntoIter<PimdirHandle, PimdirPlacement>>,
-    remote: Peekable<VecIntoIter<PimdirRemoteItem>>,
+    remote: Peekable<VecIntoIter<Remote>>,
 }
 
 impl Join {
-    pub(super) fn new(
-        local: BTreeMap<PimdirHandle, PimdirPlacement>,
-        remote: Vec<PimdirRemoteItem>,
-    ) -> Self {
+    pub(super) fn new(local: BTreeMap<PimdirHandle, PimdirPlacement>, remote: Vec<Remote>) -> Self {
         Self {
             local: local.into_iter().peekable(),
             remote: remote.into_iter().peekable(),

@@ -8,7 +8,7 @@ status: current
 
 `sync` reconciles one collection's local replica against one remote through a three-way merge of Local, Base and Remote per placement, keyed on the handle. Flags merge element-wise and never conflict; only divergent mutable content is kept as a conflict. It is tuned by `PimdirSyncOptions`.
 
-It reconciles what the replica holds and never fetches a payload: raising a placement up the detail ladder is [upgrade](upgrade.md)'s, and rebuilding a collection onto a new handle space is [rekey](rekey.md)'s.
+It reconciles what the replica holds and never fetches a payload: every member a listing carries arrives named by its meta, raising a placement to its body is [upgrade](upgrade.md)'s, and rebuilding a collection onto a new handle space is [rekey](rekey.md)'s. A listing is a delta from the checkpoint or a round over a scope, answered page by page, each page landing in one write (pimdir SYNC §4, §5).
 
 ### Requirement: Three-way reconcile
 The engine SHALL merge each candidate placement over `(local, base, remote)`, pushing local-won changes and pulling remote-won changes, comparing per-placement identities (the flag set and, for mutable-content backends, a content revision) rather than raw bytes.
@@ -60,7 +60,7 @@ A move is staged as a `Created` placement in the target plus a `Tombstone` in th
 
 Origin and destination are what the store derives from its bindings, never columns of the engine's own (SYNC §3): a `Created` placement's origin is where the same source binds the identity with a base present and, when the placement has a body, that body as its base; a `Tombstone` placement's origin is its destination, the collection where the same source holds a pending create of the identity. The engine SHALL derive `Remove { to }` from a tombstone's origin and `Add { origin }` from a create's, and SHALL rely on nothing it staged itself surviving a store round trip.
 
-A relocated member is listed by the target's next enumeration under a new handle, and the fetch naming it lands the create (upgrade.md) rather than minting a second copy. A create holding neither an origin nor a body cannot deliver: it stays visibly pending until the consumer restages it, and the engine derives no push for it. Neither half may be dropped in favour of the other. A mutation of a probe is refused (mutate.md), so every tombstone with a destination carries a link id.
+A relocated member is listed by the target's next listing under a new handle, and the page naming it lands the create rather than minting a second copy. A create holding neither an origin nor a body cannot deliver: it stays visibly pending until the consumer restages it, and the engine derives no push for it. Neither half may be dropped in favour of the other. A mutation of a placement no link id names is refused (mutate.md), so every tombstone with a destination carries a link id.
 
 #### Scenario: The target syncs first
 - GIVEN a linked member moved into a target
@@ -70,7 +70,7 @@ A relocated member is listed by the target's next enumeration under a new handle
 #### Scenario: The source syncs first
 - GIVEN the same move, the target's member not hydrated
 - WHEN the source's sync runs first
-- THEN the remove relocates the member, the target's next enumeration lists it as a probe, and the `Meta` fetch naming it lands the pending create under the arrived handle: exactly one member
+- THEN the remove relocates the member, and the target's next listing carries it with its meta, the page naming it landing the pending create under the arrived handle: exactly one member
 
 #### Scenario: A connector that cannot relocate
 - GIVEN the same move over a connector answering no relocation
@@ -114,8 +114,8 @@ A content push accepted in the same run SHALL rebase the placement the flag merg
 - WHEN the content push is accepted
 - THEN the last row written for the handle holds the pulled flag and the pushed body as its base
 
-### Requirement: A re-listed probe is not a pull
-A probe the enumeration lists again with the flags the store holds for it SHALL derive no write, no event and no count: nothing changed. One listed with other flags adopts them, as a base-less placement takes the remote set. A probe a complete enumeration no longer lists, or a delta reports vanished, SHALL be dropped `Deleted` like any member, with its `Vanished` event: a base-less row holding no body and no `Created` status is a probe, and a probe nothing lists is gone. A base-less row holding a body, a create-collision conflict whose remote side went, SHALL be resurrected as a `Created` placement instead, as a based edit is: new content beats a delete.
+### Requirement: A re-listed member is not a pull
+A member a page lists again with the flags and the meta the store holds for it SHALL derive no write, no event and no count: nothing changed. One listed with other flags merges them; one whose meta moved, its revision not, has its summary and sort key refreshed in the page's write, no event reported. A base-less row holding a body whose member a listing no longer carries, a create-collision conflict whose remote side went, SHALL be resurrected as a `Created` placement, as a based edit is: new content beats a delete; a base-less row holding none is dropped.
 
 ### Requirement: A rejection counts for a pushed handle only
 `PimdirSyncReport::rejected` SHALL count a `Rejected` outcome once per handle the chunk pushed, on the terms `pushed` counts an accepted one: a result naming a handle nobody pushed, or naming one twice, cannot inflate either.
@@ -128,13 +128,18 @@ A member absent from a complete enumeration, or listed vanished by a delta, whos
 - WHEN the collection is synced
 - THEN its handle is dropped `Superseded`, the body sits on a `Created` placement under the provisional handle, and the next sync appends it
 
-### Requirement: A create waits for the probes
-A `Created` placement SHALL derive no `Add` while the collection holds a probe, a placement with no link id and no base that is not itself a create, or a listed member the replica lacks (pimdir SYNC §5, vectors/sync/25): the member may be the create arrived, by a relocation or an add whose record was lost, and the `Meta` fetch naming it lands the create ([upgrade](upgrade.md)); pushing first lands two copies.
+### Requirement: A create waits for the page that lands it
+A `Created` placement SHALL derive no `Add` from a page before the last of a round, nor from a delta while a round is open (pimdir SYNC §5, vectors/sync/25): a page not landed yet may carry the create arrived, by a relocation or an add whose record was lost, and the page naming it lands the create; pushing first lands two copies. A member a page lists in the same run is named before any create is derived, so a page carrying the arrival lands it rather than pushing (vectors/sync/21). A pending create carrying no origin whose summary `date` the run's scope excludes SHALL wait for a round whose scope holds it, an arrival relocated with its `Date` kept being listed by no page of that scope, and is counted in `PimdirSyncReport::waiting` (vectors/sync/43).
 
-#### Scenario: A copy into a collection never enumerated
-- GIVEN a pending create in a target whose first enumeration lists members nothing names yet
+#### Scenario: A copy into a collection never listed
+- GIVEN a pending create in a target whose first listing carries other members
 - WHEN the target is synced
-- THEN nothing is pushed until those members are named, and the next sync appends the create
+- THEN those members are named by the page that lists them and, none being its arrival, the create is pushed once the round's last page has landed
+
+#### Scenario: An old message relocated into a scoped target
+- GIVEN a pending create dated August and a run over a scope since September
+- WHEN the round's last page lands without it
+- THEN no `Add` is derived and the report counts it waiting
 
 ### Requirement: An item-level conflict is held, a binding conflict is reconciled
 `reconcile_content` SHALL take its conflict branch for a placement carrying a `conflict_revision`, the divergence between this source and its own remote. A `Conflict` placement carrying none is the item's cross-source conflict projected onto this source ([hub](hub.md)): it SHALL derive no push, a pending create under it included, until an `Edit` or a `Remove` settles the item (pimdir SYNC §3, §7). A remote revision its base does not hold SHALL still be recorded, whatever the conflict policy: the binding is marked conflicted with that revision and its diverging body wanted, reported as `Conflicted`, since an incremental enumeration never lists the member again (pimdir SYNC §5, vectors/sync/33).
@@ -165,7 +170,7 @@ Only the handles of the chunk being serviced SHALL be resolved when its outcomes
 - THEN the placements of the first chunk are recorded clean, and only the second chunk's are still pending
 
 ### Requirement: The checkpoint lands in the last write
-The checkpoint the enumerate reported SHALL land in the write that follows the final chunk, and SHALL stay the pre-push one, which is what makes the engine's own echo re-listed by the next delta enumeration. An intermediate chunk's write SHALL NOT carry it, so an interrupted run resumes from the same cursor rather than from one claiming its unrecorded pushes were seen.
+The checkpoint, a delta's or the one a round closes with (`CloseRound`), SHALL land in the write that follows the final chunk, and SHALL stay the pre-push one, which is what makes the engine's own echo re-listed by the next delta enumeration. An intermediate chunk's write SHALL NOT carry it, so an interrupted run resumes from the same cursor rather than from one claiming its unrecorded pushes were seen. A page's resume cursor and the checkpoint an open round carries are not the source's checkpoint: they land with their page (`SetRoundCursor`), in the write after its last chunk.
 
 ### Requirement: Every change carries an idempotency key
 A `PimdirChange` SHALL be a `PimdirChangeKind` (what the remote is asked to do, the four verbs that were the change itself) plus the `PimdirChangeKey` naming it. The key SHALL be derived as pimdir SYNC §4 fixes it, so two engines over one store key one change alike and every vector's key reproduces: FNV-1a 64 bits over fields each followed by one `0x00` byte, rendered as sixteen lowercase hexadecimal digits; the fields being the collection id, the handle, the kind as `add`, `remove`, `set-flags` or `update`, then the kind's own, an optional value as the field `1` followed by the value or the field `0` alone, and a flag set as the field `unknown` or the field `known`, the count in decimal ASCII, then each flag in code point order. `add` folds the link id, the flags, the origin as `1`, its collection and its handle or `0` alone, then the object hash; `remove` the destination; `set-flags` the flags; `update` the object hash. The same derived change SHALL key the same on every run, and changes differing in any of those SHALL key differently.
@@ -261,7 +266,7 @@ The flag merge itself is unchanged. It runs for every placement present on both 
 ### Requirement: A conflict keeps the body it diverged from
 A placement marked conflicted SHALL carry `conflict_object`, the remote body at the revision `conflict_revision` names, so the divergence can be read without asking the remote for it. Both SHALL be set together, taken together into the base when an edit resolves the conflict (see [mutate](mutate.md)), and dropped together when the tracked revision moves: a body that outlives the revision recorded beside it describes a version the server no longer holds, and a resolver trusting it would merge against a phantom.
 
-The engine fetches nothing, so the body is requested rather than taken: marking a conflict marks the body wanted and the [upgrade](upgrade.md) pass supplies it. A conflict whose body has not yet landed is visible and unresolvable, as a probed placement holding no body is visible and unreadable.
+The engine fetches nothing, so the body is requested rather than taken: marking a conflict marks the body wanted and the [upgrade](upgrade.md) pass supplies it. A conflict whose body has not yet landed is visible and unresolvable, as a placement named at `Meta` is visible and unreadable until its body lands.
 
 Storing it is what lets resolution leave the process that found it. A resolver holding base, local and remote needs no credentials, no backend and no network, and a conflict between two hand-edited bodies is decided by a human long after the run that found it.
 
@@ -278,10 +283,37 @@ The hub round-trips both halves through `PimdirBinding`, on the per-source axis 
 - THEN the recorded revision advances and the stored body is dropped in the same write
 
 ### Requirement: Events report what the remote changed
-A sync's `PimdirSyncEvent`s SHALL report what was pulled (`Added`, `FlagsChanged`, `ContentChanged`, `Vanished`), a divergence (`Conflicted`) and an accepted add under its assigned handle (`Created`), in order, and nothing for an accepted flag, content or delete push: the consumer made those (pimdir SYNC §5, vectors/sync/02 and 05). Only a sync reports events: an upgrade, a mutation and a rekey deliver what the consumer asked for and report none.
+A sync's `PimdirSyncEvent`s SHALL report what was pulled (`Added` for a member a page named, `FlagsChanged`, `ContentChanged`, `Vanished` for a vanished handle or a member a round found absent in its scope), a divergence (`Conflicted`) and an accepted add under its assigned handle or a create a page landed under the listed one (`Created`), in order, and nothing for an accepted flag, content or delete push: the consumer made those (pimdir SYNC §5, vectors/sync/02 and 05). Only a sync reports events: an upgrade, a mutation and a rekey deliver what the consumer asked for and report none.
 
-### Requirement: A pulled member is a probe
-A member the enumeration lists and the replica lacks SHALL be pulled as a placement with no link id and no base, at level `Probed`, carrying the reported flags (pimdir SYNC §3): the store files it as a probe row until a fetch names it. A remote edit past the base of a local tombstone revives the placement instead: identity and summary kept, body dropped, the base adopting what the remote reports, so the next upgrade refetches and nothing pushes. A tombstone also holding a staged edit, a body its base does not, is the both-changed case and follows the conflict policy instead (pimdir SYNC §5): `Manual` revives it conflicted at the observed revision, `PreferRemote` pulls, `PreferLocal` pushes the staged body.
+### Requirement: A page names every member it carries
+Every member a page lists SHALL be named in the page's write from its `PimdirRemoteMeta` (pimdir SYNC §4, §6), in handle order and against the whole collection, a page before the last loading the `Handles` it lists and the `Links` of the hints it carries: a hint a pending create of this source holds lands that create (a `Superseded` drop of the provisional handle, the create under the listed handle, based on the reported flags, revision and carried body or else its own, its staged flags and body kept, reported `Created`); a free hint keys it and a held one is minted, the item inserted at `Meta`, or `Full` with a body the member carried, based on the reported flags, revision and body, reported `Added`. A bound member's meta refreshes its summary and sort key when its revision did not move, a walked attachment mark kept while it holds its body, and a mutable member stating another hint is keyed afresh. A pull takes the member's meta, and the body it carried as its body and base at the listed revision, the level `Meta` when it carried none (vectors/sync/11); under `Manual` a carried diverging body lands in `conflict_object`. A remote edit past the base of a local tombstone revives the placement as such a pull, nothing pushing. A tombstone also holding a staged edit, a body its base does not, is the both-changed case and follows the conflict policy instead (pimdir SYNC §5): `Manual` revives it conflicted at the observed revision, `PreferRemote` pulls, `PreferLocal` pushes the staged body.
 
 ### Requirement: The merge is a module of its own
 `Join`, `Merge` and `Candidate`, the walk of both sides in handle order and the delta rule narrowing it, live in `sync/join.rs`; the unit tests of every verb live beside their module in a `tests.rs`. A module with code and submodules is `foo.rs` plus `foo/`.
+
+### Requirement: A run chooses its listing from the coverage
+A sync SHALL read the source's checkpoint, coverage and round first, a `Handles` load naming none, and ask for one listing (`PimdirEnumerate`: a `PimdirListing` and a `PimdirScope`, pimdir SYNC §5): the open round resumed from its cursor when it lists the scope asked for; else a round, opened in the write of its first page, when no round ever closed (a store from an earlier draft included), a round is open over another scope, `full` is set, or the scope reaches outside the coverage, over the band alone when the connector's checkpoint is bound to no scope (`PimdirRemote::scope_bound`, `PimdirSync::scope_bound`) and the band adjoins the coverage; else a delta from the checkpoint, recording the narrower coverage (`SetCoverage`) when the scope lies strictly inside it. A connector answering a round to a delta request has one opened over the scope; one answering a delta to a round request is merged as a delta. A cursor the source rejects (`PimdirEnumerated::CursorRejected`) restarts the round under a new id; a rejected delta checkpoint opens a round.
+
+#### Scenario: A widening on IMAP
+- GIVEN a coverage since September and a connector bound to no scope
+- WHEN the scope widens to July
+- THEN the round lists July to September alone, hands no checkpoint, and closes with the coverage since July, the checkpoint kept
+
+### Requirement: A round lands page by page
+Every page SHALL land in one write: its members named and merged, the handles it listed stamped with the round's id after its upserts (`Stamp`), and, in the write after its last push chunk, its cursor with any checkpoint it carries (`SetRoundCursor`) or, on its last page, the round closed (`CloseRound`) with the checkpoint that page carried, else the one an earlier page carried, else the source's own, and the coverage of its scope or of the band's span; `OpenRound` leads the batch of the round's first page. A page before the last merges its members and vanished handles alone; a delta and a round's last page merge as a delta. A round interrupted between pages keeps what landed, and `PimdirSync::report` answers what those pages did.
+
+#### Scenario: An interrupted round resumes
+- GIVEN a round whose first page landed with the cursor `p1` before the connector failed
+- WHEN the next sync runs under the same scope
+- THEN it asks for the round from `p1`, and the last page closes it with the coverage of its scope
+
+### Requirement: Absence means deleted in scope only
+The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope or is unknown, read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
+
+#### Scenario: A message older than the scope
+- GIVEN a bound member dated August and an undated one, both unlisted, under a scope since September
+- WHEN the round's last page lands
+- THEN the August member stays as it was, and the undated one is dropped `Deleted`
+
+### Requirement: A scope bounds mail only
+`PimdirSyncOptions::scope` is unbounded by default. `PimdirSourceStore::sync` and `prepare_sync` SHALL refuse a bounded scope on a collection whose kind is not `message/rfc822`, naming the kind (`PimdirError::Scope`).

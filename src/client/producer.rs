@@ -753,7 +753,7 @@ fn stage_action(
             object: object.clone(),
             level: match object {
                 Some(_) => PimdirLevel::Full,
-                None => PimdirLevel::Probed,
+                None => PimdirLevel::Meta,
             },
             summary,
             sort_key,
@@ -874,7 +874,7 @@ fn stage_action(
         .project(&collection_id, source);
     let mut state = mutate.resume(Some(PimdirArg::Load(PimdirLoaded {
         placements,
-        checkpoint: None,
+        ..Default::default()
     })));
 
     // NOTE: a copy or a move reads its target for the identity it carries.
@@ -887,7 +887,7 @@ fn stage_action(
             write::read_hub(tx, &collection.0, Some(&links))?.project(&collection, source);
         state = mutate.resume(Some(PimdirArg::Load(PimdirLoaded {
             placements,
-            checkpoint: None,
+            ..Default::default()
         })));
     }
 

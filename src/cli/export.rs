@@ -297,7 +297,6 @@ impl ExportCommand {
 /// integer, which is an implementation detail of the schema).
 fn level(level: PimdirLevel) -> &'static str {
     match level {
-        PimdirLevel::Probed => "probed",
         PimdirLevel::Meta => "meta",
         PimdirLevel::Full => "full",
     }

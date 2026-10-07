@@ -15,14 +15,17 @@ use std::sync::Arc;
 
 use crate::{
     client::{PimdirError, PimdirSourceStore},
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoaded,
     mutate::{PimdirMutate, PimdirMutateError, PimdirMutation},
     open::PimdirOpen,
     placement::PimdirHandle,
     rekey::{PimdirRekey, PimdirRekeyReport},
-    remote::{PimdirFetchedItem, PimdirPushResult, PimdirRemote, PimdirRemoteSnapshot, PimdirTier},
+    remote::{
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirRemote,
+        PimdirTier,
+    },
     sync::{PimdirSync, PimdirSyncOptions, PimdirSyncReport},
     upgrade::{PimdirUpgrade, PimdirUpgradeReport},
 };
@@ -68,8 +71,8 @@ impl PimdirRemote for PimdirOffline {
     fn enumerate(
         &mut self,
         _: &PimdirCollectionId,
-        _: Option<PimdirCheckpoint>,
-    ) -> Result<PimdirRemoteSnapshot, Infallible> {
+        _: PimdirEnumerate,
+    ) -> Result<PimdirEnumerated, Infallible> {
         unreachable!("an offline verb never enumerates")
     }
 
@@ -141,9 +144,12 @@ impl PimdirSourceStore {
 
             arg = Some(match self.service(yielded)? {
                 Ok(arg) => arg,
-                Err(PimdirYield::WantsEnumerate { collection, cursor }) => PimdirArg::Enumerate(
+                Err(PimdirYield::WantsEnumerate {
+                    collection,
+                    request,
+                }) => PimdirArg::Enumerate(
                     remote
-                        .enumerate(&collection, cursor)
+                        .enumerate(&collection, request)
                         .map_err(PimdirRunError::Remote)?,
                 ),
                 Err(PimdirYield::WantsFetch {
@@ -202,23 +208,54 @@ impl PimdirSourceStore {
     /// Whether the collection is bound by other sources is settled here
     /// from the store's bindings, what the engine cannot know: a delete
     /// the rights refuse is then held rather than reverted, a revert
-    /// reading as a resurrection beside another source.
+    /// reading as a resurrection beside another source. Whether the
+    /// remote's checkpoint is bound to a scope is the remote's own
+    /// [`PimdirRemote::scope_bound`]. A bounded scope on a collection of
+    /// another kind than mail is refused, naming the kind
+    /// ([`PimdirError::Scope`]).
+    ///
+    /// The pages that landed before a remote failure stay landed; a
+    /// runner wanting their report drives [`PimdirSync`] itself and reads
+    /// [`PimdirSync::report`].
     pub fn sync<R: PimdirRemote>(
         &mut self,
         collection: impl Into<PimdirCollectionId>,
         opts: PimdirSyncOptions,
         remote: &mut R,
     ) -> Result<PimdirSyncReport, PimdirRunError<R::Error, PimdirArgError>> {
+        let coroutine = self.prepare_sync(collection, opts, remote.scope_bound())?;
+        self.run(coroutine, remote)
+    }
+
+    /// The sync coroutine [`sync`](Self::sync) runs, for a runner of its
+    /// own: the scope checked against the collection's kind, and the
+    /// coroutine told whether other sources bind the collection and
+    /// whether the remote's checkpoint is bound to a scope.
+    pub fn prepare_sync(
+        &self,
+        collection: impl Into<PimdirCollectionId>,
+        opts: PimdirSyncOptions,
+        scope_bound: bool,
+    ) -> Result<PimdirSync, PimdirError> {
         let collection = collection.into();
+        if !opts.scope.is_unbounded() {
+            let kind = self.collection_kind(&collection)?.unwrap_or_default();
+            let mail = kind.split(';').next().unwrap_or_default().trim() == "message/rfc822";
+            if !mail {
+                return Err(PimdirError::Scope {
+                    collection: collection.0,
+                    kind,
+                });
+            }
+        }
         let beside_others = self
             .collection_sources(&collection)?
             .iter()
             .any(|source| *source != self.source.0);
 
-        self.run(
-            PimdirSync::new(collection, opts).beside_other_sources(beside_others),
-            remote,
-        )
+        Ok(PimdirSync::new(collection, opts)
+            .beside_other_sources(beside_others)
+            .scope_bound(scope_bound))
     }
 
     /// Rebuilds a collection onto a new handle space, by link id (SYNC §8).

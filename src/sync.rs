@@ -1,8 +1,21 @@
 //! # Sync coroutine
 //!
 //! I/O-free coroutine reconciling one collection with its remote
-//! (SYNC §5): it loads local state, enumerates the remote delta, then
-//! three-way merges local, base and remote per placement.
+//! (SYNC §5): it reads the source's sync state, chooses a listing (a
+//! delta from the checkpoint, or a round over the scope, resumed where
+//! one is under way), and merges what each page lists, three-way, per
+//! placement against its base.
+//!
+//! Every member a page lists arrives named by its meta (SYNC §4), so the
+//! page's own write keys it, lands the pending create it delivers, or
+//! refreshes its summary. A round is answered in pages, each landing in
+//! one write with its resume cursor and the round's stamp on every
+//! binding it listed; deletes are inferred once, when the last page
+//! lands, from the bindings in scope no page stamped. A scope bounds
+//! what absence means and nothing else: the engine filters no page by
+//! date, explicit removals apply whatever the date, local changes push
+//! whatever the scope, and a `Remove` comes from a staged tombstone and
+//! nothing else.
 //!
 //! The merge compares per-placement identities (the flag set, a content
 //! revision), never raw bytes. Flags merge element-wise and never
@@ -25,15 +38,23 @@ use log::{debug, trace};
 
 use crate::{
     change::{PimdirChange, PimdirChangeKind, PimdirDropReason, PimdirWriteOp},
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::{
+        PimdirCheckpoint, PimdirCollectionId, PimdirCoverage, PimdirCursor, PimdirRound,
+        PimdirScope,
+    },
     coroutine::*,
-    load::PimdirLoadScope,
+    load::{PimdirLoadScope, PimdirLoaded},
+    object::PimdirObject,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
-        PimdirSortKey, PimdirStatus,
+        PimdirStatus,
     },
-    remote::{PimdirPushOutcome, PimdirPushResult, PimdirRemoteItem, PimdirRemoteSnapshot},
-    sync::join::{Candidate, Join, Merge},
+    remote::{
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirListing, PimdirPushOutcome,
+        PimdirPushResult, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot,
+    },
+    summary::{self, PimdirSummary},
+    sync::join::{Candidate, Join, Merge, Narrowing, Remote},
 };
 
 mod join;
@@ -99,14 +120,14 @@ pub enum PimdirConflictPolicy {
     PreferRemote,
 }
 
-/// Tuning for one sync run: the push direction and the enumerate depth.
+/// Tuning for one sync run: the push direction, the listing and its scope.
 ///
 /// A local delete the source's rights forbid follows no option (SYNC §5):
 /// it is held when the item has another binding, whose source pushes the
 /// delete, and reverted when this binding is its last, which
 /// [`beside_other_sources`](PimdirSync::beside_other_sources) tells the
 /// coroutine from what the store knows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirSyncOptions {
     /// The master push switch: when false the source is read-only.
     pub push: bool,
@@ -114,12 +135,17 @@ pub struct PimdirSyncOptions {
     pub rights: PimdirPushRights,
     /// How a content conflict is resolved.
     pub conflict: PimdirConflictPolicy,
-    /// Whether to ignore the checkpoint and enumerate the whole remote.
+    /// Whether to ignore the checkpoint and list the whole scope in a
+    /// round of its own, whatever the coverage and any round under way.
     ///
     /// The recovery path for a replica that drifted: the merge reconciles
-    /// the complete spine, re-adding missing members and dropping
-    /// phantoms.
+    /// the complete spine in scope, re-adding missing members and
+    /// dropping phantoms.
     pub full: bool,
+    /// The scope `[since, until)` on the summary `date` the run lists
+    /// (SYNC §5): mail only, unbounded by default and for every other
+    /// kind, whose collections the std client refuses a bound for.
+    pub scope: PimdirScope,
 }
 
 impl Default for PimdirSyncOptions {
@@ -129,6 +155,7 @@ impl Default for PimdirSyncOptions {
             rights: PimdirPushRights::all(),
             conflict: PimdirConflictPolicy::Manual,
             full: false,
+            scope: PimdirScope::unbounded(),
         }
     }
 }
@@ -141,17 +168,19 @@ impl Default for PimdirSyncOptions {
 /// [`PimdirSyncReport`] summarise them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirSyncEvent {
-    /// A new member appeared locally, pulled from the remote.
+    /// A member a listing named, new to the store.
     Added(PimdirHandle),
     /// A placement's flag set changed, pulled from the remote.
     FlagsChanged(PimdirHandle),
-    /// A placement's body was dropped after a remote content change.
+    /// A placement's body was replaced or dropped after a remote content
+    /// change.
     ContentChanged(PimdirHandle),
-    /// A member was removed after a remote delete.
+    /// A member was removed after a remote delete, stated or found absent.
     Vanished(PimdirHandle),
     /// A placement's content diverged on both sides and is left conflicted.
     Conflicted(PimdirHandle),
-    /// A local create (copy, move target or append) the remote accepted.
+    /// A local create (copy, move target or append) the remote accepted,
+    /// or a listing landed under the handle it lists.
     Created(PimdirHandle),
 }
 
@@ -168,6 +197,10 @@ pub struct PimdirSyncReport {
     pub rejected: usize,
     /// Placements whose stale body was dropped after a remote content change.
     pub refreshed: usize,
+    /// Pending creates whose add waits for a round whose scope holds their
+    /// date (SYNC §5): each may be its own arrival, relocated with its
+    /// `Date` kept, which no page of this scope lists.
+    pub waiting: usize,
     /// The per-item events this sync emitted, in order.
     pub events: Vec<PimdirSyncEvent>,
 }
@@ -179,21 +212,36 @@ pub struct PimdirSync {
     /// Whether the collection is bound by other sources too, which decides
     /// a refused delete (SYNC §5): held beside others, reverted alone.
     beside_others: bool,
-    local: BTreeMap<PimdirHandle, PimdirPlacement>,
+    /// Whether the connector's checkpoint is bound to the scope it was
+    /// made under (SYNC §4), else a widening lists only the band.
+    scope_bound: bool,
+    /// The source's checkpoint and coverage as the run found them.
     checkpoint: Option<PimdirCheckpoint>,
-    /// Whether the collection holds a probe of this source, at load or in
-    /// the enumeration: a create is not derived while it does (SYNC §5).
-    holds_probes: bool,
-    /// The merge in progress, from the enumerate to the join's last candidate.
+    coverage: Option<PimdirCoverage>,
+    /// Whether the store holds an open round of this source, as of the
+    /// writes the run handed over.
+    round_open: bool,
+    /// The listing the run asked for.
+    plan: Plan,
+    /// The page taken in, until its loads are answered.
+    page: Option<Page>,
+    /// What the page in progress lands once merged and pushed.
+    landing: Option<Landing>,
+    local: BTreeMap<PimdirHandle, PimdirPlacement>,
+    /// The bindings the open round had not stamped when the page loaded.
+    unstamped: Vec<PimdirHandle>,
+    /// The meta each listed member carried, by handle.
+    metas: BTreeMap<PimdirHandle, PimdirRemoteMeta>,
+    /// The members the page named, landed or refreshed, which the join
+    /// writes even when the merge derives nothing more for them.
+    fresh: BTreeMap<PimdirHandle, Fresh>,
+    /// Whether no create is derived from this page (SYNC §5).
+    holds_creates: bool,
+    /// The merge in progress, from the page to the join's last candidate.
     merging: Option<Merge>,
     writes: Vec<PimdirWriteOp>,
     /// The derived changes no chunk has taken yet, in derivation order.
     pushes: Vec<PimdirChange>,
-    /// The checkpoint the enumerate reported, held for the last write.
-    ///
-    /// No intermediate write carries it: it lands once every chunk is
-    /// recorded.
-    next_checkpoint: Option<PimdirCheckpoint>,
     /// What each derived push does to its row once accepted, by handle.
     ///
     /// One handle yields at most one change, and the flag axis refreshes
@@ -228,22 +276,31 @@ impl PimdirSync {
     pub fn new(collection: impl Into<PimdirCollectionId>, opts: PimdirSyncOptions) -> Self {
         let collection = collection.into();
         debug!(
-            "sync collection {} (push={})",
+            "sync collection {} (push={}, scope={:?})",
             collection.as_str(),
-            opts.push
+            opts.push,
+            opts.scope,
         );
 
         Self {
             collection,
             opts,
             beside_others: false,
-            local: BTreeMap::new(),
+            scope_bound: true,
             checkpoint: None,
-            holds_probes: false,
+            coverage: None,
+            round_open: false,
+            plan: Plan::Delta(PimdirCheckpoint::default()),
+            page: None,
+            landing: None,
+            local: BTreeMap::new(),
+            unstamped: Vec::new(),
+            metas: BTreeMap::new(),
+            fresh: BTreeMap::new(),
+            holds_creates: false,
             merging: None,
             writes: Vec::new(),
             pushes: Vec::new(),
-            next_checkpoint: None,
             pending: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             report: PimdirSyncReport::default(),
@@ -258,6 +315,569 @@ impl PimdirSync {
     pub fn beside_other_sources(mut self, beside: bool) -> Self {
         self.beside_others = beside;
         self
+    }
+
+    /// Tells the coroutine whether the connector's checkpoint is bound to
+    /// the scope it was made under (SYNC §4,
+    /// [`PimdirRemote::scope_bound`](crate::remote::PimdirRemote::scope_bound)):
+    /// one bound to none widens a scope by listing only the band its
+    /// coverage lacks, keeping its checkpoint. Bound by default.
+    pub fn scope_bound(mut self, bound: bool) -> Self {
+        self.scope_bound = bound;
+        self
+    }
+
+    /// What the run did so far, whole once it completes.
+    ///
+    /// A runner whose remote failed between two pages reads here what
+    /// the pages that landed did: what landed stays (SYNC §5).
+    pub fn report(&self) -> &PimdirSyncReport {
+        &self.report
+    }
+
+    /// Chooses the listing (SYNC §5): the open round resumed when it
+    /// lists the scope asked for; else a round when none ever closed, a
+    /// round is open over another scope, or the scope reaches outside the
+    /// coverage, over the band alone for a connector bound to no scope;
+    /// else a delta from the checkpoint.
+    fn choose(&self, round: Option<&PimdirRound>) -> Plan {
+        let wanted = self.opts.scope.clone();
+
+        let band = match (&self.coverage, self.scope_bound, self.opts.full) {
+            (Some(coverage), false, false) => coverage.scope.band(&wanted),
+            _ => None,
+        };
+        let (scope, span, banded) = match band {
+            Some((band, span)) => (band, span, true),
+            None => (wanted.clone(), wanted.clone(), false),
+        };
+
+        if let Some(round) = round
+            && round.scope == scope
+            && !self.opts.full
+        {
+            debug!("resume the round over {:?}", round.scope);
+            return Plan::Round(RoundPlan {
+                scope,
+                span,
+                band: banded,
+                cursor: round.cursor.clone(),
+                open: false,
+            });
+        }
+
+        let covered = self
+            .coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.scope.covers(&wanted));
+        match &self.checkpoint {
+            Some(checkpoint) if covered && round.is_none() && !self.opts.full => {
+                debug!("list the delta from the checkpoint");
+                Plan::Delta(checkpoint.clone())
+            }
+            _ => {
+                debug!("open a round over {scope:?}");
+                Plan::Round(RoundPlan {
+                    scope,
+                    span,
+                    band: banded,
+                    cursor: None,
+                    open: true,
+                })
+            }
+        }
+    }
+
+    /// Asks the connector for the next page of the planned listing.
+    fn enumerate(
+        &mut self,
+    ) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
+        let request = match &self.plan {
+            Plan::Delta(checkpoint) => PimdirEnumerate {
+                listing: PimdirListing::Delta(checkpoint.clone()),
+                scope: self.opts.scope.clone(),
+            },
+            Plan::Round(round) => PimdirEnumerate {
+                listing: PimdirListing::Round {
+                    cursor: round.cursor.clone(),
+                    band: round.band,
+                },
+                scope: round.scope.clone(),
+            },
+        };
+
+        trace!("enumerate {request:?}");
+        self.state = State::Enumerating;
+        PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate {
+            collection: self.collection.clone(),
+            request,
+        })
+    }
+
+    /// Restarts the round under a new id from its first page, its cursor
+    /// rejected (SYNC §5), or opens one where a delta's checkpoint was.
+    fn restart(&mut self) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
+        match &mut self.plan {
+            Plan::Round(round) if round.cursor.is_some() => {
+                debug!("cursor rejected, restart the round");
+                round.cursor = None;
+                round.open = true;
+            }
+            Plan::Round(_) => {
+                return PimdirCoroutineState::Complete(Err(PimdirArgError::UnexpectedArg));
+            }
+            Plan::Delta(_) => {
+                debug!("checkpoint rejected, open a round over the scope");
+                let scope = self.opts.scope.clone();
+                self.plan = Plan::Round(RoundPlan {
+                    span: scope.clone(),
+                    scope,
+                    band: false,
+                    cursor: None,
+                    open: true,
+                });
+            }
+        }
+
+        self.enumerate()
+    }
+
+    /// Takes a page in: what it is, and the load naming it needs (SYNC
+    /// §10): the whole collection for a delta and a round's last page,
+    /// which reason about what is missing from it, the handles it lists
+    /// then the keys its hints may be held under for a page before the
+    /// last.
+    fn take_page(
+        &mut self,
+        snapshot: PimdirRemoteSnapshot,
+    ) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
+        let PimdirRemoteSnapshot {
+            mut items,
+            vanished,
+            complete,
+            last,
+            cursor,
+            checkpoint,
+        } = snapshot;
+
+        // NOTE: the join walks both sides in handle order and pairs each
+        // handle once, so the page is sorted and deduplicated first.
+        if !items.is_sorted_by(|a, b| a.handle <= b.handle) {
+            debug!("page is not ordered by handle, sorting it");
+            items.sort_by(|a, b| a.handle.cmp(&b.handle));
+        }
+        items.dedup_by(|a, b| a.handle == b.handle);
+
+        let kind = match complete {
+            false => PageKind::Delta,
+            true => {
+                // NOTE: a connector answering a round to a delta request
+                // listed the whole scope, a round of its own.
+                if let Plan::Delta(_) = self.plan {
+                    debug!("the connector answered a round, open one over the scope");
+                    let scope = self.opts.scope.clone();
+                    self.plan = Plan::Round(RoundPlan {
+                        span: scope.clone(),
+                        scope,
+                        band: false,
+                        cursor: None,
+                        open: true,
+                    });
+                }
+                // NOTE: a page carrying no cursor cannot be resumed past,
+                // so it closes the round whatever it says.
+                match last || cursor.is_none() {
+                    true => PageKind::Last,
+                    false => PageKind::Partial,
+                }
+            }
+        };
+
+        trace!(
+            "page of {} items, {} vanished, {kind:?}",
+            items.len(),
+            vanished.len()
+        );
+        let scope = match kind {
+            PageKind::Partial => PimdirLoadScope::Handles(
+                items
+                    .iter()
+                    .map(|item| item.handle.clone())
+                    .chain(vanished.iter().cloned())
+                    .collect(),
+            ),
+            PageKind::Delta | PageKind::Last => PimdirLoadScope::All,
+        };
+        self.page = Some(Page {
+            kind,
+            items,
+            vanished,
+            cursor,
+            checkpoint,
+        });
+        self.local.clear();
+        self.unstamped.clear();
+
+        self.state = State::LoadingPage;
+        PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
+            collection: self.collection.clone(),
+            scope,
+        })
+    }
+
+    /// Adds what a page load returned to the placements the merge reads.
+    fn absorb_load(&mut self, loaded: PimdirLoaded) {
+        for placement in loaded.placements {
+            self.local
+                .entry(placement.handle.clone())
+                .or_insert(placement);
+        }
+        self.unstamped.extend(loaded.unstamped);
+    }
+
+    /// The hints a page before the last loads the holders of, so naming
+    /// its members is decided against the whole collection (SYNC §6): the
+    /// hint, and the key a minted copy of it would take.
+    fn hints(&self) -> Vec<PimdirLinkId> {
+        self.page
+            .iter()
+            .flat_map(|page| &page.items)
+            .filter(|item| !self.local.contains_key(&item.handle))
+            .flat_map(|item| {
+                [
+                    item.meta.link_id.clone(),
+                    item.meta.link_id.minted(&item.handle),
+                ]
+            })
+            .collect()
+    }
+
+    /// Opens the three-way merge over the page: names its members, settles
+    /// what it finds absent, and lays out what the page lands.
+    fn open_merge(&mut self) {
+        let page = self.page.take().expect("a page to merge");
+
+        let opening = match &mut self.plan {
+            Plan::Round(round) if page.kind != PageKind::Delta && round.open => {
+                round.open = false;
+                Some(round.scope.clone())
+            }
+            _ => None,
+        };
+        if let Some(scope) = &opening {
+            self.writes.push(PimdirWriteOp::OpenRound {
+                collection: self.collection.clone(),
+                scope: scope.clone(),
+            });
+            self.round_open = true;
+        }
+
+        self.name_members(&page.items);
+
+        let listed: BTreeSet<&PimdirHandle> = page.items.iter().map(|item| &item.handle).collect();
+        let mut vanished: BTreeSet<PimdirHandle> = page.vanished.iter().cloned().collect();
+        if let (PageKind::Last, Plan::Round(round)) = (page.kind, &self.plan) {
+            // NOTE: a round this very page opened stamped nothing yet, so
+            // what it found absent is every based binding in scope it did
+            // not list; one opened before reads the store's own stamps.
+            let absent: Vec<PimdirHandle> = match opening.is_some() {
+                true => self
+                    .local
+                    .values()
+                    .filter(|p| p.base.is_some() && !listed.contains(&p.handle))
+                    .filter(|p| round.scope.contains(date_of(p)))
+                    .map(|p| p.handle.clone())
+                    .collect(),
+                false => self
+                    .unstamped
+                    .iter()
+                    .filter(|handle| !listed.contains(handle))
+                    .cloned()
+                    .collect(),
+            };
+            trace!("found absent in scope: {absent:?}");
+            vanished.extend(absent);
+        }
+
+        // NOTE: a create derives once a round's last page has landed, or
+        // from a delta while no round is open (SYNC §5).
+        self.holds_creates = match page.kind {
+            PageKind::Partial => true,
+            PageKind::Last => false,
+            PageKind::Delta => self.round_open,
+        };
+
+        let mut tail = Vec::new();
+        match (page.kind, &self.plan) {
+            (PageKind::Delta, plan) => {
+                if let Some(checkpoint) = page.checkpoint {
+                    tail.push(PimdirWriteOp::SetCheckpoint {
+                        collection: self.collection.clone(),
+                        checkpoint,
+                    });
+                }
+                // NOTE: a checkpoint made under the coverage serves any
+                // scope inside it, and the narrower one is what the run
+                // maintains from now on.
+                let narrower = self.coverage.as_ref().is_some_and(|coverage| {
+                    coverage.scope != self.opts.scope && coverage.scope.covers(&self.opts.scope)
+                });
+                if matches!(plan, Plan::Delta(_)) && narrower {
+                    tail.push(PimdirWriteOp::SetCoverage {
+                        collection: self.collection.clone(),
+                        scope: self.opts.scope.clone(),
+                    });
+                }
+            }
+            (PageKind::Partial, Plan::Round(round)) => {
+                tail.push(PimdirWriteOp::SetRoundCursor {
+                    collection: self.collection.clone(),
+                    cursor: page.cursor.clone().unwrap_or_default(),
+                    checkpoint: page.checkpoint.filter(|_| !round.band),
+                });
+            }
+            (PageKind::Last, Plan::Round(round)) => {
+                tail.push(PimdirWriteOp::CloseRound {
+                    collection: self.collection.clone(),
+                    coverage: round.span.clone(),
+                    checkpoint: page.checkpoint.filter(|_| !round.band),
+                });
+            }
+            (_, Plan::Delta(_)) => unreachable!("a round page plans a round"),
+        }
+
+        let mut items = Vec::with_capacity(page.items.len());
+        for item in page.items {
+            self.metas.insert(item.handle.clone(), item.meta);
+            items.push(Remote {
+                handle: item.handle,
+                flags: item.flags,
+                revision: item.revision,
+            });
+        }
+
+        self.landing = Some(Landing {
+            stamp: (page.kind != PageKind::Delta)
+                .then(|| items.iter().map(|item| item.handle.clone()).collect()),
+            tail,
+            next: match page.kind {
+                PageKind::Partial => page.cursor,
+                PageKind::Delta | PageKind::Last => None,
+            },
+        });
+
+        let local = mem::take(&mut self.local);
+        self.merging = Some(Merge {
+            join: Join::new(local, items),
+            vanished,
+            narrowing: match page.kind {
+                PageKind::Partial => Narrowing::Page,
+                PageKind::Delta | PageKind::Last => Narrowing::Delta,
+            },
+        });
+    }
+
+    /// Names every member the page lists (SYNC §4, §6), in handle order:
+    /// a new handle is keyed against the whole collection or lands the
+    /// pending create its hint is held by, a bound one has its summary
+    /// and sort key refreshed from its meta, and a mutable resource
+    /// stating a new identity under its handle is keyed afresh.
+    fn name_members(&mut self, items: &[PimdirRemoteItem]) {
+        // NOTE: extended as the page resolves, since both copies of a
+        // duplicate commonly arrive in one page.
+        let mut claimed: BTreeSet<PimdirLinkId> = self
+            .local
+            .values()
+            .filter_map(|p| p.link_id.clone())
+            .collect();
+
+        for item in items {
+            let meta = &item.meta;
+            let Some(placement) = self.local.get(&item.handle) else {
+                self.name(item, &mut claimed);
+                continue;
+            };
+
+            // NOTE: never re-identifies a linked item of an immutable kind;
+            // a mutable resource stating another hint under its handle is a
+            // new identity there, the storage retiring the old binding.
+            let mutable = item.revision.is_some() || is_mutable(placement);
+            let restated = placement
+                .link_id
+                .as_ref()
+                .is_some_and(|key| *key != meta.link_id && !key.as_str().starts_with("dup:"));
+            if mutable && restated {
+                debug!(
+                    "handle {} states a new identity, keying it afresh",
+                    item.handle.as_str()
+                );
+                self.local.remove(&item.handle);
+                self.name(item, &mut claimed);
+                continue;
+            }
+
+            // NOTE: a content change is the content axis's, which takes the
+            // meta on a pull and keeps the local body's summary otherwise.
+            let base_revision = placement.base.as_ref().and_then(|b| b.revision.as_ref());
+            if item.revision.is_some() && item.revision.as_ref() != base_revision {
+                continue;
+            }
+
+            let mut refreshed = placement.clone();
+            refreshed.summary = summary::without_body(
+                placement.summary.as_ref(),
+                meta.summary.clone(),
+                placement.object.is_some(),
+            );
+            if !meta.sort_key.is_unknown() {
+                refreshed.sort_key = meta.sort_key.clone();
+            }
+            if refreshed != *placement {
+                trace!("refresh the summary of {}", item.handle.as_str());
+                self.local.insert(item.handle.clone(), refreshed);
+                self.fresh.insert(item.handle.clone(), Fresh::Refreshed);
+            }
+        }
+    }
+
+    /// Names one new member: lands the pending create its hint is held
+    /// by, else keys it, the hint when free and a minted key otherwise.
+    fn name(&mut self, item: &PimdirRemoteItem, claimed: &mut BTreeSet<PimdirLinkId>) {
+        let meta = &item.meta;
+
+        if let Some(create) = self.take_pending_create(&meta.link_id, &item.handle) {
+            claimed.insert(meta.link_id.clone());
+            let provisional = create.handle.clone();
+            let landed = self.land(create, item);
+            self.local.insert(item.handle.clone(), landed);
+            self.fresh
+                .insert(item.handle.clone(), Fresh::Landed(provisional));
+            return;
+        }
+
+        let key = meta
+            .link_id
+            .claim(&item.handle, |key| claimed.contains(key));
+        claimed.insert(key.clone());
+        let object = meta.body.clone().map(|body| self.store_body(body));
+
+        let named = PimdirPlacement {
+            collection: self.collection.clone(),
+            handle: item.handle.clone(),
+            link_id: Some(key),
+            level: match object {
+                Some(_) => PimdirLevel::Full,
+                None => PimdirLevel::Meta,
+            },
+            object: object.clone(),
+            summary: meta.summary.clone(),
+            sort_key: meta.sort_key.clone(),
+            flags: item.flags.clone(),
+            status: PimdirStatus::Clean,
+            conflict_revision: None,
+            conflict_object: None,
+            base: Some(PimdirBase {
+                flags: item.flags.clone(),
+                revision: item.revision.clone(),
+                object,
+            }),
+            origin: None,
+        };
+        self.local.insert(item.handle.clone(), named);
+        self.fresh.insert(item.handle.clone(), Fresh::Named);
+    }
+
+    /// Takes the pending create of this source holding `hint`, if any.
+    ///
+    /// A `Created` placement with no base under a provisional handle is
+    /// the create a listed `hint` delivers (SYNC §6); taken out so a
+    /// second arrival of the same hint in the page is minted instead.
+    fn take_pending_create(
+        &mut self,
+        hint: &PimdirLinkId,
+        arrived: &PimdirHandle,
+    ) -> Option<PimdirPlacement> {
+        let provisional = self
+            .local
+            .values()
+            .find(|p| {
+                p.link_id.as_ref() == Some(hint)
+                    && p.status == PimdirStatus::Created
+                    && p.base.is_none()
+                    && &p.handle != arrived
+            })
+            .map(|p| p.handle.clone())?;
+
+        self.local.remove(&provisional)
+    }
+
+    /// Lands a pending create under the handle its arrival is listed at.
+    ///
+    /// The create moves onto the listed handle with a base of what the
+    /// listing reported: its flags, the revision, and the body it carried
+    /// or else the create's own. The flags, body, summary and sort key
+    /// staged on the create stay, so an edit made on it still pushes
+    /// (SYNC §6). The join drops the provisional handle, `Superseded`.
+    fn land(&mut self, create: PimdirPlacement, item: &PimdirRemoteItem) -> PimdirPlacement {
+        debug!(
+            "land the pending create {} under {}",
+            create.handle.as_str(),
+            item.handle.as_str(),
+        );
+
+        let mut landed = create;
+        landed.handle = item.handle.clone();
+        let mut base_object = landed.object.clone();
+        if let Some(body) = item.meta.body.clone() {
+            let hash = self.store_body(body);
+            base_object = Some(hash.clone());
+            landed.object.get_or_insert(hash);
+        }
+        if landed.summary.is_none() {
+            landed.summary = item.meta.summary.clone();
+        }
+        if landed.sort_key.is_unknown() {
+            landed.sort_key = item.meta.sort_key.clone();
+        }
+        landed.level = match landed.object {
+            Some(_) => PimdirLevel::Full,
+            None => PimdirLevel::Meta,
+        };
+        landed.base = Some(PimdirBase {
+            flags: item.flags.clone(),
+            revision: item.revision.clone(),
+            object: base_object,
+        });
+        landed.status = match landed.base.as_ref() {
+            Some(base) if base.flags == landed.flags && base.object == landed.object => {
+                PimdirStatus::Clean
+            }
+            _ => PimdirStatus::Dirty,
+        };
+        landed.origin = None;
+
+        landed
+    }
+
+    /// Records a body a listing carried, answering the hash it is stored by.
+    fn store_body(&mut self, body: PimdirFetchedBody) -> crate::object::PimdirHash {
+        let (object, bytes) = match body {
+            PimdirFetchedBody::Inline { hash, bytes } => (
+                PimdirObject {
+                    hash,
+                    size: bytes.len(),
+                },
+                Some(bytes),
+            ),
+            PimdirFetchedBody::Persisted { hash, size } => (PimdirObject { hash, size }, None),
+        };
+        let hash = object.hash.clone();
+        self.writes.push(PimdirWriteOp::StoreObject {
+            object,
+            body: bytes,
+        });
+
+        hash
     }
 
     /// Yields the next push chunk, or the write recording the last one.
@@ -291,7 +911,8 @@ impl PimdirSync {
         })
     }
 
-    /// Takes the accumulated writes, plus the checkpoint after the last chunk.
+    /// Takes the accumulated writes, plus what the page lands after its
+    /// last chunk: the checkpoint and coverage, the cursor, or the close.
     ///
     /// The checkpoint stays the pre-push one, so the next delta re-lists
     /// the engine's own echo. An intermediate chunk must not carry it, or
@@ -300,53 +921,18 @@ impl PimdirSync {
         let mut batch = mem::take(&mut self.writes);
 
         if self.pushes.is_empty()
-            && let Some(checkpoint) = self.next_checkpoint.take()
+            && self.merging.is_none()
+            && let Some(landing) = &mut self.landing
         {
-            batch.push(PimdirWriteOp::SetCheckpoint {
-                collection: self.collection.clone(),
-                checkpoint,
-            });
+            for op in mem::take(&mut landing.tail) {
+                if let PimdirWriteOp::CloseRound { .. } = op {
+                    self.round_open = false;
+                }
+                batch.push(op);
+            }
         }
 
         batch
-    }
-
-    /// Opens the three-way merge over what the enumerate reported.
-    ///
-    /// The local placements are moved into the join: nothing else reads
-    /// them, so the merge owns each one instead of cloning it per
-    /// candidate.
-    fn open_merge(&mut self, snapshot: PimdirRemoteSnapshot) {
-        let PimdirRemoteSnapshot {
-            mut items,
-            vanished,
-            complete,
-            checkpoint,
-        } = snapshot;
-
-        // NOTE: the join walks both sides in handle order and pairs each
-        // handle once, so the snapshot is sorted and deduplicated first.
-        if !items.is_sorted_by(|a, b| a.handle <= b.handle) {
-            debug!("enumeration is not ordered by handle, sorting it");
-            items.sort_by(|a, b| a.handle.cmp(&b.handle));
-        }
-        items.dedup_by(|a, b| a.handle == b.handle);
-
-        let vanished: BTreeSet<PimdirHandle> = vanished.into_iter().collect();
-        let local = mem::take(&mut self.local);
-
-        // NOTE: a probe may be a pending create's own arrival, so no
-        // create is pushed while one exists (SYNC §5): the ones loaded,
-        // and the members this enumeration lists that nothing binds yet.
-        self.holds_probes = local.values().any(is_probe)
-            || items.iter().any(|item| !local.contains_key(&item.handle));
-
-        self.merging = Some(Merge {
-            join: Join::new(local, items),
-            vanished,
-            complete,
-            checkpoint,
-        });
     }
 
     /// Merges candidates until the write batch is full or the join runs out.
@@ -354,8 +940,43 @@ impl PimdirSync {
         &mut self,
     ) -> PimdirCoroutineState<PimdirYield, Result<PimdirSyncReport, PimdirArgError>> {
         while let Some(candidate) = self.next_candidate() {
+            let handle = candidate.handle.clone();
+            let mark = self.writes.len();
+            let fresh = self.fresh.remove(&handle);
+            let named = match fresh.is_some() {
+                true => candidate.local.clone(),
+                false => None,
+            };
+
+            // NOTE: the provisional handle goes first, so the upsert moving
+            // the binding onto the listed one is licensed in the same batch.
+            if let Some(Fresh::Landed(provisional)) = &fresh {
+                self.drop(provisional, PimdirDropReason::Superseded);
+            }
+
             if let Some(kind) = self.merge(candidate) {
                 self.pushes.push(PimdirChange::new(&self.collection, kind));
+            }
+
+            if let Some(fresh) = fresh {
+                let written = self.writes[mark..].iter().any(|op| match op {
+                    PimdirWriteOp::UpsertPlacement(p) => p.handle == handle,
+                    PimdirWriteOp::DropPlacement {
+                        handle: dropped, ..
+                    } => *dropped == handle,
+                    _ => false,
+                });
+                if !written && let Some(named) = named {
+                    self.upsert(named);
+                }
+                match fresh {
+                    Fresh::Named => {
+                        self.report.pulled += 1;
+                        self.emit(PimdirSyncEvent::Added(handle));
+                    }
+                    Fresh::Landed(_) => self.emit(PimdirSyncEvent::Created(handle)),
+                    Fresh::Refreshed => {}
+                }
             }
 
             // NOTE: cut between candidates, never inside one: the writes
@@ -367,8 +988,17 @@ impl PimdirSync {
             }
         }
 
-        let merge = self.merging.take().expect("a merge in progress");
-        self.next_checkpoint = Some(merge.checkpoint);
+        self.merging = None;
+        // NOTE: after the page's upserts, so a member it named is stamped
+        // too, and whether it moved or not (SYNC §5).
+        if let Some(handles) = self.landing.as_mut().and_then(|l| l.stamp.take())
+            && !handles.is_empty()
+        {
+            self.writes.push(PimdirWriteOp::Stamp {
+                collection: self.collection.clone(),
+                handles,
+            });
+        }
         debug!(
             "reconciled: {} pulled, {} conflicts, {} changes to push",
             self.report.pulled,
@@ -380,19 +1010,11 @@ impl PimdirSync {
     }
 
     /// The next handle to merge, or `None` once the join is exhausted.
-    ///
-    /// A complete snapshot merges every handle either side holds. A delta
-    /// merges the changed or vanished ones, plus every locally non-clean
-    /// handle, whose pending push it would otherwise never revisit.
     fn next_candidate(&mut self) -> Option<Candidate> {
         let merge = self.merging.as_mut()?;
 
         loop {
             let candidate = merge.join.next()?;
-
-            if merge.complete {
-                return Some(candidate);
-            }
             if let Some(candidate) = merge.narrow(candidate) {
                 return Some(candidate);
             }
@@ -503,12 +1125,6 @@ impl PimdirSync {
                 self.emit(PimdirSyncEvent::Vanished(handle.clone()));
                 None
             }
-            (false, false, true) => {
-                self.pull_add(&remote_item.expect("remote present"));
-                self.report.pulled += 1;
-                self.emit(PimdirSyncEvent::Added(handle.clone()));
-                None
-            }
             // NOTE: the flag merge runs even under a content push or
             // conflict, since a delta lists a flag change only once; the
             // content push merely withholds the flag push.
@@ -540,8 +1156,7 @@ impl PimdirSync {
                 if local.status != PimdirStatus::Created {
                     // NOTE: a base-less body is a create-collision whose
                     // remote side went, so the local body survives as a
-                    // create; a base-less row holding none is a probe, and
-                    // a probe the enumeration no longer lists is gone.
+                    // create; a base-less row holding none is gone.
                     if local.object.is_some() {
                         self.resurrect(local);
                     } else {
@@ -551,11 +1166,22 @@ impl PimdirSync {
                     self.emit(PimdirSyncEvent::Vanished(handle.clone()));
                     return None;
                 }
-                if self.holds_probes {
+                if self.holds_creates {
                     trace!(
-                        "holding the create {} while the collection holds probes",
+                        "holding the create {} until its round has landed",
                         handle.as_str()
                     );
+                    return None;
+                }
+                // NOTE: an arrival relocated with its `Date` kept is listed
+                // by no page of a scope excluding that date, so a create
+                // pushed now would file a second copy (SYNC §5).
+                if local.origin.is_none() && !self.opts.scope.contains(date_of(&local)) {
+                    debug!(
+                        "holding the create {} for a round whose scope holds it",
+                        handle.as_str()
+                    );
+                    self.report.waiting += 1;
                     return None;
                 }
                 let pushable = local.object.is_some() || local.origin.is_some();
@@ -607,11 +1233,7 @@ impl PimdirSync {
     /// Both axes read positive signals only: a dirty placement whose body
     /// its base does not hold, a reported revision differing from the
     /// base. Immutable content produces neither and falls through.
-    fn reconcile_content(
-        &mut self,
-        local: &PimdirPlacement,
-        item: &PimdirRemoteItem,
-    ) -> ContentOutcome {
+    fn reconcile_content(&mut self, local: &PimdirPlacement, item: &Remote) -> ContentOutcome {
         let Some(base) = &local.base else {
             // NOTE: a base-less body the remote also holds is a
             // create-collision.
@@ -640,8 +1262,9 @@ impl PimdirSync {
                 let mut updated = local.clone();
                 updated.conflict_revision = item.revision.clone();
                 // NOTE: the stored diverging body described the old
-                // revision, so the upgrade pass fetches it anew.
-                updated.conflict_object = None;
+                // revision, so it is replaced by the one the member
+                // carries, else the upgrade pass fetches it anew.
+                updated.conflict_object = self.carried_body(&item.handle);
                 self.upsert(updated.clone());
                 return ContentOutcome::Rewritten(updated);
             }
@@ -683,11 +1306,7 @@ impl PimdirSync {
     }
 
     /// Resolves a content conflict by the configured [`PimdirConflictPolicy`].
-    fn resolve_conflict(
-        &mut self,
-        local: &PimdirPlacement,
-        item: &PimdirRemoteItem,
-    ) -> ContentOutcome {
+    fn resolve_conflict(&mut self, local: &PimdirPlacement, item: &Remote) -> ContentOutcome {
         match self.opts.conflict {
             PimdirConflictPolicy::Manual => self.mark_conflict(local, item),
             PimdirConflictPolicy::PreferRemote => {
@@ -706,34 +1325,37 @@ impl PimdirSync {
 
     /// Marks a placement conflicted, carrying the observed remote revision.
     ///
-    /// The diverging body is marked wanted rather than taken, the engine
+    /// The diverging body is the one the member carries when it carries
+    /// one; else it is marked wanted rather than taken, the engine
     /// fetching nothing itself: a conflict holding no conflict object is
     /// the request, and the upgrade pass is what answers it.
-    fn mark_conflict(
-        &mut self,
-        local: &PimdirPlacement,
-        item: &PimdirRemoteItem,
-    ) -> ContentOutcome {
+    fn mark_conflict(&mut self, local: &PimdirPlacement, item: &Remote) -> ContentOutcome {
         let mut conflicted = local.clone();
         conflicted.status = PimdirStatus::Conflict;
         conflicted.conflict_revision = item.revision.clone();
-        conflicted.conflict_object = None;
+        conflicted.conflict_object = self.carried_body(&item.handle);
         self.upsert(conflicted.clone());
         self.report.conflicts += 1;
         self.emit(PimdirSyncEvent::Conflicted(local.handle.clone()));
         ContentOutcome::Rewritten(conflicted)
     }
 
+    /// The body the member listed under `handle` carried, recorded.
+    fn carried_body(&mut self, handle: &PimdirHandle) -> Option<crate::object::PimdirHash> {
+        let body = self.metas.get(handle).and_then(|meta| meta.body.clone())?;
+        Some(self.store_body(body))
+    }
+
     /// Reconciles the flag sets of a placement present on both sides.
     ///
     /// Flags merge element-wise ([`PimdirFlags::merge`]) and never
     /// conflict: remote-won flags are pulled, local-won ones pushed. A
-    /// base-less placement, a probe, adopts the remote set, and one
-    /// already holding it is left alone.
+    /// base-less placement adopts the remote set, and one already holding
+    /// it is left alone.
     fn reconcile_flags(
         &mut self,
         local: &PimdirPlacement,
-        remote: &PimdirRemoteItem,
+        remote: &Remote,
         allow: PushFlags,
     ) -> Option<PimdirChangeKind> {
         let base_flags = local.base.as_ref().map(|b| b.flags.clone());
@@ -838,7 +1460,7 @@ impl PimdirSync {
                         self.rekey_create(placeholder, assigned, result.revision.clone())
                     }
                     // NOTE: no assigned handle (no UIDPLUS), so the next
-                    // enumerate re-adds it.
+                    // listing lands it.
                     None => self.drop(&placeholder.handle, PimdirDropReason::Superseded),
                 }
                 self.emit(PimdirSyncEvent::Created(created));
@@ -871,67 +1493,70 @@ impl PimdirSync {
         });
     }
 
-    fn pull_add(&mut self, item: &PimdirRemoteItem) {
-        let placement = PimdirPlacement {
-            collection: self.collection.clone(),
-            handle: item.handle.clone(),
-            link_id: None,
-            object: None,
-            level: PimdirLevel::Probed,
-            summary: None,
-            sort_key: PimdirSortKey::default(),
-            flags: item.flags.clone(),
-            status: PimdirStatus::Clean,
-            conflict_revision: None,
-            conflict_object: None,
-            base: None,
-            origin: None,
-        };
-        self.upsert(placement);
-    }
-
-    /// Revives a tombstone the remote edited past its base: the identity
-    /// and summary stay, the body goes, and the base adopts what the
-    /// remote reports, so the next upgrade refetches and nothing pushes.
-    fn revive(&mut self, local: &PimdirPlacement, item: &PimdirRemoteItem) {
+    /// Revives a tombstone the remote edited past its base, as a pull
+    /// would take it: the identity stays, the summary and body follow the
+    /// member's meta, and the base adopts what the remote reports, so
+    /// nothing pushes and, without a carried body, the next upgrade
+    /// refetches.
+    fn revive(&mut self, local: &PimdirPlacement, item: &Remote) {
         let mut revived = local.clone();
-        revived.object = None;
-        revived.level = PimdirLevel::Probed;
+        self.take_listed(&mut revived, item);
         revived.flags = item.flags.clone();
         revived.status = PimdirStatus::Clean;
         revived.conflict_revision = None;
         revived.conflict_object = None;
         revived.origin = None;
-        revived.base = Some(PimdirBase {
-            flags: item.flags.clone(),
-            revision: item.revision.clone(),
-            object: None,
-        });
+        if let Some(base) = &mut revived.base {
+            base.flags = item.flags.clone();
+        }
         self.upsert(revived);
     }
 
-    /// Pulls a remote content change: stale body dropped, revision rebased.
-    ///
-    /// The level falls back to probed, keeping the stale summary as a
-    /// display fallback until a meta upgrade refetches it. Flags and
-    /// status are left for the flag reconciliation.
-    fn pull_content(
-        &mut self,
-        local: &PimdirPlacement,
-        item: &PimdirRemoteItem,
-    ) -> PimdirPlacement {
+    /// Pulls a remote content change (SYNC §5): the member's meta becomes
+    /// the summary and sort key, and the body it carried the body and the
+    /// base at its revision; a member carrying none drops the local body
+    /// and lowers the level to `Meta`. Flags and status are left for the
+    /// flag reconciliation.
+    fn pull_content(&mut self, local: &PimdirPlacement, item: &Remote) -> PimdirPlacement {
         let mut updated = local.clone();
-        updated.object = None;
-        updated.level = PimdirLevel::Probed;
-        if let Some(base) = &mut updated.base {
-            base.revision = item.revision.clone();
-            base.object = None;
-        }
+        self.take_listed(&mut updated, item);
 
         self.upsert(updated.clone());
         self.report.refreshed += 1;
         self.emit(PimdirSyncEvent::ContentChanged(local.handle.clone()));
         updated
+    }
+
+    /// Takes what a member listed at a revision the base does not hold:
+    /// its meta, its body or none, and the base at that revision.
+    fn take_listed(&mut self, placement: &mut PimdirPlacement, item: &Remote) {
+        let meta = self.metas.get(&item.handle).cloned();
+        let object = meta
+            .as_ref()
+            .and_then(|meta| meta.body.clone())
+            .map(|body| self.store_body(body));
+
+        if let Some(meta) = meta {
+            if meta.summary.is_some() {
+                placement.summary = meta.summary;
+            }
+            if !meta.sort_key.is_unknown() {
+                placement.sort_key = meta.sort_key;
+            }
+        }
+        placement.level = match object {
+            Some(_) => PimdirLevel::Full,
+            None => PimdirLevel::Meta,
+        };
+        placement.object = object.clone();
+        let flags = placement.flags.clone();
+        let base = placement.base.get_or_insert(PimdirBase {
+            flags,
+            revision: None,
+            object: None,
+        });
+        base.revision = item.revision.clone();
+        base.object = object;
     }
 
     /// Adopts `flags` as both the current and the base flag set.
@@ -1034,43 +1659,52 @@ impl PimdirCoroutine for PimdirSync {
     ) -> PimdirCoroutineState<Self::Yield, Self::Return> {
         match (&self.state, arg) {
             (State::Start, None) => {
-                debug!("load local state from storage");
-                self.state = State::Loading;
+                debug!("load the sync state from storage");
+                self.state = State::Reading;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                     collection: self.collection.clone(),
-                    scope: PimdirLoadScope::All,
+                    scope: PimdirLoadScope::Handles(Vec::new()),
                 })
             }
 
-            (State::Loading, Some(PimdirArg::Load(loaded))) => {
-                self.local = loaded
-                    .placements
-                    .into_iter()
-                    .map(|p| (p.handle.clone(), p))
-                    .collect();
-                self.checkpoint = if self.opts.full {
-                    None
-                } else {
-                    loaded.checkpoint
-                };
-
-                debug!("enumerate remote from checkpoint");
-                trace!("loaded {} local items", self.local.len());
-                self.state = State::Enumerating;
-                PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate {
-                    collection: self.collection.clone(),
-                    cursor: self.checkpoint.clone(),
-                })
+            (State::Reading, Some(PimdirArg::Load(loaded))) => {
+                self.checkpoint = loaded.checkpoint;
+                self.coverage = loaded.coverage;
+                self.round_open = loaded.round.is_some();
+                self.plan = self.choose(loaded.round.as_ref());
+                self.enumerate()
             }
 
-            (State::Enumerating, Some(PimdirArg::Enumerate(snapshot))) => {
-                trace!(
-                    "enumerated {} items, {} vanished, complete={}",
-                    snapshot.items.len(),
-                    snapshot.vanished.len(),
-                    snapshot.complete,
-                );
-                self.open_merge(snapshot);
+            (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::CursorRejected))) => {
+                self.restart()
+            }
+
+            (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page)))) => {
+                self.take_page(page)
+            }
+
+            (State::LoadingPage, Some(PimdirArg::Load(loaded))) => {
+                self.absorb_load(loaded);
+                let partial = self
+                    .page
+                    .as_ref()
+                    .is_some_and(|page| page.kind == PageKind::Partial);
+                let hints = self.hints();
+                if partial && !hints.is_empty() {
+                    debug!("check {} listed hints against the collection", hints.len());
+                    self.state = State::LoadingLinks;
+                    return PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
+                        collection: self.collection.clone(),
+                        scope: PimdirLoadScope::Links(hints),
+                    });
+                }
+                self.open_merge();
+                self.merge_step()
+            }
+
+            (State::LoadingLinks, Some(PimdirArg::Load(loaded))) => {
+                self.absorb_load(loaded);
+                self.open_merge();
                 self.merge_step()
             }
 
@@ -1108,6 +1742,15 @@ impl PimdirCoroutine for PimdirSync {
                     return self.step();
                 }
 
+                // NOTE: a page before the last landed with its cursor; the
+                // next one resumes from it.
+                let next = self.landing.take().and_then(|landing| landing.next);
+                if let (Some(cursor), Plan::Round(round)) = (next, &mut self.plan) {
+                    round.cursor = Some(cursor);
+                    self.metas.clear();
+                    return self.enumerate();
+                }
+
                 debug!(
                     "sync done: {} pulled, {} pushed, {} refreshed, {} conflicts, {} rejected",
                     self.report.pulled,
@@ -1117,7 +1760,7 @@ impl PimdirCoroutine for PimdirSync {
                     self.report.rejected,
                 );
                 self.state = State::Done;
-                PimdirCoroutineState::Complete(Ok(mem::take(&mut self.report)))
+                PimdirCoroutineState::Complete(Ok(self.report.clone()))
             }
 
             (State::Done, _) | (_, Some(_)) => {
@@ -1128,12 +1771,21 @@ impl PimdirCoroutine for PimdirSync {
     }
 }
 
-/// Whether a placement is a probe: a handle enumerated and named by no
-/// fetch yet (SYNC §3), which a create staged without an identity is not.
-fn is_probe(placement: &PimdirPlacement) -> bool {
-    placement.link_id.is_none()
-        && placement.base.is_none()
-        && placement.status != PimdirStatus::Created
+/// The summary `date` a scope reads a placement by, `None` when it has
+/// none, which is in every scope (SYNC §5).
+fn date_of(placement: &PimdirPlacement) -> Option<&str> {
+    match &placement.summary {
+        Some(PimdirSummary::Mail(mail)) => mail.date.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether the content is mutable, which a last-synced revision marks.
+fn is_mutable(placement: &PimdirPlacement) -> bool {
+    placement
+        .base
+        .as_ref()
+        .is_some_and(|base| base.revision.is_some())
 }
 
 /// Whether the content axis still owes a push for this placement.
@@ -1143,6 +1795,70 @@ fn is_probe(placement: &PimdirPlacement) -> bool {
 /// for it.
 fn content_pending(placement: &PimdirPlacement) -> bool {
     placement.status == PimdirStatus::Dirty && placement.staged_edit().is_some()
+}
+
+/// The listing a run asked for (SYNC §5).
+#[derive(Debug)]
+enum Plan {
+    /// What changed since the checkpoint.
+    Delta(PimdirCheckpoint),
+    /// A round, opened or resumed.
+    Round(RoundPlan),
+}
+
+/// The round a run lists.
+#[derive(Debug)]
+struct RoundPlan {
+    /// The scope the round lists: the one asked for, or the band.
+    scope: PimdirScope,
+    /// The coverage the round leaves when it closes.
+    span: PimdirScope,
+    /// Whether it lists only the band a coverage lacks.
+    band: bool,
+    /// Where the next page resumes, `None` from the first.
+    cursor: Option<PimdirCursor>,
+    /// Whether the next page opens the round, drawing its id.
+    open: bool,
+}
+
+/// What a page is to the merge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageKind {
+    /// A delta's one page.
+    Delta,
+    /// A round's page before the last.
+    Partial,
+    /// A round's last page, or its only one.
+    Last,
+}
+
+/// A page taken in, until its loads are answered.
+struct Page {
+    kind: PageKind,
+    items: Vec<PimdirRemoteItem>,
+    vanished: Vec<PimdirHandle>,
+    cursor: Option<PimdirCursor>,
+    checkpoint: Option<PimdirCheckpoint>,
+}
+
+/// What a page lands once merged and pushed.
+struct Landing {
+    /// The handles the round's stamp goes on, after the page's upserts.
+    stamp: Option<Vec<PimdirHandle>>,
+    /// The ops of the write after the page's last chunk.
+    tail: Vec<PimdirWriteOp>,
+    /// Where the next page resumes, `None` once the listing ends.
+    next: Option<PimdirCursor>,
+}
+
+/// How the page named a member the join writes.
+enum Fresh {
+    /// Keyed afresh: a new item and binding.
+    Named,
+    /// A pending create landed, its provisional handle superseded.
+    Landed(PimdirHandle),
+    /// Bound already, its summary or sort key refreshed.
+    Refreshed,
 }
 
 /// Whether the flag axis may derive a push of its own.
@@ -1188,8 +1904,10 @@ enum Pending {
 /// What the coroutine is doing while it waits for the caller.
 enum State {
     Start,
-    Loading,
+    Reading,
     Enumerating,
+    LoadingPage,
+    LoadingLinks,
     Merging,
     Pushing,
     Writing,
@@ -1198,6 +1916,8 @@ enum State {
 
 #[cfg(test)]
 mod tests {
+    use core::borrow::BorrowMut;
+
     use alloc::{format, vec, vec::Vec};
 
     use crate::{
@@ -1216,7 +1936,7 @@ mod tests {
             handle: PimdirHandle::from(handle),
             link_id: None,
             object: None,
-            level: PimdirLevel::Probed,
+            level: PimdirLevel::Meta,
             summary: None,
             flags: PimdirFlags::default(),
             status: PimdirStatus::Created,
@@ -1237,7 +1957,7 @@ mod tests {
             handle: PimdirHandle::from(handle),
             link_id: Some(PimdirLinkId::from(handle)),
             object: None,
-            level: PimdirLevel::Probed,
+            level: PimdirLevel::Meta,
             summary: None,
             flags: PimdirFlags::from_iter(flags.iter().copied()),
             status: PimdirStatus::Clean,
@@ -1252,29 +1972,76 @@ mod tests {
         }
     }
 
+    /// The meta a listing names a member by: its handle as its hint, the
+    /// key [`synced`] files it under.
+    fn meta(handle: &str) -> PimdirRemoteMeta {
+        PimdirRemoteMeta {
+            link_id: PimdirLinkId::from(handle),
+            summary: None,
+            sort_key: Default::default(),
+            body: None,
+        }
+    }
+
     fn remote(handle: &str, flags: &[&str]) -> PimdirRemoteItem {
         PimdirRemoteItem {
             handle: PimdirHandle::from(handle),
             flags: PimdirFlags::from_iter(flags.iter().copied()),
             revision: None,
+            meta: meta(handle),
         }
     }
 
     fn full(items: Vec<PimdirRemoteItem>) -> PimdirRemoteSnapshot {
-        PimdirRemoteSnapshot {
-            items,
-            vanished: Vec::new(),
-            complete: true,
-            checkpoint: PimdirCheckpoint(b"c1".to_vec()),
-        }
+        PimdirRemoteSnapshot::round(items, Some(PimdirCheckpoint(b"c1".to_vec())))
     }
 
     fn delta(items: Vec<PimdirRemoteItem>, vanished: Vec<PimdirHandle>) -> PimdirRemoteSnapshot {
-        PimdirRemoteSnapshot {
-            items,
-            vanished,
-            complete: false,
-            checkpoint: PimdirCheckpoint(b"c1".to_vec()),
+        PimdirRemoteSnapshot::delta(items, vanished, PimdirCheckpoint(b"c1".to_vec()))
+    }
+
+    /// The page a test answers the enumeration with.
+    struct Page(PimdirRemoteSnapshot);
+
+    /// Whether a write op is the sync state's (the round, the coverage),
+    /// which the merge tests leave aside.
+    fn is_state(op: &PimdirWriteOp) -> bool {
+        matches!(
+            op,
+            PimdirWriteOp::OpenRound { .. }
+                | PimdirWriteOp::Stamp { .. }
+                | PimdirWriteOp::SetRoundCursor { .. }
+                | PimdirWriteOp::CloseRound { .. }
+                | PimdirWriteOp::SetCoverage { .. }
+        )
+    }
+
+    /// Drives a sync from its start to its first push or write, every load
+    /// answered with `local` and the enumeration with `page`.
+    fn begin(
+        sync: &mut impl BorrowMut<PimdirSync>,
+        local: Vec<PimdirPlacement>,
+        page: Option<Page>,
+    ) -> PimdirCoroutineState<PimdirYield, Result<PimdirSyncReport, PimdirArgError>> {
+        crate::testlog::init();
+        let sync = sync.borrow_mut();
+        let mut page = page.map(|page| page.0);
+        let mut arg = None;
+
+        loop {
+            match sync.resume(arg.take()) {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { .. }) => {
+                    arg = Some(PimdirArg::Load(PimdirLoaded {
+                        placements: local.clone(),
+                        ..Default::default()
+                    }));
+                }
+                PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { .. }) => {
+                    let page = page.take().expect("one page to enumerate");
+                    arg = Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page)));
+                }
+                state => return state,
+            }
         }
     }
 
@@ -1299,15 +2066,8 @@ mod tests {
         Vec<PimdirWriteOp>,
         PimdirSyncReport,
     ) {
-        crate::testlog::init();
-        let _ = sync.resume(None);
-        let _ = sync.resume(Some(PimdirArg::Load(PimdirLoaded {
-            placements: local,
-            checkpoint: None,
-        })));
-
         let mut pushes = None;
-        let writes = match sync.resume(Some(PimdirArg::Enumerate(snapshot))) {
+        let writes = match begin(sync, local, Some(Page(snapshot))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsPush { changes, .. }) => {
                 let results = changes
                     .iter()
@@ -1320,11 +2080,15 @@ mod tests {
                     .collect();
                 pushes = Some(changes);
                 match sync.resume(Some(PimdirArg::Push(results))) {
-                    PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(w)) => w,
+                    PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(w)) => {
+                        w.into_iter().filter(|op| !is_state(op)).collect()
+                    }
                     state => panic!("expected WantsWrite, got {state:?}"),
                 }
             }
-            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(w)) => w,
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(w)) => {
+                w.into_iter().filter(|op| !is_state(op)).collect()
+            }
             state => panic!("expected push or write, got {state:?}"),
         };
 
@@ -1337,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_add_pulls_probed() {
+    fn a_listed_member_is_named_by_its_page() {
         crate::testlog::init();
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let (pushes, writes, report) = run(&mut sync, vec![], vec![remote("1", &["seen"])]);
@@ -1347,7 +2111,9 @@ mod tests {
         let PimdirWriteOp::UpsertPlacement(p) = &writes[0] else {
             panic!("expected UpsertPlacement, got {:?}", writes[0]);
         };
-        assert_eq!(p.level, PimdirLevel::Probed);
+        assert_eq!(p.level, PimdirLevel::Meta);
+        assert_eq!(p.link_id, Some(PimdirLinkId::from("1")));
+        assert!(p.base.is_some(), "named with what the source reported");
         assert!(p.flags.contains("seen"));
     }
 
@@ -1391,18 +2157,14 @@ mod tests {
         items: Vec<PimdirRemoteItem>,
         results: Vec<PimdirPushResult>,
     ) -> (Vec<PimdirWriteOp>, PimdirSyncReport) {
-        crate::testlog::init();
-        let _ = sync.resume(None);
-        let _ = sync.resume(Some(PimdirArg::Load(PimdirLoaded {
-            placements: local,
-            checkpoint: None,
-        })));
-        match sync.resume(Some(PimdirArg::Enumerate(full(items)))) {
+        match begin(sync, local, Some(Page(full(items)))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsPush { .. }) => {}
             state => panic!("expected WantsPush, got {state:?}"),
         }
         let writes = match sync.resume(Some(PimdirArg::Push(results))) {
-            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => writes,
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => {
+                writes.into_iter().filter(|op| !is_state(op)).collect()
+            }
             state => panic!("expected WantsWrite, got {state:?}"),
         };
         let report = match sync.resume(Some(PimdirArg::Write)) {
@@ -1446,23 +2208,22 @@ mod tests {
         local: Vec<PimdirPlacement>,
         snapshot: PimdirRemoteSnapshot,
     ) -> Run {
-        crate::testlog::init();
-        let _ = sync.resume(None);
-        let _ = sync.resume(Some(PimdirArg::Load(PimdirLoaded {
-            placements: local,
-            checkpoint: None,
-        })));
-
+        let first = begin(sync, local, Some(Page(snapshot)));
         let mut run = Run {
             chunks: Vec::new(),
             batches: Vec::new(),
             order: Vec::new(),
             report: PimdirSyncReport::default(),
         };
-        let mut arg = Some(PimdirArg::Enumerate(snapshot));
+        let mut arg = None;
+        let mut first = Some(first);
 
         loop {
-            match sync.resume(arg.take()) {
+            let state = match first.take() {
+                Some(state) => state,
+                None => sync.resume(arg.take()),
+            };
+            match state {
                 PimdirCoroutineState::Yielded(PimdirYield::WantsPush { changes, .. }) => {
                     run.order.push("push");
                     let results = changes
@@ -1747,8 +2508,8 @@ mod tests {
         }
 
         assert!(
-            run.batch_of(|op| matches!(op, PimdirWriteOp::SetCheckpoint { .. })) == Some(1),
-            "the checkpoint must land in the closing batch",
+            run.batch_of(|op| matches!(op, PimdirWriteOp::CloseRound { .. })) == Some(1),
+            "the round closes, its checkpoint landing, in the closing batch",
         );
 
         assert_eq!(run.report.pushed, count);
@@ -1803,8 +2564,8 @@ mod tests {
         );
         assert_eq!(
             run.writes().len(),
-            2,
-            "one upsert and the checkpoint: {:?}",
+            4,
+            "the round's open, one upsert, its stamp and its close: {:?}",
             run.writes(),
         );
     }
@@ -1825,11 +2586,11 @@ mod tests {
         assert_eq!(run.batches[0].len(), PimdirSync::WRITE_CHUNK);
         assert_eq!(
             run.batches[1].len(),
-            extra + 1,
-            "the rest, plus the checkpoint",
+            extra + 3,
+            "the rest, plus the round's stamp and close",
         );
         assert!(
-            run.batch_of(|op| matches!(op, PimdirWriteOp::SetCheckpoint { .. })) == Some(1),
+            run.batch_of(|op| matches!(op, PimdirWriteOp::CloseRound { .. })) == Some(1),
             "a mid-merge batch must not checkpoint what it has not merged",
         );
         assert_eq!(run.report.pulled, count);
@@ -1842,7 +2603,8 @@ mod tests {
     /// losing either would lose the edit or leave two rows.
     #[test]
     fn a_batch_never_cuts_through_one_candidate() {
-        let fillers = PimdirSync::WRITE_CHUNK - 1;
+        // NOTE: the round's open counts in the first batch too.
+        let fillers = PimdirSync::WRITE_CHUNK - 2;
         let items = (0..fillers)
             .map(|index| remote(&format!("{index:05}"), &[]))
             .collect();
@@ -1951,6 +2713,7 @@ mod tests {
             rights: PimdirPushRights::all(),
             conflict: PimdirConflictPolicy::Manual,
             full: false,
+            scope: PimdirScope::unbounded(),
         };
         let mut sync = PimdirSync::new("inbox", opts);
         let (pushes, _writes, report) = run(&mut sync, vec![local], vec![remote("1", &[])]);
@@ -1987,7 +2750,7 @@ mod tests {
             panic!("expected UpsertPlacement, got {:?}", writes[0]);
         };
         assert_eq!(p.handle.as_str(), "9");
-        assert_eq!(p.level, PimdirLevel::Probed);
+        assert_eq!(p.level, PimdirLevel::Meta);
     }
 
     #[test]
@@ -2113,6 +2876,7 @@ mod tests {
             rights: PimdirPushRights::all(),
             conflict: PimdirConflictPolicy::Manual,
             full: false,
+            scope: PimdirScope::unbounded(),
         };
         let mut sync = PimdirSync::new("inbox", opts);
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
@@ -2245,25 +3009,49 @@ mod tests {
         assert_eq!(resurrected.object, Some(PimdirHash::from("h1")));
     }
 
-    /// A probe the enumeration no longer lists is gone like any member.
+    /// A round's last page drops the based members it found absent in its
+    /// scope, and leaves the ones out of it alone (SYNC §5).
     #[test]
-    fn a_probe_absent_from_a_complete_enumeration_is_dropped() {
-        let mut probe = synced("1", &["flagged"]);
-        probe.link_id = None;
-        probe.base = None;
+    fn absence_means_deleted_in_scope_only() {
+        let dated = |handle: &str, date: &str| {
+            let mut placement = synced(handle, &[]);
+            placement.summary = Some(PimdirSummary::Mail(
+                crate::summary::mail::PimdirMailSummary {
+                    date: Some(date.into()),
+                    ..Default::default()
+                },
+            ));
+            placement
+        };
+        let opts = PimdirSyncOptions {
+            scope: PimdirScope::since("2026-09-01T00:00:00Z"),
+            ..Default::default()
+        };
 
-        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
-        let (pushes, writes, report) = run(&mut sync, vec![probe], vec![]);
-
-        assert!(pushes.is_none());
-        assert_eq!(report.pulled, 1);
-        assert_eq!(report.events, [PimdirSyncEvent::Vanished("1".into())]);
-        assert!(
-            writes.iter().any(
-                |w| matches!(w, PimdirWriteOp::DropPlacement { handle, reason, .. } if handle.as_str() == "1" && *reason == PimdirDropReason::Deleted)
-            ),
-            "the probe is dropped: {writes:?}",
+        let mut sync = PimdirSync::new("inbox", opts);
+        let (pushes, writes, report) = run(
+            &mut sync,
+            vec![
+                dated("1", "2026-08-01T10:00:00Z"),
+                dated("2", "2026-10-01T10:00:00Z"),
+                synced("3", &[]),
+            ],
+            vec![],
         );
+
+        assert!(pushes.is_none(), "an absence never pushes");
+        assert_eq!(
+            report.events,
+            [
+                PimdirSyncEvent::Vanished("2".into()),
+                PimdirSyncEvent::Vanished("3".into())
+            ],
+            "the undated is in every scope, the old one in none"
+        );
+        assert!(!writes.iter().any(|w| matches!(
+            w,
+            PimdirWriteOp::DropPlacement { handle, .. } if handle.as_str() == "1"
+        )));
     }
 
     /// The Add carries the origin (copy, not re-upload) and the flag set.
@@ -2377,27 +3165,291 @@ mod tests {
         assert!(upserted(&writes, "tmp-1").is_none());
     }
 
+    /// The listing a sync asks for over a source's sync state (SYNC §5).
+    fn listing(sync: &mut PimdirSync, loaded: PimdirLoaded) -> PimdirEnumerate {
+        let _ = sync.resume(None);
+        match sync.resume(Some(PimdirArg::Load(loaded))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { request, .. }) => request,
+            state => panic!("expected WantsEnumerate, got {state:?}"),
+        }
+    }
+
+    fn coverage(scope: PimdirScope) -> Option<PimdirCoverage> {
+        Some(PimdirCoverage {
+            scope,
+            at: "2026-10-07T00:00:00.000Z".into(),
+        })
+    }
+
+    fn scoped(since: &str) -> PimdirSyncOptions {
+        PimdirSyncOptions {
+            scope: PimdirScope::since(since),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn full_sync_ignores_checkpoint() {
-        let mut sync = PimdirSync::new(
-            "inbox",
-            PimdirSyncOptions {
-                push: true,
-                rights: PimdirPushRights::all(),
-                conflict: PimdirConflictPolicy::Manual,
-                full: true,
+        let opts = PimdirSyncOptions {
+            full: true,
+            scope: PimdirScope::unbounded(),
+            ..Default::default()
+        };
+        let request = listing(
+            &mut PimdirSync::new("inbox", opts),
+            PimdirLoaded {
+                checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+                coverage: coverage(PimdirScope::unbounded()),
+                ..Default::default()
             },
         );
-        let _ = sync.resume(None);
-        let loaded = PimdirLoaded {
-            placements: Vec::new(),
-            checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+        assert_eq!(
+            request.listing,
+            PimdirListing::Round {
+                cursor: None,
+                band: false
+            },
+            "a full sync must ignore the checkpoint"
+        );
+    }
+
+    #[test]
+    fn a_scope_inside_the_coverage_lists_the_delta() {
+        let request = listing(
+            &mut PimdirSync::new("inbox", scoped("2026-10-01T00:00:00Z")),
+            PimdirLoaded {
+                checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+                coverage: coverage(PimdirScope::since("2026-09-01T00:00:00Z")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Delta(PimdirCheckpoint(b"cp".to_vec()))
+        );
+        assert_eq!(request.scope, PimdirScope::since("2026-10-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn no_coverage_or_a_wider_scope_opens_a_round() {
+        let request = listing(
+            &mut PimdirSync::new("inbox", PimdirSyncOptions::default()),
+            PimdirLoaded {
+                checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            request.listing,
+            PimdirListing::Round { cursor: None, .. }
+        ));
+
+        let request = listing(
+            &mut PimdirSync::new("inbox", scoped("2026-07-01T00:00:00Z")),
+            PimdirLoaded {
+                checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+                coverage: coverage(PimdirScope::since("2026-09-01T00:00:00Z")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Round {
+                cursor: None,
+                band: false
+            }
+        );
+        assert_eq!(request.scope, PimdirScope::since("2026-07-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_connector_bound_to_no_scope_lists_the_band() {
+        let mut sync = PimdirSync::new("inbox", scoped("2026-07-01T00:00:00Z")).scope_bound(false);
+        let request = listing(
+            &mut sync,
+            PimdirLoaded {
+                checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+                coverage: coverage(PimdirScope::since("2026-09-01T00:00:00Z")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Round {
+                cursor: None,
+                band: true
+            }
+        );
+        assert_eq!(
+            request.scope,
+            PimdirScope {
+                since: Some("2026-07-01T00:00:00Z".into()),
+                until: Some("2026-09-01T00:00:00Z".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_open_round_over_the_scope_resumes_and_another_restarts() {
+        let open = |scope: PimdirScope| PimdirRound {
+            scope,
+            cursor: Some(PimdirCursor(b"p1".to_vec())),
+            checkpoint: None,
+            started_at: "2026-10-07T00:00:00.000Z".into(),
         };
-        match sync.resume(Some(PimdirArg::Load(loaded))) {
-            PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { cursor, .. }) => {
-                assert!(cursor.is_none(), "a full sync must ignore the checkpoint");
+
+        let request = listing(
+            &mut PimdirSync::new("inbox", scoped("2026-09-01T00:00:00Z")),
+            PimdirLoaded {
+                round: Some(open(PimdirScope::since("2026-09-01T00:00:00Z"))),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Round {
+                cursor: Some(PimdirCursor(b"p1".to_vec())),
+                band: false
+            }
+        );
+
+        let request = listing(
+            &mut PimdirSync::new("inbox", scoped("2026-09-01T00:00:00Z")),
+            PimdirLoaded {
+                checkpoint: Some(PimdirCheckpoint(b"cp".to_vec())),
+                coverage: coverage(PimdirScope::unbounded()),
+                round: Some(open(PimdirScope::since("2026-01-01T00:00:00Z"))),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(request.listing, PimdirListing::Round { cursor: None, .. }),
+            "a round open over another scope is abandoned for a new one"
+        );
+    }
+
+    /// A paged round: each page lands in its own write with its cursor and
+    /// the round's stamp, and the last closes it with its coverage.
+    #[test]
+    fn a_paged_round_lands_page_by_page_and_closes() {
+        crate::testlog::init();
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let mut batches = Vec::new();
+        let mut pages = vec![
+            PimdirRemoteSnapshot::page(
+                vec![remote("2", &[])],
+                Some(PimdirCursor(b"p1".to_vec())),
+                Some(PimdirCheckpoint(b"c1".to_vec())),
+            ),
+            PimdirRemoteSnapshot::page(vec![remote("1", &[])], None, None),
+        ];
+        let mut requests = Vec::new();
+        let mut arg = None;
+        let report = loop {
+            match sync.resume(arg.take()) {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { .. }) => {
+                    arg = Some(PimdirArg::Load(PimdirLoaded::default()));
+                }
+                PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { request, .. }) => {
+                    requests.push(request.listing);
+                    arg = Some(PimdirArg::Enumerate(PimdirEnumerated::Page(
+                        pages.remove(0),
+                    )));
+                }
+                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => {
+                    batches.push(writes);
+                    arg = Some(PimdirArg::Write);
+                }
+                PimdirCoroutineState::Complete(Ok(report)) => break report,
+                state => panic!("unexpected {state:?}"),
+            }
+        };
+
+        assert_eq!(report.pulled, 2, "both members named");
+        assert_eq!(
+            requests,
+            vec![
+                PimdirListing::Round {
+                    cursor: None,
+                    band: false
+                },
+                PimdirListing::Round {
+                    cursor: Some(PimdirCursor(b"p1".to_vec())),
+                    band: false
+                },
+            ]
+        );
+        assert_eq!(batches.len(), 2, "one write a page");
+        assert!(matches!(batches[0][0], PimdirWriteOp::OpenRound { .. }));
+        assert!(matches!(
+            batches[0].last(),
+            Some(PimdirWriteOp::SetRoundCursor {
+                checkpoint: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            batches[0]
+                .iter()
+                .any(|op| matches!(op, PimdirWriteOp::Stamp { handles, .. } if handles == &[PimdirHandle::from("2")]))
+        );
+        assert!(
+            !batches[1]
+                .iter()
+                .any(|op| matches!(op, PimdirWriteOp::OpenRound { .. })),
+            "the round opens once"
+        );
+        assert!(matches!(
+            batches[1].last(),
+            Some(PimdirWriteOp::CloseRound {
+                checkpoint: None,
+                ..
+            })
+        ));
+    }
+
+    /// A rejected cursor restarts the round under a new id.
+    #[test]
+    fn a_rejected_cursor_restarts_the_round() {
+        crate::testlog::init();
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let _ = sync.resume(None);
+        let state = sync.resume(Some(PimdirArg::Load(PimdirLoaded {
+            round: Some(PimdirRound {
+                scope: PimdirScope::unbounded(),
+                cursor: Some(PimdirCursor(b"p1".to_vec())),
+                checkpoint: None,
+                started_at: "2026-10-07T00:00:00.000Z".into(),
+            }),
+            ..Default::default()
+        })));
+        assert!(matches!(
+            state,
+            PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { .. })
+        ));
+        match sync.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::CursorRejected))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { request, .. }) => {
+                assert_eq!(
+                    request.listing,
+                    PimdirListing::Round {
+                        cursor: None,
+                        band: false
+                    }
+                );
             }
             state => panic!("expected WantsEnumerate, got {state:?}"),
+        }
+        let _ = sync.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(full(
+            vec![],
+        )))));
+        match sync.resume(Some(PimdirArg::Load(PimdirLoaded::default()))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => {
+                assert!(
+                    matches!(writes[0], PimdirWriteOp::OpenRound { .. }),
+                    "the restart draws a new round id: {writes:?}"
+                );
+            }
+            state => panic!("expected WantsWrite, got {state:?}"),
         }
     }
 
@@ -2453,15 +3505,11 @@ mod tests {
     #[test]
     fn local_content_edit_pushes_update_and_rebases() {
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
-        let _ = sync.resume(None);
-        let _ = sync.resume(Some(PimdirArg::Load(PimdirLoaded {
-            placements: vec![edited("1")],
-            checkpoint: None,
-        })));
-
-        let pushes = match sync.resume(Some(PimdirArg::Enumerate(full(vec![remote_rev(
-            "1", "r1",
-        )])))) {
+        let pushes = match begin(
+            &mut sync,
+            vec![edited("1")],
+            Some(Page(full(vec![remote_rev("1", "r1")]))),
+        ) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsPush { changes, .. }) => changes,
             state => panic!("expected WantsPush, got {state:?}"),
         };
@@ -2545,7 +3593,7 @@ mod tests {
         assert_eq!(refreshed.object, None, "the stale body is dropped");
         assert_eq!(
             refreshed.level,
-            PimdirLevel::Probed,
+            PimdirLevel::Meta,
             "the summary is stale too"
         );
         let base = refreshed.base.as_ref().expect("a base");
@@ -2603,7 +3651,7 @@ mod tests {
         );
     }
 
-    /// No body and no base is a probe: agreeing on the flags, it is left alone.
+    /// No body and no base agreeing on the flags is left alone.
     #[test]
     fn base_less_body_less_present_on_both_stays_flag_only() {
         let mut placement = synced("1", &["seen"]);
@@ -2933,6 +3981,7 @@ mod tests {
             rights: PimdirPushRights::all(),
             conflict: PimdirConflictPolicy::Manual,
             full: false,
+            scope: PimdirScope::unbounded(),
         };
         let mut sync = PimdirSync::new("inbox", opts);
         let (pushes, writes, _report) = run(&mut sync, vec![edited("1")], vec![]);
@@ -2952,6 +4001,7 @@ mod tests {
                 rights: PimdirPushRights::all(),
                 conflict: PimdirConflictPolicy::Manual,
                 full: false,
+                scope: PimdirScope::unbounded(),
             },
         );
         let (pushes, writes, _report) =
@@ -2975,6 +4025,7 @@ mod tests {
             rights: PimdirPushRights::all(),
             conflict: PimdirConflictPolicy::Manual,
             full: false,
+            scope: PimdirScope::unbounded(),
         };
         let mut sync = PimdirSync::new("inbox", opts);
         let (pushes, writes, report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
@@ -3061,21 +4112,19 @@ mod tests {
         }
     }
 
-    /// A probe the enumeration lists again as the store holds it is no pull.
+    /// A member a page lists again as the store holds it is no pull.
     #[test]
-    fn a_relisted_probe_with_the_same_flags_derives_nothing() {
-        let mut probe = synced("1", &["seen"]);
-        probe.link_id = None;
-        probe.base = None;
+    fn a_relisted_member_with_the_same_flags_derives_nothing() {
+        let held = synced("1", &["seen"]);
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
-        let (pushes, writes, report) = run(&mut sync, vec![probe], vec![remote("1", &["seen"])]);
+        let (pushes, writes, report) = run(&mut sync, vec![held], vec![remote("1", &["seen"])]);
 
         assert!(pushes.is_none());
         assert_eq!(report, PimdirSyncReport::default(), "nothing pulled");
         assert!(
             upserted(&writes, "1").is_none(),
-            "the probe is not rewritten: {writes:?}",
+            "the member is not rewritten: {writes:?}",
         );
     }
 
@@ -3303,7 +4352,7 @@ mod tests {
         assert_eq!(report.refreshed, 1, "the remote content is pulled");
         let pulled = upserted(&writes, "1").expect("a pulled placement");
         assert_eq!(pulled.object, None, "the local edit is dropped");
-        assert_eq!(pulled.level, PimdirLevel::Probed);
+        assert_eq!(pulled.level, PimdirLevel::Meta);
     }
 
     #[test]
@@ -3347,31 +4396,88 @@ mod tests {
         assert_eq!(report.conflicts, 1, "no push right, so it stays a conflict");
     }
 
-    /// A pending create waits while the collection holds a probe of its
-    /// source: the probe may be its own arrival (SYNC §5).
-    #[test]
-    fn a_create_waits_while_the_collection_holds_probes() {
+    /// A pending create staged under `m1`, holding its body.
+    fn pending_create() -> PimdirPlacement {
         let mut create = synced("\u{1}m1", &[]);
         create.link_id = Some(PimdirLinkId::from("m1"));
         create.object = Some(PimdirHash::from("h1"));
         create.level = PimdirLevel::Full;
         create.status = PimdirStatus::Created;
         create.base = None;
+        create
+    }
+
+    /// A pending create is landed by the page listing its arrival, never
+    /// pushed a second time (SYNC §5, §6).
+    #[test]
+    fn a_page_listing_its_arrival_lands_a_create() {
+        let mut arrival = remote("7", &[]);
+        arrival.meta.link_id = PimdirLinkId::from("m1");
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
-        let (pushes, _writes, _report) =
-            run(&mut sync, vec![create.clone()], vec![remote("7", &[])]);
-        assert!(pushes.is_none(), "the listed member is a probe until named");
+        let (pushes, writes, report) = run(&mut sync, vec![pending_create()], vec![arrival]);
+
+        assert!(pushes.is_none(), "the arrival is the create delivered");
+        assert_eq!(report.events, [PimdirSyncEvent::Created("7".into())]);
+        assert!(writes.iter().any(|op| matches!(
+            op,
+            PimdirWriteOp::DropPlacement { handle, reason: PimdirDropReason::Superseded, .. }
+                if handle.as_str() == "\u{1}m1"
+        )));
+        let landed = upserted(&writes, "7").expect("the landed create");
+        assert_eq!(landed.link_id, Some(PimdirLinkId::from("m1")));
+        assert_eq!(landed.status, PimdirStatus::Clean);
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
-        let (pushes, _writes, _report) = run(&mut sync, vec![create], vec![]);
+        let (pushes, _writes, _report) = run(&mut sync, vec![pending_create()], vec![]);
         assert!(
             matches!(
                 &pushes.expect("the add")[0].kind,
                 PimdirChangeKind::Add { .. }
             ),
-            "with no probe left the create is pushed",
+            "with no arrival listed the create is pushed",
         );
+    }
+
+    /// A create waits for its round: no page before the last derives it.
+    #[test]
+    fn a_create_waits_for_the_last_page() {
+        let page = PimdirRemoteSnapshot::page(
+            vec![remote("7", &[])],
+            Some(PimdirCursor(b"p1".to_vec())),
+            None,
+        );
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        match begin(&mut sync, vec![pending_create()], Some(Page(page))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(_)) => {}
+            state => panic!("expected the page's write and no push, got {state:?}"),
+        }
+    }
+
+    /// A create carrying no origin whose date the scope excludes waits for
+    /// a round whose scope holds it (SYNC §5).
+    #[test]
+    fn an_out_of_scope_create_waits() {
+        let mut create = pending_create();
+        create.summary = Some(PimdirSummary::Mail(
+            crate::summary::mail::PimdirMailSummary {
+                date: Some("2026-08-01T10:00:00Z".into()),
+                ..Default::default()
+            },
+        ));
+        let opts = PimdirSyncOptions {
+            scope: PimdirScope::since("2026-09-01T00:00:00Z"),
+            ..Default::default()
+        };
+
+        let mut sync = PimdirSync::new("inbox", opts);
+        let (pushes, _writes, report) = run(&mut sync, vec![create.clone()], vec![]);
+        assert!(pushes.is_none(), "the create waits");
+        assert_eq!(report.waiting, 1);
+
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (pushes, _writes, _report) = run(&mut sync, vec![create], vec![]);
+        assert!(pushes.is_some(), "a scope holding its date pushes it");
     }
 
     /// A tombstone holding a local edit met by a remote edit is the
@@ -3401,7 +4507,7 @@ mod tests {
 
         let mut edited_tomb = edited("1");
         edited_tomb.status = PimdirStatus::Tombstone;
-        let mut sync = PimdirSync::new("inbox", read_only);
+        let mut sync = PimdirSync::new("inbox", read_only.clone());
         let (_pushes, writes, _report) =
             run(&mut sync, vec![edited_tomb], vec![remote_rev("1", "r1")]);
         let reverted = upserted(&writes, "1").expect("the reverted tombstone");
@@ -3411,7 +4517,7 @@ mod tests {
         let mut conflicted_tomb = edited("2");
         conflicted_tomb.status = PimdirStatus::Tombstone;
         conflicted_tomb.conflict_revision = Some("r2".into());
-        let mut sync = PimdirSync::new("inbox", read_only);
+        let mut sync = PimdirSync::new("inbox", read_only.clone());
         let (_pushes, writes, _report) = run(
             &mut sync,
             vec![conflicted_tomb],

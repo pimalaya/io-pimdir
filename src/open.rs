@@ -85,7 +85,7 @@ mod tests {
             handle: PimdirHandle::from(handle),
             link_id: None,
             object: None,
-            level: PimdirLevel::Probed,
+            level: PimdirLevel::Meta,
             summary: None,
             flags: PimdirFlags::default(),
             status: PimdirStatus::Clean,
@@ -116,6 +116,7 @@ mod tests {
         let loaded = PimdirLoaded {
             placements: vec![placement("1"), placement("2")],
             checkpoint: Some(PimdirCheckpoint(b"tok".to_vec())),
+            ..Default::default()
         };
         match open.resume(Some(PimdirArg::Load(loaded))) {
             PimdirCoroutineState::Complete(Ok(out)) => assert_eq!(out.placements.len(), 2),
@@ -131,6 +132,7 @@ mod tests {
         let _ = open.resume(Some(PimdirArg::Load(PimdirLoaded {
             placements: vec![placement("1")],
             checkpoint: None,
+            ..Default::default()
         })));
 
         match open.resume(Some(PimdirArg::Write)) {

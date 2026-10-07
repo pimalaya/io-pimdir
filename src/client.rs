@@ -104,6 +104,14 @@ pub struct PimdirPurgeReport {
     pub items: usize,
 }
 
+/// What the owner's collection below a date removed (§11.3): rows, never
+/// bytes, which the collector frees.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirCollectReport {
+    /// The public ids of the items collected.
+    pub seqs: Vec<i64>,
+}
+
 /// What a collection reclaimed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirGcReport {
@@ -400,6 +408,43 @@ impl PimdirStore {
         tx.commit().map_err(busy_or_sql)?;
 
         Ok(PimdirPurgeReport { items })
+    }
+
+    /// The owner's manual collection of one mail collection below a date
+    /// (§11.3): every live item whose `date` is older than `before` (RFC
+    /// 3339, `Z`) and that owes nothing, removed with its bindings,
+    /// summary and addresses, the public ids collected answered.
+    ///
+    /// An item owes something while it is conflicted, a binding of it is
+    /// conflicted or has no base, or its flags differ from a binding's
+    /// base; it stays, as does an item with no `date`. Not a delete: no
+    /// tombstone, no push, and the remote keeps every member, which a
+    /// later widening lists and names again. The refcounts are recomputed
+    /// in the same transaction and the bodies fall to the collector. A
+    /// verb of this process between two of its chunks refuses it as
+    /// [`PimdirError::InFlight`] (§5). An owner narrowing a scope records
+    /// the narrower coverage with its next sync, not here.
+    pub fn collect_before(
+        &mut self,
+        collection: impl AsRef<str>,
+        before: &str,
+    ) -> Result<PimdirCollectReport, PimdirError> {
+        if self.lock.in_flight() {
+            return Err(PimdirError::InFlight(self.dir.clone()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let seqs: Vec<i64> = rows(
+            &tx,
+            sql::COLLECT_BEFORE,
+            named_params! { ":collection": collection.as_ref(), ":before": before },
+            |row| row.get(0),
+        )?;
+        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(PimdirCollectReport { seqs })
     }
 }
 
@@ -727,6 +772,23 @@ pub enum PimdirError {
         /// The handle the refused write carried.
         incoming: String,
     },
+    /// A write carried a placement no link id names, for a handle no
+    /// binding holds: nothing reaches the store unnamed (SYNC §10), a
+    /// listing naming every member it carries.
+    Unnamed {
+        /// The collection of the refused placement.
+        collection: String,
+        /// Its handle.
+        handle: String,
+    },
+    /// A sync asked for a bounded scope on a collection of another kind
+    /// than mail (SYNC §5).
+    Scope {
+        /// The collection the sync was asked for.
+        collection: String,
+        /// Its declared kind, empty when undeclared.
+        kind: String,
+    },
     /// The store's schema version is not one this crate services.
     Version {
         /// The store's `user_version`.
@@ -801,6 +863,14 @@ impl fmt::Display for PimdirError {
             } => write!(
                 f,
                 "Pimdir binding {collection}/{link_id} on source {source} holds handle {bound} and this write carries {incoming}: a binding pins one handle"
+            ),
+            Self::Unnamed { collection, handle } => write!(
+                f,
+                "Pimdir write refused: placement {collection}/{handle} is named by no link id and its handle by no binding"
+            ),
+            Self::Scope { collection, kind } => write!(
+                f,
+                "Pimdir sync refused: a scope bounds mail only, and collection {collection} holds {kind:?}"
             ),
             Self::Version { found } => write!(
                 f,

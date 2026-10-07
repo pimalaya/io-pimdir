@@ -27,7 +27,7 @@ The crate SHALL provide a `hub` module, a `PimdirHub` of logical items keyed by 
 ### Requirement: A body-less item is not `Full`
 `PimdirLevel::Full` SHALL mean the item has a stored body. An item holding none SHALL therefore read at most `Meta`, however far any source got, both where `absorb` records the level and where `project` reports it.
 
-The level is otherwise the high-water mark across sources, merged as a maximum so a source that has only probed an item cannot un-know what another one read. A dropped body is not that kind of absence: `pull_content` drops the stale body of an item whose remote content changed and lowers the placement so an upgrade refetches it, and an upgrade skips whatever already reads as `Full`. Left conflated, the item claims a body it does not have, keeps the summary of the revision before the change, and no fetch is ever derived for it.
+The level is otherwise the high-water mark across sources, merged as a maximum so a source that has only named an item cannot un-know what another one read. A dropped body is not that kind of absence: `pull_content` drops the stale body of an item whose remote content changed and lowers the placement so an upgrade refetches it, and an upgrade skips whatever already reads as `Full`. Left conflated, the item claims a body it does not have, keeps the summary of the revision before the change, and no fetch is ever derived for it.
 
 Projecting the same rule is what lets a store already written in that state heal, since an upgrade reads what `load` projects rather than the stored row.
 
@@ -147,9 +147,9 @@ Without this the merge cannot honour its own rule that an unresolved conflict is
 - THEN the base adopts the recorded remote state, the binding is no longer conflicted, and the next sync pushes the resolution against the revision it was measured on
 
 ### Requirement: An unknown sort key never erases a known one
-Absorbing an upsert whose sort key is unknown SHALL leave the shared key alone, on the same terms as an absent summary. A source that has only probed an item, or whose kind defines no key, MUST NOT un-sort an item another source has already placed. A known key SHALL replace another known key.
+Absorbing an upsert whose sort key is unknown SHALL leave the shared key alone, on the same terms as an absent summary. A source that read no key for an item, or whose kind defines no key, MUST NOT un-sort an item another source has already placed. A known key SHALL replace another known key.
 
-#### Scenario: A second source probes an item the first summarised
+#### Scenario: A second source reads no key for an item the first summarised
 - GIVEN a hub item whose key one source derived
 - WHEN another source absorbs the same item with an unknown key
 - THEN the projection still carries the derived key
@@ -172,7 +172,7 @@ Stating the shared content once is what makes a field added to `PimdirPlacement`
 ### Requirement: A body-less item is no divergence
 `PimdirHub::project` SHALL read a bound source whose base holds a body while the item holds none as agreeing on the content axis, `Clean` when the flags agree too. The body went with another source's content pull, and this source owes nothing until a hydration gives the item a body again; read as a divergence, it projected `Dirty` on every load and the flag axis rewrote its row on every run.
 
-An upsert carrying no body while the item holds one is that pull, and `absorb` SHALL lower the shared level to the placement's with the body it drops (pimdir SYNC §5, vectors/sync/11) rather than merge it as a maximum: the item reads `Probed` for the upgrade to refetch, the summary kept as that of the body it dropped.
+An upsert carrying no body while the item holds one is that pull, and `absorb` SHALL lower the shared level to the placement's with the body it drops (pimdir SYNC §5, vectors/sync/11) rather than merge it as a maximum: the item reads `Meta` for the upgrade to refetch, the summary the member's meta when it carried one.
 
 #### Scenario: One source pulled a remote content change
 - GIVEN two sources agreeing on a body
@@ -198,9 +198,7 @@ Without it the hub cannot represent a persisted create at all. `absorb` binds ev
 - THEN the placement reads `Created`, and the next sync appends it to that source's own remote
 
 ### Requirement: A hub-backed store owns the rows the hub cannot key
-`PimdirHub::absorb` SHALL ignore an upserted placement carrying no link id, because the hub keys items by link id and has nowhere to put one. The store resolves such a placement before the fold: a handle a binding holds folds into that binding's item, and a handle nothing holds is a probe row (pimdir SYNC §10).
-
-A hub-backed storage SHALL therefore hold those rows itself and return them from `load` beside the projection, until a fetch resolves their identity and the hub takes them over. A storage that does not is not a partial mirror but a broken one: its replica forgets every member it pulls, and an incremental enumeration never lists them again.
+`PimdirHub::absorb` SHALL ignore an upserted placement carrying no link id, because the hub keys items by link id and has nowhere to put one. The store resolves such a placement before the fold: a handle a binding holds folds into that binding's item, and a handle nothing holds is refused (`PimdirError::Unnamed`, pimdir SYNC §10). There are no such rows to hold: every member a listing carries arrives named, and the page naming it keys it before the write.
 
 It follows that mirroring is a sync **plus** an upgrade. The hub offers a member to a source that lacks it only when it holds the body, so a consumer that never hydrates never mirrors anything.
 

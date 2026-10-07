@@ -53,18 +53,18 @@ pub fn ids_from_json(json: &str) -> Vec<String> {
 /// The detail ladder as its column integer.
 pub fn level_to_int(level: PimdirLevel) -> i64 {
     match level {
-        PimdirLevel::Probed => 0,
         PimdirLevel::Meta => 1,
         PimdirLevel::Full => 2,
     }
 }
 
-/// The inverse of [`level_to_int`]; an unknown integer clamps to `Probed`.
+/// The inverse of [`level_to_int`]: `2` is `Full`, and anything else
+/// `Meta`, the `0` an earlier draft wrote for a probed or pulled row
+/// included (STORAGE §13), a claim the next upgrade revisits.
 pub fn level_from_int(value: i64) -> PimdirLevel {
     match value {
-        1 => PimdirLevel::Meta,
         2 => PimdirLevel::Full,
-        _ => PimdirLevel::Probed,
+        _ => PimdirLevel::Meta,
     }
 }
 
@@ -405,9 +405,10 @@ mod tests {
 
     #[test]
     fn levels_and_policies_round_trip() {
-        for level in [PimdirLevel::Probed, PimdirLevel::Meta, PimdirLevel::Full] {
+        for level in [PimdirLevel::Meta, PimdirLevel::Full] {
             assert_eq!(level_from_int(level_to_int(level)), level);
         }
+        assert_eq!(level_from_int(0), PimdirLevel::Meta);
         for policy in [
             PimdirHubConflict::Manual,
             PimdirHubConflict::PreferIncoming,

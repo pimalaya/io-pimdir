@@ -17,13 +17,13 @@ use std::{collections::BTreeSet, convert::Infallible};
 
 use io_pimdir::{
     change::PimdirChange,
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::PimdirCollectionId,
     mutate::PimdirMutation,
     object::PimdirObject,
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId, PimdirPlacement, PimdirStatus},
     remote::{
-        PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome, PimdirPushResult, PimdirRemote,
-        PimdirRemoteSnapshot, PimdirTier,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome,
+        PimdirPushResult, PimdirRemote, PimdirTier,
     },
     sync::PimdirSyncOptions,
 };
@@ -86,9 +86,12 @@ impl PimdirRemote for HostileRemote {
     fn enumerate(
         &mut self,
         collection: &PimdirCollectionId,
-        cursor: Option<PimdirCheckpoint>,
-    ) -> Result<PimdirRemoteSnapshot, Infallible> {
-        let mut snapshot = self.inner.enumerate(collection, cursor)?;
+        request: PimdirEnumerate,
+    ) -> Result<PimdirEnumerated, Infallible> {
+        let PimdirEnumerated::Page(mut snapshot) = self.inner.enumerate(collection, request)?
+        else {
+            unreachable!("the in-memory remote never rejects a cursor");
+        };
 
         if self.chaos.unsorted {
             snapshot.items.reverse();
@@ -109,7 +112,7 @@ impl PimdirRemote for HostileRemote {
             }
         }
 
-        Ok(snapshot)
+        Ok(PimdirEnumerated::Page(snapshot))
     }
 
     fn fetch(
@@ -282,7 +285,7 @@ proptest! {
         let remote = HostileRemote { inner, chaos };
         let mut client = Client::new(remote);
         let opts = PimdirSyncOptions::default();
-        client.sync("inbox", opts).map_err(TestCaseError::fail)?;
+        client.sync("inbox", opts.clone()).map_err(TestCaseError::fail)?;
         intact(&client, "after the seeding sync")?;
 
         let mut arrivals = 0usize;
@@ -342,10 +345,10 @@ proptest! {
                     client.upgrade("inbox", handles, PimdirTier::Meta).map_err(TestCaseError::fail)?;
                 }
                 HostileOp::Sync => {
-                    client.sync("inbox", opts).map_err(TestCaseError::fail)?;
+                    client.sync("inbox", opts.clone()).map_err(TestCaseError::fail)?;
                 }
                 HostileOp::SyncArchive => {
-                    client.sync("archive", opts).map_err(TestCaseError::fail)?;
+                    client.sync("archive", opts.clone()).map_err(TestCaseError::fail)?;
                 }
                 HostileOp::Rekey => {
                     bumps += 1;
@@ -358,8 +361,8 @@ proptest! {
         }
 
         for _ in 0..3 {
-            client.sync("inbox", opts).map_err(TestCaseError::fail)?;
-            client.sync("archive", opts).map_err(TestCaseError::fail)?;
+            client.sync("inbox", opts.clone()).map_err(TestCaseError::fail)?;
+            client.sync("archive", opts.clone()).map_err(TestCaseError::fail)?;
         }
         intact(&client, "after quiescence")?;
     }

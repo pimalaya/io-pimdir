@@ -39,14 +39,14 @@ Empty SHALL mean unknown, and SHALL be the default, so an item is orderable from
 ### Requirement: An unread flag set is unknown rather than empty
 `PimdirFlags` SHALL carry an `Unknown` state distinct from a known-empty set, since the reference storage records the two apart (pimdir STORAGE §13: a `NULL` flags column means never read, `'[]'` means known to carry none). Known-empty SHALL remain the default, so unknown is stated by a source that read no markers rather than fallen back to by an ordinary write.
 
-Only a local placement is ever unknown in practice: a source that reports an item reports what it read. The engine SHALL resolve the state on the first side that carries a set.
+A source that read no markers reports an unknown set too, a listing naming members whose flags it did not read among them. The engine SHALL resolve the state on the first side that carries a set.
 
 ### Requirement: An unknown side holds no opinion in the merge
 The flag merge SHALL treat an unknown side as neither an addition nor a removal: the result is the other side's set, two unknown sides stay unknown, and an unknown base is the same fact as no base on the flag axis, so nothing is derived from it and both sides' markers are kept.
 
 Reading unknown as empty would make it an opinion, since element-wise an empty set says every flag the other side holds was removed here.
 
-#### Scenario: A probed placement learns its markers
+#### Scenario: A placement read without its markers learns them
 - GIVEN a local placement whose flag set is unknown
 - AND a source reporting that item with a marker set
 - WHEN the collection is synced
@@ -66,7 +66,7 @@ This refines the retention decision point above rather than replacing it: a stor
 - THEN the item is not marked deleted and the other source projects it unchanged
 
 ### Requirement: A load states what it needs
-`PimdirYield::WantsLoad` SHALL carry a `PimdirLoadScope`: `All`, `Handles`, or `Links`. A mutation asks for the one placement it edits, or, for an `Add`, every row holding the link id it must not collide with; an upgrade asks for the handles it raises; only the merge and the rebuild ask for the whole collection, because only they reason about what is missing from it.
+`PimdirYield::WantsLoad` SHALL carry a `PimdirLoadScope`: `All`, `Handles`, or `Links`. A mutation asks for the one placement it edits, or, for an `Add`, every row holding the link id it must not collide with; an upgrade asks for the handles it raises; a delta, a round's last page and a rebuild ask for the whole collection, because only they reason about what is missing from it, a page before the last asks for the `Handles` it lists and the `Links` of the hints it carries, and a sync first asks for `Handles` naming none, its sync state alone (checkpoint, coverage, round).
 
 A load names the collection it reads, which is the coroutine's own except where a verb acts across two: a `Copy` or a `Move` reads its target for the identity it is carrying into it (mutate.md), that being the one question the collection it edits cannot answer.
 
@@ -88,3 +88,9 @@ A rebuild relies on it outright: every `Rekeyed` drop precedes every upsert ([re
 - GIVEN a placement the old handle space held under a handle the new one reuses
 - WHEN the collection is rebuilt
 - THEN the batch drops that handle `Rekeyed` first and writes it once after, the store bumping the generation
+
+### Requirement: A listed member carries its meta
+`PimdirRemoteItem` SHALL carry a `PimdirRemoteMeta`: the identity hint (never a minted key), the summary and addresses Annex A derives, the sort key, and the body when the listing read it (pimdir SYNC §4). A connector reads it in the listing itself: an IMAP `ENVELOPE` with the header fields Annex A needs, `Content-Type` among them, or `summary::mail::derive_meta` over the header block; a Graph `$select` or a JMAP `Email/get` building `PimdirMailSummary` with the source's own attachment flag; a DAV `multiget` carrying the body. A page is a `PimdirRemoteSnapshot` (`complete`, `last`, `cursor`, an optional `checkpoint`), answered as `PimdirEnumerated::Page`, or `CursorRejected` when the source refuses a resumed round's cursor.
+
+### Requirement: Nothing reaches the store unnamed
+A write SHALL refuse an upsert carrying no link id for a handle no binding holds (`PimdirError::Unnamed`, pimdir SYNC §10); one for a bound handle folds into its binding's item as before. The store holds no probe rows.

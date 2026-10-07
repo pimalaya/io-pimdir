@@ -107,7 +107,7 @@ impl PimdirSortKey {
 /// absence would be pushed onto the side that did read the markers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirFlags {
-    /// Never read, only a local [probed](PimdirLevel::Probed) item is.
+    /// Never read, which a listing or a source may report.
     Unknown,
     /// The markers as read, empty when the item carries none.
     Known(BTreeSet<String>),
@@ -171,11 +171,14 @@ impl<S: ToString> FromIterator<S> for PimdirFlags {
 }
 
 /// The detail level of a placement, a ladder each rung including the last.
+///
+/// Every member a listing names is at `Meta` at least (SYNC §4). A level
+/// of `0` an earlier draft wrote for a probed or pulled row reads as
+/// `Meta`, a claim the row may not hold, which the next upgrade revisits
+/// (SYNC §3, §6).
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PimdirLevel {
-    /// Handle known, nothing else; kept complete per collection.
-    Probed,
-    /// Minimal summary cached.
+    /// Identity and summary cached.
     Meta,
     /// Linked to a stored object body.
     Full,
@@ -241,7 +244,8 @@ pub struct PimdirPlacement {
     pub collection: PimdirCollectionId,
     /// The protocol handle within that collection.
     pub handle: PimdirHandle,
-    /// The cross-collection link id; `None` until [`PimdirLevel::Meta`].
+    /// The cross-collection link id; `None` only on a create staged with no
+    /// identity, every listed member arriving named (SYNC §4).
     pub link_id: Option<PimdirLinkId>,
     /// The stored object body; `None` until [`PimdirLevel::Full`].
     pub object: Option<PimdirHash>,
@@ -249,8 +253,8 @@ pub struct PimdirPlacement {
     pub level: PimdirLevel,
     /// The summary and addresses (Annex A), `None` until fetched.
     ///
-    /// Kept as a stale display fallback when a remote content change drops
-    /// the level back to [`PimdirLevel::Probed`].
+    /// A remote content change replaces it with the listed member's meta,
+    /// the level back to [`PimdirLevel::Meta`] when the body goes.
     pub summary: Option<PimdirSummary>,
     /// The sort key, derived beside the summary and as opaque here.
     pub sort_key: PimdirSortKey,

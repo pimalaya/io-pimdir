@@ -830,17 +830,17 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
 }
 
 #[test]
-fn a_handles_load_reads_only_its_own_probes() {
-    // STORAGE §14: the probes of a Handles load are the batch's, not
-    // every unnamed handle the source holds
+fn a_handles_load_reads_only_its_own_handles() {
+    // STORAGE §14: a Handles load reads the placements of the handles it
+    // names, not every one the source holds
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("right");
-    let probe = |handle: &str| PimdirPlacement {
+    let named = |handle: &str| PimdirPlacement {
         collection: inbox(),
         handle: PimdirHandle(handle.into()),
-        link_id: None,
+        link_id: Some(PimdirLinkId(format!("mid:{handle}"))),
         object: None,
-        level: PimdirLevel::Probed,
+        level: PimdirLevel::Meta,
         summary: None,
         sort_key: Default::default(),
         flags: PimdirFlags::default(),
@@ -852,8 +852,8 @@ fn a_handles_load_reads_only_its_own_probes() {
     };
     store
         .write(vec![
-            PimdirWriteOp::UpsertPlacement(probe("p1")),
-            PimdirWriteOp::UpsertPlacement(probe("p2")),
+            PimdirWriteOp::UpsertPlacement(named("p1")),
+            PimdirWriteOp::UpsertPlacement(named("p2")),
         ])
         .unwrap();
 
@@ -868,26 +868,26 @@ fn a_handles_load_reads_only_its_own_probes() {
         .unwrap();
     assert_eq!(batch.placements.len(), 1);
     assert_eq!(batch.placements[0].handle, PimdirHandle("p2".into()));
-    assert_eq!(batch.placements[0].level, PimdirLevel::Probed);
+    assert_eq!(batch.placements[0].level, PimdirLevel::Meta);
 }
 
 #[test]
 fn an_unknown_flag_set_stores_as_null_and_loads_back_unknown() {
     // spec §13 keeps the two absences apart: NULL means nothing has read
-    // the markers, '[]' that the item carries none. A probed placement
+    // the markers, '[]' that the item carries none. A placement read so
     // storing '[]' would claim the second while only the first is true.
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
 
-    let mut probed = placement("1", "mid:a", "cafebabe", &[]);
-    probed.flags = PimdirFlags::Unknown;
-    probed.base = None;
+    let mut unread = placement("1", "mid:a", "cafebabe", &[]);
+    unread.flags = PimdirFlags::Unknown;
+    unread.base = None;
     let known_empty = placement("2", "mid:b", "cafebabe", &[]);
 
     store
         .write(vec![
             store_object("cafebabe", b"abc"),
-            PimdirWriteOp::UpsertPlacement(probed),
+            PimdirWriteOp::UpsertPlacement(unread),
             PimdirWriteOp::UpsertPlacement(known_empty),
         ])
         .unwrap();
@@ -954,7 +954,7 @@ fn a_base_of_nothing_round_trips_as_a_base() {
 
     let mut placement = placement("1", "mid:a", "cafebabe", &[]);
     placement.object = None;
-    placement.level = PimdirLevel::Probed;
+    placement.level = PimdirLevel::Meta;
     placement.flags = PimdirFlags::Unknown;
     placement.base = Some(PimdirBase {
         flags: PimdirFlags::Unknown,

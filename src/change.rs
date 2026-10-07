@@ -10,7 +10,7 @@
 //! the destination the store derives from the pending create. The remove
 //! carries the link id its destination receives, so a connector
 //! relocates only while the destination lacks it, and a relocated member
-//! lands the create when the target's fetch names it (SYNC §6).
+//! lands the create when the target's listing names it (SYNC §6).
 //!
 //! Neither half may be dropped for the other. A create holding neither an
 //! origin nor a body cannot deliver and stays visibly pending.
@@ -18,7 +18,7 @@
 use alloc::{format, string::String, vec::Vec};
 
 use crate::{
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     object::{PimdirHash, PimdirObject},
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId, PimdirOrigin, PimdirPlacement},
 };
@@ -296,6 +296,55 @@ pub enum PimdirWriteOp {
         collection: PimdirCollectionId,
         /// The new checkpoint.
         checkpoint: PimdirCheckpoint,
+    },
+    /// Open a round over `scope`, drawing its id (SYNC §5): first in the
+    /// batch of the round's first page.
+    OpenRound {
+        /// The collection the round lists.
+        collection: PimdirCollectionId,
+        /// The scope it lists.
+        scope: PimdirScope,
+    },
+    /// Stamp the bindings of the handles a page listed with the open
+    /// round's id, after the page's upserts, so the round's last page
+    /// finds absent what no page stamped (SYNC §5).
+    Stamp {
+        /// The collection the round lists.
+        collection: PimdirCollectionId,
+        /// The handles the page listed.
+        handles: Vec<PimdirHandle>,
+    },
+    /// Land a page's resume cursor, and the checkpoint it carried when it
+    /// carried one, the round staying open (SYNC §5).
+    SetRoundCursor {
+        /// The collection the round lists.
+        collection: PimdirCollectionId,
+        /// Where the next page resumes.
+        cursor: PimdirCursor,
+        /// The checkpoint the page carried, `None` keeping an earlier one.
+        checkpoint: Option<PimdirCheckpoint>,
+    },
+    /// Close the open round (SYNC §5): its checkpoint becomes the
+    /// source's and `coverage` its coverage, stamped now. Last in the
+    /// write after the last chunk.
+    CloseRound {
+        /// The collection the round listed.
+        collection: PimdirCollectionId,
+        /// The coverage it leaves: the round's scope, or for a band round
+        /// the span of the band and the coverage it adjoins.
+        coverage: PimdirScope,
+        /// The checkpoint the last page carried, `None` landing the one an
+        /// earlier page carried, else keeping the source's.
+        checkpoint: Option<PimdirCheckpoint>,
+    },
+    /// Restate a coverage narrower than the one held, a delta under a
+    /// scope inside it maintaining no more (SYNC §5); beside the delta's
+    /// checkpoint.
+    SetCoverage {
+        /// The collection whose coverage narrows.
+        collection: PimdirCollectionId,
+        /// The narrower scope.
+        scope: PimdirScope,
     },
 }
 

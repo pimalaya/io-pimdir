@@ -6,8 +6,8 @@
 //!
 //! A plain full sync would read every old handle as deleted upstream and
 //! drop cached bodies and pending changes with them. The rebuild instead
-//! enumerates the new spine, resolves its link ids at the meta tier in
-//! bounded chunks, and carries each old placement onto the new handle of
+//! lists the new spine, every page read before one batch is written,
+//! resolves its link ids from each member's meta, and carries each old placement onto the new handle of
 //! the same item.
 //!
 //! The cache survives without a refetch, flag deltas re-derive against
@@ -16,7 +16,7 @@
 //! pending create; other unmatched pending state is dropped and counted.
 //!
 //! Pending creates are local staging, not spine, and stay untouched. A
-//! member whose fetched revision differs from the one its base held
+//! member whose listed revision differs from the one its base held
 //! changed on the remote while the handles did: it is carried as the
 //! pull a sync would make, or as a conflict when it also holds a local
 //! edit, never with a base claiming a revision it never reconciled.
@@ -38,15 +38,15 @@ use log::{debug, trace};
 
 use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     coroutine::*,
     load::PimdirLoadScope,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
         PimdirSortKey, PimdirStatus,
     },
-    remote::{PimdirRemoteItem, PimdirTier},
-    summary::PimdirSummary,
+    remote::{PimdirEnumerate, PimdirEnumerated, PimdirListing, PimdirRemoteItem},
+    summary::{self, PimdirSummary},
 };
 
 /// What a rekey did.
@@ -69,22 +69,13 @@ pub struct PimdirRekey {
     old: Vec<PimdirPlacement>,
     items: Vec<PimdirRemoteItem>,
     checkpoint: Option<PimdirCheckpoint>,
-    /// The new handles no meta fetch has resolved yet, in chunks.
-    unresolved: Vec<PimdirHandle>,
-    /// What the meta fetches resolved, by new handle.
+    /// What each member's meta resolved, by new handle.
     resolved: BTreeMap<PimdirHandle, Resolved>,
     report: PimdirRekeyReport,
     state: State,
 }
 
 impl PimdirRekey {
-    /// How many handles one meta fetch of the new spine names.
-    ///
-    /// A handle-space change touches every member, so the fetch resolving
-    /// their identities goes in bounded requests rather than one naming
-    /// the whole mailbox; the rebuild itself still lands in one batch.
-    pub const FETCH_CHUNK: usize = 256;
-
     /// Creates a coroutine rebuilding `collection` onto its new handles.
     pub fn new(collection: impl Into<PimdirCollectionId>) -> Self {
         let collection = collection.into();
@@ -95,34 +86,31 @@ impl PimdirRekey {
             old: Vec::new(),
             items: Vec::new(),
             checkpoint: None,
-            unresolved: Vec::new(),
             resolved: BTreeMap::new(),
             report: PimdirRekeyReport::default(),
             state: State::Start,
         }
     }
 
-    /// Yields the next meta fetch chunk, or the rebuild once all resolved.
-    fn step(&mut self) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
-        if self.unresolved.is_empty() {
-            trace!("resolved {} link ids", self.resolved.len());
-            self.state = State::Writing;
-            let writes = self.rebuild();
-            return PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes));
-        }
-
-        let size = self.unresolved.len().min(Self::FETCH_CHUNK);
-        let handles: Vec<PimdirHandle> = self.unresolved.drain(..size).collect();
-        debug!(
-            "resolve {} new link ids at meta tier, {} left after them",
-            handles.len(),
-            self.unresolved.len(),
-        );
-        self.state = State::Fetching;
-        PimdirCoroutineState::Yielded(PimdirYield::WantsFetch {
+    /// Asks for the next page of the new spine, from `cursor`.
+    ///
+    /// A round over the whole collection whatever the scope (SYNC §8):
+    /// the old handles being void, it is the one listing whose absence
+    /// covers every member, every page read before the batch is written.
+    fn enumerate(
+        &mut self,
+        cursor: Option<PimdirCursor>,
+    ) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
+        self.state = State::Enumerating;
+        PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate {
             collection: self.collection.clone(),
-            handles,
-            tier: PimdirTier::Meta,
+            request: PimdirEnumerate {
+                listing: PimdirListing::Round {
+                    cursor,
+                    band: false,
+                },
+                scope: PimdirScope::unbounded(),
+            },
         })
     }
 
@@ -244,10 +232,14 @@ impl PimdirRekey {
         }
 
         drops.append(&mut writes);
-        drops.push(PimdirWriteOp::SetCheckpoint {
-            collection: self.collection.clone(),
-            checkpoint: self.checkpoint.take().expect("an enumerated checkpoint"),
-        });
+        // NOTE: the rekey's checkpoint lands with it, the coverage left as
+        // it was (SYNC §8); a listing handing none keeps the old one.
+        if let Some(checkpoint) = self.checkpoint.take() {
+            drops.push(PimdirWriteOp::SetCheckpoint {
+                collection: self.collection.clone(),
+                checkpoint,
+            });
+        }
 
         drops
     }
@@ -329,9 +321,11 @@ impl PimdirRekey {
         let remote_edited = observed.is_some() && observed != base_revision;
         let local_edit = old.object.is_some() && old_base.is_none_or(|b| b.object != old.object);
 
-        let summary = resolved
-            .and_then(|r| r.summary.clone())
-            .or_else(|| old.summary.clone());
+        let summary = summary::without_body(
+            old.summary.as_ref(),
+            resolved.and_then(|r| r.summary.clone()),
+            old.object.is_some() && !remote_edited,
+        );
         let sort_key = resolved
             .map(|r| r.sort_key.clone())
             .unwrap_or_else(|| old.sort_key.clone());
@@ -376,7 +370,7 @@ impl PimdirRekey {
             // would make on the next listing is made here (SYNC §5).
             PimdirStatus::Tombstone if remote_edited => {
                 carried.object = None;
-                carried.level = PimdirLevel::Probed;
+                carried.level = PimdirLevel::Meta;
                 carried.flags = item.flags.clone();
                 carried.origin = None;
                 if let Some(base) = &mut carried.base {
@@ -393,7 +387,7 @@ impl PimdirRekey {
             }
             _ if remote_edited => {
                 carried.object = None;
-                carried.level = PimdirLevel::Probed;
+                carried.level = PimdirLevel::Meta;
                 carried.status = match flags_pending {
                     true => PimdirStatus::Dirty,
                     false => PimdirStatus::Clean,
@@ -432,11 +426,7 @@ impl PimdirRekey {
             handle: item.handle.clone(),
             link_id: key,
             object: None,
-            level: if resolved.is_some() {
-                PimdirLevel::Meta
-            } else {
-                PimdirLevel::Probed
-            },
+            level: PimdirLevel::Meta,
             summary: resolved.and_then(|r| r.summary.clone()),
             sort_key: resolved.map(|r| r.sort_key.clone()).unwrap_or_default(),
             flags: item.flags.clone(),
@@ -476,38 +466,45 @@ impl PimdirCoroutine for PimdirRekey {
 
                 debug!("enumerate the new handle space in full");
                 trace!("loaded {} old placements", self.old.len());
-                self.state = State::Enumerating;
-                PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate {
-                    collection: self.collection.clone(),
-                    cursor: None,
-                })
+                self.enumerate(None)
             }
 
-            (State::Enumerating, Some(PimdirArg::Enumerate(snapshot))) => {
-                self.items = snapshot.items;
-                self.checkpoint = Some(snapshot.checkpoint);
+            (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::CursorRejected))) => {
+                debug!("cursor rejected, list the new handle space again");
+                self.items.clear();
+                self.resolved.clear();
+                self.checkpoint = None;
+                self.enumerate(None)
+            }
 
-                if self.old.iter().any(|p| p.link_id.is_some()) {
-                    self.unresolved = self.items.iter().map(|i| i.handle.clone()).collect();
-                } else {
-                    debug!("no link ids to match, rebuild the spine");
+            (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page)))) => {
+                // NOTE: the checkpoint is the one a page hands, the first
+                // where the source gives it up front, the last for Graph.
+                if page.checkpoint.is_some() {
+                    self.checkpoint = page.checkpoint;
                 }
-                self.step()
-            }
-
-            (State::Fetching, Some(PimdirArg::Fetch(fetched))) => {
-                for item in fetched {
+                for item in page.items {
                     self.resolved.insert(
-                        item.handle,
+                        item.handle.clone(),
                         Resolved {
-                            link_id: item.link_id,
-                            summary: item.summary,
-                            sort_key: item.sort_key,
-                            revision: item.revision,
+                            link_id: item.meta.link_id.clone(),
+                            summary: item.meta.summary.clone(),
+                            sort_key: item.meta.sort_key.clone(),
+                            revision: item.revision.clone(),
                         },
                     );
+                    self.items.push(item);
                 }
-                self.step()
+
+                match page.cursor.filter(|_| !page.last) {
+                    Some(cursor) => self.enumerate(Some(cursor)),
+                    None => {
+                        trace!("resolved {} link ids", self.resolved.len());
+                        self.state = State::Writing;
+                        let writes = self.rebuild();
+                        PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes))
+                    }
+                }
             }
 
             (State::Writing, Some(PimdirArg::Write)) => {
@@ -527,7 +524,7 @@ impl PimdirCoroutine for PimdirRekey {
     }
 }
 
-/// What a meta fetch resolved for one new handle.
+/// What a listed member's meta resolved for one new handle.
 struct Resolved {
     link_id: PimdirLinkId,
     summary: Option<PimdirSummary>,
@@ -540,7 +537,6 @@ enum State {
     Start,
     Loading,
     Enumerating,
-    Fetching,
     Writing,
     Done,
 }
@@ -554,7 +550,7 @@ mod tests {
         object::PimdirHash,
         placement::PimdirOrigin,
         rekey::*,
-        remote::{PimdirFetchedItem, PimdirRemoteSnapshot},
+        remote::{PimdirFetchedItem, PimdirRemoteMeta, PimdirRemoteSnapshot},
     };
 
     /// An old-spine placement, synced clean at base `flags`.
@@ -585,6 +581,12 @@ mod tests {
             handle: PimdirHandle::from(handle),
             flags: PimdirFlags::from_iter(flags.iter().copied()),
             revision: None,
+            meta: PimdirRemoteMeta {
+                link_id: PimdirLinkId::from(handle),
+                summary: None,
+                sort_key: Default::default(),
+                body: None,
+            },
         }
     }
 
@@ -599,7 +601,30 @@ mod tests {
         }
     }
 
-    /// Runs a rekey over an old spine, a new spine and its meta replies.
+    /// The spine as listed, each member carrying the meta `metas` names
+    /// for its handle (SYNC §4).
+    fn listed(
+        items: Vec<PimdirRemoteItem>,
+        metas: Vec<PimdirFetchedItem>,
+    ) -> Vec<PimdirRemoteItem> {
+        items
+            .into_iter()
+            .map(|mut item| {
+                if let Some(meta) = metas.iter().find(|meta| meta.handle == item.handle) {
+                    item.meta = PimdirRemoteMeta {
+                        link_id: meta.link_id.clone(),
+                        summary: meta.summary.clone(),
+                        sort_key: meta.sort_key.clone(),
+                        body: None,
+                    };
+                    item.revision = item.revision.or_else(|| meta.revision.clone());
+                }
+                item
+            })
+            .collect()
+    }
+
+    /// Runs a rekey over an old spine and a new spine named by `metas`.
     fn run(
         old: Vec<PimdirPlacement>,
         items: Vec<PimdirRemoteItem>,
@@ -610,26 +635,18 @@ mod tests {
         let _ = rekey.resume(None);
         let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
             placements: old,
-            checkpoint: None,
+            ..Default::default()
         })));
 
-        let snapshot = PimdirRemoteSnapshot {
-            items,
-            vanished: Vec::new(),
-            complete: true,
-            checkpoint: PimdirCheckpoint(b"v2".to_vec()),
-        };
-        let writes = match rekey.resume(Some(PimdirArg::Enumerate(snapshot))) {
-            PimdirCoroutineState::Yielded(PimdirYield::WantsFetch { tier, .. }) => {
-                assert_eq!(tier, PimdirTier::Meta);
-                match rekey.resume(Some(PimdirArg::Fetch(metas))) {
-                    PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(w)) => w,
-                    state => panic!("expected WantsWrite, got {state:?}"),
-                }
-            }
-            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(w)) => w,
-            state => panic!("expected fetch or write, got {state:?}"),
-        };
+        let snapshot = PimdirRemoteSnapshot::round(
+            listed(items, metas),
+            Some(PimdirCheckpoint(b"v2".to_vec())),
+        );
+        let writes =
+            match rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(snapshot)))) {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(w)) => w,
+                state => panic!("expected write, got {state:?}"),
+            };
 
         let report = match rekey.resume(Some(PimdirArg::Write)) {
             PimdirCoroutineState::Complete(Ok(report)) => report,
@@ -823,7 +840,7 @@ mod tests {
         assert_eq!(resurrected.object, Some(PimdirHash::from("h2")));
     }
 
-    /// A probed-only placement has no link id to match on.
+    /// A placement with no link id has nothing to match on.
     #[test]
     fn unmatched_pending_state_is_dropped_and_counted() {
         let mut old = synced("1", "msg-a", &[]);
@@ -840,28 +857,65 @@ mod tests {
         assert_eq!(fresh.status, PimdirStatus::Clean);
     }
 
+    /// A rekey lists the whole collection, every page read before its one
+    /// batch, a rejected cursor relisting it from the start (SYNC §8).
     #[test]
-    fn no_link_ids_skips_the_meta_fetch() {
-        let mut old = synced("1", "msg-a", &[]);
-        old.link_id = None;
+    fn every_page_is_read_before_the_one_batch() {
+        crate::testlog::init();
+        let old: Vec<PimdirPlacement> = (0..3)
+            .map(|i| synced(&format!("{i}"), &format!("m{i}"), &[]))
+            .collect();
+        let named = |handle: &str, link: &str| {
+            listed(vec![item(handle, &[])], vec![fetched(handle, link)]).remove(0)
+        };
 
         let mut rekey = PimdirRekey::new("inbox");
         let _ = rekey.resume(None);
-        let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
-            placements: vec![old],
-            checkpoint: None,
+        let mut requests = Vec::new();
+        let mut state = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: old,
+            ..Default::default()
         })));
-
-        let snapshot = PimdirRemoteSnapshot {
-            items: vec![item("101", &[])],
-            vanished: Vec::new(),
-            complete: true,
-            checkpoint: PimdirCheckpoint(b"v2".to_vec()),
+        let mut answers = vec![
+            PimdirEnumerated::Page(PimdirRemoteSnapshot::page(
+                vec![named("v2-0", "m0")],
+                Some(PimdirCursor(b"p1".to_vec())),
+                Some(PimdirCheckpoint(b"v2".to_vec())),
+            )),
+            PimdirEnumerated::CursorRejected,
+            PimdirEnumerated::Page(PimdirRemoteSnapshot::page(
+                vec![named("v2-0", "m0"), named("v2-1", "m1")],
+                Some(PimdirCursor(b"p1".to_vec())),
+                Some(PimdirCheckpoint(b"v3".to_vec())),
+            )),
+            PimdirEnumerated::Page(PimdirRemoteSnapshot::page(
+                vec![named("v2-2", "m2")],
+                None,
+                None,
+            )),
+        ];
+        let writes = loop {
+            match state {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { request, .. }) => {
+                    assert_eq!(request.scope, PimdirScope::unbounded());
+                    requests.push(request.cursor().cloned());
+                    state = rekey.resume(Some(PimdirArg::Enumerate(answers.remove(0))));
+                }
+                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => break writes,
+                state => panic!("expected enumerate or write, got {state:?}"),
+            }
         };
-        match rekey.resume(Some(PimdirArg::Enumerate(snapshot))) {
-            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(_)) => {}
-            state => panic!("expected WantsWrite without a fetch, got {state:?}"),
+
+        let p1 = Some(PimdirCursor(b"p1".to_vec()));
+        assert_eq!(requests, vec![None, p1.clone(), None, p1]);
+        assert!(answers.is_empty());
+        for handle in ["v2-0", "v2-1", "v2-2"] {
+            assert!(upserted(&writes, handle).is_some(), "{handle} carried");
         }
+        assert!(writes.iter().any(|w| matches!(
+            w,
+            PimdirWriteOp::SetCheckpoint { checkpoint, .. } if checkpoint.0 == b"v3"
+        )));
     }
 
     #[test]
@@ -898,12 +952,9 @@ mod tests {
         let mut rekey = PimdirRekey::new("inbox");
         let _ = rekey.resume(None);
         let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded::default())));
-        let _ = rekey.resume(Some(PimdirArg::Enumerate(PimdirRemoteSnapshot {
-            items: Vec::new(),
-            vanished: Vec::new(),
-            complete: true,
-            checkpoint: PimdirCheckpoint(b"v2".to_vec()),
-        })));
+        let _ = rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(
+            PimdirRemoteSnapshot::round(Vec::new(), Some(PimdirCheckpoint(b"v2".to_vec()))),
+        ))));
         let _ = rekey.resume(Some(PimdirArg::Write));
 
         match rekey.resume(Some(PimdirArg::Write)) {
@@ -950,7 +1001,7 @@ mod tests {
         let carried = upserted(&writes, "b.vcf").expect("a carried placement");
         assert_eq!(carried.status, PimdirStatus::Clean);
         assert_eq!(carried.object, None, "the stale body is dropped");
-        assert_eq!(carried.level, PimdirLevel::Probed);
+        assert_eq!(carried.level, PimdirLevel::Meta);
         let base = carried.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
         assert_eq!(base.object, None);
@@ -1028,58 +1079,22 @@ mod tests {
         assert_eq!(base.object, None);
     }
 
-    /// A large mailbox is resolved in bounded meta fetches, one write.
+    /// A large mailbox is resolved from its listing alone, one write.
     #[test]
-    fn the_meta_fetch_goes_in_chunks() {
-        let extra = 5;
-        let count = PimdirRekey::FETCH_CHUNK + extra;
+    fn a_large_spine_is_resolved_with_no_fetch() {
+        let count = 300;
         let old: Vec<PimdirPlacement> = (0..count)
             .map(|i| synced(&format!("{i:04}"), &format!("m{i}"), &[]))
             .collect();
         let items: Vec<PimdirRemoteItem> = (0..count)
             .map(|i| item(&format!("v2-{i:04}"), &[]))
             .collect();
+        let metas: Vec<PimdirFetchedItem> = (0..count)
+            .map(|i| fetched(&format!("v2-{i:04}"), &format!("m{i}")))
+            .collect();
 
-        crate::testlog::init();
-        let mut rekey = PimdirRekey::new("inbox");
-        let _ = rekey.resume(None);
-        let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
-            placements: old,
-            checkpoint: None,
-        })));
-        let mut state = rekey.resume(Some(PimdirArg::Enumerate(PimdirRemoteSnapshot {
-            items,
-            vanished: Vec::new(),
-            complete: true,
-            checkpoint: PimdirCheckpoint(b"v2".to_vec()),
-        })));
+        let (writes, report) = run(old, items, metas);
 
-        let mut chunks = Vec::new();
-        let writes = loop {
-            match state {
-                PimdirCoroutineState::Yielded(PimdirYield::WantsFetch { handles, .. }) => {
-                    let metas = handles
-                        .iter()
-                        .map(|h| {
-                            fetched(
-                                h.as_str(),
-                                &format!("m{}", h.as_str()[3..].parse::<usize>().unwrap()),
-                            )
-                        })
-                        .collect();
-                    chunks.push(handles.len());
-                    state = rekey.resume(Some(PimdirArg::Fetch(metas)));
-                }
-                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => break writes,
-                state => panic!("expected fetch or write, got {state:?}"),
-            }
-        };
-
-        assert_eq!(chunks, [PimdirRekey::FETCH_CHUNK, extra]);
-        let report = match rekey.resume(Some(PimdirArg::Write)) {
-            PimdirCoroutineState::Complete(Ok(report)) => report,
-            state => panic!("expected Complete(Ok), got {state:?}"),
-        };
         assert_eq!(report.rekeyed, count, "every member found its new handle");
         assert_eq!(report.pulled, 0);
         assert_eq!(

@@ -1,11 +1,11 @@
 //! An upsert carrying no link id, against a handle a binding already
 //! holds (spec §10).
 //!
-//! A probe is unlinked until a `Meta` fetch resolves its identity, so the
-//! store stages it apart from the hub. A handle the store has already
-//! bound is not in that position: it names an item, and filing a second
-//! row for it hands the engine two placements for one handle, which is
-//! where a spurious `dup:` key comes from.
+//! Nothing reaches the store unnamed, so such an upsert for a handle no
+//! binding holds is refused. A handle the store has already bound names
+//! an item, and the upsert folds into it: filing a second row for it
+//! would hand the engine two placements for one handle, which is where
+//! a spurious `dup:` key comes from.
 
 use io_pimdir::client::{PimdirError, PimdirSourceStore, PimdirStore};
 use io_pimdir::{
@@ -46,17 +46,16 @@ fn placement(handle: &str, link: &str) -> PimdirPlacement {
     }
 }
 
-/// The freshly probed placement io-replica's `sync` builds for a remote
-/// item it has no local side for: a handle, flags and a revision, and no
-/// identity at all.
-fn probed(handle: &str, revision: &str) -> PimdirPlacement {
+/// An upsert naming a handle, flags and a revision and no identity at
+/// all, what an earlier engine wrote for a member before naming it.
+fn unnamed(handle: &str, revision: &str) -> PimdirPlacement {
     PimdirPlacement {
         sort_key: Default::default(),
         collection: inbox(),
         handle: PimdirHandle(handle.into()),
         link_id: None,
         object: None,
-        level: PimdirLevel::Probed,
+        level: PimdirLevel::Meta,
         summary: None,
         flags: PimdirFlags::default(),
         status: PimdirStatus::Clean,
@@ -100,7 +99,7 @@ fn an_unlinked_upsert_lands_on_the_binding_its_handle_holds() {
         .unwrap();
 
     store
-        .write(vec![PimdirWriteOp::UpsertPlacement(probed("u1", "2"))])
+        .write(vec![PimdirWriteOp::UpsertPlacement(unnamed("u1", "2"))])
         .unwrap();
 
     let placements = projected(&store);
@@ -118,7 +117,7 @@ fn an_unlinked_upsert_lands_on_the_binding_its_handle_holds() {
 }
 
 /// The write that produces it: a remote edit resurrecting an item
-/// deleted locally, which `sync` pulls as a fresh probe of the same
+/// deleted locally, which an earlier `sync` pulled as an unnamed row of the same
 /// handle (io-replica, `pull_add`).
 #[test]
 fn a_resurrected_tombstone_stays_one_item() {
@@ -138,7 +137,7 @@ fn a_resurrected_tombstone_stays_one_item() {
         .unwrap();
 
     store
-        .write(vec![PimdirWriteOp::UpsertPlacement(probed("u1", "2"))])
+        .write(vec![PimdirWriteOp::UpsertPlacement(unnamed("u1", "2"))])
         .unwrap();
 
     let placements = projected(&store);
@@ -151,24 +150,22 @@ fn a_resurrected_tombstone_stays_one_item() {
     );
 }
 
-/// A handle nothing holds is what the residual is for: it stays
-/// unlinked, waiting for the `Meta` upgrade that names it.
+/// A handle nothing holds is refused: nothing reaches the store unnamed
+/// (SYNC §10), a listing naming every member it carries.
 #[test]
-fn a_probe_of_an_unbound_handle_stays_unlinked() {
+fn an_unlinked_upsert_of_an_unbound_handle_is_refused() {
     let dir = tempdir().unwrap();
     let mut store = opened(dir.path());
 
-    store
-        .write(vec![PimdirWriteOp::UpsertPlacement(probed("u1", "1"))])
-        .unwrap();
+    let refused = store
+        .write(vec![PimdirWriteOp::UpsertPlacement(unnamed("u1", "1"))])
+        .unwrap_err();
 
-    let placements = projected(&store);
-    assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].handle, PimdirHandle("u1".into()));
-    assert_eq!(
-        placements[0].link_id, None,
-        "a freshly probed row claims no identity",
+    assert!(
+        matches!(&refused, PimdirError::Unnamed { handle, .. } if handle == "u1"),
+        "the refusal names the handle: {refused}",
     );
+    assert!(projected(&store).is_empty());
 }
 
 /// Keyed back onto its binding, an unlinked upsert is subject to the
@@ -187,7 +184,7 @@ fn an_unlinked_upsert_is_seen_by_the_rebind_guard() {
 
     let refused = store
         .write(vec![
-            PimdirWriteOp::UpsertPlacement(probed("u1", "2")),
+            PimdirWriteOp::UpsertPlacement(unnamed("u1", "2")),
             PimdirWriteOp::UpsertPlacement(placement("u2", "msg-a")),
         ])
         .unwrap_err();

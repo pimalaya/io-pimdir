@@ -44,7 +44,8 @@ fn full_offline_lifecycle() {
         loaded
             .placements
             .iter()
-            .all(|p| p.level == PimdirLevel::Probed)
+            .all(|p| p.level == PimdirLevel::Meta && p.link_id.is_some()),
+        "the listing named every member"
     );
     assert_eq!(
         client.remote().calls,
@@ -59,7 +60,10 @@ fn full_offline_lifecycle() {
             PimdirTier::Meta,
         )
         .unwrap();
-    assert_eq!(report.upgraded, 2);
+    assert_eq!(
+        report.upgraded, 0,
+        "named by the listing, nothing to revisit"
+    );
     assert_eq!(
         client.storage().placement("inbox", "i1").level,
         PimdirLevel::Meta
@@ -76,13 +80,10 @@ fn full_offline_lifecycle() {
     );
     assert_eq!(client.storage().objects(), 1, "one stored body");
 
-    // NOTE: a Meta fetch resolves a1's link id, which enumerate does not
-    // carry, so the Full upgrade dedups the shared body by it, fetch-free.
+    // NOTE: the listing names a1 by its meta, so the Full upgrade dedups
+    // the shared body by its link id, fetch-free.
     client
         .sync("archive", PimdirSyncOptions::default())
-        .unwrap();
-    client
-        .upgrade("archive", vec![PimdirHandle::from("a1")], PimdirTier::Meta)
         .unwrap();
     let fetches_before = client.remote().full_fetches.len();
 
@@ -174,7 +175,7 @@ fn offline_copy_creates_pushes_and_rekeys() {
     let mut client = seeded_client();
     let opts = PimdirSyncOptions::default();
 
-    client.sync("inbox", opts).unwrap();
+    client.sync("inbox", opts.clone()).unwrap();
     client
         .upgrade("inbox", vec![PimdirHandle::from("i2")], PimdirTier::Full)
         .unwrap();
@@ -201,21 +202,10 @@ fn offline_copy_creates_pushes_and_rekeys() {
         "the copy source is untouched",
     );
 
-    // NOTE: the archive's first enumeration lists members nothing names
-    // yet, and a create waits for those probes (SYNC §5): naming them
-    // frees it.
-    let report = client.sync("archive", opts).unwrap();
-    assert_eq!(report.pushed, 0, "held behind the probes");
-    let probes: Vec<PimdirHandle> = client
-        .storage()
-        .rows("archive")
-        .into_iter()
-        .filter(|p| p.link_id.is_none())
-        .map(|p| p.handle)
-        .collect();
-    client.upgrade("archive", probes, PimdirTier::Meta).unwrap();
-
-    let report = client.sync("archive", opts).unwrap();
+    // NOTE: the archive's first listing names its members in the page
+    // that lists them, none the create's arrival, so the create is pushed
+    // once that page has landed (SYNC §5).
+    let report = client.sync("archive", opts.clone()).unwrap();
     assert_eq!(report.pushed, 1);
     assert!(
         !client.storage().contains("archive", "\u{1}msg-b"),

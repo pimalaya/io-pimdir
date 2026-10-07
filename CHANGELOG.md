@@ -12,6 +12,24 @@ All notable changes to this project are documented in this file. The format is b
 - Added `PimdirActionError::Invalid`, a payload field breaking its intent's rule.
 - Added `PimdirStore::acknowledge_action(id, seq)`: an intent its owner performed is removed with its pin released and its receipt recorded, so `action_status` answers `Applied` rather than `Unknown`; `replace_action` records the replaced intent's receipt too. `drop_action` stays the withdrawal, without a receipt.
 - Added collection roles (pimdir draft-04, STORAGE §14): `PimdirStore::set_collection_role`, `PimdirCollection::role`, the `ROLE` column of `pimdir collection list`; `collections.role`, its index and its triggers are added on open to a store written by 0.6, and a reader of one not reconciled yet reads `None`.
+- Added scoped, paged mail syncs (pimdir draft-04, SYNC §4, §5): `PimdirSyncOptions::scope` (`PimdirScope`, `[since, until)` on the summary `date`, mail only, else `PimdirError::Scope`), rounds answered in pages and landed page by page (`PimdirWriteOp::OpenRound`, `Stamp`, `SetRoundCursor`, `CloseRound`, `SetCoverage`), resumed from their cursor, restarted on `PimdirEnumerated::CursorRejected`, and widened by the band alone for a connector bound to no scope (`PimdirRemote::scope_bound`, `PimdirSync::scope_bound`); deletes inferred at the last page in scope only; out-of-scope creates waiting (`PimdirSyncReport::waiting`); `PimdirSync::report` and `PimdirSourceStore::prepare_sync` for a runner of its own.
+- Added coverage: `PimdirCoverage`, `PimdirRound` and `PimdirCursor`; `PimdirLoaded::coverage`, `round` and `unstamped`; `PimdirCollection::coverage`, `PimdirReader::list_coverage`, and the `COVERED` column of `pimdir collection list`. The columns, `bindings.round` and their trigger are added on open to an older store.
+- Added the mail reads: `PimdirReader::count_mail`, `count_mail_by_day`, `count_unread`, `list_mail_page_filtered`, `search_mail`, `PimdirMailFilter`, `PimdirMailCursor`, `PimdirMailEntry`, `PimdirDayCount`, and `reader::like_pattern`.
+- Added `PimdirStore::collect_before`, the owner's manual collection of a mail collection below a date (STORAGE §11.3).
+- Added `summary::mail::derive_meta` and `meta_attachment`: the attachment mark read without the body (Annex A.1), which a body-less listing or fetch never writes over a walked one.
+
+### Changed
+
+- Changed the remote seam: `PimdirRemote::enumerate` takes a `PimdirEnumerate` (`PimdirListing`, delta or round from a cursor, and the scope) and answers a `PimdirEnumerated`; `PimdirRemoteItem` carries its `PimdirRemoteMeta` (hint, summary, sort key, optional body), and `PimdirRemoteSnapshot` is a page (`last`, `cursor`, an optional `checkpoint`, constructors `round`, `page`, `delta`). `PimdirYield::WantsEnumerate` and `PimdirArg::Enumerate` follow.
+- Changed the sync to name every listed member in the page that lists it, landing a pending create its hint holds, and a pull to take the member's meta and carried body, the level lowered to `Meta`.
+- Changed the rekey to list every page before its one batch and name members from their meta, fetching nothing.
+- Changed `PimdirSyncOptions` to `Clone` without `Copy`, the scope holding strings.
+- Changed a write to refuse an unnamed upsert of an unbound handle (`PimdirError::Unnamed`), and the items a batch inserts to draw their public ids in batch order.
+- Changed a level of 0, an earlier draft's, to load as `Meta` with no summary, which a `Meta` upgrade revisits; `PimdirMutateError::Probed` is `Unnamed`.
+
+### Removed
+
+- Removed probes (pimdir draft-04): `PimdirLevel::Probed`, `PimdirReader::count_probes`, `PimdirRekey::FETCH_CHUNK`, the `probes` table (dropped on open) and the probe statements.
 
 ## [0.6.0] - 2026-10-03
 

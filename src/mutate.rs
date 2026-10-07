@@ -166,8 +166,9 @@ impl PimdirMutation {
 pub enum PimdirMutateError {
     /// The targeted handle has no placement in the collection.
     UnknownHandle(String),
-    /// The targeted handle is a probe: a `Meta` upgrade names it first.
-    Probed(String),
+    /// The targeted placement is named by no link id, which nothing keys a
+    /// staged edit by; every listed member arrives named (SYNC §4).
+    Unnamed(String),
     /// An `Add` names a link id a live placement already holds.
     LinkExists(String),
     /// A `Copy` or a `Move` names a placement with neither a body nor a
@@ -183,8 +184,11 @@ impl fmt::Display for PimdirMutateError {
             Self::UnknownHandle(handle) => {
                 write!(f, "Pimdir MUTATE failed: unknown handle {handle}")
             }
-            Self::Probed(handle) => {
-                write!(f, "Pimdir MUTATE failed: handle {handle} is a probe")
+            Self::Unnamed(handle) => {
+                write!(
+                    f,
+                    "Pimdir MUTATE failed: handle {handle} is named by no link id"
+                )
             }
             Self::LinkExists(link_id) => {
                 write!(
@@ -466,7 +470,7 @@ impl PimdirCoroutine for PimdirMutate {
                         return PimdirCoroutineState::Complete(Err(err));
                     };
                     if placement.link_id.is_none() {
-                        let err = PimdirMutateError::Probed(handle.as_str().into());
+                        let err = PimdirMutateError::Unnamed(handle.as_str().into());
                         return PimdirCoroutineState::Complete(Err(err));
                     }
 
@@ -580,6 +584,7 @@ mod tests {
                 origin: None,
             }],
             checkpoint: None,
+            ..Default::default()
         }
     }
 
@@ -685,23 +690,23 @@ mod tests {
         }
     }
 
-    /// A probe has no identity to stage anything under.
+    /// A placement no link id names has no identity to stage anything under.
     #[test]
-    fn a_probe_refuses_a_mutation() {
+    fn an_unnamed_placement_refuses_a_mutation() {
         let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
-        let mut probed = loaded("1");
-        probed.placements[0].link_id = None;
-        probed.placements[0].level = PimdirLevel::Probed;
-        probed.placements[0].base = None;
+        let mut unnamed = loaded("1");
+        unnamed.placements[0].link_id = None;
+        unnamed.placements[0].level = PimdirLevel::Meta;
+        unnamed.placements[0].base = None;
 
-        match mutate.resume(Some(PimdirArg::Load(probed))) {
-            PimdirCoroutineState::Complete(Err(PimdirMutateError::Probed(h))) => {
+        match mutate.resume(Some(PimdirArg::Load(unnamed))) {
+            PimdirCoroutineState::Complete(Err(PimdirMutateError::Unnamed(h))) => {
                 assert_eq!(h, "1");
             }
-            state => panic!("expected Probed, got {state:?}"),
+            state => panic!("expected Unnamed, got {state:?}"),
         }
     }
 
@@ -1179,6 +1184,7 @@ mod tests {
         let loaded = PimdirLoaded {
             placements: holds,
             checkpoint: None,
+            ..Default::default()
         };
         match mutate.resume(Some(PimdirArg::Load(loaded))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,

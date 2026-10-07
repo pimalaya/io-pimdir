@@ -6,7 +6,9 @@
 //!
 //! The decoders are public so a connector building the summary from an
 //! IMAP ENVELOPE at the `Meta` tier lands on the same bytes the `Full`
-//! tier derives from the body.
+//! tier derives from the body, and [`derive_meta`] reads a header block
+//! the way a listing names a member, the attachment mark read without
+//! the body.
 
 use alloc::{
     format,
@@ -36,7 +38,9 @@ pub struct PimdirMailSummary {
     pub date: Option<String>,
     /// The raw message octets, or `RFC822.SIZE` at the `Meta` tier.
     pub size: Option<u64>,
-    /// Whether a part is an attachment; `None` when the parts were not walked.
+    /// The attachment mark (Annex A.1): from the walk of the parts when
+    /// the body was read, else read without it ([`derive_meta`]); `None`
+    /// only on a row an earlier draft wrote at the `Meta` tier.
     pub attachment: Option<bool>,
     /// Every `From` address, in document order.
     pub from: Vec<PimdirAddress>,
@@ -79,10 +83,56 @@ impl PimdirMailSummary {
 }
 
 /// Derives a message's key, summary and sort key from its bytes.
+///
+/// The parts are walked for the attachment mark (Annex A.1), which
+/// replaces any mark read without the body.
 pub fn derive(body: &[u8]) -> PimdirDerivation {
     let (headers, rest) = split_headers(body);
     let headers = header_fields(headers);
-    let header = |name: &str| field(&headers, name);
+    let attachment = has_attachment(&headers, rest);
+
+    from_headers(&headers, Some(body.len() as u64), attachment).derivation()
+}
+
+/// Derives what names a message without its body (Annex A.1): the same
+/// key, summary and sort key [`derive()`] gives, read off the header block
+/// alone, the way a listing names a member (SYNC §4).
+///
+/// `header` is the header block (an IMAP `BODY.PEEK[HEADER]` or
+/// `HEADER.FIELDS`, Gmail's metadata headers), or a whole message whose
+/// body is ignored. `size` is the server's `RFC822.SIZE`. The attachment
+/// mark is `attachment`, the source's own flag where it states one
+/// (Graph's `hasAttachments`, JMAP's `hasAttachment`), else
+/// [`meta_attachment`] over the top-level `Content-Type`. A connector
+/// reading the fields off a server-side summary (an `ENVELOPE`, a Graph
+/// `$select`) builds [`PimdirMailSummary`] itself through the decoders
+/// this module exposes, and sets the mark the same way.
+pub fn derive_meta(header: &[u8], size: Option<u64>, attachment: Option<bool>) -> PimdirDerivation {
+    let (headers, _) = split_headers(header);
+    let headers = header_fields(headers);
+    let attachment = attachment.unwrap_or_else(|| meta_attachment(field(&headers, "content-type")));
+
+    from_headers(&headers, size, attachment).derivation()
+}
+
+/// The attachment mark read without the body (Annex A.1): `true` when the
+/// top-level `Content-Type` is `multipart/mixed`, `false` otherwise, none
+/// included. It misses both ways (a list footer as a second part reads as
+/// one, an attachment under `multipart/signed` as none), each corrected
+/// when the body is read and the parts walked.
+pub fn meta_attachment(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("multipart/mixed"))
+}
+
+/// The summary a header block names, the attachment mark given.
+fn from_headers(
+    headers: &[(String, String)],
+    size: Option<u64>,
+    attachment: bool,
+) -> PimdirMailSummary {
+    let header = |name: &str| field(headers, name);
 
     let from = header("from").map(addresses).unwrap_or_default();
     let first = from.first();
@@ -94,14 +144,13 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
         sender: first.map(|address| address.address.clone()),
         sender_name: first.and_then(|address| address.name.clone()),
         date: header("date").and_then(instant),
-        size: Some(body.len() as u64),
-        attachment: Some(has_attachment(&headers, rest)),
-        from,
+        size,
+        attachment: Some(attachment),
         to: header("to").map(addresses).unwrap_or_default(),
         cc: header("cc").map(addresses).unwrap_or_default(),
         bcc: header("bcc").map(addresses).unwrap_or_default(),
+        from,
     }
-    .derivation()
 }
 
 /// Decodes a header value: unfolded, RFC 2047 encoded words decoded.
@@ -632,6 +681,25 @@ mod tests {
         let plain = b"Content-Type: text/plain\r\n\r\nhi\r\n";
         let (headers, rest) = split_headers(plain);
         assert!(!has_attachment(&header_fields(headers), rest));
+    }
+
+    #[test]
+    fn the_mark_without_the_body_reads_the_top_level_content_type() {
+        let mixed = b"Content-Type: multipart/mixed; boundary=b\r\nMessage-ID: <m@x>\r\n\r\n--b\r\n\r\nhi\r\n--b--\r\n";
+        let mark = |derivation: PimdirDerivation| match derivation.summary {
+            Some(PimdirSummary::Mail(mail)) => mail.attachment,
+            _ => unreachable!("a message derives a mail summary"),
+        };
+        assert_eq!(mark(derive_meta(mixed, Some(9), None)), Some(true));
+        assert_eq!(mark(derive_meta(mixed, Some(9), Some(false))), Some(false));
+        assert_eq!(mark(derive(mixed)), Some(false));
+        assert_eq!(
+            mark(derive_meta(b"Subject: hi\r\n\r\n", None, None)),
+            Some(false)
+        );
+        assert!(meta_attachment(Some("Multipart/Mixed ; boundary=x")));
+        assert!(!meta_attachment(Some("multipart/alternative")));
+        assert!(!meta_attachment(None));
     }
 
     #[test]

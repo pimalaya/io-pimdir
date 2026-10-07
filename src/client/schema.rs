@@ -19,7 +19,7 @@ use crate::{
 /// (§6) and the version stamp alone cannot tell an earlier draft's store
 /// apart. The triggers are named since the last drafts moved the feed
 /// into them, and a store lacking one stamps nothing.
-const SCHEMA: [&str; 17] = [
+const SCHEMA: [&str; 16] = [
     "bindings",
     "collections",
     "collections_restamp_items",
@@ -32,7 +32,6 @@ const SCHEMA: [&str; 17] = [
     "mail_summary",
     "objects",
     "objects_count_collect",
-    "probes",
     "queue",
     "sources",
     "store_meta",
@@ -84,8 +83,9 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
 const RECONCILED: [&str; 3] = ["capabilities", "performers", "receipts"];
 
 /// Creates the [`RECONCILED`] tables a store lacks, each with its key, and
-/// adds `collections.role` with its index and triggers ([`reconcile_role`]),
-/// in one transaction.
+/// adds `collections.role` with its index and triggers ([`reconcile_role`])
+/// and the coverage and round columns ([`reconcile_rounds`]), in one
+/// transaction.
 fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -104,6 +104,7 @@ fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
         }
     }
     reconcile_role(&tx)?;
+    reconcile_rounds(&tx)?;
     tx.commit().map_err(busy_or_sql)
 }
 
@@ -144,6 +145,70 @@ fn reconcile_role(conn: &Connection) -> Result<(), PimdirError> {
         conn.execute_batch(cut("CREATE TRIGGER collections_stamp_update", "END;"))?;
     }
 
+    Ok(())
+}
+
+/// The coverage and round a later draft added to version 1 (STORAGE §6,
+/// SYNC §5): the columns of `sources` and `bindings.round`, each cut out
+/// of the canonical DDL, the trigger restamping a collection whose
+/// coverage moved, and the `probes` table the draft no longer has
+/// dropped, its handles named again by the next round, a store from an
+/// earlier draft holding no coverage.
+fn reconcile_rounds(conn: &Connection) -> Result<(), PimdirError> {
+    let schema = sql::MIGRATION_0001;
+    let column = |table: &str, name: &str| {
+        let body = &schema[schema
+            .find(&format!("CREATE TABLE {table} ("))
+            .expect("canonical DDL")..];
+        let from = body.find(&format!("\n    {name} ")).expect("canonical DDL") + 5;
+        let to = from + body[from..].find(',').expect("canonical DDL");
+        String::from(&body[from..to])
+    };
+
+    // NOTE: in the canonical order, so a check naming an earlier column
+    // finds it added already.
+    for name in [
+        "covered_since",
+        "covered_until",
+        "covered_at",
+        "round",
+        "round_since",
+        "round_until",
+        "round_cursor",
+        "round_checkpoint",
+        "round_started_at",
+    ] {
+        if !has_column(conn, "sources", name)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE sources ADD COLUMN {};",
+                column("sources", name)
+            ))?;
+        }
+    }
+    if !has_column(conn, "bindings", "round")? {
+        conn.execute_batch(&format!(
+            "ALTER TABLE bindings ADD COLUMN {};",
+            column("bindings", "round")
+        ))?;
+    }
+
+    let declared = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'sources_stamp_coverage'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !declared {
+        let from = schema
+            .find("CREATE TRIGGER sources_stamp_coverage")
+            .expect("canonical DDL");
+        let to = from + schema[from..].find("END;").expect("canonical DDL") + 4;
+        conn.execute_batch(&schema[from..to])?;
+    }
+
+    conn.execute_batch("DROP TABLE IF EXISTS probes;")?;
     Ok(())
 }
 

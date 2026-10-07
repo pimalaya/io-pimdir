@@ -80,6 +80,7 @@ fn arb_opts() -> impl Strategy<Value = PimdirSyncOptions> {
             rights,
             conflict,
             full,
+            ..Default::default()
         })
 }
 
@@ -201,7 +202,7 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
 
     let mut client = Client::new(remote);
     let writable = PimdirSyncOptions::default();
-    client.sync("inbox", writable).unwrap();
+    client.sync("inbox", writable.clone()).unwrap();
     hydrate(&mut client);
     well_formed(&client, "after the seeding sync")?;
 
@@ -305,7 +306,7 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
                 }
             }
             PolicyOp::Sync(opts) => {
-                let report = client.sync("inbox", opts).unwrap();
+                let report = client.sync("inbox", opts.clone()).unwrap();
                 let conflicted = report
                     .events
                     .iter()
@@ -320,7 +321,7 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
                 hydrate(&mut client);
             }
             PolicyOp::SyncArchive => {
-                client.sync("archive", writable).unwrap();
+                client.sync("archive", writable.clone()).unwrap();
             }
         }
 
@@ -328,8 +329,8 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
     }
 
     for _ in 0..3 {
-        client.sync("inbox", writable).unwrap();
-        client.sync("archive", writable).unwrap();
+        client.sync("inbox", writable.clone()).unwrap();
+        client.sync("archive", writable.clone()).unwrap();
     }
     well_formed(&client, "after a writable quiescence")?;
 

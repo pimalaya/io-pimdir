@@ -375,7 +375,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 PimdirStatus::Conflict,
                 PimdirStatus::Tombstone,
             ][status];
-            let level = [PimdirLevel::Probed, PimdirLevel::Meta, PimdirLevel::Full][level];
+            let level = [PimdirLevel::Meta, PimdirLevel::Meta, PimdirLevel::Full][level];
             let conflicted_before = is_conflicted(harness.path(), collection, source, link);
 
             let mut batch = harness.bodies(&[object, base_object.flatten(), conflict_object]);

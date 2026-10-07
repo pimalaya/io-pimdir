@@ -40,6 +40,7 @@ use crate::{
         },
     },
     codec::{self, PimdirAction},
+    collection::{PimdirCoverage, PimdirScope},
     hash::{PimdirHashAlgo, PimdirHasher},
     hub::{PimdirBinding, PimdirSourceId},
     object::PimdirHash,
@@ -86,6 +87,12 @@ pub struct PimdirCollection {
     /// book, `None` when the source states nothing or the store predates
     /// the column.
     pub role: Option<String>,
+    /// The coverage the collection is listed with (§14.1): the narrowest
+    /// of its sources' (the latest floor, the earliest ceiling, the oldest
+    /// closing), `None` while one of them has never closed a round. A
+    /// reader says "mail since" from it, and a search over the collection
+    /// knows it is not exhaustive below it.
+    pub coverage: Option<PimdirCoverage>,
 }
 
 /// One live item as a read reports it (STORAGE §14.1).
@@ -203,6 +210,83 @@ pub struct PimdirConflict {
     pub object: Option<PimdirHash>,
     /// The remote side, `None` until the upgrade supplies it.
     pub conflict_object: Option<PimdirHash>,
+}
+
+/// One source's coverage of a collection and the round it has under way
+/// (§14.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirSourceCoverage {
+    /// The source.
+    pub source: String,
+    /// The scope of its last closed round and when it closed, `None`
+    /// before one closed.
+    pub coverage: Option<PimdirCoverage>,
+    /// The round it has under way, if any.
+    pub round: Option<PimdirRoundState>,
+}
+
+/// A round under way as a reader sees it: its scope and when it opened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirRoundState {
+    /// The scope the round lists.
+    pub scope: PimdirScope,
+    /// When it opened, an RFC 3339 instant.
+    pub started_at: String,
+}
+
+/// The read and attachment chips of the mail reads (§14.1), `None` for
+/// either way.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirMailFilter {
+    /// `Some(true)` read only, `Some(false)` unread only: a flag set
+    /// holding no `\Seen`, an unknown one included, is unread.
+    pub seen: Option<bool>,
+    /// `Some(true)` with an attachment mark only, `Some(false)` without;
+    /// a mark never examined matches neither.
+    pub attachment: Option<bool>,
+}
+
+/// Where a filtered mail page resumes: the last entry of the page before.
+///
+/// One public id is shared by an identity's placements (§9.1), so the
+/// collection breaks the tie.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirMailCursor {
+    /// The entry's sort key.
+    pub sort_key: String,
+    /// Its public id.
+    pub seq: i64,
+    /// Its collection.
+    pub collection: String,
+}
+
+/// One entry of a mail page spanning collections.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirMailEntry {
+    /// The collection the placement sits in.
+    pub collection: String,
+    /// The item, with its summary and addresses.
+    pub item: PimdirItem,
+}
+
+impl PimdirMailEntry {
+    /// The cursor resuming the page after this entry.
+    pub fn cursor(&self) -> PimdirMailCursor {
+        PimdirMailCursor {
+            sort_key: self.item.sort_key.clone(),
+            seq: self.item.seq,
+            collection: self.collection.clone(),
+        }
+    }
+}
+
+/// How much mail one day of the `Date` holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirDayCount {
+    /// The day as `YYYY-MM-DD`, `None` for the undated.
+    pub day: Option<String>,
+    /// The messages that day.
+    pub count: u64,
 }
 
 /// One item the change feed reports (§4.5).
@@ -372,13 +456,23 @@ impl PimdirReader {
     }
 
     /// A collection listing as the store can answer it: one whose owner has
-    /// not reconciled `collections.role` yet reads it as `NULL` (§6).
+    /// not reconciled `collections.role` or the coverage columns yet reads
+    /// them as `NULL` (§6).
     fn collections_sql(&self, statement: &'static str) -> Result<String, PimdirError> {
-        Ok(if schema::has_column(&self.conn, "collections", "role")? {
-            String::from(statement)
-        } else {
-            statement.replace("generation, role", "generation, NULL AS role")
-        })
+        let mut statement = String::from(statement);
+        if !schema::has_column(&self.conn, "collections", "role")? {
+            statement = statement.replace("c.generation, c.role", "c.generation, NULL AS role");
+        }
+        if !schema::has_column(&self.conn, "sources", "covered_at")?
+            && let (Some(from), Some(to)) = (statement.find("LEFT JOIN ("), statement.find(") v"))
+        {
+            statement.replace_range(
+                from..to + 3,
+                "LEFT JOIN (SELECT NULL AS collection, NULL AS covered_since, \
+                 NULL AS covered_until, NULL AS covered_at) v",
+            );
+        }
+        Ok(statement)
     }
 
     /// The accounts owning at least one collection; not a configured roster.
@@ -745,17 +839,6 @@ impl PimdirReader {
         Ok(count + self.arrived(&pending)?.len() as u64)
     }
 
-    /// How many of a collection's handles no read can list yet.
-    pub fn count_probes(&self, collection: impl AsRef<str>) -> Result<u64, PimdirError> {
-        let collection = collection.as_ref();
-        let count: i64 = self.conn.query_row(
-            sql::COUNT_PROBES,
-            named_params! { ":collection": collection },
-            |r| r.get(0),
-        )?;
-        Ok(count.max(0) as u64)
-    }
-
     /// Every live placement of one key, with its collection and account (§9.2).
     pub fn link_placements(&self, link_id: &str) -> Result<Vec<PimdirItemLocation>, PimdirError> {
         Ok(rows(
@@ -1043,6 +1126,249 @@ impl PimdirReader {
     }
 }
 
+/// The mail reads (§14.1): counts and pages over a set of collections
+/// under the read and attachment chips, and the sender and subject
+/// search, so a list is sized by a count before it loads around the
+/// scroll position. They read the committed rows, the pending queue not
+/// folded in.
+impl PimdirReader {
+    /// One collection's coverage per source, with the round each has
+    /// under way (`list_coverage`): what a reader says "mail since" from
+    /// per account, or shows a first sync filling in by. A store its
+    /// owner has not reconciled answers no coverage.
+    pub fn list_coverage(
+        &self,
+        collection: impl AsRef<str>,
+    ) -> Result<Vec<PimdirSourceCoverage>, PimdirError> {
+        if !schema::has_column(&self.conn, "sources", "covered_at")? {
+            return Ok(Vec::new());
+        }
+        Ok(rows(
+            &self.conn,
+            sql::LIST_COVERAGE,
+            named_params! { ":collection": collection.as_ref() },
+            |r| {
+                let at: Option<String> = r.get(3)?;
+                let started_at: Option<String> = r.get(4)?;
+                Ok(PimdirSourceCoverage {
+                    source: r.get(0)?,
+                    coverage: match at {
+                        Some(at) => Some(PimdirCoverage {
+                            scope: PimdirScope {
+                                since: r.get(1)?,
+                                until: r.get(2)?,
+                            },
+                            at,
+                        }),
+                        None => None,
+                    },
+                    round: match started_at {
+                        Some(started_at) => Some(PimdirRoundState {
+                            scope: PimdirScope {
+                                since: r.get(5)?,
+                                until: r.get(6)?,
+                            },
+                            started_at,
+                        }),
+                        None => None,
+                    },
+                })
+            },
+        )?)
+    }
+
+    /// How much live mail a set of collections holds under the chips
+    /// (`count_mail`).
+    pub fn count_mail(
+        &self,
+        collections: &[impl AsRef<str>],
+        filter: PimdirMailFilter,
+    ) -> Result<u64, PimdirError> {
+        let count: i64 = self.conn.query_row(
+            sql::COUNT_MAIL,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":seen": filter.seen,
+                ":attachment": filter.attachment,
+            },
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// [`count_mail`](Self::count_mail) per day of the `Date`
+    /// (`count_mail_by_day`), newest day first and the undated last.
+    /// `shift` is a SQLite date modifier moving the UTC instant to the
+    /// reader's wall clock (`"+120 minutes"`), `None` reading UTC days.
+    pub fn count_mail_by_day(
+        &self,
+        collections: &[impl AsRef<str>],
+        filter: PimdirMailFilter,
+        shift: Option<&str>,
+    ) -> Result<Vec<PimdirDayCount>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            sql::COUNT_MAIL_BY_DAY,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":seen": filter.seen,
+                ":attachment": filter.attachment,
+                ":shift": shift,
+            },
+            |r| {
+                Ok(PimdirDayCount {
+                    day: r.get(0)?,
+                    count: r.get::<_, i64>(1)?.max(0) as u64,
+                })
+            },
+        )?)
+    }
+
+    /// The unread mail of each collection of a set under the attachment
+    /// chip (`count_unread`), a collection holding none left out.
+    pub fn count_unread(
+        &self,
+        collections: &[impl AsRef<str>],
+        attachment: Option<bool>,
+    ) -> Result<BTreeMap<String, u64>, PimdirError> {
+        let counted = rows(
+            &self.conn,
+            sql::COUNT_UNREAD,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":attachment": attachment,
+            },
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64)),
+        )?;
+        Ok(counted.into_iter().collect())
+    }
+
+    /// A newest-first page of live mail over a set of collections under
+    /// the chips (`list_mail_page_filtered`), each with its summary and
+    /// addresses; `after` is the last entry of the page before, `None`
+    /// the first page.
+    pub fn list_mail_page_filtered(
+        &self,
+        collections: &[impl AsRef<str>],
+        filter: PimdirMailFilter,
+        after: Option<&PimdirMailCursor>,
+        limit: usize,
+    ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        let mut entries = rows(
+            &self.conn,
+            sql::LIST_MAIL_PAGE_FILTERED,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":seen": filter.seen,
+                ":attachment": filter.attachment,
+                ":after_key": after.map(|after| after.sort_key.as_str()),
+                ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
+                ":after_collection": after.map(|after| after.collection.as_str()),
+                ":limit": limit as i64,
+            },
+            mail_entry_from_row,
+        )?;
+        self.attach_mail_addresses(&mut entries)?;
+        Ok(entries)
+    }
+
+    /// [`list_mail_page_filtered`](Self::list_mail_page_filtered) over
+    /// the messages whose subject, sender or sender name matches the
+    /// `LIKE` pattern (`search_mail`), [`like_pattern`] building one from
+    /// the words searched. Not the body, which SEARCH.md's index answers:
+    /// a hit list says so.
+    pub fn search_mail(
+        &self,
+        collections: &[impl AsRef<str>],
+        pattern: &str,
+        filter: PimdirMailFilter,
+        after: Option<&PimdirMailCursor>,
+        limit: usize,
+    ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        let mut entries = rows(
+            &self.conn,
+            sql::SEARCH_MAIL,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":pattern": pattern,
+                ":seen": filter.seen,
+                ":attachment": filter.attachment,
+                ":after_key": after.map(|after| after.sort_key.as_str()),
+                ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
+                ":after_collection": after.map(|after| after.collection.as_str()),
+                ":limit": limit as i64,
+            },
+            mail_entry_from_row,
+        )?;
+        self.attach_mail_addresses(&mut entries)?;
+        Ok(entries)
+    }
+
+    /// Joins the address rows onto a mail page spanning collections, one
+    /// query per collection the page holds.
+    fn attach_mail_addresses(&self, entries: &mut [PimdirMailEntry]) -> Result<(), PimdirError> {
+        let mut by_collection: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (at, entry) in entries.iter().enumerate() {
+            by_collection
+                .entry(entry.collection.clone())
+                .or_default()
+                .push(at);
+        }
+        for (collection, positions) in by_collection {
+            let mut items: Vec<PimdirItem> = positions
+                .iter()
+                .map(|at| entries[*at].item.clone())
+                .collect();
+            self.attach_addresses(&collection, &[PimdirSummaryTable::Mail], &mut items)?;
+            for (at, item) in positions.into_iter().zip(items) {
+                entries[at].item = item;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `LIKE` pattern [`PimdirReader::search_mail`] matches: the words
+/// searched as typed, `%` around them, and a literal `%`, `_` or `\`
+/// escaped with `\`.
+pub fn like_pattern(words: &str) -> String {
+    let mut pattern = String::from("%");
+    for char in words.trim().chars() {
+        if matches!(char, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(char);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// A set of collection ids as the JSON array the mail reads bind.
+fn collections_json(collections: &[impl AsRef<str>]) -> Result<String, PimdirError> {
+    let ids: Vec<&str> = collections.iter().map(AsRef::as_ref).collect();
+    Ok(serde_json::to_string(&ids)?)
+}
+
+/// Maps a `list_mail_page_filtered`-shaped row: the collection, the item
+/// columns, then the mail summary's.
+fn mail_entry_from_row(row: &Row) -> rusqlite::Result<PimdirMailEntry> {
+    let flags: Option<String> = row.get(3)?;
+    let object: Option<String> = row.get(4)?;
+    Ok(PimdirMailEntry {
+        collection: row.get(0)?,
+        item: PimdirItem {
+            seq: row.get(1)?,
+            link_id: PimdirLinkId(row.get(2)?),
+            flags: codec::flags_from_json(flags.as_deref()),
+            object: object.map(PimdirHash),
+            sort_key: row.get(5)?,
+            level: codec::level_from_int(row.get(6)?),
+            summary: PimdirSummaryTable::Mail.read_row(row, 7)?,
+            retention: None,
+        },
+    })
+}
+
 /// What the pending queue changes about one collection (§15.4).
 #[derive(Debug, Default)]
 struct PimdirPending {
@@ -1276,6 +1602,16 @@ fn collection_from_row(r: &Row<'_>) -> rusqlite::Result<PimdirCollection> {
         sort_order: r.get(7)?,
         generation: r.get(8)?,
         role: r.get(9)?,
+        coverage: match r.get::<_, Option<String>>(12)? {
+            Some(at) => Some(PimdirCoverage {
+                scope: PimdirScope {
+                    since: r.get(10)?,
+                    until: r.get(11)?,
+                },
+                at,
+            }),
+            None => None,
+        },
     })
 }
 

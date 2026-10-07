@@ -35,9 +35,11 @@ impl CollectionCommand {
 /// List every collection with its counts.
 ///
 /// One row per collection: its id, declared media type, display name,
-/// handle-space generation, live, probed and retained item counts. A probe is
-/// a handle a source enumerated whose identity is not read yet, so no listing
-/// can show it. The retained count is what a delete left behind: hidden from
+/// handle-space generation, coverage, live and retained item counts. The
+/// coverage is the scope every source of the collection has listed whole
+/// (`all`, or since a date and until one), `-` while one of them has never
+/// closed a round: below it, the store may lack mail the server holds. The
+/// retained count is what a delete left behind: hidden from
 /// every read and from the sync, and only `item purge` destroys them.
 #[derive(Debug, Args)]
 pub struct CollectionListCommand;
@@ -51,13 +53,21 @@ impl CollectionListCommand {
         for collection in store.list_collections().map_err(report)? {
             rows.push(CollectionRow {
                 live: store.count_items(&collection.id).map_err(report)?,
-                probes: store.count_probes(&collection.id).map_err(report)?,
                 retained: store.count_retained(&collection.id).map_err(report)?.max(0) as u64,
                 id: collection.id,
                 kind: collection.kind,
                 name: collection.name,
                 generation: collection.generation,
                 role: collection.role,
+                covered_since: collection
+                    .coverage
+                    .as_ref()
+                    .and_then(|c| c.scope.since.clone()),
+                covered_until: collection
+                    .coverage
+                    .as_ref()
+                    .and_then(|c| c.scope.until.clone()),
+                covered_at: collection.coverage.map(|c| c.at),
             });
         }
 
@@ -83,10 +93,34 @@ pub struct CollectionRow {
     pub role: Option<String>,
     /// Live items.
     pub live: u64,
-    /// Handles enumerated but not yet identified.
-    pub probes: u64,
+    /// The floor of the scope every source has listed whole, `None` for
+    /// none or while one source never closed a round.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_since: Option<String>,
+    /// Its ceiling, exclusive, `None` for none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_until: Option<String>,
+    /// When the oldest of those rounds closed, `None` while one source
+    /// never closed one: no coverage at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_at: Option<String>,
     /// Retained (soft-deleted) items.
     pub retained: u64,
+}
+
+impl CollectionRow {
+    /// The coverage as the table shows it.
+    fn coverage(&self) -> String {
+        if self.covered_at.is_none() {
+            return String::from("-");
+        }
+        match (&self.covered_since, &self.covered_until) {
+            (None, None) => String::from("all"),
+            (Some(since), None) => format!("since {since}"),
+            (None, Some(until)) => format!("until {until}"),
+            (Some(since), Some(until)) => format!("{since} to {until}"),
+        }
+    }
 }
 
 /// The `collection list` output.
@@ -111,7 +145,7 @@ impl fmt::Display for CollectionsOutput {
                 Cell::new("ROLE"),
                 Cell::new("GEN"),
                 Cell::new("LIVE"),
-                Cell::new("PROBED"),
+                Cell::new("COVERED"),
                 Cell::new("RETAINED"),
             ]);
 
@@ -123,7 +157,7 @@ impl fmt::Display for CollectionsOutput {
                 Cell::new(or_dash(row.role.as_deref())),
                 Cell::new(row.generation),
                 Cell::new(row.live),
-                Cell::new(row.probes),
+                Cell::new(row.coverage()),
                 Cell::new(row.retained),
             ]);
         }

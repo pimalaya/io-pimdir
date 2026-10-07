@@ -1,10 +1,11 @@
 //! # The seam
 //!
 //! The load and the write of one source (STORAGE §14): a load projects
-//! the hub for the source with its probes and checkpoint, and a write
-//! folds a batch into the hub narrowed to the link ids it names, then
-//! persists only the rows that moved. Probes, retention, refcounts and
-//! the generation bump ride the same transaction.
+//! the hub for the source with its sync state (checkpoint, coverage and
+//! round), and a write folds a batch into the hub narrowed to the link
+//! ids it names, then persists only the rows that moved. The round ops,
+//! retention, refcounts and the generation bump ride the same
+//! transaction.
 
 use alloc::{string::String, vec, vec::Vec};
 
@@ -21,13 +22,16 @@ use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     client::{PimdirError, PimdirSourceStore, blobs::PimdirBlobs, busy_or_sql, release_pins, rows},
     codec,
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::{
+        PimdirCheckpoint, PimdirCollectionId, PimdirCoverage, PimdirCursor, PimdirRound,
+        PimdirScope,
+    },
     hub::{PimdirBinding, PimdirHub, PimdirHubItem, PimdirSourceId},
     load::{PimdirLoadScope, PimdirLoaded},
     object::{PimdirHash, PimdirObject},
     placement::{
-        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
-        PimdirPlacement, PimdirSortKey, PimdirStatus,
+        PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin, PimdirPlacement,
+        PimdirSortKey, PimdirStatus,
     },
     sql,
     summary::{
@@ -43,9 +47,10 @@ impl PimdirSourceStore {
     /// Loads a collection as this source sees it (SYNC §3, §10).
     ///
     /// `scope` is a floor: the projection holds at least the placements
-    /// it names. A handle no binding holds is a probe, and a probe has
-    /// no link id, so a `Links` scope yields none of them; nor does it
-    /// yield the copy the hub offers for an item this source lacks, which
+    /// it names, and with them the source's checkpoint, coverage and round
+    /// under way; an `All` load while a round is open adds the bindings
+    /// it has not stamped in its scope. A `Links` scope does not yield the
+    /// copy the hub offers for an item this source lacks, which
     /// is no row the source holds under the key. A `Created` placement
     /// carries its origin and a `Tombstone` its destination, both read
     /// from this source's bindings elsewhere (SYNC §3).
@@ -93,45 +98,22 @@ impl PimdirSourceStore {
                         .is_some_and(|item| item.sources.contains_key(&self.source))
                 })
             });
-        } else {
-            let probes = match scope {
-                PimdirLoadScope::Handles(handles) => {
-                    probes_by_handle(conn, &collection.0, &self.source, handles)?
-                }
-                _ => probes(conn, &collection.0, &self.source)?,
-            };
-            for (handle, flags) in probes {
-                placements.push(PimdirPlacement {
-                    collection: collection.clone(),
-                    handle,
-                    link_id: None,
-                    object: None,
-                    level: PimdirLevel::Probed,
-                    summary: None,
-                    sort_key: PimdirSortKey::default(),
-                    flags,
-                    status: PimdirStatus::Clean,
-                    conflict_revision: None,
-                    conflict_object: None,
-                    base: None,
-                    origin: None,
-                });
-            }
         }
 
-        let checkpoint = conn
-            .query_row(
-                sql::LOAD_CHECKPOINT,
-                named_params! { ":collection": collection.0, ":source": self.source.0 },
-                |r| r.get::<_, Option<Vec<u8>>>(0),
-            )
-            .optional()?
-            .flatten()
-            .map(PimdirCheckpoint);
+        let state = sync_state(conn, &collection.0, &self.source)?;
+        let unstamped = match (scope, &state.round) {
+            (PimdirLoadScope::All, Some(_)) => {
+                unstamped_bindings(conn, &collection.0, &self.source)?
+            }
+            _ => Vec::new(),
+        };
 
         Ok(PimdirLoaded {
             placements,
-            checkpoint,
+            checkpoint: state.checkpoint,
+            coverage: state.coverage,
+            round: state.round,
+            unstamped,
         })
     }
 
@@ -195,9 +177,10 @@ impl PimdirSourceStore {
 
 /// Applies a batch inside the caller's transaction.
 ///
-/// Objects and checkpoints are written as they come. A placement with
-/// no link id lands on the binding its handle holds (§10) or, when none
-/// does, as a probe; a placement whose handle is bound to another link
+/// Objects, checkpoints and the round ops are written as they come, but
+/// for the round's stamps, which follow the batch's upserts. A placement
+/// with no link id lands on the binding its handle holds (§10) and is
+/// refused when none does, nothing reaching the store unnamed; one whose handle is bound to another link
 /// id retires that binding first, as a `Deleted` drop of the handle
 /// would (§10); every other placement op folds into the hub per
 /// collection, and the diff between the hub before and after is what
@@ -213,6 +196,7 @@ pub(crate) fn apply(
     let mut licensed: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
     let mut dropped: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
     let mut rekeyed: BTreeSet<String> = BTreeSet::new();
+    let mut stamps: Vec<(PimdirCollectionId, Vec<PimdirHandle>)> = Vec::new();
 
     for op in ops {
         match op {
@@ -239,6 +223,64 @@ pub(crate) fn apply(
                     },
                 )?;
             }
+            PimdirWriteOp::OpenRound { collection, scope } => {
+                ensure_collection(tx, &collection.0, account)?;
+                tx.execute(
+                    sql::OPEN_ROUND,
+                    named_params! {
+                        ":collection": collection.0,
+                        ":source": source.0,
+                        ":since": scope.since,
+                        ":until": scope.until,
+                    },
+                )?;
+            }
+            PimdirWriteOp::Stamp {
+                collection,
+                handles,
+            } => stamps.push((collection, handles)),
+            PimdirWriteOp::SetRoundCursor {
+                collection,
+                cursor,
+                checkpoint,
+            } => {
+                tx.execute(
+                    sql::SET_ROUND_CURSOR,
+                    named_params! {
+                        ":collection": collection.0,
+                        ":source": source.0,
+                        ":cursor": cursor.0,
+                        ":checkpoint": checkpoint.map(|checkpoint| checkpoint.0),
+                    },
+                )?;
+            }
+            PimdirWriteOp::CloseRound {
+                collection,
+                coverage,
+                checkpoint,
+            } => {
+                tx.execute(
+                    sql::CLOSE_ROUND,
+                    named_params! {
+                        ":collection": collection.0,
+                        ":source": source.0,
+                        ":since": coverage.since,
+                        ":until": coverage.until,
+                        ":checkpoint": checkpoint.map(|checkpoint| checkpoint.0),
+                    },
+                )?;
+            }
+            PimdirWriteOp::SetCoverage { collection, scope } => {
+                tx.execute(
+                    sql::SET_COVERAGE,
+                    named_params! {
+                        ":collection": collection.0,
+                        ":source": source.0,
+                        ":since": scope.since,
+                        ":until": scope.until,
+                    },
+                )?;
+            }
             PimdirWriteOp::UpsertPlacement(mut placement) => {
                 ensure_collection(tx, &placement.collection.0, account)?;
                 let bound =
@@ -247,19 +289,14 @@ pub(crate) fn apply(
                 if placement.link_id.is_none() {
                     placement.link_id = bound.clone();
                 }
+                // NOTE: nothing reaches the store unnamed (SYNC §10): a
+                // listing names every member it carries.
                 let Some(link) = &placement.link_id else {
-                    tx.execute(
-                        sql::UPSERT_PROBE,
-                        named_params! {
-                            ":collection": placement.collection.0,
-                            ":source": source.0,
-                            ":handle": placement.handle.0,
-                            ":flags": codec::flags_to_json(&placement.flags),
-                        },
-                    )?;
-                    continue;
+                    return Err(PimdirError::Unnamed {
+                        collection: placement.collection.0.clone(),
+                        handle: placement.handle.0.clone(),
+                    });
                 };
-                delete_probe(tx, &placement.collection.0, source, &placement.handle)?;
                 let ops = hub_ops.entry(placement.collection.0.clone()).or_default();
                 let already_dropped = dropped
                     .get(&placement.collection.0)
@@ -278,7 +315,6 @@ pub(crate) fn apply(
                 handle,
                 reason,
             } => {
-                delete_probe(tx, &collection.0, source, &handle)?;
                 dropped
                     .entry(collection.0.clone())
                     .or_default()
@@ -310,8 +346,22 @@ pub(crate) fn apply(
         let mut new = old.clone();
         new.absorb(source, &ops);
         let licensed = licensed.remove(&collection).unwrap_or_default();
-        save_hub_diff(tx, &collection, source, &old, &mut new, &licensed)?;
+        save_hub_diff(tx, &collection, source, &ops, &old, &mut new, &licensed)?;
         adjust_refcounts(tx, &object_refs(&old), &object_refs(&new))?;
+    }
+
+    // NOTE: after the upserts, so a binding the batch inserted is stamped
+    // too (SYNC §5).
+    for (collection, handles) in stamps {
+        let handles: Vec<&str> = handles.iter().map(|handle| handle.0.as_str()).collect();
+        tx.execute(
+            sql::STAMP_BINDINGS,
+            named_params! {
+                ":collection": collection.0,
+                ":source": source.0,
+                ":handles": serde_json::to_string(&handles)?,
+            },
+        )?;
     }
 
     for collection in rekeyed {
@@ -337,60 +387,82 @@ fn ensure_collection(
     Ok(())
 }
 
-fn delete_probe(
-    conn: &Connection,
-    collection: &str,
-    source: &PimdirSourceId,
-    handle: &PimdirHandle,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        sql::DELETE_PROBE,
-        named_params! { ":collection": collection, ":source": source.0, ":handle": handle.0 },
-    )?;
-    Ok(())
+/// One source's sync state of a collection (SYNC §5): its checkpoint,
+/// the coverage it serves and the round under way. A store its owner has
+/// not reconciled reads with no coverage and no round.
+pub(crate) struct PimdirSyncState {
+    pub(crate) checkpoint: Option<PimdirCheckpoint>,
+    pub(crate) coverage: Option<PimdirCoverage>,
+    pub(crate) round: Option<PimdirRound>,
 }
 
-/// One source's probes of a collection: the unnamed handles with the
-/// flags the enumeration reported.
-fn probes(
+/// Reads a source's checkpoint with its coverage (`load_checkpoint`) and
+/// the round under way (`load_round`).
+pub(crate) fn sync_state(
     conn: &Connection,
     collection: &str,
     source: &PimdirSourceId,
-) -> rusqlite::Result<Vec<(PimdirHandle, PimdirFlags)>> {
+) -> Result<PimdirSyncState, PimdirError> {
+    let key = named_params! { ":collection": collection, ":source": source.0 };
+    let loaded = conn
+        .query_row(sql::LOAD_CHECKPOINT, key, |r| {
+            Ok((
+                r.get::<_, Option<Vec<u8>>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .optional()?;
+    let Some((checkpoint, since, until, at)) = loaded else {
+        return Ok(PimdirSyncState {
+            checkpoint: None,
+            coverage: None,
+            round: None,
+        });
+    };
+
+    let round = conn
+        .query_row(sql::LOAD_ROUND, key, |r| {
+            Ok(r.get::<_, Option<String>>(1)?.map(|started_at| {
+                Ok::<_, rusqlite::Error>(PimdirRound {
+                    started_at,
+                    scope: PimdirScope {
+                        since: r.get(2)?,
+                        until: r.get(3)?,
+                    },
+                    cursor: r.get::<_, Option<Vec<u8>>>(4)?.map(PimdirCursor),
+                    checkpoint: r.get::<_, Option<Vec<u8>>>(5)?.map(PimdirCheckpoint),
+                })
+            }))
+        })
+        .optional()?
+        .flatten()
+        .transpose()?;
+
+    Ok(PimdirSyncState {
+        checkpoint: checkpoint.map(PimdirCheckpoint),
+        coverage: at.map(|at| PimdirCoverage {
+            scope: PimdirScope { since, until },
+            at,
+        }),
+        round,
+    })
+}
+
+/// The based bindings of `source` the open round has not stamped and
+/// whose item's `date` is in its scope or unknown (`list_unstamped_bindings`).
+fn unstamped_bindings(
+    conn: &Connection,
+    collection: &str,
+    source: &PimdirSourceId,
+) -> rusqlite::Result<Vec<PimdirHandle>> {
     rows(
         conn,
-        sql::LOAD_PROBES,
+        sql::LIST_UNSTAMPED_BINDINGS,
         named_params! { ":collection": collection, ":source": source.0 },
-        probe_from_row,
+        |r| Ok(PimdirHandle(r.get(0)?)),
     )
-}
-
-/// The probes of a `Handles` load: the unnamed handles among those asked
-/// for (§14), bound as a JSON array.
-fn probes_by_handle(
-    conn: &Connection,
-    collection: &str,
-    source: &PimdirSourceId,
-    handles: &[PimdirHandle],
-) -> Result<Vec<(PimdirHandle, PimdirFlags)>, PimdirError> {
-    let handles: Vec<&str> = handles.iter().map(|handle| handle.0.as_str()).collect();
-    Ok(rows(
-        conn,
-        sql::LOAD_PROBES_BY_HANDLE,
-        named_params! {
-            ":collection": collection,
-            ":source": source.0,
-            ":handles": serde_json::to_string(&handles)?,
-        },
-        probe_from_row,
-    )?)
-}
-
-fn probe_from_row(row: &Row) -> rusqlite::Result<(PimdirHandle, PimdirFlags)> {
-    Ok((
-        PimdirHandle(row.get(0)?),
-        codec::flags_from_json(row.get::<_, Option<String>>(1)?.as_deref()),
-    ))
 }
 
 /// Refuses a batch binding one link id to two handles, unless a
@@ -564,7 +636,14 @@ pub(crate) fn read_hub(
         params.push((":links", scope));
     }
 
-    for (link, item) in rows(conn, items_sql, params.as_slice(), item_from_row)? {
+    // NOTE: a level of 0 an earlier draft wrote reads as `Meta`, a claim
+    // the row may not hold (SYNC §3): its summary is not offered, so the
+    // next `Meta` upgrade revisits it.
+    let mut unheld: Vec<PimdirLinkId> = Vec::new();
+    for (link, item, claimed) in rows(conn, items_sql, params.as_slice(), item_from_row)? {
+        if claimed {
+            unheld.push(link.clone());
+        }
         hub.items.insert(link, item);
     }
     for (link, source, binding) in rows(conn, bindings_sql, params.as_slice(), binding_from_row)? {
@@ -588,6 +667,11 @@ pub(crate) fn read_hub(
             .and_then(|item| item.summary.as_mut())
         {
             attach_address(summary, role, address);
+        }
+    }
+    for link in unheld {
+        if let Some(item) = hub.items.get_mut(&link) {
+            item.summary = None;
         }
     }
 
@@ -866,6 +950,7 @@ fn save_hub_diff(
     conn: &Connection,
     collection: &str,
     source: &PimdirSourceId,
+    ops: &[PimdirWriteOp],
     old: &PimdirHub,
     new: &mut PimdirHub,
     licensed: &BTreeSet<PimdirHandle>,
@@ -876,7 +961,24 @@ fn save_hub_diff(
         }
     }
 
-    let links: Vec<PimdirLinkId> = new.items.keys().cloned().collect();
+    // NOTE: in the batch's own order, so the items a page names draw
+    // their public ids in the order it lists them (§9.1).
+    let mut links: Vec<PimdirLinkId> = Vec::with_capacity(new.items.len());
+    let mut seen: BTreeSet<&PimdirLinkId> = BTreeSet::new();
+    for op in ops {
+        if let PimdirWriteOp::UpsertPlacement(placement) = op
+            && let Some(link) = &placement.link_id
+            && new.items.contains_key(link)
+            && seen.insert(link)
+        {
+            links.push(link.clone());
+        }
+    }
+    for link in new.items.keys() {
+        if seen.insert(link) {
+            links.push(link.clone());
+        }
+    }
     for link in &links {
         let item = new.items.get_mut(link).expect("a hub item");
         let prev = old.items.get(link);
@@ -1412,7 +1514,9 @@ fn adjust_refcounts(
     Ok(())
 }
 
-fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem)> {
+/// Maps a `load_items`-shaped row, and whether its level is the `0` an
+/// earlier draft wrote, a claim the row may not hold.
+fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem, bool)> {
     let link: String = row.get(0)?;
     let flags: Option<String> = row.get(1)?;
     let object: Option<String> = row.get(2)?;
@@ -1435,6 +1539,7 @@ fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem)> {
             conflict_object: conflict_object.map(PimdirHash),
             sources: BTreeMap::new(),
         },
+        level == 0,
     ))
 }
 

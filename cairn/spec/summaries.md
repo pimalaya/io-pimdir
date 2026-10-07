@@ -20,10 +20,13 @@ An encoded word's charset is decoded by the byte for `iso-8859-1` and `us-ascii`
 Content stating no identity SHALL still be keyed, the same way by every writer: `alt:{subject}|{date}|{sender}` for a message with no `Message-ID`, `hash:` over the FNV-1a 64 digest of the bytes (offset basis `cbf29ce484222325`, prime `100000001b3`) for a card or a resource with no `UID`, the key vectors/summaries.json pins.
 
 ### Requirement: The two tiers agree
-A `PimdirMailSummary` built from an envelope at the `Meta` tier SHALL yield the same key, row and sort key as the `Full` derivation of the same message, `attachment` aside, which the envelope cannot walk and leaves `None`.
+A `PimdirMailSummary` built without the body (an envelope, `summary::mail::derive_meta` over the header block, a Graph `$select`) SHALL yield the same key, row and sort key as the `Full` derivation of the same message, `attachment` aside, which it reads without the body (below).
+
+### Requirement: The attachment mark is read without the body
+Read without the body, the mark SHALL be the source's own flag where it states one (Graph's `hasAttachments`, JMAP's `hasAttachment`), else `summary::mail::meta_attachment`: `true` when the top-level `Content-Type` is `multipart/mixed`, `false` otherwise (pimdir STORAGE Annex A.1). `derive_meta(header, size, attachment)` takes the source's flag as `attachment`. The walk of the parts replaces it once the body is read, and a summary read without the body SHALL NOT replace a walked mark (`summary::without_body`, for a listing, a `Meta` fetch and a rekey over a placement holding its body).
 
 ### Requirement: A time is resolved from what the resource carries
 A calendar `sort_key` SHALL resolve a zoned start through the `VTIMEZONE` the resource carries and nothing else; an ambiguous or nonexistent wall time takes the numerically greater offset; a zone that will not resolve reads as floating; a date-only value reads as midnight UTC.
 
 ### Requirement: The derivations are checked against the format's vectors
-tests/summaries.rs SHALL run every case of the specification's vectors/summaries.json: the fixture's names under both hashes, the key (the minted one where the case states a hint and a handle), the summary row, the address rows and the sort key, compared as parsed structures, skipping when the spec checkout is absent.
+tests/summaries.rs SHALL run every case of the specification's vectors/summaries.json: the fixture's names under both hashes, the key (the minted one where the case states a hint and a handle), the summary row, the address rows, the sort key and, for mail, the mark read without the body (`meta_attachment`) with every other column agreeing, compared as parsed structures, skipping when the spec checkout is absent.

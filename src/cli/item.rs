@@ -561,7 +561,6 @@ fn one(found: Vec<Found>, seq: i64) -> Result<Found> {
 /// The detail ladder as its lowercase name.
 fn level_name(level: PimdirLevel) -> &'static str {
     match level {
-        PimdirLevel::Probed => "probed",
         PimdirLevel::Meta => "meta",
         PimdirLevel::Full => "full",
     }
@@ -585,7 +584,7 @@ pub struct ItemRow {
     pub link_id: String,
     /// The raw flag strings, `null` while nothing has read them.
     pub flags: Option<Vec<String>>,
-    /// The detail level (`probed`, `meta`, `full`).
+    /// The detail level (`meta`, `full`).
     pub level: &'static str,
     /// The body's content hash, when hydrated.
     pub object: Option<String>,

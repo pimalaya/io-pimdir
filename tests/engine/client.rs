@@ -5,10 +5,13 @@
 
 use io_pimdir::{
     change::PimdirChange,
-    collection::{PimdirCheckpoint, PimdirCollectionId},
+    collection::PimdirCollectionId,
     mutate::PimdirMutation,
     placement::PimdirHandle,
-    remote::{PimdirFetchedItem, PimdirPushResult, PimdirRemote, PimdirRemoteSnapshot, PimdirTier},
+    remote::{
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirRemote,
+        PimdirTier,
+    },
     sync::PimdirSyncOptions,
 };
 
@@ -23,8 +26,8 @@ impl PimdirRemote for BrokenRemote {
     fn enumerate(
         &mut self,
         _: &PimdirCollectionId,
-        _: Option<PimdirCheckpoint>,
-    ) -> Result<PimdirRemoteSnapshot, Self::Error> {
+        _: PimdirEnumerate,
+    ) -> Result<PimdirEnumerated, Self::Error> {
         Err("network unplugged")
     }
 

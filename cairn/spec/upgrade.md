@@ -6,9 +6,9 @@ status: current
 
 # Upgrade
 
-`PimdirUpgrade` is the I/O-free coroutine that raises placements up the detail ladder: `Probed` (the handle exists), `Meta` (its summary and identity are known), `Full` (its body is stored). Enumeration stays cheap because it stops at the first rung, and hydration is a separate verb the consumer runs when it wants the payload, for the members it wants it for.
+`PimdirUpgrade` is the I/O-free coroutine that raises placements to `Full` (their body stored), or revisits at `Meta` (summary and identity known) a claim a row does not hold. A listing names every member at `Meta` (pimdir SYNC §4), and hydration is a separate verb the consumer runs when it wants the payload, for the members it wants it for.
 
-Two things make it more than a fetch loop. It **resolves identity**, since a probed placement has no link id until something reads one, and identity is what every other verb keys on; and it **avoids fetching what the store already holds**, since one body may serve several collections.
+Two things make it more than a fetch loop. It **resolves identity** for a placement no link id names yet, on the rules a page names its members by ([sync](sync.md)), identity being what every other verb keys on; and it **avoids fetching what the store already holds**, since one body may serve several collections.
 
 What the merge does with a hydrated placement lives under [sync](sync.md); what a rebuilt handle space does with one lives under [rekey](rekey.md).
 
@@ -32,7 +32,7 @@ A placement whose base carries a revision SHALL be fetched rather than linked fr
 - THEN the body is fetched from the remote rather than linked from the store
 
 ### Requirement: A fetch establishes a link only for a not-yet-linked item
-Applying a fetched item SHALL set the placement's `link_id` from the fetch **only when the placement has none**: a `Meta` upgrade of a probed placement, or a `Full` fetch of an item that never resolved a link. An already-linked placement SHALL keep its link id when a later fetch (in particular a `Full` body fetch) returns a different one, and simply rise to the fetched tier. A body fetch does not re-identify an item; identity is resolved once, at the first fetch that carries a link. This prevents a two-tier link disagreement (a server ENVELOPE `Message-ID` the body parser misses, or a differently formatted fallback-digest date) from stranding the linked item and duplicating it under the body's link.
+Applying a fetched item SHALL set the placement's `link_id` from the fetch **only when the placement has none**: a `Meta` upgrade of an unnamed placement, or a `Full` fetch of an item that never resolved a link. An already-linked placement SHALL keep its link id when a later fetch (in particular a `Full` body fetch) returns a different one, and simply rise to the fetched tier. A body fetch does not re-identify an item; identity is resolved once, at the first fetch that carries a link. This prevents a two-tier link disagreement (a server ENVELOPE `Message-ID` the body parser misses, or a differently formatted fallback-digest date) from stranding the linked item and duplicating it under the body's link.
 
 #### Scenario: Largest-first hydration overlaps a heavy message
 - GIVEN a consumer that fetches a Full batch across a bounded connection pool, largest first (by its own member sizes)
@@ -40,7 +40,7 @@ Applying a fetched item SHALL set the placement's `link_id` from the fetch **onl
 - THEN the heavy member is fetched concurrently with the light ones, results are matched by handle, and no fetch order is assumed
 
 ### Requirement: An upgrade revisits what it never got
-An upgrade SHALL revisit a placement whose level claims a tier it does not hold: `Full` with no object, `Meta` with no summary. The level is a claim and the payload is the fact, and nothing else revisits what already reads as reached, so such a row would be skipped for good.
+An upgrade SHALL revisit a placement whose level claims a tier it does not hold: `Full` with no object, `Meta` with no summary, which a row an earlier draft wrote at level `0` loads as (pimdir SYNC §3, §6). The `Meta` tier exists for this alone. The level is a claim and the payload is the fact, and nothing else revisits what already reads as reached, so such a row would be skipped for good.
 
 #### Scenario: A body-less full row
 - GIVEN a placement recorded at `Full` holding no object
@@ -114,19 +114,19 @@ A `Full` fetch over a placement holding no staged edit SHALL set the base to the
 ### Requirement: A mutable member restating its hint is a new identity
 A fetch reporting, under a handle, a hint other than the link id the placement holds SHALL key the handle afresh where the kind is mutable, a revision on the fetch or the base: link id, body and base dropped, the storage retiring the old binding as a changed key (pimdir SYNC §6, STORAGE §10). A minted `dup:` key never equals its hint and stays, and an immutable kind is never re-identified, its tiers disagreeing on the link at times.
 
-### Requirement: Naming a probe gives it a base
-A `Meta` fetch that names a placement holding no link id SHALL give it a base equal to what the source reported, the probe's flags and the fetched revision, since a probe carries none (pimdir SYNC §3) and naming it is what agrees with the source, except when the hint is one a pending create of this source holds, which the fetch lands instead (below). Every fetch SHALL write the summary and addresses Annex A derives, carried on the placement as `PimdirSummary`, the fetched one replacing the stored one whether or not it is present.
+### Requirement: A Meta upgrade revisits a claim the row does not hold
+A `Meta` fetch SHALL raise only a placement holding no summary (vectors/sync/07). One naming a placement holding no link id SHALL give it a base equal to what the source reported, its flags and the fetched revision, naming it being what agrees with the source, except when the hint is one a pending create of this source holds, which the fetch lands instead (below). Every fetch SHALL write the summary and addresses Annex A derives, carried on the placement as `PimdirSummary`, the fetched one replacing the stored one, except the attachment mark of a body-less fetch over a placement holding its body: a mark the walk of the parts gave is never replaced by one read without it (STORAGE Annex A.1, vectors/sync/45).
 
 ### Requirement: A pending create is landed by its arrival
-A fetch resolving a probe to a hint a pending create of the same source holds in the collection, a `Created` placement with no base under a provisional handle, SHALL land that create rather than mint a second copy (pimdir SYNC §6): the hint arrived by a relocation the source's remove made, by an accepted add whose record was lost, or by another client, and it is the create delivered. Only a hint a based binding holds is minted.
+A page or a fetch resolving a member to a hint a pending create of the same source holds in the collection, a `Created` placement with no base under a provisional handle, SHALL land that create rather than mint a second copy (pimdir SYNC §6): the hint arrived by a relocation the source's remove made, by an accepted add whose record was lost, or by another client, and it is the create delivered. Only a hint a based binding holds is minted.
 
-Landing is a `Superseded` drop of the provisional handle, then the create upserted under the fetched handle in the same batch, with a base of the probe's flags, the fetched revision, and the fetched body at `Full` or else the create's own body. The flags, body, summary and sort key staged on the create stay, so an edit made on it still pushes: the status is `Clean` when they equal the base and `Dirty` otherwise, and the origin goes, there being nothing left to copy from. A create holding no body adopts a fetched one as its own.
+Landing is a `Superseded` drop of the provisional handle, then the create upserted under the fetched handle in the same batch, with a base of the flags the source reported, the fetched revision, and the fetched body at `Full` or else the create's own body. The flags, body, summary and sort key staged on the create stay, so an edit made on it still pushes: the status is `Clean` when they equal the base and `Dirty` otherwise, and the origin goes, there being nothing left to copy from. A create holding no body adopts a fetched one as its own.
 
 The `Links` load an upgrade makes for a fresh hint asks for the hint and its minted form, and a store answers with the placements the source binds (SYNC §10), a pending create being one, so the holder to land is in the batch whether or not the requested handles named it.
 
 #### Scenario: A relocated member arrives
-- GIVEN a pending create under `tmp-1` holding `m1`, and a probe `7` the enumeration listed
-- WHEN the `Meta` fetch of `7` resolves to `m1`
+- GIVEN a pending create under `tmp-1` holding `m1`
+- WHEN a page lists `7` with the hint `m1`, or a fetch of an unnamed `7` resolves to it
 - THEN `tmp-1` is dropped `Superseded` and the create is written under `7`, based on what the fetch reported, its body kept
 
 #### Scenario: A held hint is still minted
