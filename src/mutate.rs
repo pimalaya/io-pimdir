@@ -19,7 +19,7 @@ use alloc::{collections::BTreeSet, string::String, vec, vec::Vec};
 use log::{debug, trace};
 
 use crate::{
-    change::PimdirWriteOp,
+    change::{PimdirDropReason, PimdirWriteOp},
     collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoadScope,
@@ -277,7 +277,20 @@ impl PimdirMutate {
                     base.revision = Some(revision);
                     base.object = settled;
                 }
-                vec![PimdirWriteOp::UpsertPlacement(source)]
+                if source.base.is_some() {
+                    return vec![PimdirWriteOp::UpsertPlacement(source)];
+                }
+
+                // NOTE: a pending create is withdrawn (SYNC §7): the
+                // tombstone marks the item deleted, binding an offered
+                // copy if need be, and the drop takes that binding, so
+                // the item is retained or its holders push the delete.
+                let drop = PimdirWriteOp::DropPlacement {
+                    collection: source.collection.clone(),
+                    handle: source.handle.clone(),
+                    reason: PimdirDropReason::Deleted,
+                };
+                vec![PimdirWriteOp::UpsertPlacement(source), drop]
             }
             PimdirMutation::Edit {
                 object,
@@ -674,6 +687,38 @@ mod tests {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
         assert_eq!(p.status, PimdirStatus::Tombstone);
+        assert_eq!(ops.len(), 1, "a based binding stays to push the remove");
+    }
+
+    /// A pending create, bound or offered, is withdrawn by the same write:
+    /// the tombstone marks the item deleted, the drop takes the binding
+    /// (SYNC §7).
+    #[test]
+    fn remove_withdraws_a_pending_create() {
+        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = PimdirStatus::Created;
+        loaded.placements[0].base = None;
+
+        let ops = match mutate.resume(Some(PimdirArg::Load(loaded))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let [PimdirWriteOp::UpsertPlacement(p), drop] = ops.as_slice() else {
+            panic!("expected a tombstone then a drop, got {ops:?}");
+        };
+        assert_eq!(p.status, PimdirStatus::Tombstone);
+        assert_eq!(
+            drop,
+            &PimdirWriteOp::DropPlacement {
+                collection: "inbox".into(),
+                handle: PimdirHandle::from("1"),
+                reason: PimdirDropReason::Deleted,
+            },
+        );
     }
 
     #[test]

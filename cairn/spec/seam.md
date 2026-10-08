@@ -70,7 +70,7 @@ This refines the retention decision point above rather than replacing it: a stor
 
 A load names the collection it reads, which is the coroutine's own except where a verb acts across two: a `Copy` or a `Move` reads its target for the identity it is carrying into it (mutate.md), that being the one question the collection it edits cannot answer.
 
-The scope is a floor, not a ceiling: a storage SHALL return at least the placements it names and MAY return more, so a storage that ignores it stays correct, just as expensive as before. Under-delivering is not correct: a mutation that cannot see a colliding link id creates a duplicate.
+The scope is a floor, not a ceiling: a storage SHALL return at least the placements it names and MAY return more, so a storage that ignores it stays correct, just as expensive as before. Under-delivering is not correct: a mutation that cannot see a colliding link id creates a duplicate. A `Handles` scope naming a provisional handle no binding of the source holds names the copy the hub offers under it, so a mutation can withdraw it.
 
 #### Scenario: A one-row edit reads one row
 - GIVEN a storage that honours the scope exactly

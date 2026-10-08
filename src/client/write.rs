@@ -51,7 +51,8 @@ impl PimdirSourceStore {
     /// under way; an `All` load while a round is open adds the bindings
     /// it has not stamped in its scope. A `Links` scope does not yield the
     /// copy the hub offers for an item this source lacks, which
-    /// is no row the source holds under the key. A `Created` placement
+    /// is no row the source holds under the key, while a `Handles` scope
+    /// naming its provisional handle does. A `Created` placement
     /// carries its origin and a `Tombstone` its destination, both read
     /// from this source's bindings elsewhere (SYNC §3).
     pub fn load(
@@ -69,7 +70,11 @@ impl PimdirSourceStore {
             PimdirLoadScope::Handles(handles) => {
                 let mut links = Vec::new();
                 for handle in handles {
-                    links.extend(link_for_handle(conn, &collection.0, &self.source, handle)?);
+                    let bound = link_for_handle(conn, &collection.0, &self.source, handle)?;
+                    // NOTE: a provisional handle nothing binds names the
+                    // copy the hub offers under it (SYNC §3), its key.
+                    let offered = || handle.as_str().strip_prefix('\u{1}').map(String::from);
+                    links.extend(bound.or_else(offered));
                 }
                 read_hub(conn, &collection.0, Some(&links))?
             }

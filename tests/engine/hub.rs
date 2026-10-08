@@ -655,3 +655,132 @@ fn a_member_a_rebuild_lost_is_deleted_across_the_hub() {
         mirror.server('b'),
     );
 }
+
+/// A removed pending create is withdrawn: its binding goes with the
+/// write, nothing waits on a sync, and the item is retained (SYNC §7).
+#[test]
+fn a_removed_pending_create_leaves_no_binding() {
+    let mut mirror = Mirror::new();
+    let body = b"authored on a";
+    let object = PimdirObject {
+        hash: hash(body),
+        size: body.len(),
+    };
+    let link = PimdirLinkId::from("msg-a");
+    mirror
+        .a
+        .mutate(
+            "inbox",
+            PimdirMutation::Add {
+                link_id: link.clone(),
+                flags: Default::default(),
+                object,
+                body: body.to_vec(),
+                summary: None,
+                sort_key: Default::default(),
+            },
+        )
+        .unwrap();
+
+    mirror
+        .a
+        .mutate("inbox", PimdirMutation::Remove(link.provisional()))
+        .unwrap();
+
+    assert!(mirror.bindings().is_empty(), "{:?}", mirror.hub());
+    assert!(mirror.a.open("inbox").unwrap().placements.is_empty());
+    assert!(mirror.b.open("inbox").unwrap().placements.is_empty());
+    assert!(mirror.retained("msg-a"), "the item is retained");
+
+    mirror.quiesce(PimdirSyncOptions::default());
+
+    assert!(mirror.server('a').is_empty(), "nothing was pushed");
+    assert!(mirror.server('b').is_empty(), "nor offered");
+}
+
+/// Removing the copy the hub offers a source binds nothing there and
+/// deletes the item on the source holding it (SYNC §9).
+#[test]
+fn a_removed_offered_member_is_deleted_on_its_holder() {
+    let mut mirror = Mirror::new();
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a1", "msg-a", &[], b"body a");
+    mirror
+        .a
+        .sync("inbox", PimdirSyncOptions::default())
+        .unwrap();
+    mirror
+        .a
+        .upgrade("inbox", vec![PimdirHandle::from("a1")], PimdirTier::Full)
+        .unwrap();
+    let offered = PimdirLinkId::from("msg-a").provisional();
+
+    mirror
+        .b
+        .mutate("inbox", PimdirMutation::Remove(offered))
+        .unwrap();
+
+    assert_eq!(
+        mirror.bindings(),
+        [("msg-a".to_string(), vec!["a".to_string()])],
+        "b binds nothing",
+    );
+    assert_eq!(mirror.deleted("msg-a"), Some(true));
+    assert!(mirror.b.open("inbox").unwrap().placements.is_empty());
+    assert_eq!(
+        mirror.a.open("inbox").unwrap().placements[0].status,
+        PimdirStatus::Tombstone,
+    );
+
+    mirror.quiesce(PimdirSyncOptions::default());
+
+    assert!(mirror.server('a').is_empty(), "the delete reached a");
+    assert!(mirror.server('b').is_empty(), "and b never got the member");
+    assert!(mirror.retained("msg-a"));
+}
+
+/// A pending create withdrawn beside a based binding still deletes the
+/// item, the other source pushing the remove (SYNC §9).
+#[test]
+fn a_withdrawn_create_beside_a_holder_deletes_the_item() {
+    let mut mirror = Mirror::new();
+    mirror.a.remote_mut().mutable = true;
+    mirror.b.remote_mut().mutable = true;
+    mirror
+        .a
+        .remote_mut()
+        .seed("inbox", "a1", "msg-a", &[], b"the meeting");
+    mirror.quiesce(PimdirSyncOptions::default());
+    let handle = mirror.server('b')[0].clone();
+    edit(&mut mirror.b, &handle, b"the meeting, moved");
+    mirror.b.remote_mut().remove("inbox", &handle);
+    mirror
+        .b
+        .sync("inbox", PimdirSyncOptions::default())
+        .unwrap();
+    let pending = PimdirLinkId::from("msg-a").provisional();
+    let hub = mirror.hub();
+    let binding = &hub.items[&PimdirLinkId::from("msg-a")].sources[&PimdirSourceId::from("b")];
+    assert_eq!(binding.handle, pending, "b's vanished edit is re-staged");
+    assert!(binding.base.is_none(), "as a pending create");
+
+    mirror
+        .b
+        .mutate("inbox", PimdirMutation::Remove(pending))
+        .unwrap();
+
+    assert_eq!(
+        mirror.bindings(),
+        [("msg-a".to_string(), vec!["a".to_string()])],
+        "b's binding went with the write",
+    );
+    assert_eq!(mirror.deleted("msg-a"), Some(true));
+
+    mirror.quiesce(PimdirSyncOptions::default());
+
+    assert!(mirror.server('a').is_empty(), "the delete reached a");
+    assert!(mirror.server('b').is_empty());
+    assert!(mirror.retained("msg-a"));
+}
