@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc ccdc91076cf6b20d7099d60c66738d70a39dea60666a25adf8d84a3c72008b27 # shrinks to ops = [Edit(3525036839008080821, 0), ServerRemove(17290049543006883413)]
+cc 744fcb0d751d42c307d2d29ed417be17e22c1e069b9e2f4367efe774682ccd0c # shrinks to ops = [Remove(145436171575830900), ServerRemove(427024117183168704), Move(0), Move(2809069849191649579), Sync(PimdirSyncOptions { push: false, rights: PimdirPushRights { flags: false, content: false, add: false, remove: false }, conflict: Manual, full: false, scope: PimdirScope { since: None, until: None } }), Remove(191727233031004251), Move(586262887484845177), Sync(PimdirSyncOptions { push: false, rights: PimdirPushRights { flags: false, content: false, add: false, remove: false }, conflict: Manual, full: false, scope: PimdirScope { since: None, until: None } })]

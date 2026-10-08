@@ -36,7 +36,7 @@ Every create the engine stages, an `Add`, a `Copy`, a `Move`, a vanished edit re
 - THEN they land on one provisional handle, the second upsert restating the first, and one add is pushed
 
 ### Requirement: A staged create never takes a key its target holds
-A `Copy` or a `Move` SHALL read the target collection for the identity it is carrying into it, and SHALL key the staged create under a minted key (upgrade.md) when a live placement there already holds that identity. Refusing is not the answer, the way it is for an `Add`: the caller is asking for the copy, and a target holding the identity already is a target holding two resources once the create lands.
+A `Copy` or a `Move` SHALL read the target collection for the identity it is carrying into it, and SHALL key the staged create under a minted key (upgrade.md) when a live placement there already holds that identity. The key is the identity minted over the provisional handle it derives, minted again while held, and the store pairs it with the identity for the create's origin and the tombstone's destination (pimdir SYNC §3). Refusing is not the answer, the way it is for an `Add`: the caller is asking for the copy, and a target holding the identity already is a target holding two resources once the create lands.
 
 The read SHALL ask for the key a second copy would take beside the identity itself, and SHALL be made against the target rather than the collection the mutation reads, which cannot answer it. A source placement holding no identity yet stages its create without the read, having no key to collide with.
 

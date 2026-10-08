@@ -803,9 +803,9 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
         inbox_proj[0].origin,
         Some(PimdirOrigin {
             collection: PimdirCollectionId("Archive".into()),
-            handle: PimdirHandle("1".into()),
+            handle: PimdirHandle("\u{1}mid:a".into()),
         }),
-        "the tombstone's destination, under its own handle"
+        "the tombstone's destination, under the pending create's handle"
     );
     let archive_proj = reopened
         .load(&PimdirCollectionId("Archive".into()), &PimdirLoadScope::All)

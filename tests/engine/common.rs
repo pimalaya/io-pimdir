@@ -654,7 +654,17 @@ impl PimdirRemote for MemRemote {
                                 continue;
                             };
                             let seq = self.bump();
-                            let new = PimdirHandle::from(format!("{}-copy", o.handle.as_str()));
+                            // NOTE: a second copy of one origin takes a
+                            // fresh handle, as a server assigns one
+                            let mut new = PimdirHandle::from(format!("{}-copy", o.handle.as_str()));
+                            if self
+                                .items
+                                .get(collection)
+                                .is_some_and(|c| c.contains_key(&new))
+                            {
+                                new =
+                                    PimdirHandle::from(format!("{}-copy-{seq}", o.handle.as_str()));
+                            }
                             item.seq = seq;
                             self.items
                                 .entry(collection.clone())

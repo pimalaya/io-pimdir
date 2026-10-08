@@ -1106,10 +1106,19 @@ impl PimdirSync {
 
                 self.pending.insert(handle.clone(), Pending::Remove);
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
+                // NOTE: a destination keyed by a minted key held the
+                // identity before the move, so holding it proves no
+                // delivery and the remove carries no link id (SYNC §4).
+                let link_id = local.link_id.clone().filter(|link| {
+                    local
+                        .origin
+                        .as_ref()
+                        .is_none_or(|o| o.handle == link.provisional())
+                });
                 Some(PimdirChangeKind::Remove {
                     handle,
                     to,
-                    link_id: local.link_id.clone(),
+                    link_id,
                     if_match: base_revision,
                 })
             }

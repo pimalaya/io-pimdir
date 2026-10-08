@@ -36,6 +36,7 @@ All notable changes to this project are documented in this file. The format is b
 ### Fixed
 
 - Fixed a copy or move into a collection already holding its identity, staged under a minted key, never being landed by its arrival and pushed a second time.
+- Fixed a move of a body-less member into a collection already holding its identity deleting it from the server: the minted create now gets its origin, and the source's remove its destination with no `link_id`, so it relocates (pimdir SYNC §3, §4). A tombstone's destination now names the pending create's handle.
 
 ## [0.6.0] - 2026-10-03
 

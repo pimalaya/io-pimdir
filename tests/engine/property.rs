@@ -361,11 +361,12 @@ struct Ledger {
     copies: Vec<(PimdirHandle, Option<PimdirLinkId>)>,
     /// Staged moves: the source handle, its server link, and voided.
     moves: Vec<(PimdirHandle, Option<PimdirLinkId>, bool)>,
-    /// Moves of a body-less member whose link the archive did not hold:
-    /// the source handle, the link, and voided.
+    /// Moves of a body-less member: the source handle, the link, voided,
+    /// the server copies of the link before, and the archive's creates
+    /// of it pending then.
     ///
-    /// Exactly one copy of the link must land across both collections.
-    cold_moves: Vec<(PimdirHandle, PimdirLinkId, bool)>,
+    /// A move neither loses nor adds a copy of the link.
+    cold_moves: Vec<(PimdirHandle, PimdirLinkId, bool, usize, usize)>,
 }
 
 /// Voids every staged move of `handle`, a later action having overtaken it.
@@ -426,6 +427,24 @@ fn link_count(client: &Client, collection: &str, link: &PimdirLinkId) -> usize {
         .into_iter()
         .flatten()
         .filter(|(_, item)| &item.link_id == link)
+        .count()
+}
+
+/// The copies of `link` both collections hold on the server.
+fn server_copies(client: &Client, link: &PimdirLinkId) -> usize {
+    link_count(client, "inbox", link) + link_count(client, "archive", link)
+}
+
+/// The archive's creates pending under `link` or the key minted beside it.
+fn pending_copies(client: &Client, link: &PimdirLinkId) -> usize {
+    let minted = link.minted(&link.provisional());
+
+    client
+        .storage()
+        .rows("archive")
+        .into_iter()
+        .filter(|p| p.status == PimdirStatus::Created && p.base.is_none())
+        .filter(|p| p.link_id.as_ref() == Some(link) || p.link_id.as_ref() == Some(&minted))
         .count()
 }
 
@@ -681,15 +700,18 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                             .get(&"inbox".into())
                             .and_then(|c| c.get(&handle))
                             .map(|i| i.rev.to_string());
-                    // NOTE: a target already holding the identity, on its
-                    // server or as a pending create, gets a second copy
-                    let held = link.as_ref().is_some_and(|link| {
-                        collection_has_link(&client, "archive", link)
-                            || client.storage().rows("archive").iter().any(|p| {
-                                p.status != PimdirStatus::Tombstone
-                                    && p.link_id.as_ref() == Some(link)
-                            })
+                    // NOTE: a target holding the once-minted key mints the
+                    // create again, a key the pairing does not reach
+                    let twice = link.as_ref().is_some_and(|link| {
+                        let minted = link.minted(&link.provisional());
+                        client.storage().rows("archive").iter().any(|p| {
+                            p.status != PimdirStatus::Tombstone
+                                && p.link_id.as_ref() == Some(&minted)
+                        })
                     });
+                    let copies = link
+                        .as_ref()
+                        .map(|link| (server_copies(&client, link), pending_copies(&client, link)));
                     let staged = client.mutate(
                         "inbox",
                         PimdirMutation::Move {
@@ -701,10 +723,12 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                         ledger.edits.remove(&handle);
                         ledger.flags.remove(&handle);
                         ledger.moves.push((handle.clone(), link.clone(), doomed));
-                        if let Some(link) = link
-                            && !held
+                        if let (Some(link), Some((server, pending))) = (link, copies)
+                            && !twice
                         {
-                            ledger.cold_moves.push((handle, link, doomed));
+                            ledger
+                                .cold_moves
+                                .push((handle, link, doomed, server, pending));
                         }
                     }
                 }
@@ -818,7 +842,7 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                     .retain(|(handle, _, _)| linked.contains(handle));
                 ledger
                     .cold_moves
-                    .retain(|(handle, _, _)| linked.contains(handle));
+                    .retain(|(handle, _, _, _, _)| linked.contains(handle));
 
                 let mapping = client.remote_mut().renumber("inbox", bumps);
                 client.rekey("inbox").map_err(TestCaseError::fail)?;
@@ -1020,19 +1044,21 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
     }
 
     // NOTE: a move delivers exactly one copy (SYNC §5), by relocation or
-    // by the copy from its origin, the arrival landing the create
-    for (handle, link, voided) in &ledger.cold_moves {
+    // by the copy from its origin, the arrival landing the create, a copy
+    // the archive held before kept; a create pending before may land the
+    // relocated member as its own arrival, or a copy of its own
+    for (handle, link, voided, server, pending) in &ledger.cold_moves {
         if *voided {
             continue;
         }
-        let copies = link_count(&client, "inbox", link) + link_count(&client, "archive", link);
-        prop_assert_eq!(
-            copies,
-            1,
-            "the cold move of {:?} ({:?}) landed {} copies",
+        let copies = server_copies(&client, link);
+        prop_assert!(
+            (*server..=server + pending).contains(&copies),
+            "the cold move of {:?} ({:?}) left {} copies of {}",
             handle,
             link,
             copies,
+            server,
         );
     }
 

@@ -345,7 +345,7 @@ impl PimdirMutate {
                 source.status = PimdirStatus::Tombstone;
                 source.origin = Some(PimdirOrigin {
                     collection: target.clone(),
-                    handle: source.handle.clone(),
+                    handle: create.handle.clone(),
                 });
 
                 vec![

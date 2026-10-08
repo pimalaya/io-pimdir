@@ -210,12 +210,12 @@ pub enum PimdirStatus {
 /// On a [`Tombstone`](PimdirStatus::Tombstone) it is the destination,
 /// the collection where the same source holds a pending create of the
 /// identity, so the remove relocates rather than deletes; `handle` is
-/// then the tombstone's own.
+/// then that create's provisional one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirOrigin {
     /// The collection the source member lives in, or the destination.
     pub collection: PimdirCollectionId,
-    /// The source member's handle, or the tombstone's own.
+    /// The source member's handle, or the pending create's.
     pub handle: PimdirHandle,
 }
 

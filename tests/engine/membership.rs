@@ -4,9 +4,9 @@
 //!
 //! A move is staged as a copy into the target plus a remove from the
 //! source (see `PimdirMutation::Move`), so two independent syncs derive
-//! the halves. Through the store a binding carries no origin (SYNC §3),
-//! so the create uploads the body it holds, and the remove relocates the
-//! source only while the target does not hold the identity yet.
+//! the halves. The create copies from its origin or uploads the body it
+//! holds, and the remove relocates into the target's pending create, a
+//! copy the target held before the move proving no delivery (SYNC §3).
 
 use io_pimdir::{
     mutate::PimdirMutation,
@@ -129,9 +129,9 @@ fn a_copy_leaves_the_source_and_delivers_one_member() {
 
 const ALT: &str = "alt:Hi|2026-08-01T10:00:00Z|a@x.y";
 
-/// One hydrated inbox member keyed `link`, the archive synced too, holding
-/// a member of the same identity when `held`.
-fn moving_client(link: &str, held: bool) -> Client {
+/// One inbox member keyed `link`, hydrated when `hydrated`, the archive
+/// synced too, holding a member of the same identity when `held`.
+fn moving_client(link: &str, held: bool, hydrated: bool) -> Client {
     let body = b"From: a\r\nSubject: Hi\r\n\r\nbody\r\n";
 
     let mut remote = MemRemote::default();
@@ -144,9 +144,11 @@ fn moving_client(link: &str, held: bool) -> Client {
     let opts = PimdirSyncOptions::default();
     client.sync("inbox", opts.clone()).unwrap();
     client.sync("archive", opts).unwrap();
-    client
-        .upgrade("inbox", vec![PimdirHandle::from("i1")], PimdirTier::Full)
-        .unwrap();
+    if hydrated {
+        client
+            .upgrade("inbox", vec![PimdirHandle::from("i1")], PimdirTier::Full)
+            .unwrap();
+    }
     client
 }
 
@@ -162,8 +164,8 @@ fn server_move(client: &mut Client, link: &str) {
 }
 
 /// Exactly one moved copy on both sides, landed on the listed handle.
-fn assert_moved(client: &Client, held: bool) {
-    let mut expected = vec!["i1-moved"];
+fn assert_moved(client: &Client, held: bool, delivered: &str) {
+    let mut expected = vec![delivered];
     if held {
         expected.insert(0, "a1");
     }
@@ -178,7 +180,7 @@ fn assert_moved(client: &Client, held: bool) {
     landed.sort();
     assert_eq!(landed, expected, "create landed");
     assert_eq!(
-        client.storage().placement("archive", "i1-moved").status,
+        client.storage().placement("archive", delivered).status,
         PimdirStatus::Clean,
     );
     assert!(
@@ -189,7 +191,7 @@ fn assert_moved(client: &Client, held: bool) {
 
 /// The target listing lands the staged create before the source syncs.
 fn listing_first(link: &str, held: bool) {
-    let mut client = moving_client(link, held);
+    let mut client = moving_client(link, held, true);
     let opts = PimdirSyncOptions::default();
     stage_move(&mut client);
 
@@ -197,25 +199,33 @@ fn listing_first(link: &str, held: bool) {
     client.sync("archive", opts.clone()).unwrap();
     client.sync("inbox", opts).unwrap();
 
-    assert_moved(&client, held);
+    assert_moved(&client, held, "i1-moved");
 }
 
 /// The source pushes the move first, relocated by the connector, then
 /// the target listing lands the staged create.
-fn push_first(link: &str, held: bool) {
-    let mut client = moving_client(link, held);
+fn push_first(link: &str, held: bool, hydrated: bool) {
+    let mut client = moving_client(link, held, hydrated);
     let opts = PimdirSyncOptions::default();
     stage_move(&mut client);
 
-    // NOTE: the fake relocates only into a target not holding the
-    // identity yet, so a held one is moved as the connector would.
-    if held {
-        server_move(&mut client, link);
-    }
     client.sync("inbox", opts.clone()).unwrap();
     client.sync("archive", opts).unwrap();
 
-    assert_moved(&client, held);
+    assert_moved(&client, held, "i1-moved");
+}
+
+/// The target pushes the create first, a copy from its origin, then the
+/// source's remove is a plain delete.
+fn copy_first(link: &str, held: bool, hydrated: bool) {
+    let mut client = moving_client(link, held, hydrated);
+    let opts = PimdirSyncOptions::default();
+    stage_move(&mut client);
+
+    client.sync("archive", opts.clone()).unwrap();
+    client.sync("inbox", opts).unwrap();
+
+    assert_moved(&client, held, "i1-copy");
 }
 
 #[test]
@@ -225,7 +235,7 @@ fn a_move_listed_before_its_push_lands_the_create() {
 
 #[test]
 fn a_move_pushed_before_its_listing_lands_the_create() {
-    push_first("msg-a", false);
+    push_first("msg-a", false, true);
 }
 
 #[test]
@@ -235,7 +245,7 @@ fn a_minted_move_listed_before_its_push_lands_the_create() {
 
 #[test]
 fn a_minted_move_pushed_before_its_listing_lands_the_create() {
-    push_first("msg-a", true);
+    push_first("msg-a", true, true);
 }
 
 #[test]
@@ -245,11 +255,26 @@ fn an_alt_keyed_move_listed_before_its_push_lands_the_create() {
 
 #[test]
 fn an_alt_keyed_move_pushed_before_its_listing_lands_the_create() {
-    push_first(ALT, false);
+    push_first(ALT, false, true);
 }
 
 #[test]
 fn a_minted_alt_keyed_move_lands_the_create() {
     listing_first(ALT, true);
-    push_first(ALT, true);
+    push_first(ALT, true, true);
+}
+
+/// A body-less source relocates beside a held copy rather than deleting.
+#[test]
+fn a_cold_minted_move_pushed_before_its_listing_relocates() {
+    push_first("msg-a", false, false);
+    push_first("msg-a", true, false);
+}
+
+/// A body-less source's create copies from its origin beside a held copy.
+#[test]
+fn a_cold_minted_move_synced_target_first_copies_from_its_origin() {
+    copy_first("msg-a", false, false);
+    copy_first("msg-a", true, false);
+    copy_first("msg-a", true, true);
 }

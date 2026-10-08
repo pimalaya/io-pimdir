@@ -9,8 +9,9 @@
 //! origin or an upload of the stored body, the remove by relocating into
 //! the destination the store derives from the pending create. The remove
 //! carries the link id its destination receives, so a connector
-//! relocates only while the destination lacks it, and a relocated member
-//! lands the create when the target's listing names it (SYNC §6).
+//! relocates only while the destination lacks it, and none when the
+//! create is minted beside a copy the target already held. A relocated
+//! member lands the create when the target's listing names it (SYNC §6).
 //!
 //! Neither half may be dropped for the other. A create holding neither an
 //! origin nor a body cannot deliver and stays visibly pending.
@@ -99,7 +100,8 @@ pub enum PimdirChangeKind {
         /// The item identity when resolved, the delivery key of a move.
         ///
         /// A `to` already holding it was served by the move's other half,
-        /// so the remove is a plain delete.
+        /// so the remove is a plain delete. `None` when the destination's
+        /// create is minted: `to` held the identity before the move.
         link_id: Option<PimdirLinkId>,
         /// The last-synced revision as a precondition (a WebDAV If-Match).
         if_match: Option<String>,

@@ -559,7 +559,7 @@ fn origin_for(
 
 /// Where this source holds a pending create of the placement's identity
 /// in another collection (SYNC §3): the destination a `Tombstone`
-/// carries, under its own handle, so its remove is a relocation.
+/// carries, under the create's handle, so its remove is a relocation.
 fn destination_for(
     conn: &Connection,
     source: &PimdirSourceId,
@@ -578,7 +578,7 @@ fn destination_for(
         |r| {
             Ok(PimdirOrigin {
                 collection: PimdirCollectionId(r.get(0)?),
-                handle: placement.handle.clone(),
+                handle: PimdirHandle(r.get(1)?),
             })
         },
     )

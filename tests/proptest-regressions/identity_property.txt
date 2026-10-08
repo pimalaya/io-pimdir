@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc ce849ef78e09910b4ffaf1c3bf9baeed73ae1c01f5d08a1f2d8ca2a12d57d867 # shrinks to ops = [ServerRemove(0)]
+cc 8b0a38ddf8db05fa1d83be88a33d1df7010160c3743b35f5fe10af2ec67fa53d # shrinks to ops = [Copy(8922895000836163228), Copy(13433582686087170241), Add(0, 0)]

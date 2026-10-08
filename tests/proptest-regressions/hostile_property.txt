@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 7931ca01a70451508c63a95e6ec64a794059264c6a32aa3095d6799b97603ad5 # shrinks to chaos = Chaos { unsorted: false, repeat: false, phantom_vanished: false, skip_fetch: false, ghost_fetch: false, one_identity: true, meta_body: false, ghost_push: false, repeat_push: false, silent_push: false, blind_flags: false }, ops = [Hydrate, Rekey, Rekey, Remove(4521257793473930058), Hydrate]
+cc f2b0204a1a626c850b650c79fd29ccfd87cc166cb39cc50f280d58be21a5cdba # shrinks to chaos = Chaos { unsorted: true, repeat: false, phantom_vanished: true, skip_fetch: false, ghost_fetch: false, one_identity: false, meta_body: false, ghost_push: false, repeat_push: false, silent_push: false, blind_flags: false }, ops = [Copy(1357741413032453953), Copy(877986380823565585), ServerAdd(0)]
