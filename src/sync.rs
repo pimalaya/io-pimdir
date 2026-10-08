@@ -538,16 +538,19 @@ impl PimdirSync {
 
     /// The hints a page before the last loads the holders of, so naming
     /// its members is decided against the whole collection (SYNC §6): the
-    /// hint, and the key a minted copy of it would take.
+    /// hint, the key a minted copy of it would take, and the key a create
+    /// staged beside a held copy took.
     fn hints(&self) -> Vec<PimdirLinkId> {
         self.page
             .iter()
             .flat_map(|page| &page.items)
             .filter(|item| !self.local.contains_key(&item.handle))
             .flat_map(|item| {
+                let hint = &item.meta.link_id;
                 [
-                    item.meta.link_id.clone(),
-                    item.meta.link_id.minted(&item.handle),
+                    hint.clone(),
+                    hint.minted(&item.handle),
+                    hint.minted(&hint.provisional()),
                 ]
             })
             .collect()
@@ -793,21 +796,25 @@ impl PimdirSync {
     /// Takes the pending create of this source holding `hint`, if any.
     ///
     /// A `Created` placement with no base under a provisional handle is
-    /// the create a listed `hint` delivers (SYNC §6); taken out so a
-    /// second arrival of the same hint in the page is minted instead.
+    /// the create a listed `hint` delivers (SYNC §6), keyed by the hint or,
+    /// staged beside a copy already holding it, by the key minted over its
+    /// provisional handle (SYNC §7); taken out so a second arrival of the
+    /// same hint in the page is minted instead.
     fn take_pending_create(
         &mut self,
         hint: &PimdirLinkId,
         arrived: &PimdirHandle,
     ) -> Option<PimdirPlacement> {
-        let provisional = self
-            .local
-            .values()
-            .find(|p| {
-                p.link_id.as_ref() == Some(hint)
-                    && p.status == PimdirStatus::Created
-                    && p.base.is_none()
-                    && &p.handle != arrived
+        let minted = hint.minted(&hint.provisional());
+        let provisional = [hint, &minted]
+            .into_iter()
+            .find_map(|key| {
+                self.local.values().find(|p| {
+                    p.link_id.as_ref() == Some(key)
+                        && p.status == PimdirStatus::Created
+                        && p.base.is_none()
+                        && &p.handle != arrived
+                })
             })
             .map(|p| p.handle.clone())?;
 

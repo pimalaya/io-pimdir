@@ -33,6 +33,10 @@ All notable changes to this project are documented in this file. The format is b
 
 - Removed probes (pimdir draft-04): `PimdirLevel::Probed`, `PimdirReader::count_probes`, `PimdirRekey::FETCH_CHUNK`, the `probes` table (dropped on open) and the probe statements.
 
+### Fixed
+
+- Fixed a copy or move into a collection already holding its identity, staged under a minted key, never being landed by its arrival and pushed a second time.
+
 ## [0.6.0] - 2026-10-03
 
 ### Added
