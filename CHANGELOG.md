@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-09
+
 ### Added
 
 - Added the `collection-create` intent (pimdir draft-04, Annex B.2): `capability::COLLECTION_CREATE`, declared in every domain's list, the `intent` module's `PimdirCollectionCreate`, and `PimdirProducer::enqueue_collection_create`, which anchors it on its parent and names its performer.
@@ -445,7 +447,8 @@ All notable changes to this project are documented in this file. The format is b
 - Collection generations (spec §15): the handle-space epoch on PimdirCollection and generation(), bumped atomically with a rebuild batch by write_rekeyed().
 - Read-only store open (open_read_only): opens an existing store with SQLITE_OPEN_READ_ONLY, never creates anything, refuses any other schema version, and exposes the full read surface for frontend processes that must be unable to write.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.6.0..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.7.0..HEAD
+[0.7.0]: https://github.com/pimalaya/io-pimdir/compare/v0.6.0..v0.7.0
 [0.6.0]: https://github.com/pimalaya/io-pimdir/compare/v0.5.1..v0.6.0
 [0.5.1]: https://github.com/pimalaya/io-pimdir/compare/v0.5.0..v0.5.1
 [0.5.0]: https://github.com/pimalaya/io-pimdir/compare/v0.4.1..v0.5.0
