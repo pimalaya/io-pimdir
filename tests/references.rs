@@ -17,6 +17,10 @@ use io_pimdir::{
         PimdirStatus,
     },
     reference::{PimdirEndpoint, PimdirReferenceOrigin, PimdirReferenceRole},
+    summary::{
+        PimdirAddress, PimdirSummary, calendar::PimdirEventSummary, contact::PimdirContactSummary,
+        mail::PimdirMailSummary,
+    },
 };
 
 const MAIL: &str = "message/rfc822";
@@ -221,9 +225,9 @@ fn a_reference_goes_with_the_last_row_of_an_end() {
     );
 }
 
-/// A store an earlier build of draft-04 wrote has no references: a reader
-/// reads none, and its owner adds the table, its index and its trigger
-/// on open (STORAGE §6).
+/// A store an earlier build of draft-04 wrote has no references and no
+/// invitation: a reader reads none, and its owner adds the table, its
+/// index, its trigger and the column on open (STORAGE §6).
 #[test]
 fn an_earlier_store_gains_the_references_on_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -233,7 +237,9 @@ fn an_earlier_store_gains_the_references_on_open() {
     conn.execute_batch(
         "DROP TRIGGER items_drop_references;
          DROP INDEX item_reference_to;
-         DROP TABLE item_reference;",
+         DROP TABLE item_reference;
+         DROP INDEX mail_summary_by_invitation;
+         ALTER TABLE mail_summary DROP COLUMN invitation;",
     )
     .unwrap();
 
@@ -250,12 +256,24 @@ fn an_earlier_store_gains_the_references_on_open() {
     let declared: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_schema WHERE name IN
-                 ('item_reference', 'item_reference_to', 'items_drop_references')",
+                 ('item_reference', 'item_reference_to', 'items_drop_references',
+                  'mail_summary_by_invitation')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(declared, 3, "the table, its index and its trigger");
+    assert_eq!(
+        declared, 4,
+        "the table, its index, its trigger, the invitation's index"
+    );
+    let invitation: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('mail_summary') WHERE name = 'invitation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(invitation, 1, "the invitation column");
     assert!(
         store
             .add_reference(
@@ -266,5 +284,82 @@ fn an_earlier_store_gains_the_references_on_open() {
             )
             .unwrap()
             .is_some()
+    );
+}
+
+/// The writer records the automatic references a written summary reads
+/// (STORAGE §14.2), from the mail to what it names, whichever end lands
+/// first: a contact before or after the mail it sent, an event after its
+/// invitation. A person's reference is never touched.
+#[test]
+fn the_writer_records_the_automatic_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seeded(dir.path());
+    store.ensure_collection("Cal", "text/calendar").unwrap();
+    let alice = || PimdirAddress {
+        address: "alice@example.org".into(),
+        name: None,
+    };
+    let summarised = |collection: &str, handle: &str, link: &str, summary: PimdirSummary| {
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            summary: Some(summary),
+            ..placement(collection, handle, link)
+        })
+    };
+    let card = |name: &str| {
+        PimdirSummary::Contact(PimdirContactSummary {
+            full_name: name.into(),
+            emails: vec![alice()],
+            ..Default::default()
+        })
+    };
+
+    store
+        .write(vec![summarised("Cards", "b", "bob", card("Bob"))])
+        .unwrap();
+    store
+        .write(vec![summarised(
+            "INBOX",
+            "9",
+            "invite",
+            PimdirSummary::Mail(PimdirMailSummary {
+                subject: "Weekly sync".into(),
+                invitation: Some("ev1".into()),
+                from: vec![alice()],
+                ..Default::default()
+            }),
+        )])
+        .unwrap();
+    store
+        .write(vec![summarised("Cards", "c", "carol", card("Carol"))])
+        .unwrap();
+    store
+        .write(vec![summarised(
+            "Cal",
+            "e",
+            "ev1",
+            PimdirSummary::Event(PimdirEventSummary {
+                uid: Some("ev1".into()),
+                summary: "Weekly sync".into(),
+                ..Default::default()
+            }),
+        )])
+        .unwrap();
+
+    let read: Vec<(String, String, PimdirReferenceOrigin)> = store
+        .references_from(&endpoint(MAIL, "invite"))
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.to.link_id.0, r.role.as_str().to_string(), r.origin))
+        .collect();
+    let auto = PimdirReferenceOrigin::Auto;
+    assert_eq!(
+        read,
+        [
+            ("bob".into(), "sender".into(), auto),
+            ("carol".into(), "sender".into(), auto),
+            ("ev1".into(), "invitation".into(), auto),
+        ],
+        "the sender before and after, the event after its invitation"
     );
 }

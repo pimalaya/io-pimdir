@@ -10,6 +10,8 @@ All notable changes to this project are documented in this file. The format is b
 - Added `PimdirStore::release_before` and `PimdirReleaseReport`: the bodies of a set of mail collections below a date go back to `Meta`, headers kept, those still needed kept (pimdir draft-04, STORAGE §11.4).
 - Added references between items (pimdir draft-04, STORAGE §14.2): the `reference` module (`PimdirEndpoint`, `PimdirReference`, `PimdirReferenceRole`, `PimdirReferenceOrigin`), `PimdirStore::add_reference` and `remove_reference`, `PimdirReader::references_from` and `references_to`; the `item_reference` table, its index and its trigger are added on open to an older store, whose reader reads none.
 - Added files (pimdir draft-04, STORAGE §14.3, Annex A.7): the `application/octet-stream` kind (`summary::file::KIND`), `PimdirFileSummary`, `PimdirSummary::File`, `summary::file::part_key`, `PimdirStore::put_file` for a file holding no body in a collection no source syncs, `PimdirReader::list_attachments` and `PimdirAttachment`, `PimdirError::NotFiles`, and file pages in `list_summaries`; the `file_summary` table and the trigger collecting unreferenced stand-ins are added on open to an older store.
+- Added automatic references (pimdir draft-04, STORAGE §14.2): a write recording a summary runs the canonical rules, a mail's senders (`link_senders_of`) and invitation (`link_invitations_of`), a contact's mail (`link_mail_from`), a calendar item's invitations (`link_invitations_to`), origin `auto`, never touching a person's.
+- Added `PimdirMailSummary::invitation` (Annex A.1): the `UID` of the first `text/calendar` part, derived with the body and kept over a write without it; the column and its index are added on open to an older store.
 
 ### Changed
 

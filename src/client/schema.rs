@@ -95,8 +95,10 @@ const RECONCILED: [&str; 5] = [
 /// lacking one reads as before: `items_by_sort_global` orders a page
 /// across collections (§9.3), slower without it; `item_reference_to`
 /// and `items_drop_references` serve and hold the references (§14.2);
-/// `item_reference_collects_files` collects the stand-ins (§14.3).
-const RECONCILED_OBJECTS: [(&str, &str); 4] = [
+/// `item_reference_collects_files` collects the stand-ins (§14.3);
+/// `mail_summary_by_invitation` finds an event's invitations (§14.2).
+const RECONCILED_OBJECTS: [(&str, &str); 5] = [
+    ("INDEX", "mail_summary_by_invitation"),
     ("INDEX", "items_by_sort_global"),
     ("INDEX", "item_reference_to"),
     ("TRIGGER", "items_drop_references"),
@@ -105,7 +107,8 @@ const RECONCILED_OBJECTS: [(&str, &str); 4] = [
 
 /// Creates the [`RECONCILED`] tables a store lacks, each with its key, and
 /// adds `collections.role` with its index and triggers ([`reconcile_role`]),
-/// the coverage and round columns ([`reconcile_rounds`]) and the
+/// the coverage and round columns ([`reconcile_rounds`]), the mail
+/// invitation ([`reconcile_invitation`]) and the
 /// [`RECONCILED_OBJECTS`] ([`reconcile_objects`]), in one transaction.
 fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     let tx = conn
@@ -126,6 +129,7 @@ fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     }
     reconcile_role(&tx)?;
     reconcile_rounds(&tx)?;
+    reconcile_invitation(&tx)?;
     reconcile_objects(&tx)?;
     tx.commit().map_err(busy_or_sql)
 }
@@ -232,6 +236,23 @@ fn reconcile_rounds(conn: &Connection) -> Result<(), PimdirError> {
     }
 
     conn.execute_batch("DROP TABLE IF EXISTS probes;")?;
+    Ok(())
+}
+
+/// The invitation a later draft added to `mail_summary` (Annex A.1), cut out
+/// of the canonical DDL; `mail_summary_by_invitation` follows among the
+/// [`RECONCILED_OBJECTS`].
+fn reconcile_invitation(conn: &Connection) -> Result<(), PimdirError> {
+    if has_column(conn, "mail_summary", "invitation")? {
+        return Ok(());
+    }
+    let schema = sql::MIGRATION_0001;
+    let from = schema.find("\n    invitation ").expect("canonical DDL") + 5;
+    let to = from + schema[from..].find(',').expect("canonical DDL");
+    conn.execute_batch(&format!(
+        "ALTER TABLE mail_summary ADD COLUMN {};",
+        &schema[from..to]
+    ))?;
     Ok(())
 }
 

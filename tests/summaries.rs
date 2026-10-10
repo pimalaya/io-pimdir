@@ -43,6 +43,7 @@ fn row(summary: &PimdirSummary) -> (&'static str, Value) {
                 "date": mail.date,
                 "size": mail.size,
                 "attachment": flag(mail.attachment),
+                "invitation": mail.invitation,
             }),
         ),
         PimdirSummary::Contact(contact) => (
@@ -207,7 +208,8 @@ fn every_summary_vector_derives() {
 
         // NOTE: the mark without the body (Annex A.1): the same row read
         // off the header block alone agrees on every column but the mark,
-        // which the top-level Content-Type gives.
+        // which the top-level Content-Type gives, and the invitation, which
+        // only the parts give.
         if let Some(mark) = case.get("meta_attachment") {
             let meta = mail::derive_meta(&body, Some(body.len() as u64), None);
             let Some(PimdirSummary::Mail(read)) = &meta.summary else {
@@ -222,6 +224,7 @@ fn every_summary_vector_derives() {
             let mut walked = summary.clone();
             if let PimdirSummary::Mail(walked) = &mut walked {
                 walked.attachment = read.attachment;
+                walked.invitation = None;
             }
             assert_eq!(
                 meta.summary.as_ref(),

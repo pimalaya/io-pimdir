@@ -964,3 +964,9 @@ A collection of kind `application/octet-stream` (`summary::file::KIND`) SHALL ho
 
 #### Scenario: An earlier store gains the files
 - tests/files.rs `an_earlier_store_gains_the_files_on_open`.
+
+### Requirement: The writer records the automatic references
+A write recording an item's summary SHALL run the canonical rule statements for it (STORAGE §14.2): `link_senders_of` for a mail, and `link_invitations_of` when it carries an invitation; `link_mail_from` for a contact; `link_invitations_to` for a calendar item. Each records origin `auto` from the mail to what it names, never twice and never over a person's reference. `PimdirMailSummary::invitation` SHALL be derived with the body (Annex A.1) and kept over a write without it; opening a store as its owner SHALL add the column and `mail_summary_by_invitation` when absent.
+
+#### Scenario: Whichever end lands first
+- tests/references.rs `the_writer_records_the_automatic_references`.

@@ -42,6 +42,9 @@ pub struct PimdirMailSummary {
     /// the body was read, else read without it ([`derive_meta`]); `None`
     /// only on a row an earlier draft wrote at the `Meta` tier.
     pub attachment: Option<bool>,
+    /// The `UID` the first `text/calendar` part carries (Annex A.1), read
+    /// with the body; `None` without it or when no part is one.
+    pub invitation: Option<String>,
     /// Every `From` address, in document order.
     pub from: Vec<PimdirAddress>,
     /// Every `To` address, in document order.
@@ -85,13 +88,15 @@ impl PimdirMailSummary {
 /// Derives a message's key, summary and sort key from its bytes.
 ///
 /// The parts are walked for the attachment mark (Annex A.1), which
-/// replaces any mark read without the body.
+/// replaces any mark read without the body, and for the invitation.
 pub fn derive(body: &[u8]) -> PimdirDerivation {
     let (headers, rest) = split_headers(body);
     let headers = header_fields(headers);
     let attachment = has_attachment(&headers, rest);
 
-    from_headers(&headers, Some(body.len() as u64), attachment).derivation()
+    let mut summary = from_headers(&headers, Some(body.len() as u64), attachment);
+    summary.invitation = invitation(&headers, rest);
+    summary.derivation()
 }
 
 /// Derives what names a message without its body (Annex A.1): the same
@@ -146,6 +151,7 @@ fn from_headers(
         date: header("date").and_then(instant),
         size,
         attachment: Some(attachment),
+        invitation: None,
         to: header("to").map(addresses).unwrap_or_default(),
         cc: header("cc").map(addresses).unwrap_or_default(),
         bcc: header("bcc").map(addresses).unwrap_or_default(),
@@ -555,26 +561,60 @@ fn has_attachment(headers: &[(String, String)], body: &[u8]) -> bool {
         return true;
     }
 
-    let Some(content_type) = field(headers, "content-type") else {
-        return false;
-    };
-    let mut params = content_type.split(';');
-    let media = params.next().unwrap_or_default().trim().to_lowercase();
-    if !media.starts_with("multipart/") {
-        return false;
-    }
-    let Some(boundary) = params.find_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case("boundary")
-            .then(|| value.trim().trim_matches('"').to_string())
-    }) else {
+    let Some(boundary) = field(headers, "content-type").and_then(boundary) else {
         return false;
     };
 
     parts(body, &boundary).into_iter().any(|part| {
         let (headers, body) = split_headers(part);
         has_attachment(&header_fields(headers), body)
+    })
+}
+
+/// The first `UID` of the first `text/calendar` part in document order,
+/// its transfer encoding undone and its lines unfolded (Annex A.1).
+fn invitation(headers: &[(String, String)], body: &[u8]) -> Option<String> {
+    let content_type = field(headers, "content-type").unwrap_or_default();
+    let media = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if media == "text/calendar" {
+        let encoding = field(headers, "content-transfer-encoding").map(str::to_lowercase);
+        let text = String::from_utf8_lossy(body);
+        let decoded = match encoding.as_deref().map(str::trim) {
+            Some("base64") => base64(&text).unwrap_or_default(),
+            Some("quoted-printable") => quoted_printable(&text, false),
+            _ => body.to_vec(),
+        };
+        return unfold(&decoded, false).into_iter().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            let name = name.split(';').next().unwrap_or_default();
+            name.eq_ignore_ascii_case("UID").then(|| value.to_string())
+        });
+    }
+
+    let boundary = boundary(content_type)?;
+    parts(body, &boundary).into_iter().find_map(|part| {
+        let (headers, body) = split_headers(part);
+        invitation(&header_fields(headers), body)
+    })
+}
+
+/// The boundary of a `multipart/*` content type, `None` for any other.
+fn boundary(content_type: &str) -> Option<String> {
+    let mut params = content_type.split(';');
+    let media = params.next().unwrap_or_default().trim().to_lowercase();
+    if !media.starts_with("multipart/") {
+        return None;
+    }
+    params.find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("boundary")
+            .then(|| value.trim().trim_matches('"').to_string())
     })
 }
 

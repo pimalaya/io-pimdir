@@ -806,6 +806,11 @@ impl PimdirSummaryTable {
                         .get::<_, Option<i64>>(at + 6)?
                         .map(|size| size.max(0) as u64),
                     attachment: flag(7)?,
+                    // NOTE: owner loads only; a reader's statements leave it out.
+                    invitation: match row.as_ref().column_index("invitation") {
+                        Ok(at) => row.get(at)?,
+                        Err(_) => None,
+                    },
                     ..Default::default()
                 })
             }
@@ -1019,6 +1024,7 @@ fn save_hub_diff(
             None => {
                 insert_item(conn, collection, link, item)?;
                 write_summary(conn, collection, link, None, item.summary.as_ref())?;
+                link_references(conn, link, item.summary.as_ref())?;
             }
             Some(prev) => {
                 let columns_moved = !item_columns_eq(prev, item);
@@ -1037,6 +1043,9 @@ fn save_hub_diff(
                         sql::STAMP_ITEM,
                         named_params! { ":collection": collection, ":link_id": link.0 },
                     )?;
+                }
+                if summary_moved {
+                    link_references(conn, link, item.summary.as_ref())?;
                 }
                 save_bindings_diff(conn, collection, link, prev, item, licensed)?;
             }
@@ -1244,6 +1253,34 @@ fn update_item(
     Ok(())
 }
 
+/// Records the automatic references a written summary reads (§14.2):
+/// a mail's senders and invitation, the mail from a contact's addresses,
+/// the invitations to a calendar item. Each statement records nothing
+/// twice and never touches a person's reference.
+fn link_references(
+    conn: &Connection,
+    link: &PimdirLinkId,
+    summary: Option<&PimdirSummary>,
+) -> rusqlite::Result<()> {
+    let key = named_params! { ":link_id": link.0 };
+    match summary {
+        Some(PimdirSummary::Mail(mail)) => {
+            conn.execute(sql::LINK_SENDERS_OF, key)?;
+            if mail.invitation.is_some() {
+                conn.execute(sql::LINK_INVITATIONS_OF, key)?;
+            }
+        }
+        Some(PimdirSummary::Contact(_)) => {
+            conn.execute(sql::LINK_MAIL_FROM, key)?;
+        }
+        Some(PimdirSummary::Event(_) | PimdirSummary::Task(_) | PimdirSummary::Journal(_)) => {
+            conn.execute(sql::LINK_INVITATIONS_TO, key)?;
+        }
+        Some(PimdirSummary::File(_)) | None => {}
+    }
+    Ok(())
+}
+
 /// Writes the summary and address rows when they moved, reporting
 /// whether they did: the row of the old variant goes when the variant
 /// changed, the addresses are replaced as a set (Annex A.6).
@@ -1285,6 +1322,7 @@ fn write_summary(
                 ":date": mail.date,
                 ":size": mail.size.map(|size| size as i64),
                 ":attachment": mail.attachment.map(i64::from),
+                ":invitation": mail.invitation,
             },
         )?,
         PimdirSummary::Contact(contact) => conn.execute(

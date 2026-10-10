@@ -75,6 +75,7 @@ fn columns(summary: &PimdirSummary) -> (&'static str, Map<String, Value>) {
             put("date", json!(mail.date));
             put("size", json!(mail.size));
             put("attachment", json!(mail.attachment.map(i64::from)));
+            put("invitation", json!(mail.invitation));
             "mail_summary"
         }
         PimdirSummary::Contact(contact) => {
