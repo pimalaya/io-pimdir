@@ -250,7 +250,8 @@ pub struct PimdirMailFilter {
     pub attachment: Option<bool>,
 }
 
-/// Where a filtered mail page resumes: the last entry of the page before.
+/// Where a page spanning collections resumes (mail, or a contact, calendar
+/// or file search): the last entry of the page before.
 ///
 /// One public id is shared by an identity's placements (§9.1), so the
 /// collection breaks the tie.
@@ -264,7 +265,8 @@ pub struct PimdirMailCursor {
     pub collection: String,
 }
 
-/// One entry of a mail page spanning collections.
+/// One entry of a page spanning collections: mail, or a contact or file
+/// search.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirMailEntry {
     /// The collection the placement sits in.
@@ -317,6 +319,74 @@ pub struct PimdirAttachment {
     pub summary: Option<PimdirFileSummary>,
     /// A body a placement of the file holds, a saved copy's.
     pub object: Option<PimdirHash>,
+}
+
+/// One calendar item a search answers (`search_calendar`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirCalendarHit {
+    /// The placement, its item carrying no summary.
+    pub entry: PimdirMailEntry,
+    /// Its component: `event`, `task` or `journal`.
+    pub component: String,
+    /// Its summary.
+    pub title: String,
+}
+
+/// A reference's end as a link shows it (`describe_endpoint`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirEndpointView {
+    /// The collection of its first live placement.
+    pub collection: String,
+    /// Its public id.
+    pub seq: i64,
+    /// A subject, a name, a summary or a file's name.
+    pub title: Option<String>,
+}
+
+/// One stand-in of an account with its message (`list_attachments_by_account`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirAccountAttachment {
+    /// The attachments collection holding the stand-in.
+    pub collection: String,
+    /// The stand-in's public id.
+    pub seq: i64,
+    /// Its `part:` key.
+    pub link_id: PimdirLinkId,
+    /// Its name, media type, size and part.
+    pub summary: Option<PimdirFileSummary>,
+    /// The message attaching it.
+    pub message: PimdirLinkId,
+    /// The collection of the message's placement read.
+    pub message_collection: String,
+    /// The message's public id.
+    pub message_seq: i64,
+    /// The message's sort key, its `Date`.
+    pub message_sort_key: String,
+    /// The message's sender, canonical.
+    pub sender: Option<String>,
+    /// The sender's display name.
+    pub sender_name: Option<String>,
+    /// The message's date, RFC 3339.
+    pub date: Option<String>,
+}
+
+impl PimdirAccountAttachment {
+    /// The cursor resuming the page after this entry.
+    pub fn cursor(&self) -> PimdirAccountAttachmentCursor {
+        PimdirAccountAttachmentCursor {
+            message_sort_key: self.message_sort_key.clone(),
+            seq: self.seq,
+        }
+    }
+}
+
+/// Where a page of an account's attachments resumes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirAccountAttachmentCursor {
+    /// The message sort key of the last entry.
+    pub message_sort_key: String,
+    /// The stand-in's public id.
+    pub seq: i64,
 }
 
 /// One item the change feed reports (§4.5).
@@ -1361,6 +1431,7 @@ impl PimdirReader {
         &self,
         collections: &[impl AsRef<str>],
         filter: PimdirMailFilter,
+        held: Option<bool>,
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<PimdirMailSum, PimdirError> {
@@ -1370,6 +1441,7 @@ impl PimdirReader {
                 ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
+                ":held": held,
                 ":since": since,
                 ":until": until,
             },
@@ -1380,6 +1452,183 @@ impl PimdirReader {
             size: size.max(0) as u64,
             unknown: unknown.max(0) as u64,
         })
+    }
+
+    /// One live mail row by key (`get_mail_row`), in
+    /// [`list_mail_page_filtered`](Self::list_mail_page_filtered)'s shape,
+    /// with its summary and addresses; `None` when no live row holds it.
+    pub fn get_mail_row(
+        &self,
+        collection: impl AsRef<str>,
+        link_id: &PimdirLinkId,
+    ) -> Result<Option<PimdirMailEntry>, PimdirError> {
+        let mut entries = rows(
+            &self.conn,
+            sql::GET_MAIL_ROW,
+            named_params! { ":collection": collection.as_ref(), ":link_id": link_id.as_str() },
+            |row| entry_from_row(row, Some(PimdirSummaryTable::Mail)),
+        )?;
+        self.attach_entry_addresses(&mut entries, PimdirSummaryTable::Mail)?;
+        Ok(entries.pop())
+    }
+
+    /// Contacts of a set of collections whose name or an address matches
+    /// a `LIKE` pattern (`search_contacts`), A to Z across the set, each
+    /// with its summary and addresses; `after` resumes after an entry.
+    pub fn search_contacts(
+        &self,
+        collections: &[impl AsRef<str>],
+        pattern: &str,
+        after: Option<&PimdirMailCursor>,
+        limit: usize,
+    ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        let mut entries = rows(
+            &self.conn,
+            sql::SEARCH_CONTACTS,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":pattern": pattern,
+                ":after_key": after.map(|after| after.sort_key.as_str()),
+                ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
+                ":after_collection": after.map(|after| after.collection.as_str()),
+                ":limit": limit as i64,
+            },
+            |row| entry_from_row(row, Some(PimdirSummaryTable::Contact)),
+        )?;
+        self.attach_entry_addresses(&mut entries, PimdirSummaryTable::Contact)?;
+        Ok(entries)
+    }
+
+    /// Files of a set of collections whose name matches a `LIKE` pattern
+    /// (`search_files`), on [`search_contacts`](Self::search_contacts)'s
+    /// terms.
+    pub fn search_files(
+        &self,
+        collections: &[impl AsRef<str>],
+        pattern: &str,
+        after: Option<&PimdirMailCursor>,
+        limit: usize,
+    ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        if !schema::has_table(&self.conn, "file_summary")? {
+            return Ok(Vec::new());
+        }
+        Ok(rows(
+            &self.conn,
+            sql::SEARCH_FILES,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":pattern": pattern,
+                ":after_key": after.map(|after| after.sort_key.as_str()),
+                ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
+                ":after_collection": after.map(|after| after.collection.as_str()),
+                ":limit": limit as i64,
+            },
+            |row| entry_from_row(row, Some(PimdirSummaryTable::File)),
+        )?)
+    }
+
+    /// Events, tasks and journals of a set of collections whose summary,
+    /// or an event's location, matches a `LIKE` pattern
+    /// (`search_calendar`), on [`search_contacts`](Self::search_contacts)'s
+    /// terms, each with its component and title.
+    pub fn search_calendar(
+        &self,
+        collections: &[impl AsRef<str>],
+        pattern: &str,
+        after: Option<&PimdirMailCursor>,
+        limit: usize,
+    ) -> Result<Vec<PimdirCalendarHit>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            sql::SEARCH_CALENDAR,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":pattern": pattern,
+                ":after_key": after.map(|after| after.sort_key.as_str()),
+                ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
+                ":after_collection": after.map(|after| after.collection.as_str()),
+                ":limit": limit as i64,
+            },
+            |row| {
+                Ok(PimdirCalendarHit {
+                    entry: entry_from_row(row, None)?,
+                    component: row.get(7)?,
+                    title: row.get(8)?,
+                })
+            },
+        )?)
+    }
+
+    /// A reference's end as a link shows it (`describe_endpoint`, §14.2):
+    /// its first live placement under the kind and a title from whichever
+    /// summary it has; `None` when no live placement holds it.
+    pub fn describe_endpoint(
+        &self,
+        endpoint: &PimdirEndpoint,
+    ) -> Result<Option<PimdirEndpointView>, PimdirError> {
+        if !schema::has_table(&self.conn, "file_summary")? {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                sql::DESCRIBE_ENDPOINT,
+                named_params! { ":kind": endpoint.kind, ":link_id": endpoint.link_id.as_str() },
+                |row| {
+                    Ok(PimdirEndpointView {
+                        collection: row.get(0)?,
+                        seq: row.get(1)?,
+                        title: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every stand-in of an account's attachments collection with the
+    /// message attaching it (`list_attachments_by_account`, §14.3), newest
+    /// message first; `after` resumes after an entry. None on a store whose
+    /// owner has not added the references or the file summaries yet.
+    pub fn list_attachments_by_account(
+        &self,
+        account: Option<&str>,
+        after: Option<&PimdirAccountAttachmentCursor>,
+        limit: usize,
+    ) -> Result<Vec<PimdirAccountAttachment>, PimdirError> {
+        if !schema::has_table(&self.conn, "item_reference")?
+            || !schema::has_table(&self.conn, "file_summary")?
+        {
+            return Ok(Vec::new());
+        }
+        Ok(rows(
+            &self.conn,
+            sql::LIST_ATTACHMENTS_BY_ACCOUNT,
+            named_params! {
+                ":account": account,
+                ":after_key": after.map(|after| after.message_sort_key.as_str()),
+                ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
+                ":limit": limit as i64,
+            },
+            |row| {
+                let summary = match PimdirSummaryTable::File.read_row(row, 3)? {
+                    Some(PimdirSummary::File(file)) => Some(file),
+                    _ => None,
+                };
+                Ok(PimdirAccountAttachment {
+                    collection: row.get(0)?,
+                    seq: row.get(1)?,
+                    link_id: PimdirLinkId(row.get(2)?),
+                    summary,
+                    message: PimdirLinkId(row.get(7)?),
+                    message_collection: row.get(8)?,
+                    message_seq: row.get(9)?,
+                    message_sort_key: row.get(10)?,
+                    sender: row.get(11)?,
+                    sender_name: row.get(12)?,
+                    date: row.get(13)?,
+                })
+            },
+        )?)
     }
 
     /// A newest-first page of live mail over a set of collections under
@@ -1407,9 +1656,9 @@ impl PimdirReader {
                 ":after_collection": after.map(|after| after.collection.as_str()),
                 ":limit": limit as i64,
             },
-            mail_entry_from_row,
+            |row| entry_from_row(row, Some(PimdirSummaryTable::Mail)),
         )?;
-        self.attach_mail_addresses(&mut entries)?;
+        self.attach_entry_addresses(&mut entries, PimdirSummaryTable::Mail)?;
         Ok(entries)
     }
 
@@ -1439,15 +1688,19 @@ impl PimdirReader {
                 ":after_collection": after.map(|after| after.collection.as_str()),
                 ":limit": limit as i64,
             },
-            mail_entry_from_row,
+            |row| entry_from_row(row, Some(PimdirSummaryTable::Mail)),
         )?;
-        self.attach_mail_addresses(&mut entries)?;
+        self.attach_entry_addresses(&mut entries, PimdirSummaryTable::Mail)?;
         Ok(entries)
     }
 
-    /// Joins the address rows onto a mail page spanning collections, one
-    /// query per collection the page holds.
-    fn attach_mail_addresses(&self, entries: &mut [PimdirMailEntry]) -> Result<(), PimdirError> {
+    /// Joins the address rows onto a page spanning collections, read for
+    /// `table`, one query per collection the page holds.
+    fn attach_entry_addresses(
+        &self,
+        entries: &mut [PimdirMailEntry],
+        table: PimdirSummaryTable,
+    ) -> Result<(), PimdirError> {
         let mut by_collection: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (at, entry) in entries.iter().enumerate() {
             by_collection
@@ -1460,7 +1713,7 @@ impl PimdirReader {
                 .iter()
                 .map(|at| entries[*at].item.clone())
                 .collect();
-            self.attach_addresses(&collection, &[PimdirSummaryTable::Mail], &mut items)?;
+            self.attach_addresses(&collection, &[table], &mut items)?;
             for (at, item) in positions.into_iter().zip(items) {
                 entries[at].item = item;
             }
@@ -1507,9 +1760,12 @@ pub(crate) fn collections_json(collections: &[impl AsRef<str>]) -> Result<String
     Ok(serde_json::to_string(&ids)?)
 }
 
-/// Maps a `list_mail_page_filtered`-shaped row: the collection, the item
-/// columns, then the mail summary's.
-fn mail_entry_from_row(row: &Row) -> rusqlite::Result<PimdirMailEntry> {
+/// Maps a row spanning collections: the collection, the item columns,
+/// then `table`'s summary columns when it names one.
+fn entry_from_row(
+    row: &Row,
+    table: Option<PimdirSummaryTable>,
+) -> rusqlite::Result<PimdirMailEntry> {
     let flags: Option<String> = row.get(3)?;
     let object: Option<String> = row.get(4)?;
     Ok(PimdirMailEntry {
@@ -1521,7 +1777,10 @@ fn mail_entry_from_row(row: &Row) -> rusqlite::Result<PimdirMailEntry> {
             object: object.map(PimdirHash),
             sort_key: row.get(5)?,
             level: codec::level_from_int(row.get(6)?),
-            summary: PimdirSummaryTable::Mail.read_row(row, 7)?,
+            summary: match table {
+                Some(table) => table.read_row(row, 7)?,
+                None => None,
+            },
             retention: None,
         },
     })

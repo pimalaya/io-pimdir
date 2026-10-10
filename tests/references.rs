@@ -98,8 +98,8 @@ fn a_reference_is_recorded_once_and_read_from_either_end() {
         store
             .add_reference(&m, &alice, &sender, PimdirReferenceOrigin::Auto)
             .unwrap(),
-        None,
-        "a duplicate records nothing"
+        Some(recorded.clone()),
+        "a duplicate records nothing and answers the reference standing"
     );
     let taken = store
         .add_reference(&m, &alice, &sender, PimdirReferenceOrigin::User)
@@ -110,7 +110,7 @@ fn a_reference_is_recorded_once_and_read_from_either_end() {
         store
             .add_reference(&m, &alice, &sender, PimdirReferenceOrigin::Auto)
             .unwrap(),
-        None,
+        Some(taken.clone()),
         "a rule's never takes back"
     );
 

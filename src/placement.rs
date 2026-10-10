@@ -33,6 +33,15 @@ crate::pimdir_id! {
 }
 
 impl PimdirLinkId {
+    /// Whether the key is writer-derived (`alt:`, `hash:`, `dup:`, STORAGE
+    /// §9): it names no identity, shares no public id and takes no
+    /// reference.
+    pub fn is_derived(&self) -> bool {
+        ["alt:", "hash:", "dup:"]
+            .iter()
+            .any(|prefix| self.0.starts_with(prefix))
+    }
+
     /// The provisional handle a create of this key is staged under:
     /// `U+0001` followed by the key (SYNC §2), a name no protocol hands
     /// out, so it never collides with a member the next enumeration lists

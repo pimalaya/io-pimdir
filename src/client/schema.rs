@@ -6,12 +6,16 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params};
+use std::path::Path;
+
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params, params};
 
 use crate::{
-    client::{PimdirError, busy_or_sql},
+    client::{PimdirError, blobs::PimdirBlobs, busy_or_sql, rows},
     hash::PimdirHashAlgo,
+    object::PimdirHash,
     sql,
+    summary::{PimdirSummary, mail},
 };
 
 /// The tables and triggers the canonical schema declares, which a store
@@ -42,7 +46,11 @@ const SCHEMA: [&str; 16] = [
 /// transaction setting the version it reaches (§6), the first one
 /// seeding `store_meta` (§4.2); then checks the store as [`check`] does.
 /// A store above the current version is refused.
-pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), PimdirError> {
+pub(crate) fn init(
+    conn: &mut Connection,
+    hash: PimdirHashAlgo,
+    dir: &Path,
+) -> Result<(), PimdirError> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version > sql::VERSION {
         return Err(PimdirError::Version { found: version });
@@ -72,7 +80,8 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
         tx.commit().map_err(busy_or_sql)?;
     }
 
-    reconcile(conn)?;
+    reconcile_role_constraint(conn)?;
+    reconcile(conn, &PimdirBlobs::open(dir, hash))?;
     check(conn)
 }
 
@@ -110,7 +119,7 @@ const RECONCILED_OBJECTS: [(&str, &str); 5] = [
 /// the coverage and round columns ([`reconcile_rounds`]), the mail
 /// invitation ([`reconcile_invitation`]) and the
 /// [`RECONCILED_OBJECTS`] ([`reconcile_objects`]), in one transaction.
-fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
+fn reconcile(conn: &mut Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(busy_or_sql)?;
@@ -129,7 +138,7 @@ fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     }
     reconcile_role(&tx)?;
     reconcile_rounds(&tx)?;
-    reconcile_invitation(&tx)?;
+    reconcile_invitation(&tx, blobs)?;
     reconcile_objects(&tx)?;
     tx.commit().map_err(busy_or_sql)
 }
@@ -240,9 +249,12 @@ fn reconcile_rounds(conn: &Connection) -> Result<(), PimdirError> {
 }
 
 /// The invitation a later draft added to `mail_summary` (Annex A.1), cut out
-/// of the canonical DDL; `mail_summary_by_invitation` follows among the
-/// [`RECONCILED_OBJECTS`].
-fn reconcile_invitation(conn: &Connection) -> Result<(), PimdirError> {
+/// of the canonical DDL, and backfilled once from every held body (§6), a
+/// held message never being read again; the references it implies follow
+/// (`link_invitations_of` over every mail). `mail_summary_by_invitation`
+/// follows among the [`RECONCILED_OBJECTS`]. A body the blob directory
+/// does not hold leaves its row `NULL`.
+fn reconcile_invitation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
     if has_column(conn, "mail_summary", "invitation")? {
         return Ok(());
     }
@@ -253,7 +265,113 @@ fn reconcile_invitation(conn: &Connection) -> Result<(), PimdirError> {
         "ALTER TABLE mail_summary ADD COLUMN {};",
         &schema[from..to]
     ))?;
+
+    let held: Vec<(String, String, String)> = rows(
+        conn,
+        "SELECT s.collection, s.link_id, i.object_hash FROM mail_summary s \
+         JOIN items i ON i.collection = s.collection AND i.link_id = s.link_id \
+         WHERE i.object_hash IS NOT NULL",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    for (collection, link_id, hash) in held {
+        let Some(body) = blobs.get(&PimdirHash(hash))? else {
+            continue;
+        };
+        let Some(PimdirSummary::Mail(mail)) = mail::derive(&body).summary else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE mail_summary SET invitation = ?3 WHERE collection = ?1 AND link_id = ?2",
+            params![collection, link_id, mail.invitation],
+        )?;
+    }
+    conn.execute(
+        sql::LINK_INVITATIONS_OF,
+        named_params! { ":link_id": None::<String> },
+    )?;
     Ok(())
+}
+
+/// The role `CHECK` a later draft widened to `attachments` (§6, §14.3), a
+/// constraint `ALTER TABLE` cannot change: `collections` rebuilt from the
+/// canonical DDL when its declared `CHECK` lacks it, its rows copied, its
+/// indexes and triggers recreated, with foreign keys off and checked before
+/// the commit. `legacy_alter_table` keeps the rename from re-parsing the
+/// triggers of other tables, which name `collections` while it is gone.
+fn reconcile_role_constraint(conn: &mut Connection) -> Result<(), PimdirError> {
+    let declared: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'collections'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if declared.is_none_or(|sql| !sql.contains("role") || sql.contains("'attachments'")) {
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
+    let rebuilt = rebuild_collections(conn);
+    conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")?;
+    rebuilt
+}
+
+/// The rebuild [`reconcile_role_constraint`] runs, in one transaction.
+fn rebuild_collections(conn: &mut Connection) -> Result<(), PimdirError> {
+    let schema = sql::MIGRATION_0001;
+    let cut = |start: &str, end: &str| {
+        let from = schema.find(start)?;
+        let to = from + schema[from..].find(end)? + end.len();
+        Some(String::from(&schema[from..to]))
+    };
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(busy_or_sql)?;
+    let attached: Vec<(String, String)> = rows(
+        &tx,
+        "SELECT type, name FROM sqlite_schema WHERE tbl_name = 'collections' \
+         AND type IN ('index', 'trigger') AND sql IS NOT NULL",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let columns: Vec<String> = rows(
+        &tx,
+        "SELECT name FROM pragma_table_info('collections')",
+        [],
+        |row| row.get(0),
+    )?;
+    let columns = columns.join(", ");
+    let create = cut("CREATE TABLE collections (", ") STRICT;").expect("canonical DDL");
+    tx.execute_batch(&format!(
+        "{}\nINSERT INTO collections_rebuild ({columns}) SELECT {columns} FROM collections;\n\
+         DROP TABLE collections;\nALTER TABLE collections_rebuild RENAME TO collections;",
+        create.replacen(
+            "CREATE TABLE collections (",
+            "CREATE TABLE collections_rebuild (",
+            1
+        ),
+    ))?;
+    for (kind, name) in attached {
+        let statement = match kind.as_str() {
+            "trigger" => cut(&format!("CREATE TRIGGER {name} "), "END;"),
+            _ => cut(&format!("CREATE INDEX {name} "), ";")
+                .or_else(|| cut(&format!("CREATE UNIQUE INDEX {name} "), ";")),
+        };
+        if let Some(statement) = statement {
+            tx.execute_batch(&statement)?;
+        }
+    }
+    let broken = tx
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()?;
+    if broken.is_some() {
+        return Err(PimdirError::Stale {
+            missing: "a foreign key the collections rebuild left dangling",
+        });
+    }
+    tx.commit().map_err(busy_or_sql)
 }
 
 /// Creates the [`RECONCILED_OBJECTS`] a store lacks, each cut out of the

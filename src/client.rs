@@ -167,7 +167,7 @@ impl PimdirStore {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
         )?;
-        schema::init(&mut conn, hash.unwrap_or_default())?;
+        schema::init(&mut conn, hash.unwrap_or_default(), dir)?;
         let hash = schema::hash_algo(&conn, hash)?;
 
         Ok(Self {
@@ -271,9 +271,10 @@ impl PimdirStore {
     }
 
     /// Records a reference from one item to another (`add_reference`,
-    /// §14.2), answering it when recorded, or when a person's took over a
-    /// rule's, and `None` when it changed nothing: a reference already
-    /// recorded, or an end the store holds no row of under its kind.
+    /// §14.2), answering it as it stands, recorded now or before, a
+    /// person's taking over a rule's; `None` when it cannot link: an end
+    /// the store holds no row of under its kind, or one under a
+    /// writer-derived key.
     ///
     /// Nothing requires one. A role outside the vocabulary, or an item
     /// referring to itself, is refused by the schema.
@@ -496,18 +497,20 @@ impl PimdirStore {
     /// Removes a collection with everything under it (§14), reporting
     /// whether there was one. Retention does not apply: the operator
     /// removed the collection itself. The pins the cascade drops are
-    /// settled by a recompute in the same transaction; the bodies fall to
-    /// the collector.
+    /// settled by a recompute in the same transaction, skipped when the
+    /// collection held none (`collection_holds_objects`); the bodies fall
+    /// to the collector.
     pub fn delete_collection(&mut self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        let deleted = tx.execute(
-            sql::DELETE_COLLECTION,
-            named_params! { ":collection": collection.as_ref() },
-        )?;
-        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+        let key = named_params! { ":collection": collection.as_ref() };
+        let pins: bool = tx.query_row(sql::COLLECTION_HOLDS_OBJECTS, key, |row| row.get(0))?;
+        let deleted = tx.execute(sql::DELETE_COLLECTION, key)?;
+        if pins {
+            tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+        }
         tx.commit().map_err(busy_or_sql)?;
         Ok(deleted > 0)
     }
@@ -515,6 +518,35 @@ impl PimdirStore {
 
 /// Retention (§11): the trash a store keeps, and the only deletes.
 impl PimdirStore {
+    /// Deletes an item no source binds (`delete_unbound_item`, §14.3), a
+    /// file of a device folder or a stand-in, releasing its pins, and
+    /// reports whether there was one; a bound item is its source's to
+    /// remove and is left alone.
+    pub fn delete_unbound(
+        &mut self,
+        collection: impl AsRef<str>,
+        link_id: &PimdirLinkId,
+    ) -> Result<bool, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let pinned: Option<(Option<String>, Option<String>)> = tx
+            .prepare(sql::DELETE_UNBOUND_ITEM)?
+            .query_row(
+                named_params! { ":collection": collection.as_ref(), ":link_id": link_id.as_str() },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((object, conflict_object)) = pinned else {
+            return Ok(false);
+        };
+
+        release_pins(&tx, [object, conflict_object].into_iter().flatten())?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(true)
+    }
+
     /// Purges one retained item by its public id, reporting whether there
     /// was one; a live item is never reached.
     pub fn purge(&mut self, collection: impl AsRef<str>, seq: i64) -> Result<bool, PimdirError> {

@@ -1136,10 +1136,7 @@ fn insert_item(
 
     // NOTE: a derived key states nothing the content carries and never
     // shares a public id (§9.1).
-    let derived = ["alt:", "hash:", "dup:"]
-        .iter()
-        .any(|prefix| link.0.starts_with(prefix));
-    let existing = match derived {
+    let existing = match link.is_derived() {
         true => None,
         false => conn
             .query_row(

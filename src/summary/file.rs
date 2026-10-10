@@ -52,7 +52,8 @@ impl PimdirFileSummary {
 
 /// The key of an attachment (Annex A.7): `part:`, the message's link id,
 /// `#` and the part's section, so every writer walking one message names
-/// its files alike.
-pub fn part_key(message: &PimdirLinkId, section: &str) -> PimdirLinkId {
-    PimdirLinkId(format!("part:{}#{section}", message.as_str()))
+/// its files alike; `None` for a message under a writer-derived key,
+/// which names no identity and gets no stand-in (STORAGE §14.3).
+pub fn part_key(message: &PimdirLinkId, section: &str) -> Option<PimdirLinkId> {
+    (!message.is_derived()).then(|| PimdirLinkId(format!("part:{}#{section}", message.as_str())))
 }

@@ -617,7 +617,7 @@ fn the_mail_readers_take_a_floor_and_sum_a_range() {
 
     let size = |body: &[u8]| body.len() as u64;
     assert_eq!(
-        reader.sum_mail(&both, any, floor, None).unwrap(),
+        reader.sum_mail(&both, any, None, floor, None).unwrap(),
         PimdirMailSum {
             count: 2,
             size: size(&recent),
@@ -625,7 +625,7 @@ fn the_mail_readers_take_a_floor_and_sum_a_range() {
         },
     );
     assert_eq!(
-        reader.sum_mail(&both, any, None, floor).unwrap(),
+        reader.sum_mail(&both, any, None, None, floor).unwrap(),
         PimdirMailSum {
             count: 2,
             size: size(&undated) + size(&old),
@@ -639,7 +639,7 @@ fn the_mail_readers_take_a_floor_and_sum_a_range() {
     };
     assert_eq!(
         reader
-            .sum_mail(&["INBOX"], unread, None, Some("2026-10-05T10:00:00Z"))
+            .sum_mail(&["INBOX"], unread, None, None, Some("2026-10-05T10:00:00Z"))
             .unwrap(),
         PimdirMailSum {
             count: 2,
@@ -650,7 +650,7 @@ fn the_mail_readers_take_a_floor_and_sum_a_range() {
     );
     assert_eq!(
         reader
-            .sum_mail(&both, any, Some("2027-01-01T00:00:00Z"), None)
+            .sum_mail(&both, any, None, Some("2027-01-01T00:00:00Z"), None)
             .unwrap(),
         PimdirMailSum::default(),
     );

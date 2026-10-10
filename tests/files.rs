@@ -80,7 +80,7 @@ fn seeded(dir: &Path) -> PimdirSourceStore {
 
     let message = PimdirLinkId("m".into());
     for (part, name) in [("2", "Report.pdf"), ("3", "photo.jpg")] {
-        let key = part_key(&message, part);
+        let key = part_key(&message, part).expect("an identity");
         store
             .put_file("Attachments", &key, &summary(name, part))
             .unwrap();
@@ -107,8 +107,16 @@ fn seeded(dir: &Path) -> PimdirSourceStore {
 fn a_stand_in_is_a_meta_file_listed_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = seeded(dir.path());
-    let key = part_key(&PimdirLinkId("m".into()), "2");
+    let key = part_key(&PimdirLinkId("m".into()), "2").expect("an identity");
     assert_eq!(key.as_str(), "part:m#2");
+    assert_eq!(
+        part_key(
+            &PimdirLinkId("alt:Alert|2026-08-01T10:00:00Z|cron@host".into()),
+            "2"
+        ),
+        None,
+        "a derived message key names no identity, so no stand-in"
+    );
 
     let page = store.list_summaries("Attachments", None, 10).unwrap();
     let names: Vec<&str> = page
@@ -248,4 +256,103 @@ fn an_earlier_store_gains_the_files_on_open() {
         )
         .unwrap();
     assert_eq!(declared, 2, "the table and its trigger");
+}
+
+/// The attachments collection carries the role `attachments`, and an
+/// account's stand-ins read in one statement with their messages; a file
+/// no source binds is deleted by its owner (STORAGE §14.3).
+#[test]
+fn an_account_lists_its_attachments_and_deletes_unbound_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seeded(dir.path());
+    store
+        .set_collection_role("Attachments", Some("attachments"))
+        .unwrap();
+    assert!(
+        store
+            .set_collection_role("INBOX", Some("attachments"))
+            .is_err(),
+        "only a file collection takes the role"
+    );
+
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let page = reader.list_attachments_by_account(None, None, 1).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(
+        page[0].link_id.as_str(),
+        "part:m#3",
+        "newest message, then seq"
+    );
+    assert_eq!(page[0].message.as_str(), "m");
+    let rest = reader
+        .list_attachments_by_account(None, Some(&page[0].cursor()), 10)
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|a| a.link_id.as_str()).collect::<Vec<_>>(),
+        ["part:m#2"]
+    );
+    drop(reader);
+
+    store
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
+            "Docs", "d1", "bound",
+        ))])
+        .unwrap();
+    store
+        .put_file(
+            "Docs",
+            &PimdirLinkId("file:01".into()),
+            &summary("a.txt", "9"),
+        )
+        .unwrap();
+    assert!(
+        store
+            .delete_unbound("Docs", &PimdirLinkId("file:01".into()))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .delete_unbound("Docs", &PimdirLinkId("bound".into()))
+            .unwrap(),
+        "a bound file is its source's"
+    );
+}
+
+/// A store whose role `CHECK` predates `attachments` is rebuilt on open,
+/// its rows kept (STORAGE §6).
+#[test]
+fn an_earlier_role_constraint_is_rebuilt_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(seeded(dir.path()));
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch(
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_schema SET sql = replace(sql,
+             ' OR (kind = ''application/octet-stream'' AND role = ''attachments'')', '')
+         WHERE name = 'collections';
+         PRAGMA writable_schema = OFF;",
+    )
+    .unwrap();
+    drop(conn);
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    let declared: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'collections'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !declared.contains("'attachments'"),
+        "the earlier constraint"
+    );
+    drop(conn);
+
+    let store = PimdirStore::open(dir.path()).unwrap();
+    store
+        .set_collection_role("Attachments", Some("attachments"))
+        .unwrap();
+    assert_eq!(store.list_collections().unwrap().len(), 3, "rows kept");
+    assert_eq!(store.count_items("INBOX").unwrap(), 1);
 }
