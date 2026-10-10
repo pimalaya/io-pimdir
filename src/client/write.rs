@@ -38,6 +38,7 @@ use crate::{
         PimdirAddress, PimdirAddressRole, PimdirSummary,
         calendar::{PimdirEventSummary, PimdirJournalSummary, PimdirTaskSummary, PimdirTime},
         contact::PimdirContactSummary,
+        file::{self, PimdirFileSummary},
         mail::PimdirMailSummary,
     },
 };
@@ -701,11 +702,13 @@ pub(crate) fn kind_of(conn: &Connection, collection: &str) -> rusqlite::Result<S
 }
 
 /// The summary tables a collection's kind may hold rows in; every table
-/// for a collection whose kind was never declared.
+/// a body derives for a collection whose kind was never declared, a file
+/// collection being always declared (§14.3).
 pub(crate) fn tables_of(kind: &str) -> Vec<PimdirSummaryTable> {
     match kind.split(';').next().unwrap_or_default().trim() {
         "message/rfc822" => vec![PimdirSummaryTable::Mail],
         "text/vcard" => vec![PimdirSummaryTable::Contact],
+        file::KIND => vec![PimdirSummaryTable::File],
         "text/calendar" => vec![
             PimdirSummaryTable::Event,
             PimdirSummaryTable::Task,
@@ -721,7 +724,7 @@ pub(crate) fn tables_of(kind: &str) -> Vec<PimdirSummaryTable> {
     }
 }
 
-/// One of the five summary tables (§4.3).
+/// One of the six summary tables (§4.3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PimdirSummaryTable {
     Mail,
@@ -729,6 +732,7 @@ pub(crate) enum PimdirSummaryTable {
     Event,
     Task,
     Journal,
+    File,
 }
 
 impl PimdirSummaryTable {
@@ -740,6 +744,7 @@ impl PimdirSummaryTable {
             PimdirSummary::Event(_) => Self::Event,
             PimdirSummary::Task(_) => Self::Task,
             PimdirSummary::Journal(_) => Self::Journal,
+            PimdirSummary::File(_) => Self::File,
         }
     }
 
@@ -750,14 +755,15 @@ impl PimdirSummaryTable {
             Self::Event => sql::LOAD_EVENT_SUMMARIES,
             Self::Task => sql::LOAD_TASK_SUMMARIES,
             Self::Journal => sql::LOAD_JOURNAL_SUMMARIES,
+            Self::File => sql::LOAD_FILE_SUMMARIES,
         }
     }
 
-    /// The delete a component rewritten as another runs; a mail or contact
-    /// row never leaves its item, the collection's kind being fixed.
+    /// The delete a component rewritten as another runs; a mail, contact
+    /// or file row never leaves its item, the collection's kind being fixed.
     fn delete_sql(self) -> Option<&'static str> {
         match self {
-            Self::Mail | Self::Contact => None,
+            Self::Mail | Self::Contact | Self::File => None,
             Self::Event => Some(sql::DELETE_EVENT_SUMMARY),
             Self::Task => Some(sql::DELETE_TASK_SUMMARY),
             Self::Journal => Some(sql::DELETE_JOURNAL_SUMMARY),
@@ -859,6 +865,19 @@ impl PimdirSummaryTable {
                     dtstart: time(2, 3, 4)?,
                     organizer: None,
                     attendees: Vec::new(),
+                })
+            }
+            Self::File => {
+                let Some(name) = present(0)? else {
+                    return Ok(None);
+                };
+                PimdirSummary::File(PimdirFileSummary {
+                    name,
+                    media_type: text(1)?,
+                    size: row
+                        .get::<_, Option<i64>>(at + 2)?
+                        .map(|size| size.max(0) as u64),
+                    part: text(3)?,
                 })
             }
         };
@@ -1325,6 +1344,17 @@ fn write_summary(
                 ":dtstart": journal.dtstart.as_ref().map(|t| t.value.as_str()),
                 ":dtstart_tzid": journal.dtstart.as_ref().and_then(|t| t.tzid.as_deref()),
                 ":dtstart_value": journal.dtstart.as_ref().map(PimdirTime::value_kind),
+            },
+        )?,
+        PimdirSummary::File(file) => conn.execute(
+            sql::UPSERT_FILE_SUMMARY,
+            named_params! {
+                ":collection": collection,
+                ":link_id": link.0,
+                ":name": file.name,
+                ":media_type": file.media_type,
+                ":size": file.size.map(|size| size as i64),
+                ":part": file.part,
             },
         )?,
     };

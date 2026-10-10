@@ -80,19 +80,27 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
 /// one can take as they are (§6): the owner creates them on open, from the
 /// canonical DDL, instead of refusing the store. Readers and producers
 /// read their absence as nothing declared, no receipt kept and no
-/// reference recorded.
-const RECONCILED: [&str; 4] = ["capabilities", "performers", "receipts", "item_reference"];
+/// reference recorded, no file summarised.
+const RECONCILED: [&str; 5] = [
+    "capabilities",
+    "performers",
+    "receipts",
+    "item_reference",
+    "file_summary",
+];
 
 /// The indexes and triggers a later draft added to version 1 (§6), each
 /// `(kind, name)`, created on open when absent from the canonical DDL,
 /// after the [`RECONCILED`] tables they hang off. A reader of a store
 /// lacking one reads as before: `items_by_sort_global` orders a page
 /// across collections (§9.3), slower without it; `item_reference_to`
-/// and `items_drop_references` serve and hold the references (§14.2).
-const RECONCILED_OBJECTS: [(&str, &str); 3] = [
+/// and `items_drop_references` serve and hold the references (§14.2);
+/// `item_reference_collects_files` collects the stand-ins (§14.3).
+const RECONCILED_OBJECTS: [(&str, &str); 4] = [
     ("INDEX", "items_by_sort_global"),
     ("INDEX", "item_reference_to"),
     ("TRIGGER", "items_drop_references"),
+    ("TRIGGER", "item_reference_collects_files"),
 ];
 
 /// Creates the [`RECONCILED`] tables a store lacks, each with its key, and

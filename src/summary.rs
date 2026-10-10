@@ -8,10 +8,13 @@
 //! `Full` tier through [`derive()`], and at the `Meta` tier builds the
 //! kind's summary from what the protocol hands it (an IMAP ENVELOPE),
 //! through the same decoding the kind modules expose, so the two tiers
-//! agree byte for byte as Annex A requires.
+//! agree byte for byte as Annex A requires. A file states nothing in its
+//! bytes: its summary is what its source or writer states
+//! ([`file`](mod@file)).
 
 pub mod calendar;
 pub mod contact;
+pub mod file;
 pub mod mail;
 mod time;
 
@@ -22,6 +25,7 @@ use crate::{
     summary::{
         calendar::{PimdirEventSummary, PimdirJournalSummary, PimdirTaskSummary},
         contact::PimdirContactSummary,
+        file::PimdirFileSummary,
         mail::PimdirMailSummary,
     },
 };
@@ -39,6 +43,8 @@ pub enum PimdirSummary {
     Task(PimdirTaskSummary),
     /// A `text/calendar` `VJOURNAL` resource (Annex A.5).
     Journal(PimdirJournalSummary),
+    /// An `application/octet-stream` file (Annex A.7).
+    File(PimdirFileSummary),
 }
 
 impl PimdirSummary {
@@ -50,6 +56,7 @@ impl PimdirSummary {
             Self::Event(event) => event.uid.as_deref(),
             Self::Task(task) => task.uid.as_deref(),
             Self::Journal(journal) => journal.uid.as_deref(),
+            Self::File(_) => None,
         }
     }
 
@@ -73,6 +80,7 @@ impl PimdirSummary {
             Self::Event(event) => &event.summary,
             Self::Task(task) => &task.summary,
             Self::Journal(journal) => &journal.summary,
+            Self::File(file) => &file.name,
         }
     }
 
@@ -112,6 +120,7 @@ impl PimdirSummary {
                 );
                 push(&mut out, PimdirAddressRole::Attendee, &journal.attendees);
             }
+            Self::File(_) => {}
         }
 
         out

@@ -106,6 +106,15 @@ fn row(summary: &PimdirSummary) -> (&'static str, Value) {
                 }),
             )
         }
+        PimdirSummary::File(file) => (
+            "file_summary",
+            json!({
+                "name": file.name,
+                "media_type": file.media_type,
+                "size": file.size,
+                "part": file.part,
+            }),
+        ),
     }
 }
 

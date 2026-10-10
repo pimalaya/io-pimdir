@@ -952,3 +952,15 @@ The reader SHALL answer, over a set of collections and under `PimdirMailFilter` 
 
 #### Scenario: An earlier store gains the table
 - tests/references.rs `an_earlier_store_gains_the_references_on_open`.
+
+### Requirement: Files, and attachments standing for a message's parts
+A collection of kind `application/octet-stream` (`summary::file::KIND`) SHALL hold files, its rows summarised by `PimdirFileSummary` in `file_summary` (Annex A.7), listed A to Z by `list_summaries` (STORAGE §14.3). `PimdirStore::put_file(collection, link_id, summary)` SHALL write a file holding no body at `Meta`, or restate its summary and sort key when held, drawing the `seq` its key already has elsewhere, and SHALL refuse a collection of another kind (`PimdirError::NotFiles`). `summary::file::part_key` SHALL key an attachment `part:<message>#<section>`. `PimdirReader::list_attachments(account, message)` SHALL answer a message's files through its `attachment` references in the order recorded, the stand-in's summary and any placement's body, none on a store lacking the tables. A stand-in SHALL go once no reference names it, by the canonical trigger; opening a store as its owner SHALL create `file_summary` and `item_reference_collects_files` when absent (STORAGE §6).
+
+#### Scenario: A stand-in is a Meta file
+- tests/files.rs `a_stand_in_is_a_meta_file_listed_by_name`.
+
+#### Scenario: A message lists its attachments and takes them with it
+- tests/files.rs `a_message_lists_its_attachments_and_takes_them_with_it`.
+
+#### Scenario: An earlier store gains the files
+- tests/files.rs `an_earlier_store_gains_the_files_on_open`.

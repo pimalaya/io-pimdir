@@ -112,6 +112,13 @@ fn columns(summary: &PimdirSummary) -> (&'static str, Map<String, Value>) {
             time(&mut put, "dtstart", &journal.dtstart);
             "journal_summary"
         }
+        PimdirSummary::File(file) => {
+            put("name", json!(file.name));
+            put("media_type", json!(file.media_type));
+            put("size", json!(file.size));
+            put("part", json!(file.part));
+            "file_summary"
+        }
     };
 
     (table, row)

@@ -47,7 +47,10 @@ use crate::{
     placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId},
     reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
     sql,
-    summary::{PimdirAddressRole, PimdirSummary},
+    summary::{
+        PimdirAddressRole, PimdirSummary,
+        file::{self, PimdirFileSummary},
+    },
 };
 
 /// A pimdir store opened to read: the projection every role shares.
@@ -299,6 +302,21 @@ pub struct PimdirMailSum {
     pub size: u64,
     /// The messages whose size is unknown, left out of `size`.
     pub unknown: u64,
+}
+
+/// One file a message attaches (`list_attachments`, §14.3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirAttachment {
+    /// The file's key, `part:` for one standing for a part.
+    pub link_id: PimdirLinkId,
+    /// The collection of the placement read, the stand-in's when held.
+    pub collection: String,
+    /// The file's public id.
+    pub seq: i64,
+    /// Its summary there: name, media type, size and part.
+    pub summary: Option<PimdirFileSummary>,
+    /// A body a placement of the file holds, a saved copy's.
+    pub object: Option<PimdirHash>,
 }
 
 /// One item the change feed reports (§4.5).
@@ -606,6 +624,7 @@ impl PimdirReader {
             match kind.split(';').next().unwrap_or_default().trim() {
                 "message/rfc822" => vec![(sql::LIST_MAIL_PAGE_DESC, PimdirSummaryTable::Mail)],
                 "text/vcard" => vec![(sql::LIST_CONTACTS_PAGE_ASC, PimdirSummaryTable::Contact)],
+                file::KIND => vec![(sql::LIST_FILES_PAGE_ASC, PimdirSummaryTable::File)],
                 "text/calendar" => vec![
                     (sql::LIST_EVENTS_PAGE_ASC, PimdirSummaryTable::Event),
                     (sql::LIST_TASKS_PAGE_ASC, PimdirSummaryTable::Task),
@@ -1207,6 +1226,41 @@ impl PimdirReader {
         )?)
     }
 
+    /// The files a message attaches (`list_attachments`, §14.3), read
+    /// from the file collections of `account` (`None` in a single-account
+    /// store), in the order recorded: each with its part, and the body a
+    /// saved copy holds. None on a store whose owner has not added the
+    /// references or the file summaries yet.
+    pub fn list_attachments(
+        &self,
+        account: Option<&str>,
+        message: &PimdirLinkId,
+    ) -> Result<Vec<PimdirAttachment>, PimdirError> {
+        if !schema::has_table(&self.conn, "item_reference")?
+            || !schema::has_table(&self.conn, "file_summary")?
+        {
+            return Ok(Vec::new());
+        }
+        Ok(rows(
+            &self.conn,
+            sql::LIST_ATTACHMENTS,
+            named_params! { ":account": account, ":link_id": message.as_str() },
+            |row| {
+                let summary = match PimdirSummaryTable::File.read_row(row, 3)? {
+                    Some(PimdirSummary::File(file)) => Some(file),
+                    _ => None,
+                };
+                Ok(PimdirAttachment {
+                    link_id: PimdirLinkId(row.get(0)?),
+                    collection: row.get(1)?,
+                    seq: row.get(2)?,
+                    summary,
+                    object: row.get::<_, Option<String>>(7)?.map(PimdirHash),
+                })
+            },
+        )?)
+    }
+
     /// The references made to an item (`references_to`, §14.2), on
     /// [`references_from`](Self::references_from)'s terms.
     pub fn references_to(
@@ -1512,6 +1566,7 @@ impl PimdirReader {
             PimdirSummaryTable::Event => sql::GET_EVENT,
             PimdirSummaryTable::Task => sql::GET_TASK,
             PimdirSummaryTable::Journal => sql::GET_JOURNAL,
+            PimdirSummaryTable::File => sql::GET_FILE,
         };
 
         let mut found: Option<PimdirItem> = None;

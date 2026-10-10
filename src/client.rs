@@ -30,12 +30,15 @@ use crate::{
     client::{
         lock::PimdirLock,
         reader::{PimdirReader, collections_json, reference_from_row},
+        write::kind_of,
     },
     codec::{self, PimdirAction, PimdirActionError},
     hash::PimdirHashAlgo,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
+    placement::PimdirLinkId,
     reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
     sql,
+    summary::file::{self, PimdirFileSummary},
 };
 
 pub mod blobs;
@@ -321,6 +324,95 @@ impl PimdirStore {
             )
             .optional()
             .map_err(busy_or_sql)
+    }
+
+    /// Writes a file holding no body into a collection no source syncs
+    /// (§14.3), or restates its summary when the collection holds it,
+    /// answering its public id: the stand-in of an attachment, keyed by
+    /// [`part_key`](crate::summary::file::part_key), at `Meta`, which no
+    /// sync reads as a body to fetch.
+    ///
+    /// The owner records the stand-in and its `attachment` reference in
+    /// one transaction of its own; a stand-in no reference names goes on
+    /// the next reference removed. A collection of another kind than
+    /// files is refused as [`PimdirError::NotFiles`].
+    pub fn put_file(
+        &mut self,
+        collection: impl AsRef<str>,
+        link_id: &PimdirLinkId,
+        summary: &PimdirFileSummary,
+    ) -> Result<i64, PimdirError> {
+        let collection = collection.as_ref();
+        let kind = kind_of(&self.conn, collection)?;
+        if kind != file::KIND {
+            return Err(PimdirError::NotFiles {
+                collection: collection.into(),
+                kind,
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let key = named_params! { ":collection": collection, ":link_id": link_id.as_str() };
+        let held: Option<i64> = tx
+            .query_row(sql::SEQ_BY_LINK, key, |row| row.get(0))
+            .optional()?;
+        let seq = match held {
+            Some(seq) => {
+                tx.execute(
+                    sql::SET_SORT_KEY,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link_id.as_str(),
+                        ":sort_key": summary.sort_key().0,
+                    },
+                )?;
+                seq
+            }
+            None => {
+                let shared: Option<i64> = tx
+                    .query_row(
+                        sql::SEQ_FOR_LINK_ANY,
+                        named_params! { ":link_id": link_id.as_str() },
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let seq = match shared {
+                    Some(seq) => seq,
+                    None => tx.query_row(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
+                };
+                tx.execute(
+                    sql::INSERT_ITEM,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link_id.as_str(),
+                        ":seq": seq,
+                        ":flags": "[]",
+                        ":object_hash": None::<String>,
+                        ":sort_key": summary.sort_key().0,
+                        ":level": 1,
+                        ":deleted": 0,
+                        ":conflicted": 0,
+                        ":conflict_object": None::<String>,
+                    },
+                )?;
+                seq
+            }
+        };
+        tx.execute(
+            sql::UPSERT_FILE_SUMMARY,
+            named_params! {
+                ":collection": collection,
+                ":link_id": link_id.as_str(),
+                ":name": summary.name,
+                ":media_type": summary.media_type,
+                ":size": summary.size.map(|size| size as i64),
+                ":part": summary.part,
+            },
+        )?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(seq)
     }
 
     /// Regroups a collection under `account`, or out of one with `None` (§9.2).
@@ -899,6 +991,14 @@ pub enum PimdirError {
         /// Its declared kind, empty when undeclared.
         kind: String,
     },
+    /// A file was written to a collection of another kind than files
+    /// (§14.3).
+    NotFiles {
+        /// The collection written to.
+        collection: String,
+        /// Its declared kind, empty when undeclared.
+        kind: String,
+    },
     /// The store's schema version is not one this crate services.
     Version {
         /// The store's `user_version`.
@@ -981,6 +1081,10 @@ impl fmt::Display for PimdirError {
             Self::Scope { collection, kind } => write!(
                 f,
                 "Pimdir sync refused: a scope bounds mail only, and collection {collection} holds {kind:?}"
+            ),
+            Self::NotFiles { collection, kind } => write!(
+                f,
+                "Pimdir file write refused: collection {collection} holds {kind:?}, not files"
             ),
             Self::Version { found } => write!(
                 f,
