@@ -940,3 +940,15 @@ The drain SHALL record a receipt (`record_receipt`) in the transaction applying 
 
 ### Requirement: The mail reads count, page and search across collections
 The reader SHALL answer, over a set of collections and under `PimdirMailFilter` (the read and attachment chips, `None` for either), `count_mail`, `count_mail_by_day` (per day of the `Date`, a SQLite modifier moving it to the reader's clock), `count_unread` (per collection), `list_mail_page_filtered` and `search_mail` (newest first on `PimdirMailCursor`, `(sort_key, seq, collection)`, with summaries and addresses), from the committed rows (STORAGE §14.1). All but `search_mail` SHALL take a `since` floor on the sort key, undated mail below it and `None` setting none. `sum_mail` SHALL answer, under the same set and chips over `[since, until)` (either `None` for open), a `PimdirMailSum`: the messages, the summed size of those knowing it, and the count of those that do not. `like_pattern` SHALL build `search_mail`'s pattern from the words searched, `%` around them and `%`, `_` and `\` escaped. A page over several collections SHALL walk `items_by_sort_global` and sort nothing, on a store without statistics (STORAGE §9.3); opening a store as its owner SHALL create that index when absent, a reader of a store lacking it paging by a scan and a sort.
+
+### Requirement: Items refer to each other
+`PimdirStore::add_reference(from, to, role, origin)` SHALL run `add_reference` and answer the reference when recorded, or when a `User` one took over an `Auto` one, `None` when it changed nothing: a duplicate, or an end the store holds no row of under its kind (STORAGE §14.2). A role outside the vocabulary and a self-reference SHALL be refused by the schema. `remove_reference` SHALL delete one whatever its origin. `PimdirReader::references_from` and `references_to` SHALL answer an end's references in the canonical order, none on a store lacking the table. A reference SHALL go with the last row of either end, by the canonical trigger; opening a store as its owner SHALL create `item_reference`, `item_reference_to` and `items_drop_references` when absent (STORAGE §6).
+
+#### Scenario: Recorded once, read from either end
+- tests/references.rs `a_reference_is_recorded_once_and_read_from_either_end`.
+
+#### Scenario: Gone with the last row
+- tests/references.rs `a_reference_goes_with_the_last_row_of_an_end`.
+
+#### Scenario: An earlier store gains the table
+- tests/references.rs `an_earlier_store_gains_the_references_on_open`.

@@ -29,11 +29,12 @@ use crate::{
     capability::{PimdirCapability, PimdirRefusal},
     client::{
         lock::PimdirLock,
-        reader::{PimdirReader, collections_json},
+        reader::{PimdirReader, collections_json, reference_from_row},
     },
     codec::{self, PimdirAction, PimdirActionError},
     hash::PimdirHashAlgo,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
+    reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
     sql,
 };
 
@@ -264,6 +265,62 @@ impl PimdirStore {
             )
             .map_err(busy_or_sql)?;
         Ok(())
+    }
+
+    /// Records a reference from one item to another (`add_reference`,
+    /// §14.2), answering it when recorded, or when a person's took over a
+    /// rule's, and `None` when it changed nothing: a reference already
+    /// recorded, or an end the store holds no row of under its kind.
+    ///
+    /// Nothing requires one. A role outside the vocabulary, or an item
+    /// referring to itself, is refused by the schema.
+    pub fn add_reference(
+        &self,
+        from: &PimdirEndpoint,
+        to: &PimdirEndpoint,
+        role: &PimdirReferenceRole,
+        origin: PimdirReferenceOrigin,
+    ) -> Result<Option<PimdirReference>, PimdirError> {
+        self.conn
+            .query_row(
+                sql::ADD_REFERENCE,
+                named_params! {
+                    ":from_kind": from.kind,
+                    ":from_link_id": from.link_id.as_str(),
+                    ":to_kind": to.kind,
+                    ":to_link_id": to.link_id.as_str(),
+                    ":role": role.as_str(),
+                    ":origin": origin.as_str(),
+                },
+                reference_from_row,
+            )
+            .optional()
+            .map_err(busy_or_sql)
+    }
+
+    /// Removes one reference, whatever its origin (`remove_reference`,
+    /// §14.2), answering it, or `None` when none was recorded. A rule
+    /// matching again records it anew.
+    pub fn remove_reference(
+        &self,
+        from: &PimdirEndpoint,
+        to: &PimdirEndpoint,
+        role: &PimdirReferenceRole,
+    ) -> Result<Option<PimdirReference>, PimdirError> {
+        self.conn
+            .query_row(
+                sql::REMOVE_REFERENCE,
+                named_params! {
+                    ":from_kind": from.kind,
+                    ":from_link_id": from.link_id.as_str(),
+                    ":to_kind": to.kind,
+                    ":to_link_id": to.link_id.as_str(),
+                    ":role": role.as_str(),
+                },
+                reference_from_row,
+            )
+            .optional()
+            .map_err(busy_or_sql)
     }
 
     /// Regroups a collection under `account`, or out of one with `None` (§9.2).

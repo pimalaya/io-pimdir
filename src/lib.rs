@@ -26,6 +26,8 @@
 //! detail ladder, reconciled against a per-source base. [`hub`] is the
 //! shared item with a binding per source, which a store projects for one
 //! source and absorbs a source's writes back into (SYNC.md §3, §9).
+//! [`reference`](mod@reference) links one item to another across kinds
+//! and collections (STORAGE.md §14.2).
 //!
 //! ## The engine
 //!
@@ -102,6 +104,7 @@ pub mod mutate;
 pub mod object;
 pub mod open;
 pub mod placement;
+pub mod reference;
 pub mod rekey;
 pub mod remote;
 pub mod sql;

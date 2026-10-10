@@ -45,6 +45,7 @@ use crate::{
     hub::{PimdirBinding, PimdirSourceId},
     object::PimdirHash,
     placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId},
+    reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
     sql,
     summary::{PimdirAddressRole, PimdirSummary},
 };
@@ -1188,6 +1189,41 @@ impl PimdirReader {
         )?)
     }
 
+    /// The references an item makes (`references_from`, §14.2), in the
+    /// order of the other end and the role, whatever the state of either
+    /// end; none on a store whose owner has not added the table yet.
+    pub fn references_from(
+        &self,
+        endpoint: &PimdirEndpoint,
+    ) -> Result<Vec<PimdirReference>, PimdirError> {
+        if !schema::has_table(&self.conn, "item_reference")? {
+            return Ok(Vec::new());
+        }
+        Ok(rows(
+            &self.conn,
+            sql::REFERENCES_FROM,
+            named_params! { ":kind": endpoint.kind, ":link_id": endpoint.link_id.as_str() },
+            reference_from_row,
+        )?)
+    }
+
+    /// The references made to an item (`references_to`, §14.2), on
+    /// [`references_from`](Self::references_from)'s terms.
+    pub fn references_to(
+        &self,
+        endpoint: &PimdirEndpoint,
+    ) -> Result<Vec<PimdirReference>, PimdirError> {
+        if !schema::has_table(&self.conn, "item_reference")? {
+            return Ok(Vec::new());
+        }
+        Ok(rows(
+            &self.conn,
+            sql::REFERENCES_TO,
+            named_params! { ":kind": endpoint.kind, ":link_id": endpoint.link_id.as_str() },
+            reference_from_row,
+        )?)
+    }
+
     /// How much live mail a set of collections holds under the chips
     /// (`count_mail`). `since` is a floor on the sort key, an RFC 3339
     /// instant: mail below it, and undated mail, is left out; `None` sets
@@ -1392,6 +1428,23 @@ pub fn like_pattern(words: &str) -> String {
     }
     pattern.push('%');
     pattern
+}
+
+/// Maps an `item_reference` row in its canonical column order.
+pub(crate) fn reference_from_row(row: &Row) -> rusqlite::Result<PimdirReference> {
+    Ok(PimdirReference {
+        from: PimdirEndpoint {
+            kind: row.get(0)?,
+            link_id: PimdirLinkId(row.get(1)?),
+        },
+        to: PimdirEndpoint {
+            kind: row.get(2)?,
+            link_id: PimdirLinkId(row.get(3)?),
+        },
+        role: PimdirReferenceRole::parse(&row.get::<_, String>(4)?),
+        origin: PimdirReferenceOrigin::parse(&row.get::<_, String>(5)?),
+        created_at: row.get(6)?,
+    })
 }
 
 /// A set of collection ids as the JSON array the mail reads bind.

@@ -79,19 +79,26 @@ pub(crate) fn init(conn: &mut Connection, hash: PimdirHashAlgo) -> Result<(), Pi
 /// The tables a later draft added to version 1 that a store from an earlier
 /// one can take as they are (§6): the owner creates them on open, from the
 /// canonical DDL, instead of refusing the store. Readers and producers
-/// read their absence as nothing declared, and no receipt kept.
-const RECONCILED: [&str; 3] = ["capabilities", "performers", "receipts"];
+/// read their absence as nothing declared, no receipt kept and no
+/// reference recorded.
+const RECONCILED: [&str; 4] = ["capabilities", "performers", "receipts", "item_reference"];
 
-/// The indexes a later draft added to version 1 over tables a store from an
-/// earlier one already holds (§6), created on open when absent from the
-/// canonical DDL. A reader of a store lacking one reads as before, slower:
-/// `items_by_sort_global` orders a page across collections (§9.3).
-const RECONCILED_INDEXES: [&str; 1] = ["items_by_sort_global"];
+/// The indexes and triggers a later draft added to version 1 (§6), each
+/// `(kind, name)`, created on open when absent from the canonical DDL,
+/// after the [`RECONCILED`] tables they hang off. A reader of a store
+/// lacking one reads as before: `items_by_sort_global` orders a page
+/// across collections (§9.3), slower without it; `item_reference_to`
+/// and `items_drop_references` serve and hold the references (§14.2).
+const RECONCILED_OBJECTS: [(&str, &str); 3] = [
+    ("INDEX", "items_by_sort_global"),
+    ("INDEX", "item_reference_to"),
+    ("TRIGGER", "items_drop_references"),
+];
 
 /// Creates the [`RECONCILED`] tables a store lacks, each with its key, and
 /// adds `collections.role` with its index and triggers ([`reconcile_role`]),
 /// the coverage and round columns ([`reconcile_rounds`]) and the
-/// [`RECONCILED_INDEXES`] ([`reconcile_indexes`]), in one transaction.
+/// [`RECONCILED_OBJECTS`] ([`reconcile_objects`]), in one transaction.
 fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -111,7 +118,7 @@ fn reconcile(conn: &mut Connection) -> Result<(), PimdirError> {
     }
     reconcile_role(&tx)?;
     reconcile_rounds(&tx)?;
-    reconcile_indexes(&tx)?;
+    reconcile_objects(&tx)?;
     tx.commit().map_err(busy_or_sql)
 }
 
@@ -220,23 +227,25 @@ fn reconcile_rounds(conn: &Connection) -> Result<(), PimdirError> {
     Ok(())
 }
 
-/// Creates the [`RECONCILED_INDEXES`] a store lacks, each cut out of the
-/// canonical DDL.
-fn reconcile_indexes(conn: &Connection) -> Result<(), PimdirError> {
+/// Creates the [`RECONCILED_OBJECTS`] a store lacks, each cut out of the
+/// canonical DDL: an index up to its `;`, a trigger up to its `END;`.
+fn reconcile_objects(conn: &Connection) -> Result<(), PimdirError> {
     let schema = sql::MIGRATION_0001;
-    for index in RECONCILED_INDEXES {
+    for (kind, name) in RECONCILED_OBJECTS {
         let declared = conn
             .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1",
-                [index],
+                "SELECT 1 FROM sqlite_schema WHERE type = lower(?1) AND name = ?2",
+                [kind, name],
                 |_| Ok(()),
             )
             .optional()?
             .is_some();
         if !declared {
-            let start = format!("CREATE INDEX {index} ");
-            let from = schema.find(&start).expect("canonical DDL");
-            let to = from + schema[from..].find(';').expect("canonical DDL") + 1;
+            let end = if kind == "TRIGGER" { "END;" } else { ";" };
+            let from = schema
+                .find(&format!("CREATE {kind} {name} "))
+                .expect("canonical DDL");
+            let to = from + schema[from..].find(end).expect("canonical DDL") + end.len();
             conn.execute_batch(&schema[from..to])?;
         }
     }

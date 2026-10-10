@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file. The format is b
 
 - Added `PimdirReader::sum_mail` and `PimdirMailSum`: the messages, known size and unknown sizes of a `[since, until)` range under the chips (pimdir draft-04, STORAGE §14.1).
 - Added `PimdirStore::release_before` and `PimdirReleaseReport`: the bodies of a set of mail collections below a date go back to `Meta`, headers kept, those still needed kept (pimdir draft-04, STORAGE §11.4).
+- Added references between items (pimdir draft-04, STORAGE §14.2): the `reference` module (`PimdirEndpoint`, `PimdirReference`, `PimdirReferenceRole`, `PimdirReferenceOrigin`), `PimdirStore::add_reference` and `remove_reference`, `PimdirReader::references_from` and `references_to`; the `item_reference` table, its index and its trigger are added on open to an older store, whose reader reads none.
 
 ### Changed
 
