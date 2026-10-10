@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Added `PimdirReader::sum_mail` and `PimdirMailSum`: the messages, known size and unknown sizes of a `[since, until)` range under the chips (pimdir draft-04, STORAGE §14.1).
+
+### Changed
+
+- Changed `PimdirReader::count_mail`, `count_mail_by_day`, `count_unread` and `list_mail_page_filtered` to take a `since` floor on the sort key, seeked on the index, undated mail falling below it; `None` keeps the previous behaviour (pimdir draft-04, STORAGE §14.1).
+
 ## [0.7.0] - 2026-10-09
 
 ### Added

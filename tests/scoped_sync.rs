@@ -10,7 +10,7 @@ use io_pimdir::{
     change::PimdirChange,
     client::{
         PimdirError, PimdirRunError, PimdirStore,
-        reader::{PimdirMailFilter, PimdirReader, like_pattern},
+        reader::{PimdirMailFilter, PimdirMailSum, PimdirReader, like_pattern},
     },
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     placement::{PimdirFlags, PimdirHandle, PimdirLevel},
@@ -367,20 +367,20 @@ fn the_mail_readers_count_page_and_search_across_collections() {
     let reader = PimdirReader::open(dir.path()).unwrap();
     let both = ["INBOX", "Archive"];
     let any = PimdirMailFilter::default();
-    assert_eq!(reader.count_mail(&both, any).unwrap(), 4);
+    assert_eq!(reader.count_mail(&both, any, None).unwrap(), 4);
     let unread = PimdirMailFilter {
         seen: Some(false),
         ..any
     };
-    assert_eq!(reader.count_mail(&both, unread).unwrap(), 2);
+    assert_eq!(reader.count_mail(&both, unread, None).unwrap(), 2);
     let attached = PimdirMailFilter {
         attachment: Some(true),
         ..any
     };
-    assert_eq!(reader.count_mail(&both, attached).unwrap(), 2);
+    assert_eq!(reader.count_mail(&both, attached, None).unwrap(), 2);
 
     let days: BTreeMap<Option<String>, u64> = reader
-        .count_mail_by_day(&both, any, None)
+        .count_mail_by_day(&both, any, None, None)
         .unwrap()
         .into_iter()
         .map(|day| (day.day, day.count))
@@ -388,16 +388,18 @@ fn the_mail_readers_count_page_and_search_across_collections() {
     assert_eq!(days[&Some("2026-10-05".into())], 2);
     assert_eq!(days[&Some("2026-10-03".into())], 1);
     let shifted = reader
-        .count_mail_by_day(&["INBOX"], any, Some("-11 hours"))
+        .count_mail_by_day(&["INBOX"], any, None, Some("-11 hours"))
         .unwrap();
     assert_eq!(shifted[0].day.as_deref(), Some("2026-10-05"));
     assert_eq!(shifted[0].count, 1, "10:00 UTC falls the day before");
 
-    let unread = reader.count_unread(&both, None).unwrap();
+    let unread = reader.count_unread(&both, None, None).unwrap();
     assert_eq!(unread.get("INBOX"), Some(&2));
     assert_eq!(unread.get("Archive"), None, "a collection with none");
 
-    let first = reader.list_mail_page_filtered(&both, any, None, 2).unwrap();
+    let first = reader
+        .list_mail_page_filtered(&both, any, None, None, 2)
+        .unwrap();
     assert_eq!(
         first
             .iter()
@@ -408,7 +410,7 @@ fn the_mail_readers_count_page_and_search_across_collections() {
     );
     assert!(first[0].item.summary.is_some(), "with its summary");
     let rest = reader
-        .list_mail_page_filtered(&both, any, Some(&first[1].cursor()), 10)
+        .list_mail_page_filtered(&both, any, None, Some(&first[1].cursor()), 10)
         .unwrap();
     assert_eq!(
         rest.iter()
@@ -430,6 +432,125 @@ fn the_mail_readers_count_page_and_search_across_collections() {
         .unwrap();
     assert_eq!(hits.len(), 2, "the sender's name, under the chip");
     assert_eq!(like_pattern(" a_b\\ "), "%a\\_b\\\\%");
+}
+
+/// The mail readers cut at a floor on the sort key, the undated below
+/// any, and `sum_mail` weighs a `[since, until)` range, a size the
+/// listing did not state counted apart (STORAGE §14.1).
+#[test]
+fn the_mail_readers_take_a_floor_and_sum_a_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    store
+        .ensure_collection("Archive", "message/rfc822")
+        .unwrap();
+
+    let recent = message(
+        "1@x",
+        "Recent",
+        "Mon, 5 Oct 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let sizeless = message(
+        "2@x",
+        "Sizeless",
+        "Sun, 4 Oct 2026 09:00:00 +0000",
+        "text/plain",
+    );
+    let undated = message("3@x", "Undated", "not a date", "text/plain");
+    let old = message("9@x", "Old", "Sat, 3 Oct 2026 09:00:00 +0000", "text/plain");
+    let inbox = vec![
+        member("1", &["\\Seen"], &recent),
+        PimdirRemoteItem {
+            meta: PimdirRemoteMeta::new(mail::derive_meta(&sizeless, None, None)),
+            ..member("2", &[], &sizeless)
+        },
+        member("3", &[], &undated),
+    ];
+    for (collection, items) in [("INBOX", inbox), ("Archive", vec![member("9", &[], &old)])] {
+        let mut remote = Paged {
+            pages: vec![page(items, None)],
+            ..Default::default()
+        };
+        store
+            .sync(collection, PimdirSyncOptions::default(), &mut remote)
+            .unwrap();
+    }
+
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let both = ["INBOX", "Archive"];
+    let any = PimdirMailFilter::default();
+    let floor = Some("2026-10-04T00:00:00Z");
+    assert_eq!(reader.count_mail(&both, any, None).unwrap(), 4);
+    assert_eq!(
+        reader
+            .count_mail(&both, any, Some("2026-10-04T09:00:00Z"))
+            .unwrap(),
+        2,
+        "a key equal to the floor stays, the undated falls below"
+    );
+    let days = reader.count_mail_by_day(&both, any, floor, None).unwrap();
+    assert_eq!(
+        days.iter()
+            .map(|day| (day.day.as_deref(), day.count))
+            .collect::<Vec<_>>(),
+        [(Some("2026-10-05"), 1), (Some("2026-10-04"), 1)],
+        "no undated day above a floor"
+    );
+    let unread = reader.count_unread(&both, None, floor).unwrap();
+    assert_eq!(unread.get("INBOX"), Some(&1));
+    assert_eq!(unread.get("Archive"), None);
+    let page = reader
+        .list_mail_page_filtered(&both, any, floor, None, 10)
+        .unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|entry| entry.item.link_id.as_str())
+            .collect::<Vec<_>>(),
+        ["1@x", "2@x"],
+        "the page ends at the floor"
+    );
+
+    let size = |body: &[u8]| body.len() as u64;
+    assert_eq!(
+        reader.sum_mail(&both, any, floor, None).unwrap(),
+        PimdirMailSum {
+            count: 2,
+            size: size(&recent),
+            unknown: 1,
+        },
+    );
+    assert_eq!(
+        reader.sum_mail(&both, any, None, floor).unwrap(),
+        PimdirMailSum {
+            count: 2,
+            size: size(&undated) + size(&old),
+            unknown: 0,
+        },
+        "a range open below holds the undated"
+    );
+    let unread = PimdirMailFilter {
+        seen: Some(false),
+        ..any
+    };
+    assert_eq!(
+        reader
+            .sum_mail(&["INBOX"], unread, None, Some("2026-10-05T10:00:00Z"))
+            .unwrap(),
+        PimdirMailSum {
+            count: 2,
+            size: size(&undated),
+            unknown: 1,
+        },
+        "under the chips, the ceiling excluded"
+    );
+    assert_eq!(
+        reader
+            .sum_mail(&both, any, Some("2027-01-01T00:00:00Z"), None)
+            .unwrap(),
+        PimdirMailSum::default(),
+    );
 }
 
 /// A store an earlier draft wrote (probes, no coverage, rows at level 0)
@@ -477,7 +598,7 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
     assert_eq!(collections[0].coverage, None, "read as NULL, unreconciled");
     assert!(reader.list_coverage("INBOX").unwrap().is_empty());
     let page = reader
-        .list_mail_page_filtered(&["INBOX"], PimdirMailFilter::default(), None, 10)
+        .list_mail_page_filtered(&["INBOX"], PimdirMailFilter::default(), None, None, 10)
         .unwrap();
     assert_eq!(page.len(), 1, "paged without the global order's index");
     drop(reader);

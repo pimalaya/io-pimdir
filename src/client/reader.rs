@@ -289,6 +289,17 @@ pub struct PimdirDayCount {
     pub count: u64,
 }
 
+/// What a range of mail weighs (`sum_mail`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirMailSum {
+    /// The messages in the range.
+    pub count: u64,
+    /// The summed size in octets of those whose size is known.
+    pub size: u64,
+    /// The messages whose size is unknown, left out of `size`.
+    pub unknown: u64,
+}
+
 /// One item the change feed reports (§4.5).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirItemChange {
@@ -1178,11 +1189,14 @@ impl PimdirReader {
     }
 
     /// How much live mail a set of collections holds under the chips
-    /// (`count_mail`).
+    /// (`count_mail`). `since` is a floor on the sort key, an RFC 3339
+    /// instant: mail below it, and undated mail, is left out; `None` sets
+    /// none.
     pub fn count_mail(
         &self,
         collections: &[impl AsRef<str>],
         filter: PimdirMailFilter,
+        since: Option<&str>,
     ) -> Result<u64, PimdirError> {
         let count: i64 = self.conn.query_row(
             sql::COUNT_MAIL,
@@ -1190,6 +1204,7 @@ impl PimdirReader {
                 ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
+                ":since": since,
             },
             |r| r.get(0),
         )?;
@@ -1204,6 +1219,7 @@ impl PimdirReader {
         &self,
         collections: &[impl AsRef<str>],
         filter: PimdirMailFilter,
+        since: Option<&str>,
         shift: Option<&str>,
     ) -> Result<Vec<PimdirDayCount>, PimdirError> {
         Ok(rows(
@@ -1213,6 +1229,7 @@ impl PimdirReader {
                 ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
+                ":since": since,
                 ":shift": shift,
             },
             |r| {
@@ -1225,11 +1242,13 @@ impl PimdirReader {
     }
 
     /// The unread mail of each collection of a set under the attachment
-    /// chip (`count_unread`), a collection holding none left out.
+    /// chip and above `since` as [`count_mail`](Self::count_mail) reads
+    /// it (`count_unread`), a collection holding none left out.
     pub fn count_unread(
         &self,
         collections: &[impl AsRef<str>],
         attachment: Option<bool>,
+        since: Option<&str>,
     ) -> Result<BTreeMap<String, u64>, PimdirError> {
         let counted = rows(
             &self.conn,
@@ -1237,20 +1256,51 @@ impl PimdirReader {
             named_params! {
                 ":collections": collections_json(collections)?,
                 ":attachment": attachment,
+                ":since": since,
             },
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64)),
         )?;
         Ok(counted.into_iter().collect())
     }
 
+    /// What [`count_mail`](Self::count_mail) counts with a sort key in
+    /// `[since, until)`, either bound `None` for open (`sum_mail`): the
+    /// messages, their known size and how many have none. Undated mail
+    /// lies below every date, so only a range open below holds it.
+    pub fn sum_mail(
+        &self,
+        collections: &[impl AsRef<str>],
+        filter: PimdirMailFilter,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<PimdirMailSum, PimdirError> {
+        let (count, size, unknown): (i64, i64, i64) = self.conn.query_row(
+            sql::SUM_MAIL,
+            named_params! {
+                ":collections": collections_json(collections)?,
+                ":seen": filter.seen,
+                ":attachment": filter.attachment,
+                ":since": since,
+                ":until": until,
+            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(PimdirMailSum {
+            count: count.max(0) as u64,
+            size: size.max(0) as u64,
+            unknown: unknown.max(0) as u64,
+        })
+    }
+
     /// A newest-first page of live mail over a set of collections under
-    /// the chips (`list_mail_page_filtered`), each with its summary and
-    /// addresses; `after` is the last entry of the page before, `None`
-    /// the first page.
+    /// the chips and above `since` (`list_mail_page_filtered`), each with
+    /// its summary and addresses; `after` is the last entry of the page
+    /// before, `None` the first page.
     pub fn list_mail_page_filtered(
         &self,
         collections: &[impl AsRef<str>],
         filter: PimdirMailFilter,
+        since: Option<&str>,
         after: Option<&PimdirMailCursor>,
         limit: usize,
     ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
@@ -1261,6 +1311,7 @@ impl PimdirReader {
                 ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
+                ":since": since,
                 ":after_key": after.map(|after| after.sort_key.as_str()),
                 ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
                 ":after_collection": after.map(|after| after.collection.as_str()),
@@ -1275,8 +1326,8 @@ impl PimdirReader {
     /// [`list_mail_page_filtered`](Self::list_mail_page_filtered) over
     /// the messages whose subject, sender or sender name matches the
     /// `LIKE` pattern (`search_mail`), [`like_pattern`] building one from
-    /// the words searched. Not the body, which SEARCH.md's index answers:
-    /// a hit list says so.
+    /// the words searched, with no floor. Not the body, which SEARCH.md's
+    /// index answers: a hit list says so.
     pub fn search_mail(
         &self,
         collections: &[impl AsRef<str>],
