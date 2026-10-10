@@ -16,6 +16,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- Changed a listing over a file holding its body to keep the size the body gave (pimdir draft-04, Annex A.7).
 - Changed `PimdirStore::delete_collection` to skip the store-wide refcount recompute when the collection held no object pointer.
 - Changed `PimdirStore::collect_before` to keep a mail a person's reference names (pimdir draft-04, STORAGE §11.3).
 - Changed `PimdirReader::count_mail`, `count_mail_by_day`, `count_unread` and `list_mail_page_filtered` to take a `since` floor on the sort key, seeked on the index, undated mail falling below it; `None` keeps the previous behaviour (pimdir draft-04, STORAGE §14.1).

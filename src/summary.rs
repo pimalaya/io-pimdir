@@ -259,11 +259,11 @@ pub fn hash_key(body: &[u8]) -> PimdirLinkId {
 }
 
 /// The summary a listing or a fetch carrying no body brings over a held
-/// one (STORAGE Annex A.1, SYNC §6): the incoming one, keeping the held
-/// attachment mark and size when the row holds its body, what the body
-/// gave never being replaced by what the source states without it, and a
-/// known invitation whatever the body, the message being immutable; an
-/// incoming `None` leaves the held summary.
+/// one (STORAGE Annex A.1, A.7, SYNC §6): the incoming one, keeping the
+/// held attachment mark and size, or a file's size, when the row holds its
+/// body, what the body gave never being replaced by what the source states
+/// without it, and a known invitation whatever the body, the message being
+/// immutable; an incoming `None` leaves the held summary.
 pub(crate) fn without_body(
     held: Option<&PimdirSummary>,
     incoming: Option<PimdirSummary>,
@@ -277,6 +277,12 @@ pub(crate) fn without_body(
             (&mut incoming, held)
     {
         incoming.attachment = held.attachment;
+        incoming.size = held.size;
+    }
+    if holds_body
+        && let (PimdirSummary::File(incoming), Some(PimdirSummary::File(held))) =
+            (&mut incoming, held)
+    {
         incoming.size = held.size;
     }
     if let (PimdirSummary::Mail(incoming), Some(PimdirSummary::Mail(held))) = (&mut incoming, held)

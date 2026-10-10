@@ -25,7 +25,11 @@ use io_pimdir::{
         PimdirTier,
     },
     sql,
-    summary::{self, mail},
+    summary::{
+        self, PimdirDerivation,
+        file::{self, PimdirFileSummary},
+        mail,
+    },
     sync::{PimdirConflictPolicy, PimdirPushRights, PimdirSyncEvent, PimdirSyncOptions},
 };
 use rusqlite::{Connection, named_params, params};
@@ -327,11 +331,28 @@ struct Scripted {
     pushes: Vec<Value>,
 }
 
+/// A file's derivation from the key and summary its source states
+/// (Annex A.7).
+fn stated_file(meta: &Value) -> PimdirDerivation {
+    let summary = &meta["summary"];
+    PimdirFileSummary {
+        name: summary["name"].as_str().unwrap_or_default().into(),
+        media_type: summary["media_type"].as_str().map(String::from),
+        size: summary["size"].as_u64(),
+        part: summary["part"].as_str().map(String::from),
+    }
+    .derivation(PimdirLinkId(meta["link_id"].as_str().unwrap().into()))
+}
+
 impl Scripted {
     /// The meta a member carries, read from its fixture (SYNC §11): for
     /// mail without the body, the attachment mark and the size the source
-    /// states where the case states them (Annex A.1).
+    /// states where the case states them (Annex A.1); for a file, the key
+    /// and summary its source states, the bytes saying nothing (A.7).
     fn meta(spec: &Path, kind: &str, meta: &Value) -> PimdirRemoteMeta {
+        if kind == file::KIND {
+            return PimdirRemoteMeta::new(stated_file(meta));
+        }
         let body = fs::read(spec.join("vectors").join(meta["body"].as_str().unwrap())).unwrap();
         let derivation = match kind.split(';').next().unwrap_or_default().trim() {
             "message/rfc822" => mail::derive_meta(
@@ -486,6 +507,7 @@ impl PimdirRemote for Scripted {
             // fields, which walk no part; the fixture stands in for one
             // (Annex A.1).
             let derivation = match (tier, self.kind.as_str()) {
+                (_, file::KIND) => stated_file(&answer["meta"]),
                 (PimdirTier::Meta, "message/rfc822") => {
                     mail::derive_meta(&body, Some(body.len() as u64), None)
                 }
