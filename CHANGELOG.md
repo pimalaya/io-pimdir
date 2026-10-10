@@ -16,6 +16,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- Changed the reconciliation on open to compare every table, index and trigger with the canonical schema's own text, comments dropped and whitespace collapsed, rebuilding a table that differs and recreating an index or trigger that does, instead of per-change checks (pimdir draft-04, STORAGE §6); a store missing a core table is refused before anything is reconciled.
 - Changed a listing over a file holding its body to keep the size the body gave (pimdir draft-04, Annex A.7).
 - Changed `PimdirStore::delete_collection` to skip the store-wide refcount recompute when the collection held no object pointer.
 - Changed `PimdirStore::collect_before` to keep a mail a person's reference names (pimdir draft-04, STORAGE §11.3).

@@ -979,3 +979,9 @@ A write recording an item's summary SHALL run the canonical rule statements for 
 
 #### Scenario: An older store is reconciled
 - tests/files.rs `an_earlier_role_constraint_is_rebuilt_on_open`, tests/linking.rs `an_earlier_store_backfills_the_invitation_on_open`.
+
+### Requirement: Open reconciles against the canonical text
+Opening a store as its owner SHALL refuse one missing a core table or trigger (`PimdirError::Stale`), then compare every table, index and trigger with the one the canonical migrations create in an empty in-memory database, by its `sqlite_schema` text with comments dropped and whitespace collapsed (STORAGE §6). A table that differs SHALL be rebuilt from the canonical text in one transaction (its indexes and triggers dropped, renamed aside with `legacy_alter_table` on and foreign keys off, created, its shared columns copied, its `AUTOINCREMENT` counter carried, the old one dropped); what is missing SHALL be created, what differs recreated, what the canonical schema lacks dropped; the columns a rebuild added SHALL be backfilled (`backfill_shared_object`, the invitation from the held bodies by `list_held_mail`), and no foreign key left dangling. A current store SHALL be left untouched.
+
+#### Scenario: An older shape reconciled
+- tests/files.rs `an_earlier_role_constraint_is_rebuilt_on_open` (the rebuilt text equals a fresh store's), tests/scoped_sync.rs `an_earlier_draft_store_is_reconciled_on_open`, tests/linking.rs `an_earlier_store_backfills_the_invitation_on_open`, tests/references.rs `an_earlier_store_gains_the_references_on_open`.

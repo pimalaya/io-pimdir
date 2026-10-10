@@ -6,7 +6,7 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params, params};
 
@@ -18,11 +18,11 @@ use crate::{
     summary::{PimdirSummary, mail},
 };
 
-/// The tables and triggers the canonical schema declares, which a store
-/// at the current version has to hold whole: the draft is edited in place
-/// (§6) and the version stamp alone cannot tell an earlier draft's store
-/// apart. The triggers are named since the last drafts moved the feed
-/// into them, and a store lacking one stamps nothing.
+/// The core tables and triggers every draft's store holds: one missing is
+/// a damaged store, refused before anything is reconciled, where any other
+/// difference from the canonical schema is an earlier draft's, reconciled
+/// on open (§6). The triggers are named since the last drafts moved the
+/// feed into them, and a store lacking one stamps nothing.
 const SCHEMA: [&str; 16] = [
     "bindings",
     "collections",
@@ -80,211 +80,207 @@ pub(crate) fn init(
         tx.commit().map_err(busy_or_sql)?;
     }
 
-    reconcile_role_constraint(conn)?;
+    // NOTE: a core table or trigger missing is a damaged store, not an
+    // earlier one: refused before anything is reconciled.
+    check(conn)?;
     reconcile(conn, &PimdirBlobs::open(dir, hash))?;
     check(conn)
 }
 
-/// The tables a later draft added to version 1 that a store from an earlier
-/// one can take as they are (§6): the owner creates them on open, from the
-/// canonical DDL, instead of refusing the store. Readers and producers
-/// read their absence as nothing declared, no receipt kept and no
-/// reference recorded, no file summarised.
-const RECONCILED: [&str; 5] = [
-    "capabilities",
-    "performers",
-    "receipts",
-    "item_reference",
-    "file_summary",
-];
+/// One table, index or trigger as `sqlite_schema` declares it.
+struct PimdirSchemaObject {
+    /// `table`, `index` or `trigger`.
+    kind: String,
+    /// The table it belongs to.
+    table: String,
+    /// Its declaring statement as stored.
+    sql: String,
+}
 
-/// The indexes and triggers a later draft added to version 1 (§6), each
-/// `(kind, name)`, created on open when absent from the canonical DDL,
-/// after the [`RECONCILED`] tables they hang off. A reader of a store
-/// lacking one reads as before: `items_by_sort_global` orders a page
-/// across collections (§9.3), slower without it; `item_reference_to`
-/// and `items_drop_references` serve and hold the references (§14.2);
-/// `item_reference_collects_files` collects the stand-ins (§14.3);
-/// `mail_summary_by_invitation` finds an event's invitations (§14.2).
-const RECONCILED_OBJECTS: [(&str, &str); 5] = [
-    ("INDEX", "mail_summary_by_invitation"),
-    ("INDEX", "items_by_sort_global"),
-    ("INDEX", "item_reference_to"),
-    ("TRIGGER", "items_drop_references"),
-    ("TRIGGER", "item_reference_collects_files"),
-];
-
-/// Creates the [`RECONCILED`] tables a store lacks, each with its key, and
-/// adds `collections.role` with its index and triggers ([`reconcile_role`]),
-/// the coverage and round columns ([`reconcile_rounds`]), the mail
-/// invitation ([`reconcile_invitation`]) and the
-/// [`RECONCILED_OBJECTS`] ([`reconcile_objects`]), in one transaction.
+/// Reconciles the store against the canonical schema's own text (§6): the
+/// canonical migrations are applied to an empty in-memory database, and
+/// every table, index and trigger whose stored text differs from its
+/// canonical one, comments dropped and whitespace collapsed, is brought to
+/// it in one transaction; a store already current is left untouched.
 fn reconcile(conn: &mut Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
+    let canonical = Connection::open_in_memory()?;
+    for migration in sql::MIGRATIONS {
+        canonical.execute_batch(migration)?;
+    }
+    let wanted = objects(&canonical)?;
+    let held = objects(conn)?;
+    let current = wanted.len() == held.len()
+        && wanted.iter().all(|(name, object)| {
+            held.get(name)
+                .is_some_and(|held| normalised(&held.sql) == normalised(&object.sql))
+        });
+    if current {
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
+    let reconciled = rebuild(conn, &canonical, &wanted, &held, blobs);
+    conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")?;
+    reconciled
+}
+
+/// The four steps of §6 in one transaction: the refcounts settled, every
+/// table whose text differs rebuilt from the canonical one, what is
+/// missing created, what differs recreated, what the canonical schema
+/// lacks dropped; then the columns a rebuild added backfilled, and no
+/// foreign key left dangling.
+fn rebuild(
+    conn: &mut Connection,
+    canonical: &Connection,
+    wanted: &BTreeMap<String, PimdirSchemaObject>,
+    held: &BTreeMap<String, PimdirSchemaObject>,
+    blobs: &PimdirBlobs,
+) -> Result<(), PimdirError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(busy_or_sql)?;
-    for table in RECONCILED {
-        let exists = tx
-            .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-                [table],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !exists {
-            tx.execute_batch(&ddl(table))?;
+    let without_invitation =
+        has_table(&tx, "mail_summary")? && !has_column(&tx, "mail_summary", "invitation")?;
+    let without_shared_object =
+        has_table(&tx, "bindings")? && !has_column(&tx, "bindings", "shared_object")?;
+    let pointers = ["objects", "items", "bindings", "queue"];
+    if pointers.iter().all(|table| held.contains_key(*table)) {
+        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+    }
+
+    for (name, object) in wanted.iter().filter(|(_, o)| o.kind == "table") {
+        let Some(stored) = held.get(name) else {
+            continue;
+        };
+        if normalised(&stored.sql) == normalised(&object.sql) {
+            continue;
+        }
+        for (attached, other) in held {
+            if other.table == *name && other.kind != "table" {
+                tx.execute_batch(&format!("DROP {} {attached};", other.kind.to_uppercase()))?;
+            }
+        }
+        let columns: Vec<String> = rows(
+            &tx,
+            "SELECT name FROM pragma_table_info(?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        let canonical_columns: Vec<String> = rows(
+            canonical,
+            "SELECT name FROM pragma_table_info(?1)",
+            [name],
+            |row| row.get(0),
+        )?;
+        let shared: Vec<&String> = columns
+            .iter()
+            .filter(|column| canonical_columns.contains(column))
+            .collect();
+        let shared = shared
+            .iter()
+            .map(|column| column.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute_batch(&format!(
+            "ALTER TABLE {name} RENAME TO {name}_aside;\n{};\n\
+             INSERT INTO {name} ({shared}) SELECT {shared} FROM {name}_aside;",
+            object.sql
+        ))?;
+        if has_table(&tx, "sqlite_sequence")? {
+            tx.execute_batch(&format!(
+                "UPDATE sqlite_sequence SET seq = max(seq, (SELECT seq FROM sqlite_sequence \
+                 WHERE name = '{name}_aside')) WHERE name = '{name}';\n\
+                 INSERT INTO sqlite_sequence(name, seq) SELECT '{name}', seq FROM sqlite_sequence \
+                 WHERE name = '{name}_aside' \
+                 AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = '{name}');"
+            ))?;
+        }
+        tx.execute_batch(&format!("DROP TABLE {name}_aside;"))?;
+    }
+
+    for (name, object) in wanted.iter().filter(|(_, o)| o.kind == "table") {
+        if !held.contains_key(name) {
+            tx.execute_batch(&object.sql)?;
         }
     }
-    reconcile_role(&tx)?;
-    reconcile_rounds(&tx)?;
-    reconcile_invitation(&tx, blobs)?;
-    reconcile_objects(&tx)?;
+    for name in held
+        .iter()
+        .filter(|(_, o)| o.kind == "table")
+        .map(|(name, _)| name)
+    {
+        if !wanted.contains_key(name) {
+            tx.execute_batch(&format!("DROP TABLE {name};"))?;
+        }
+    }
+
+    let now = objects(&tx)?;
+    for (name, object) in now.iter().filter(|(_, o)| o.kind != "table") {
+        let stale = wanted
+            .get(name)
+            .is_none_or(|wanted| normalised(&wanted.sql) != normalised(&object.sql));
+        if stale {
+            tx.execute_batch(&format!("DROP {} {name};", object.kind.to_uppercase()))?;
+        }
+    }
+    let now = objects(&tx)?;
+    for (name, object) in wanted.iter().filter(|(_, o)| o.kind != "table") {
+        if !now.contains_key(name) {
+            tx.execute_batch(&object.sql)?;
+        }
+    }
+
+    if without_shared_object {
+        tx.execute(sql::BACKFILL_SHARED_OBJECT, [])?;
+    }
+    if without_invitation {
+        backfill_invitation(&tx, blobs)?;
+    }
+
+    let dangling = tx
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()?;
+    if dangling.is_some() {
+        return Err(PimdirError::Stale {
+            missing: "a foreign key the reconciliation left dangling",
+        });
+    }
     tx.commit().map_err(busy_or_sql)
 }
 
-/// The role a source states (§14), added to version 1 by a later draft: the
-/// column with its `CHECK`, the index keeping one holder, the trigger moving
-/// a role, and the stamp trigger watching it, recreated when its body
-/// predates the column (§6). All cut out of the canonical DDL.
-fn reconcile_role(conn: &Connection) -> Result<(), PimdirError> {
-    let schema = sql::MIGRATION_0001;
-    let cut = |start: &str, end: &str| {
-        let from = schema.find(start).expect("canonical DDL");
-        let to = from + schema[from..].find(end).expect("canonical DDL") + end.len();
-        &schema[from..to]
-    };
-
-    if !has_column(conn, "collections", "role")? {
-        let column = cut("role        TEXT CHECK", "'default'))");
-        conn.execute_batch(&format!("ALTER TABLE collections ADD COLUMN {column};"))?;
-    }
-
-    let declared = |name: &str| -> Result<Option<String>, PimdirError> {
-        Ok(conn
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE name = ?1",
-                [name],
-                |row| row.get(0),
-            )
-            .optional()?)
-    };
-    if declared("collections_by_role")?.is_none() {
-        conn.execute_batch(cut("CREATE UNIQUE INDEX collections_by_role", ";"))?;
-    }
-    if declared("collections_role_moves")?.is_none() {
-        conn.execute_batch(cut("CREATE TRIGGER collections_role_moves", "END;"))?;
-    }
-    if declared("collections_stamp_update")?.is_some_and(|sql| !sql.contains("role")) {
-        conn.execute_batch("DROP TRIGGER collections_stamp_update;")?;
-        conn.execute_batch(cut("CREATE TRIGGER collections_stamp_update", "END;"))?;
-    }
-
-    Ok(())
-}
-
-/// The coverage and round a later draft added to version 1 (STORAGE §6,
-/// SYNC §5): the columns of `sources` and `bindings.round`, each cut out
-/// of the canonical DDL, the trigger restamping a collection whose
-/// coverage moved, and the `probes` table the draft no longer has
-/// dropped, its handles named again by the next round, a store from an
-/// earlier draft holding no coverage.
-fn reconcile_rounds(conn: &Connection) -> Result<(), PimdirError> {
-    let schema = sql::MIGRATION_0001;
-    let column = |table: &str, name: &str| {
-        let body = &schema[schema
-            .find(&format!("CREATE TABLE {table} ("))
-            .expect("canonical DDL")..];
-        let from = body.find(&format!("\n    {name} ")).expect("canonical DDL") + 5;
-        let to = from + body[from..].find(',').expect("canonical DDL");
-        String::from(&body[from..to])
-    };
-
-    // NOTE: in the canonical order, so a check naming an earlier column
-    // finds it added already.
-    for name in [
-        "covered_since",
-        "covered_until",
-        "covered_at",
-        "round",
-        "round_since",
-        "round_until",
-        "round_cursor",
-        "round_checkpoint",
-        "round_started_at",
-        "round_band",
-    ] {
-        if !has_column(conn, "sources", name)? {
-            conn.execute_batch(&format!(
-                "ALTER TABLE sources ADD COLUMN {};",
-                column("sources", name)
-            ))?;
-        }
-    }
-    if !has_column(conn, "bindings", "round")? {
-        conn.execute_batch(&format!(
-            "ALTER TABLE bindings ADD COLUMN {};",
-            column("bindings", "round")
-        ))?;
-    }
-
-    let declared = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_schema WHERE name = 'sources_stamp_coverage'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !declared {
-        let from = schema
-            .find("CREATE TRIGGER sources_stamp_coverage")
-            .expect("canonical DDL");
-        let to = from + schema[from..].find("END;").expect("canonical DDL") + 4;
-        conn.execute_batch(&schema[from..to])?;
-    }
-
-    conn.execute_batch("DROP TABLE IF EXISTS probes;")?;
-    Ok(())
-}
-
-/// The invitation a later draft added to `mail_summary` (Annex A.1), cut out
-/// of the canonical DDL, and backfilled once from every held body (§6), a
-/// held message never being read again; the references it implies follow
-/// (`link_invitations_of` over every mail). `mail_summary_by_invitation`
-/// follows among the [`RECONCILED_OBJECTS`]. A body the blob directory
-/// does not hold leaves its row `NULL`.
-fn reconcile_invitation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
-    if has_column(conn, "mail_summary", "invitation")? {
-        return Ok(());
-    }
-    let schema = sql::MIGRATION_0001;
-    let from = schema.find("\n    invitation ").expect("canonical DDL") + 5;
-    let to = from + schema[from..].find(',').expect("canonical DDL");
-    conn.execute_batch(&format!(
-        "ALTER TABLE mail_summary ADD COLUMN {};",
-        &schema[from..to]
-    ))?;
-
-    let held: Vec<(String, String, String)> = rows(
-        conn,
-        "SELECT s.collection, s.link_id, i.object_hash FROM mail_summary s \
-         JOIN items i ON i.collection = s.collection AND i.link_id = s.link_id \
-         WHERE i.object_hash IS NOT NULL",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    for (collection, link_id, hash) in held {
-        let Some(body) = blobs.get(&PimdirHash(hash))? else {
-            continue;
-        };
-        let Some(PimdirSummary::Mail(mail)) = mail::derive(&body).summary else {
-            continue;
-        };
-        conn.execute(
-            "UPDATE mail_summary SET invitation = ?3 WHERE collection = ?1 AND link_id = ?2",
-            params![collection, link_id, mail.invitation],
+/// Re-derives `mail_summary.invitation` from every held body, a page of
+/// `list_held_mail` at a time, then records the invitations they imply
+/// (`link_invitations_of` over every mail): a held message is never read
+/// again (§6, Annex A.1). A body the blob directory does not hold leaves
+/// its row `NULL`.
+fn backfill_invitation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let page: Vec<(String, String, String)> = rows(
+            conn,
+            sql::LIST_HELD_MAIL,
+            named_params! {
+                ":after_collection": after.as_ref().map(|(collection, _)| collection.as_str()),
+                ":after_link_id": after.as_ref().map(|(_, link_id)| link_id.as_str()),
+                ":limit": 500,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(3)?)),
         )?;
+        let Some((collection, link_id, _)) = page.last() else {
+            break;
+        };
+        after = Some((collection.clone(), link_id.clone()));
+        for (collection, link_id, hash) in page {
+            let Some(body) = blobs.get(&PimdirHash(hash))? else {
+                continue;
+            };
+            let Some(PimdirSummary::Mail(mail)) = mail::derive(&body).summary else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE mail_summary SET invitation = ?3 WHERE collection = ?1 AND link_id = ?2",
+                params![collection, link_id, mail.invitation],
+            )?;
+        }
     }
     conn.execute(
         sql::LINK_INVITATIONS_OF,
@@ -293,129 +289,46 @@ fn reconcile_invitation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), Pi
     Ok(())
 }
 
-/// The role `CHECK` a later draft widened to `attachments` (§6, §14.3), a
-/// constraint `ALTER TABLE` cannot change: `collections` rebuilt from the
-/// canonical DDL when its declared `CHECK` lacks it, its rows copied, its
-/// indexes and triggers recreated, with foreign keys off and checked before
-/// the commit. `legacy_alter_table` keeps the rename from re-parsing the
-/// triggers of other tables, which name `collections` while it is gone.
-fn reconcile_role_constraint(conn: &mut Connection) -> Result<(), PimdirError> {
-    let declared: Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'collections'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if declared.is_none_or(|sql| !sql.contains("role") || sql.contains("'attachments'")) {
-        return Ok(());
-    }
-
-    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
-    let rebuilt = rebuild_collections(conn);
-    conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")?;
-    rebuilt
+/// Every table, index and trigger a database declares, by name; the
+/// automatic indexes, which declare no statement, and SQLite's own tables
+/// left out.
+fn objects(conn: &Connection) -> Result<BTreeMap<String, PimdirSchemaObject>, PimdirError> {
+    let declared = rows(
+        conn,
+        "SELECT name, type, tbl_name, sql FROM sqlite_schema \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PimdirSchemaObject {
+                    kind: row.get(1)?,
+                    table: row.get(2)?,
+                    sql: row.get(3)?,
+                },
+            ))
+        },
+    )?;
+    Ok(declared.into_iter().collect())
 }
 
-/// The rebuild [`reconcile_role_constraint`] runs, in one transaction.
-fn rebuild_collections(conn: &mut Connection) -> Result<(), PimdirError> {
-    let schema = sql::MIGRATION_0001;
-    let cut = |start: &str, end: &str| {
-        let from = schema.find(start)?;
-        let to = from + schema[from..].find(end)? + end.len();
-        Some(String::from(&schema[from..to]))
-    };
-
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(busy_or_sql)?;
-    let attached: Vec<(String, String)> = rows(
-        &tx,
-        "SELECT type, name FROM sqlite_schema WHERE tbl_name = 'collections' \
-         AND type IN ('index', 'trigger') AND sql IS NOT NULL",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let columns: Vec<String> = rows(
-        &tx,
-        "SELECT name FROM pragma_table_info('collections')",
-        [],
-        |row| row.get(0),
-    )?;
-    let columns = columns.join(", ");
-    let create = cut("CREATE TABLE collections (", ") STRICT;").expect("canonical DDL");
-    tx.execute_batch(&format!(
-        "{}\nINSERT INTO collections_rebuild ({columns}) SELECT {columns} FROM collections;\n\
-         DROP TABLE collections;\nALTER TABLE collections_rebuild RENAME TO collections;",
-        create.replacen(
-            "CREATE TABLE collections (",
-            "CREATE TABLE collections_rebuild (",
-            1
-        ),
-    ))?;
-    for (kind, name) in attached {
-        let statement = match kind.as_str() {
-            "trigger" => cut(&format!("CREATE TRIGGER {name} "), "END;"),
-            _ => cut(&format!("CREATE INDEX {name} "), ";")
-                .or_else(|| cut(&format!("CREATE UNIQUE INDEX {name} "), ";")),
-        };
-        if let Some(statement) = statement {
-            tx.execute_batch(&statement)?;
+/// A declaring statement as §6 compares it: every `--` comment dropped and
+/// whitespace collapsed to single spaces.
+fn normalised(sql: &str) -> String {
+    let mut out = String::new();
+    for line in sql.lines() {
+        let code = line.split_once("--").map_or(line, |(code, _)| code);
+        for word in code.split_whitespace() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
         }
     }
-    let broken = tx
-        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
-        .optional()?;
-    if broken.is_some() {
-        return Err(PimdirError::Stale {
-            missing: "a foreign key the collections rebuild left dangling",
-        });
-    }
-    tx.commit().map_err(busy_or_sql)
+    out
 }
 
-/// Creates the [`RECONCILED_OBJECTS`] a store lacks, each cut out of the
-/// canonical DDL: an index up to its `;`, a trigger up to its `END;`.
-fn reconcile_objects(conn: &Connection) -> Result<(), PimdirError> {
-    let schema = sql::MIGRATION_0001;
-    for (kind, name) in RECONCILED_OBJECTS {
-        let declared = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = lower(?1) AND name = ?2",
-                [kind, name],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !declared {
-            let end = if kind == "TRIGGER" { "END;" } else { ";" };
-            let from = schema
-                .find(&format!("CREATE {kind} {name} "))
-                .expect("canonical DDL");
-            let to = from + schema[from..].find(end).expect("canonical DDL") + end.len();
-            conn.execute_batch(&schema[from..to])?;
-        }
-    }
-    Ok(())
-}
-
-/// The canonical statements creating `table` and its key index when it
-/// has one, cut out of the first migration so they never drift from it.
-fn ddl(table: &str) -> String {
-    let schema = sql::MIGRATION_0001;
-    let cut = |start: &str, end: &str| {
-        let from = schema.find(start)?;
-        let to = from + schema[from..].find(end)? + end.len();
-        Some(String::from(&schema[from..to]))
-    };
-    let create = cut(&format!("CREATE TABLE {table} ("), ") STRICT;").expect("canonical DDL");
-    match cut(&format!("CREATE UNIQUE INDEX {table}_key"), ";") {
-        Some(key) => create + "\n" + &key,
-        None => create,
-    }
-}
-
-/// Whether the store holds `table`: one of the [`RECONCILED`] ones is
+/// Whether the store holds `table`: one a later draft added is
 /// missing from a store whose owner predates it.
 pub(crate) fn has_table(conn: &Connection, table: &str) -> Result<bool, PimdirError> {
     Ok(conn

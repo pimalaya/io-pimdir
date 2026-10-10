@@ -355,4 +355,21 @@ fn an_earlier_role_constraint_is_rebuilt_on_open() {
         .unwrap();
     assert_eq!(store.list_collections().unwrap().len(), 3, "rows kept");
     assert_eq!(store.count_items("INBOX").unwrap(), 1);
+    drop(store);
+
+    // NOTE: rebuilt from the canonical text, the stored statement is the
+    // one a fresh store holds, so the next open finds it current.
+    let fresh = tempfile::tempdir().unwrap();
+    drop(PimdirStore::open(fresh.path()).unwrap());
+    let declared = |dir: &Path| -> String {
+        rusqlite::Connection::open(dir.join("pimdir.db"))
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'collections'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(declared(dir.path()), declared(fresh.path()));
 }
