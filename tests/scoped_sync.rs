@@ -13,10 +13,13 @@ use io_pimdir::{
         reader::{PimdirMailFilter, PimdirMailSum, PimdirReader, like_pattern},
     },
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
+    hash::PimdirHashAlgo,
+    mutate::PimdirMutation,
     placement::{PimdirFlags, PimdirHandle, PimdirLevel},
     remote::{
-        PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushOutcome, PimdirPushResult,
-        PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot, PimdirTier,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome,
+        PimdirPushResult, PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot,
+        PimdirTier,
     },
     summary::mail,
     sync::PimdirSyncOptions,
@@ -270,7 +273,7 @@ fn collecting_below_a_date_keeps_what_is_owed() {
     store
         .mutate(
             "INBOX",
-            io_pimdir::mutate::PimdirMutation::SetFlags {
+            PimdirMutation::SetFlags {
                 handle: PimdirHandle::from("2"),
                 flags: PimdirFlags::from_iter(["\\Flagged"]),
             },
@@ -298,6 +301,106 @@ fn collecting_below_a_date_keeps_what_is_owed() {
         report.pushed, 1,
         "the owed flag, and nothing for the collected"
     );
+}
+
+/// The owner's release below a date lowers held bodies to `Meta`, the
+/// undated included, keeps the headers and the owed flag, frees the
+/// bodies to the collector, and the next round fetches nothing back
+/// (STORAGE §11.4, SYNC §6).
+#[test]
+fn releasing_bodies_below_a_date_keeps_the_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let old = message(
+        "old@x",
+        "Old",
+        "Sat, 1 Aug 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let undated = message("undated@x", "When", "someday", "text/plain");
+    let recent = message(
+        "new@x",
+        "New",
+        "Mon, 5 Oct 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let held = |handle: &str, body: &[u8]| {
+        let mut item = member(handle, &[], body);
+        item.meta =
+            PimdirRemoteMeta::new(mail::derive(body)).with_body(PimdirFetchedBody::Inline {
+                hash: PimdirHashAlgo::Blake3.hash(body),
+                bytes: body.to_vec(),
+            });
+        item
+    };
+
+    let mut remote = Paged {
+        pages: vec![page(
+            vec![held("1", &old), held("2", &undated), held("3", &recent)],
+            None,
+        )],
+        ..Default::default()
+    };
+    store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+    store
+        .mutate(
+            "INBOX",
+            PimdirMutation::SetFlags {
+                handle: PimdirHandle::from("1"),
+                flags: PimdirFlags::from_iter(["\\Flagged"]),
+            },
+        )
+        .unwrap();
+
+    let seq = |store: &PimdirStore, link: &str| store.seq_for_link("INBOX", link).unwrap().unwrap();
+    let report = store
+        .release_before(&["INBOX"], Some("2026-10-01T00:00:00Z"))
+        .unwrap();
+    let mut released = report.seqs.clone();
+    released.sort();
+    assert_eq!(released, [seq(&store, "old@x"), seq(&store, "undated@x")]);
+
+    let item = store
+        .get_item("INBOX", seq(&store, "old@x"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.level, PimdirLevel::Meta);
+    assert_eq!(item.object, None);
+    assert!(item.summary.is_some(), "the headers stay");
+    assert!(item.flags.contains("\\Flagged"), "the owed flag stays");
+    let item = store
+        .get_item("INBOX", seq(&store, "new@x"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.level, PimdirLevel::Full, "the newer keeps its body");
+    assert_eq!(store.count_items("INBOX").unwrap(), 3);
+
+    let gc = store.collect_garbage().unwrap();
+    assert_eq!(gc.objects, 2, "both released bodies fall to the collector");
+
+    // NOTE: the round lists the members without their bodies; nothing is
+    // fetched (Paged answers none), the owed flag alone is pushed.
+    remote.pages = vec![page(
+        vec![
+            member("1", &[], &old),
+            member("2", &[], &undated),
+            member("3", &[], &recent),
+        ],
+        None,
+    )];
+    let report = store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+    assert_eq!(report.pushed, 1, "the owed flag, and nothing else");
+    let item = store
+        .get_item("INBOX", seq(&store, "old@x"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.level, PimdirLevel::Meta, "a released row is no claim");
+    assert_eq!(store.count_retained("INBOX").unwrap(), 0, "no tombstone");
 }
 
 /// The mail readers: counts under the chips, per day and unread, pages

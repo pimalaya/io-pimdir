@@ -27,7 +27,10 @@ use rusqlite::{
 
 use crate::{
     capability::{PimdirCapability, PimdirRefusal},
-    client::{lock::PimdirLock, reader::PimdirReader},
+    client::{
+        lock::PimdirLock,
+        reader::{PimdirReader, collections_json},
+    },
     codec::{self, PimdirAction, PimdirActionError},
     hash::PimdirHashAlgo,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
@@ -109,6 +112,13 @@ pub struct PimdirPurgeReport {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirCollectReport {
     /// The public ids of the items collected.
+    pub seqs: Vec<i64>,
+}
+
+/// What the owner's release of bodies below a date lowered to `Meta`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirReleaseReport {
+    /// The public ids of the items whose body was released.
     pub seqs: Vec<i64>,
 }
 
@@ -445,6 +455,49 @@ impl PimdirStore {
         tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(PimdirCollectReport { seqs })
+    }
+
+    /// The owner's release of the bodies of a set of mail collections
+    /// below a sort key (§11.4): every live item whose `sort_key` is
+    /// below `until` (RFC 3339, `Z`; `None` for no ceiling), the undated
+    /// below any, goes back to `Meta`, keeping its summary, addresses,
+    /// flags, bindings and public id, the public ids released answered.
+    ///
+    /// An item needing its body keeps it: one conflicted, holding a
+    /// conflicted binding, a pending create or a local edit, bound by no
+    /// source, or not yet bound by a source of its collection. A binding
+    /// whose base is the body lets go of it and stays based. Not a
+    /// delete: no tombstone, no push; the next `Full` upgrade fetches or
+    /// links the body again. The refcounts are recomputed in the same
+    /// transaction and the bodies fall to the collector. A verb of this
+    /// process between two of its chunks refuses it as
+    /// [`PimdirError::InFlight`] (§5).
+    pub fn release_before(
+        &mut self,
+        collections: &[impl AsRef<str>],
+        until: Option<&str>,
+    ) -> Result<PimdirReleaseReport, PimdirError> {
+        if self.lock.in_flight() {
+            return Err(PimdirError::InFlight(self.dir.clone()));
+        }
+        let collections = collections_json(collections)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        tx.execute(
+            sql::RELEASE_BASES_BEFORE,
+            named_params! { ":collections": collections, ":until": until },
+        )?;
+        let seqs: Vec<i64> = rows(
+            &tx,
+            sql::RELEASE_BEFORE,
+            named_params! { ":collections": collections, ":until": until },
+            |row| row.get(0),
+        )?;
+        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(PimdirReleaseReport { seqs })
     }
 }
 

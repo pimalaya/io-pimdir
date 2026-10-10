@@ -1395,7 +1395,7 @@ pub fn like_pattern(words: &str) -> String {
 }
 
 /// A set of collection ids as the JSON array the mail reads bind.
-fn collections_json(collections: &[impl AsRef<str>]) -> Result<String, PimdirError> {
+pub(crate) fn collections_json(collections: &[impl AsRef<str>]) -> Result<String, PimdirError> {
     let ids: Vec<&str> = collections.iter().map(AsRef::as_ref).collect();
     Ok(serde_json::to_string(&ids)?)
 }

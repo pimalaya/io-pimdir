@@ -329,14 +329,16 @@ struct Scripted {
 
 impl Scripted {
     /// The meta a member carries, read from its fixture (SYNC §11): for
-    /// mail without the body, the attachment mark the source's own flag
-    /// where the case states one (Annex A.1).
+    /// mail without the body, the attachment mark and the size the source
+    /// states where the case states them (Annex A.1).
     fn meta(spec: &Path, kind: &str, meta: &Value) -> PimdirRemoteMeta {
         let body = fs::read(spec.join("vectors").join(meta["body"].as_str().unwrap())).unwrap();
         let derivation = match kind.split(';').next().unwrap_or_default().trim() {
-            "message/rfc822" => {
-                mail::derive_meta(&body, Some(body.len() as u64), meta["attachment"].as_bool())
-            }
+            "message/rfc822" => mail::derive_meta(
+                &body,
+                Some(meta["size"].as_u64().unwrap_or(body.len() as u64)),
+                meta["attachment"].as_bool(),
+            ),
             _ => summary::derive(kind, &body).expect("a known kind"),
         };
         PimdirRemoteMeta::new(derivation)
