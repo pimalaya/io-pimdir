@@ -51,3 +51,12 @@ A `VTODO` summary SHALL carry the four columns pimdir STORAGE Annex A.4 reads wi
 
 #### Scenario: The organised task vector
 - tests/summaries.rs, the case "todo, organised" of pimdir vectors/summaries.json; the unit test `a_task_reads_its_organisation_on_annex_a4s_edges` of src/summary/calendar.rs (a priority out of range, an escaped comma, a `CHILD` relation skipped, a `mid:` URI with a part).
+
+### Requirement: A reader reads the task columns an owner has not reconciled as NULL
+
+`PimdirReader` SHALL probe `task_summary` for `priority`, `categories`, `parent` and `mid` before every statement naming them (`list_tasks_page_asc`, `get_task`, `load_task_summaries`) and read each one the store lacks as `NULL`, so a listing on a store an owner at io-pimdir 3b4bed8 reconciled never fails "no such column" (STORAGE §6). The query client SHALL do the same on the attached store: `priority:` reads such a task as of no priority, `category:` as carrying none, and an item read from its summary reads the columns `NULL`.
+
+#### Scenario: the 3b4bed8 shape lists
+- GIVEN a store whose `task_summary` has the 3b4bed8 shape, holding a task stating priority 1 and `CATEGORIES:inbox,home`
+- WHEN a reader lists the collection, reads the item, lists the trash, and a query client asks `category:inbox` and `priority:none`
+- THEN every read answers, the task with no priority and no category, `category:inbox` matching nothing and `priority:none` matching it; once the owner opens the store, the columns are backfilled and read (tests/older_task_summary.rs)

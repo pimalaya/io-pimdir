@@ -1011,3 +1011,39 @@ A write SHALL state, on the mail row of every live, stored item gaining a body (
 
 #### Scenario: A copy of a body held with no mark
 - tests/attachments.rs `a_copy_of_a_body_held_with_no_mark_takes_the_columns_a_walk_gives`: held rows stating neither column and no stand-in, as an older writer left them; a copy guessing the opposite mark takes the walk's mark and invitation, records no stand-in, and the held rows still state neither.
+
+### Requirement: Collections refusing tasks
+
+`capability::X_VTODO` SHALL name `x-vtodo` (STORAGE §15.6). The gate SHALL refuse with `PimdirError::Unsupported` naming `x-vtodo` an `add` or `update` whose new resource is a VTODO, and a `move` or `copy` of one, into a collection where a source concerned states `x-vtodo` `none` there or source-wide; a source stating no row refuses nothing by it. `PimdirReader::accepts_vtodo(collection)` SHALL answer whether no source syncing the collection states `none` there, for a client choosing where tasks go.
+
+#### Scenario: an events-only calendar
+- GIVEN source caldav declaring `x-vtodo` `none` on Events
+- WHEN a producer enqueues an add of a VTODO into Events
+- THEN it is refused naming `x-vtodo` and caldav, a VEVENT is queued, `accepts_vtodo("Events")` is false and true elsewhere (tests/capabilities.rs)
+
+### Requirement: Which message ids a mail replies to
+
+`PimdirReader::replied(message_ids)` SHALL answer which of the given ids some live mail replies to (`list_replied`), mail under the `sent` or `drafts` role aside: each id trimmed and stripped of one pair of enclosing angle brackets, an empty one dropped, compared bare and exactly, answered once each in code point order; `collections.role` missing reads as `NULL`.
+
+#### Scenario: a reply and the person's own
+- GIVEN INBOX holding a mail replying to asked@example.org and Sent (role `sent`) one replying to mine@example.org
+- WHEN a reader asks for `<asked@example.org>`, ` mine@example.org `, never@example.org, asked@example.org and an empty id
+- THEN it answers asked@example.org alone (tests/replied.rs)
+
+### Requirement: An owner open that reconciles nothing
+
+`PimdirStore::open_current(dir)` SHALL open the existing store as its owner, taking the same lock as `open` (`PimdirError::Owned` at once when another process holds it), and SHALL create, migrate and reconcile nothing. It SHALL refuse, writing nothing, as `PimdirError::NotCurrent` with `PimdirNotCurrent::Absent` when no pimdir.db is under `dir`, `PimdirNotCurrent::Version { found }` when `user_version` is not this crate's, and `PimdirNotCurrent::Shape { object }` naming the first table, index or trigger whose text differs from the canonical schema or that one side lacks, which `open` would reconcile. A damaged store is refused as `open` refuses it (`Stale`, `VersionMismatch`, `HashAlgo`).
+
+#### Scenario: a store another revision reconciled
+- GIVEN a store whose `task_summary` lacks the task organisation columns
+- WHEN `open_current` opens it
+- THEN it answers `NotCurrent(Shape { object: "task_summary" })` and the table is left as it was; `open` then reconciles it and `open_current` opens it (tests/open_current.rs)
+
+### Requirement: An add superseding an item
+
+`PimdirAction::Add` SHALL carry `supersedes: Option<PimdirSupersedes>`, `PimdirSupersedes { collection, seq }`, encoded as the payload's `supersedes: { "collection", "seq" }` (STORAGE §15.3) and decoded strictly (a malformed one parks). The drain SHALL stage the add, parking it for a live duplicate link id before anything else, then in the same transaction tombstone the superseded item as a `remove` would and record the pair (`supersede_item`); a superseded item absent applies the add alone, and one no source binds is retained. The gate SHALL run the add against its collection and a `remove` of the superseded item against the sources binding it, as producer and as the owner's backstop.
+
+#### Scenario: a parked add leaves the source in place
+- GIVEN task 1 live in Inbox and a queued add into Next carrying `supersedes: {Inbox, 1}`, Next holding a live item under the add's link id
+- WHEN the owner drains
+- THEN the row is parked, task 1 is still live in Inbox and no supersession is recorded (tests/engine/supersedes.rs)

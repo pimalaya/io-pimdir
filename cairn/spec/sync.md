@@ -352,3 +352,21 @@ A delta head stamps its members and records its checkpoint as the round's (`SetR
 - GIVEN a round left open on checkpoint h1000 and cursor t1
 - WHEN the next run's head lists a new member with checkpoint h1001, and the last page lands
 - THEN the member is named and stamped, it survives the close, and the round closes on h1001
+
+### Requirement: The superseded delete is held until the add is pushed
+
+`PimdirLoaded::held` SHALL list the handles of the loaded tombstones `list_superseded_pending` names, which the client loads on every scope. The sync SHALL derive no `Remove` (and no ride-ahead `Update`) for such a tombstone and leave it pending; a remote edit over it still revives it. Once the superseding create is accepted, withdrawn or gone, the tombstone derives a plain `Remove` (SYNC §5).
+
+#### Scenario: a refused push leaves the source in place
+- GIVEN task t1 in tasks-a superseded by an add into tasks-b, both synced by one source
+- WHEN tasks-a syncs, tasks-b syncs and its create is rejected, and tasks-a syncs again
+- THEN no `Remove` of t1 is pushed and t1 stays on the server; once the create is accepted, the next sync of tasks-a pushes a plain `Remove` (tests/engine/supersedes.rs, vectors/sync 71 and 72)
+
+### Requirement: A create keeping its identity names the member to move
+
+`PimdirLoaded::superseded` SHALL map each loaded pending create whose item superseded one of its own identity elsewhere, bound by this source with a base, to that binding (`placement::PimdirSuperseded { collection, handle, if_match }`, `list_superseded_bindings`). The sync SHALL carry it on the create's `PimdirChangeKind::Add` as `supersedes`, outside the change key. A connector able to move members SHALL be free to deliver it by a move then a write of `object`, answering the moved member's handle; the superseded tombstone's delete that follows finds the member gone and is accepted (SYNC §3, §4).
+
+#### Scenario: a filing moved on a server keeping one identity per account
+- GIVEN msg-a in inbox, filed into archive with its identity kept, on a remote refusing an append whose identity another collection holds and moving superseded members
+- WHEN archive syncs, then inbox
+- THEN the member moves into archive under its handle, never in two places, and inbox's delete passes with nothing left (tests/engine/supersedes.rs, vectors/sync 73); without a move the create is refused and the source kept
