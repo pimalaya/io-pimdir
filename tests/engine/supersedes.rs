@@ -159,3 +159,88 @@ fn a_refused_push_leaves_the_source_in_place() {
             .contains("inbox", PimdirHandle::from("1").as_str())
     );
 }
+
+/// The item [`file_keeping`] files: `msg-a` again, its body rewritten.
+const KEPT: &[u8] = b"Message-ID: <msg-a>\r\nSubject: The lease, clarified\r\n\r\nDone.\r\n";
+
+/// Queues an add of [`KEPT`] into `archive` under the identity of the item
+/// `seq` of `inbox`, which it supersedes: a task filed with its `UID` kept.
+fn file_keeping(client: &Client, seq: i64) {
+    let mut producer = PimdirProducer::open(client.path(), "test").unwrap();
+    let blobs = producer.blobs();
+    let hash = blobs.hash(KEPT);
+    let mut writer = blobs.writer().unwrap();
+    writer.write_all(KEPT).unwrap();
+    writer.commit(&hash).unwrap();
+    let add = PimdirAction::Add {
+        link_id: Some(PimdirLinkId::from("msg-a")),
+        flags: PimdirFlags::default(),
+        object: Some(hash.clone()),
+        supersedes: Some(PimdirSupersedes {
+            collection: PimdirCollectionId::from("inbox"),
+            seq,
+        }),
+    };
+    let object = PimdirObject {
+        hash,
+        size: KEPT.len(),
+    };
+    producer.enqueue("archive", &add, Some(&object)).unwrap();
+}
+
+#[test]
+fn a_filing_keeping_its_identity_is_moved_on_a_server_keeping_one() {
+    // NOTE: Fastmail's shape: an append whose identity another collection
+    // holds is refused, a move is taken.
+    let (mut client, seq) = synced();
+    client.remote_mut().one_identity = true;
+    client.remote_mut().moves = true;
+    file_keeping(&client, seq);
+    client.store.drain().unwrap();
+
+    client
+        .sync("archive", PimdirSyncOptions::default())
+        .unwrap();
+    assert_eq!(
+        on_server(&client, "archive"),
+        ["1"],
+        "moved, its handle kept"
+    );
+    assert!(
+        on_server(&client, "inbox").is_empty(),
+        "never in two places"
+    );
+
+    // NOTE: the held delete released, it finds the member gone and passes.
+    client.sync("inbox", PimdirSyncOptions::default()).unwrap();
+    assert!(on_server(&client, "inbox").is_empty());
+    assert!(
+        !client
+            .storage()
+            .contains("inbox", PimdirHandle::from("1").as_str()),
+        "the source's binding is gone",
+    );
+    client
+        .sync("archive", PimdirSyncOptions::default())
+        .unwrap();
+    assert_eq!(live(&client, "archive"), ["msg-a"]);
+    assert_eq!(on_server(&client, "archive"), ["1"], "and stays put");
+}
+
+#[test]
+fn a_filing_keeping_its_identity_without_a_move_keeps_its_source() {
+    let (mut client, seq) = synced();
+    client.remote_mut().one_identity = true;
+    file_keeping(&client, seq);
+    client.store.drain().unwrap();
+
+    client
+        .sync("archive", PimdirSyncOptions::default())
+        .unwrap();
+    client.sync("inbox", PimdirSyncOptions::default()).unwrap();
+    assert!(
+        on_server(&client, "archive").is_empty(),
+        "the create refused"
+    );
+    assert_eq!(on_server(&client, "inbox"), ["1"], "the source kept");
+}

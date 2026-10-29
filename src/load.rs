@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::{
     collection::{PimdirCheckpoint, PimdirCoverage, PimdirRound},
-    placement::{PimdirHandle, PimdirLinkId, PimdirPlacement},
+    placement::{PimdirHandle, PimdirLinkId, PimdirPlacement, PimdirSuperseded},
 };
 
 /// Which of a collection's placements a load has to return.
@@ -52,4 +52,7 @@ pub struct PimdirLoaded {
     /// superseded them and the item it created is still a pending create
     /// (`list_superseded_pending`, STORAGE §15.3, SYNC §5).
     pub held: Vec<PimdirHandle>,
+    /// The member each loaded pending create may be moved from, keyed by
+    /// the create's handle (`list_superseded_bindings`, SYNC §3).
+    pub superseded: Vec<(PimdirHandle, PimdirSuperseded)>,
 }

@@ -127,6 +127,10 @@ pub enum PimdirYield {
 ///
 /// Each variant matches the corresponding [`PimdirYield`] request and
 /// carries the value the caller gathered while servicing it.
+// NOTE: a reply is built, moved into one resume and dropped, never kept in
+// bulk, so the load's size costs nothing a box would save, and boxing it
+// would change every caller.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum PimdirArg {
     /// Reply to [`PimdirYield::WantsEnumerate`].

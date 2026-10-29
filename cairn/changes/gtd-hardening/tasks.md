@@ -18,4 +18,5 @@ Waits on pimdir cairn/changes/gtd-hardening.
 - [x] `PimdirReader::replied`; tests/replied.rs
 - [x] fmt, clippy, `cargo test --all-features`
 - [x] CHANGELOG (Unreleased)
+- [x] `PimdirSuperseded`, `PimdirLoaded::superseded` (`list_superseded_bindings`), `PimdirChangeKind::Add::supersedes`; tests/engine/supersedes.rs (a moving remote keeping one identity, and one that cannot move), vectors/sync 73; the old engine fails both
 - [ ] Fold into cairn/spec/, log, status landed: left to the user's review

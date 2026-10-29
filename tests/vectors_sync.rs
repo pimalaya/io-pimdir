@@ -456,20 +456,33 @@ impl Scripted {
                 link_id,
                 flags,
                 origin,
+                supersedes,
                 object,
                 ..
-            } => json!({
-                "kind": "Add",
-                "handle": handle,
-                "key": key,
-                "link_id": link_id.as_ref().map(|l| l.0.clone()),
-                "flags": flags.known(),
-                "origin": origin.as_ref().map(|o| json!({
-                    "collection": o.collection.0,
-                    "handle": o.handle.0,
-                })),
-                "object": label(object),
-            }),
+            } => {
+                let mut push = json!({
+                    "kind": "Add",
+                    "handle": handle,
+                    "key": key,
+                    "link_id": link_id.as_ref().map(|l| l.0.clone()),
+                    "flags": flags.known(),
+                    "origin": origin.as_ref().map(|o| json!({
+                        "collection": o.collection.0,
+                        "handle": o.handle.0,
+                    })),
+                    "object": label(object),
+                });
+                // NOTE: stated only when the add carries it (SYNC §11), so
+                // a case predating it reads the same.
+                if let Some(s) = supersedes {
+                    push["supersedes"] = json!({
+                        "collection": s.collection.0,
+                        "handle": s.handle.0,
+                        "if_match": s.if_match,
+                    });
+                }
+                push
+            }
         }
     }
 }

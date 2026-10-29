@@ -34,7 +34,7 @@ use crate::{
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin, PimdirPlacement,
-        PimdirSortKey, PimdirStatus,
+        PimdirSortKey, PimdirStatus, PimdirSuperseded,
     },
     sql,
     summary::{
@@ -137,6 +137,33 @@ impl PimdirSourceStore {
             .map(|placement| placement.handle.clone())
             .collect();
 
+        let movable: BTreeMap<String, PimdirSuperseded> = rows(
+            conn,
+            sql::LIST_SUPERSEDED_BINDINGS,
+            named_params! { ":collection": collection.0, ":source": self.source.0 },
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    PimdirSuperseded {
+                        collection: PimdirCollectionId(r.get(1)?),
+                        handle: PimdirHandle(r.get(2)?),
+                        if_match: r.get(3)?,
+                    },
+                ))
+            },
+        )?
+        .into_iter()
+        .collect();
+        let superseded = placements
+            .iter()
+            .filter(|placement| placement.status == PimdirStatus::Created)
+            .filter_map(|placement| {
+                let link = placement.link_id.as_ref()?;
+                let member = movable.get(&link.0)?;
+                Some((placement.handle.clone(), member.clone()))
+            })
+            .collect();
+
         Ok(PimdirLoaded {
             placements,
             checkpoint: state.checkpoint,
@@ -144,6 +171,7 @@ impl PimdirSourceStore {
             round: state.round,
             unstamped,
             held,
+            superseded,
         })
     }
 

@@ -51,7 +51,7 @@ use crate::{
     object::PimdirObject,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
-        PimdirStatus,
+        PimdirStatus, PimdirSuperseded,
     },
     remote::{
         PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirHead, PimdirHeads,
@@ -243,6 +243,8 @@ pub struct PimdirSync {
     /// The tombstones whose remove is held while the add superseding them
     /// is pending (SYNC §5).
     held: BTreeSet<PimdirHandle>,
+    /// The member each pending create may be moved from (SYNC §3).
+    superseded: BTreeMap<PimdirHandle, PimdirSuperseded>,
     /// The meta each listed member carried, by handle.
     metas: BTreeMap<PimdirHandle, PimdirRemoteMeta>,
     /// The members the page named, landed or refreshed, which the join
@@ -311,6 +313,7 @@ impl PimdirSync {
             local: BTreeMap::new(),
             unstamped: Vec::new(),
             held: BTreeSet::new(),
+            superseded: BTreeMap::new(),
             metas: BTreeMap::new(),
             fresh: BTreeMap::new(),
             holds_creates: false,
@@ -602,6 +605,7 @@ impl PimdirSync {
         self.local.clear();
         self.unstamped.clear();
         self.held.clear();
+        self.superseded.clear();
 
         self.state = State::LoadingPage;
         PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
@@ -619,6 +623,7 @@ impl PimdirSync {
         }
         self.unstamped.extend(loaded.unstamped);
         self.held.extend(loaded.held);
+        self.superseded.extend(loaded.superseded);
     }
 
     /// The hints a page before the last loads the holders of, so naming
@@ -1343,6 +1348,7 @@ impl PimdirSync {
                         link_id: local.link_id.clone(),
                         flags: local.flags.clone(),
                         origin: local.origin.clone(),
+                        supersedes: self.superseded.get(&handle).cloned(),
                         object: local.object.clone(),
                     };
                     self.pending.insert(handle, Pending::Create(local));

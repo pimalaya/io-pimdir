@@ -25,6 +25,7 @@ use io_pimdir::{
     object::PimdirHash,
     placement::{
         PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirStatus,
+        PimdirSuperseded,
     },
     rekey::PimdirRekeyReport,
     remote::{
@@ -242,6 +243,12 @@ pub struct MemRemote {
     /// How a DAV server answers `no-uid-conflict` to a resource whose
     /// `UID` its collection already holds.
     pub refused_appends: BTreeSet<PimdirLinkId>,
+    /// Whether an append is refused while any collection holds its
+    /// identity, as a server keeping one `UID` per account does (Fastmail).
+    pub one_identity: bool,
+    /// Whether an `Add` naming the member it supersedes is delivered by
+    /// moving that member, as a WebDAV `MOVE` does (SYNC §4).
+    pub moves: bool,
     /// The global change counter; a delta serves everything past it.
     seq: usize,
     /// Handles removed, stamped with the counter value of their removal.
@@ -249,6 +256,38 @@ pub struct MemRemote {
 }
 
 impl MemRemote {
+    /// Moves the member `supersedes` names into `collection`, its body
+    /// replaced by `object`, as a WebDAV `MOVE` then a write do; `None`
+    /// when this remote does not move or the member is gone.
+    fn move_superseded(
+        &mut self,
+        collection: &PimdirCollectionId,
+        supersedes: Option<PimdirSuperseded>,
+        object: Option<PimdirHash>,
+    ) -> Option<(PimdirHandle, Option<String>)> {
+        let supersedes = supersedes.filter(|_| self.moves)?;
+        let mut item = self
+            .items
+            .get_mut(&supersedes.collection)?
+            .remove(&supersedes.handle)?;
+        let seq = self.bump();
+        self.vanished
+            .entry(supersedes.collection.clone())
+            .or_default()
+            .push((seq, supersedes.handle.clone()));
+        if let Some(object) = object {
+            item.body = object.as_str().as_bytes().to_vec();
+        }
+        item.seq = seq;
+        item.rev += 1;
+        let revision = self.revision(item.rev);
+        self.items
+            .entry(collection.clone())
+            .or_default()
+            .insert(supersedes.handle.clone(), item);
+        Some((supersedes.handle, revision))
+    }
+
     fn bump(&mut self) -> usize {
         self.seq += 1;
         self.seq
@@ -638,8 +677,25 @@ impl PimdirRemote for MemRemote {
                     link_id,
                     flags,
                     origin,
+                    supersedes,
                     object,
                 } => {
+                    if let Some(moved) =
+                        self.move_superseded(collection, supersedes, object.clone())
+                    {
+                        results.push(accepted(handle, Some(moved.0), moved.1));
+                        continue;
+                    }
+                    let held_elsewhere = link_id.as_ref().is_some_and(|link| {
+                        self.items
+                            .values()
+                            .flat_map(|c| c.values())
+                            .any(|item| &item.link_id == link)
+                    });
+                    if self.one_identity && held_elsewhere {
+                        results.push(rejected(handle));
+                        continue;
+                    }
                     if link_id
                         .as_ref()
                         .is_some_and(|link| self.refused_appends.contains(link))

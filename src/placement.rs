@@ -228,6 +228,25 @@ pub struct PimdirOrigin {
     pub handle: PimdirHandle,
 }
 
+/// The member a pending create may be moved from (SYNC §3): the binding
+/// this source holds, with a base, of the item the create superseded, of
+/// the same identity in another collection (STORAGE §15.3).
+///
+/// Derived by the store (`list_superseded_bindings`) and never stored. A
+/// connector whose source moves members between collections delivers the
+/// create by moving this one, gated on `if_match`, then writing the
+/// create's body over it, so the identity never lives twice on the
+/// server; one that cannot uploads the body as for any create.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirSuperseded {
+    /// The collection the superseded member lives in.
+    pub collection: PimdirCollectionId,
+    /// The superseded member's handle there.
+    pub handle: PimdirHandle,
+    /// The member's last-synced revision, the move's precondition.
+    pub if_match: Option<String>,
+}
+
 /// The last-synced state a placement reconciles against.
 ///
 /// Its existence is the membership base: a based placement was a member

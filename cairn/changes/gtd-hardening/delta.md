@@ -43,6 +43,15 @@ change: gtd-hardening
 - WHEN tasks-a syncs, tasks-b syncs and its create is rejected, and tasks-a syncs again
 - THEN no `Remove` of t1 is pushed and t1 stays on the server; once the create is accepted, the next sync of tasks-a pushes a plain `Remove` (tests/engine/supersedes.rs, vectors/sync 71 and 72)
 
+### Requirement: A create keeping its identity names the member to move
+
+`PimdirLoaded::superseded` SHALL map each loaded pending create whose item superseded one of its own identity elsewhere, bound by this source with a base, to that binding (`placement::PimdirSuperseded { collection, handle, if_match }`, `list_superseded_bindings`). The sync SHALL carry it on the create's `PimdirChangeKind::Add` as `supersedes`, outside the change key. A connector able to move members SHALL be free to deliver it by a move then a write of `object`, answering the moved member's handle; the superseded tombstone's delete that follows finds the member gone and is accepted (SYNC §3, §4).
+
+#### Scenario: a filing moved on a server keeping one identity per account
+- GIVEN msg-a in inbox, filed into archive with its identity kept, on a remote refusing an append whose identity another collection holds and moving superseded members
+- WHEN archive syncs, then inbox
+- THEN the member moves into archive under its handle, never in two places, and inbox's delete passes with nothing left (tests/engine/supersedes.rs, vectors/sync 73); without a move the create is refused and the source kept
+
 ### Requirement: Collections refusing tasks
 
 `capability::X_VTODO` SHALL name `x-vtodo` (STORAGE §15.6). The gate SHALL refuse with `PimdirError::Unsupported` naming `x-vtodo` an `add` or `update` whose new resource is a VTODO, and a `move` or `copy` of one, into a collection where a source concerned states `x-vtodo` `none` there or source-wide; a source stating no row refuses nothing by it. `PimdirReader::accepts_vtodo(collection)` SHALL answer whether no source syncing the collection states `none` there, for a client choosing where tasks go.

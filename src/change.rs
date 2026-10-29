@@ -21,7 +21,9 @@ use alloc::{format, string::String, vec::Vec};
 use crate::{
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     object::{PimdirHash, PimdirObject},
-    placement::{PimdirFlags, PimdirHandle, PimdirLinkId, PimdirOrigin, PimdirPlacement},
+    placement::{
+        PimdirFlags, PimdirHandle, PimdirLinkId, PimdirOrigin, PimdirPlacement, PimdirSuperseded,
+    },
 };
 
 /// A change to push to the remote: what to do, and the key naming it.
@@ -82,6 +84,11 @@ pub enum PimdirChangeKind {
         /// When the origin is gone a consumer holding `object` may upload
         /// it instead; without a body, rejecting keeps the create pending.
         origin: Option<PimdirOrigin>,
+        /// The member it may be moved from, `None` for no such member.
+        ///
+        /// Outside the key (SYNC §4): a create delivered by a move or by an
+        /// upload is one change.
+        supersedes: Option<PimdirSuperseded>,
         /// The stored body to upload when there is no `origin`.
         object: Option<PimdirHash>,
     },
@@ -435,6 +442,7 @@ mod tests {
                     link_id: None,
                     flags: PimdirFlags::default(),
                     origin: None,
+                    supersedes: None,
                     object: None,
                 },
             ),
@@ -445,6 +453,7 @@ mod tests {
                     link_id: Some(PimdirLinkId::from("mid")),
                     flags: PimdirFlags::default(),
                     origin: None,
+                    supersedes: None,
                     object: None,
                 },
             ),
@@ -458,6 +467,7 @@ mod tests {
                         collection: archive.clone(),
                         handle: PimdirHandle::from("9"),
                     }),
+                    supersedes: None,
                     object: None,
                 },
             ),
@@ -468,6 +478,7 @@ mod tests {
                     link_id: None,
                     flags: PimdirFlags::default(),
                     origin: None,
+                    supersedes: None,
                     object: Some(PimdirHash::from("aaa")),
                 },
             ),
