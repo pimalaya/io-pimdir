@@ -320,6 +320,9 @@ fn walk(blobs: &PimdirBlobs, hash: &PimdirHash) -> Result<Option<PimdirParts>, P
             Ok(0) => break,
             Ok(read) => read,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            // NOTE: read to its end, the body failed its name: no body,
+            // never parsed (§7).
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
             Err(err) => return Err(err.into()),
         };
         walk.feed(&buffer[..read]);

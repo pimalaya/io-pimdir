@@ -18,7 +18,7 @@ use crate::{
     collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoaded,
-    mutate::{PimdirMutate, PimdirMutateError, PimdirMutation},
+    mutate::{PimdirMutate, PimdirMutateError, PimdirMutateReport, PimdirMutation},
     open::PimdirOpen,
     placement::PimdirHandle,
     rekey::{PimdirRekey, PimdirRekeyReport},
@@ -107,10 +107,8 @@ impl PimdirSourceStore {
             PimdirYield::WantsLookupObject(links) => {
                 PimdirArg::LookupObject(self.lookup_objects(&links)?)
             }
-            PimdirYield::WantsWrite(ops) => {
-                self.write(ops)?;
-                PimdirArg::Write
-            }
+            PimdirYield::WantsWrite(ops) => PimdirArg::Written(self.write(ops)?),
+            PimdirYield::WantsVerify(hashes) => PimdirArg::Verified(self.verify(&hashes)?),
             remote => return Ok(Err(remote)),
         }))
     }
@@ -199,7 +197,7 @@ impl PimdirSourceStore {
         &mut self,
         collection: impl Into<PimdirCollectionId>,
         mutation: PimdirMutation,
-    ) -> Result<(), PimdirRunError<Infallible, PimdirMutateError>> {
+    ) -> Result<PimdirMutateReport, PimdirRunError<Infallible, PimdirMutateError>> {
         self.run(PimdirMutate::new(collection, mutation), &mut PimdirOffline)
     }
 
@@ -264,11 +262,18 @@ impl PimdirSourceStore {
     }
 
     /// Rebuilds a collection onto a new handle space, by link id (SYNC §8).
+    ///
+    /// A listing leaving more than half of at least 20 based bindings with
+    /// no member parks the rekey, nothing written, unless the caller
+    /// confirmed the absences with `accept_absences`
+    /// ([`PimdirRekeyReport::parked`]).
     pub fn rekey<R: PimdirRemote>(
         &mut self,
         collection: impl Into<PimdirCollectionId>,
+        accept_absences: bool,
         remote: &mut R,
     ) -> Result<PimdirRekeyReport, PimdirRunError<R::Error, PimdirArgError>> {
-        self.run(PimdirRekey::new(collection), remote)
+        let rekey = PimdirRekey::new(collection).accept_absences(accept_absences);
+        self.run(rekey, remote)
     }
 }

@@ -3,7 +3,7 @@
 //! refcount pinning of queued bodies, generation bumps, and the refusal
 //! of a store stamped with an unserviced schema version.
 
-use std::{io::Write, path::Path, sync::mpsc, thread, time::Duration};
+use std::{fs, path::Path, sync::mpsc, thread, time::Duration};
 
 use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
@@ -85,16 +85,18 @@ fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
     (store, seq)
 }
 
-/// Streams `body` into the blob store under `hash`, the producer's
-/// blob-first step, and returns the object the enqueue indexes.
-fn write_blob(dir: &Path, hash: &str, body: &[u8]) -> PimdirObject {
-    let blobs = PimdirBlobs::open(dir, PimdirHashAlgo::default());
-    let mut writer = blobs.writer().unwrap();
-    writer.write_all(body).unwrap();
-    let size = writer.commit(&PimdirHash(hash.into())).unwrap();
+/// Places `body` in the blob tree under the name `hash`, a body a producer
+/// staged, and returns the object the enqueue indexes.
+/// Writes `body` to the blob tree under its content hash, as a producer
+/// stages it, outside any lock.
+fn write_blob(dir: &Path, body: &[u8]) -> PimdirObject {
+    let hash = PimdirHashAlgo::default().hash(body);
+    let path = PimdirBlobs::open(dir, PimdirHashAlgo::default()).path(&hash);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, body).unwrap();
     PimdirObject {
-        hash: PimdirHash(hash.into()),
-        size: size as usize,
+        hash,
+        size: body.len(),
     }
 }
 
@@ -105,12 +107,12 @@ fn a_queued_add_round_trips_into_a_staged_item() {
 
     // the producer writes the blob durably first, then enqueues in one
     // transaction, and the pending action shows in its own reads
-    let object = write_blob(dir.path(), "beef0000", b"Subject: hi\r\n\r\nnew body");
+    let object = write_blob(dir.path(), b"Subject: hi\r\n\r\nnew body");
     let mut producer = PimdirProducer::open(dir.path(), "smtp").unwrap();
     let add = PimdirAction::Add {
         link_id: Some(PimdirLinkId("mid:new".into())),
         flags: PimdirFlags::from_iter(["\\Draft"]),
-        object: Some(PimdirHash("beef0000".into())),
+        object: Some(object.hash.clone()),
         supersedes: None,
     };
     producer.enqueue("INBOX", &add, Some(&object)).unwrap();
@@ -129,7 +131,7 @@ fn a_queued_add_round_trips_into_a_staged_item() {
 
     let items = store.list_items("INBOX", None, 10).unwrap();
     let item = items.iter().find(|i| i.link_id.0 == "mid:new").unwrap();
-    assert_eq!(item.object, Some(PimdirHash("beef0000".into())));
+    assert_eq!(item.object, Some(object.hash.clone()));
     assert_eq!(item.level, PimdirLevel::Full);
     assert!(item.flags.contains("\\Draft"));
     // the owner derived the summary from the body the producer wrote
@@ -309,14 +311,15 @@ fn update_repoints_the_body() {
     let dir = tempfile::tempdir().unwrap();
     let (mut store, seq) = seeded(dir.path());
 
-    let object = write_blob(dir.path(), "beef0000", b"edited body");
+    let object = write_blob(dir.path(), b"edited body");
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     producer
         .enqueue(
             "INBOX",
             &PimdirAction::Update {
                 seq,
-                object: PimdirHash("beef0000".into()),
+                object: object.hash.clone(),
+                if_match: None,
             },
             Some(&object),
         )
@@ -326,10 +329,10 @@ fn update_repoints_the_body() {
     assert_eq!((report.applied, report.parked), (1, 0));
 
     let item = store.get_item("INBOX", seq).unwrap().unwrap();
-    assert_eq!(item.object, Some(PimdirHash("beef0000".into())));
+    assert_eq!(item.object, Some(object.hash.clone()));
     // the old body survives: the sync base still references it
     assert!(blob_exists(dir.path(), "cafebabe"));
-    assert!(blob_exists(dir.path(), "beef0000"));
+    assert!(blob_exists(dir.path(), &object.hash.0));
     // an immutable kind never owes a body (SYNC §9): the base follows the
     // edit and nothing is left to push
     let projected = store
@@ -339,7 +342,7 @@ fn update_repoints_the_body() {
     assert_eq!(projected[0].status, PimdirStatus::Clean);
     assert_eq!(
         projected[0].base.as_ref().and_then(|b| b.object.clone()),
-        Some(PimdirHash("beef0000".into())),
+        Some(object.hash.clone()),
     );
 }
 
@@ -399,7 +402,7 @@ fn gc_never_sweeps_a_queued_body() {
     let (mut store, seeded_seq) = seeded(dir.path());
 
     // a producer stages a body and enqueues the add referencing it
-    let object = write_blob(dir.path(), "beef0000", b"queued body");
+    let object = write_blob(dir.path(), b"queued body");
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     producer
         .enqueue(
@@ -407,20 +410,17 @@ fn gc_never_sweeps_a_queued_body() {
             &PimdirAction::Add {
                 link_id: Some(PimdirLinkId("mid:new".into())),
                 flags: PimdirFlags::default(),
-                object: Some(PimdirHash("beef0000".into())),
+                object: Some(object.hash.clone()),
                 supersedes: None,
             },
             Some(&object),
         )
         .unwrap();
 
-    // a collector cannot run while the producer holds its staging lock:
-    // the body it just wrote is pinned by nothing until the enqueue
-    // commits, and that window is why the lock exists
-    assert!(matches!(
-        store.collect_garbage(),
-        Err(PimdirError::Staging(_))
-    ));
+    // the producer's staging window closed with the commit pinning the
+    // body (tests/staging.rs proves the window itself), so a collector may
+    // run beside the open producer
+    assert!(store.collect_garbage().is_ok());
     drop(producer);
 
     // the owner retires and purges the seeded item, orphaning its body,
@@ -438,14 +438,17 @@ fn gc_never_sweeps_a_queued_body() {
     assert_eq!((collected.objects, collected.blobs), (1, 1));
     assert!(!blob_exists(dir.path(), "cafebabe"), "the orphan is taken");
     assert!(
-        blob_exists(dir.path(), "beef0000"),
+        blob_exists(dir.path(), &object.hash.0),
         "the queued body is not"
     );
 
     // draining hands the pin over to the applied item
     let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
-    assert!(blob_exists(dir.path(), "beef0000"), "now the item pins it");
+    assert!(
+        blob_exists(dir.path(), &object.hash.0),
+        "now the item pins it"
+    );
 
     // the hand-over was exact, so retiring and purging the item's only
     // placement orphans the body and the next collection takes it, with
@@ -460,7 +463,7 @@ fn gc_never_sweeps_a_queued_body() {
         .unwrap();
     assert!(store.purge(inbox(), seq).unwrap());
     assert_eq!(store.collect_garbage().unwrap().blobs, 1);
-    assert!(!blob_exists(dir.path(), "beef0000"), "no refcount leak");
+    assert!(!blob_exists(dir.path(), &object.hash.0), "no refcount leak");
 }
 
 #[test]
@@ -472,11 +475,11 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     let (mut store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
 
-    let object = write_blob(dir.path(), "beef0000", b"a message to send");
+    let object = write_blob(dir.path(), b"a message to send");
     let submit = PimdirAction::Unknown {
         kind: "submit".into(),
-        payload: "{\"v\":1,\"object\":\"beef0000\",\"to\":[\"a@b.c\"]}".into(),
-        object_hash: Some(PimdirHash("beef0000".into())),
+        payload: format!(r#"{{"v":1,"object":"{}","to":["a@b.c"]}}"#, object.hash.0),
+        object_hash: Some(object.hash.clone()),
     };
     let id = producer.enqueue("INBOX", &submit, Some(&object)).unwrap();
     producer
@@ -510,7 +513,7 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, id);
     assert_eq!(pending[0].action, submit);
-    assert!(blob_exists(dir.path(), "beef0000"));
+    assert!(blob_exists(dir.path(), &object.hash.0));
 
     // a second pass skips it again rather than accumulating attempts
     let report = store.drain().unwrap();
@@ -526,28 +529,28 @@ fn an_acknowledged_action_releases_its_queued_body() {
     let (mut store, _) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "himalaya").unwrap();
 
-    let object = write_blob(dir.path(), "beef0000", b"sent already");
+    let object = write_blob(dir.path(), b"sent already");
     let id = producer
         .enqueue(
             "INBOX",
             &PimdirAction::Unknown {
                 kind: "submit".into(),
-                payload: "{\"v\":1,\"object\":\"beef0000\"}".into(),
-                object_hash: Some(PimdirHash("beef0000".into())),
+                payload: format!(r#"{{"v":1,"object":"{}"}}"#, object.hash.0),
+                object_hash: Some(object.hash.clone()),
             },
             Some(&object),
         )
         .unwrap();
-    assert!(blob_exists(dir.path(), "beef0000"));
+    assert!(blob_exists(dir.path(), &object.hash.0));
 
     assert!(store.drop_action(id).unwrap());
     assert!(store.pending_actions("INBOX").unwrap().is_empty());
-    assert!(blob_exists(dir.path(), "beef0000"), "no write collects");
+    assert!(blob_exists(dir.path(), &object.hash.0), "no write collects");
 
     drop(producer);
     assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(
-        !blob_exists(dir.path(), "beef0000"),
+        !blob_exists(dir.path(), &object.hash.0),
         "the pin went with the row"
     );
 
@@ -675,7 +678,11 @@ fn a_store_stamped_with_a_higher_version_is_refused() {
         PimdirReader::open(dir.path()).map(drop),
     ] {
         match result {
-            Err(PimdirError::Version { found }) => assert_eq!(found, sql::VERSION + 1),
+            Err(err @ PimdirError::Version { .. }) => {
+                assert!(matches!(err, PimdirError::Version { found } if found == sql::VERSION + 1));
+                assert_eq!(err.code(), "store-newer");
+                assert!(err.to_string().ends_with("upgrade this program"), "{err}");
+            }
             Err(other) => panic!("expected a version refusal, got {other:?}"),
             Ok(()) => panic!("expected a version refusal, got an open store"),
         }
@@ -967,10 +974,12 @@ fn an_action_naming_an_unindexed_body_is_refused_at_the_enqueue() {
     let dir = tempfile::tempdir().unwrap();
     let (mut store, _) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    // NOTE: the bytes sit in the blob tree, unindexed.
+    let object = write_blob(dir.path(), b"new body");
     let add = PimdirAction::Add {
         link_id: Some(PimdirLinkId("mid:new".into())),
         flags: PimdirFlags::default(),
-        object: Some(PimdirHash("beef0000".into())),
+        object: Some(object.hash.clone()),
         supersedes: None,
     };
 
@@ -980,7 +989,6 @@ fn an_action_naming_an_unindexed_body_is_refused_at_the_enqueue() {
     ));
     assert!(store.pending_actions("INBOX").unwrap().is_empty());
 
-    let object = write_blob(dir.path(), "beef0000", b"new body");
     producer.enqueue("INBOX", &add, Some(&object)).unwrap();
     assert_eq!(store.drain().unwrap().applied, 1);
 }
@@ -1008,4 +1016,173 @@ fn a_store_lacking_store_meta_is_stale() {
             missing: "store_meta"
         })
     ));
+}
+
+/// Unlinks the blob of `hash`, as a collector running between a body's
+/// write and its enqueue would (pimdir STORAGE §8).
+fn unlink_blob(dir: &Path, hash: &str) {
+    std::fs::remove_file(
+        dir.join("objects")
+            .join(&hash[0..2])
+            .join(&hash[2..4])
+            .join(hash),
+    )
+    .unwrap();
+}
+
+/// A queued `add` whose body is gone is a failure of the environment
+/// (pimdir STORAGE §15.2): retried, then parked, never applied as an item
+/// naming a body the store lacks.
+#[test]
+fn a_queued_add_missing_its_body_is_retried_then_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = seeded(dir.path());
+    let object = write_blob(dir.path(), b"Subject: hi\r\n\r\nnew body");
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let add = PimdirAction::Add {
+        link_id: Some(PimdirLinkId("mid:new".into())),
+        flags: PimdirFlags::default(),
+        object: Some(object.hash.clone()),
+        supersedes: None,
+    };
+    let id = producer.enqueue("INBOX", &add, Some(&object)).unwrap();
+    drop(producer);
+    unlink_blob(dir.path(), &object.hash.0);
+
+    for attempt in 1..PimdirSourceStore::MAX_ATTEMPTS {
+        let report = store.drain().unwrap();
+        assert_eq!((report.applied, report.retried), (0, 1), "drain {attempt}");
+        assert_eq!(store.pending_actions("INBOX").unwrap()[0].attempts, attempt);
+    }
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+
+    let parked = store.parked_actions().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].id, id);
+    assert!(
+        parked[0].error.contains(&object.hash.0),
+        "{}",
+        parked[0].error
+    );
+    let items = store.list_items("INBOX", None, 10).unwrap();
+    assert!(
+        items.iter().all(|item| item.link_id.0 != "mid:new"),
+        "no item created"
+    );
+}
+
+/// The same for an `update`: the item keeps the body it had.
+#[test]
+fn a_queued_update_missing_its_body_is_retried_then_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let object = write_blob(dir.path(), b"edited body");
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let update = PimdirAction::Update {
+        seq,
+        object: object.hash.clone(),
+        if_match: None,
+    };
+    producer.enqueue("INBOX", &update, Some(&object)).unwrap();
+    drop(producer);
+    unlink_blob(dir.path(), &object.hash.0);
+
+    for _ in 1..PimdirSourceStore::MAX_ATTEMPTS {
+        let report = store.drain().unwrap();
+        assert_eq!((report.applied, report.retried), (0, 1));
+    }
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+
+    let item = store.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(item.object, Some(PimdirHash("cafebabe".into())));
+}
+
+/// A card body under `uid` with full name `name`.
+fn card(uid: &str, name: &str) -> Vec<u8> {
+    format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:{name}\r\nEND:VCARD\r\n").into_bytes()
+}
+
+/// A drained edit a collection's policy settles against another body
+/// keeps the loser as a retained item (SYNC §9), and the drain says so:
+/// nothing else reports a body kept aside while the queue was applied.
+#[test]
+fn a_body_a_policy_overrules_during_a_drain_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let algo = PimdirHashAlgo::default();
+    let contacts = PimdirCollectionId("contacts".into());
+    let bound = |handle: &str, body: &[u8]| {
+        let hash = algo.hash(body);
+        vec![
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: hash.clone(),
+                    size: body.len(),
+                },
+                body: Some(body.to_vec()),
+            },
+            PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                sort_key: Default::default(),
+                collection: contacts.clone(),
+                handle: PimdirHandle(handle.into()),
+                link_id: Some(PimdirLinkId("u1".into())),
+                object: Some(hash.clone()),
+                level: PimdirLevel::Full,
+                summary: None,
+                flags: PimdirFlags::default(),
+                status: PimdirStatus::Clean,
+                conflict_revision: None,
+                conflict_object: None,
+                base: Some(PimdirBase {
+                    flags: PimdirFlags::default(),
+                    revision: Some("1".into()),
+                    object: Some(hash),
+                }),
+                origin: None,
+            }),
+        ]
+    };
+
+    let store = PimdirStore::open(dir.path()).unwrap();
+    store.ensure_collection("contacts", "text/vcard").unwrap();
+    store
+        .set_collection_conflict(
+            "contacts",
+            io_pimdir::hub::PimdirHubConflict::PreferIncoming,
+        )
+        .unwrap();
+    let mut a = store.for_source("a");
+    a.write(bound("a1", &card("u1", "Ann"))).unwrap();
+    drop(a);
+    let mut b = PimdirStore::open(dir.path()).unwrap().for_source("b");
+    b.write(bound("b1", &card("u1", "Ann B"))).unwrap();
+    let seq = b.list_items("contacts", None, 10).unwrap()[0].seq;
+    let retained = b.list_retained("contacts", None, 10).unwrap().len();
+    drop(b);
+
+    let mut producer = PimdirProducer::open(dir.path(), "app").unwrap();
+    let row = producer
+        .enqueue_with_body("contacts", &card("u1", "Ann A"), |hash| {
+            PimdirAction::Update {
+                seq,
+                object: hash,
+                if_match: None,
+            }
+        })
+        .unwrap();
+    drop(producer);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("a");
+    let report = owner.drain().unwrap();
+    assert_eq!(report.applied, 1, "{report:?}");
+    let kept = owner.list_retained("contacts", None, 10).unwrap();
+    assert_eq!(kept.len(), retained + 1, "the policy kept a body aside");
+    assert_eq!(report.overruled.len(), 1, "{report:?}");
+    assert_eq!(report.overruled[0].id, row);
+    assert_eq!(report.overruled[0].collection, "contacts");
+    assert!(
+        kept.iter()
+            .any(|item| item.link_id == report.overruled[0].link_id)
+    );
 }

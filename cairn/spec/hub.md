@@ -60,7 +60,7 @@ Projecting the same rule is what lets a store already written in that state heal
 - THEN the item is no longer deleted and is copied back to the sources that lack it
 
 ### Requirement: A binding records what it last agreed with the hub on
-`PimdirBinding` SHALL carry `shared_object`, the hub's shared body at this source's last absorbed upsert, and the hub SHALL treat it as the base of the cross-source merge. Every live upsert SHALL move it to the shared body the reconcile settled on, whether that body was adopted, kept, or refused; a `Tombstone` adopts no content and SHALL leave it where it stood. Until a source has folded once it is `None`, and the sync base stands in for it.
+`PimdirBinding` SHALL carry `shared_object`, the shared body this source last agreed with, and the hub SHALL treat it as the base of the cross-source merge. A live upsert carrying a body SHALL move it to the body the item settles on, adopted or kept; an upsert carrying none (a pull at `Meta`, which agreed to no body) and one leaving the item conflicted, a divergence included, the conflict being settled against it, SHALL NOT move it (pimdir SYNC §9, vectors/sync/28, 33, 80 to 84); a `Tombstone` adopts no content and leaves it where it stood. Until a source has folded once it is `None`, and the sync base stands in for it. The store pins it as it pins the base (STORAGE §5).
 
 This is a second base, for the second axis, and the two cannot be one field. `base` is what the source last agreed with its own remote and only a sync moves it, so it stays behind while an unpushed edit waits, which is what keeps the push derivable. The shared axis needs the opposite: a body this source folded in is agreed with, pushed or not.
 
@@ -69,18 +69,28 @@ This is a second base, for the second axis, and the two cannot be one field. `ba
 - WHEN an upsert is absorbed for it
 - THEN the cross-source comparison is made against its sync base
 
+#### Scenario: A body-less pull keeps the agreed body
+- GIVEN two sources agreeing on `c1`, and one pulling its server's edit with no body
+- WHEN the pull is absorbed
+- THEN the item holds no body at `Meta` and the pulling binding still agrees `c1` (vectors/sync/80)
+
 ### Requirement: The hub resolves cross-source content conflicts by policy
-`PimdirHubItem` SHALL carry a `conflicted` flag and a `conflict_object`, and `PimdirHub` a `PimdirHubConflict` policy (`Manual`, `PreferIncoming`, `PreferExisting`; default `Manual`). On an upsert, the hub SHALL compare the incoming body against the source's own sync base and the hub's shared body against what that source last agreed with the hub on: a conflict is the source having changed its body **and** another source having moved the shared body, to different bodies. `Manual` SHALL flag it and record the diverging body, preserving both and keeping the shared body; `PreferIncoming` SHALL adopt the incoming body; `PreferExisting` SHALL keep the shared body. A clean fast-forward (only the source changed) SHALL adopt the incoming body, and an upsert carrying the shared body itself settles nothing either way.
+`PimdirHubItem` SHALL carry a `conflicted` flag and a `conflict_object`, and `PimdirHub` a `PimdirHubConflict` policy (`Manual`, `PreferIncoming`, `PreferExisting`; default `Manual`). On an upsert, three facts SHALL be read before it lands (pimdir SYNC §9): the source changed when the incoming body differs from the base its binding held, or it leaves a conflicted binding; the item changed when the shared body differs from `shared_object`, the sync base standing in; the two disagree when the bodies differ. An item holding no body has changed for a binding that agreed one, and an upsert carrying no body over an item holding one disagrees with it. All three is a divergence: `Manual` SHALL flag the item and record the incoming body in `conflict_object`, keeping the shared body; `PreferIncoming` SHALL adopt the incoming body; `PreferExisting` SHALL keep the shared body. Only the source having changed is a fast-forward, adopting the incoming body.
 
-The three facts SHALL be read before the upsert lands and against the base the binding held, never the base the upsert carries (pimdir SYNC §9): read from the carried base, a source whose sync just moved its base onto the remote body reads as having said nothing, and an edit on two endpoints loses one silently. Whether the content is mutable SHALL be judged across every binding of the item and the placement's own base, any revision meaning mutable: judged on the upserting binding alone, a source whose base holds no revision yet resolved a divergence silently. An immutable kind never diverges: a based binding whose base holds a body while the item holds another SHALL adopt the item's body into its base, so a mail fetched at `Full` beside a linked copy of the same message reads `Clean` rather than `Dirty` for ever with nothing to push.
+Two rules keep every body (vectors/sync/81 to 84):
 
-Under `Manual` every binding of a conflicted item SHALL project `Conflict` carrying no `conflict_revision` (pimdir SYNC §3), and `absorb` SHALL clear `conflicted` and `conflict_object` when an upsert settles the item: a live upsert adopted as the shared body, or a tombstone.
+- An upsert carrying a body over an item holding none, from a binding whose base names no body, fills the item without measuring a divergence, an item conflict standing staying as it is.
+- A divergence one of whose bodies nobody has read (the upsert carries none, or the item holds none) SHALL be recorded as `Manual` records one, whatever the policy: the shared body stays, the item is flagged, and its `conflict_object` is the incoming body or waits for the upgrade.
 
-A source SHALL NOT diverge from itself. Its own body folded into the hub and not yet pushed leaves its sync base behind the shared body, which is the gap another source folding in also leaves, and reading the two as one drops the source's next edit: a second offline edit under `Manual`, or the edit that resolves a conflicted binding, whose merged body would then never be pushed.
+A body a policy does not adopt SHALL be kept (vectors/sync/14, 85, 86): the shared body `PreferIncoming` replaced, the incoming one `PreferExisting` refused, and the local edit a source's `PreferRemote` pull dropped, which reaches the hub as a fast-forward whose base revision moved, replacing a body the binding's base did not hold. The hub records it in `PimdirHub::overruled`, and the write keeps it as a retained item keyed by the identity minted over the settling binding's handle (minted again over a held key), with a `seq` of its own, deleted and retained by the settling source, its body pinned, answering it in `PimdirWritten::overruled`. The summary and sort key of an item that kept its body over the upsert's stay its own.
 
-An upsert leaving a conflicted binding SHALL count as the source having changed its body whatever body it carries, read from the status rather than from the body alone. A resolution keeping the ancestor of the divergence restates the source's own sync base, so comparing bodies reads it as the source having said nothing, and the hub would keep the body the resolution discarded and hand every source a decision nobody took.
+The three facts SHALL be read against the base the binding held, never the base the upsert carries. Whether the content is mutable SHALL be judged across every binding of the item and the placement's own base, any revision meaning mutable. An immutable kind never diverges: a based binding whose base holds a body while the item holds another SHALL adopt the item's body into its base.
 
-Flags are unaffected (element-wise, never conflicting), and immutable-content backends mint a new link id per body and never reach this path.
+Under `Manual` every binding of a conflicted item SHALL project `Conflict` carrying no `conflict_revision` (pimdir SYNC §3), and `absorb` SHALL clear `conflicted` and `conflict_object` when an upsert settles the item: a live upsert adopted as the shared body, a policy settling a divergence, or a tombstone. A divergence the write records is answered in `PimdirWritten::conflicted`.
+
+A source SHALL NOT diverge from itself: its own body folded into the hub and not yet pushed leaves its sync base behind the shared body, and only `shared_object` tells that gap from another source folding in. An upsert leaving a conflicted binding SHALL count as the source having changed its body whatever body it carries.
+
+Flags are unaffected (element-wise, never conflicting).
 
 #### Scenario: A divergent edit conflicts and preserves both under Manual
 - GIVEN two sources agreeing on a body, then each editing it to a different body
@@ -101,6 +111,16 @@ Flags are unaffected (element-wise, never conflicting), and immutable-content ba
 - GIVEN one source whose offline edit the hub adopted, with the push still pending
 - WHEN a second offline edit from that source is absorbed
 - THEN the hub adopts it, and the item is not conflicted
+
+#### Scenario: A local edit over an emptied item
+- GIVEN two sources agreeing on a body, one pulling its server's edit with no body
+- WHEN the other's offline edit is absorbed
+- THEN the item is flagged with the edit as its diverging body and every binding projects `Conflict`, never `Clean` (src/hub.rs `a_local_edit_over_an_emptied_item_is_recorded`)
+
+#### Scenario: A policy's loser is kept
+- GIVEN `prefer-incoming`, and a source settling its own conflict by taking `c2` while another folded `c3`
+- WHEN the edit is absorbed
+- THEN the item holds `c2`, `c3` is a retained item under `dup:<link>#<handle>`, and the mutation reports `Overruled` (vectors/sync/85)
 
 #### Scenario: A resolving edit becomes the shared body
 - GIVEN a conflicted binding whose local body the hub holds as the shared one
@@ -172,7 +192,7 @@ Stating the shared content once is what makes a field added to `PimdirPlacement`
 ### Requirement: A body-less item is no divergence
 `PimdirHub::project` SHALL read a bound source whose base holds a body while the item holds none as agreeing on the content axis, `Clean` when the flags agree too. The body went with another source's content pull, and this source owes nothing until a hydration gives the item a body again; read as a divergence, it projected `Dirty` on every load and the flag axis rewrote its row on every run.
 
-An upsert carrying no body while the item holds one is that pull, and `absorb` SHALL lower the shared level to the placement's with the body it drops (pimdir SYNC §5, vectors/sync/11) rather than merge it as a maximum: the item reads `Meta` for the upgrade to refetch, the summary the member's meta when it carried one.
+An upsert carrying no body while the item holds one is that pull, and `absorb` SHALL lower the shared level to the placement's with the body it drops (pimdir SYNC §5, vectors/sync/11) rather than merge it as a maximum: the item reads `Meta` for the upgrade to refetch, the summary the member's meta when it carried one. A pull the merge records as a divergence instead drops nothing: the item keeps its body, level, summary and sort key (vectors/sync/83).
 
 #### Scenario: One source pulled a remote content change
 - GIVEN two sources agreeing on a body

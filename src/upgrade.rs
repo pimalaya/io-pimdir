@@ -32,10 +32,11 @@ use crate::{
     },
     remote::{PimdirFetchedBody, PimdirFetchedItem, PimdirTier},
     summary::{self, PimdirSummary},
+    sync::PimdirSyncEvent,
 };
 
 /// What an upgrade did.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirUpgradeReport {
     /// Placements raised to the requested level.
     pub upgraded: usize,
@@ -43,6 +44,10 @@ pub struct PimdirUpgradeReport {
     pub fetched: usize,
     /// Bodies linked from the object store without a fetch.
     pub deduped: usize,
+    /// The bodies its write kept that a policy did not adopt, each a
+    /// [`PimdirSyncEvent::Overruled`], once the write committed (SYNC §5):
+    /// the only event an upgrade reports.
+    pub events: Vec<PimdirSyncEvent>,
 }
 
 /// I/O-free UPGRADE coroutine.
@@ -95,6 +100,13 @@ impl PimdirUpgrade {
             .filter(|h| match self.placements.get(h) {
                 Some(p) => match self.tier {
                     PimdirTier::Meta => p.summary.is_none(),
+                    // NOTE: the item's own conflict waits for the body of
+                    // the binding whose base names a revision and no body,
+                    // the pull nobody has read (SYNC §6, §9).
+                    PimdirTier::Full if is_item_conflict(p) => p
+                        .base
+                        .as_ref()
+                        .is_some_and(|base| base.revision.is_some() && base.object.is_none()),
                     PimdirTier::Full => match is_conflicted(p) {
                         true => p.conflict_object.is_none(),
                         false => p.level < PimdirLevel::Full || p.object.is_none(),
@@ -128,6 +140,38 @@ impl PimdirUpgrade {
                 continue;
             };
             let mut patched = placement.clone();
+
+            // NOTE: the body an item conflict waits for is this binding's
+            // own, its pull read at last: it lands as the binding's body and
+            // base, and the write settles it against the item's by the
+            // collection's policy, as a carried body would have been (SYNC
+            // §6, §9).
+            if self.tier == PimdirTier::Full && is_item_conflict(&patched) {
+                let Some(body) = item.body else {
+                    continue;
+                };
+                let (object, bytes) = stored_body(body);
+                let hash = object.hash.clone();
+                self.ops.push(PimdirWriteOp::StoreObject {
+                    object,
+                    body: bytes,
+                });
+                patched.object = Some(hash.clone());
+                patched.base = Some(PimdirBase {
+                    flags: patched
+                        .base
+                        .as_ref()
+                        .map(|base| base.flags.clone())
+                        .unwrap_or_else(|| patched.flags.clone()),
+                    revision: item.revision.clone(),
+                    object: Some(hash),
+                });
+                patched.level = PimdirLevel::Full;
+                self.ops.push(PimdirWriteOp::UpsertPlacement(patched));
+                self.report.fetched += 1;
+                self.report.upgraded += 1;
+                continue;
+            }
 
             if self.tier == PimdirTier::Full && is_conflicted(&patched) {
                 let Some(body) = item.body else {
@@ -253,11 +297,17 @@ impl PimdirUpgrade {
                 }
                 // NOTE: a row holding a body stays full whichever tier
                 // answered last, else the next full upgrade refetches it.
-                _ => {
+                // A full fetch answering no body fetched nothing and raised
+                // nothing, whatever it refreshed (SYNC §6).
+                (tier, _) => {
                     patched.level = match patched.object {
                         Some(_) => PimdirLevel::Full,
                         None => PimdirLevel::Meta,
                     };
+                    if tier == PimdirTier::Full {
+                        self.ops.push(PimdirWriteOp::UpsertPlacement(patched));
+                        continue;
+                    }
                     self.report.fetched += 1;
                 }
             }
@@ -302,7 +352,12 @@ impl PimdirUpgrade {
     /// moved onto the fetched one with a base of what the fetch reported:
     /// the flags it reported, the revision, and the body at `Full` or else the
     /// create's own. The flags, body, summary and sort key staged on the
-    /// create stay, so an edit made on it still pushes (SYNC §6).
+    /// create stay, so an edit made on it still pushes (SYNC §6). A
+    /// mutable fetch carrying no body, or another body than the staged
+    /// one, is the both-changed case: the binding is conflicted at the
+    /// fetched revision, its base naming no body, the fetched body its
+    /// `conflict_object`, since nothing read what the server held or no
+    /// policy is known here to choose between the two.
     fn land(&mut self, create: PimdirPlacement, named: &PimdirPlacement, item: PimdirFetchedItem) {
         debug!(
             "land the pending create {} under {}",
@@ -318,6 +373,8 @@ impl PimdirUpgrade {
         let mut landed = create;
         landed.handle = item.handle;
         let mut base_object = landed.object.clone();
+        let mutable = item.revision.is_some() && landed.object.is_some();
+        let mut diverged = mutable;
 
         if let (PimdirTier::Full, Some(body)) = (self.tier, item.body) {
             let (object, bytes) = stored_body(body);
@@ -326,8 +383,14 @@ impl PimdirUpgrade {
                 object,
                 body: bytes,
             });
-            base_object = Some(hash.clone());
-            landed.object.get_or_insert(hash);
+            diverged = mutable && landed.object.as_ref() != Some(&hash);
+            match diverged {
+                true => landed.conflict_object = Some(hash),
+                false => {
+                    base_object = Some(hash.clone());
+                    landed.object.get_or_insert(hash);
+                }
+            }
         }
 
         if landed.summary.is_none() {
@@ -351,6 +414,13 @@ impl PimdirUpgrade {
             }
             _ => PimdirStatus::Dirty,
         };
+        if diverged {
+            if let Some(base) = &mut landed.base {
+                base.object = None;
+            }
+            landed.status = PimdirStatus::Conflict;
+            landed.conflict_revision = landed.base.as_ref().and_then(|b| b.revision.clone());
+        }
         landed.origin = None;
 
         self.ops.push(PimdirWriteOp::UpsertPlacement(landed));
@@ -388,7 +458,7 @@ impl PimdirCoroutine for PimdirUpgrade {
                 if pending.is_empty() {
                     debug!("nothing to upgrade");
                     self.state = State::Done;
-                    return PimdirCoroutineState::Complete(Ok(self.report));
+                    return PimdirCoroutineState::Complete(Ok(mem::take(&mut self.report)));
                 }
 
                 match self.tier {
@@ -526,13 +596,20 @@ impl PimdirCoroutine for PimdirUpgrade {
                 self.write_fetched()
             }
 
-            (State::Writing, Some(PimdirArg::Write)) => {
+            (State::Writing, Some(arg @ (PimdirArg::Write | PimdirArg::Written(_)))) => {
+                if let PimdirArg::Written(written) = arg {
+                    for (handle, link_id) in written.overruled {
+                        self.report
+                            .events
+                            .push(PimdirSyncEvent::Overruled { handle, link_id });
+                    }
+                }
                 debug!(
                     "upgraded {} items ({} fetched, {} linked from store)",
                     self.report.upgraded, self.report.fetched, self.report.deduped,
                 );
                 self.state = State::Done;
-                PimdirCoroutineState::Complete(Ok(self.report))
+                PimdirCoroutineState::Complete(Ok(mem::take(&mut self.report)))
             }
 
             (State::Done, _) | (_, Some(_)) => {
@@ -567,6 +644,12 @@ fn stored_body(body: PimdirFetchedBody) -> (PimdirObject, Option<Vec<u8>>) {
 /// remote alone has.
 fn is_conflicted(placement: &PimdirPlacement) -> bool {
     placement.status == PimdirStatus::Conflict
+}
+
+/// Whether the conflict is the item's (SYNC §3), two sources disagreeing
+/// on the body, which records no revision on the binding.
+fn is_item_conflict(placement: &PimdirPlacement) -> bool {
+    is_conflicted(placement) && placement.conflict_revision.is_none()
 }
 
 /// Whether the content is mutable, which a last-synced revision marks.
@@ -1081,6 +1164,90 @@ mod tests {
         );
     }
 
+    /// A mutable member fetched at `revision`, at `tier`, landing the
+    /// pending create of `m1` staged under `tmp-1` with body `h-c`.
+    fn land_mutable(tier: PimdirTier, body: Option<&str>) -> Vec<PimdirWriteOp> {
+        crate::testlog::init();
+        let mut up = PimdirUpgrade::new("cards", vec![PimdirHandle::from("7")], tier);
+        let _ = up.resume(None);
+        let _ = up.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: vec![row("7", None, PimdirLevel::Meta)],
+            ..Default::default()
+        })));
+
+        let item = PimdirFetchedItem {
+            sort_key: Default::default(),
+            handle: PimdirHandle::from("7"),
+            link_id: PimdirLinkId::from("m1"),
+            summary: Some(crate::summary::stub("hdr")),
+            body: body.map(|hash| PimdirFetchedBody::Inline {
+                hash: PimdirHash::from(hash),
+                bytes: hash.as_bytes().to_vec(),
+            }),
+            revision: Some(String::from("r1")),
+        };
+        match up.resume(Some(PimdirArg::Fetch(vec![item]))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
+                scope: PimdirLoadScope::Links(_),
+                ..
+            }) => (),
+            state => panic!("expected a link check, got {state:?}"),
+        }
+        match up.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: vec![pending_create("tmp-1", "m1", &[])],
+            ..Default::default()
+        }))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
+
+    /// A fetch carrying no body names a revision nobody has read: landing
+    /// the create there as agreed would let a push gated on it overwrite
+    /// an edit made before the fetch (SYNC §6). The binding is conflicted
+    /// at that revision, its base naming no body, for the upgrade to fetch.
+    #[test]
+    fn an_unread_fetch_landing_a_mutable_create_conflicts() {
+        let ops = land_mutable(PimdirTier::Meta, None);
+
+        let landed = upserted(&ops, "7").expect("the landed create");
+        assert_eq!(landed.status, PimdirStatus::Conflict);
+        assert_eq!(landed.conflict_revision.as_deref(), Some("r1"));
+        assert_eq!(landed.conflict_object, None);
+        assert_eq!(landed.object, Some(PimdirHash::from("h-c")), "kept");
+        let base = landed.base.as_ref().expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r1"));
+        assert_eq!(base.object, None, "the body at r1 is unknown");
+    }
+
+    /// A fetched body other than the staged one is the both-changed case,
+    /// recorded as the divergence's body, the upgrade knowing no source
+    /// policy (SYNC §6).
+    #[test]
+    fn a_fetched_body_other_than_the_create_conflicts() {
+        let ops = land_mutable(PimdirTier::Full, Some("h-r"));
+
+        let landed = upserted(&ops, "7").expect("the landed create");
+        assert_eq!(landed.status, PimdirStatus::Conflict);
+        assert_eq!(landed.conflict_revision.as_deref(), Some("r1"));
+        assert_eq!(landed.conflict_object, Some(PimdirHash::from("h-r")));
+        assert_eq!(landed.object, Some(PimdirHash::from("h-c")), "kept");
+        assert_eq!(landed.base.as_ref().and_then(|b| b.object.as_ref()), None);
+    }
+
+    /// The staged body fetched back is the add whose record was lost,
+    /// landed: agreed, clean.
+    #[test]
+    fn a_fetched_body_equal_to_the_create_lands_it_clean() {
+        let ops = land_mutable(PimdirTier::Full, Some("h-c"));
+
+        let landed = upserted(&ops, "7").expect("the landed create");
+        assert_eq!(landed.status, PimdirStatus::Clean);
+        assert_eq!(landed.conflict_revision, None);
+        let base = landed.base.as_ref().expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r1"));
+        assert_eq!(base.object, Some(PimdirHash::from("h-c")));
+    }
     /// A hint a based binding holds is a second copy, minted as before.
     #[test]
     fn a_hint_held_by_a_based_binding_is_still_minted() {

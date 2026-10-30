@@ -19,7 +19,7 @@ use alloc::{
 use rusqlite::types::Value;
 
 use crate::{
-    client::{schema, search::PimdirSearchSort},
+    client::search::PimdirSearchSort,
     search::query::{
         PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryDateUnit, PimdirQueryId,
         PimdirQueryKind, PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm,
@@ -63,21 +63,12 @@ pub(crate) struct Compiled {
     ends: Ends,
     /// The instant relative dates resolve against, Unix seconds.
     now: i64,
-    /// The `task_summary` columns the attached store lacks, read as `NULL`
-    /// (STORAGE §6).
-    missing: Vec<&'static str>,
 }
 
 impl Compiled {
     /// Compiles a query, `ends` holding the items each `linked:` term
-    /// names, its relative dates resolved against `now` (Unix seconds),
-    /// `missing` the `task_summary` columns the store lacks.
-    pub(crate) fn new(
-        query: &PimdirQuery,
-        ends: Ends,
-        missing: Vec<&'static str>,
-        now: i64,
-    ) -> Self {
+    /// names, its relative dates resolved against `now` (Unix seconds).
+    pub(crate) fn new(query: &PimdirQuery, ends: Ends, now: i64) -> Self {
         let undated: Vec<&str> = query
             .terms()
             .into_iter()
@@ -95,7 +86,6 @@ impl Compiled {
             words: Vec::new(),
             ends,
             now,
-            missing,
         };
         compiled.condition = compiled.node(query, false, &undated);
         compiled
@@ -104,7 +94,8 @@ impl Compiled {
     /// The hits in `sort` order (SEARCH §8.2), `limit` of them after
     /// `offset`, every one with `None`: account, seq, what they matched
     /// on, rank, sort key, whether undated, title. The `name` order folds
-    /// titles as SQL cannot, so its caller sorts the whole set itself.
+    /// titles as SQL cannot, so its caller sorts the whole set itself;
+    /// another order leaves the title empty, read for no hit.
     pub(crate) fn select(
         &mut self,
         sort: PimdirSearchSort,
@@ -124,6 +115,16 @@ impl Compiled {
         let placements = "FROM store.items i JOIN store.collections c ON c.id = i.collection \
             WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey \
             AND i.deleted = 0 AND i.retained_at IS NULL";
+        // NOTE: the title joins six summary tables per hit, before the order
+        // and the page cut: only the `name` order reads it.
+        let title = match sort {
+            PimdirSearchSort::Name => format!(
+                "(SELECT coalesce(ms.subject, cs.fn, es.summary, ts.summary, js.summary, fs.name, '') \
+                 {TITLES} WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0 \
+                 AND i.retained_at IS NULL ORDER BY i.collection LIMIT 1)"
+            ),
+            _ => String::from("''"),
+        };
 
         format!(
             "{}
@@ -133,12 +134,9 @@ SELECT h.account, h.seq,
   (SELECT min(m.rank) FROM matched m WHERE m.akey = h.akey AND m.seq = h.seq) AS rank,
   (SELECT max(i.sort_key) {placements}) AS sort_key,
   (SELECT max(c.kind IN ('text/vcard', 'application/octet-stream')) {placements}) AS undated,
-  (SELECT coalesce(ms.subject, cs.fn, es.summary, ts.summary, js.summary, fs.name, '') {titles}
-   WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0
-     AND i.retained_at IS NULL ORDER BY i.collection LIMIT 1) AS title
+  {title} AS title
 FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             self.with(),
-            titles = TITLES,
         )
     }
 
@@ -300,10 +298,16 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             PimdirQueryPredicate::HasBody => {
                 format!("SELECT i.collection, i.seq {live} AND i.object_hash IS NOT NULL")
             }
-            PimdirQueryPredicate::HasAttachment => format!(
-                "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.mail_summary m \
-                 WHERE m.collection = i.collection AND m.link_id = i.link_id AND m.attachment = 1)"
-            ),
+            PimdirQueryPredicate::HasAttachment => {
+                // NOTE: a calendar item by the mark its body's extraction
+                // recorded (SEARCH §6), the FTS rows keeping no text.
+                let attached = self.embed(search::ATTACHED, Vec::new());
+                format!(
+                    "SELECT i.collection, i.seq {live} AND (EXISTS (SELECT 1 FROM store.mail_summary m \
+                     WHERE m.collection = i.collection AND m.link_id = i.link_id AND m.attachment = 1) \
+                     OR (c.kind = 'text/calendar' AND (i.collection, i.seq) IN ({attached})))"
+                )
+            }
             PimdirQueryPredicate::Kind(kind) => match kind {
                 PimdirQueryKind::Event | PimdirQueryKind::Task | PimdirQueryKind::Journal => {
                     let table = match kind {
@@ -338,26 +342,20 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 };
                 // NOTE: a store whose owner predates the column reads it as
                 // NULL (STORAGE §6), every task then of no priority.
-                schema::nulled(
-                    &format!(
-                        "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                format!(
+                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
                          WHERE s.collection = i.collection AND s.link_id = i.link_id AND {band})"
-                    ),
-                    &self.missing,
                 )
             }
             PimdirQueryPredicate::Category(category) => {
                 // NOTE: both sides folded as STORAGE Annex A.2 folds `fn`,
                 // the stored side by the function the connection registers.
                 let category = self.bind(fold(category).into());
-                schema::nulled(
-                    &format!(
-                        "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                format!(
+                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
                          JOIN json_each(s.categories) j \
                          WHERE s.collection = i.collection AND s.link_id = i.link_id \
                          AND {FOLD}(j.value) = {category})"
-                    ),
-                    &self.missing,
                 )
             }
             PimdirQueryPredicate::Account(account) => {
@@ -365,10 +363,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             }
             PimdirQueryPredicate::Collection(collection) => {
                 let collection = self.bind(collection.clone().into());
-                format!(
-                    "SELECT i.collection, i.seq {live} \
-                     AND (i.collection = {collection} OR c.name = {collection})"
-                )
+                format!("SELECT i.collection, i.seq {live} AND i.collection = {collection}")
             }
             PimdirQueryPredicate::Date(range) => {
                 let (since, until) = bounds(range, self.now);
@@ -408,19 +403,24 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                      AND ({until} IS NULL OR i.changed <= {until})"
                 )
             }
-            PimdirQueryPredicate::Id(PimdirQueryId::Seq(seq)) => {
-                return format!("(seq = {})", self.bind((*seq).into()));
-            }
-            PimdirQueryPredicate::Id(PimdirQueryId::Link(link)) => {
-                let link = self.bind(link.clone().into());
-                format!("SELECT i.collection, i.seq {live} AND i.link_id = {link}")
+            PimdirQueryPredicate::Id(id) => {
+                // NOTE: a value of digits names the item of that seq and
+                // every item whose link id it is (SEARCH §8).
+                let link = self.bind(id.as_str().to_string().into());
+                let linked = member(&format!(
+                    "SELECT ifnull(c.account, ''), i.seq {live} AND i.link_id = {link}"
+                ));
+                return match id.seq() {
+                    Some(seq) => format!("((seq = {}) OR {linked})", self.bind(seq.into())),
+                    None => linked,
+                };
             }
         };
 
-        format!(
-            "((akey, seq) IN (SELECT ifnull(c.account, ''), x.seq FROM ({placements}) x \
-             JOIN store.collections c ON c.id = x.collection))"
-        )
+        member(&format!(
+            "SELECT ifnull(c.account, ''), x.seq FROM ({placements}) x \
+             JOIN store.collections c ON c.id = x.collection"
+        ))
     }
 
     /// The placements of `person:` (SEARCH §8): the contacts whose title
@@ -504,8 +504,20 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             self.words.push(text.text.clone());
         }
 
-        format!("((akey, seq) IN (SELECT akey, seq FROM t{at}))")
+        member(&format!("SELECT akey, seq FROM t{at}"))
     }
+}
+
+/// The condition that a hit of `live` is among `hits`, a statement
+/// answering `(akey, seq)` pairs, as 1 or 0 and never `NULL`.
+///
+/// A bare `(akey, seq) IN (...)` may be `NULL` as far as SQLite knows, so
+/// under `not`, where `NULL` and false part ways, it walks every row of the
+/// set for each hit it does not hold, to tell a partial `NULL` match from
+/// none: `is:unread`, no `\Seen`, took 24 s over 50,000 messages. Read as
+/// the test of a `CASE`, where `NULL` is false, it is one probe of the set.
+fn member(hits: &str) -> String {
+    format!("(CASE WHEN (akey, seq) IN ({hits}) THEN 1 ELSE 0 END)")
 }
 
 /// The titles a hit's placements carry, joined for the `name` order.

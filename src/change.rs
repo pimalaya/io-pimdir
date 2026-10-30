@@ -16,7 +16,7 @@
 //! Neither half may be dropped for the other. A create holding neither an
 //! origin nor a body cannot deliver and stays visibly pending.
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
 
 use crate::{
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
@@ -73,6 +73,9 @@ pub enum PimdirChangeKind {
         /// The provisional handle the member is staged under locally.
         handle: PimdirHandle,
         /// The item identity when resolved, telling a retried add it landed.
+        ///
+        /// The store's key: a connector naming it to its server strips its
+        /// one leading `esc:` ([`PimdirLinkId::stated`], STORAGE §9).
         link_id: Option<PimdirLinkId>,
         /// The flag set to create the member with.
         ///
@@ -108,17 +111,28 @@ pub enum PimdirChangeKind {
         ///
         /// A `to` already holding it was served by the move's other half,
         /// so the remove is a plain delete. `None` when the destination's
-        /// create is minted: `to` held the identity before the move.
+        /// create is minted: `to` held the identity before the move. The
+        /// store's key, read on a server as [`PimdirLinkId::stated`].
         link_id: Option<PimdirLinkId>,
         /// The last-synced revision as a precondition (a WebDAV If-Match).
         if_match: Option<String>,
     },
-    /// Replace a member's flag set.
+    /// Add and remove flags, leaving every other flag the member holds
+    /// (SYNC §4), so a flag the server changed after the listing survives.
+    ///
+    /// Derived from the flag merge against the set the source holds, the
+    /// one the run listed, else the base: `add` what the placement carries
+    /// and that set lacks, `remove` what that set carries and the
+    /// placement lacks. A connector applies both as deltas (an IMAP `STORE
+    /// +FLAGS` and `-FLAGS`, a JMAP keyword patch), never as a
+    /// replacement.
     SetFlags {
         /// The member to update.
         handle: PimdirHandle,
-        /// The new flag set.
-        flags: PimdirFlags,
+        /// The flags to add.
+        add: BTreeSet<String>,
+        /// The flags to remove.
+        remove: BTreeSet<String>,
     },
     /// Replace a member's content in place with a locally edited body.
     Update {
@@ -178,8 +192,8 @@ impl PimdirChangeKind {
                     .field(b"remove")
                     .option(to.as_ref().map(|to| to.as_str().as_bytes()));
             }
-            Self::SetFlags { flags, .. } => {
-                digest.field(b"set-flags").flags(flags);
+            Self::SetFlags { add, remove, .. } => {
+                digest.field(b"set-flags").set(add).set(remove);
             }
             Self::Update { object, .. } => {
                 digest.field(b"update").field(object.as_str().as_bytes());
@@ -235,10 +249,15 @@ impl PimdirChangeDigest {
     /// Folds a flag set in: `unknown`, or `known`, the count in decimal
     /// ASCII, then each flag in code point order (SYNC §4).
     fn flags(&mut self, flags: &PimdirFlags) -> &mut Self {
-        let Some(flags) = flags.known() else {
-            return self.field(b"unknown");
-        };
+        match flags.known() {
+            Some(flags) => self.set(flags),
+            None => self.field(b"unknown"),
+        }
+    }
 
+    /// Folds a known flag set in: `known`, the count in decimal ASCII,
+    /// then each flag in code point order (SYNC §4).
+    fn set(&mut self, flags: &BTreeSet<String>) -> &mut Self {
         let count = format!("{}", flags.len());
         self.field(b"known").field(count.as_bytes());
         for flag in flags {
@@ -361,6 +380,18 @@ pub enum PimdirWriteOp {
         /// The narrower scope.
         scope: PimdirScope,
     },
+    /// Keep the diverging bodies the next upsert of `handle` settles and
+    /// does not adopt, the binding's `conflict_object` then the item's,
+    /// each as a retained item reported overruled (SYNC §7, §9): what an
+    /// overruling [`Edit`](crate::mutate::PimdirMutation::Edit) stages
+    /// before its upsert. A conflict holding no diverging body yet refuses
+    /// the write.
+    Overrule {
+        /// The collection holding the placement.
+        collection: PimdirCollectionId,
+        /// The placement whose conflict the next upsert settles.
+        handle: PimdirHandle,
+    },
 }
 
 #[cfg(test)]
@@ -378,10 +409,11 @@ mod tests {
         PimdirChange::new(collection, kind).key
     }
 
-    fn set_flags(handle: &str, flags: &[&str]) -> PimdirChangeKind {
+    fn set_flags(handle: &str, add: &[&str], remove: &[&str]) -> PimdirChangeKind {
         PimdirChangeKind::SetFlags {
             handle: PimdirHandle::from(handle),
-            flags: PimdirFlags::from_iter(flags.iter().copied()),
+            add: add.iter().map(|flag| String::from(*flag)).collect(),
+            remove: remove.iter().map(|flag| String::from(*flag)).collect(),
         }
     }
 
@@ -398,8 +430,8 @@ mod tests {
         let inbox = PimdirCollectionId::from("inbox");
 
         assert_eq!(
-            key(&inbox, set_flags("1", &["seen"])),
-            key(&inbox, set_flags("1", &["seen"])),
+            key(&inbox, set_flags("1", &["seen"], &[])),
+            key(&inbox, set_flags("1", &["seen"], &[])),
         );
     }
 
@@ -409,12 +441,14 @@ mod tests {
         let archive = PimdirCollectionId::from("archive");
 
         let keys: Vec<PimdirChangeKey> = vec![
-            key(&inbox, set_flags("1", &["seen"])),
-            key(&archive, set_flags("1", &["seen"])),
-            key(&inbox, set_flags("2", &["seen"])),
-            key(&inbox, set_flags("1", &["flagged"])),
-            key(&inbox, set_flags("1", &["seen", "flagged"])),
-            key(&inbox, set_flags("1", &[])),
+            key(&inbox, set_flags("1", &["seen"], &[])),
+            key(&archive, set_flags("1", &["seen"], &[])),
+            key(&inbox, set_flags("2", &["seen"], &[])),
+            key(&inbox, set_flags("1", &["flagged"], &[])),
+            key(&inbox, set_flags("1", &[], &["seen"])),
+            key(&inbox, set_flags("1", &[], &[])),
+            key(&inbox, set_flags("1", &["seen"], &["flagged"])),
+            key(&inbox, set_flags("1", &["flagged"], &["seen"])),
             key(&inbox, update("1", "aaa", None)),
             key(&inbox, update("1", "bbb", None)),
             key(
@@ -494,8 +528,8 @@ mod tests {
         let inbox = PimdirCollectionId::from("INBOX");
 
         assert_eq!(
-            key(&inbox, set_flags("10", &["\\Flagged", "\\Seen"])),
-            PimdirChangeKey::from("33f66fc5223a52f4"),
+            key(&inbox, set_flags("10", &["\\Flagged"], &[])),
+            PimdirChangeKey::from("892471aec94fc225"),
         );
         assert_eq!(
             key(
@@ -530,16 +564,5 @@ mod tests {
 
         assert_eq!(key(&inbox, update("1", "aaa", Some("r1"))), keyed);
         assert_eq!(key(&inbox, update("1", "aaa", Some("r2"))), keyed);
-    }
-
-    #[test]
-    fn an_unknown_flag_set_does_not_key_as_an_empty_one() {
-        let inbox = PimdirCollectionId::from("inbox");
-        let unknown = PimdirChangeKind::SetFlags {
-            handle: PimdirHandle::from("1"),
-            flags: PimdirFlags::Unknown,
-        };
-
-        assert_ne!(key(&inbox, unknown), key(&inbox, set_flags("1", &[])));
     }
 }

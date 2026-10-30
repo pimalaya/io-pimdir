@@ -35,6 +35,13 @@ A mutable member whose listed revision differs from the one its old base held ch
 ### Requirement: A rebuild reads every page before its one batch
 A rekey SHALL list a round over the whole collection whatever the scope, every page read before its one batch is written, a rejected cursor relisting it from the start, and name each member from its meta, fetching nothing (pimdir SYNC §8): the old handles being void, it is the one listing whose absence covers every member. The batch lands the last checkpoint a page carried, none keeping the old one, and leaves the coverage as it was.
 
+A page neither `last` nor carrying a cursor SHALL complete the rekey with `PimdirArgError::UnresumablePage`, and a page that is not a round's (`complete` false) with `PimdirArgError::IncompleteListing`, writing nothing: the rebuild's absence covers every member, so only a whole round may answer it.
+
+#### Scenario: A delta answering a rekey
+- GIVEN an old spine of two placements
+- WHEN the rekey's round request is answered by a delta listing one member
+- THEN it completes with `IncompleteListing` and writes nothing (src/rekey.rs `a_delta_answering_a_rekey_is_refused`; a page neither last nor cursored, `a_page_neither_last_nor_cursored_is_refused`)
+
 ### Requirement: A rebuild's drops say the row is superseded
 Every drop a rebuild emits for a placement its own batch re-writes SHALL carry `PimdirDropReason::Rekeyed`, never `Deleted`. The item is not going anywhere: the same batch upserts it under its new handle, and a storage sharing one item across sources reads a `Deleted` drop as the item being gone and propagates a removal to sources nobody touched.
 
@@ -85,6 +92,9 @@ Where one hint had several old copies, a member SHALL be matched first to the ol
 - WHEN a rebuilt member resolves to that identity
 - THEN the member takes a minted key, the create keeping the one a push is about to land
 
+#### Scenario: Two copies at one revision
+- tests/engine/sync_audit.rs `a_rekey_matches_copies_of_one_hint_by_their_body` (failed before the change, which matched no body: the rebuild carried one copy onto the other's handle and the store refused it)
+
 ### Requirement: A rebuild is the only bump of the handle-space epoch
 The consumer SHALL commit the rebuild's write batch and the collection's epoch bump in one transaction (pimdir STORAGE §12: `collections.generation`), so a reader deriving an epoch-dependent protocol value from the store never sees a rebuilt spine under the old epoch. Ordinary syncs, full resyncs from an expired checkpoint and content changes SHALL NOT bump it.
 
@@ -97,3 +107,18 @@ Rebuilding a collection onto a new handle space SHALL carry each placement's key
 
 ### Requirement: The store bumps the generation on a rekeyed batch
 The engine emits no op for the epoch bump: a batch carrying a `Rekeyed` drop is a rebuild, and the store bumps the collection's generation in the transaction applying it (pimdir STORAGE §12, SYNC §8).
+
+### Requirement: A rekey missing most members parks
+A rekey whose listing leaves more than half of the source's based bindings in the collection with no member, those bindings numbering at least 20, SHALL write nothing (no drop, no upsert, the checkpoint and the generation unmoved) unless `PimdirRekey::accept_absences` is set (`PimdirSourceStore::rekey(collection, accept_absences, remote)`), and `PimdirRekeyReport::parked` carries the counts (pimdir SYNC §8, vectors/sync/89). The old checkpoint still names the old handle space, so the next run names the rekey again.
+
+### Requirement: A re-staged edit takes a provisional handle
+A rebuild re-staging an edited row no member carries (SYNC §8) SHALL key it under the provisional handle its link id derives, its binding moved there by a `Superseded` drop of the old handle, which is void and may be one the new space gives another member.
+
+#### Scenario: A renumbering that gave the edited member's handle away
+- tests/engine/sync_audit.rs `a_rekey_restages_an_uncarried_edit_under_a_provisional_handle` (failed before the change: the batch bound two items to one handle and the store refused it)
+
+### Requirement: Every old handle is dropped before any upsert
+A rebuild SHALL drop every old handle but one carried onto itself, every drop before every upsert (SYNC §8): a handle the new space reuses for another member is still dropped, `Rekeyed` when its member was carried elsewhere and `Deleted` when it resolved to none, and the mass-absence guard counts the latter.
+
+#### Scenario: A server renumbering from 1
+- tests/engine/sync_audit.rs `a_rekey_reusing_a_gone_members_handle_drops_it` (the store already retired the old binding), `a_rekey_counts_a_gone_member_whose_handle_is_reused_as_absent` (failed before the change: 24 of 25 absent counted)

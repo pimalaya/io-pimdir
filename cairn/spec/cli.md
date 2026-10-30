@@ -82,6 +82,13 @@ store, or another writer holds its write lock, the CLI SHALL report it as a
 plain sentence naming the likely cause (a running sync) and never as a raw SQL
 or debug error dump.
 
+The CLI's owner role SHALL open the store through `open_current`: the CLI is never the store's sync engine, so it SHALL NOT create, migrate or reconcile a store, and a store of another version or shape fails the verb with `NotCurrent`'s sentence, written nothing. A verb that enqueues then drains (`item restore`, `tag`) SHALL leave its action queued and report it `queued`, as when another process owns the store: the store's sync engine applies it once it has brought the store to its schema.
+
+#### Scenario: An older binary over a newer store
+- GIVEN a store whose schema text differs from the binary's
+- WHEN `pimdir queue cancel` or `pimdir gc` runs
+- THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`); `pimdir item restore` reports its action `queued` and exits 0 (`a_restore_over_a_store_of_another_revision_stays_queued`)
+
 ### Requirement: Destroying data is confirmed
 `item purge` and `queue cancel` SHALL confirm interactively before destroying
 anything, stating what will be destroyed (how many items, how many bytes)

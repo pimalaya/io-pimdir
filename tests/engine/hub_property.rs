@@ -269,11 +269,6 @@ struct Owed {
 }
 
 impl Owed {
-    /// Whether the source has seen the body the hub currently shares.
-    fn seen(&self, source: usize) -> bool {
-        self.agreed.get(&source) == Some(&self.body)
-    }
-
     /// Records that a live write of this source landed on the shared body.
     ///
     /// A tombstone adopts no content and moves no agreement point, so it
@@ -349,24 +344,50 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                     hash: hash(&body),
                     size: body.len(),
                 };
+                let synced = cluster.synced_object(source, &link);
                 let owed = ledger.entry(link.clone()).or_default();
-                let stages = cluster.synced_object(source, &link) != Some(object.hash.clone());
+                let stages = synced != Some(object.hash.clone());
+                // NOTE: the facts of SYNC §9 as the hub holds them before the
+                // edit: the body the item shares, and whether this source
+                // agreed with it, by its agreement point or, before it folded
+                // once, its sync base. A ledger kept from the ops alone loses
+                // the point where a binding folds while the item is
+                // conflicted, which moves no agreement point.
+                let (held, seen) = {
+                    let hub = cluster.hub();
+                    let sid = PimdirSourceId::from(format!("s{source}"));
+                    match hub.items.get(&link) {
+                        Some(item) => {
+                            let agreed = item.sources.get(&sid).and_then(|binding| {
+                                binding
+                                    .shared_object
+                                    .clone()
+                                    .or_else(|| binding.base.as_ref()?.object.clone())
+                            });
+                            (
+                                item.object.clone(),
+                                agreed.is_some() && agreed == item.object,
+                            )
+                        }
+                        None => (None, false),
+                    }
+                };
                 // NOTE: a divergence needs the content known to be mutable, a
                 // revision on some base saying so (SYNC §9); an item every
                 // source holds as a pending create shows none and fast-forwards
                 let observable = cluster.revised(&link);
                 let diverging = stages
                     && observable
-                    && !owed.seen(source)
-                    && owed.body.as_ref().is_some_and(|held| held != &object.hash);
+                    && !seen
+                    && held.as_ref().is_some_and(|held| held != &object.hash);
                 let first = owed.diverged;
                 let was_conflicted = conflicted(&cluster, &link);
-                let alone = owed.author.is_none_or(|author| author == source);
-                let held = owed.body.clone();
 
                 let staged = cluster.sources[source].mutate(
                     "inbox",
                     PimdirMutation::Edit {
+                        overrule: false,
+                        if_match: None,
                         handle,
                         object: object.clone(),
                         body,
@@ -395,14 +416,17 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                         held.clone(),
                         "and the body it diverged from is kept",
                     );
-                } else if !was_conflicted && alone {
+                } else if !was_conflicted && seen {
                     prop_assert!(
                         !conflicted(&cluster, &link),
                         "s{source} was read as diverging from itself on {link:?}",
                     );
                 }
 
-                let adopted = live(&cluster, &link);
+                // NOTE: an upsert leaving the item conflicted moves no
+                // agreement point, the conflict being settled against it
+                // (SYNC §9)
+                let adopted = live(&cluster, &link) && !conflicted(&cluster, &link);
                 let owed = ledger.entry(link).or_default();
                 owed.resolved = owed.diverged;
                 owed.diverged |= diverging;
@@ -428,7 +452,7 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 };
                 let staged = cluster.sources[source]
                     .mutate("inbox", PimdirMutation::SetFlags { handle, flags });
-                if staged.is_ok() && live(&cluster, &link) {
+                if staged.is_ok() && live(&cluster, &link) && !conflicted(&cluster, &link) {
                     ledger.entry(link).or_default().agree(source);
                 }
             }
@@ -529,7 +553,9 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 let _ = cluster.sources[source].rekey("inbox");
 
                 for link in carried {
-                    ledger.entry(link).or_default().agree(source);
+                    if !conflicted(&cluster, &link) {
+                        ledger.entry(link).or_default().agree(source);
+                    }
                 }
             }
             HubOp::Sync(s) => {
@@ -551,7 +577,9 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                     .links()
                     .into_iter()
                     .filter(|link| {
-                        live(&cluster, link) && !(waiting.contains(link) && pending(&cluster, link))
+                        live(&cluster, link)
+                            && !conflicted(&cluster, link)
+                            && !(waiting.contains(link) && pending(&cluster, link))
                     })
                     .collect();
                 for link in live {

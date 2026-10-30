@@ -7,24 +7,28 @@
 use core::slice;
 
 use alloc::{
+    collections::BTreeSet,
     format,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 
-use std::{path::Path, sync::Arc};
-
-use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, named_params,
+use std::{
+    cell::RefCell,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
+
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params};
 
 use crate::{
     capability::{COLLECTION_CREATE, PimdirPartial, PimdirSourceCapabilities},
     change::PimdirWriteOp,
     client::{
-        PimdirError, PimdirSourceStore,
-        blobs::PimdirBlobs,
+        PimdirDuplicate, PimdirError, PimdirSourceStore,
+        blobs::{PimdirBlobStage, PimdirBlobWriter, PimdirBlobs},
         busy_or_sql, capability,
         lock::PimdirLock,
         reader::{PimdirItem, item_from_row},
@@ -40,7 +44,8 @@ use crate::{
     mutate::{PimdirMutate, PimdirMutation},
     object::{PimdirHash, PimdirObject},
     placement::{
-        PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey, PimdirStatus,
+        PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey,
+        PimdirStatus,
     },
     sql, summary,
 };
@@ -49,14 +54,52 @@ use crate::{
 ///
 /// A process that originates mutations without owning the store, whose
 /// sole write is the enqueue. It holds the staging lock shared for its
-/// lifetime, so a body it writes before enqueueing is never swept in
-/// between.
+/// staging window alone (§8): from the first body it stages until a row
+/// pins every body it staged, so a body is never swept before its row,
+/// and an idle producer, an always-open frontend, keeps no collector out.
+///
+/// ```no_run
+/// use io_pimdir::{
+///     client::{PimdirError, producer::PimdirProducer},
+///     placement::{PimdirFlags, PimdirLinkId},
+/// };
+///
+/// # fn main() -> Result<(), PimdirError> {
+/// let card = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a\r\nFN:A\r\nEND:VCARD\r\n";
+///
+/// let mut producer = PimdirProducer::open("store", "app")?.for_account("me");
+/// let object = producer.stage_body(card)?;
+/// let link_id = PimdirLinkId("a".into());
+/// let flags = PimdirFlags::default();
+/// let object = Some(&object);
+///
+/// match producer.enqueue_add("contacts", &link_id, flags, object, None) {
+///     Ok(row) => println!("queued as action {row}"),
+///     Err(err) => println!("{}: {err}", err.code()),
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct PimdirProducer {
     conn: Connection,
-    _lock: PimdirLock,
     blobs: PimdirBlobs,
+    dir: PathBuf,
+    /// The staging window: the lock while a staged body waits for its row.
+    staging: RefCell<PimdirStaging>,
     producer: String,
     account: Option<String>,
+}
+
+/// A producer's staging window (§8).
+#[derive(Default)]
+struct PimdirStaging {
+    /// The staging lock, held shared while the window is open.
+    lock: Option<Arc<PimdirLock>>,
+    /// The bodies staged whole that no enqueue of this producer pinned yet.
+    unpinned: BTreeSet<PimdirHash>,
+    /// Whether a streamed body was staged: its hash is the writer's to
+    /// know, so the window stays open until the producer drops.
+    streamed: bool,
 }
 
 impl PimdirProducer {
@@ -73,19 +116,72 @@ impl PimdirProducer {
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
-        )?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+        // NOTE: the journal mode is the owner's, chosen when it created the
+        // store (§8): a producer writes no database header.
         schema::check_version(&conn)?;
         let hash = schema::hash_algo(&conn, None)?;
 
         Ok(Self {
             conn,
-            _lock: PimdirLock::stage(dir)?,
             blobs: PimdirBlobs::open(dir, hash),
+            dir: dir.to_path_buf(),
+            staging: RefCell::default(),
             producer: producer.into(),
             account: None,
         })
+    }
+
+    /// The staging lock, taken shared when the window opens: a collector
+    /// running is waited out, its work being bounded.
+    fn hold(&self) -> Result<Arc<PimdirLock>, PimdirError> {
+        let mut staging = self.staging.borrow_mut();
+        if let Some(lock) = &staging.lock {
+            return Ok(Arc::clone(lock));
+        }
+        let lock = Arc::new(PimdirLock::stage(&self.dir)?);
+        staging.lock = Some(Arc::clone(&lock));
+        Ok(lock)
+    }
+
+    /// Notes that a row pinned `hash`, closing the window once every body
+    /// staged whole is pinned and none was streamed.
+    fn pinned(&self, hash: Option<&PimdirHash>) {
+        let mut staging = self.staging.borrow_mut();
+        if let Some(hash) = hash {
+            staging.unpinned.remove(hash);
+        }
+        if staging.unpinned.is_empty() && !staging.streamed {
+            staging.lock = None;
+        }
+    }
+
+    /// The write side of the blob directory, holding the staging lock.
+    fn stage(&self) -> Result<PimdirBlobStage, PimdirError> {
+        Ok(PimdirBlobStage::new(self.blobs.clone(), self.hold()?))
+    }
+
+    /// Proves the store writable by this producer without writing anything
+    /// into it, for an app's `check`: takes the staging lock shared and
+    /// releases it, then takes the database's write lock and rolls it back
+    /// (STORAGE §8). Since a producer takes the staging lock at its first
+    /// staged body only, this is what tells a store whose lock is out of
+    /// reach before the first write rather than at it.
+    ///
+    /// A collector holding the staging lock is [`PimdirError::Busy`],
+    /// answered at once rather than waited out; a database it cannot write
+    /// is the error SQLite answers ([`PimdirError::Sql`], or
+    /// [`PimdirError::Busy`] past the busy timeout). A producer whose
+    /// staging window is open holds the lock already and probes the
+    /// database alone. Nothing enters objects/ and no row is written.
+    pub fn probe(&self) -> Result<(), PimdirError> {
+        if self.staging.borrow().lock.is_none() {
+            drop(PimdirLock::try_stage(&self.dir)?);
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .map_err(busy_or_sql)?;
+        Ok(())
     }
 
     /// The hash this store names its objects by (§5).
@@ -98,14 +194,40 @@ impl PimdirProducer {
         self.blobs.hash(bytes)
     }
 
-    /// An incremental hasher for a body streamed into the blob store.
+    /// An incremental hasher under this store's algorithm.
     pub fn hasher(&self) -> PimdirHasher {
         self.blobs.hasher()
     }
 
-    /// The blob directory, where a body is written before its enqueue.
+    /// The blob directory, read-only: a body enters it through
+    /// [`stage_body`](Self::stage_body) or [`blob_writer`](Self::blob_writer).
     pub fn blobs(&self) -> PimdirBlobs {
         self.blobs.clone()
+    }
+
+    /// Hashes a body under the store's algorithm and writes it to the
+    /// blob tree inside this producer's staging window (§8), answering
+    /// the object [`enqueue`](Self::enqueue) takes. A collector cannot
+    /// run until a row of this producer pins the body, or this handle
+    /// drops, so the body reaches the row that pins it.
+    pub fn stage_body(&self, bytes: &[u8]) -> Result<PimdirObject, PimdirError> {
+        let object = self.stage()?.stage_body(bytes)?;
+        self.staging
+            .borrow_mut()
+            .unpinned
+            .insert(object.hash.clone());
+        Ok(object)
+    }
+
+    /// A streaming writer for a body too large to hold whole, as
+    /// [`stage_body`](Self::stage_body): it holds the staging lock until it
+    /// commits, and its commit answers the object. The window it opens
+    /// stays open until this producer drops, the body's hash being the
+    /// writer's to know.
+    pub fn blob_writer(&self) -> Result<PimdirBlobWriter, PimdirError> {
+        let writer = self.stage()?.writer()?;
+        self.staging.borrow_mut().streamed = true;
+        Ok(writer)
     }
 
     /// Binds this producer to an account (§9.2).
@@ -116,10 +238,10 @@ impl PimdirProducer {
 
     /// Appends one action to a collection's queue (§15.1), returning the
     /// row's id: `ensure_collection`, at most one object upsert for the
-    /// body the caller wrote through [`blobs`](Self::blobs) and passes as
-    /// `object`, hash and size together, the pin of the hash the action
-    /// names, and the insert. SQLite stamps `created_at`. A body the store
-    /// already indexes may be passed again or left out.
+    /// body the caller staged through [`stage_body`](Self::stage_body) and
+    /// passes as `object`, hash and size together, the pin of the hash the
+    /// action names, and the insert. SQLite stamps `created_at`. A body the
+    /// store already indexes may be passed again or left out.
     ///
     /// The action passes the gate of §15.6 first: one a declared source
     /// does not support is [`PimdirError::Unsupported`] and nothing is
@@ -132,13 +254,137 @@ impl PimdirProducer {
         action: &PimdirAction,
         object: Option<&PimdirObject>,
     ) -> Result<i64, PimdirError> {
-        capability::gate(&self.conn, &self.blobs, collection, action)?;
+        Ok(self.append(collection, action, object, None, None)?.id)
+    }
+
+    /// Appends an `add` creating an item under `link_id` (§15.1, §15.3),
+    /// returning the row's id, as [`enqueue`](Self::enqueue) does with
+    /// the body [`stage_body`](Self::stage_body) answered as `object`.
+    ///
+    /// Refuses, appending nothing, a link id the drain would park: one a
+    /// live item of the collection holds (`live_item_for_link`) and no
+    /// pending `remove` or `move` withdraws, or one a pending `add` there
+    /// names, as [`PimdirError::Duplicate`]. The check and the append are
+    /// one transaction, so two producers never both pass it.
+    pub fn enqueue_add(
+        &mut self,
+        collection: &str,
+        link_id: &PimdirLinkId,
+        flags: PimdirFlags,
+        object: Option<&PimdirObject>,
+        supersedes: Option<PimdirSupersedes>,
+    ) -> Result<i64, PimdirError> {
+        let action = PimdirAction::Add {
+            link_id: Some(link_id.clone()),
+            flags,
+            object: object.map(|object| object.hash.clone()),
+            supersedes,
+        };
+        Ok(self
+            .append(collection, &action, object, None, Some(link_id))?
+            .id)
+    }
+
+    /// Stages `body` and appends the action `action` builds from its hash
+    /// as one step (§15.1), answering the row's id: the gate of §15.6 and,
+    /// for an `add`, the duplicate check of
+    /// [`enqueue_add`](Self::enqueue_add) run on the bytes in hand before
+    /// anything reaches the blob tree, so a refused write leaves no body
+    /// behind. An `add` naming no link id is checked under the key the
+    /// owner derives from the body (Annex A). The duplicate check, the
+    /// blob write and the append are one transaction.
+    ///
+    /// The calls staging first ([`stage_body`](Self::stage_body), then
+    /// [`enqueue`](Self::enqueue) or [`enqueue_add`](Self::enqueue_add))
+    /// leave a refused write's body unpinned in the tree, for the collector.
+    ///
+    /// [`enqueue_with_body_checked`](Self::enqueue_with_body_checked) is
+    /// the same step answering the partial supports the gate passed the
+    /// action with as well.
+    pub fn enqueue_with_body(
+        &mut self,
+        collection: &str,
+        body: &[u8],
+        action: impl FnOnce(PimdirHash) -> PimdirAction,
+    ) -> Result<i64, PimdirError> {
+        Ok(self.enqueue_with_body_checked(collection, body, action)?.id)
+    }
+
+    /// [`enqueue_with_body`](Self::enqueue_with_body), answering the row's
+    /// id and the partial supports the action passed the gate of §15.6
+    /// with, read with the body in hand: what [`check`](Self::check) would
+    /// answer, for the frontend to show, without running the gate again.
+    pub fn enqueue_with_body_checked(
+        &mut self,
+        collection: &str,
+        body: &[u8],
+        action: impl FnOnce(PimdirHash) -> PimdirAction,
+    ) -> Result<PimdirEnqueued, PimdirError> {
+        let object = PimdirObject {
+            hash: self.hash(body),
+            size: body.len(),
+        };
+        let action = action(object.hash.clone());
+        let fresh = match &action {
+            PimdirAction::Add {
+                link_id: Some(link_id),
+                ..
+            } => Some(link_id.clone()),
+            PimdirAction::Add { link_id: None, .. } => {
+                let kind = write::kind_of(&self.conn, collection)?;
+                summary::derive(&kind, body).map(|derived| derived.link_id)
+            }
+            _ => None,
+        };
+        self.append(
+            collection,
+            &action,
+            Some(&object),
+            Some(body),
+            fresh.as_ref(),
+        )
+    }
+
+    /// The enqueue transaction, refusing an add whose `fresh` link id is
+    /// taken first when one is given; `body`, the bytes of `object` when
+    /// the caller has not staged them, is gated in hand and written once
+    /// every check passed. Answers the row's id and the partial supports
+    /// the gate passed the action with.
+    fn append(
+        &mut self,
+        collection: &str,
+        action: &PimdirAction,
+        object: Option<&PimdirObject>,
+        body: Option<&[u8]>,
+        fresh: Option<&PimdirLinkId>,
+    ) -> Result<PimdirEnqueued, PimdirError> {
+        let partial = capability::gate(&self.conn, &self.blobs, collection, action, body)?;
         let hash = action.object_hash().cloned();
+        // NOTE: before the transaction, so waiting out a collector never
+        // holds the write lock it needs.
+        let _window = match body {
+            Some(_) => Some(self.hold()?),
+            None => None,
+        };
 
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
+        if let Some(link_id) = fresh
+            && let Some(existing) = duplicate(&tx, collection, link_id)?
+        {
+            return Err(PimdirError::Duplicate {
+                collection: collection.to_string(),
+                link_id: link_id.0.clone(),
+                existing,
+            });
+        }
+        // NOTE: inside the transaction, so a duplicate refused above stages
+        // nothing, and under this producer's staging lock (§8).
+        if let (Some(object), Some(body)) = (object, body) {
+            self.blobs.write(&object.hash, body)?;
+        }
         tx.execute(
             sql::ENSURE_COLLECTION,
             named_params! { ":collection": collection, ":account": self.account.as_deref() },
@@ -164,7 +410,8 @@ impl PimdirProducer {
         )?;
         let id = tx.last_insert_rowid();
         tx.commit().map_err(busy_or_sql)?;
-        Ok(id)
+        self.pinned(hash.as_ref());
+        Ok(PimdirEnqueued { id, partial })
     }
 
     /// Runs an action through the gate of §15.6 without enqueueing it,
@@ -174,7 +421,7 @@ impl PimdirProducer {
         collection: &str,
         action: &PimdirAction,
     ) -> Result<Vec<PimdirPartial>, PimdirError> {
-        capability::gate(&self.conn, &self.blobs, collection, action)
+        capability::gate(&self.conn, &self.blobs, collection, action, None)
     }
 
     /// Resolves who performs an intent capability anchored on `collection`
@@ -241,6 +488,16 @@ impl PimdirProducer {
     }
 }
 
+/// What [`PimdirProducer::enqueue_with_body_checked`] queued.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirEnqueued {
+    /// The row's id, which [`PimdirProducer::action_status`] follows.
+    pub id: i64,
+    /// The partial supports the action passed the gate with (§15.6), each
+    /// worth showing: the action is queued whatever they say.
+    pub partial: Vec<PimdirPartial>,
+}
+
 /// Where one queue row stands (§15.4), read by the id its enqueue
 /// answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -284,14 +541,18 @@ pub enum PimdirActionStatus {
 /// Reads where the row `id` stands: `load_action`, then `load_receipt`.
 pub(crate) fn action_status(conn: &Connection, id: i64) -> Result<PimdirActionStatus, PimdirError> {
     let queued = conn
-        .query_row(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
-            Ok((
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, Option<String>>(7)?,
-            ))
-        })
+        .query_row(
+            &schema::as_reconciled(conn, "main", sql::LOAD_ACTION)?,
+            named_params! { ":id": id },
+            |r| {
+                Ok((
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
         .optional()?;
     if let Some((collection, kind, attempts, error)) = queued {
         return Ok(match error {
@@ -309,18 +570,20 @@ pub(crate) fn action_status(conn: &Connection, id: i64) -> Result<PimdirActionSt
         });
     }
 
-    // NOTE: a store whose owner predates receipts keeps none.
-    if !schema::has_table(conn, "receipts")? {
-        return Ok(PimdirActionStatus::Unknown);
-    }
+    // NOTE: a store whose owner predates receipts keeps none, its table
+    // read as empty (§6).
     let receipt = conn
-        .query_row(sql::LOAD_RECEIPT, named_params! { ":id": id }, |r| {
-            Ok(PimdirActionStatus::Applied {
-                applied_at: r.get(0)?,
-                collection: r.get(1)?,
-                seq: r.get(2)?,
-            })
-        })
+        .query_row(
+            &schema::as_reconciled(conn, "main", sql::LOAD_RECEIPT)?,
+            named_params! { ":id": id },
+            |r| {
+                Ok(PimdirActionStatus::Applied {
+                    applied_at: r.get(0)?,
+                    collection: r.get(1)?,
+                    seq: r.get(2)?,
+                })
+            },
+        )
         .optional()?;
     Ok(receipt.unwrap_or(PimdirActionStatus::Unknown))
 }
@@ -367,7 +630,7 @@ pub struct PimdirParkedAction {
 }
 
 /// What a drain pass did.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirDrainReport {
     /// Actions applied and deleted from the queue.
     pub applied: usize,
@@ -377,6 +640,21 @@ pub struct PimdirDrainReport {
     pub skipped: usize,
     /// Actions the environment failed, left pending for the next pass.
     pub retried: usize,
+    /// The bodies a collection's conflict policy did not adopt while an
+    /// applied action was written (SYNC §9), each kept as a retained item
+    /// beside the one it lost to: nothing else reports them.
+    pub overruled: Vec<PimdirDrainOverruled>,
+}
+
+/// A body kept aside while the drain applied a row (SYNC §9).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirDrainOverruled {
+    /// The applied row.
+    pub id: i64,
+    /// The collection holding the retained item.
+    pub collection: String,
+    /// The retained item's key, minted for the body kept.
+    pub link_id: PimdirLinkId,
 }
 
 /// Reads pending rows, a collection's or every collection's, decoding
@@ -438,7 +716,7 @@ fn pending_rows(
     match collection {
         Some(collection) => Ok(rows(
             conn,
-            sql::LOAD_PENDING_ACTIONS,
+            &schema::as_reconciled(conn, "main", sql::LOAD_PENDING_ACTIONS)?,
             named_params! { ":collection": collection },
             |r| {
                 Ok(PimdirQueueRow {
@@ -453,19 +731,65 @@ fn pending_rows(
                 })
             },
         )?),
-        None => Ok(rows(conn, sql::LIST_PENDING_ACTIONS, [], |r| {
-            Ok(PimdirQueueRow {
-                id: r.get(0)?,
-                created_at: r.get(1)?,
-                producer: r.get(2)?,
-                collection: r.get(3)?,
-                action: r.get(4)?,
-                payload: r.get(5)?,
-                object_hash: r.get(6)?,
-                attempts: r.get(7)?,
-            })
-        })?),
+        None => Ok(rows(
+            conn,
+            &schema::as_reconciled(conn, "main", sql::LIST_PENDING_ACTIONS)?,
+            [],
+            |r| {
+                Ok(PimdirQueueRow {
+                    id: r.get(0)?,
+                    created_at: r.get(1)?,
+                    producer: r.get(2)?,
+                    collection: r.get(3)?,
+                    action: r.get(4)?,
+                    payload: r.get(5)?,
+                    object_hash: r.get(6)?,
+                    attempts: r.get(7)?,
+                })
+            },
+        )?),
     }
+}
+
+/// What already holds `link_id` in `collection` for a new `add` (§15.3):
+/// a pending `add` naming it, else a live item no pending `remove` or
+/// `move` withdraws. A pending row whose payload does not decode is left
+/// out, the drain being what parks it.
+fn duplicate(
+    conn: &Connection,
+    collection: &str,
+    link_id: &PimdirLinkId,
+) -> Result<Option<PimdirDuplicate>, PimdirError> {
+    let pending: Vec<PimdirPendingAction> = pending_rows(conn, Some(collection))?
+        .iter()
+        .filter_map(|row| row.decode().ok())
+        .collect();
+
+    let queued = pending.iter().find(|queued| {
+        matches!(&queued.action, PimdirAction::Add { link_id: Some(l), .. } if l == link_id)
+    });
+    if let Some(queued) = queued {
+        return Ok(Some(PimdirDuplicate::Pending(queued.id)));
+    }
+
+    let live = conn
+        .query_row(
+            &schema::as_reconciled(conn, "main", sql::LIVE_ITEM_FOR_LINK)?,
+            named_params! { ":collection": collection, ":link_id": link_id.0 },
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(seq) = live else {
+        return Ok(None);
+    };
+
+    let withdrawn = pending.iter().any(|queued| {
+        matches!(
+            queued.action,
+            PimdirAction::Remove { seq: s } | PimdirAction::Move { seq: s, .. } if s == seq
+        )
+    });
+    Ok((!withdrawn).then_some(PimdirDuplicate::Live(seq)))
 }
 
 /// What a drain did with one row (§15.2).
@@ -476,6 +800,9 @@ enum PimdirOutcome {
     Parked(String),
     /// Not this owner's, or not this transaction's: the row is left as found.
     Skipped,
+    /// It names an item no source binds, under this key: the store's alone
+    /// to settle, nothing having a change to push.
+    Unbound(PimdirLinkId),
 }
 
 /// The owner's drain (§15.2).
@@ -507,6 +834,13 @@ impl PimdirSourceStore {
         for row in pending {
             let action = match codec::action_from_payload(&row.action, &row.payload) {
                 Ok(action) => action,
+                // NOTE: a version this owner does not know is a later
+                // producer's, skipped as an unknown kind is (§15.2); one
+                // missing is a malformed payload, parked.
+                Err(PimdirActionError::UnknownVersion(Some(_))) => {
+                    report.skipped += 1;
+                    continue;
+                }
                 Err(err) => {
                     self.fail_action(row.id, Some(&err.to_string()))?;
                     report.parked += 1;
@@ -520,9 +854,12 @@ impl PimdirSourceStore {
             // NOTE: a failed apply rolled its transaction back on the way
             // out, restoring the claimed row; the park or the bump runs in
             // a transaction of its own (§15.2).
-            match self.apply_queued(&row, &action) {
+            match self.apply_queued(&row, &action, &mut report.overruled) {
                 Ok(PimdirOutcome::Applied) => report.applied += 1,
                 Ok(PimdirOutcome::Skipped) => report.skipped += 1,
+                Ok(PimdirOutcome::Unbound(_)) => {
+                    unreachable!("an unbound action is applied or parked")
+                }
                 Ok(PimdirOutcome::Parked(reason)) => {
                     self.fail_action(row.id, Some(&reason))?;
                     report.parked += 1;
@@ -559,11 +896,13 @@ impl PimdirSourceStore {
     /// Applies one action and deletes its row in one transaction, the
     /// claim first (§15.2): a claim that deletes nothing is a row another
     /// handle applied or a cancellation removed, and is skipped. The same
-    /// transaction records the row's receipt (§15.4).
+    /// transaction records the row's receipt (§15.4). A body a conflict
+    /// policy kept aside is added to `overruled` once the row committed.
     fn apply_queued(
         &mut self,
         row: &PimdirQueueRow,
         action: &PimdirAction,
+        overruled: &mut Vec<PimdirDrainOverruled>,
     ) -> Result<PimdirOutcome, PimdirError> {
         let collection = row.collection.as_str();
         let blobs = self.store.reader.blobs();
@@ -598,7 +937,7 @@ impl PimdirSourceStore {
 
         // NOTE: the owner's backstop (§15.6): what a producer should have
         // refused is parked here rather than pushed and rejected later.
-        match capability::gate(&tx, &blobs, collection, action) {
+        match capability::gate(&tx, &blobs, collection, action, None) {
             Err(PimdirError::Unsupported(refusal)) => {
                 return Ok(PimdirOutcome::Parked(refusal.to_string()));
             }
@@ -608,6 +947,23 @@ impl PimdirSourceStore {
         let acting = acting_source(&tx, &self.source, collection)?;
         let (source, ops) = match stage_action(&tx, &blobs, &acting, collection, action)? {
             Ok(staged) => staged,
+            Err(PimdirOutcome::Unbound(link)) => {
+                let kind = write::kind_of(&tx, collection)?;
+                if let Err(outcome) =
+                    apply_unbound(&tx, &blobs, &acting, collection, &kind, &link, action)?
+                {
+                    return Ok(outcome);
+                }
+                if let Some(hash) = &row.object_hash {
+                    tx.execute(
+                        sql::ADJUST_REFCOUNT,
+                        named_params! { ":delta": -1, ":hash": hash },
+                    )?;
+                }
+                record_receipt(&tx, row.id, &row.collection, None)?;
+                tx.commit().map_err(busy_or_sql)?;
+                return Ok(PimdirOutcome::Applied);
+            }
             Err(outcome) => return Ok(outcome),
         };
         // NOTE: an add's item is the one its staged key names once the
@@ -619,7 +975,7 @@ impl PimdirSourceStore {
             }),
             _ => None,
         };
-        write::apply(&tx, &blobs, &source, self.store.account.as_deref(), ops)?;
+        let written = write::apply(&tx, &blobs, &source, self.store.account.as_deref(), ops)?;
         // NOTE: the item an add supersedes is tombstoned in the transaction
         // applying it, after its duplicate check parked nothing (§15.3).
         if let (
@@ -654,6 +1010,16 @@ impl PimdirSourceStore {
         };
         record_receipt(&tx, row.id, &row.collection, seq)?;
         tx.commit().map_err(busy_or_sql)?;
+        overruled.extend(
+            written
+                .overruled
+                .into_iter()
+                .map(|(_, link_id)| PimdirDrainOverruled {
+                    id: row.id,
+                    collection: row.collection.clone(),
+                    link_id,
+                }),
+        );
         Ok(PimdirOutcome::Applied)
     }
 }
@@ -693,8 +1059,10 @@ fn supersede(
         seq: superseded.seq,
     };
     match stage_action(tx, blobs, &acting, collection, &remove)? {
-        Ok((source, ops)) => write::apply(tx, blobs, &source, account, ops)?,
-        Err(PimdirOutcome::Skipped) => {
+        Ok((source, ops)) => {
+            write::apply(tx, blobs, &source, account, ops)?;
+        }
+        Err(PimdirOutcome::Skipped | PimdirOutcome::Unbound(_)) => {
             tx.execute(
                 sql::RETAIN_ITEM,
                 named_params! {
@@ -724,11 +1092,29 @@ fn supersede(
 fn retryable(err: &PimdirError) -> bool {
     match err {
         PimdirError::Busy | PimdirError::Io(_) => true,
-        PimdirError::Sql(rusqlite::Error::SqliteFailure(failure, _)) => matches!(
-            failure.code,
-            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
-        ),
+        PimdirError::Sql(err) => err.is_busy(),
         _ => false,
+    }
+}
+
+/// The body a queued `add` or `update` names, read for its derivation. A
+/// body the blob store lacks is a failure of the environment (§15.2): an
+/// I/O error the drain retries then parks, never an action applied over a
+/// body the store does not hold.
+///
+/// A file whose bytes do not hash to its name is the same state (§7): the
+/// owner unlinks it under the staging lock, so the next write of that body
+/// writes it anew.
+fn queued_body(blobs: &PimdirBlobs, hash: &PimdirHash) -> Result<Vec<u8>, PimdirError> {
+    match blobs.get(hash)? {
+        Some(body) => Ok(body),
+        None => Err(PimdirError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            match blobs.discard_unverified(hash)? {
+                true => format!("queued body {} failed its hash and was unlinked", hash.0),
+                false => format!("queued body {} is missing from the blob store", hash.0),
+            },
+        ))),
     }
 }
 
@@ -794,9 +1180,7 @@ fn stage_action(
     } = action
     {
         let derivation = match object {
-            Some(hash) => blobs
-                .get(hash)?
-                .and_then(|body| summary::derive(&kind, &body)),
+            Some(hash) => summary::derive(&kind, &queued_body(blobs, hash)?),
             None => None,
         };
         let link = link_id
@@ -872,6 +1256,24 @@ fn stage_action(
         };
     };
 
+    // NOTE: another write replaced the body this edit was made over since
+    // its producer read it; applying it would drop that write (§15.3).
+    if let PimdirAction::Update {
+        if_match: Some(read),
+        ..
+    } = action
+        && item.object.as_ref() != Some(read)
+    {
+        let held = item
+            .object
+            .as_ref()
+            .map_or("no body", |hash| hash.0.as_str());
+        return Ok(Err(PimdirOutcome::Parked(format!(
+            "body replaced since it was read: the edit was made over {}, the item holds {held}",
+            read.0
+        ))));
+    }
+
     let handle = tx
         .query_row(
             sql::HANDLE_FOR_LINK,
@@ -897,7 +1299,7 @@ fn stage_action(
                 )
                 .optional()?;
             let Some((source, handle)) = bound else {
-                return Ok(Err(PimdirOutcome::Skipped));
+                return unbound(tx, collection, seq, &item.link_id, action);
             };
             (PimdirSourceId(source), PimdirHandle(handle))
         }
@@ -918,15 +1320,16 @@ fn stage_action(
             handle,
             target: to.clone(),
         },
-        PimdirAction::Update { object, .. } => {
-            let derivation = blobs
-                .get(object)?
-                .and_then(|body| summary::derive(&kind, &body));
+        PimdirAction::Update {
+            object, if_match, ..
+        } => {
+            let derivation = summary::derive(&kind, &queued_body(blobs, object)?);
             let (summary, sort_key) = match derivation {
                 Some(derivation) => (derivation.summary, Some(derivation.sort_key)),
                 None => (None, None::<PimdirSortKey>),
             };
             PimdirMutation::Edit {
+                overrule: false,
                 handle,
                 // NOTE: the body already sits in the blob store, indexed
                 // and pinned at enqueue; the op is stripped below.
@@ -937,6 +1340,7 @@ fn stage_action(
                 body: Vec::new(),
                 summary,
                 sort_key,
+                if_match: if_match.clone(),
             }
         }
         PimdirAction::Add { .. } => unreachable!("add staged above"),
@@ -981,4 +1385,89 @@ fn stage_action(
             "unexpected mutate state: {state:?}"
         )))),
     }
+}
+
+/// What a drain does with an action on an item no source binds (§15.2,
+/// §15.3): the store's alone to settle, never skipped, which would leave
+/// the row pending forever. A `remove` retains it, a delete nobody pushes.
+/// In a collection no source syncs, an item kept on the device (§14.3),
+/// an `update` and a `set-flags` apply to the store; a `move` or a `copy`,
+/// and anything on an unbound item of a synced collection, park.
+fn unbound(
+    tx: &Connection,
+    collection: &str,
+    seq: i64,
+    link: &PimdirLinkId,
+    action: &PimdirAction,
+) -> Result<Result<(PimdirSourceId, Vec<PimdirWriteOp>), PimdirOutcome>, PimdirError> {
+    let synced = tx
+        .prepare(sql::COLLECTION_SOURCES)?
+        .exists(named_params! { ":collection": collection })?;
+    let outcome = match action {
+        PimdirAction::Remove { .. } => PimdirOutcome::Unbound(link.clone()),
+        PimdirAction::Update { .. } | PimdirAction::SetFlags { .. } if !synced => {
+            PimdirOutcome::Unbound(link.clone())
+        }
+        PimdirAction::Move { .. } | PimdirAction::Copy { .. } if !synced => {
+            PimdirOutcome::Parked(format!(
+                "item {seq} is kept on the device, bound by no source: write it into the target instead"
+            ))
+        }
+        _ => PimdirOutcome::Parked(format!("no source binds item {seq}")),
+    };
+    Ok(Err(outcome))
+}
+
+/// Applies an action on an item no source binds to the store alone, as
+/// [`unbound`] judged it: a `remove` retains it, a `set-flags` sets its
+/// flags, an `update` writes its new body as `put_item` does, its flags
+/// kept and its summary derived again; a body deriving no summary, or
+/// another key, parks. An `update`'s `if_match` was checked by
+/// [`stage_action`] before the item was found unbound (§15.3).
+fn apply_unbound(
+    tx: &Connection,
+    blobs: &PimdirBlobs,
+    acting: &PimdirSourceId,
+    collection: &str,
+    kind: &str,
+    link: &PimdirLinkId,
+    action: &PimdirAction,
+) -> Result<Result<(), PimdirOutcome>, PimdirError> {
+    match action {
+        PimdirAction::Remove { .. } => {
+            tx.execute(
+                sql::RETAIN_ITEM,
+                named_params! {
+                    ":collection": collection,
+                    ":link_id": link.0,
+                    ":source": acting.0,
+                },
+            )?;
+        }
+        PimdirAction::SetFlags { flags, .. } => {
+            write::set_unbound_flags(tx, collection, link, flags)?;
+        }
+        PimdirAction::Update { object, .. } => {
+            let body = queued_body(blobs, object)?;
+            let Some(derivation) = summary::derive(kind, &body) else {
+                return Ok(Err(PimdirOutcome::Parked(format!(
+                    "body {} derives no summary for a {kind} item",
+                    object.0
+                ))));
+            };
+            if derivation.link_id != *link {
+                return Ok(Err(PimdirOutcome::Parked(format!(
+                    "body {} names item {}, not {}",
+                    object.0, derivation.link_id.0, link.0
+                ))));
+            }
+            let object = PimdirObject {
+                hash: object.clone(),
+                size: body.len(),
+            };
+            write::put_unbound(tx, collection, &object, derivation)?;
+        }
+        _ => unreachable!("only a remove, a set-flags or an update is unbound"),
+    }
+    Ok(Ok(()))
 }

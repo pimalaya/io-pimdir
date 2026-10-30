@@ -713,20 +713,6 @@ fn an_index_built_otherwise_is_rebuilt_and_a_held_lock_skips_the_refresh() {
     let mut index = PimdirIndex::open(dir.path()).unwrap();
     assert_eq!(index.cursor().unwrap(), 0, "rebuilt, not migrated");
 
-    index
-        .refresh(&PimdirIndexRefreshOptions::default())
-        .unwrap();
-    drop(index);
-    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
-    conn.execute("DROP TABLE index_build", []).unwrap();
-    drop(conn);
-    let mut index = PimdirIndex::open(dir.path()).unwrap();
-    assert_eq!(
-        index.cursor().unwrap(),
-        0,
-        "an index from before threads is rebuilt"
-    );
-
     let held = fs::File::create(dir.path().join("index.lock")).unwrap();
     fs4::FileExt::try_lock(&held).unwrap();
     let report = index
@@ -1386,4 +1372,220 @@ fn a_tag_says_which_placements_reach_their_server() {
         other => panic!("the gate refuses the keyword on pop, got {other:?}"),
     }
     assert!(producer.pending_actions("Local").unwrap().is_empty());
+}
+
+/// A query client never builds, rebuilds nor refreshes the index (SEARCH
+/// §3): a missing or outdated index is a coded error naming the indexer,
+/// and an answer says how far the index lags the store.
+#[test]
+fn a_query_open_neither_builds_rebuilds_nor_refreshes() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+
+    let Err(err) = PimdirIndex::open_query(dir.path()) else {
+        panic!("a missing index opens for queries");
+    };
+    assert_eq!(err.code(), "index-missing");
+    assert!(!dir.path().join("index.db").exists(), "nothing created");
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    drop(index);
+
+    let mut query = PimdirIndex::open_query(dir.path()).unwrap();
+    assert_eq!(hits(&query, "alpha").len(), 1);
+    let Err(err) = query.refresh(&PimdirIndexRefreshOptions::default()) else {
+        panic!("a query handle refreshed");
+    };
+    assert_eq!(err.code(), "index-query-only");
+
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("b@x", "Beta", "second body"),
+        &[],
+    );
+    let answer = query
+        .count(
+            &PimdirQuery::parse("beta").unwrap(),
+            &PimdirSearchClock::default(),
+        )
+        .unwrap();
+    assert_eq!(answer.count, 0, "the index answers as it stands");
+    assert!(answer.coverage.local.behind > 0, "and says it is behind");
+    assert!(!answer.coverage.is_complete());
+    drop(query);
+
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    conn.execute("UPDATE index_meta SET tokenizer = 'porter'", [])
+        .unwrap();
+    drop(conn);
+    let Err(err) = PimdirIndex::open_query(dir.path()) else {
+        panic!("an outdated index opens for queries");
+    };
+    assert_eq!(err.code(), "index-outdated");
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    let tokenizer: String = conn
+        .query_row("SELECT tokenizer FROM index_meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tokenizer, "porter", "nothing rebuilt");
+}
+
+/// An index an earlier draft built is told by its shape (SEARCH §2): one
+/// whose tables, indexes or triggers differ from the schema's is rebuilt
+/// by the indexer and refused by a query client, while a table of another
+/// implementation's beside them, and FTS5's own, change nothing.
+#[test]
+fn an_index_of_another_shape_is_rebuilt_never_queried() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    drop(index);
+
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    conn.execute("CREATE TABLE another_indexer (x INTEGER)", [])
+        .unwrap();
+    drop(conn);
+    let index = PimdirIndex::open_query(dir.path()).unwrap();
+    assert_eq!(hits(&index, "alpha").len(), 1, "another table is left out");
+    drop(index);
+
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    conn.execute("DROP INDEX placement_by_link", []).unwrap();
+    drop(conn);
+    let Err(err) = PimdirIndex::open_query(dir.path()) else {
+        panic!("an index of another shape opens for queries");
+    };
+    assert_eq!(err.code(), "index-outdated");
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(index.cursor().unwrap(), 0, "rebuilt, not migrated");
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    drop(index);
+    let index = PimdirIndex::open_query(dir.path()).unwrap();
+    assert_eq!(hits(&index, "alpha").len(), 1);
+}
+
+/// A collection's name is a label, never an address (STORAGE §14):
+/// `collection:` and `folder:` name an id alone.
+#[test]
+fn a_collection_term_names_an_id_never_a_display_name() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .set_collection_name("INBOX", "Archive")
+        .unwrap();
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(hits(&index, "collection:INBOX").len(), 1);
+    assert_eq!(hits(&index, "collection:Archive"), Vec::<i64>::new());
+    assert_eq!(hits(&index, "folder:Archive"), Vec::<i64>::new());
+}
+
+/// A rename a deadline-cut pass folded past is still reconciled by the
+/// next pass completing (SEARCH §4): the cut pass advanced the cursor past
+/// the collection's stamp, which no longer says anything moved.
+#[test]
+fn a_rename_a_cut_pass_went_past_is_reconciled_by_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("b@x", "Beta", "second body"),
+        &[],
+    );
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .rename_collection("INBOX", "Mail")
+        .unwrap();
+
+    // NOTE: the state a pass cut by its deadline right after the batch
+    // folding the restamped items leaves: its cursor at their last stamp,
+    // the purge count as the previous pass recorded it, the completing
+    // transaction never run (SEARCH §4).
+    let head = io_pimdir::client::reader::PimdirReader::open(dir.path())
+        .unwrap()
+        .change_cursor()
+        .unwrap()
+        .changed;
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    conn.execute("UPDATE index_meta SET store_change = ?1", [head])
+        .unwrap();
+    drop(conn);
+
+    let report = index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert!(report.reconciled, "the rename is reconciled");
+    assert_eq!(report.removed, 2, "the old id's placements go");
+}
+
+/// A value of digits names the item of that seq and every item whose link
+/// id it is (SEARCH §8), a hit set rather than a guess.
+#[test]
+fn an_id_of_digits_names_the_seq_and_the_link_id() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("777", "Digits", "second body"),
+        &[],
+    );
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let alpha = hits(&index, "alpha");
+    let digits = hits(&index, "subject:digits");
+    assert_eq!((alpha.len(), digits.len()), (1, 1));
+
+    assert_eq!(hits(&index, "id:777"), digits, "the link id 777");
+    assert_eq!(hits(&index, &format!("id:{}", alpha[0])), alpha, "a seq");
+    let mut both = hits(&index, &format!("id:{} or id:777", alpha[0]));
+    both.sort();
+    assert_eq!(both.len(), 2);
 }

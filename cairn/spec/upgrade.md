@@ -43,7 +43,7 @@ Applying a fetched item SHALL set the placement's `link_id` from the fetch **onl
 - THEN the heavy member is fetched concurrently with the light ones, results are matched by handle, and no fetch order is assumed
 
 ### Requirement: An upgrade revisits what it never got
-An upgrade SHALL revisit a placement whose level claims a tier it does not hold: `Full` with no object, `Meta` with no summary, which a row an earlier draft wrote at level `0` loads as (pimdir SYNC §3, §6). The `Meta` tier exists for this alone. The level is a claim and the payload is the fact, and nothing else revisits what already reads as reached, so such a row would be skipped for good.
+An upgrade SHALL revisit a placement whose level claims a tier it does not hold: `Full` with no object, `Meta` with no summary (pimdir SYNC §3, §6). The `Meta` tier exists for this alone. The level is a claim and the payload is the fact, and nothing else revisits what already reads as reached, so such a row would be skipped for good.
 
 #### Scenario: A body-less full row
 - GIVEN a placement recorded at `Full` holding no object
@@ -123,7 +123,7 @@ A `Meta` fetch SHALL raise only a placement holding no summary (vectors/sync/07)
 ### Requirement: A pending create is landed by its arrival
 A page or a fetch resolving a member to a hint a pending create of the same source holds in the collection, a `Created` placement with no base under a provisional handle, SHALL land that create rather than mint a second copy (pimdir SYNC §6): the hint arrived by a relocation the source's remove made, by an accepted add whose record was lost, or by another client, and it is the create delivered. Only a hint a based binding holds is minted.
 
-Landing is a `Superseded` drop of the provisional handle, then the create upserted under the fetched handle in the same batch, with a base of the flags the source reported, the fetched revision, and the fetched body at `Full` or else the create's own body. The flags, body, summary and sort key staged on the create stay, so an edit made on it still pushes: the status is `Clean` when they equal the base and `Dirty` otherwise, and the origin goes, there being nothing left to copy from. A create holding no body adopts a fetched one as its own.
+Landing is a `Superseded` drop of the provisional handle, then the create upserted under the fetched handle in the same batch, with a base of the flags the source reported, the fetched revision, and the fetched body at `Full` or else, for an immutable kind, the create's own body. The flags, body, summary and sort key staged on the create stay, so an edit made on it still pushes: the status is `Clean` when they equal the base and `Dirty` otherwise, and the origin goes, there being nothing left to copy from. A create holding no body adopts a fetched one as its own. A mutable fetch carrying no body, or another body than the staged one, leaves the binding conflicted at the fetched revision, its base naming no body, the fetched body its `conflict_object` ("An unread arrival landing a create conflicts" in [sync](sync.md)).
 
 The `Links` load an upgrade makes for a fresh hint asks for the hint and its minted form, and a store answers with the placements the source binds (SYNC §10), a pending create being one, so the holder to land is in the batch whether or not the requested handles named it.
 
@@ -136,3 +136,12 @@ The `Links` load an upgrade makes for a fresh hint asks for the hint and its min
 - GIVEN a based binding holding `m1` under `u1`
 - WHEN a fetch of `7` resolves to `m1`
 - THEN `7` is linked under `dup:m1#7` and nothing is superseded
+
+### Requirement: An item conflict's late body meets the policy
+An item conflict recorded for want of its incoming body SHALL be revisited by the `Full` upgrade of each binding whose base names a revision and no body, and only those: the fetched body lands as that binding's body and base, and the write settles it against the item's by the collection's policy as a carried body would have been, `Manual` recording it in `items.conflict_object`, `PreferIncoming` adopting it and `PreferExisting` keeping the shared body, the conflict cleared and the body not adopted kept and reported `Overruled` (pimdir SYNC §6, §9, vectors/sync/84, 90, 91). A binding whose base holds a body is not refetched for the item's conflict.
+
+### Requirement: A full fetch answering no body counts nothing
+A `Full` fetch whose answer carries no body SHALL count neither as `fetched` nor as `upgraded`: it raised nothing. The placement is still written with what the fetch refreshed, its level the one the row supports.
+
+#### Scenario: A server answering a full fetch without the body
+- tests/engine/sync_audit.rs `a_full_fetch_answering_no_body_counts_nothing` (failed before the change: one fetched, one upgraded)

@@ -64,7 +64,7 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
 
     PimdirDerivation {
         link_id: match &summary.uid {
-            Some(uid) => PimdirLinkId(uid.clone()),
+            Some(uid) => PimdirLinkId::from_hint(uid.as_str()),
             None => hash_key(body),
         },
         sort_key: summary.sort_key(),

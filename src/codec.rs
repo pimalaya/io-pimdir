@@ -150,6 +150,10 @@ pub enum PimdirAction {
         seq: i64,
         /// The new body's hash, written durably by the producer before enqueueing.
         object: PimdirHash,
+        /// The body the producer read and replaced (§15.3): the owner parks
+        /// the row when the item holds another, a write it would otherwise
+        /// drop without a merge; `None` applies over whatever it holds.
+        if_match: Option<PimdirHash>,
     },
     /// Record the source performing an intent capability for the account
     /// of the collection the action is anchored on (§15.6), or withdraw
@@ -284,9 +288,16 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             map.insert("seq".into(), json!(seq));
             map.insert("to".into(), json!(to.0));
         }
-        PimdirAction::Update { seq, object } => {
+        PimdirAction::Update {
+            seq,
+            object,
+            if_match,
+        } => {
             map.insert("seq".into(), json!(seq));
             map.insert("object".into(), json!(object.0));
+            if let Some(if_match) = if_match {
+                map.insert("if_match".into(), json!(if_match.0));
+            }
         }
         PimdirAction::SetPerformer { capability, source } => {
             map.insert("capability".into(), json!(capability));
@@ -336,6 +347,7 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
         "update" => Ok(PimdirAction::Update {
             seq: require_seq(map)?,
             object: PimdirHash(require_string(map, "object")?),
+            if_match: get_string(map, "if_match")?.map(PimdirHash),
         }),
         "set-performer" => Ok(PimdirAction::SetPerformer {
             capability: require_string(map, "capability")?,
@@ -520,6 +532,12 @@ mod tests {
             PimdirAction::Update {
                 seq: 8,
                 object: PimdirHash("beef0000".into()),
+                if_match: None,
+            },
+            PimdirAction::Update {
+                seq: 9,
+                object: PimdirHash("beef0000".into()),
+                if_match: Some(PimdirHash("cafebabe".into())),
             },
         ];
         for action in actions {

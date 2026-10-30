@@ -501,31 +501,27 @@ fn a_body_streams_in_and_back_out() {
     use std::io::{Read, Write};
 
     let dir = tempfile::tempdir().unwrap();
-    let blobs = io_pimdir::client::blobs::PimdirBlobs::open(dir.path(), PimdirHashAlgo::default());
+    let store = PimdirStore::open(dir.path()).unwrap();
+    let blobs = store.blobs();
 
-    // stream a body in, in chunks, committing under its hash
-    let mut w = blobs.writer().unwrap();
+    // stream a body in, in chunks, committed under the hash of its bytes
+    let mut w = store.blob_stage().writer().unwrap();
     w.write_all(b"hello ").unwrap();
     w.write_all(b"world").unwrap();
-    let size = w.commit(&PimdirHash("aabbccdd".into())).unwrap();
-    assert_eq!(size, 11);
+    let object = w.commit().unwrap();
+    assert_eq!(object.size, 11);
+    assert_eq!(object.hash, blobs.hash(b"hello world"));
     assert!(
-        blob_exists(dir.path(), "aabbccdd"),
+        blob_exists(dir.path(), &object.hash.0),
         "committed to the shard path"
     );
 
     // read it back as a stream and buffered: both see the same bytes
-    let mut file = blobs
-        .reader(&PimdirHash("aabbccdd".into()))
-        .unwrap()
-        .unwrap();
+    let mut file = blobs.reader(&object.hash).unwrap().unwrap();
     let mut streamed = Vec::new();
     file.read_to_end(&mut streamed).unwrap();
     assert_eq!(streamed, b"hello world");
-    assert_eq!(
-        blobs.get(&PimdirHash("aabbccdd".into())).unwrap().unwrap(),
-        b"hello world"
-    );
+    assert_eq!(blobs.get(&object.hash).unwrap().unwrap(), b"hello world");
 
     // a missing object streams as None
     assert!(
@@ -541,26 +537,21 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
     use std::io::Write;
 
     let dir = tempfile::tempdir().unwrap();
-    let blobs = io_pimdir::client::blobs::PimdirBlobs::open(dir.path(), PimdirHashAlgo::default());
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let blobs = store.blobs();
 
     // the consumer streams the blob into place during a fetch
-    let mut w = blobs.writer().unwrap();
+    let mut w = store.blob_stage().writer().unwrap();
     w.write_all(b"streamed-body").unwrap();
-    let size = w.commit(&PimdirHash("beef0000".into())).unwrap() as usize;
+    let object = w.commit().unwrap();
+    let hash = object.hash.0.clone();
 
     // then the write batch records the object with no bytes, plus a
     // placement pointing at it
     store
         .write(vec![
-            PimdirWriteOp::StoreObject {
-                object: PimdirObject {
-                    hash: PimdirHash("beef0000".into()),
-                    size,
-                },
-                body: None,
-            },
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "beef0000", &["\\Seen"])),
+            PimdirWriteOp::StoreObject { object, body: None },
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", &hash, &["\\Seen"])),
         ])
         .unwrap();
 
@@ -569,12 +560,9 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
     drop(store);
     let store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     let loaded = store.load(&inbox(), &PimdirLoadScope::All).unwrap();
+    assert_eq!(loaded.placements[0].object, Some(PimdirHash(hash.clone())));
     assert_eq!(
-        loaded.placements[0].object,
-        Some(PimdirHash("beef0000".into()))
-    );
-    assert_eq!(
-        blobs.get(&PimdirHash("beef0000".into())).unwrap().unwrap(),
+        blobs.get(&PimdirHash(hash)).unwrap().unwrap(),
         b"streamed-body"
     );
 }

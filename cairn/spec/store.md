@@ -66,10 +66,11 @@ producers still contend at the SQLite layer, and that contention is worth waitin
 out.
 
 ### Requirement: Blobs are content-addressed and sharded
-An object's bytes SHALL live at `objects/<hash[0:2]>/<hash[2:4]>/<hash>`,
-immutable once written, so an identical body delivered twice is stored once.
-`PimdirBlobs` reads a blob independently of the SQLite connection, so a body can
-be read while the store is mutably borrowed to service a sync.
+An object's bytes SHALL live at `objects/<hash[0:2]>/<hash[2:4]>/<hash>`, immutable once written, so an identical body delivered twice is stored once. `PimdirBlobs` reads a blob independently of the SQLite connection, so a body can be read while the store is mutably borrowed to service a sync. It SHALL be read-only: `get`, `reader`, `path`, `files` and the hash, with no writer, so a handle that holds no lock (a reader's, or one opened from a path) cannot put a body in the tree.
+
+`get` SHALL check the bytes it read against their name (STORAGE §7): a file that does not hash to its name answers `None`, the state of a missing one, so no parser, index, gate or drain is handed corrupt content. `reader` SHALL answer a `PimdirBlobReader` hashing what it streams and failing the read that reaches the end of the file with `ErrorKind::InvalidData` when the bytes do not hash to the name, so a streamed upload or export never hands on corrupt content as sound; its `metadata` and `len` size the body first. A read of part of a body is not verified. The store's own streamed reads (the verification before a push, the attachment walk) read a body failing its name as none.
+
+A body SHALL be written only through `PimdirBlobStage`, which a producer (`PimdirProducer::stage_body`, `blob_writer`) or an owner (`PimdirStore::blob_stage`) hands out and which holds that handle's lock for as long as it lives: a producer's shared staging lock, an owner's owner lock (STORAGE §8). A body written through it is therefore never in the window a collector runs in.
 
 ### Requirement: A handle names a source only where an operation acts as one
 `PimdirStore::open(dir)` and `PimdirReader::open(dir)` SHALL take no source. The handle they return serves what an operation means for the store as a whole: every client read, retention and its purges, the queue rows a cancellation or an acknowledgement removes, and the collection generations. None of those consult a source, and none SHALL require one to be named.
@@ -139,10 +140,7 @@ view lists every placement, a contact view may offer to merge them, and both
 read the same rows.
 
 ### Requirement: A body may be ingested and emitted by streaming
-The store SHALL be able to persist an object from a byte stream (`Read`),
-computing its content hash incrementally, with the same temp → fsync → rename
-durability as a buffered write, so a large body is never held whole; and it SHALL
-expose a stored object as a readable stream for the same reason on the read side.
+The store SHALL be able to persist an object from a byte stream (`PimdirBlobWriter`, `Write`), computing its content hash incrementally under the store's algorithm, with the same temp, fsync, rename durability as a buffered write, so a large body is never held whole: `commit` answers the `PimdirObject` (hash and size) the bytes written name, so a body is never filed under a hash its caller computed apart. It SHALL expose a stored object as a readable stream for the same reason on the read side. The stream (`PimdirBlobReader`) SHALL verify the body as the bytes read reach the length the file stated when opened (`len`), and at the end of the file before it, failing the read with `InvalidData` on a mismatch, and SHALL fail a read of a byte past that length, so a consumer reading a known length is verified as one reading to the end (tests/store_rules.rs `a_streamed_body_read_to_its_length_is_verified`, which failed before: the read of exactly `len` corrupted bytes answered them).
 
 ### Requirement: A byteless object write indexes an already-stored blob
 A `StoreObject` carrying no bytes, its blob already persisted by a streaming
@@ -233,11 +231,10 @@ local changes.
   than a re-download
 
 ### Requirement: A collection can be deleted
-`delete_collection(collection)` SHALL remove a collection the operator no longer
-wants, `DELETE_COLLECTION` cascading over its items, bindings, sources and queue
-rows with retention not applying, then `RECOMPUTE_REFCOUNTS` in the same
-transaction, since the cascade releases pins no statement returns (STORAGE §14).
-It answers whether a row went.
+`delete_collection(collection)` SHALL remove a collection the operator no longer wants, `DELETE_COLLECTION` cascading over its items, bindings and sources with retention not applying, then `RECOMPUTE_REFCOUNTS` in the same transaction, since the cascade releases pins no statement returns (STORAGE §14). It answers whether a row went. A collection holding a pending or parked queue row SHALL be refused as `PimdirError::Queued { collection }` (code `collection-queued`), nothing deleted: `collections_keep_queued` refuses the delete, which would drop the action with no receipt; the operator cancels the rows first.
+
+#### Scenario: A queued action holds its collection
+- tests/store_rules.rs `a_collection_holding_a_queued_action_is_not_deleted` (pending, then parked, then dropped and deleted)
 
 ### Requirement: Items carry a message-scoped public id
 Each item SHALL carry a `seq`: an integer id a consumer shows and accepts in place
@@ -285,28 +282,18 @@ probing the blob store, and can trigger a hydrate through the sync engine rather
 than treating the absence as data loss.
 
 ### Requirement: Schema version
-The store schema is version 1 (`user_version` 1), migrations/storage/0001_init.sql
-verbatim: the spec is a draft, so there is no earlier schema and no upgrade path.
-build.rs SHALL generate `sql::MIGRATIONS`, every canonical migration in file
-order, and the owner open SHALL run STORAGE §6's runner over it: read
-`user_version`, then for each migration above it, in order, one transaction
-running the script and setting `user_version`, the first one seeding
-`store_meta`. A store stamped above the current version is refused with
-`PimdirError::Version`. A store stamped current by an earlier draft, lacking a
-table the schema declares, is refused with `PimdirError::Stale` naming the
-table: the operator deletes it and lets it resync. The table scan SHALL run
-before `store_meta` is read, so a store lacking `store_meta` names that table
-rather than failing the read of its stamp.
+The store schema is version 1 (`user_version` 1), migrations/storage/0001_init.sql verbatim. build.rs SHALL generate `sql::MIGRATIONS`, every canonical migration in file order, and the owner open SHALL run STORAGE §6's steps in order, nothing else changing the schema:
+
+1. Read `user_version`. A store above `sql::VERSION` SHALL be refused as `PimdirError::Version { found }` (code `store-newer`, its message saying to upgrade this program) before anything is written, the journal mode included. A database at version 0 that declares any table is not a pimdir store and SHALL be refused as `PimdirError::Foreign` (code `store-foreign`), as SHALL one whose `store_meta.format` is not `pimdir`. A store lacking a core table or trigger is refused as `PimdirError::Stale` by every role, the table scan running before `store_meta` is read. The declared algorithm (`open_with_hash`) is checked here, so a mismatch is `PimdirError::HashAlgo` with nothing reconciled.
+2. A version 1 store is reconciled to 0001_init.sql alone ("Open reconciles against the canonical text"), before any migration; no other version is reconciled.
+3. Each migration above the store's version runs in its own transaction, which also sets `user_version` and, through the canonical `set_store_version`, `store_meta.version`; a fresh database runs `init_store_meta` (`:version`, `:hash_algo`, `:derivation`) in the transaction applying 0001_init.sql.
+
+`PRAGMA journal_mode = WAL` is set only after step 1 passed, by the owner, `open_current` and the producer alike, since it writes the database header.
 
 ### Requirement: The two schema stamps must agree
-`PRAGMA user_version` and `store_meta.version` mirror one another (STORAGE §4.2),
-so a store where they differ is corrupt rather than a store at either version.
-Both the owner open and the read-only open SHALL compare them and refuse a
-disagreement with `PimdirError::VersionMismatch`.
+`PRAGMA user_version` and `store_meta.version` mirror one another (STORAGE §4.2), so a store where they differ is corrupt rather than a store at either version. Every role SHALL compare `store_meta.version` with the store's own `user_version`, not with this crate's version, and refuse a disagreement with `PimdirError::VersionMismatch`.
 
-A store carrying no `store_meta` row SHALL be left alone: the row is seeded by
-whoever created the schema, and refusing there would make a missing stamp
-unrepairable.
+A store carrying no `store_meta` row SHALL be left alone: the row is seeded by whoever created the schema, and refusing there would make a missing stamp unrepairable.
 
 ### Requirement: An unknown flag set is stored as NULL
 The `flags` column keeps two absences apart (STORAGE §13): `NULL` means nothing has
@@ -392,6 +379,8 @@ the overlay SHALL NOT invent an identifier.
 A pending `add` SHALL NOT be projected as an item: it has no `seq` until the
 owner applies it, and it is a request to create an item rather than one. The
 reader SHALL report pending creates apart, as rows and as a count.
+
+An `update` stating `if_match` SHALL fold only when it names the body the item holds at that point of the fold, the edits folded before it included: one naming another will park at the drain (STORAGE §15.3), so the overlay shows the item as the drain will leave it (tests/overlay.rs `an_edit_that_will_park_is_not_folded`).
 
 A parked row SHALL NOT overlay, its error asserting that it will not be applied
 without an operator. A pending row whose payload the reader cannot decode
@@ -511,16 +500,12 @@ bases adopting it (STORAGE §11.1): a `Meta` fetch reviving a row must not
 discard what the store still holds.
 
 ### Requirement: An owner skips the actions it cannot apply
-An action kind the store does not recognise SHALL decode as an opaque action
-(kind, raw payload, and the body hash the payload pins) rather than an error, so
-one queue can carry store mutations any owner applies beside capability-bound
-intents (a mail submission) only a specific owner can perform. Genuinely
-malformed payloads (not JSON, no supported `v`) SHALL still park.
+An action kind the store does not recognise SHALL decode as an opaque action (kind, raw payload, and the body hash the payload pins) rather than an error, so one queue can carry store mutations any owner applies beside capability-bound intents (a mail submission) only a specific owner can perform. A payload stating a version `v` this owner does not know, for any kind, SHALL be skipped the same way (STORAGE §15.2). A payload that is not JSON, or states no `v`, SHALL still park.
 
-The drain SHALL **skip** a row it cannot apply: the row stays pending, is never
-parked (parking means permanently unappliable), and never blocks later actions
-in the same collection. The drain report SHALL count skips beside applies and
-parks.
+The drain SHALL **skip** a row it cannot apply: the row stays pending, `error` `NULL` and `attempts` unbumped, is never parked (parking means permanently unappliable), and never blocks later actions in the same collection. The drain report SHALL count skips beside applies and parks.
+
+#### Scenario: A later producer's payload
+- tests/store_rules.rs `an_unknown_payload_version_is_skipped_not_parked`
 
 ### Requirement: A queued action can be cancelled or acknowledged
 `drop_action(id)` SHALL delete one queue row, pending or parked, releasing its
@@ -542,8 +527,15 @@ instead, `set-flags` being absolute rather than a delta.
 operation, opening the store as owner, cancelling one row and releasing the lock
 before returning, so a consumer that is otherwise a reader and a producer never
 holds a handle that could drain the queue or sweep the objects. It SHALL NOT
-create a store it cannot find, and a store another process owns SHALL fail fast
-rather than wait.
+create a store it cannot find (`PimdirError::Uncreated`), and a store another
+process owns SHALL fail fast rather than wait.
+
+It SHALL open the store through `open_current`, never `open`: a consumer cancelling a row owns the store for one write and SHALL NOT create, migrate or reconcile it. A store of another `user_version` or shape is refused as `PimdirError::NotCurrent`, left as it was.
+
+#### Scenario: A cancel on a store another revision keeps
+- GIVEN a store whose `task_summary` carries a column a later revision added, and a queued row
+- WHEN a consumer cancels the row through `cancel_action`
+- THEN it answers `NotCurrent(Shape { object: "task_summary" })`, and the table and the row are left as they were (tests/open_current.rs `a_cancel_leaves_a_store_needing_a_reconcile_as_it_was`)
 
 ### Requirement: The store owns the content hash
 The crate SHALL implement the hashes the format admits (STORAGE §4.3: `blake3`,
@@ -598,7 +590,12 @@ The first descending page SHALL bind a `NULL` cursor rather than a key no real o
 The pending rows are read outside any transaction, so a second owner may hold the same list; deleting at the end has both apply the row, and `add` and `copy` are not idempotent. Claiming first makes exactly-once a property of the statement rather than a convention about who runs the drain.
 
 ### Requirement: A blob rename is durable
-Writing a blob SHALL sync the shard directory after the rename, and every directory above it up to objects/, since the write may have created the shards themselves. Syncing the file makes its bytes durable and says nothing about the name that reaches them, while the database commit is durable, so without it a crash can leave a committed row pointing at a body that never arrived: the one asymmetry the write order exists to prevent.
+Writing a blob SHALL go through a temporary file in the shard directory named uniquely to the writer (the body's name, the process id and a per-process counter), so two processes storing one body never write, then rename, each other's bytes; a temporary another writer holds is left alone, and a failed write removes its own. It SHALL sync the shard directory after the rename, and every directory above it up to objects/, since the write may have created the shards themselves. Syncing the file makes its bytes durable and says nothing about the name that reaches them, while the database commit is durable, so without it a crash can leave a committed row pointing at a body that never arrived: the one asymmetry the write order exists to prevent.
+
+#### Scenario: Another writer's temporary
+- GIVEN a temporary file another writer holds under the body's old shared name
+- WHEN a producer stages the same body
+- THEN the body lands under its name and the other temporary keeps its bytes (tests/store_rules.rs `a_blob_write_never_takes_another_writers_temporary`)
 
 ### Requirement: An unreadable flag set holds no opinion
 A `flags` column this crate cannot decode SHALL read as unknown, never as a known-empty set. Malformed JSON is a column written by something whose format this does not share, or a corrupted one, and neither is evidence about the item's markers. Reading it as known-empty makes it an authoritative "this item carries no markers", which the merge takes as one side's opinion: it clears every marker the other side reports and persists the result, so a read failure becomes permanent loss.
@@ -682,15 +679,9 @@ Unreferenced objects accumulate until someone collects. A consumer that wants
 that bounded schedules the verb.
 
 ### Requirement: The store repairs what it can recompute
-`recompute_refcounts` SHALL settle every object's count from the five columns
-that pin one (STORAGE §7), returning how many disagreed, and
-`clear_dangling_bindings` SHALL delete the bindings whose item is gone, returning
-how many. Both recover a fact the store already holds.
+`recompute_refcounts` SHALL settle every object's count from the six columns that pin one (STORAGE §5, §7), `bindings.shared_object` among them, returning how many disagreed, and `clear_dangling_bindings` SHALL delete the bindings whose item is gone, returning how many. Both recover a fact the store already holds. `refcount_drift` compares the stored counts with the same six columns.
 
-Every other dangling row stays reported and untouched: an item whose object row
-is missing is still the item, and a queue row whose body is missing is still an
-intent somebody expressed, so deleting either would destroy data rather than
-repair it.
+Every other dangling row stays reported and untouched: an item whose object row is missing is still the item, and a queue row whose body is missing is still an intent somebody expressed, so deleting either would destroy data rather than repair it.
 
 ### Requirement: A superseded handle licenses its own rebind
 A write batch dropping a handle with `PimdirDropReason::Superseded` or `Rekeyed` SHALL let the binding holding it move to whatever handle the same batch upserts for that identity, by deleting the binding and inserting the new one (STORAGE §10, §12). A batch dropping a handle as `Deleted`, or not dropping it at all, SHALL keep the bound handle and **refuse the write**. A batch carrying a `Rekeyed` drop SHALL bump the collection's generation in the same transaction, the engine emitting no op for it.
@@ -787,28 +778,11 @@ a question the store answers rather than one its callers assemble.
 - THEN every conflicted one is named with its three hashes, and no other row appears
 
 ### Requirement: A binding persists what it last agreed with the hub on
-The `bindings` table SHALL carry `shared_object` (TEXT, nullable),
-round-tripped through `PimdirBinding`: the hub's shared body this source
-last reconciled against, which is the base of the cross-source merge. It is
-meaningful on every binding, conflicted or not, and `NULL` only until the source
-has folded once, where the sync base stands in for it.
+The `bindings` table SHALL carry `shared_object`, round-tripped through `PimdirBinding`: the hub's shared body this source last reconciled against, which is the base of the cross-source merge. It is meaningful on every binding, conflicted or not, and `NULL` only until the source has folded once, where the sync base stands in for it.
 
-This is the second base, for the second axis, and the store MUST keep both.
-`base_object` is what the source last agreed with its own **remote** and only a
-sync moves it, which is what keeps a pending push derivable; `shared_object` is
-what it last agreed with the **hub** and every live absorb moves it. Read one as
-the other and a source disagrees with itself: its own unpushed edit leaves the
-sync base behind the shared body exactly as another source folding in does, so
-the next edit is filed as a cross-source conflict and dropped. In memory the hub
-carries the field either way; the store is what makes it survive, and a
-conflicted absorb and the edit that settles it are typically different runs.
+This is the second base, for the second axis, and the store MUST keep both. `base_object` is what the source last agreed with its own **remote** and only a sync moves it, which is what keeps a pending push derivable; `shared_object` is what it last agreed with the **hub** and every live absorb moves it. Read one as the other and a source disagrees with itself: its own unpushed edit leaves the sync base behind the shared body exactly as another source folding in does, so the next edit is filed as a cross-source conflict and dropped.
 
-Unlike `conflict_object` beside it, `shared_object` SHALL NOT reference
-`objects(hash)`, SHALL NOT join the reachability union the collector walks, and
-SHALL NOT be refcounted. It is only ever compared for equality and never read as
-bytes, and a content hash compares the same after the body it named has been
-swept, so pinning would hold every body a source ever agreed with for the life
-of the binding and buy nothing.
+`shared_object` SHALL reference `objects(hash)` and be pinned as `base_object` is (STORAGE §5): counted in the write path's refcount diff, in `recompute_refcounts` and in the collector's reachability, released when the binding agrees with another body, and released by `release_bases_before` with the item's own body. It is the common ancestor a merge reads, so it outlives the item's own body until the binding reconciles against what replaced it.
 
 #### Scenario: The agreement point survives a reopen
 - GIVEN an ordinary unconflicted binding written by a sync
@@ -825,6 +799,11 @@ of the binding and buy nothing.
 - WHEN the store is reopened and a second offline edit is absorbed
 - THEN the hub adopts it and the item holds the second body
 
+#### Scenario: The agreement point pins its body
+- GIVEN a source whose agreement point is the only pointer at a body
+- WHEN the collector runs, then the source agrees with another body and the collector runs again
+- THEN the first run keeps the body readable, the second takes it (tests/shared_object_pin.rs)
+
 ### Requirement: A summary and its addresses are written with the item
 A named placement carries its `PimdirSummary` (STORAGE Annex A), and the write SHALL persist it as the row of the kind's summary table and the `item_address` rows, in the item's transaction, only when it moved: the batch's load reads the summaries and addresses of the link ids it names, the diff compares them, and a summary that moved under unmoved item columns runs `stamp_item` so the change feed sees it (STORAGE §4.5). A summary of another variant deletes the old row; a placement carrying none deletes the stored row too.
 
@@ -836,6 +815,18 @@ A named placement carries its `PimdirSummary` (STORAGE Annex A), and the write S
 
 ### Requirement: The queue derives summaries from bodies
 A queued `add` or `update` SHALL carry no summary: the drain reads the body the producer wrote and derives the key, the summary and the sort key under Annex A for the collection's declared kind, parking an `add` that names no link id and derives none.
+
+A body an `add` or `update` names that the blob store lacks, or whose file does not hash to its name, SHALL fail the row as a failure of the environment (`PimdirError::Io`, `NotFound`), never apply it: its attempts are bumped and it stays pending, then parks past `MAX_ATTEMPTS` (pimdir STORAGE §15.2). A file failing its name is unlinked by the owner under the staging lock taken exclusively, left for the next read when a producer holds it shared, so the next write of that body writes it anew (STORAGE §7).
+
+#### Scenario: A body unlinked after its enqueue
+- GIVEN a queued `add` whose blob was unlinked after the enqueue
+- WHEN the owner drains `MAX_ATTEMPTS` times
+- THEN each drain but the last counts it `retried`, the last parks it with the error naming the body, and no item was created (tests/queue.rs `a_queued_add_missing_its_body_is_retried_then_parked`, and `a_queued_update_missing_its_body_is_retried_then_parked` for an `update`)
+
+#### Scenario: A body failing its name
+- GIVEN a queued `add` whose blob had a byte flipped
+- WHEN the owner drains, the producer stages the body again, and the owner drains again
+- THEN `get` answers none, the first drain retries and unlinks the file, and the second applies the add (tests/store_rules.rs `a_body_failing_its_name_is_no_body_and_the_owner_unlinks_it`)
 
 ### Requirement: A load derives a tombstone's destination and reads its sync state
 `load` SHALL set a `Tombstone` placement's origin to the collection `DESTINATION_FOR_LINK` names, the same source's base-less binding of the same link id elsewhere, under the tombstone's own handle, so the engine derives `Remove { to }` from it (SYNC §3); a `Created` placement's origin stays `ORIGIN_FOR_LINK`'s. Both are derived from the bindings and never stored, so they read the same after a reopen and under every scope. Every scope SHALL read the source's checkpoint with its coverage (`LOAD_CHECKPOINT`) and its round under way (`LOAD_ROUND`), and an `All` scope while a round is open the bindings it has not stamped in its scope (`LIST_UNSTAMPED_BINDINGS`, STORAGE §14).
@@ -914,7 +905,7 @@ The drain SHALL record a receipt (`record_receipt`) in the transaction applying 
 - **THEN** `action_status(id)` is `Applied` with the `seq` of the new item, and a second `add` of the same key reads `Parked`
 
 ### Requirement: A collection keeps the role its source states
-`PimdirStore::set_collection_role(collection, role)` SHALL set or clear `collections.role` on a declared collection (pimdir STORAGE §14), a value outside its kind's vocabulary refused by the schema, the old holder of the role in the account losing it in the same statement (`collections_role_moves`), both collections stamped in the feed. `PimdirCollection::role` SHALL carry it on `list_collections` and `list_collections_by_account`. Opening a store as its owner SHALL add the column, `collections_by_role` and `collections_role_moves` when absent and recreate a `collections_stamp_update` that predates the column, in one transaction; a reader of a store its owner has not reconciled SHALL read every role as `None`.
+`PimdirStore::set_collection_role(collection, role)` SHALL set or clear `collections.role` on a declared collection (pimdir STORAGE §14), the old holder of the role in the account losing it in the same statement (`collections_role_moves`), both collections stamped in the feed. The column is an open vocabulary no constraint checks (§13): the owner SHALL refuse a role outside its collection's kind vocabulary (`collection::role_of_kind`) as `PimdirError::Role { collection, role }` (code `collection-role`), and a reader SHALL read a role it does not know, or one of another kind's, as `None`. `PimdirCollection::role` SHALL carry it on `list_collections` and `list_collections_by_account`; a reader of a store its owner has not reconciled SHALL read every role as `None` when the column is absent.
 
 #### Scenario: A server moves its Sent folder
 - **GIVEN** `imap/Sent` holding `sent`
@@ -922,12 +913,12 @@ The drain SHALL record a receipt (`record_receipt`) in the transaction applying 
 - **THEN** `imap/Sent` holds no role, `imap/Sent Items` holds `sent`, and both are above the reader's cursor
 
 ### Requirement: The store holds coverage and rounds per source
-`write` SHALL apply `OpenRound`, `SetRoundCursor`, `CloseRound` and `SetCoverage` with the canonical statements (`open_round`, `set_round_cursor`, `close_round`, `set_coverage`), the first in its batch after `ensure_collection`, `open_round` recording whether the round is a band round (`round_band`), which `load_round` answers as `PimdirRound::band`, and `Stamp` (`stamp_bindings`) after the batch's upserts, so a binding the batch inserted is stamped too (STORAGE §4.3, SYNC §5). The items a batch inserts SHALL draw their public ids in the order the batch upserts them, a page's members numbered in the order it names them. Open SHALL reconcile a store an earlier draft wrote, in one transaction: the coverage and round columns of `sources`, `round_band` among them, and `bindings.round` added by `ALTER TABLE`, each cut out of the canonical DDL, an open round of an earlier build reading as no band round, `sources_stamp_coverage` created, and the `probes` table dropped, its handles named again by the next round (STORAGE §6). A reader of a store not reconciled yet reads no coverage. A row an earlier draft wrote at level `0` SHALL load as `Meta` with no summary offered, a claim the next `Meta` upgrade revisits (STORAGE §13).
+`write` SHALL apply `OpenRound`, `SetRoundCursor`, `CloseRound` and `SetCoverage` with the canonical statements (`open_round`, `set_round_cursor`, `close_round`, `set_coverage`), the first in its batch after `ensure_collection`, `open_round` recording whether the round is a band round (`round_band`), which `load_round` answers as `PimdirRound::band`, and `Stamp` (`stamp_bindings`) after the batch's upserts, so a binding the batch inserted is stamped too (STORAGE §4.3, SYNC §5). The items a batch inserts SHALL draw their public ids in the order the batch upserts them, a page's members numbered in the order it names them. Open SHALL reconcile a store an earlier draft wrote, in one transaction: the coverage and round columns of `sources`, `round_band` among them, and `bindings.round` added by `ALTER TABLE`, each cut out of the canonical DDL, an open round of an earlier build reading as no band round, `sources_stamp_coverage` created, and the `probes` table dropped, its handles named again by the next round (STORAGE §6). A reader of a store not reconciled yet reads no coverage. A row an earlier draft wrote at level `0` is repaired to `1` by the reconciliation (`repair_levels`, STORAGE §6) and loads as `Meta`, the level being closed to 1 and 2 (STORAGE §13); the owner's read special-cases no other value.
 
 #### Scenario: An earlier draft's store
 - GIVEN a store holding a `probes` table, no coverage columns and items at level `0`
 - WHEN its owner opens it
-- THEN the columns and the trigger are added, `probes` is dropped, and the items load at `Meta` without their summary
+- THEN the columns and the trigger are added, `probes` is dropped, and the items load at `Meta`
 
 ### Requirement: A collection is listed with its coverage
 `PimdirCollection::coverage` SHALL be the narrowest coverage of the collection's sources (the latest floor, the earliest ceiling, the oldest closing), `None` while one of them never closed a round (STORAGE §14.1); `list_coverage(collection)` SHALL answer it per source, with the scope and start of the round each has under way. A coverage moving restamps its collection (`sources_stamp_coverage`).
@@ -989,10 +980,17 @@ A write recording an item's summary SHALL run the canonical rule statements for 
 - tests/files.rs `an_earlier_role_constraint_is_rebuilt_on_open`, tests/linking.rs `an_earlier_store_backfills_the_invitation_on_open`.
 
 ### Requirement: Open reconciles against the canonical text
-Opening a store as its owner SHALL refuse one missing a core table or trigger (`PimdirError::Stale`), then compare every table, index and trigger with the one the canonical migrations create in an empty in-memory database, by its `sqlite_schema` text with comments dropped and whitespace collapsed (STORAGE §6). A table that differs SHALL be rebuilt from the canonical text in one transaction (its indexes and triggers dropped, renamed aside with `legacy_alter_table` on and foreign keys off, created, its shared columns copied, its `AUTOINCREMENT` counter carried, the old one dropped); what is missing SHALL be created, what differs recreated, what the canonical schema lacks dropped; the columns a rebuild added SHALL be backfilled (`backfill_shared_object`, the invitation from the held bodies by `list_held_mail`, the task columns `priority`, `categories`, `parent` and `mid` from the held bodies by `list_held_tasks` then the four task rules with a `NULL` link id), and no foreign key left dangling. A current store SHALL be left untouched.
+Opening a version 1 store as its owner SHALL compare every table, index and trigger with the one 0001_init.sql alone creates in an empty in-memory database, by its `sqlite_schema` text with comments dropped and whitespace collapsed (STORAGE §6). A store that differs SHALL be reconciled in one transaction, foreign keys off:
+
+1. The data a new constraint would refuse is repaired first: `repair_shared_objects` and `recompute_refcounts` (once `bindings` holds `shared_object`, else after it is rebuilt), `repair_levels`, `repair_kinds`.
+2. A table that differs is rebuilt from the canonical text (its indexes and triggers dropped, renamed aside with `legacy_alter_table` on, created, its shared columns copied, its `AUTOINCREMENT` counter carried, the old one dropped).
+3. What is missing is created, what differs recreated, what the canonical schema lacks dropped.
+4. The columns a rebuild added are backfilled with the canonical statements: `backfill_shared_object` then `repair_shared_objects`, `backfill_invitation` over the held bodies by `list_held_mail` then `link_invitations_of`, `backfill_task_organisation` over the held bodies by `list_held_tasks` then the four task rules with a `NULL` link id; then `recompute_refcounts` again, and no foreign key left dangling.
+
+A current store SHALL be left untouched.
 
 #### Scenario: An older shape reconciled
-- tests/files.rs `an_earlier_role_constraint_is_rebuilt_on_open` (the rebuilt text equals a fresh store's), tests/scoped_sync.rs `an_earlier_draft_store_is_reconciled_on_open`, tests/linking.rs `an_earlier_store_backfills_the_invitation_on_open`, tests/references.rs `an_earlier_store_gains_the_references_on_open`.
+- tests/files.rs `an_earlier_role_constraint_is_rebuilt_on_open` (the rebuilt text equals a fresh store's), tests/scoped_sync.rs `an_earlier_draft_store_is_reconciled_on_open` (a level 0 row repaired to `Meta`), tests/linking.rs `an_earlier_store_backfills_the_invitation_on_open`, tests/references.rs `an_earlier_store_gains_the_references_on_open`.
 
 ### Requirement: A body entering the store stands for its attachments
 A write SHALL record, in its transaction, the stand-ins of every `message/rfc822` body it brings into the store (STORAGE §14.3): a body a live, stored item under a key naming an identity gains, which `lookup_objects` did not find under that key in the account before the write. Each part `summary::mail::attachments` answers SHALL get a file at `Meta` holding no body in the account's attachments collection, keyed `part:`, with its `file_summary`, unless the collection holds it, and an `auto` `attachment` reference from the message. The collection SHALL be the account's file collection with the role `attachments`, else `<account>/\u0001attachments` (`\u0001attachments` with no account) declared with the file kind, the name `attachments` and the role. A body filed again, stored again or held before SHALL walk nothing: no backfill, no recompute.
@@ -1031,8 +1029,7 @@ A write SHALL state, on the mail row of every live, stored item gaining a body (
 - THEN it answers asked@example.org alone (tests/replied.rs)
 
 ### Requirement: An owner open that reconciles nothing
-
-`PimdirStore::open_current(dir)` SHALL open the existing store as its owner, taking the same lock as `open` (`PimdirError::Owned` at once when another process holds it), and SHALL create, migrate and reconcile nothing. It SHALL refuse, writing nothing, as `PimdirError::NotCurrent` with `PimdirNotCurrent::Absent` when no pimdir.db is under `dir`, `PimdirNotCurrent::Version { found }` when `user_version` is not this crate's, and `PimdirNotCurrent::Shape { object }` naming the first table, index or trigger whose text differs from the canonical schema or that one side lacks, which `open` would reconcile. A damaged store is refused as `open` refuses it (`Stale`, `VersionMismatch`, `HashAlgo`).
+`PimdirStore::open_current(dir)` SHALL open the existing store as its owner, taking the same lock as `open` (`PimdirError::Owned` at once when another process holds it), and SHALL create, migrate and reconcile nothing. It SHALL refuse, writing nothing, as `PimdirError::NotCurrent` with `PimdirNotCurrent::Absent` when no pimdir.db is under `dir`, `PimdirNotCurrent::Version { found }` when `user_version` is not this crate's, and `PimdirNotCurrent::Shape { object }` naming the first table, index or trigger whose text differs from the canonical schema or that one side lacks, which `open` would reconcile. A damaged or foreign store is refused as `open` refuses it (`Stale`, `VersionMismatch`, `Foreign`, `HashAlgo`).
 
 #### Scenario: a store another revision reconciled
 - GIVEN a store whose `task_summary` lacks the task organisation columns
@@ -1047,3 +1044,144 @@ A write SHALL state, on the mail row of every live, stored item gaining a body (
 - GIVEN task 1 live in Inbox and a queued add into Next carrying `supersedes: {Inbox, 1}`, Next holding a live item under the add's link id
 - WHEN the owner drains
 - THEN the row is parked, task 1 is still live in Inbox and no supersession is recorded (tests/engine/supersedes.rs)
+
+### Requirement: A producer stages its own body
+`PimdirProducer::stage_body(bytes)` SHALL hash a body under the store's algorithm and write it to the blob tree while the producer's staging lock is held, answering the `PimdirObject` `enqueue` takes; `PimdirProducer::blob_writer()` SHALL do the same for a streamed body. A collector running between the stage and the enqueue SHALL be refused (`PimdirError::Staging`), so the body reaches the row that pins it.
+
+The producer SHALL hold the staging lock for its staging window alone (STORAGE §8), not its lifetime: taken at the first `stage_body`, `blob_writer` or one-step enqueue, released once a committed enqueue of this producer pinned every body it staged whole, and kept until the producer drops after a streamed one, whose hash the writer alone knows. An open producer that stages nothing, an always-open frontend, keeps no collector out. The lock is taken before the enqueue transaction opens, so waiting out a collector never holds the write lock it needs.
+
+#### Scenario: An idle producer
+- tests/staging.rs `an_idle_producer_keeps_no_collector_out` (failed before the change: the collector was refused beside an idle producer)
+
+#### Scenario: A collector between a stage and its enqueue
+- GIVEN a producer that staged a body and has not enqueued yet
+- WHEN the owner runs the collector, then the producer enqueues an `add` naming the body
+- THEN the collector is refused with `Staging`, and the drain applies the add over the body (tests/staging.rs `a_body_staged_before_its_enqueue_survives_a_collector`)
+
+### Requirement: A create refuses a link id live or pending
+`PimdirProducer::enqueue_add(collection, link_id, flags, object, supersedes)` SHALL enqueue an `add` naming `link_id`, answering the queue row id, and SHALL refuse it with `PimdirError::Duplicate`, nothing appended, when the collection holds a live item under that link id (`live_item_for_link`, the check the drain parks on) that no pending `remove` or `move` withdraws, or when a pending `add` in the collection names it. The check and the append SHALL be one transaction, so two producers cannot both pass it.
+
+#### Scenario: A create racing the same key
+- GIVEN a collection with a live item `mid:a` and a pending add `mid:b`
+- WHEN a producer adds `mid:a`, then `mid:b`, then `mid:c`
+- THEN the first two are `Duplicate` (`Live(seq)`, `Pending(row)`) and leave the queue as it was, the third answers its row id (tests/staging.rs `a_create_naming_a_live_or_pending_link_id_is_refused`)
+
+### Requirement: The submit intent is typed
+`intent::PimdirSubmit` SHALL build and read the `submit` intent payload (pimdir STORAGE Annex B.2): `v: 1`, the optional performing `source`, the message's `object` (the body the row pins), the envelope `from` (empty for the null path) and `rcpts` (at least one), the optional `subject` and the optional `copy` collection. `to_action` SHALL validate and answer the `PimdirAction::Unknown` carrying it, its `object_hash` set; `from_payload` SHALL read a payload strictly, refusing an unknown version, a missing field or an empty `rcpts` with `PimdirActionError`.
+
+### Requirement: An error carries a stable code
+`PimdirError::code()` SHALL answer a stable kebab-case code per failure, the contract a consumer maps to its own output rather than matching the message: `store-stale`, `store-newer` (a `Version`, raised above this crate's version alone, or a `NotCurrent` above it), `store-uncreated` (an `Uncreated` or an absent `NotCurrent`), `store-foreign`, `store-not-current`, `store-corrupt`, `store-hash-algo`, `store-busy`, `store-owned`, `store-staging`, `store-in-flight`, `sql`, `io`, `json`, `action-malformed`, `binding-rebind`, `placement-unnamed`, `scope-not-mail`, `collection-not-files`, `collection-synced`, `collection-not-unbound`, `item-duplicate`, `unsupported`, `no-performer`, `ambiguous-performer`, `cutoff-invalid`, and with `search` `query-refused`, `tag-refused`, `index-fts5-missing`, `query-unanswerable`, `index-busy`, `index-missing`, `index-outdated`, `index-query-only`. A code never changes meaning; a new failure gets a new code.
+
+No message SHALL advise deleting the store: a resync restores neither the queue, unsent mail, retained items, references nor items kept on the device. `Stale` and `NotCurrent` say to run or upgrade the store's sync engine, `Version` above this crate's to upgrade this program; the CLI's report the same.
+
+#### Scenario: A newer store
+- GIVEN a store stamped above this crate's version
+- WHEN an owner, a producer or a reader opens it
+- THEN the error's code is `store-newer` and its message ends "upgrade this program", naming no reset (tests/queue.rs `a_store_stamped_with_a_higher_version_is_refused`); a store missing a core table is `store-stale`, its message ending "run or upgrade the store's sync engine" (tests/stale_store.rs)
+
+### Requirement: The public API names no foreign error type
+`PimdirError::Sql`, `Unanswerable` and `Json` SHALL wrap the opaque `PimdirSqlError` and `PimdirJsonError`, which display the cause and give it through `Error::source` without naming rusqlite or serde_json types, so a major of either is not one of this crate. The `From` conversions the crate's own `?` relies on are hidden from the documentation and are no contract.
+
+### Requirement: The enums consumers match grow without a major
+`PimdirError`, `PimdirSyncEvent`, `PimdirEnumerated` and `PimdirQueryErrorCode` SHALL be `#[non_exhaustive]`: a consumer matching one keeps a wildcard arm, and a variant the spec adds is a minor. Structs stay pub-fielded and exhaustive, built as literals.
+
+### Requirement: A store this crate may not write is never written
+A store above this crate's version, a foreign database, and a store whose algorithm is not the one declared SHALL be refused by the owner open before any byte of pimdir.db changes; the reader, the producer and `open_current` SHALL refuse the first two as well, a database declaring tables at `user_version` 0 being foreign (`PimdirError::Foreign`, `store-foreign`) for every role, never `store-uncreated` nor `store-not-current` (tests/store_version.rs `every_role_refuses_a_foreign_database_as_foreign`).
+
+#### Scenario: A newer store in rollback-journal mode
+- GIVEN a released store stamped one version above this crate's, in rollback-journal mode, holding a table this crate does not know
+- WHEN the owner, a reader, a producer and `open_current` open it
+- THEN each is refused (`Version`, `store-newer`) and pimdir.db is byte for byte as it was (tests/store_version.rs `a_store_above_this_version_is_refused_by_every_role_and_never_written`; also `a_foreign_database_is_refused_and_left_as_it_was`, `a_declared_algorithm_is_checked_before_anything_is_reconciled`)
+
+### Requirement: A reader or a producer reads an older store as it stands
+A reader or a producer meeting a store below this crate's version, or a version 1 store its owner has not reconciled yet, SHALL read it as its reconciliation would leave it before any backfill (STORAGE §6): a column it lacks as its canonical `DEFAULT` where 0001_init.sql declares it `NOT NULL` with one, else `NULL`, a table it lacks as empty, running no statement naming either. `schema::as_reconciled` runs a canonical statement with each table the store lacks, or holds without some column, read through a subquery answering the canonical columns, the statement's parameters and result columns kept; every statement a reader, a producer or the search index runs over the store goes through it, through `schema::StoreShape`, which runs it unchanged on a store holding every canonical table and column: the collection listings, `list_coverage`, `replied`, the task and summary reads, the capability and performer reads, the queue and receipt reads, the reference, attachment, file and endpoint reads, and the index's compiled query, feed and extraction. A store without the capability tables therefore lists its syncing sources undeclared, and one without `file_summary` lists its attachments without summaries, as its owner's reconciliation would. Owner-only paths (the drain, the write path, diagnostics) read a store their open reconciled or `open_current` found current. A source whose store lacks the coverage columns therefore never closed a round: `list_coverage` lists it with no coverage, and a search over its collection is filling, never complete.
+
+#### Scenario: The released fixtures, read as they stand
+- GIVEN a store io-pimdir 0.5.1, 0.7.0 or 0.8.0 wrote, with a source syncing INBOX
+- WHEN a reader and a producer read it
+- THEN `list_coverage("INBOX")` lists the source with no coverage and no round, `search_coverage` is `Bounded { filling: true }`, every public read answers, and pimdir.db is byte for byte as it was (tests/store_version.rs `a_store_released_by_*_reads_as_its_reconciliation_would_leave_it`; 0.5.1 failed before the change: no source listed)
+- src/client/schema.rs `a_statement_reads_an_older_store_as_its_reconciliation_leaves_it` (a `NOT NULL` default, `categories` as `'[]'`, a missing table as no row), `a_current_store_runs_the_statement_unchanged`
+
+#### Scenario: Capabilities on a store without the capability tables
+- GIVEN the 0.5.1 fixture, unreconciled, and a copy its owner reconciled
+- WHEN a reader and a producer read capabilities, performers and action statuses
+- THEN both answer alike, the syncing sources undeclared (tests/store_version.rs `a_store_released_by_*_declares_as_its_reconciliation_would`; 0.5.1 failed before: no source listed)
+
+### Requirement: A released store opens whole
+A store io-pimdir 0.5.1, 0.7.0 or 0.8.0 wrote SHALL open as owner with every row of every table kept: collections (one of a media type outside today's closed set, recorded kindless), items (a retained one included), bindings, objects, receipts, references, and the queue, its parked row still parked and its pending rows applying at the next drain; the invitation and the task organisation are re-derived from the held bodies, the refcounts settle with no drift, and the next `open_current` finds it current.
+
+#### Scenario: The released fixtures
+- tests/fixtures/store-v0.5.1, store-v0.7.0 and store-v0.8.0, written by those releases with tests/fixtures/store_gen.rs, read by a reader and a producer before the owner opens them (tests/store_version.rs `a_store_released_by_*_opens_without_losing_a_row`)
+
+### Requirement: A migration runs after the reconciliation and keeps every row
+A migration above version 1 SHALL run after the reconciliation of a version 1 store, so a script assuming 0001's canonical shape applies; it SHALL move both stamps to its number and keep every row of every table. A store at version 2 or above is never reconciled to 0001.
+
+#### Scenario: A synthetic 0002
+- GIVEN a version 1 store missing an index an earlier draft lacked, and a 0002 that drops that index, adds a column and a table
+- WHEN the runner opens it with both migrations
+- THEN both stamps read 2, every table keeps its row count, a second open drops nothing it added, and this crate (version 1) refuses it as `Version { found: 2 }` (src/client/schema.rs `migration::a_migration_runs_after_the_reconciliation_and_keeps_every_row`)
+
+### Requirement: The store records the derivation revision
+The store SHALL record in `store_meta.derivation` the Annex A revision its summaries, addresses and sort keys were derived under (STORAGE §6): `init_store_meta` writes this crate's (`schema::DERIVATION`, revision 1), a reconciliation gives an existing store the column's default 1, and an owner at a later revision re-derives what changed then records it with `set_derivation`, which never lowers it. Raising `DERIVATION` owes that re-derivation.
+
+### Requirement: A stated identity beginning like a derived key is escaped
+The key a body states (a `Message-ID`, a vCard or iCalendar `UID`) SHALL be filed under `esc:` and the hint when the hint begins with one of the reserved prefixes `alt:`, `hash:`, `dup:`, `part:`, `file:` or `esc:` (STORAGE §9, `PimdirLinkId::RESERVED`, `PimdirLinkId::from_hint`), so it never reads as a key the writer derived. A connector naming the identity to its server strips the one leading `esc:`.
+
+#### Scenario: A card whose UID reads like a hash key
+- the summaries vector case card-reserved-uid.vcf (tests/summaries.rs)
+
+### Requirement: An edit names the body it replaced
+`PimdirAction::Update` SHALL carry `if_match: Option<PimdirHash>`, encoded as the payload's optional `if_match` (STORAGE §15.3): the body the producer read and replaced. The drain SHALL park the row, naming both bodies, when the item holds another body, and apply a row stating none over whatever the item holds.
+
+#### Scenario: Two producers edit one read
+- tests/store_rules.rs `an_update_whose_read_body_was_replaced_parks`
+
+### Requirement: A write staged with its body stages nothing when refused
+`PimdirProducer::enqueue_with_body(collection, body, |hash| action)` SHALL hash the body, build the action from its hash, run the gate of §15.6 on the bytes in hand and, for an `add`, the duplicate check of `enqueue_add` on its link id or on the key the drain would derive from the body, then write the body and append the row in one transaction, answering the row id. A refused write SHALL leave objects/ as it was. `stage_body` with `enqueue` or `enqueue_add` keep working, a refused write there leaving its body for the collector.
+
+`PimdirProducer::enqueue_with_body_checked` SHALL be the same step answering `PimdirEnqueued { id, partial }`, `partial` the partial supports the gate passed the action with, read with the body in hand, so a frontend warns without running `check` a second time (tests/capabilities.rs `a_checked_enqueue_answers_the_partial_supports_it_passed_with`).
+
+#### Scenario: A duplicate and an unsupported create
+- tests/staging.rs `a_create_refused_for_its_link_id_stages_nothing`, tests/capabilities.rs `a_refused_create_stages_nothing`
+
+### Requirement: An action on an item no source binds is the store's to settle
+The drain SHALL never skip an action on an existing item no source binds, which would leave the row pending for ever (STORAGE §15.2 reserves skipping for a kind, a payload version or an intent the owner does not run). A `remove` SHALL retain the item, a delete nobody pushes. In a collection no source syncs, an item kept on the device (`put_item`, STORAGE §14.3), a `set-flags` SHALL set its flags and an `update` SHALL write its new body as `put_item` writes one, its flags kept and its summary derived again, on an `update`'s usual terms: one whose `if_match` names another body than the item's parks naming both (STORAGE §15.3), checked before the item is found unbound; a body deriving no summary, or another key than the item's, parks. A `move` or a `copy` of such an item, and anything on an unbound item of a synced collection, SHALL park naming the item. Each applied row leaves its receipt and releases its pin as any other.
+
+#### Scenario: A device-only event edited, flagged, moved and removed
+- tests/unbound_items.rs `a_queued_action_on_an_item_no_source_binds_applies_or_parks` (failed before the change: the drain reported both rows skipped)
+
+#### Scenario: A device-only event edited over a replaced body
+- tests/unbound_items.rs `an_unbound_edit_over_a_replaced_body_parks` (passed before this change: the fence was already checked in `stage_action`)
+
+### Requirement: The drain reports the bodies a policy kept aside
+`PimdirDrainReport::overruled` SHALL list, as `PimdirDrainOverruled { id, collection, link_id }`, every body a collection's conflict policy did not adopt while an applied row was written (SYNC §9), kept as a retained item under `link_id`: nothing else reports a body set aside during a drain. `PimdirDrainReport` is therefore not `Copy`.
+
+#### Scenario: A drained edit under prefer-incoming
+- tests/queue.rs `a_body_a_policy_overrules_during_a_drain_is_reported` (failed before the change: the retained item was kept and nothing reported it)
+
+### Requirement: The journal mode is chosen when the store is created
+The owner open SHALL set `PRAGMA journal_mode = WAL` when it creates a store, as STORAGE §4.1 recommends for a local one, and no handle SHALL set the journal mode of an existing store: a store its operator switched to a rollback journal for a network filesystem (STORAGE §8) stays on it through every owner, producer and reader open. README states the switch.
+
+#### Scenario: A store on a rollback journal
+- tests/store_rules.rs `a_store_on_a_rollback_journal_stays_on_it` (failed before the change: the producer's open set WAL again)
+
+### Requirement: A purge cutoff is written as the stamps are
+`purge_retained_before(cutoff)` SHALL refuse a cutoff not written as the store's stamps are, `%Y-%m-%dT%H:%M:%fZ` (STORAGE §11.2, the comparison being textual), as `PimdirError::Cutoff` (`cutoff-invalid`), purging nothing: a word (`now`) or an instant without milliseconds would purge what was never asked.
+
+#### Scenario: A word and an instant without milliseconds
+- tests/retention.rs `a_purge_cutoff_not_written_as_the_stamps_are_is_refused` (failed before the change: `now` purged the trash)
+
+### Requirement: pimdir.db holds the canonical schema alone
+The owner's reconciliation of a version 1 store SHALL drop every table, column, index and trigger 0001_init.sql lacks, whoever added it (STORAGE §6), and this crate SHALL keep no state of its own in pimdir.db: the search index's lives in index.db (SEARCH §2), the locks in their own files.
+
+#### Scenario: Another implementation's schema
+- GIVEN a current store to which another implementation added a table, a column, an index and a trigger
+- WHEN its owner opens it
+- THEN all four are gone, every canonical row is kept, and `open_current` finds it current (tests/store_version.rs `the_reconciliation_drops_what_the_canonical_schema_lacks`)
+
+### Requirement: A producer proves it can write without writing
+`PimdirProducer::probe` SHALL take the staging lock shared without waiting and release it, and take the database's write lock and roll it back, so an app's check proves the store writable by its producer, the staging lock included, before its first write, writing nothing into the store (objects/ untouched). A collector holding the staging lock SHALL be reported at once as `PimdirError::Busy` (`store-busy`), never waited out. A producer whose staging window is open already holds the lock and probes the database alone.
+
+#### Scenario: A collector holds the staging lock
+- GIVEN a store whose objects.lock another process holds exclusively
+- WHEN a producer probes, THEN it answers `Busy` at once; once the lock is released it answers Ok, and objects/ holds no file (tests/staging.rs `a_probe_takes_the_staging_lock_and_writes_nothing`)

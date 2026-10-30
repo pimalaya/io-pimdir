@@ -1,0 +1,6 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:urn:uuid:card-1
+FN:Alice Example
+EMAIL:alice@example.org
+END:VCARD

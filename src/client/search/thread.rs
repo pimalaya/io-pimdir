@@ -27,7 +27,7 @@ use mail_parser::MessageParser;
 use rusqlite::{OptionalExtension, Transaction, named_params};
 
 use crate::{
-    client::{PimdirError, blobs::PimdirBlobs, rows},
+    client::{PimdirError, blobs::PimdirBlobs, rows, schema::StoreShape},
     object::PimdirHash,
     sql::search,
 };
@@ -37,6 +37,7 @@ use crate::{
 pub(crate) fn relink(
     tx: &Transaction,
     blobs: &PimdirBlobs,
+    shape: StoreShape,
     touched: &BTreeSet<String>,
 ) -> Result<(), PimdirError> {
     if touched.is_empty() {
@@ -47,13 +48,13 @@ pub(crate) fn relink(
     let mut seeds = BTreeSet::new();
     for link_id in touched {
         let held = message(tx, link_id)?;
-        let present = presence(tx, link_id)?.is_some();
+        let present = presence(tx, shape, link_id)?.is_some();
         if held.is_none() && !present {
             continue;
         }
 
         let parent = match present {
-            true => parent(tx, blobs, link_id)?,
+            true => parent(tx, blobs, shape, link_id)?,
             false => None,
         };
         // NOTE: the edge that would close a cycle is ignored, a message
@@ -87,7 +88,7 @@ pub(crate) fn relink(
         seeds.insert(link_id.clone());
     }
 
-    rethread(tx, &seeds)
+    rethread(tx, shape, &seeds)
 }
 
 /// Recomputes the thread of every component a seed is in: a component
@@ -96,7 +97,11 @@ pub(crate) fn relink(
 /// pointed to one thread row named after the present member with the
 /// lowest `(sort_key, link_id)`; last the thread rows no member points
 /// to any more.
-fn rethread(tx: &Transaction, seeds: &BTreeSet<String>) -> Result<(), PimdirError> {
+fn rethread(
+    tx: &Transaction,
+    shape: StoreShape,
+    seeds: &BTreeSet<String>,
+) -> Result<(), PimdirError> {
     let mut done = BTreeSet::new();
     let mut stale = BTreeSet::new();
 
@@ -128,7 +133,7 @@ fn rethread(tx: &Transaction, seeds: &BTreeSet<String>) -> Result<(), PimdirErro
 
         let mut present = Vec::new();
         for link_id in members.keys() {
-            if let Some(presence) = presence(tx, link_id)? {
+            if let Some(presence) = presence(tx, shape, link_id)? {
                 present.push((link_id.clone(), presence));
             }
         }
@@ -202,10 +207,14 @@ fn message(
 
 /// The mail placements the index holds for an id, `None` when it holds
 /// none: a message the store does not hold.
-fn presence(tx: &Transaction, link_id: &str) -> Result<Option<Presence>, PimdirError> {
+fn presence(
+    tx: &Transaction,
+    shape: StoreShape,
+    link_id: &str,
+) -> Result<Option<Presence>, PimdirError> {
     let (count, sort_key, first, last): (i64, Option<String>, Option<String>, Option<String>) = tx
         .query_row(
-            search::MESSAGE_PRESENCE,
+            &shape.sql(tx, search::MESSAGE_PRESENCE)?,
             named_params! { ":link_id": link_id },
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
@@ -223,6 +232,7 @@ fn presence(tx: &Transaction, link_id: &str) -> Result<Option<Presence>, PimdirE
 fn parent(
     tx: &Transaction,
     blobs: &PimdirBlobs,
+    shape: StoreShape,
     link_id: &str,
 ) -> Result<Option<String>, PimdirError> {
     let hash: Option<String> = tx
@@ -250,7 +260,7 @@ fn parent(
 
     let in_reply_to: Option<String> = tx
         .query_row(
-            search::MESSAGE_IN_REPLY_TO,
+            &shape.sql(tx, search::MESSAGE_IN_REPLY_TO)?,
             named_params! { ":link_id": link_id },
             |r| r.get(0),
         )

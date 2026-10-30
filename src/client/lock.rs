@@ -167,13 +167,27 @@ impl PimdirLock {
     ///
     /// A producer writes a body to the blob tree and then enqueues the
     /// action that pins it, and in between the body is a file nothing
-    /// references. The lock spans the producer handle rather than the
-    /// enqueue, so the blob write is inside the window too. It waits
+    /// references. The producer holds it from the first body it stages
+    /// until a row pins every one, so the blob write is inside the window
+    /// too, and an idle producer holds none. It waits
     /// rather than failing: the only thing it waits for is a collector,
     /// whose work is bounded.
     pub fn stage(dir: &Path) -> Result<Self, PimdirError> {
         let file = open(&dir.join(OBJECTS))?;
         FileExt::lock_shared(&file)?;
+        Ok(Self {
+            _file: Some(file),
+            registered: None,
+            shared: Arc::default(),
+        })
+    }
+
+    /// Takes the store's shared staging lock without waiting: a collector
+    /// holding it exclusively is [`PimdirError::Busy`], reported at once. What
+    /// a producer's probe takes and releases.
+    pub fn try_stage(dir: &Path) -> Result<Self, PimdirError> {
+        let file = open(&dir.join(OBJECTS))?;
+        FileExt::try_lock_shared(&file).map_err(|_| PimdirError::Busy)?;
         Ok(Self {
             _file: Some(file),
             registered: None,

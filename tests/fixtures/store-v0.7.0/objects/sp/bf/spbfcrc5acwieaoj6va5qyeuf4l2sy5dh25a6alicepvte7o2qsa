@@ -1,0 +1,22 @@
+Message-ID: <b@example.org>
+From: Carol <carol@example.org>
+To: Bob <bob@example.org>
+Subject: invitation
+Date: Tue, 06 Oct 2026 10:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/calendar; method=REQUEST; charset=utf-8
+
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//fixture//EN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:meet-1@example.org
+DTSTAMP:20261006T100000Z
+DTSTART:20261010T100000Z
+DTEND:20261010T110000Z
+SUMMARY:Meeting
+ORGANIZER:mailto:carol@example.org
+ATTENDEE:mailto:bob@example.org
+END:VEVENT
+END:VCALENDAR

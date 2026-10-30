@@ -16,6 +16,7 @@ use io_pimdir::client::{PimdirSourceStore, PimdirStore};
 use io_pimdir::{
     change::PimdirWriteOp,
     collection::PimdirCollectionId,
+    hash::PimdirHashAlgo,
     hub::PimdirSourceId,
     load::PimdirLoadScope,
     object::{PimdirHash, PimdirObject},
@@ -51,33 +52,36 @@ fn card(
         collection: PimdirCollectionId(collection.into()),
         handle: PimdirHandle(handle.into()),
         link_id: Some(PimdirLinkId(link.into())),
-        object: Some(PimdirHash(object.into())),
+        object: Some(hashed(object)),
         level: PimdirLevel::Full,
         summary: None,
         flags: PimdirFlags::default(),
         status,
         conflict_revision: conflict_revision.map(Into::into),
-        conflict_object: conflict_object.map(|hash| PimdirHash(hash.into())),
+        conflict_object: conflict_object.map(hashed),
         base: Some(PimdirBase {
             flags: PimdirFlags::default(),
             revision: Some("r-base".into()),
-            object: Some(PimdirHash("0rig".into())),
+            object: Some(hashed("0rig")),
         }),
         origin: None,
     }
 }
 
-fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
+fn store_object(name: &str) -> PimdirWriteOp {
+    let body = body_of(name);
     PimdirWriteOp::StoreObject {
         object: PimdirObject {
-            hash: PimdirHash(hash.into()),
+            hash: hashed(name),
             size: body.len(),
         },
-        body: Some(body.to_vec()),
+        body: Some(body),
     }
 }
 
-fn blob_exists(dir: &std::path::Path, hash: &str) -> bool {
+fn blob_exists(dir: &std::path::Path, name: &str) -> bool {
+    let hash = hashed(name).0;
+    let hash = hash.as_str();
     dir.join("objects")
         .join(&hash[0..2])
         .join(&hash[2..4])
@@ -97,6 +101,11 @@ fn body_of(hash: &str) -> Vec<u8> {
     format!("the card at {hash}").into_bytes()
 }
 
+/// The content hash of the body filed under a name, as the store names it.
+fn hashed(name: &str) -> PimdirHash {
+    PimdirHashAlgo::default().hash(&body_of(name))
+}
+
 /// A placement plus the bodies it points at, as one batch.
 ///
 /// They must ride in the **same** batch: an object no placement references has
@@ -108,13 +117,10 @@ fn card_batch(
     conflict_revision: Option<&str>,
     conflict_object: Option<&str>,
 ) -> Vec<PimdirWriteOp> {
-    let mut batch = vec![
-        store_object("0rig", b"old"),
-        store_object(object, &body_of(object)),
-    ];
+    let mut batch = vec![store_object("0rig"), store_object(object)];
 
     if let Some(hash) = conflict_object {
-        batch.push(store_object(hash, b"remote"));
+        batch.push(store_object(hash));
     }
 
     batch.push(PimdirWriteOp::UpsertPlacement(card(
@@ -157,7 +163,7 @@ fn a_conflict_survives_a_reopen() {
     );
     assert_eq!(
         loaded.placements[0].conflict_object,
-        Some(PimdirHash("rmte".into())),
+        Some(hashed("rmte")),
         "and the body at that revision is what it merges, with no remote to ask"
     );
 }
@@ -207,18 +213,18 @@ fn resolving_the_conflict_clears_it_and_adopts_the_merged_body() {
 
     assert_eq!(
         loaded.placements[0].object,
-        Some(PimdirHash("mrgd".into())),
+        Some(hashed("mrgd")),
         "the merged card is what the store holds; keeping the pre-merge body \
          discards the resolution and pushes it over the remote next run"
     );
     assert_eq!(
-        store.blobs().get(&PimdirHash("mrgd".into())).unwrap(),
+        store.blobs().get(&hashed("mrgd")).unwrap(),
         Some(body_of("mrgd")),
         "and the hash it holds resolves to the merged bytes"
     );
     assert_eq!(
         store.list_items("contacts", None, 10).unwrap()[0].object,
-        Some(PimdirHash("mrgd".into())),
+        Some(hashed("mrgd")),
         "and the client read agrees with the seam about which body it is"
     );
 }
@@ -252,10 +258,7 @@ fn a_conflict_body_outlives_a_collection() {
     );
 
     let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
-    assert_eq!(
-        loaded.placements[0].conflict_object,
-        Some(PimdirHash("rmte".into()))
-    );
+    assert_eq!(loaded.placements[0].conflict_object, Some(hashed("rmte")));
 }
 
 /// The other half: the pin is a pin, not a leak, and neither is the body
@@ -303,7 +306,7 @@ fn resolving_releases_the_pin_and_the_next_collection_takes_the_body() {
         "and the pre-merge body is released rather than pinned for ever"
     );
     assert_eq!(
-        store.blobs().get(&PimdirHash("mrgd".into())).unwrap(),
+        store.blobs().get(&hashed("mrgd")).unwrap(),
         Some(body_of("mrgd")),
         "the merged body is what survives the collection"
     );
@@ -357,12 +360,9 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
             None,
         ),
     ] {
-        let mut batch = vec![
-            store_object("0rig", b"old"),
-            store_object("ed17", &body_of("ed17")),
-        ];
+        let mut batch = vec![store_object("0rig"), store_object("ed17")];
         if let Some(hash) = object {
-            batch.push(store_object(hash, b"remote"));
+            batch.push(store_object(hash));
         }
         batch.push(PimdirWriteOp::UpsertPlacement(card(
             collection, handle, link, "ed17", status, revision, object,
@@ -380,14 +380,14 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
     assert_eq!(event.source, PimdirSourceId("left".into()));
     assert_eq!(event.handle, PimdirHandle("event1.ics".into()));
     assert_eq!(event.conflict_revision.as_deref(), Some("r-event"));
-    assert_eq!(event.conflict_object, Some(PimdirHash("evnt".into())));
+    assert_eq!(event.conflict_object, Some(hashed("evnt")));
 
     // The three bodies of a divergence, off one row: what the two sides last
     // agreed on, what this store holds, and what the remote holds.
     let card = &conflicts[1];
     assert_eq!(card.collection, "contacts");
     assert_eq!(card.link_id, PimdirLinkId("uid:a".into()));
-    assert_eq!(card.base_object, Some(PimdirHash("0rig".into())));
-    assert_eq!(card.object, Some(PimdirHash("ed17".into())));
-    assert_eq!(card.conflict_object, Some(PimdirHash("rmte".into())));
+    assert_eq!(card.base_object, Some(hashed("0rig")));
+    assert_eq!(card.object, Some(hashed("ed17")));
+    assert_eq!(card.conflict_object, Some(hashed("rmte")));
 }

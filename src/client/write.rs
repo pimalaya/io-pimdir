@@ -22,23 +22,24 @@ use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
         PimdirError, PimdirSourceStore, attachments, blobs::PimdirBlobs, busy_or_sql, release_pins,
-        rows,
+        rows, schema,
     },
     codec,
     collection::{
         PimdirCheckpoint, PimdirCollectionId, PimdirCoverage, PimdirCursor, PimdirRound,
         PimdirScope,
     },
-    hub::{PimdirBinding, PimdirHub, PimdirHubItem, PimdirSourceId},
+    coroutine::PimdirWritten,
+    hub::{PimdirBinding, PimdirHub, PimdirHubItem, PimdirOverruled, PimdirSourceId},
     load::{PimdirLoadScope, PimdirLoaded},
     object::{PimdirHash, PimdirObject},
     placement::{
-        PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin, PimdirPlacement,
-        PimdirSortKey, PimdirStatus, PimdirSuperseded,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
+        PimdirPlacement, PimdirSortKey, PimdirStatus, PimdirSuperseded,
     },
     sql,
     summary::{
-        PimdirAddress, PimdirAddressRole, PimdirDerivation, PimdirSummary,
+        self, PimdirAddress, PimdirAddressRole, PimdirDerivation, PimdirSummary,
         calendar::{PimdirEventSummary, PimdirJournalSummary, PimdirTaskSummary, PimdirTime},
         contact::PimdirContactSummary,
         file::{self, PimdirFileSummary},
@@ -204,12 +205,38 @@ impl PimdirSourceStore {
         Ok(found.into_iter().collect())
     }
 
-    /// Applies a write batch atomically and in order (§14).
+    /// The bodies among `hashes` whose blob reads whole and hashes to its
+    /// name (STORAGE §7), streamed: a missing or corrupt one is left out,
+    /// so a sync never pushes it (SYNC §5).
+    pub fn verify(&self, hashes: &[PimdirHash]) -> Result<BTreeSet<PimdirHash>, PimdirError> {
+        let blobs = self.store.reader.blobs();
+        let mut verified = BTreeSet::new();
+
+        for hash in hashes {
+            let Some(mut reader) = blobs.reader(hash)? else {
+                continue;
+            };
+            // NOTE: the reader checks the bytes against the name at the
+            // end of the stream.
+            match std::io::copy(&mut reader, &mut std::io::sink()) {
+                Ok(_) => {
+                    verified.insert(hash.clone());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => (),
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(verified)
+    }
+
+    /// Applies a write batch atomically and in order (§14), answering what
+    /// the cross-source merge recorded beyond the ops (SYNC §9).
     ///
     /// The bodies land before the transaction opens, so the writer lock
     /// is never held across a file write; `BEGIN IMMEDIATE` takes it up
     /// front so contention fails fast as [`PimdirError::Busy`].
-    pub fn write(&mut self, ops: Vec<PimdirWriteOp>) -> Result<(), PimdirError> {
+    pub fn write(&mut self, ops: Vec<PimdirWriteOp>) -> Result<PimdirWritten, PimdirError> {
         let blobs = self.store.reader.blobs();
         let lock = Arc::clone(&self.store.lock);
         let _writing = lock.writing();
@@ -221,7 +248,7 @@ impl PimdirSourceStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        apply(
+        let written = apply(
             &tx,
             &blobs,
             &self.source,
@@ -229,7 +256,7 @@ impl PimdirSourceStore {
             ops,
         )?;
         tx.commit().map_err(busy_or_sql)?;
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -249,7 +276,8 @@ pub(crate) fn apply(
     source: &PimdirSourceId,
     account: Option<&str>,
     ops: Vec<PimdirWriteOp>,
-) -> Result<(), PimdirError> {
+) -> Result<PimdirWritten, PimdirError> {
+    let mut written = PimdirWritten::default();
     let mut hub_ops: BTreeMap<String, Vec<PimdirWriteOp>> = BTreeMap::new();
     let mut licensed: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
     let mut dropped: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
@@ -258,6 +286,12 @@ pub(crate) fn apply(
 
     for op in ops {
         match op {
+            PimdirWriteOp::Overrule { collection, handle } => {
+                hub_ops
+                    .entry(collection.0.clone())
+                    .or_default()
+                    .push(PimdirWriteOp::Overrule { collection, handle });
+            }
             PimdirWriteOp::StoreObject { object, body } => {
                 if let Some(body) = body {
                     blobs.write(&object.hash, &body)?;
@@ -402,10 +436,12 @@ pub(crate) fn apply(
         }
     }
 
-    for (collection, ops) in hub_ops {
+    for (collection, mut ops) in hub_ops {
         refuse_colliding_upserts(&collection, source, &ops)?;
         let links = batch_links(tx, &collection, source, &ops)?;
         let old = read_hub(tx, &collection, Some(&links))?;
+        mint_other_messages(tx, &collection, source, &old, &mut ops)?;
+        refuse_unread_overrule(&collection, source, &old, &ops)?;
         let mut new = old.clone();
         new.absorb(source, &ops);
         // NOTE: read before the diff is saved, which would make every
@@ -414,6 +450,19 @@ pub(crate) fn apply(
         let entering = attachments::gaining(tx, blobs, &collection, &old, &mut new)?;
         let licensed = licensed.remove(&collection).unwrap_or_default();
         save_hub_diff(tx, &collection, source, &ops, &old, &mut new, &licensed)?;
+        written.conflicted.append(&mut new.diverged);
+        for mut lost in core::mem::take(&mut new.overruled) {
+            // NOTE: a conflict's body kept by an overruling edit has no
+            // summary the hub holds, so it is derived from the body.
+            if lost.summary.is_none()
+                && let Some(body) = blobs.get(&lost.object)?
+            {
+                let kind = kind_of(tx, &collection)?;
+                lost.summary = summary::derive(&kind, &body).and_then(|derived| derived.summary);
+            }
+            let key = keep_overruled(tx, &collection, &new, &lost)?;
+            written.overruled.push((lost.handle, key));
+        }
         adjust_refcounts(tx, &object_refs(&old), &object_refs(&new))?;
         if let Some(entering) = entering {
             attachments::record(tx, entering)?;
@@ -442,7 +491,7 @@ pub(crate) fn apply(
         )?;
     }
 
-    Ok(())
+    Ok(written)
 }
 
 fn ensure_collection(
@@ -707,14 +756,7 @@ pub(crate) fn read_hub(
         params.push((":links", scope));
     }
 
-    // NOTE: a level of 0 an earlier draft wrote reads as `Meta`, a claim
-    // the row may not hold (SYNC §3): its summary is not offered, so the
-    // next `Meta` upgrade revisits it.
-    let mut unheld: Vec<PimdirLinkId> = Vec::new();
-    for (link, item, claimed) in rows(conn, items_sql, params.as_slice(), item_from_row)? {
-        if claimed {
-            unheld.push(link.clone());
-        }
+    for (link, item) in rows(conn, items_sql, params.as_slice(), item_from_row)? {
         hub.items.insert(link, item);
     }
     for (link, source, binding) in rows(conn, bindings_sql, params.as_slice(), binding_from_row)? {
@@ -731,7 +773,12 @@ pub(crate) fn read_hub(
             }
         }
     }
-    for (link, role, address) in load_addresses(conn, collection, scope.as_deref())? {
+    for (link, role, address) in load_addresses(
+        conn,
+        sql::LOAD_ADDRESSES_BY_LINK,
+        collection,
+        scope.as_deref(),
+    )? {
         if let Some(summary) = hub
             .items
             .get_mut(&link)
@@ -740,24 +787,21 @@ pub(crate) fn read_hub(
             attach_address(summary, role, address);
         }
     }
-    for link in unheld {
-        if let Some(item) = hub.items.get_mut(&link) {
-            item.summary = None;
-        }
-    }
 
     Ok(hub)
 }
 
-/// The declared kind of a collection, empty when undeclared.
-pub(crate) fn kind_of(conn: &Connection, collection: &str) -> rusqlite::Result<String> {
-    conn.query_row(
-        sql::LOAD_KIND,
-        named_params! { ":collection": collection },
-        |r| r.get::<_, String>(0),
-    )
-    .optional()
-    .map(|kind| kind.unwrap_or_default())
+/// The declared kind of a collection, empty when undeclared, read as the
+/// store answers `load_kind` (§6): a producer and a reader call it too.
+pub(crate) fn kind_of(conn: &Connection, collection: &str) -> Result<String, PimdirError> {
+    Ok(conn
+        .query_row(
+            &schema::as_reconciled(conn, "main", sql::LOAD_KIND)?,
+            named_params! { ":collection": collection },
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default())
 }
 
 /// The summary tables a collection's kind may hold rows in; every table
@@ -815,6 +859,20 @@ impl PimdirSummaryTable {
             Self::Task => sql::LOAD_TASK_SUMMARIES,
             Self::Journal => sql::LOAD_JOURNAL_SUMMARIES,
             Self::File => sql::LOAD_FILE_SUMMARIES,
+        }
+    }
+
+    /// The read of one live item by `:collection` and `:seq` with its row
+    /// of this table (`get_mail` and its siblings, §14.1), a seek where the
+    /// load statements filtered by `:links` scan the collection.
+    pub(crate) fn get_sql(self) -> &'static str {
+        match self {
+            Self::Mail => sql::GET_MAIL,
+            Self::Contact => sql::GET_CONTACT,
+            Self::Event => sql::GET_EVENT,
+            Self::Task => sql::GET_TASK,
+            Self::Journal => sql::GET_JOURNAL,
+            Self::File => sql::GET_FILE,
         }
     }
 
@@ -988,15 +1046,17 @@ pub(crate) fn load_summaries_by(
         .collect())
 }
 
-/// The addresses of a collection's items, or of `:links`, in document order.
+/// The addresses of a collection's items, or of `:links`, in document order,
+/// through `statement`, `load_addresses_by_link` as the store answers it.
 pub(crate) fn load_addresses(
     conn: &Connection,
+    statement: &str,
     collection: &str,
     links: Option<&str>,
 ) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirAddressRole, PimdirAddress)>> {
     let loaded = rows(
         conn,
-        sql::LOAD_ADDRESSES_BY_LINK,
+        statement,
         named_params! { ":collection": collection, ":links": links },
         |row| {
             Ok((
@@ -1185,6 +1245,160 @@ fn purge_retained(
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     release_pins(conn, [object, conflict_object].into_iter().flatten())
+}
+
+/// Keys apart a member naming an item another source binds whose mail
+/// summary names another message (SYNC §6, §9): the identity minted over
+/// its handle, minted again over a held key, rather than the held item,
+/// whose body would otherwise stand for both. A page before the last
+/// names its members against this source's holders alone (SYNC §10), so
+/// the write is where another source's holder is met.
+fn mint_other_messages(
+    conn: &Connection,
+    collection: &str,
+    source: &PimdirSourceId,
+    old: &PimdirHub,
+    ops: &mut [PimdirWriteOp],
+) -> Result<(), PimdirError> {
+    let mut claimed: BTreeSet<PimdirLinkId> = ops
+        .iter()
+        .filter_map(|op| match op {
+            PimdirWriteOp::UpsertPlacement(placement) => placement.link_id.clone(),
+            _ => None,
+        })
+        .collect();
+
+    for op in ops.iter_mut() {
+        let PimdirWriteOp::UpsertPlacement(placement) = op else {
+            continue;
+        };
+        let Some(link) = placement.link_id.clone() else {
+            continue;
+        };
+        let Some(held) = old.items.get(&link) else {
+            continue;
+        };
+        let elsewhere = !held.sources.is_empty() && !held.sources.contains_key(source);
+        if !elsewhere || summary::same_message(held.summary.as_ref(), placement.summary.as_ref()) {
+            continue;
+        }
+
+        let mut key = link.minted(&placement.handle);
+        loop {
+            let taken = old.items.contains_key(&key)
+                || claimed.contains(&key)
+                || conn
+                    .query_row(
+                        sql::SEQ_BY_LINK,
+                        named_params! { ":collection": collection, ":link_id": key.0 },
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+            if !taken {
+                break;
+            }
+            key = key.minted(&placement.handle);
+        }
+        log::debug!(
+            "{} names another message than {}, keyed {} apart",
+            placement.handle.as_str(),
+            link.as_str(),
+            key.as_str(),
+        );
+        claimed.insert(key.clone());
+        placement.link_id = Some(key);
+    }
+
+    Ok(())
+}
+
+/// Keeps a body a policy did not adopt as a retained item beside the one
+/// it lost to (SYNC §9, STORAGE §11): keyed by the identity minted over
+/// the settling binding's handle, minted again over a held key, with a
+/// public id of its own, deleted and retained by the settling source.
+/// Answers its key.
+fn keep_overruled(
+    conn: &Connection,
+    collection: &str,
+    hub: &PimdirHub,
+    lost: &PimdirOverruled,
+) -> Result<PimdirLinkId, PimdirError> {
+    let held = |key: &PimdirLinkId| -> rusqlite::Result<bool> {
+        if hub.items.contains_key(key) {
+            return Ok(true);
+        }
+        conn.query_row(
+            sql::SEQ_BY_LINK,
+            named_params! { ":collection": collection, ":link_id": key.0 },
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|seq| seq.is_some())
+    };
+    let mut key = lost.link.minted(&lost.handle);
+    while held(&key)? {
+        key = key.minted(&lost.handle);
+    }
+
+    let seq: i64 = conn.query_row(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?;
+    conn.execute(
+        sql::INSERT_ITEM,
+        named_params! {
+            ":collection": collection,
+            ":link_id": key.0,
+            ":seq": seq,
+            ":flags": codec::flags_to_json(&lost.flags),
+            ":object_hash": lost.object.0,
+            ":sort_key": lost.sort_key.0.as_str(),
+            ":level": codec::level_to_int(PimdirLevel::Full),
+            ":deleted": 1,
+            ":conflicted": 0,
+            ":conflict_object": None::<&str>,
+        },
+    )?;
+    write_summary(conn, collection, &key, None, lost.summary.as_ref())?;
+    conn.execute(
+        sql::RETAIN_ITEM,
+        named_params! { ":collection": collection, ":link_id": key.0, ":source": lost.source.0 },
+    )?;
+    conn.execute(
+        sql::ADJUST_REFCOUNT,
+        named_params! { ":delta": 1, ":hash": lost.object.0 },
+    )?;
+
+    Ok(key)
+}
+
+/// Refuses an overruling edit over a conflict whose diverging body nobody
+/// has read, the binding's or the item's (SYNC §7, §9): there is nothing
+/// to keep, and adopting it would choose against a body nobody read.
+fn refuse_unread_overrule(
+    collection: &str,
+    source: &PimdirSourceId,
+    hub: &PimdirHub,
+    ops: &[PimdirWriteOp],
+) -> Result<(), PimdirError> {
+    for op in ops {
+        let PimdirWriteOp::Overrule { handle, .. } = op else {
+            continue;
+        };
+        let unread = hub.items.values().any(|item| {
+            let Some(binding) = item.sources.get(source) else {
+                return false;
+            };
+            &binding.handle == handle
+                && ((binding.conflicted && binding.conflict_object.is_none())
+                    || (item.conflicted && item.conflict_object.is_none()))
+        });
+        if unread {
+            return Err(PimdirError::Unread {
+                collection: String::from(collection),
+                handle: handle.0.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Whether two items' own columns match, bindings and summary aside.
@@ -1633,7 +1847,8 @@ fn conflict_object(binding: &PimdirBinding) -> Option<&PimdirHash> {
 
 /// The multiset of object references a hub holds (§5): every item's body
 /// and conflict body, every binding's base body and, while conflicted,
-/// its diverging body. A binding's `shared_object` is never counted.
+/// its diverging body, and its `shared_object`, the body a merge reads as
+/// the common ancestor, pinned as the base is.
 fn object_refs(hub: &PimdirHub) -> HashMap<String, i64> {
     let mut refs: HashMap<String, i64> = HashMap::new();
     let mut bump = |hash: &PimdirHash| *refs.entry(hash.0.clone()).or_insert(0) += 1;
@@ -1650,6 +1865,9 @@ fn object_refs(hub: &PimdirHub) -> HashMap<String, i64> {
             }
             if let Some(conflict) = conflict_object(binding) {
                 bump(conflict);
+            }
+            if let Some(shared) = &binding.shared_object {
+                bump(shared);
             }
         }
     }
@@ -1682,9 +1900,10 @@ fn adjust_refcounts(
     Ok(())
 }
 
-/// Maps a `load_items`-shaped row, and whether its level is the `0` an
-/// earlier draft wrote, a claim the row may not hold.
-fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem, bool)> {
+/// Maps a `load_items`-shaped row. The level is 1 or 2 (STORAGE §13): the
+/// reconciliation repairs the `0` an earlier draft wrote before an owner
+/// reads the store (`repair_levels`), and an owner alone reads it here.
+fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem)> {
     let link: String = row.get(0)?;
     let flags: Option<String> = row.get(1)?;
     let object: Option<String> = row.get(2)?;
@@ -1707,7 +1926,6 @@ fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem, bo
             conflict_object: conflict_object.map(PimdirHash),
             sources: BTreeMap::new(),
         },
-        level == 0,
     ))
 }
 
@@ -1830,4 +2048,25 @@ pub(crate) fn put_unbound(
         named_params! { ":collection": collection, ":link_id": link.0 },
         |row| row.get(0),
     )?)
+}
+
+/// Sets the flags of an item no source binds (§14.3), a queued
+/// `set-flags` the drain applies to the store alone, nothing having a
+/// change to push. An item absent or deleted is left as it is.
+pub(crate) fn set_unbound_flags(
+    conn: &Connection,
+    collection: &str,
+    link: &PimdirLinkId,
+    flags: &PimdirFlags,
+) -> Result<(), PimdirError> {
+    let hub = read_hub(conn, collection, Some(core::slice::from_ref(&link.0)))?;
+    let Some(prev) = hub.items.get(link) else {
+        return Ok(());
+    };
+    let mut item = prev.clone();
+    item.flags = flags.clone();
+    if !item_columns_eq(prev, &item) {
+        update_item(conn, collection, link, &item)?;
+    }
+    Ok(())
 }

@@ -928,7 +928,8 @@ impl fmt::Display for ItemExportOutput {
 pub enum RestoreStatus {
     /// The action was applied and the item is live again.
     Applied,
-    /// Another writer holds the store lock, so the action waits in the queue.
+    /// Another writer holds the store lock, or the store is of another
+    /// revision, so the action waits in the queue for its sync engine.
     Queued,
     /// The drain ran and the item is still not live: the action was refused.
     Refused,

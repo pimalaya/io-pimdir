@@ -29,9 +29,10 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 - **Typed summaries**: what a reader lists from without the body, one table per kind with the people an item names, derived the same way by every writer and checked against the format's vectors.
 - **Deduplicated bodies**: each body is stored once by content hash, so a message filed in two mailboxes costs one copy and a body already held is linked without a download.
 - **Retention**: an item every source dropped is kept, hidden and restorable until an explicit purge.
-- **Action queue**: processes that do not own the store append actions the owner applies exactly once.
+- **Action queue**: processes that do not own the store stage their bodies under the store's lock and append actions the owner applies exactly once, a create naming a key the collection holds or has queued refused at once.
 - **Change feed**: every row carries a stamp, so an index or a window folds what moved since it last looked.
 - **Three roles, three handles**: one owner that writes, any number of producers that enqueue, any number of readers that take no lock.
+- **Stable error codes**: every failure carries a kebab-case code a client maps to its own output, and no message advises deleting a store.
 - **Operator CLI**: inspect a store while a sync runs, read the trash, restore or purge, prune the queue, check consistency, collect what nothing references, dump the store.
 - **Conformance suite**: the specification's sync and summary vectors run against the real store in the test suite.
 
@@ -40,7 +41,14 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 ## Specification
 
-io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard: the owner store STORAGE.md specifies, with its reader and producer profiles, and the engine SYNC.md describes. This release implements pimdir draft-04: the canonical schema and statements of that text are vendored under spec/ byte for byte and generated into the crate at build time, the summaries follow Annex A, and the engine reproduces the sync vectors. The reference index of SEARCH.md is not implemented yet and will come in a later release.
+io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard: the owner store STORAGE.md specifies, with its reader and producer profiles, and the engine SYNC.md describes. This release implements storage-draft-05 and sync-draft-05: the canonical schema and statements of that text are vendored under spec/ byte for byte and generated into the crate at build time, the summaries follow Annex A, and the engine reproduces the sync vectors. The reference index of search-draft-05 ships behind the `search` feature (off by default, enabled by the operator CLI), checked against the search vectors; it is **experimental**, its API and index build free to change in a minor release.
+
+Known deviations, each bounded and stated in cairn/spec/summaries.md:
+
+- Annex A.0: an encoded word in an 8-bit charset other than `iso-8859-1`, `us-ascii` and `windows-1252` is read as UTF-8, lossily, the crate depending on no charset library.
+- Annex A.1: the walk of a message's parts stops at `MIME_DEPTH_MAX` (64) levels of nesting, which Annex A states no bound for; a part nested deeper is examined neither for the attachment mark nor for an invitation.
+
+A store is created in WAL mode, which STORAGE §4.1 recommends for a local store. On a network filesystem (STORAGE §8), switch it once to a rollback journal, with no process holding it open (`sqlite3 pimdir.db 'PRAGMA journal_mode = DELETE'`): no handle of this crate sets the journal mode of an existing store again.
 
 A client that only lists a store, or only queues an action, needs the reader or the producer handle and nothing of the engine; the standard's GUIDE.md §1 says what each profile owes, and this crate's handles meet it.
 

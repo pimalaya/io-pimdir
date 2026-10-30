@@ -3,7 +3,7 @@
 //! performer and the user's choice among several, the owner parks what
 //! slipped past the gate, and a store from 0.5 gains the tables on open.
 
-use std::{io::Write, path::Path};
+use std::path::Path;
 
 use io_pimdir::{
     capability::{self, PimdirCapability, PimdirSupport},
@@ -237,7 +237,7 @@ fn seeded_event(dir: &Path, source: &str, collection: &str, uid: &str) -> i64 {
         .ensure_collection(collection, "text/calendar")
         .unwrap();
     let body = MEETING.replace("UID:m1", &format!("UID:{uid}"));
-    let hash = PimdirHash(format!("{uid}-hash"));
+    let hash = io_pimdir::hash::PimdirHashAlgo::default().hash(body.as_bytes());
     store
         .write(vec![
             PimdirWriteOp::StoreObject {
@@ -274,24 +274,14 @@ fn seeded_event(dir: &Path, source: &str, collection: &str, uid: &str) -> i64 {
 /// Writes `body` into the blob store the way a producer does before its
 /// enqueue, and the `add` carrying it.
 fn add(producer: &PimdirProducer, body: &str) -> (PimdirAction, PimdirObject) {
-    let blobs = producer.blobs();
-    let hash = blobs.hash(body.as_bytes());
-    let mut writer = blobs.writer().unwrap();
-    writer.write_all(body.as_bytes()).unwrap();
-    writer.commit(&hash).unwrap();
+    let object = producer.stage_body(body.as_bytes()).unwrap();
     let action = PimdirAction::Add {
         link_id: None,
         flags: PimdirFlags::default(),
-        object: Some(hash.clone()),
+        object: Some(object.hash.clone()),
         supersedes: None,
     };
-    (
-        action,
-        PimdirObject {
-            hash,
-            size: body.len(),
-        },
-    )
+    (action, object)
 }
 
 #[test]
@@ -632,7 +622,7 @@ fn events_only(dir: &Path) -> i64 {
     let mut store = PimdirStore::open(dir).unwrap().for_source("caldav");
     store.ensure_collection("Tasks", "text/calendar").unwrap();
     let body = TODO.replace("UID:t1", "UID:t0");
-    let hash = PimdirHash("t0-hash".into());
+    let hash = io_pimdir::hash::PimdirHashAlgo::default().hash(body.as_bytes());
     store
         .write(vec![
             PimdirWriteOp::StoreObject {
@@ -787,4 +777,84 @@ fn a_superseding_add_needs_the_remove_of_what_it_supersedes() {
         panic!("superseding an item its source cannot remove should be refused");
     };
     assert_eq!(refusal.capability, capability::CALENDAR_ITEM_REMOVE);
+}
+
+/// A write the gate refuses stages nothing when its body is handed in
+/// (§15.1, §15.6): the gate reads the bytes in hand, where staging first
+/// left the refused task's body unpinned in the tree.
+#[test]
+fn a_refused_create_stages_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    events_only(dir.path());
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    refuse_tasks(&mut store);
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let path = producer.blobs().path(&producer.hash(TODO.as_bytes()));
+    let refused = producer
+        .enqueue_with_body("Events", TODO.as_bytes(), |hash| PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: Some(hash),
+            supersedes: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(refused, PimdirError::Unsupported(_)),
+        "{refused:?}"
+    );
+    assert!(!path.exists(), "the refused body never reached the tree");
+
+    producer
+        .enqueue_with_body("Tasks", TODO.as_bytes(), |hash| PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: Some(hash),
+            supersedes: None,
+        })
+        .unwrap();
+    assert!(path.exists());
+}
+
+/// The one-step enqueue answers the partial supports its action passed
+/// with, read with the body in hand, so a frontend warns without running
+/// the gate a second time.
+#[test]
+fn a_checked_enqueue_answers_the_partial_supports_it_passed_with() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded_event(dir.path(), "dav", "work", "m0");
+    let mut declared = calendar(&[]);
+    for capability in &mut declared {
+        if capability.name == capability::CALENDAR_SCHEDULING {
+            capability.support = PimdirSupport::Partial;
+            capability.detail = Some("no counter-proposals".into());
+        }
+    }
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .declare("dav", &declared)
+        .unwrap();
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let meeting = MEETING.replace("UID:m1", "UID:m2");
+    let enqueued = producer
+        .enqueue_with_body_checked("work", meeting.as_bytes(), |hash| PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: Some(hash),
+            supersedes: None,
+        })
+        .unwrap();
+    assert_eq!(enqueued.partial.len(), 1, "{:?}", enqueued.partial);
+    assert_eq!(
+        enqueued.partial[0].capability,
+        capability::CALENDAR_SCHEDULING
+    );
+    assert_eq!(enqueued.partial[0].source, "dav");
+    assert_eq!(
+        producer.pending_actions("work").unwrap()[0].id,
+        enqueued.id,
+        "the row is queued"
+    );
 }

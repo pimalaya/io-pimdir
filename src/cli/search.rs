@@ -893,8 +893,8 @@ pub enum TagStatus {
     Unsupported,
     /// Staged and applied: the store shows the flags.
     Applied,
-    /// Staged while another writer holds the store lock: applies at the
-    /// next sync.
+    /// Staged while another writer holds the store lock, or while the store
+    /// is of another revision: applies at the next sync.
     Queued,
     /// Staged, drained, and the store does not show the flags: the action
     /// was refused, see `pimdir queue list --parked`.
@@ -1062,6 +1062,7 @@ impl From<&PimdirSearchCoverage> for CoverageRow {
             local: LocalRow {
                 bodiless: coverage.local.bodiless.clone(),
                 unindexed: coverage.local.unindexed,
+                behind: coverage.local.behind,
             },
             temporal: match &coverage.temporal {
                 PimdirSearchTemporal::Full => TemporalRow::Full,
@@ -1105,6 +1106,13 @@ impl fmt::Display for CoverageRow {
                 self.local.unindexed
             )?;
         }
+        if self.local.behind > 0 {
+            writeln!(
+                f,
+                " - the index is {} change(s) behind the store",
+                self.local.behind
+            )?;
+        }
         if let TemporalRow::Bounded {
             since,
             until,
@@ -1142,6 +1150,8 @@ pub struct LocalRow {
     pub bodiless: BTreeMap<String, u64>,
     /// Live items whose last change the index has not folded in yet.
     pub unindexed: u64,
+    /// The store's changes the index has not folded in, store-wide.
+    pub behind: u64,
 }
 
 /// The temporal axis.

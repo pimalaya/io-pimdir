@@ -125,12 +125,13 @@ where
     pub fn mutate(&mut self, collection: &str, mutation: PimdirMutation) -> Result<(), String> {
         self.store
             .mutate(collection, mutation)
+            .map(|_| ())
             .map_err(|err| err.to_string())
     }
 
     pub fn rekey(&mut self, collection: &str) -> Result<PimdirRekeyReport, String> {
         self.store
-            .rekey(collection, &mut self.remote)
+            .rekey(collection, false, &mut self.remote)
             .map_err(|err| err.to_string())
     }
 
@@ -249,6 +250,12 @@ pub struct MemRemote {
     /// Whether an `Add` naming the member it supersedes is delivered by
     /// moving that member, as a WebDAV `MOVE` does (SYNC §4).
     pub moves: bool,
+    /// Whether a `Full` fetch answers no body, as a server that lost it
+    /// or a connector that failed to read it does.
+    pub bodiless_full: bool,
+    /// Whether a push batch is answered with no result at all, as a
+    /// connector whose session dropped mid-batch does (SYNC §5).
+    pub unanswered: bool,
     /// The global change counter; a delta serves everything past it.
     seq: usize,
     /// Handles removed, stamped with the counter value of their removal.
@@ -307,7 +314,7 @@ impl MemRemote {
             revision: self.revision(item.rev),
             meta: PimdirRemoteMeta {
                 link_id: item.link_id.clone(),
-                summary: Some(summary_of(handle)),
+                summary: Some(summary_of(&item.link_id)),
                 sort_key: Default::default(),
                 body: self.mutable.then(|| PimdirFetchedBody::Inline {
                     hash: hash(&item.body),
@@ -454,21 +461,19 @@ impl MemRemote {
     }
 }
 
-/// A tiny deterministic hash: identical bytes collapse to one object.
+/// The content hash a store of the default algorithm names a body by
+/// (STORAGE §5): a body read back is checked against its name (§7).
 pub fn hash(body: &[u8]) -> PimdirHash {
-    let mut acc: u64 = 1469598103934665603;
-    for byte in body {
-        acc ^= *byte as u64;
-        acc = acc.wrapping_mul(1099511628211);
-    }
-    PimdirHash::from(format!("{acc:016x}"))
+    io_pimdir::hash::PimdirHashAlgo::default().hash(body)
 }
 
-/// The summary the fake remote derives for a handle: a mail row whose
-/// subject names it, enough for the `Meta` tier to count as reached.
-pub fn summary_of(handle: &PimdirHandle) -> PimdirSummary {
+/// The summary the fake remote derives for a member: a mail row whose
+/// subject names its identity, the same under every handle as a
+/// message's headers are (SYNC §6), enough for the `Meta` tier to count
+/// as reached.
+pub fn summary_of(link: &PimdirLinkId) -> PimdirSummary {
     PimdirSummary::Mail(PimdirMailSummary {
-        subject: format!("headers:{}", handle.as_str()),
+        subject: format!("headers:{}", link.as_str()),
         ..Default::default()
     })
 }
@@ -551,6 +556,7 @@ impl PimdirRemote for MemRemote {
 
             let body = match tier {
                 PimdirTier::Meta => None,
+                PimdirTier::Full if self.bodiless_full => None,
                 PimdirTier::Full => {
                     self.full_fetches.push(handle.clone());
                     Some(PimdirFetchedBody::Inline {
@@ -561,7 +567,7 @@ impl PimdirRemote for MemRemote {
             };
 
             out.push(PimdirFetchedItem {
-                summary: Some(summary_of(&handle)),
+                summary: Some(summary_of(&item.link_id)),
                 sort_key: Default::default(),
                 handle,
                 link_id: item.link_id.clone(),
@@ -584,14 +590,21 @@ impl PimdirRemote for MemRemote {
 
         for change in changes {
             let result = match change.kind {
-                PimdirChangeKind::SetFlags { handle, flags } => {
+                PimdirChangeKind::SetFlags {
+                    handle,
+                    add,
+                    remove,
+                } => {
                     let seq = self.bump();
                     if let Some(item) = self
                         .items
                         .get_mut(collection)
                         .and_then(|c| c.get_mut(&handle))
                     {
-                        item.flags = flags;
+                        let mut flags = item.flags.known().cloned().unwrap_or_default();
+                        flags.retain(|flag| !remove.contains(flag));
+                        flags.extend(add);
+                        item.flags = PimdirFlags::Known(flags);
                         item.seq = seq;
                     }
                     accepted(handle, None, None)
@@ -774,6 +787,9 @@ impl PimdirRemote for MemRemote {
             results.push(result);
         }
 
+        if self.unanswered {
+            results.clear();
+        }
         Ok(results)
     }
 }

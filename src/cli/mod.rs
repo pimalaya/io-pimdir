@@ -95,19 +95,25 @@ impl StoreFlags {
     /// source (purge, queue cancellation, orphan sweep).
     ///
     /// Fails when another process owns the store (spec §8): a verb that
-    /// destroys or repairs has nothing useful to do without the role.
+    /// destroys or repairs has nothing useful to do without the role. Opened
+    /// as the store stands (`open_current`): this tool is never the store's
+    /// sync engine, so it never migrates nor reconciles a store another
+    /// revision keeps, and refuses it instead.
     pub fn owner(&self) -> Result<PimdirStore> {
         self.ensure_store()?;
-        PimdirStore::open(&self.store).map_err(report)
+        PimdirStore::open_current(&self.store).map_err(report)
     }
 
     /// The owner role when it is free, `None` when another process holds it:
     /// what a verb that can leave its work queued reports instead of failing.
+    /// Opened as the store stands, as [`owner`](Self::owner): a store of
+    /// another revision is `None` too, its work left queued for the sync
+    /// engine that brings the store to its schema.
     pub fn owner_if_free(&self) -> Result<Option<PimdirStore>> {
         self.ensure_store()?;
-        match PimdirStore::open(&self.store) {
+        match PimdirStore::open_current(&self.store) {
             Ok(store) => Ok(Some(store)),
-            Err(PimdirError::Owned(_)) => Ok(None),
+            Err(PimdirError::Owned(_) | PimdirError::NotCurrent(_)) => Ok(None),
             Err(err) => Err(report(err)),
         }
     }
@@ -171,7 +177,7 @@ pub fn report(err: PimdirError) -> anyhow::Error {
         }
         PimdirError::Stale { missing } => {
             anyhow!(
-                "this store was written by an earlier draft of the format and lacks {missing}: delete it and let it resync"
+                "this store was written by an earlier draft of the format and lacks {missing}: run or upgrade the store's sync engine"
             )
         }
         err => anyhow!(err),

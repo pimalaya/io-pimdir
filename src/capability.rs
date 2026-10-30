@@ -523,6 +523,7 @@ mod tests {
         let action = PimdirAction::Update {
             seq: 1,
             object: crate::object::PimdirHash::from("h"),
+            if_match: None,
         };
         let required = |current: &str, new: &str| {
             required_by_content(

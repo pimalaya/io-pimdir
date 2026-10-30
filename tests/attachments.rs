@@ -4,11 +4,11 @@
 //! the message, in the transaction storing the body, whatever path
 //! stores it, once.
 
-use std::{io::Write, path::Path};
+use std::path::Path;
 
 use io_pimdir::{
     change::PimdirWriteOp,
-    client::{PimdirSourceStore, PimdirStore, blobs::PimdirBlobs, producer::PimdirProducer},
+    client::{PimdirSourceStore, PimdirStore, producer::PimdirProducer},
     codec::PimdirAction,
     collection::PimdirCollectionId,
     hash::PimdirHashAlgo,
@@ -378,12 +378,9 @@ fn a_queued_add_stands_for_its_attachments_when_drained() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = opened(dir.path());
 
-    let blobs = PimdirBlobs::open(dir.path(), PimdirHashAlgo::default());
-    let mut writer = blobs.writer().unwrap();
-    writer.write_all(BODY).unwrap();
-    let hash = hash_of(BODY);
-    let size = writer.commit(&hash).unwrap();
     let mut producer = PimdirProducer::open(dir.path(), "smtp").unwrap();
+    let object = producer.stage_body(BODY).unwrap();
+    let hash = object.hash.clone();
     producer
         .enqueue(
             "INBOX",
@@ -393,10 +390,7 @@ fn a_queued_add_stands_for_its_attachments_when_drained() {
                 object: Some(hash.clone()),
                 supersedes: None,
             },
-            Some(&PimdirObject {
-                hash,
-                size: size as usize,
-            }),
+            Some(&object),
         )
         .unwrap();
 

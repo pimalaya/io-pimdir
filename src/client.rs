@@ -29,7 +29,7 @@ use rusqlite::{
 use crate::{
     capability::{PimdirCapability, PimdirRefusal},
     client::{
-        blobs::PimdirBlobs,
+        blobs::{PimdirBlobStage, PimdirBlobs},
         lock::PimdirLock,
         reader::{PimdirReader, collections_json, reference_from_row},
         write::kind_of,
@@ -157,9 +157,13 @@ impl PimdirStore {
     /// Takes the store's exclusive advisory lock (§8) and holds it until
     /// the handle drops; a store another process owns is
     /// [`PimdirError::Owned`] at once, never a wait. A fresh database is
-    /// created by running the migrations (§6); one above the current
-    /// version, or from an earlier draft, is refused and recreated by its
-    /// owner.
+    /// created by running the migrations (§6). An existing store is opened
+    /// in §6's order, refused before anything is written when it is above
+    /// this crate's version ([`PimdirError::Version`]), not a pimdir store
+    /// ([`PimdirError::Foreign`]), missing a core table
+    /// ([`PimdirError::Stale`]) or naming its objects by another algorithm;
+    /// a version 1 store an earlier draft wrote is then reconciled to
+    /// 0001_init.sql, and every migration above its version run.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         Self::open_with_hash(dir, None)
     }
@@ -192,14 +196,12 @@ impl PimdirStore {
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&db, flags)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
-        )?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
         schema::current(&conn)?;
         let hash = schema::hash_algo(&conn, None)?;
 
         Ok(Self {
-            reader: PimdirReader::over(conn, dir.to_path_buf(), hash),
+            reader: PimdirReader::over(conn, dir.to_path_buf(), hash)?,
             lock,
             account: None,
         })
@@ -219,14 +221,13 @@ impl PimdirStore {
         let lock = PimdirLock::own(dir)?;
 
         let mut conn = Connection::open(dir.join("pimdir.db"))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
-        )?;
-        schema::init(&mut conn, hash.unwrap_or_default(), dir)?;
-        let hash = schema::hash_algo(&conn, hash)?;
+        // NOTE: the journal mode is set by the schema runner once it knows
+        // the database is a store it may write (§6).
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+        let hash = schema::init(&mut conn, hash, dir)?;
 
         Ok(Self {
-            reader: PimdirReader::over(conn, dir.to_path_buf(), hash),
+            reader: PimdirReader::over(conn, dir.to_path_buf(), hash)?,
             lock,
             account: None,
         })
@@ -242,6 +243,13 @@ impl PimdirStore {
     /// The account this handle writes under, `None` in a single-account store.
     pub fn account(&self) -> Option<&str> {
         self.account.as_deref()
+    }
+
+    /// The write side of the blob directory (§5), holding the owner lock
+    /// while it lives: what a connector streams a fetched body through
+    /// before the byteless `StoreObject` that indexes it (§14).
+    pub fn blob_stage(&self) -> PimdirBlobStage {
+        PimdirBlobStage::new(self.blobs(), Arc::clone(&self.lock))
     }
 
     /// Binds this handle to a source, yielding the sync seam.
@@ -310,16 +318,26 @@ impl PimdirStore {
     /// Only from what a source states, never guessed from a name. The
     /// collection holding the role in the account loses it in the same
     /// statement. The collection must be declared: a role outside its
-    /// kind's vocabulary is refused by the schema.
+    /// kind's vocabulary is refused as [`PimdirError::Role`], the column
+    /// being an open vocabulary no constraint checks (§13).
     pub fn set_collection_role(
         &self,
         collection: impl AsRef<str>,
         role: Option<&str>,
     ) -> Result<(), PimdirError> {
+        let collection = collection.as_ref();
+        if let Some(role) = role
+            && !crate::collection::role_of_kind(&write::kind_of(&self.conn, collection)?, role)
+        {
+            return Err(PimdirError::Role {
+                collection: String::from(collection),
+                role: String::from(role),
+            });
+        }
         self.conn
             .execute(
                 sql::SET_COLLECTION_ROLE,
-                named_params! { ":collection": collection.as_ref(), ":role": role },
+                named_params! { ":collection": collection, ":role": role },
             )
             .map_err(busy_or_sql)?;
         Ok(())
@@ -604,15 +622,28 @@ impl PimdirStore {
     /// removed the collection itself. The pins the cascade drops are
     /// settled by a recompute in the same transaction, skipped when the
     /// collection held none (`collection_holds_objects`); the bodies fall
-    /// to the collector.
+    /// to the collector. A collection holding a pending or parked queue
+    /// row is refused as [`PimdirError::Queued`], the cascade dropping the
+    /// action with no receipt (`collections_keep_queued`).
     pub fn delete_collection(&mut self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
+        let collection = collection.as_ref();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        let key = named_params! { ":collection": collection.as_ref() };
+        let key = named_params! { ":collection": collection };
         let pins: bool = tx.query_row(sql::COLLECTION_HOLDS_OBJECTS, key, |row| row.get(0))?;
-        let deleted = tx.execute(sql::DELETE_COLLECTION, key)?;
+        let deleted = match tx.execute(sql::DELETE_COLLECTION, key) {
+            Err(rusqlite::Error::SqliteFailure(err, Some(message)))
+                if err.code == ErrorCode::ConstraintViolation
+                    && message == "collection holds queued actions" =>
+            {
+                return Err(PimdirError::Queued {
+                    collection: String::from(collection),
+                });
+            }
+            deleted => deleted?,
+        };
         if pins {
             tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
         }
@@ -679,10 +710,17 @@ impl PimdirStore {
 
     /// Purges every item retired strictly before `cutoff` (RFC 3339),
     /// store-wide: the cutoff is the caller's policy, never the store's clock.
+    ///
+    /// The comparison is textual (§11.2), so the cutoff is written as the
+    /// stamps are, UTC with milliseconds (`2026-06-01T00:00:00.000Z`):
+    /// anything else is [`PimdirError::Cutoff`] and nothing is purged.
     pub fn purge_retained_before(
         &mut self,
         cutoff: &str,
     ) -> Result<PimdirPurgeReport, PimdirError> {
+        if !is_stamp(cutoff) {
+            return Err(PimdirError::Cutoff(cutoff.into()));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -874,13 +912,18 @@ impl PimdirStore {
 
     /// Cancels one queue row as the store's owner, holding the role for
     /// the length of the call (§15.5); the store must exist already.
+    ///
+    /// Opened through [`open_current`](Self::open_current): a consumer
+    /// owning the store for one write never migrates nor reconciles it, so
+    /// a store of another revision is refused as
+    /// [`PimdirError::NotCurrent`] and left as it was.
     pub fn cancel_action(dir: impl AsRef<Path>, id: i64) -> Result<bool, PimdirError> {
         let dir = dir.as_ref();
         if !dir.join("pimdir.db").is_file() {
             return Err(PimdirError::Uncreated);
         }
 
-        Self::open(dir)?.drop_action(id)
+        Self::open_current(dir)?.drop_action(id)
     }
 
     /// Removes one queue row by request, pending or parked, releasing its
@@ -1082,7 +1125,7 @@ pub(crate) fn busy_or_sql(err: rusqlite::Error) -> PimdirError {
         {
             PimdirError::Busy
         }
-        _ => PimdirError::Sql(err),
+        _ => PimdirError::Sql(PimdirSqlError(err)),
     }
 }
 
@@ -1107,15 +1150,79 @@ pub enum PimdirNotCurrent {
     },
 }
 
-/// Everything that can go wrong servicing the store.
+/// What already holds the link id a new `add` names (§15.3), see
+/// [`PimdirProducer::enqueue_add`].
+///
+/// [`PimdirProducer::enqueue_add`]: crate::client::producer::PimdirProducer::enqueue_add
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PimdirDuplicate {
+    /// A live item of the collection, by its public id.
+    Live(i64),
+    /// A pending `add` in the collection, by its queue row id.
+    Pending(i64),
+}
+
+/// A failure of SQLite, opaque so the public API names no rusqlite type:
+/// its message is the cause's, and the cause is its
+/// [`source`](core::error::Error::source).
 #[derive(Debug)]
+pub struct PimdirSqlError(rusqlite::Error);
+
+impl PimdirSqlError {
+    /// Whether SQLite answered busy or locked.
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(
+            &self.0,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+    }
+}
+
+impl fmt::Display for PimdirSqlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PimdirSqlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// A failure to encode or decode JSON, opaque so the public API names no
+/// serde_json type: its message is the cause's, and the cause is its
+/// [`source`](core::error::Error::source).
+#[derive(Debug)]
+pub struct PimdirJsonError(serde_json::Error);
+
+impl fmt::Display for PimdirJsonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PimdirJsonError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Everything that can go wrong servicing the store.
+///
+/// [`code`](Self::code) names each failure with a stable code, the
+/// contract a consumer maps its own output to; the message is for a
+/// person and may change.
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum PimdirError {
     /// The SQLite database refused a statement, or the connection failed.
-    Sql(rusqlite::Error),
+    Sql(PimdirSqlError),
     /// The blob directory refused a read, a write or a rename.
     Io(io::Error),
     /// JSON encoding failed at the seam.
-    Json(serde_json::Error),
+    Json(PimdirJsonError),
     /// A queue action payload is malformed (§15.3).
     Action(PimdirActionError),
     /// A write resolved an existing binding to a different handle and was
@@ -1142,6 +1249,15 @@ pub enum PimdirError {
         /// Its handle.
         handle: String,
     },
+    /// An overruling edit would settle a conflict whose diverging body
+    /// nobody has read (SYNC §7, §9): refused, staging nothing, until the
+    /// upgrade fetches it.
+    Unread {
+        /// The collection of the conflicted placement.
+        collection: String,
+        /// Its handle.
+        handle: String,
+    },
     /// A sync asked for a bounded scope on a collection of another kind
     /// than mail (SYNC §5).
     Scope {
@@ -1164,6 +1280,20 @@ pub enum PimdirError {
         /// The collection written to.
         collection: String,
     },
+    /// A collection holding a pending or parked queue row was deleted
+    /// (§14, `collections_keep_queued`): cancel the rows first.
+    Queued {
+        /// The collection the delete was for.
+        collection: String,
+    },
+    /// A role outside the vocabulary of the collection's kind was set on
+    /// it (§14), or the collection is not declared.
+    Role {
+        /// The collection the role was for.
+        collection: String,
+        /// The role refused.
+        role: String,
+    },
     /// An item was put into a collection of a kind no unbound write
     /// derives (§14.3): mail, files, or undeclared.
     NotUnbound {
@@ -1172,13 +1302,28 @@ pub enum PimdirError {
         /// Its declared kind, empty when undeclared.
         kind: String,
     },
-    /// The store's schema version is not one this crate services.
+    /// A create named a link id the collection already holds or has
+    /// queued (§15.3), refused before anything was appended.
+    Duplicate {
+        /// The collection the create was for.
+        collection: String,
+        /// The link id it named.
+        link_id: String,
+        /// What holds it.
+        existing: PimdirDuplicate,
+    },
+    /// The store's schema version is not one this crate services: above
+    /// it, a later program wrote the store.
     Version {
         /// The store's `user_version`.
         found: i64,
     },
     /// The store has no schema yet; only the owner's open creates one.
     Uncreated,
+    /// The database is not a pimdir store (§3): its `store_meta.format` is
+    /// another, or it declares tables at `user_version` 0. Nothing in it is
+    /// read, reconciled or written.
+    Foreign,
     /// The two schema stamps disagree, which §4.2 defines as corruption.
     VersionMismatch {
         /// The store's `PRAGMA user_version`.
@@ -1190,9 +1335,8 @@ pub enum PimdirError {
     /// stands: only [`PimdirStore::open`] creates, migrates or reconciles
     /// a store (§6).
     NotCurrent(PimdirNotCurrent),
-    /// The store was created by an earlier draft and lacks a table or a
-    /// trigger the current schema declares (§6): recreate it, the draft
-    /// offers no migration.
+    /// The store was written by an earlier draft and lacks a table or a
+    /// trigger the current schema declares (§6).
     Stale {
         /// The first table or trigger found missing.
         missing: &'static str,
@@ -1232,6 +1376,9 @@ pub enum PimdirError {
         /// The sources declaring it.
         candidates: Vec<String>,
     },
+    /// A purge cutoff is not an instant written as the store's stamps are,
+    /// UTC with milliseconds (§11.2), which a textual comparison needs.
+    Cutoff(String),
     /// A search query was refused (SEARCH §8.4), for a caller parsing
     /// with `?`.
     #[cfg(feature = "search")]
@@ -1251,11 +1398,124 @@ pub enum PimdirError {
     /// it compiled to failed, which is this implementation's fault, not
     /// the query's.
     #[cfg(feature = "search")]
-    Unanswerable(rusqlite::Error),
+    Unanswerable(PimdirSqlError),
     /// Another indexer holds index.lock (SEARCH §3) while this one has to
     /// create or rebuild the index.
     #[cfg(feature = "search")]
     Indexing(PathBuf),
+    /// The store has no search index yet (SEARCH §2): a query client never
+    /// builds one, the store's indexer does.
+    #[cfg(feature = "search")]
+    IndexMissing(PathBuf),
+    /// The search index is at another schema version, tokenizer or build
+    /// than this crate's (SEARCH §2): a query client never rebuilds it,
+    /// the store's indexer does.
+    #[cfg(feature = "search")]
+    IndexOutdated(PathBuf),
+    /// A refresh was asked of an index opened for queries alone (SEARCH
+    /// §3).
+    #[cfg(feature = "search")]
+    IndexQueryOnly(PathBuf),
+}
+
+impl PimdirError {
+    /// The failure's stable kebab-case code, for a consumer to map to its
+    /// own output (a JSON error code, an exit status) instead of matching
+    /// the message. A code never changes meaning; a new failure gets a new
+    /// one.
+    ///
+    /// | Code | Failure |
+    /// |---|---|
+    /// | `sql` | [`Sql`](Self::Sql) |
+    /// | `io` | [`Io`](Self::Io) |
+    /// | `json` | [`Json`](Self::Json) |
+    /// | `action-malformed` | [`Action`](Self::Action) |
+    /// | `binding-rebind` | [`Rebind`](Self::Rebind) |
+    /// | `placement-unnamed` | [`Unnamed`](Self::Unnamed) |
+    /// | `conflict-unread` | [`Unread`](Self::Unread) |
+    /// | `scope-not-mail` | [`Scope`](Self::Scope) |
+    /// | `collection-not-files` | [`NotFiles`](Self::NotFiles) |
+    /// | `collection-synced` | [`Synced`](Self::Synced) |
+    /// | `collection-not-unbound` | [`NotUnbound`](Self::NotUnbound) |
+    /// | `collection-role` | [`Role`](Self::Role) |
+    /// | `collection-queued` | [`Queued`](Self::Queued) |
+    /// | `item-duplicate` | [`Duplicate`](Self::Duplicate) |
+    /// | `store-newer` | [`Version`](Self::Version), or `NotCurrent` above this crate's |
+    /// | `store-uncreated` | `Uncreated`, or an absent `NotCurrent` |
+    /// | `store-foreign` | [`Foreign`](Self::Foreign) |
+    /// | `store-corrupt` | [`VersionMismatch`](Self::VersionMismatch) |
+    /// | `store-not-current` | [`NotCurrent`](Self::NotCurrent) otherwise |
+    /// | `store-stale` | [`Stale`](Self::Stale) |
+    /// | `store-hash-algo` | [`HashAlgo`](Self::HashAlgo) |
+    /// | `store-busy` | [`Busy`](Self::Busy) |
+    /// | `store-owned` | [`Owned`](Self::Owned) |
+    /// | `store-staging` | [`Staging`](Self::Staging) |
+    /// | `store-in-flight` | [`InFlight`](Self::InFlight) |
+    /// | `unsupported` | [`Unsupported`](Self::Unsupported) |
+    /// | `no-performer` | [`NoPerformer`](Self::NoPerformer) |
+    /// | `ambiguous-performer` | [`Ambiguous`](Self::Ambiguous) |
+    /// | `cutoff-invalid` | [`Cutoff`](Self::Cutoff) |
+    /// | `query-refused` | `Query` (feature `search`) |
+    /// | `tag-refused` | `Tag` (feature `search`) |
+    /// | `index-fts5-missing` | `Fts5` (feature `search`) |
+    /// | `query-unanswerable` | `Unanswerable` (feature `search`) |
+    /// | `index-busy` | `Indexing` (feature `search`) |
+    /// | `index-missing` | `IndexMissing` (feature `search`) |
+    /// | `index-outdated` | `IndexOutdated` (feature `search`) |
+    /// | `index-query-only` | `IndexQueryOnly` (feature `search`) |
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Sql(_) => "sql",
+            Self::Io(_) => "io",
+            Self::Json(_) => "json",
+            Self::Action(_) => "action-malformed",
+            Self::Rebind { .. } => "binding-rebind",
+            Self::Unnamed { .. } => "placement-unnamed",
+            Self::Unread { .. } => "conflict-unread",
+            Self::Scope { .. } => "scope-not-mail",
+            Self::NotFiles { .. } => "collection-not-files",
+            Self::Synced { .. } => "collection-synced",
+            Self::NotUnbound { .. } => "collection-not-unbound",
+            Self::Role { .. } => "collection-role",
+            Self::Queued { .. } => "collection-queued",
+            Self::Duplicate { .. } => "item-duplicate",
+            Self::Version { .. } => "store-newer",
+            Self::Uncreated => "store-uncreated",
+            Self::Foreign => "store-foreign",
+            Self::VersionMismatch { .. } => "store-corrupt",
+            Self::NotCurrent(PimdirNotCurrent::Absent) => "store-uncreated",
+            Self::NotCurrent(PimdirNotCurrent::Version { found }) if *found > sql::VERSION => {
+                "store-newer"
+            }
+            Self::NotCurrent(_) => "store-not-current",
+            Self::Stale { .. } => "store-stale",
+            Self::HashAlgo { .. } => "store-hash-algo",
+            Self::Busy => "store-busy",
+            Self::Owned(_) => "store-owned",
+            Self::Staging(_) => "store-staging",
+            Self::InFlight(_) => "store-in-flight",
+            Self::Unsupported(_) => "unsupported",
+            Self::NoPerformer { .. } => "no-performer",
+            Self::Ambiguous { .. } => "ambiguous-performer",
+            Self::Cutoff(_) => "cutoff-invalid",
+            #[cfg(feature = "search")]
+            Self::Query(_) => "query-refused",
+            #[cfg(feature = "search")]
+            Self::Tag(_) => "tag-refused",
+            #[cfg(feature = "search")]
+            Self::Fts5 { .. } => "index-fts5-missing",
+            #[cfg(feature = "search")]
+            Self::Unanswerable(_) => "query-unanswerable",
+            #[cfg(feature = "search")]
+            Self::Indexing(_) => "index-busy",
+            #[cfg(feature = "search")]
+            Self::IndexMissing(_) => "index-missing",
+            #[cfg(feature = "search")]
+            Self::IndexOutdated(_) => "index-outdated",
+            #[cfg(feature = "search")]
+            Self::IndexQueryOnly(_) => "index-query-only",
+        }
+    }
 }
 
 impl fmt::Display for PimdirError {
@@ -1279,6 +1539,10 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir write refused: placement {collection}/{handle} is named by no link id and its handle by no binding"
             ),
+            Self::Unread { collection, handle } => write!(
+                f,
+                "Pimdir write refused: the conflict of {collection}/{handle} holds a body nobody has read, fetch it before overruling it"
+            ),
             Self::Scope { collection, kind } => write!(
                 f,
                 "Pimdir sync refused: a scope bounds mail only, and collection {collection} holds {kind:?}"
@@ -1291,18 +1555,46 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir unbound write refused: a source syncs collection {collection}"
             ),
+            Self::Queued { collection } => write!(
+                f,
+                "Pimdir collection delete refused: collection {collection} holds queued actions, cancel them first"
+            ),
+            Self::Role { collection, role } => write!(
+                f,
+                "Pimdir collection role refused: {role} is not a role of collection {collection}'s kind"
+            ),
             Self::NotUnbound { collection, kind } => write!(
                 f,
                 "Pimdir unbound write refused: collection {collection} holds {kind:?}, not contacts or calendar items"
             ),
+            Self::Duplicate {
+                collection,
+                link_id,
+                existing: PimdirDuplicate::Live(seq),
+            } => write!(
+                f,
+                "Pimdir create refused: collection {collection} already holds {link_id} as item {seq}"
+            ),
+            Self::Duplicate {
+                collection,
+                link_id,
+                existing: PimdirDuplicate::Pending(id),
+            } => write!(
+                f,
+                "Pimdir create refused: collection {collection} already has {link_id} queued as action {id}"
+            ),
             Self::Version { found } => write!(
                 f,
-                "Pimdir store schema version {found} is unsupported (this crate services version {})",
+                "Pimdir store schema version {found} is newer than this program's {}: upgrade this program",
                 sql::VERSION
             ),
             Self::Uncreated => write!(
                 f,
                 "Pimdir store has no schema yet: its owner has to create it first"
+            ),
+            Self::Foreign => write!(
+                f,
+                "Pimdir store database is not a pimdir store: another program wrote it"
             ),
             Self::VersionMismatch {
                 user_version,
@@ -1313,20 +1605,27 @@ impl fmt::Display for PimdirError {
             ),
             Self::NotCurrent(PimdirNotCurrent::Absent) => write!(
                 f,
-                "Pimdir store does not exist yet: its owner has to create it first"
+                "Pimdir store does not exist yet: its sync engine has to create it first"
             ),
+            Self::NotCurrent(PimdirNotCurrent::Version { found }) if *found > sql::VERSION => {
+                write!(
+                    f,
+                    "Pimdir store schema version {found} is newer than this program's {}: upgrade this program",
+                    sql::VERSION
+                )
+            }
             Self::NotCurrent(PimdirNotCurrent::Version { found }) => write!(
                 f,
-                "Pimdir store schema version {found} is not this crate's {}: its owner has to migrate it first",
+                "Pimdir store schema version {found} is not this program's {}: run or upgrade the store's sync engine, which migrates it",
                 sql::VERSION
             ),
             Self::NotCurrent(PimdirNotCurrent::Shape { object }) => write!(
                 f,
-                "Pimdir store schema differs from this crate's at {object}: its owner has to reconcile it first"
+                "Pimdir store schema differs from this program's at {object}: run or upgrade the store's sync engine, which reconciles it"
             ),
             Self::Stale { missing } => write!(
                 f,
-                "Pimdir store was written by an earlier draft and lacks {missing}: delete the store and let it resync"
+                "Pimdir store was written by an earlier draft and lacks {missing}: run or upgrade the store's sync engine"
             ),
             Self::HashAlgo {
                 found,
@@ -1370,6 +1669,10 @@ impl fmt::Display for PimdirError {
                 "Several sources can perform {capability} ({}): choose one",
                 candidates.join(", ")
             ),
+            Self::Cutoff(cutoff) => write!(
+                f,
+                "Pimdir purge cutoff {cutoff:?} is not an instant written as the stamps are, UTC with milliseconds (2026-06-01T00:00:00.000Z)"
+            ),
             #[cfg(feature = "search")]
             Self::Query(err) => write!(f, "Pimdir search query refused: {err}"),
             #[cfg(feature = "search")]
@@ -1390,15 +1693,45 @@ impl fmt::Display for PimdirError {
                 "Pimdir index at {} is being refreshed by another process",
                 store.display()
             ),
+            #[cfg(feature = "search")]
+            Self::IndexMissing(index) => write!(
+                f,
+                "Pimdir search index {} does not exist yet: run the store's sync engine, which builds it",
+                index.display()
+            ),
+            #[cfg(feature = "search")]
+            Self::IndexOutdated(index) => write!(
+                f,
+                "Pimdir search index {} was built by another version: run the store's sync engine, which rebuilds it",
+                index.display()
+            ),
+            #[cfg(feature = "search")]
+            Self::IndexQueryOnly(index) => write!(
+                f,
+                "Pimdir search index {} is open for queries alone: only its indexer refreshes it",
+                index.display()
+            ),
         }
     }
 }
 
-impl std::error::Error for PimdirError {}
+impl std::error::Error for PimdirError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sql(err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::Json(err) => Some(err),
+            #[cfg(feature = "search")]
+            Self::Unanswerable(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
+#[doc(hidden)]
 impl From<rusqlite::Error> for PimdirError {
     fn from(err: rusqlite::Error) -> Self {
-        Self::Sql(err)
+        Self::Sql(PimdirSqlError(err))
     }
 }
 
@@ -1414,9 +1747,10 @@ impl From<io::Error> for PimdirError {
     }
 }
 
+#[doc(hidden)]
 impl From<serde_json::Error> for PimdirError {
     fn from(err: serde_json::Error) -> Self {
-        Self::Json(err)
+        Self::Json(PimdirJsonError(err))
     }
 }
 
@@ -1438,4 +1772,20 @@ impl From<crate::search::query::PimdirQueryError> for PimdirError {
     fn from(err: crate::search::query::PimdirQueryError) -> Self {
         Self::Query(err)
     }
+}
+
+/// Whether `value` is an instant written as the store's stamps are,
+/// `%Y-%m-%dT%H:%M:%fZ` (STORAGE §11.2): what a textual comparison with
+/// them needs.
+pub(crate) fn is_stamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 24
+        && bytes.iter().enumerate().all(|(at, byte)| match at {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'.',
+            23 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
 }

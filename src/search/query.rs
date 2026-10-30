@@ -463,20 +463,39 @@ impl PimdirQueryDate {
     }
 }
 
-/// An item named by `id:` or `linked:`: a public id or a link id.
+/// An item named by `id:` or `linked:` (SEARCH §8): a value of digits,
+/// naming a public id and a link id at once, or any other link id.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirQueryId {
-    /// A public id, `seq` (STORAGE §9.1).
-    Seq(i64),
-    /// A link id.
+    /// A value of ASCII digits alone, as written: the item whose public
+    /// id `seq` (STORAGE §9.1) it reads as, and every item whose link id
+    /// it is, a hit set rather than a guess.
+    Digits(String),
+    /// Any other value: a link id.
     Link(String),
 }
 
 impl PimdirQueryId {
     fn parse(value: &str) -> Self {
-        match value.parse() {
-            Ok(seq) if value.bytes().all(|b| b.is_ascii_digit()) => Self::Seq(seq),
-            _ => Self::Link(value.into()),
+        match !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+            true => Self::Digits(value.into()),
+            false => Self::Link(value.into()),
+        }
+    }
+
+    /// The public id a value of digits reads as, `None` for a link id or
+    /// digits past the range of a `seq`.
+    pub fn seq(&self) -> Option<i64> {
+        match self {
+            Self::Digits(digits) => digits.parse().ok(),
+            Self::Link(_) => None,
+        }
+    }
+
+    /// The value as written, the link id it names.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Digits(value) | Self::Link(value) => value,
         }
     }
 }
@@ -542,6 +561,7 @@ impl core::error::Error for PimdirQueryError {}
 
 /// The faults a refusal names (SEARCH §8.4), each spelled as its code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PimdirQueryErrorCode {
     /// No term in the query, or in a group: `empty-query`.
     EmptyQuery,
@@ -1075,7 +1095,7 @@ fn is_reference_role(role: &str) -> bool {
     matches!(
         role,
         "attachment" | "invitation" | "sender" | "parent" | "source" | "related"
-    ) || role.starts_with("x-")
+    ) || role.strip_prefix("x-").is_some_and(|name| !name.is_empty())
 }
 
 /// Reads a range of `point`s: one, or two around `..` with either side
@@ -1263,5 +1283,36 @@ mod tests {
         assert_eq!(refusal("date:3m"), ("invalid-date", 5, 7));
         assert_eq!(refusal("changed:1..x"), ("invalid-value", 8, 12));
         assert_eq!(refusal("kind:\"mail\" is:\"x\""), ("invalid-value", 15, 18));
+    }
+
+    #[test]
+    fn a_linked_value_reads_a_role_only_when_it_names_one() {
+        let linked = |query: &str| match &PimdirQuery::parse(query).unwrap() {
+            PimdirQuery::Term(term) => match &term.predicate {
+                PimdirQueryPredicate::Linked { role, id } => (
+                    role.as_ref().map(|role| role.as_str().to_string()),
+                    id.clone(),
+                ),
+                _ => panic!("a linked term"),
+            },
+            _ => panic!("one term"),
+        };
+        assert_eq!(
+            linked("linked:x-cal:a"),
+            (Some("x-cal".into()), PimdirQueryId::Link("a".into()))
+        );
+        assert_eq!(
+            linked("linked:x-:a"),
+            (None, PimdirQueryId::Link("x-:a".into()))
+        );
+        assert_eq!(
+            linked("linked:sender:007"),
+            (Some("sender".into()), PimdirQueryId::Digits("007".into()))
+        );
+        assert_eq!(PimdirQueryId::Digits("007".into()).seq(), Some(7));
+        assert_eq!(
+            PimdirQueryId::Digits("99999999999999999999".into()).seq(),
+            None
+        );
     }
 }

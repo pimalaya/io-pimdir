@@ -30,7 +30,9 @@ use io_pimdir::{
         file::{self, PimdirFileSummary},
         mail,
     },
-    sync::{PimdirConflictPolicy, PimdirPushRights, PimdirSyncEvent, PimdirSyncOptions},
+    sync::{
+        PimdirConflictPolicy, PimdirParked, PimdirPushRights, PimdirSyncEvent, PimdirSyncOptions,
+    },
 };
 use rusqlite::{Connection, named_params, params};
 use serde_json::{Map, Value, json};
@@ -101,19 +103,31 @@ fn flags_json(flags: &Option<String>) -> Value {
 fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
     let owner = PimdirStore::open_with_hash(dir, Some(PimdirHashAlgo::Blake3)).unwrap();
     let blobs = owner.blobs();
+    let stage = owner.blob_stage();
     let mut hashes = BTreeMap::new();
     let mut bytes = BTreeMap::new();
     for (label, object) in store["objects"].as_object().unwrap() {
         let body = fs::read(spec.join("vectors").join(object["body"].as_str().unwrap())).unwrap();
-        let hash = blobs.hash(&body);
-        let mut writer = blobs.writer().unwrap();
-        std::io::Write::write_all(&mut writer, &body).unwrap();
-        writer.commit(&hash).unwrap();
+        let hash = stage.stage_body(&body).unwrap().hash;
         hashes.insert(label.clone(), hash.0.clone());
         bytes.insert(label.clone(), body);
     }
     let bodies = Bodies { hashes, bytes };
     drop(owner);
+
+    // NOTE: an object stated with `blob` false has its row and no file, one
+    // stated `corrupt` a file whose bytes do not hash to its name (SYNC §11).
+    let damaged = |object: &Value, key: &str| object[key].as_bool();
+    let damage = |label: &str, object: &Value| {
+        let path = blobs.path(&bodies.hashes[label].clone().into());
+        if damaged(object, "blob") == Some(false) {
+            fs::remove_file(&path).unwrap();
+        } else if damaged(object, "corrupt") == Some(true) {
+            let mut altered = fs::read(&path).unwrap();
+            altered.push(b'\n');
+            fs::write(&path, altered).unwrap();
+        }
+    };
 
     let conn = Connection::open(dir.join("pimdir.db")).unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -137,15 +151,14 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
         )
         .unwrap();
     }
-    for object in bodies.hashes.values() {
-        let size = fs::metadata(blobs.path(&object.clone().into()))
-            .unwrap()
-            .len();
+    for (label, object) in &bodies.hashes {
+        let size = bodies.bytes[label].len();
         conn.execute(
             sql::STORE_OBJECT,
             named_params! { ":hash": object, ":size": size as i64 },
         )
         .unwrap();
+        damage(label, &store["objects"][label]);
     }
     let mut next_seq = 1;
     for item in store["items"].as_array().unwrap() {
@@ -427,9 +440,13 @@ impl Scripted {
         let label =
             |hash: &Option<PimdirHash>| self.bodies.label(hash.as_ref().map(|h| h.0.clone()));
         match &change.kind {
-            PimdirChangeKind::SetFlags { flags, .. } => {
-                json!({ "kind": "SetFlags", "handle": handle, "key": key, "flags": flags.known() })
-            }
+            PimdirChangeKind::SetFlags { add, remove, .. } => json!({
+                "kind": "SetFlags",
+                "handle": handle,
+                "key": key,
+                "add": add,
+                "remove": remove,
+            }),
             PimdirChangeKind::Remove {
                 to,
                 link_id,
@@ -651,7 +668,20 @@ fn options(value: &Value) -> PimdirSyncOptions {
             since: value["scope"]["since"].as_str().map(String::from),
             until: value["scope"]["until"].as_str().map(String::from),
         },
+        accept_absences: value["accept_absences"].as_bool().unwrap_or(false),
     }
+}
+
+/// A body a mutation carries, read through the store as a producer's
+/// drain reads it: checked against its name, `None` when it cannot be
+/// read (STORAGE §7, §15.2).
+fn readable(store: &PimdirSourceStore, bodies: &Bodies, label: &Value) -> Option<PimdirObject> {
+    let hash = PimdirHash::from(bodies.hash(label).expect("a body label"));
+    let bytes = store.blobs().get(&hash).unwrap()?;
+    Some(PimdirObject {
+        hash,
+        size: bytes.len(),
+    })
 }
 
 /// The mutation a `mutate` run carries (SYNC §7), bodies by label; the
@@ -662,7 +692,7 @@ fn mutation(
     value: &Value,
     kind: &str,
     bodies: &Bodies,
-) -> PimdirMutation {
+) -> Option<PimdirMutation> {
     let handle = || {
         let seq = value["seq"].as_i64().expect("the item's seq");
         let item = store
@@ -677,13 +707,14 @@ fn mutation(
     let target = || PimdirCollectionId::from(value["target"].as_str().unwrap());
     let derived = |body: &[u8]| summary::derive(kind, body);
 
-    match value["kind"].as_str().unwrap() {
+    Some(match value["kind"].as_str().unwrap() {
         "SetFlags" => PimdirMutation::SetFlags {
             handle: handle(),
             flags: flags(&value["flags"]),
         },
         "Remove" => PimdirMutation::Remove(handle()),
         "Edit" => {
+            readable(store, bodies, &value["object"])?;
             let (object, body) = bodies.object(&value["object"]);
             let derivation = derived(&body);
             PimdirMutation::Edit {
@@ -692,6 +723,8 @@ fn mutation(
                 summary: derivation.as_ref().and_then(|d| d.summary.clone()),
                 sort_key: derivation.map(|d| d.sort_key),
                 body,
+                if_match: bodies.hash(&value["if_match"]).map(PimdirHash::from),
+                overrule: value["overrule"].as_bool().unwrap_or(false),
             }
         }
         "Copy" => PimdirMutation::Copy {
@@ -703,6 +736,7 @@ fn mutation(
             target: target(),
         },
         "Add" => {
+            readable(store, bodies, &value["object"])?;
             let (object, body) = bodies.object(&value["object"]);
             let derivation = derived(&body);
             let link_id = value["link_id"]
@@ -720,17 +754,41 @@ fn mutation(
             }
         }
         kind => panic!("unsupported mutation {kind}"),
-    }
+    })
 }
 
-/// Runs one case's verb, returning the pushes and the events.
-fn run(
-    store: &mut PimdirSourceStore,
-    case: &Value,
-    remote: &mut Scripted,
-) -> (Vec<Value>, Vec<Value>) {
+/// What a run gave back: its pushes, its events, whether it failed, and
+/// the counts of a round or a rekey it parked.
+struct Ran {
+    pushes: Vec<Value>,
+    events: Vec<Value>,
+    failed: bool,
+    parked: Option<PimdirParked>,
+}
+
+/// An event as SYNC §11 spells it.
+fn event_json(event: &PimdirSyncEvent) -> Value {
+    let (kind, handle) = match event {
+        PimdirSyncEvent::Added(h) => ("Added", h),
+        PimdirSyncEvent::FlagsChanged(h) => ("FlagsChanged", h),
+        PimdirSyncEvent::ContentChanged(h) => ("ContentChanged", h),
+        PimdirSyncEvent::Vanished(h) => ("Vanished", h),
+        PimdirSyncEvent::Conflicted(h) => ("Conflicted", h),
+        PimdirSyncEvent::Created(h) => ("Created", h),
+        PimdirSyncEvent::Overruled { handle, link_id } => {
+            return json!({ "kind": "Overruled", "handle": handle.0, "link_id": link_id.0 });
+        }
+        event => panic!("unexpected event {event:?}"),
+    };
+    json!({ "kind": kind, "handle": handle.0 })
+}
+
+/// Runs one case's verb.
+fn run(store: &mut PimdirSourceStore, case: &Value, remote: &mut Scripted) -> Ran {
     let run = &case["run"];
     let collection = run["collection"].as_str().unwrap();
+    let mut failed = false;
+    let mut parked = None;
     let events = match run["verb"].as_str().unwrap() {
         "sync" => {
             // NOTE: driven here rather than through the store's runner, so
@@ -743,7 +801,11 @@ fn run(
             let mut arg = None;
             let report = loop {
                 let yielded = match sync.resume(arg.take()) {
-                    PimdirCoroutineState::Complete(result) => break result.unwrap(),
+                    PimdirCoroutineState::Complete(Ok(report)) => break report,
+                    PimdirCoroutineState::Complete(Err(_)) => {
+                        failed = true;
+                        break sync.report().clone();
+                    }
                     PimdirCoroutineState::Yielded(yielded) => yielded,
                 };
                 arg = Some(match store.service(yielded).unwrap() {
@@ -767,21 +829,8 @@ fn run(
                     Err(_) => unreachable!("a storage yield is serviced"),
                 });
             };
-            report
-                .events
-                .iter()
-                .map(|event| {
-                    let (kind, handle) = match event {
-                        PimdirSyncEvent::Added(h) => ("Added", h),
-                        PimdirSyncEvent::FlagsChanged(h) => ("FlagsChanged", h),
-                        PimdirSyncEvent::ContentChanged(h) => ("ContentChanged", h),
-                        PimdirSyncEvent::Vanished(h) => ("Vanished", h),
-                        PimdirSyncEvent::Conflicted(h) => ("Conflicted", h),
-                        PimdirSyncEvent::Created(h) => ("Created", h),
-                    };
-                    json!({ "kind": kind, "handle": handle.0 })
-                })
-                .collect()
+            parked = report.parked;
+            report.events
         }
         "upgrade" => {
             let handles = run["handles"]
@@ -795,8 +844,10 @@ fn run(
                 Some("Full") => PimdirTier::Full,
                 _ => PimdirTier::Meta,
             };
-            store.upgrade(collection, handles, tier, remote).unwrap();
-            Vec::new()
+            store
+                .upgrade(collection, handles, tier, remote)
+                .unwrap()
+                .events
         }
         "mutate" => {
             let mutation = mutation(
@@ -806,11 +857,18 @@ fn run(
                 &remote.kind,
                 &remote.bodies,
             );
-            store.mutate(collection, mutation).unwrap();
-            Vec::new()
+            match mutation.map(|mutation| store.mutate(collection, mutation)) {
+                Some(Ok(report)) => report.events,
+                Some(Err(_)) | None => {
+                    failed = true;
+                    Vec::new()
+                }
+            }
         }
         "rekey" => {
-            store.rekey(collection, remote).unwrap();
+            let accept = run["options"]["accept_absences"].as_bool().unwrap_or(false);
+            let report = store.rekey(collection, accept, remote).unwrap();
+            parked = report.parked;
             Vec::new()
         }
         "open" => {
@@ -820,7 +878,12 @@ fn run(
         verb => panic!("unsupported verb {verb}"),
     };
 
-    (std::mem::take(&mut remote.pushes), events)
+    Ran {
+        pushes: std::mem::take(&mut remote.pushes),
+        events: events.iter().map(event_json).collect(),
+        failed,
+        parked,
+    }
 }
 
 /// Every row of a table the case expects, projected onto the keys the
@@ -1015,7 +1078,31 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-fn assert_same_set(label: &str, table: &str, mut expected: Vec<Value>, mut actual: Vec<Value>) {
+fn assert_same_set(label: &str, table: &str, mut expected: Vec<Value>, actual: Vec<Value>) {
+    // NOTE: each row is compared on the columns its own expected row names
+    // (SYNC §11), the two paired by the columns naming the row.
+    const NAMING: [&str; 6] = ["id", "collection", "link_id", "source", "role", "position"];
+    let mut actual: Vec<Value> = actual
+        .into_iter()
+        .map(|row| {
+            let paired = expected.iter().find(|wanted| {
+                NAMING
+                    .iter()
+                    .filter(|key| wanted.get(**key).is_some())
+                    .all(|key| wanted[*key] == row[*key])
+            });
+            match (paired, row.as_object()) {
+                (Some(wanted), Some(columns)) => Value::Object(
+                    columns
+                        .iter()
+                        .filter(|(key, _)| wanted.get(key.as_str()).is_some())
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ),
+                _ => row,
+            }
+        })
+        .collect();
     let key = |value: &Value| value.to_string();
     expected.sort_by_key(key);
     actual.sort_by_key(key);
@@ -1063,8 +1150,23 @@ fn every_sync_vector_reproduces() {
     paths.sort();
     assert!(!paths.is_empty(), "the sync vectors carry no case");
 
-    for path in paths {
-        let case: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    // NOTE: every case runs, so a run names every vector it fails at once.
+    let failed: Vec<String> = paths
+        .iter()
+        .filter(|path| std::panic::catch_unwind(|| reproduce(&spec, path)).is_err())
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{} sync vectors fail: {failed:#?}",
+        failed.len()
+    );
+}
+
+/// Builds one case into a store, runs it and compares what it expects.
+fn reproduce(spec: &Path, path: &Path) {
+    {
+        let case: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         let label = format!(
             "{}: {}",
             path.file_name().unwrap().to_string_lossy(),
@@ -1072,7 +1174,7 @@ fn every_sync_vector_reproduces() {
         );
         println!("{label}");
         let dir = tempfile::tempdir().unwrap();
-        let bodies = seed(dir.path(), &spec, &case["store"]);
+        let bodies = seed(dir.path(), spec, &case["store"]);
 
         let run_spec = &case["run"];
         let collection = run_spec["collection"].as_str().unwrap();
@@ -1088,16 +1190,16 @@ fn every_sync_vector_reproduces() {
         let pages: Vec<PimdirRemoteSnapshot> = match remote_spec["pages"].as_array() {
             Some(pages) => pages
                 .iter()
-                .map(|page| Scripted::page(&spec, &kind, page))
+                .map(|page| Scripted::page(spec, &kind, page))
                 .collect(),
             None => remote_spec["snapshot"]
                 .as_object()
-                .map(|_| Scripted::page(&spec, &kind, &remote_spec["snapshot"]))
+                .map(|_| Scripted::page(spec, &kind, &remote_spec["snapshot"]))
                 .into_iter()
                 .collect(),
         };
         let mut remote = Scripted {
-            spec: spec.clone(),
+            spec: spec.to_path_buf(),
             kind,
             algo: PimdirHashAlgo::Blake3,
             bodies: bodies.clone(),
@@ -1137,7 +1239,12 @@ fn every_sync_vector_reproduces() {
         let mut store = PimdirStore::open(dir.path())
             .unwrap()
             .for_source(run_spec["source"].as_str().unwrap());
-        let (pushes, events) = run(&mut store, &case, &mut remote);
+        let Ran {
+            pushes,
+            events,
+            failed,
+            parked,
+        } = run(&mut store, &case, &mut remote);
         drop(store);
         assert!(
             remote.head.is_none(),
@@ -1160,6 +1267,16 @@ fn every_sync_vector_reproduces() {
         expected_events.sort_by_key(|event| event.to_string());
         events.sort_by_key(|event| event.to_string());
         assert_eq!(expected_events, events, "{label}: events differ");
+
+        let expect_failed = case["expect"]["failed"].as_bool().unwrap_or(false);
+        assert_eq!(expect_failed, failed, "{label}: the run failing differs");
+        let expect_parked = case["expect"]["parked"]
+            .as_object()
+            .map(|parked| PimdirParked {
+                absent: parked["absent"].as_u64().unwrap() as usize,
+                bound: parked["bound"].as_u64().unwrap() as usize,
+            });
+        assert_eq!(expect_parked, parked, "{label}: the park differs");
 
         let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
         let expect = case["expect"]["store"].as_object().unwrap();

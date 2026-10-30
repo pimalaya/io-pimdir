@@ -16,6 +16,17 @@
 //! round began, so what arrives during a long round shows before it
 //! closes. A connector states which heads it lists
 //! ([`PimdirRemote::heads`]); one listing none is never asked for one.
+//!
+//! A push applies each [`PimdirChange`] on the terms SYNC §4 fixes: a
+//! `SetFlags` adds and removes, never replaces; a precondition guards only
+//! where the source enforces it, a source enforcing none leaving a window
+//! in which a server change under the push is lost; and an identity named
+//! to the server is the key's [`stated`](PimdirLinkId::stated) form, its
+//! one leading `esc:` stripped. A connector mirroring collections between
+//! sources deletes one on a server because another source stopped listing
+//! it only when its configuration enables it, and then only when it is
+//! empty or every member was reconciled in the run (SYNC §5): the engine
+//! derives no such delete.
 
 use alloc::{string::String, vec::Vec};
 
@@ -352,6 +363,7 @@ impl PimdirEnumerate {
 
 /// What an enumeration answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PimdirEnumerated {
     /// One page of the listing asked for.
     Page(PimdirRemoteSnapshot),

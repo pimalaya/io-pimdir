@@ -18,6 +18,30 @@ impl AsRef<str> for PimdirCollectionId {
     }
 }
 
+/// Whether `role` is of the vocabulary STORAGE §14 lists for collections
+/// of `kind`: the one an owner writes, and the one a reader knows. The
+/// column is an open vocabulary (§13), so a role outside it is read as
+/// none rather than refused.
+pub fn role_of_kind(kind: &str, role: &str) -> bool {
+    match kind.split(';').next().unwrap_or_default().trim() {
+        "message/rfc822" => matches!(
+            role,
+            "inbox"
+                | "sent"
+                | "drafts"
+                | "trash"
+                | "junk"
+                | "archive"
+                | "all"
+                | "flagged"
+                | "important"
+        ),
+        "text/calendar" | "text/vcard" => role == "default",
+        "application/octet-stream" => role == "attachments",
+        _ => false,
+    }
+}
+
 /// An opaque per-collection sync token.
 ///
 /// A QRESYNC pack, a JMAP state string or a WebDAV sync-token, never

@@ -265,17 +265,25 @@ impl PimdirExtract {
                         push(field, &text);
                         push(&mut extract.people, &text);
                     }
+                    // NOTE: its `FILENAME` (RFC 8607) and `FMTTYPE` (SEARCH
+                    // §6), so `has:attachment` reads a non-empty field.
                     "ATTACH" => {
                         for param in &prop.params {
-                            if let IcalParam::Unknown { name, values } = param
-                                && matches!(
-                                    name.to_ascii_uppercase().as_str(),
-                                    "FILENAME" | "X-FILENAME"
-                                )
-                            {
-                                for value in values {
-                                    push(&mut extract.attachment, value);
+                            match param {
+                                IcalParam::Unknown { name, values }
+                                    if matches!(
+                                        name.to_ascii_uppercase().as_str(),
+                                        "FILENAME" | "X-FILENAME"
+                                    ) =>
+                                {
+                                    for value in values {
+                                        push(&mut extract.attachment, value);
+                                    }
                                 }
+                                IcalParam::FmtType(media_type) => {
+                                    push(&mut extract.attachment, media_type);
+                                }
+                                _ => (),
                             }
                         }
                     }

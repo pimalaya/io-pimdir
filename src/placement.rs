@@ -10,6 +10,7 @@
 
 use alloc::{
     collections::BTreeSet,
+    format,
     string::{String, ToString},
 };
 
@@ -33,6 +34,32 @@ crate::pimdir_id! {
 }
 
 impl PimdirLinkId {
+    /// The prefixes STORAGE §9 reserves: the five a writer derives keys
+    /// under, and the escape.
+    pub const RESERVED: [&str; 6] = ["alt:", "hash:", "dup:", "part:", "file:", "esc:"];
+
+    /// The key a stated identity is filed under (STORAGE §9): the hint
+    /// verbatim, or `esc:` and the hint when it begins with a reserved
+    /// prefix, so a vCard `UID` stating `hash:` never reads as a key the
+    /// writer derived. A connector naming the identity to its server
+    /// strips the one leading `esc:`.
+    pub fn from_hint(hint: impl Into<String>) -> Self {
+        let hint = hint.into();
+        match Self::RESERVED.iter().any(|prefix| hint.starts_with(prefix)) {
+            true => Self(format!("esc:{hint}")),
+            false => Self(hint),
+        }
+    }
+
+    /// The identity a stated key names on a server (STORAGE §9): the key
+    /// with its one leading `esc:` stripped, the inverse of
+    /// [`from_hint`](Self::from_hint). What a connector compares with, or
+    /// hands, the identity its server holds, such as the `link_id` of an
+    /// `Add` or a `Remove` (SYNC §4); a writer-derived key names none.
+    pub fn stated(&self) -> &str {
+        self.0.strip_prefix("esc:").unwrap_or(&self.0)
+    }
+
     /// Whether the key is writer-derived (`alt:`, `hash:`, `dup:`, STORAGE
     /// §9): it names no identity, shares no public id and takes no
     /// reference.
@@ -344,6 +371,15 @@ mod tests {
             PimdirLinkId::from("m")
         );
         assert_eq!(PimdirLinkId::from("m").as_str(), "m");
+    }
+
+    /// A connector names the identity a body states, the one `esc:` the
+    /// key gained stripped and no more (STORAGE §9).
+    #[test]
+    fn a_stated_key_names_the_identity_its_body_states() {
+        for hint in ["hash:0123", "esc:x", "urn:uuid:1"] {
+            assert_eq!(PimdirLinkId::from_hint(hint).stated(), hint);
+        }
     }
 
     #[test]

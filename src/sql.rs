@@ -56,12 +56,13 @@ COUNT_RETAINED_BEFORE = r#"SELECT count(*), coalesce(sum(o.size), 0) FROM items 
 LEFT JOIN objects o ON o.hash = i.object_hash
 WHERE i.retained_at IS NOT NULL AND i.retained_at < :cutoff;"#;
 
-/// The objects whose stored refcount disagrees with the five pointer columns.
+/// The objects whose stored refcount disagrees with the six pointer columns.
 REFCOUNT_DRIFT = r#"WITH refs(hash) AS (
   SELECT object_hash FROM items WHERE object_hash IS NOT NULL
   UNION ALL SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL
   UNION ALL SELECT base_object FROM bindings WHERE base_object IS NOT NULL
   UNION ALL SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL
+  UNION ALL SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL
   UNION ALL SELECT object_hash FROM queue WHERE object_hash IS NOT NULL
 ), counted(hash, n) AS (SELECT hash, count(*) FROM refs GROUP BY hash)
 SELECT o.hash, o.refcount, coalesce(c.n, 0) FROM objects o

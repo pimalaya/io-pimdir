@@ -40,6 +40,7 @@ impl PimdirSearchCoverage {
             *self.local.bodiless.entry(kind.clone()).or_default() += count;
         }
         self.local.unindexed += other.local.unindexed;
+        self.local.behind = self.local.behind.max(other.local.behind);
         self.temporal.merge(&other.temporal);
         self.remote.merge(&other.remote);
         self.horizon_left |= other.horizon_left;
@@ -68,6 +69,12 @@ pub struct PimdirSearchLocal {
     /// what it answers about them may be stale or missing. Always zero for
     /// the store's own reads, which need no index.
     pub unindexed: u64,
+    /// How far the index is behind the store, whole: the change stamps the
+    /// store drew above the index cursor (STORAGE §4.5, SEARCH §4), so a
+    /// client can say the index is N changes behind and to run its
+    /// indexer. Unlike `unindexed` it is not scoped to the query, and it
+    /// counts deletions too. Always zero for the store's own reads.
+    pub behind: u64,
 }
 
 /// The temporal axis: whether the store holds every member of the range

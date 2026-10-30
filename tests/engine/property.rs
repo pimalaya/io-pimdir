@@ -641,6 +641,8 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                     let staged = client.mutate(
                         "inbox",
                         PimdirMutation::Edit {
+                            overrule: false,
+                            if_match: None,
                             sort_key: Default::default(),
                             handle: handle.clone(),
                             object,
@@ -920,6 +922,8 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                 .mutate(
                     "inbox",
                     PimdirMutation::Edit {
+                        overrule: false,
+                        if_match: None,
                         sort_key: Default::default(),
                         handle,
                         object,
@@ -965,6 +969,8 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                 .mutate(
                     "archive",
                     PimdirMutation::Edit {
+                        overrule: false,
+                        if_match: None,
                         sort_key: Default::default(),
                         handle,
                         object,
@@ -1379,6 +1385,8 @@ fn duo_edit(client: &mut Replica, index: usize, tag: &str, n: u8) {
             .mutate(
                 "inbox",
                 PimdirMutation::Edit {
+                    overrule: false,
+                    if_match: None,
                     sort_key: Default::default(),
                     handle,
                     object,
@@ -1412,6 +1420,8 @@ fn duo_resolve(client: &mut Replica, tag: &str) -> bool {
             .mutate(
                 "inbox",
                 PimdirMutation::Edit {
+                    overrule: false,
+                    if_match: None,
                     sort_key: Default::default(),
                     handle,
                     object,

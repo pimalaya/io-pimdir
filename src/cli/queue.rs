@@ -294,7 +294,16 @@ fn summary(action: &PimdirAction) -> String {
         PimdirAction::Remove { seq } => format!("seq {seq}"),
         PimdirAction::Move { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Copy { seq, to } => format!("seq {seq} -> {}", to.0),
-        PimdirAction::Update { seq, object } => format!("seq {seq}, object {}", object.0),
+        PimdirAction::Update {
+            seq,
+            object,
+            if_match: None,
+        } => format!("seq {seq}, object {}", object.0),
+        PimdirAction::Update {
+            seq,
+            object,
+            if_match: Some(read),
+        } => format!("seq {seq}, object {}, if-match {}", object.0, read.0),
         PimdirAction::SetPerformer { capability, source } => {
             format!("{capability} -> {}", source.as_deref().unwrap_or("none"))
         }

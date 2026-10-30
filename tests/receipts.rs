@@ -4,7 +4,7 @@
 //! predates receipts gains the table on open. An intent its performer
 //! acknowledges leaves one too (§15.5), a withdrawn row none.
 
-use std::{io::Write, path::Path};
+use std::path::Path;
 
 use io_pimdir::{
     client::{
@@ -27,26 +27,16 @@ fn store(dir: &Path) {
     store.ensure_collection("Drafts", "message/rfc822").unwrap();
 }
 
-/// Writes `body` through the producer's blobs and returns the `add` of it.
+/// Stages `body` through the producer and returns the `add` of it.
 fn add(producer: &PimdirProducer, body: &str) -> (PimdirAction, PimdirObject) {
-    let blobs = producer.blobs();
-    let hash = blobs.hash(body.as_bytes());
-    let mut writer = blobs.writer().unwrap();
-    writer.write_all(body.as_bytes()).unwrap();
-    writer.commit(&hash).unwrap();
+    let object = producer.stage_body(body.as_bytes()).unwrap();
     let action = PimdirAction::Add {
         link_id: None,
         flags: PimdirFlags::from_iter(["\\Draft"]),
-        object: Some(hash.clone()),
+        object: Some(object.hash.clone()),
         supersedes: None,
     };
-    (
-        action,
-        PimdirObject {
-            hash,
-            size: body.len(),
-        },
-    )
+    (action, object)
 }
 
 fn drain(dir: &Path) {

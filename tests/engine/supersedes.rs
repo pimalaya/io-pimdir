@@ -7,13 +7,10 @@
 //! cost the item it replaces, which the pair of an `add` and a `remove`
 //! queued together did.
 
-use std::io::Write;
-
 use io_pimdir::{
     client::{producer::PimdirProducer, reader::PimdirReader},
     codec::{PimdirAction, PimdirSupersedes},
     collection::PimdirCollectionId,
-    object::PimdirObject,
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId},
     sync::PimdirSyncOptions,
 };
@@ -45,23 +42,15 @@ fn synced() -> (Client, i64) {
 /// `archive`, superseding the item `seq` of `inbox`.
 fn file(client: &Client, seq: i64) {
     let mut producer = PimdirProducer::open(client.path(), "test").unwrap();
-    let blobs = producer.blobs();
-    let hash = blobs.hash(FILED);
-    let mut writer = blobs.writer().unwrap();
-    writer.write_all(FILED).unwrap();
-    writer.commit(&hash).unwrap();
+    let object = producer.stage_body(FILED).unwrap();
     let add = PimdirAction::Add {
         link_id: Some(PimdirLinkId::from("filed-a")),
         flags: PimdirFlags::default(),
-        object: Some(hash.clone()),
+        object: Some(object.hash.clone()),
         supersedes: Some(PimdirSupersedes {
             collection: PimdirCollectionId::from("inbox"),
             seq,
         }),
-    };
-    let object = PimdirObject {
-        hash,
-        size: FILED.len(),
     };
     producer.enqueue("archive", &add, Some(&object)).unwrap();
 }
@@ -167,23 +156,15 @@ const KEPT: &[u8] = b"Message-ID: <msg-a>\r\nSubject: The lease, clarified\r\n\r
 /// `seq` of `inbox`, which it supersedes: a task filed with its `UID` kept.
 fn file_keeping(client: &Client, seq: i64) {
     let mut producer = PimdirProducer::open(client.path(), "test").unwrap();
-    let blobs = producer.blobs();
-    let hash = blobs.hash(KEPT);
-    let mut writer = blobs.writer().unwrap();
-    writer.write_all(KEPT).unwrap();
-    writer.commit(&hash).unwrap();
+    let object = producer.stage_body(KEPT).unwrap();
     let add = PimdirAction::Add {
         link_id: Some(PimdirLinkId::from("msg-a")),
         flags: PimdirFlags::default(),
-        object: Some(hash.clone()),
+        object: Some(object.hash.clone()),
         supersedes: Some(PimdirSupersedes {
             collection: PimdirCollectionId::from("inbox"),
             seq,
         }),
-    };
-    let object = PimdirObject {
-        hash,
-        size: KEPT.len(),
     };
     producer.enqueue("archive", &add, Some(&object)).unwrap();
 }

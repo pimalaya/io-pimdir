@@ -226,6 +226,8 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
                     let _ = client.mutate(
                         "inbox",
                         PimdirMutation::Edit {
+                            overrule: false,
+                            if_match: None,
                             handle,
                             object: PimdirObject {
                                 hash: hash(&body),
@@ -244,6 +246,8 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
                     let _ = client.mutate(
                         "inbox",
                         PimdirMutation::Edit {
+                            overrule: false,
+                            if_match: None,
                             handle,
                             object: PimdirObject {
                                 hash: hash(&body),

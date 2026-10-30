@@ -71,7 +71,7 @@ impl PimdirMailSummary {
     /// over the subject, the date and the sender (Annex A.1).
     pub fn link_id(&self) -> PimdirLinkId {
         match &self.message_id {
-            Some(id) => PimdirLinkId(id.clone()),
+            Some(id) => PimdirLinkId::from_hint(id.as_str()),
             None => PimdirLinkId(format!(
                 "alt:{}|{}|{}",
                 self.subject,

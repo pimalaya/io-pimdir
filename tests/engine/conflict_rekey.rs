@@ -78,6 +78,8 @@ fn edit(client: &mut Client, handle: &str, body: &[u8]) {
         .mutate(
             "inbox",
             PimdirMutation::Edit {
+                overrule: false,
+                if_match: None,
                 handle: PimdirHandle::from(handle),
                 object,
                 body: body.to_vec(),

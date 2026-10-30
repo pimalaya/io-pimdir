@@ -6,16 +6,20 @@ status: current
 
 # Search
 
-The reference implementation of pimdir SEARCH.md (`draft-04`): index.db beside the store, its refresh from the change feed, extraction and the query language. It ships behind the `search` feature on `client`, which `cli` enables and the default leaves out, so a consumer that does not search (the Android cdylib) carries none of it. Milestones M1 to M4 of pimdir's search-milestones: every kind's extraction, every field, occurrences within the horizon, threads, relative dates, tagging and the thread verb.
+The reference implementation of pimdir SEARCH.md (`search-draft-05`), experimental: its API and index build may change in a minor release: index.db beside the store, its refresh from the change feed, extraction and the query language. It ships behind the `search` feature on `client`, which `cli` enables and the default leaves out, so a consumer that does not search (the Android cdylib) carries none of it. Milestones M1 to M4 of pimdir's search-milestones: every kind's extraction, every field, occurrences within the horizon, threads, relative dates, tagging and the thread verb.
 
 ### Requirement: The index is derived and rebuilt, never migrated
-`PimdirIndex::open` SHALL open index.db as the main database with pimdir.db attached read-only as `store`, and SHALL rebuild it when its version or its tokenizer differs from the vendored schema's, or when its own `index_build` marker is absent or differs from `sql::search::BUILD`, so an index built by an earlier release of this crate is rebuilt rather than answering from data it lacks. It SHALL refuse a SQLite without FTS5 or older than 3.43 (`PimdirError::Fts5`) rather than build a partial index.
+`PimdirIndex::open` SHALL open index.db as the main database with pimdir.db attached read-only as `store`, and SHALL rebuild it when its version, its tokenizer or its shape differs from the vendored schema's (SEARCH §2): every table, index and trigger migrations/search/0001_init.sql creates, compared by its `sqlite_schema` text with `--` comments removed and whitespace collapsed, the shadow tables FTS5 creates and any other table left out. An index an earlier draft or an earlier release of this crate built is therefore rebuilt rather than answering from data it lacks, and stored chunk offsets are always this crate's extraction's, which a snippet re-extracts (SEARCH §6). `PimdirIndex::open_query` SHALL refuse such an index as `PimdirError::IndexOutdated`. It SHALL refuse a SQLite without FTS5 or older than 3.43 (`PimdirError::Fts5`) rather than build a partial index.
+
+#### Scenario: An index an earlier draft built
+- GIVEN an index.db at version 1 whose `object` table lacks `attachment`
+- WHEN `open_query` opens it, THEN it answers `IndexOutdated`; WHEN `open` opens it, THEN it rebuilds it and the next `open_query` opens it (tests/search.rs `an_index_of_another_shape_is_rebuilt_never_queried`)
 
 ### Requirement: A refresh folds the feed in bounded, resumable batches
-`PimdirIndex::refresh` SHALL take index.lock without waiting, answering `busy` when another indexer holds it. It SHALL fold `load_changed_items` in transactions of a bounded number of rows, each full batch recording its last row's stamp with the previous pass's purge count, so a pass cut short resumes where it stopped. The transaction exhausting the feed SHALL reconcile keys when the purge count or a collection stamp moved, and record the cursor and purge count read before the pass. A deadline SHALL be checked between batches.
+`PimdirIndex::refresh` SHALL take index.lock without waiting, answering `busy` when another indexer holds it. It SHALL fold `load_changed_items` in transactions of a bounded number of rows, each full batch recording through `set_index_cursor` its last row's stamp with the purge count and `store_reconciled` the last completed pass recorded, so a pass cut short resumes where it stopped. The transaction exhausting the feed SHALL reconcile keys when the purge count moved or a collection was stamped above `index_meta.store_reconciled`, and record the cursor read before the pass as `store_change` and `store_reconciled`, with the purge count read beside it: no batch advances `store_reconciled`, so a rename a deadline-cut pass folded past is still reconciled, by this indexer or another one resuming the pass. A deadline SHALL be checked between batches. A handle opened by `open_query` SHALL refuse to refresh (`PimdirError::IndexQueryOnly`).
 
 ### Requirement: One-shot answers refresh first and say what is behind
-`search` and `count` SHALL refresh up to the store's head within `--refresh-timeout` before answering (`0s` skips it), and SHALL count what stays unfolded as `coverage.local.unindexed`. A session that keeps the index open follows the feed instead.
+`search` and `count` SHALL refresh up to the store's head within `--refresh-timeout` before answering (`0s` skips it), and SHALL count what stays unfolded as `coverage.local.unindexed`; every answer SHALL say in `coverage.local.behind` (`behind` in JSON) what the canonical `behind` answers: the change stamps the store drew above the index cursor, store-wide. A session that keeps the index open follows the feed instead.
 
 ### Requirement: Mail is extracted by mail-parser, chunked as SEARCH §6 says
 Mail extraction SHALL go through mail-parser (`full_encoding`): the MIME walk under `MIME_DEPTH_MAX`, transfer encodings, charsets, RFC 2047 and 2231, `text/plain` preferred and `text/html` reduced to text, `encrypted` and `unparseable` statuses, the attachment field from the crate's own stand-in walk. The `body` and `note` fields SHALL be cut into chunks by `search::chunk::chunks` on SEARCH §6's rule. Contacts and calendar items SHALL be extracted through vcard-rs and ical-rs on SEARCH §6's table, a `TEL` as written and as its digits, every event, task and journal of a resource, overrides included; an item falls back to its summary only while bodiless or unparseable, and a file always reads its summary.
@@ -52,3 +56,49 @@ The refresh SHALL relink the messages a batch touched (SEARCH §9): the parent f
 
 #### Scenario: The task vectors
 - tests/search.rs, the eleven cases over item 16 of pimdir vectors/search/queries.json; the unit test `a_category_folds_by_the_full_unicode_lowercase_mapping` of src/client/search/compile.rs.
+
+### Requirement: A calendar item has an attachment when its field is not empty
+The calendar extraction SHALL put each `ATTACH`'s `FILENAME` (or `X-FILENAME`) and `FMTTYPE` in the `attachment` field, `insert_object` SHALL record in `object.attachment` whether that text is non-empty, and `has:attachment` SHALL match a message whose `mail_summary.attachment` is 1 or a calendar item `attached` names (SEARCH §6, §8). No implementation function reads FTS5's shadow tables.
+
+#### Scenario: The attachment vectors
+- the search vectors `has:attachment` and `has:attachment kind:task` over items 13, 16 and 23 (tests/search.rs)
+
+### Requirement: A query client opens the index read-only and builds nothing
+`PimdirIndex::open_query` SHALL open index.db read-only with pimdir.db attached read-only, take no lock and write nothing, the journal mode included (SEARCH §3): it never creates, rebuilds nor refreshes the index, which the store's indexer (its owner, at sync time) keeps. An index.db absent or holding no schema SHALL be `PimdirError::IndexMissing` (`index-missing`), one at another schema version, tokenizer or build `PimdirError::IndexOutdated` (`index-outdated`), each saying to run the store's sync engine. `PimdirIndex::open` stays the indexer's open, building and rebuilding.
+
+#### Scenario: A missing, a lagging and an outdated index
+- tests/search.rs `a_query_open_neither_builds_rebuilds_nor_refreshes`
+
+### Requirement: A collection term names an id
+`collection:` and `folder:` SHALL match collection ids alone, in the compiled query and in the coverage's scope: a collection's name is a label, never an address (STORAGE §14).
+
+#### Scenario: A display name
+- tests/search.rs `a_collection_term_names_an_id_never_a_display_name` (failed before the change: the name matched)
+
+### Requirement: A value of digits names a seq and a link id
+`id:` and `linked:` with a value of ASCII digits alone (`PimdirQueryId::Digits`, the text as written) SHALL name the item of that `seq` and every item whose link id it is (SEARCH §8), a hit set; a value past a `seq`'s range names the link id alone. `linked:` SHALL read the text before the first colon as a role only when it is one of STORAGE §14.2's or `x-` and a name.
+
+#### Scenario: A message keyed by digits
+- tests/search.rs `an_id_of_digits_names_the_seq_and_the_link_id` (failed before the change: `id:777` named seq 777 alone); src/search/query.rs `a_linked_value_reads_a_role_only_when_it_names_one`
+
+### Requirement: A rename past a cut pass is reconciled
+A collection renamed while a pass was cut by its deadline after folding past the rename's stamp SHALL be reconciled by the next completed pass, its old id's placements dropped.
+
+#### Scenario: A cut pass
+- tests/search.rs `a_rename_a_cut_pass_went_past_is_reconciled_by_the_next_one` (failed before the change: nothing reconciled)
+
+### Requirement: A search answers at the scale of a mailbox
+A refresh SHALL read one item's summary and addresses by seek (`get_mail` and its siblings by `(collection, seq)`, `load_addresses`), never by a scan of its collection, and a compiled term's membership SHALL never be `NULL`, so a negated term is one probe per hit; a page reads its hits' titles for the `name` order alone. Over 50,000 summary-only messages in one collection (tests/search_scale.rs, release build) the index builds in about 5 s, and `is:unread` answers a page of 50 in about 120 ms and a count in about 25 ms.
+
+#### Scenario: 50,000 messages
+- GIVEN 50,000 summary-only messages in one collection, a third read
+- WHEN the index is built, then `is:unread`, `not is:unread`, `is:flagged`, `date:`, `from:`, `subject:` are asked a page and a count
+- THEN the build takes about 5 s (454 s before) and every page and count under 0.2 s (`is:unread` 25 s before)
+
+### Requirement: The index reads an older store as its reconciliation would leave it
+Every statement the index runs naming the attached store (its compiled query, its feed, its reconciliation, its extraction, its thread and occurrence reads) SHALL go through `schema::StoreShape` (STORAGE §6): unchanged on a store holding every canonical table and column, else read as its reconciliation would leave it, so a store an older release wrote is indexed and searched before its owner reconciles it.
+
+#### Scenario: Searching an older store
+- GIVEN the 0.5.1, 0.7.0 or 0.8.0 fixture, unreconciled
+- WHEN it is indexed and asked every field of SEARCH §8
+- THEN every query answers, its task of no priority and no category, and pimdir.db is unwritten (tests/store_version.rs `a_store_released_by_*_is_indexed_and_searched`; 0.5.1 and 0.7.0 failed before: "no such table: store.file_summary")

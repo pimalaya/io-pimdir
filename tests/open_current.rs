@@ -5,8 +5,12 @@
 
 use std::fs;
 
-use io_pimdir::client::{
-    PimdirError, PimdirNotCurrent, PimdirStore, TIME_COLLECTION, reader::PimdirReader,
+use io_pimdir::{
+    client::{
+        PimdirError, PimdirNotCurrent, PimdirStore, TIME_COLLECTION, producer::PimdirProducer,
+        reader::PimdirReader,
+    },
+    codec::PimdirAction,
 };
 
 const ENTRY: &[u8] = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
@@ -71,13 +75,22 @@ fn another_schema_version_is_refused_and_not_migrated() {
         drop(conn);
 
         let refused = PimdirStore::open_current(dir.path()).err();
-        assert!(
-            matches!(
+        // NOTE: tables at version 0 are another program's (§3), as the
+        // owner's open reads them.
+        let expected = match version {
+            0 => matches!(refused, Some(PimdirError::Foreign)),
+            _ => matches!(
                 refused,
                 Some(PimdirError::NotCurrent(PimdirNotCurrent::Version { found })) if found == version
             ),
-            "{refused:?}"
-        );
+        };
+        assert!(expected, "{refused:?}");
+        let code = if version > 1 {
+            "store-newer"
+        } else {
+            "store-foreign"
+        };
+        assert_eq!(refused.unwrap().code(), code);
         let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
         let after: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -166,4 +179,39 @@ fn a_store_another_process_owns_is_refused_at_once() {
 
     drop(file);
     drop(PimdirStore::open_current(dir.path()).unwrap());
+}
+
+/// A consumer cancelling one queue row owns the store for that write alone:
+/// a store another revision keeps is refused, never brought to this crate's
+/// schema (himalaya at 3b4bed8 dropped a newer store's tables this way).
+#[test]
+fn a_cancel_leaves_a_store_needing_a_reconcile_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    drop(store);
+    let id = PimdirProducer::open(dir.path(), "test")
+        .unwrap()
+        .enqueue("INBOX", &PimdirAction::Remove { seq: 1 }, None)
+        .unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch("ALTER TABLE task_summary ADD COLUMN newer TEXT;")
+        .unwrap();
+    drop(conn);
+    let before = columns(dir.path(), "task_summary");
+
+    let refused = PimdirStore::cancel_action(dir.path(), id).err();
+    assert!(
+        matches!(
+            &refused,
+            Some(PimdirError::NotCurrent(PimdirNotCurrent::Shape { object })) if object == "task_summary"
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(columns(dir.path(), "task_summary"), before, "not rebuilt");
+    let pending = PimdirReader::open(dir.path())
+        .unwrap()
+        .pending_actions("INBOX")
+        .unwrap();
+    assert_eq!(pending.len(), 1, "the row stays queued");
 }

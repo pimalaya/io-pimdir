@@ -296,7 +296,8 @@ proptest! {
                 HostileOp::Edit(i, n) => {
                     if let Some(handle) = nth(&live(&client, "inbox"), i) {
                         let body = format!("local-{n}-{}", handle.as_str()).into_bytes();
-                        let _ = client.mutate("inbox", PimdirMutation::Edit {
+                        let _ = client.mutate("inbox", PimdirMutation::Edit { overrule: false,
+                            if_match: None,
                             handle,
                             object: PimdirObject { hash: hash(&body), size: body.len() },
                             body,

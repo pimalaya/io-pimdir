@@ -1,18 +1,12 @@
-//! The agreement point names a body and pins none (spec §5, §13).
+//! The agreement point pins the body it names (STORAGE §5).
 //!
-//! `bindings.shared_object` is the one pointer at an object the refcount
-//! deliberately does not count. The format says so twice: §5 calls it
-//! "the one exception and it is deliberate", and §13 repeats that it
-//! "names an object and MUST NOT be counted in the refcount above",
-//! because it is only ever compared for equality and never read as bytes,
-//! and a content hash compares the same after the body it named has been
-//! swept. Counting it would pin every body a source ever agreed with for
-//! the life of the binding.
-//!
-//! The asymmetry with `conflict_object` beside it is what invites a
-//! future reader to "fix" it, so it is nailed down here from both ends: a
-//! body no column but this one names is collectable, and the column still
-//! reads back afterwards, which is the whole argument for not pinning.
+//! `bindings.shared_object` names the body a binding last agreed with the
+//! shared item, the common ancestor an engine reads to merge a source's
+//! body with the item's (SYNC §9). It is counted as `bindings.base_object`
+//! is, so it outlives the item's own body until the binding reconciles
+//! against what replaced it: one body per binding, released when the
+//! binding agrees with another. An earlier draft left it unpinned, and a
+//! collector could sweep the very ancestor a later merge needed.
 
 use std::path::Path;
 
@@ -94,14 +88,14 @@ fn blob_of(dir: &Path, hash: &PimdirHash) -> std::path::PathBuf {
         .join(&hash.0)
 }
 
-/// The decision, from both ends: a body only the agreement point names is
-/// collectable, and the column survives the collection that took it.
+/// The rule, from both ends: a body only the agreement point names
+/// survives the collector, and goes once the binding agrees with another.
 ///
 /// A source that has folded once and then stops writing keeps the
 /// agreement point it settled on while the hub moves under it, which is
 /// the only way a `shared_object` can lag behind every other pointer.
 #[test]
-fn a_body_named_only_by_an_agreement_point_is_collectable() {
+fn a_body_named_only_by_an_agreement_point_is_pinned_until_it_moves() {
     let dir = tempfile::tempdir().unwrap();
     let mut left = store(dir.path(), "left");
     let mut right = store(dir.path(), "right");
@@ -136,50 +130,37 @@ fn a_body_named_only_by_an_agreement_point_is_collectable() {
     assert_eq!(agreement(&right, "right"), Some(one.clone()));
     assert_eq!(agreement(&left, "left"), Some(two.clone()));
 
-    // Nothing counted it: the incremental write path and the
-    // recomputation over the five pointer columns both put "one" at zero,
-    // so the drift read that compares them is empty.
-    assert!(
-        left.refcount_drift().unwrap().is_empty(),
-        "counting the agreement point would put the write path and the \
-         five-column recomputation at odds about this body"
-    );
-    assert!(
-        blob_of(dir.path(), &one).is_file(),
-        "still there, since no write reclaims (spec §5)"
-    );
+    // The write path counted it as the six-column recomputation does.
+    assert!(left.refcount_drift().unwrap().is_empty());
 
     let collected = left.collect_garbage().unwrap();
     assert_eq!(
         (collected.objects, collected.blobs),
-        (1, 1),
-        "the agreement point held no pin, so the body it names is taken"
+        (0, 0),
+        "the agreement point pins the body it names"
     );
-    assert!(!blob_of(dir.path(), &one).is_file(), "the body is gone");
-    assert!(
-        blob_of(dir.path(), &two).is_file(),
-        "the shared body is still referenced and untouched"
+    assert_eq!(
+        std::fs::read(blob_of(dir.path(), &one)).unwrap(),
+        b"one",
+        "the common ancestor a merge reads is readable as bytes"
     );
 
-    // The whole argument for not pinning: a content hash compares the
-    // same after the body it named has been swept, so the column still
-    // does its job and the store still opens and reads.
-    drop(left);
-    drop(right);
-    let reopened = store(dir.path(), "right");
-    assert_eq!(agreement(&reopened, "right"), Some(one));
-    assert!(reopened.refcount_drift().unwrap().is_empty());
+    // Right agrees with "two": its pin moves, and "one" falls.
+    right
+        .write(vec![card(&right, "right-1.vcf", b"two", None)])
+        .unwrap();
+    assert_eq!(agreement(&right, "right"), Some(two.clone()));
+    assert!(right.refcount_drift().unwrap().is_empty());
+    let collected = left.collect_garbage().unwrap();
+    assert_eq!((collected.objects, collected.blobs), (1, 1));
+    assert!(!blob_of(dir.path(), &one).is_file(), "released, then taken");
+    assert!(blob_of(dir.path(), &two).is_file());
 }
 
-/// The pin beside it, so the two are asserted against each other rather
-/// than each in isolation.
-///
-/// `conflict_object` and `shared_object` are two hashes on one row,
-/// written by one statement. Only one of them is a reference, and a test
-/// that checked either alone would pass on an implementation that counted
-/// both or neither.
+/// The pin beside it: `conflict_object` and `shared_object` are two
+/// hashes on one row, written by one statement, both references.
 #[test]
-fn the_conflict_body_is_pinned_where_the_agreement_point_is_not() {
+fn the_conflict_body_is_pinned_as_the_agreement_point_is() {
     let dir = tempfile::tempdir().unwrap();
     let mut left = store(dir.path(), "left");
 

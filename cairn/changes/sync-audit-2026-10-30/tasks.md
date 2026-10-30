@@ -1,0 +1,19 @@
+---
+cairn: tasks
+change: sync-audit-2026-10-30
+---
+
+- [x] S7: a restated identity discards a staged edit: the engine re-stages it as a pending create under its provisional handle (src/sync.rs `name_members`). tests/engine/sync_audit.rs `a_restated_identity_keeps_the_local_edit_of_the_old_one` (failed before: the local body dropped). The upgrade's half closed as unproven: a placement holding a local edit holds its body, so no upgrade fetches it, and a conflict revisit lands in `conflict_object`
+- [x] S8: closed as unproven. SYNC §6 has the base take the listed revision and the body when carried, and states nothing for a mutable arrival carrying none; following it literally leaves the base without a body, which reads the staged body as an edit and pushes it over the arrival at once. No test shows a loss the literal reading avoids: reported to pimdir as a gap
+- [x] S9: rekey re-stages an uncarried edit under the provisional handle its key derives, its old handle dropped `Superseded`. tests/engine/sync_audit.rs `a_rekey_restages_an_uncarried_edit_under_a_provisional_handle` (failed before: `UNIQUE constraint failed: bindings.collection, bindings.source, bindings.handle`, the rekey stuck)
+- [x] S10: rekey matches copies of one hint by revision, then by the body the listing carried, then by handle (src/rekey.rs `key_of`). tests/engine/sync_audit.rs `a_rekey_matches_copies_of_one_hint_by_their_body` (failed before: "binding inbox/dup:l1#m2 ... holds handle m2 and this write carries m1", the rekey stuck)
+- [x] S11: an accepted `Add` with no handle emits `Created` for a dropped binding: landed with the-engine-follows-sync-draft-05 (vector 92 failed first)
+- [x] S12: a paged delta lands its checkpoint early: landed with a-listing-proves-what-it-drops (failed first: the checkpoint landed)
+- [x] S13: an equal listing-carried body still conflicts: landed with the-engine-follows-sync-draft-05 (failed first: one conflict)
+- [x] S14: the hub reverses `PreferRemote` on a bodiless pull: landed with the-agreed-body-stays-pinned (vector 83 failed first)
+- [x] S15: a flag axis with no base drops local-only flags: landed with the-engine-follows-sync-draft-05 (failed first: no push, the local flag dropped)
+- [x] S16: report honesty. A body-less `Full` fetch counts nothing (`a_full_fetch_answering_no_body_counts_nothing`, failed before: `(1, 1)`); unanswered pushes counted in `PimdirSyncReport::unanswered` (`an_unanswered_push_is_counted`, failed before: 0); rejected creates named in `rejected_creates` every run (`a_rejected_create_is_reported_on_every_run`, failed before: nothing named; an event was tried first and dropped, vector 18's closed event vocabulary refusing it); the round's closure stated in the report's docs (a run returns after its last page, closed unless `parked`)
+- [x] Rekey over a reused handle (found by the neverest port): every old handle but one carried in place is dropped before any upsert, `Deleted` when gone, so the mass-absence guard counts it. tests/engine/sync_audit.rs `a_rekey_counts_a_gone_member_whose_handle_is_reused_as_absent` (failed before: 24 of 25 absent); `a_rekey_reusing_a_gone_members_handle_drops_it` passed before as well (the store retired the overwritten binding itself), kept as the end-state guard. No vector covers it: reported to pimdir
+- [x] N6: closed as unproven: a conflict body fetched at a later revision than `conflict_revision` is settled at the next sync, which sees the revision moved and records the conflict again; no test shows a loss, and the fake remote carries every mutable body, so no conflict waits for one
+- [x] N7: closed as unproven: the engine writes no base-less placement but a pending create (`Created`), the upgrade giving a named row a base, so status and "no base" select the same rows
+- [x] Spec: sync.md, rekey.md, upgrade.md folded; log 2026-10-30-sync-audit-2026-10-30; CHANGELOG

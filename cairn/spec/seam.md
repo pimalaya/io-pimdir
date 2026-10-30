@@ -94,3 +94,15 @@ A rebuild relies on it outright: every `Rekeyed` drop precedes every upsert ([re
 
 ### Requirement: Nothing reaches the store unnamed
 A write SHALL refuse an upsert carrying no link id for a handle no binding holds (`PimdirError::Unnamed`, pimdir SYNC §10); one for a bound handle folds into its binding's item as before. The store holds no probe rows.
+
+### Requirement: A stated key is named on a server without its escape
+`PimdirLinkId::stated` SHALL answer the identity a stated key names on a server, the key with its one leading `esc:` stripped (pimdir STORAGE §9): what a connector compares with or hands its server for the `link_id` of an `Add` or a `Remove`. The engine names no identity to a server itself.
+
+### Requirement: The push window a source leaves unguarded
+A precondition guards a push only where the source enforces it (an `If-Match`, a `STORE UNCHANGEDSINCE`); a source enforcing none leaves a window between the listing and the push in which a server change under an `Update`, a `Remove` or the flags a `SetFlags` names is lost (pimdir SYNC §4). The seam documents it; no row says which sources leave it open.
+
+### Requirement: A server collection is deleted only when enabled
+An engine mirroring collections between sources SHALL NOT delete a collection on one source's server because another source stopped listing it unless its configuration enables it, and then only when that collection is empty or every member was reconciled in the run (pimdir SYNC §5). The library mirrors no collection: the rule is the connector's and its configuration's, documented on the seam; `delete_collection` refuses a collection holding queued actions (the-store-follows-storage-draft-05).
+
+### Requirement: A write answers what the merge recorded
+`PimdirSourceStore::write` SHALL answer a `PimdirWritten` (`conflicted`, the handles whose upsert the write recorded as a divergence on the item; `overruled`, each body a policy did not adopt with the key of the retained item keeping it), and `service` SHALL answer `PimdirYield::WantsWrite` with `PimdirArg::Written`. Every verb accepts `PimdirArg::Write` as a write recording nothing beyond its ops, for a storage of its own.

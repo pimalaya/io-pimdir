@@ -178,3 +178,130 @@ fn a_card_kept_on_the_device_is_written_with_its_summary() {
         other => panic!("a contact summary, got {other:?}"),
     }
 }
+
+/// A queued action on an item no source binds is the store's to settle
+/// (§15.2): never skipped, which would leave it pending forever. An edit
+/// and a flag change of a device-only item apply to the store, a remove
+/// retains it, and a move, which nothing could push, parks.
+#[test]
+fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
+    use io_pimdir::{client::producer::PimdirProducer, codec::PimdirAction};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store.ensure_time_collection().unwrap();
+    store.ensure_collection("archive", "text/calendar").unwrap();
+    let (_, seq) = store.put_item(TIME_COLLECTION, &entry(None)).unwrap();
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "app").unwrap();
+    producer
+        .enqueue(
+            TIME_COLLECTION,
+            &PimdirAction::SetFlags {
+                seq,
+                flags: PimdirFlags::from_iter(["\\Flagged"]),
+            },
+            None,
+        )
+        .unwrap();
+    producer
+        .enqueue_with_body(TIME_COLLECTION, &entry(Some("20261028T100000Z")), |hash| {
+            PimdirAction::Update {
+                seq,
+                object: hash,
+                if_match: None,
+            }
+        })
+        .unwrap();
+    drop(producer);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("phone");
+    let report = owner.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked, report.skipped),
+        (2, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(dtend(&owner, seq).as_deref(), Some("20261028T100000Z"));
+    let item = owner.get_item(TIME_COLLECTION, seq).unwrap().unwrap();
+    assert!(item.flags.contains("\\Flagged"), "{:?}", item.flags);
+    drop(owner);
+
+    let mut producer = PimdirProducer::open(dir.path(), "app").unwrap();
+    producer
+        .enqueue(
+            TIME_COLLECTION,
+            &PimdirAction::Move {
+                seq,
+                to: PimdirCollectionId("archive".into()),
+            },
+            None,
+        )
+        .unwrap();
+    producer
+        .enqueue(TIME_COLLECTION, &PimdirAction::Remove { seq }, None)
+        .unwrap();
+    drop(producer);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("phone");
+    let report = owner.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked, report.skipped),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert!(owner.get_item(TIME_COLLECTION, seq).unwrap().is_none());
+    assert_eq!(
+        owner
+            .list_retained(TIME_COLLECTION, None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(owner.list_pending_actions().unwrap().is_empty());
+}
+
+/// An edit of an item no source binds applies on an edit's usual terms
+/// (STORAGE §15.3), `if_match` included: one made over a body another
+/// write has replaced since parks naming both, the item left as it is.
+#[test]
+fn an_unbound_edit_over_a_replaced_body_parks() {
+    use io_pimdir::{client::producer::PimdirProducer, codec::PimdirAction};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store.ensure_time_collection().unwrap();
+    let (_, seq) = store.put_item(TIME_COLLECTION, &entry(None)).unwrap();
+    let read = store.hash(&entry(None));
+    store
+        .put_item(TIME_COLLECTION, &entry(Some("20261028T110000Z")))
+        .unwrap();
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "app").unwrap();
+    producer
+        .enqueue_with_body(TIME_COLLECTION, &entry(Some("20261028T100000Z")), |hash| {
+            PimdirAction::Update {
+                seq,
+                object: hash,
+                if_match: Some(read),
+            }
+        })
+        .unwrap();
+    drop(producer);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("phone");
+    let report = owner.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked, report.skipped),
+        (0, 1, 0),
+        "{report:?}"
+    );
+    assert_eq!(dtend(&owner, seq).as_deref(), Some("20261028T110000Z"));
+    let parked = owner.parked_actions().unwrap();
+    assert!(
+        parked[0].error.contains("body replaced since it was read"),
+        "{parked:?}"
+    );
+}

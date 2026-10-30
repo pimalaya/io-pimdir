@@ -18,7 +18,9 @@ use log::{debug, trace};
 use rusqlite::{OptionalExtension, Transaction, named_params};
 
 use crate::{
-    client::{PimdirError, blobs::PimdirBlobs, rows, search::PimdirIndexReport},
+    client::{
+        PimdirError, blobs::PimdirBlobs, rows, schema::StoreShape, search::PimdirIndexReport,
+    },
     object::PimdirHash,
     sql::search,
     summary::time,
@@ -76,6 +78,7 @@ impl Horizon {
 pub(crate) fn roll(
     tx: &Transaction,
     blobs: &PimdirBlobs,
+    shape: StoreShape,
     now: i64,
     report: &mut PimdirIndexReport,
 ) -> Result<Horizon, PimdirError> {
@@ -100,7 +103,7 @@ pub(crate) fn roll(
     );
     let items = rows(
         tx,
-        search::ITEMS_TO_REEXPAND,
+        &shape.sql(tx, search::ITEMS_TO_REEXPAND)?,
         named_params! {
             ":old_start": time::rfc3339(old.start),
             ":old_end": time::rfc3339(old.end),

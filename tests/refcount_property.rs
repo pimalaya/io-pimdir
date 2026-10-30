@@ -4,7 +4,7 @@
 //! `objects.refcount` is what stands between a body and the collector, so
 //! a miscount is not a bookkeeping slip: too low and a live body is
 //! unlinked, too high and it is held for ever. The store maintains the
-//! count incrementally on the write path and recomputes it from the five
+//! count incrementally on the write path and recomputes it from the six
 //! pointer columns in the repair, which are two independent
 //! implementations of one fact. `REFCOUNT_DRIFT` compares them, so a
 //! random sequence of writes, drains, purges, rekeys and collections
@@ -12,7 +12,7 @@
 //! against the recomputation.
 //!
 //! Two further laws ride the same sequences. No live body is ever
-//! collected: every hash any of the five columns names still has its row
+//! collected: every hash any of the six columns names still has its row
 //! and its blob. And nothing is leaked: after a collection no object row
 //! is left at zero references and no blob file is left without a row.
 //! Asserting one direction alone passes on a collector that takes
@@ -399,7 +399,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 origin: None,
             }));
 
-            match harness.sources[source].write(batch) {
+            match harness.sources[source].write(batch).map(|_| ()) {
                 Ok(()) => {}
                 Err(PimdirError::Rebind { .. }) => {
                     reached.rebind_refused += 1;
@@ -432,7 +432,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     false => PimdirDropReason::Superseded,
                 },
             }];
-            match harness.sources[source].write(batch) {
+            match harness.sources[source].write(batch).map(|_| ()) {
                 Ok(()) => {}
                 Err(PimdirError::Rebind { .. }) => reached.rebind_refused += 1,
                 Err(err) => panic!("unexpected drop error: {err}"),
@@ -470,7 +470,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 }));
             }
 
-            match harness.sources[source].write(batch) {
+            match harness.sources[source].write(batch).map(|_| ()) {
                 Ok(()) => {}
                 Err(PimdirError::Rebind { .. }) => reached.rebind_refused += 1,
                 Err(err) => panic!("unexpected batch error: {err}"),
@@ -485,7 +485,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     handle: harness.handle(collection, source, link),
                     reason: PimdirDropReason::Deleted,
                 }];
-                match harness.sources[source].write(batch) {
+                match harness.sources[source].write(batch).map(|_| ()) {
                     Ok(()) => {}
                     Err(PimdirError::Rebind { .. }) => reached.rebind_refused += 1,
                     Err(err) => panic!("unexpected retire error: {err}"),
@@ -534,7 +534,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 origin: None,
             }));
 
-            match harness.sources[source].write(batch) {
+            match harness.sources[source].write(batch).map(|_| ()) {
                 Ok(_) => {}
                 Err(PimdirError::Rebind { .. }) => reached.rebind_refused += 1,
                 Err(err) => panic!("unexpected rekey error: {err}"),
@@ -553,14 +553,10 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
             // what takes the reference.
             let hash = object.map(|body| harness.hash(body));
             let staged = object.map(|body| {
-                let blobs = harness.sources[0].blobs();
-                let mut writer = blobs.writer().unwrap();
-                std::io::Write::write_all(&mut writer, BODIES[body]).unwrap();
-                let size = writer.commit(&harness.hash(body)).unwrap();
-                PimdirObject {
-                    hash: harness.hash(body),
-                    size: size as usize,
-                }
+                harness.sources[0]
+                    .blob_stage()
+                    .stage_body(BODIES[body])
+                    .unwrap()
             });
 
             let seqs: Vec<i64> = harness.sources[0]
@@ -580,9 +576,11 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 (2, Some(seq)) => Some(PimdirAction::Remove { seq }),
                 (3, Some(seq)) => Some(PimdirAction::Move { seq, to: elsewhere }),
                 (4, Some(seq)) => Some(PimdirAction::Copy { seq, to: elsewhere }),
-                (5, Some(seq)) => hash
-                    .clone()
-                    .map(|object| PimdirAction::Update { seq, object }),
+                (5, Some(seq)) => hash.clone().map(|object| PimdirAction::Update {
+                    seq,
+                    object,
+                    if_match: None,
+                }),
                 // NOTE: an owner-defined intent this store cannot apply.
                 // Its drain skips the row, which must leave the pin the
                 // enqueue took exactly where it was.
@@ -674,7 +672,7 @@ fn peek(dir: &Path) -> Connection {
     Connection::open(dir.join("pimdir.db")).unwrap()
 }
 
-/// The hashes the five pointer columns name (spec §5), which is exactly
+/// The hashes the six pointer columns name (spec §5), which is exactly
 /// the set the collector must not touch.
 fn reachable(dir: &Path) -> BTreeSet<String> {
     let conn = peek(dir);
@@ -684,6 +682,7 @@ fn reachable(dir: &Path) -> BTreeSet<String> {
              UNION SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
              UNION SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
              UNION SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL \
+             UNION SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL \
              UNION SELECT object_hash FROM queue WHERE object_hash IS NOT NULL",
         )
         .unwrap();
@@ -703,6 +702,7 @@ fn indexed(dir: &Path) -> BTreeMap<String, i64> {
                UNION ALL SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
                UNION ALL SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
                UNION ALL SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL \
+               UNION ALL SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL \
                UNION ALL SELECT object_hash FROM queue WHERE object_hash IS NOT NULL \
              ) \
              SELECT o.hash, (SELECT count(*) FROM refs WHERE refs.hash = o.hash) FROM objects o",
@@ -811,7 +811,7 @@ fn check_always(harness: &Harness, step: usize, op: &Op) {
     let dir = harness.path();
 
     // The differential half: the incremental count the write path keeps
-    // and the recomputation over the five pointer columns are two
+    // and the recomputation over the six pointer columns are two
     // implementations of one fact, so a disagreement means one is wrong.
     let drift = harness.sources[0].refcount_drift().unwrap();
     assert!(

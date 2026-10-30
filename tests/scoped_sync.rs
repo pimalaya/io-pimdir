@@ -742,8 +742,8 @@ fn the_mail_readers_take_a_floor_and_sum_a_range() {
 /// A store an earlier draft wrote (probes, no coverage, rows at level 0)
 /// is read by a reader as it is and reconciled by its owner on open
 /// (STORAGE §6): the columns, the trigger and the global order's index
-/// added, the probes dropped, and a level-0 row read as a `Meta` claim
-/// to revisit.
+/// added, the probes dropped, and a level-0 row repaired to `Meta`
+/// (`repair_levels`).
 #[test]
 fn an_earlier_draft_store_is_reconciled_on_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -774,6 +774,7 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
              handle TEXT NOT NULL, flags TEXT, PRIMARY KEY (collection, source, handle)) STRICT;
          INSERT INTO probes VALUES ('INBOX', 'imap', '2', NULL);
          DROP INDEX items_by_sort_global;
+         PRAGMA ignore_check_constraints = ON;
          UPDATE items SET level = 0;",
     )
     .unwrap();
@@ -782,7 +783,9 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
     let reader = PimdirReader::open(dir.path()).unwrap();
     let collections = reader.list_collections().unwrap();
     assert_eq!(collections[0].coverage, None, "read as NULL, unreconciled");
-    assert!(reader.list_coverage("INBOX").unwrap().is_empty());
+    let sources = reader.list_coverage("INBOX").unwrap();
+    assert_eq!(sources.len(), 1, "the source is listed");
+    assert_eq!(sources[0].coverage, None, "never closed, filling (§6)");
     let page = reader
         .list_mail_page_filtered(&["INBOX"], PimdirMailFilter::default(), None, None, 10)
         .unwrap();
@@ -833,9 +836,9 @@ fn an_earlier_draft_store_is_reconciled_on_open() {
     assert_eq!(loaded.coverage, None, "a store from an earlier draft");
     assert_eq!(loaded.checkpoint, Some(PimdirCheckpoint(b"c1".to_vec())));
     assert_eq!(loaded.placements[0].level, PimdirLevel::Meta);
-    assert_eq!(
-        loaded.placements[0].summary, None,
-        "a level 0 claim the next Meta upgrade revisits"
+    assert!(
+        loaded.placements[0].summary.is_some(),
+        "a level 0 row repaired to 1 (repair_levels), a Meta row like any other"
     );
 }
 

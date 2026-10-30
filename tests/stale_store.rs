@@ -1,9 +1,10 @@
-//! A store an earlier draft wrote is refused, never reconciled (spec §6).
+//! A store missing a core table is refused by every role (spec §6): where
+//! the owner open reconciles any other difference from the canonical
+//! schema, a core table or trigger missing is a damaged store.
 //!
-//! The draft is edited in place and its version stamp stays at 1, so a
-//! store missing a table the current schema declares looks current to the
-//! version check alone. Every role opening it says so instead of failing
-//! on the first statement that names the table.
+//! The draft is edited in place and its version stamp stays at 1, so such
+//! a store looks current to the version check alone. Every role opening it
+//! says so instead of failing on the first statement that names the table.
 
 use io_pimdir::client::{PimdirError, PimdirStore, producer::PimdirProducer, reader::PimdirReader};
 
@@ -20,12 +21,20 @@ fn a_store_missing_a_canonical_table_is_refused_by_every_role() {
     assert_eq!(version, 1, "still stamped current, so only the shape says");
     drop(conn);
 
+    let refused = PimdirStore::open(dir.path()).err().unwrap();
     assert!(matches!(
-        PimdirStore::open(dir.path()),
-        Err(PimdirError::Stale {
+        refused,
+        PimdirError::Stale {
             missing: "item_address"
-        })
+        }
     ));
+    assert_eq!(refused.code(), "store-stale");
+    assert!(
+        refused
+            .to_string()
+            .ends_with("run or upgrade the store's sync engine"),
+        "{refused}"
+    );
     assert!(matches!(
         PimdirReader::open(dir.path()),
         Err(PimdirError::Stale {

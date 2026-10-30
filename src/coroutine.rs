@@ -11,13 +11,16 @@
 
 use core::{error, fmt};
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 
 use crate::{
     change::{PimdirChange, PimdirWriteOp},
     collection::PimdirCollectionId,
     load::{PimdirLoadScope, PimdirLoaded},
-    object::PimdirObject,
+    object::{PimdirHash, PimdirObject},
     placement::{PimdirHandle, PimdirLinkId},
     remote::{PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirTier},
 };
@@ -38,7 +41,8 @@ pub enum PimdirCoroutineState<Y, R> {
 ///
 /// The only way any verb but [`mutate`](crate::mutate) fails, since
 /// nothing a verb does can go wrong inside the engine. One type for every
-/// verb, because it is one bug and it sits in the caller.
+/// verb, because it is one bug and it sits in the caller, or in the
+/// connector whose answer it relayed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PimdirArgError {
     /// An arg not matching the pending yield, or any resume after
@@ -46,6 +50,16 @@ pub enum PimdirArgError {
     UnexpectedArg,
     /// The caller resumed without the arg the pending yield required.
     MissingArg,
+    /// A page the run can neither resume from nor close on (SYNC §4): a
+    /// round page neither last nor carrying a cursor, which read as the
+    /// last would find absent every member the round has not listed yet,
+    /// or a delta page not the last, whose checkpoint would claim what the
+    /// pages it says follow list. Refused, nothing of it written.
+    UnresumablePage,
+    /// A page answering a rekey's round that is not a round's (SYNC §8):
+    /// a rebuild drops every old placement its listing does not name, so
+    /// only a whole round may answer it.
+    IncompleteListing,
 }
 
 impl fmt::Display for PimdirArgError {
@@ -53,6 +67,14 @@ impl fmt::Display for PimdirArgError {
         match self {
             Self::UnexpectedArg => write!(f, "Pimdir coroutine failed: unexpected arg"),
             Self::MissingArg => write!(f, "Pimdir coroutine failed: missing arg"),
+            Self::UnresumablePage => write!(
+                f,
+                "Pimdir coroutine failed: a page neither last nor resumable"
+            ),
+            Self::IncompleteListing => write!(
+                f,
+                "Pimdir coroutine failed: a rekey answered by a listing that is not a round"
+            ),
         }
     }
 }
@@ -119,8 +141,16 @@ pub enum PimdirYield {
     /// The dedup check skipping the download of a body another collection
     /// already holds.
     WantsLookupObject(Vec<PimdirLinkId>),
-    /// Apply the writes atomically, answered by [`PimdirArg::Write`].
+    /// Apply the writes atomically, answered by [`PimdirArg::Written`]
+    /// (or [`PimdirArg::Write`] by a storage that records nothing beyond
+    /// the ops).
     WantsWrite(Vec<PimdirWriteOp>),
+    /// Read each body whole and check it against its name (STORAGE §7),
+    /// answered by [`PimdirArg::Verified`].
+    ///
+    /// A sync asks it for every body a push chunk uploads, so a body that
+    /// fails is never pushed (SYNC §5).
+    WantsVerify(Vec<PimdirHash>),
 }
 
 /// Reply fed back into [`PimdirCoroutine::resume`] by the caller.
@@ -145,8 +175,30 @@ pub enum PimdirArg {
     /// with the body each holds and its size, the witness the link needs
     /// (SYNC §6).
     LookupObject(BTreeMap<PimdirLinkId, PimdirObject>),
-    /// Reply to [`PimdirYield::WantsWrite`].
+    /// Reply to [`PimdirYield::WantsWrite`] from a storage recording
+    /// nothing beyond the ops: [`Written`](Self::Written) with nothing in
+    /// it.
     Write,
+    /// Reply to [`PimdirYield::WantsWrite`], with what the write recorded
+    /// beyond the ops it was handed (SYNC §5, §9).
+    Written(PimdirWritten),
+    /// Reply to [`PimdirYield::WantsVerify`]: the bodies that read whole
+    /// and hash to their name, a missing or corrupt one left out.
+    Verified(BTreeSet<PimdirHash>),
+}
+
+/// What a write recorded beyond the ops it was handed (SYNC §9): the
+/// cross-source merge is the storage's, so the verb learns its verdict
+/// here and reports it once the write committed (SYNC §5).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirWritten {
+    /// The handles whose upsert the write recorded as a divergence on the
+    /// shared item, under whatever policy: the body it carried, or the one
+    /// it pulled, did not become the item's.
+    pub conflicted: Vec<PimdirHandle>,
+    /// The bodies a policy did not adopt, each kept as a retained item:
+    /// the handle whose write settled it and the retained item's key.
+    pub overruled: Vec<(PimdirHandle, PimdirLinkId)>,
 }
 
 #[cfg(test)]

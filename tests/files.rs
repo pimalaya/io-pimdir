@@ -223,8 +223,9 @@ fn a_message_lists_its_attachments_and_takes_them_with_it() {
 }
 
 /// A store an earlier build of draft-04 wrote has no file summaries: a
-/// reader lists no attachment, and its owner adds the table and the
-/// trigger on open (STORAGE §6).
+/// reader lists its attachments as the reconciliation leaves them, the
+/// table empty, so each without its summary, and its owner adds the table
+/// and the trigger on open (STORAGE §6).
 #[test]
 fn an_earlier_store_gains_the_files_on_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -237,16 +238,18 @@ fn an_earlier_store_gains_the_files_on_open() {
     )
     .unwrap();
 
-    let reader = PimdirReader::open(dir.path()).unwrap();
-    assert!(
-        reader
+    let listed = || {
+        PimdirReader::open(dir.path())
+            .unwrap()
             .list_attachments(None, &PimdirLinkId("m".into()))
             .unwrap()
-            .is_empty()
-    );
-    drop(reader);
+    };
+    let older = listed();
+    assert_eq!(older.len(), 2, "both parts, read through their references");
+    assert!(older.iter().all(|file| file.summary.is_none()));
 
     drop(PimdirStore::open(dir.path()).unwrap());
+    assert_eq!(listed(), older, "as the reconciled store lists them");
     let declared: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_schema WHERE name IN

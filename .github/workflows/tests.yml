@@ -12,8 +12,9 @@ jobs:
       # NOTE: the spec is a sibling checkout, not a vendored copy, and the
       # suites proving the crate against it (the schema and statement
       # fidelity of tests/spec_drift.rs, the object-naming vectors of
-      # tests/objects.rs, the Annex A summaries of tests/summaries.rs and
-      # the sync vectors of tests/vectors_sync.rs) skip without it.
+      # tests/objects.rs, the Annex A summaries of tests/summaries.rs, the
+      # sync vectors of tests/vectors_sync.rs and the search vectors of
+      # tests/search.rs) skip without it.
       # Checking it out is what makes them run, and drift between the two
       # repositories is exactly what nothing else notices.
       - uses: actions/checkout@v4
@@ -29,9 +30,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # NOTE: every feature, so the dependencies of `cli` and `search`
+      # (the git2 and libz-sys of the build tooling among them) are checked
+      # too.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: io-pimdir/Cargo.toml
+          arguments: --all-features
       - run: cargo fmt --all --check
         working-directory: io-pimdir
       - run: cargo clippy --all-features --all-targets -- -D warnings
@@ -52,7 +57,7 @@ jobs:
         working-directory: io-pimdir
         run: |
           set -eu
-          for suite in spec_drift summaries vectors_sync objects; do
+          for suite in spec_drift summaries vectors_sync objects search; do
             [ -f "tests/$suite.rs" ] || continue
             if cargo test --all-features --test "$suite" -- --nocapture 2>&1 | grep -qE "skipped: no pimdir spec checkout beside this one|skipping: the pimdir spec checkout is not beside this crate"; then
               echo "::error::$suite skipped: the pimdir checkout was not found"

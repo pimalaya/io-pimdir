@@ -11,7 +11,19 @@ keywords = ["pimdir", "sqlite", "sync", "no-std", "io-free"]
 homepage = "https://pimalaya.org"
 documentation = "https://docs.rs/io-pimdir/latest/io_pimdir"
 repository = "https://github.com/pimalaya/io-pimdir"
-exclude = [".github/", "cairn/", "tests/proptest-regressions/"]
+exclude = [
+  ".github/",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "cairn/",
+  "default.nix",
+  "deny.toml",
+  "flake.lock",
+  "flake.nix",
+  "package.nix",
+  "shell.nix",
+  "tests/proptest-regressions/",
+]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -19,7 +19,7 @@ use crate::{
         CALENDAR_REPLY_OCCURRENCE, COLLECTION_CREATE, MAIL_SUBMIT, MAIL_SUBMIT_COPY,
         PimdirCapability, PimdirPartial, PimdirRefusal, PimdirSourceCapabilities, PimdirSupport,
     },
-    client::{PimdirError, blobs::PimdirBlobs, rows, write},
+    client::{PimdirError, blobs::PimdirBlobs, rows, schema, write},
     codec::{self, PimdirAction, PimdirActionError},
     intent::{self, PimdirCollectionCreate},
     object::PimdirHash,
@@ -27,17 +27,11 @@ use crate::{
     sql,
 };
 
-/// Whether the store holds the declaration tables: a store from an owner
-/// predating §15.6 does not, and every source in it is undeclared.
-pub(crate) fn declarable(conn: &Connection) -> Result<bool, PimdirError> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'capabilities'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+/// A canonical statement as the store answers it (§6): one from an owner
+/// predating §15.6 holds no declaration table, read as empty, and every
+/// source in it is undeclared.
+fn reconciled(conn: &Connection, statement: &str) -> Result<String, PimdirError> {
+    schema::as_reconciled(conn, "main", statement)
 }
 
 /// What every source syncing `collection` can do there.
@@ -45,11 +39,13 @@ pub(crate) fn at_collection(
     conn: &Connection,
     collection: &str,
 ) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
-    if !declarable(conn)? {
-        return Ok(Vec::new());
-    }
     let params = named_params! { ":collection": collection };
-    group(rows(conn, sql::LOAD_CAPABILITIES, params, declaration_row)?)
+    group(rows(
+        conn,
+        &reconciled(conn, sql::LOAD_CAPABILITIES)?,
+        params,
+        declaration_row,
+    )?)
 }
 
 /// What every source binding the item `seq` of `collection` can do there.
@@ -58,13 +54,10 @@ pub(crate) fn at_item(
     collection: &str,
     seq: i64,
 ) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
-    if !declarable(conn)? {
-        return Ok(Vec::new());
-    }
     let params = named_params! { ":collection": collection, ":seq": seq };
     group(rows(
         conn,
-        sql::LOAD_ITEM_CAPABILITIES,
+        &reconciled(conn, sql::LOAD_ITEM_CAPABILITIES)?,
         params,
         declaration_row,
     )?)
@@ -80,17 +73,17 @@ pub(crate) fn candidates(
     collection: Option<&str>,
     capability: &str,
 ) -> Result<Vec<String>, PimdirError> {
-    if !declarable(conn)? {
-        return Ok(Vec::new());
-    }
     let params = named_params! {
         ":account": account,
         ":collection": collection,
         ":capability": capability,
     };
-    Ok(rows(conn, sql::LIST_CAPABILITY_SOURCES, params, |r| {
-        r.get(0)
-    })?)
+    Ok(rows(
+        conn,
+        &reconciled(conn, sql::LIST_CAPABILITY_SOURCES)?,
+        params,
+        |r| r.get(0),
+    )?)
 }
 
 /// The source the user chose to perform `capability` for `account`.
@@ -99,12 +92,9 @@ pub(crate) fn performer(
     account: Option<&str>,
     capability: &str,
 ) -> Result<Option<String>, PimdirError> {
-    if !declarable(conn)? {
-        return Ok(None);
-    }
     Ok(conn
         .query_row(
-            sql::LOAD_PERFORMER,
+            &reconciled(conn, sql::LOAD_PERFORMER)?,
             named_params! { ":account": account, ":capability": capability },
             |r| r.get(0),
         )
@@ -120,13 +110,18 @@ pub(crate) fn chosen(
     account: Option<&str>,
     capability: &str,
 ) -> Result<Option<String>, PimdirError> {
-    let queued = rows(conn, sql::LIST_PENDING_ACTIONS, [], |r| {
-        Ok((
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-        ))
-    })?;
+    let queued = rows(
+        conn,
+        &reconciled(conn, sql::LIST_PENDING_ACTIONS)?,
+        [],
+        |r| {
+            Ok((
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        },
+    )?;
 
     let mut pending = None;
     for (collection, kind, payload) in queued {
@@ -192,11 +187,16 @@ pub(crate) fn resolve_performer(
 /// [`PimdirError::Unsupported`]; an intent whose performer cannot be
 /// resolved is [`PimdirError::NoPerformer`] or [`PimdirError::Ambiguous`].
 /// A store whose sources are all undeclared passes everything.
+///
+/// The body the action names is read from the blob tree, unless `body`
+/// holds it: a producer gating a body before it stages it, so a refused
+/// write leaves nothing behind.
 pub(crate) fn gate(
     conn: &Connection,
     blobs: &PimdirBlobs,
     collection: &str,
     action: &PimdirAction,
+    body: Option<&[u8]>,
 ) -> Result<Vec<PimdirPartial>, PimdirError> {
     let kind = write::kind_of(conn, collection)?;
     let mut partials = gate_by_kind(conn, &kind, collection, action)?;
@@ -211,19 +211,21 @@ pub(crate) fn gate(
         let remove = PimdirAction::Remove {
             seq: superseded.seq,
         };
-        partials.extend(gate(conn, blobs, &superseded.collection.0, &remove)?);
+        partials.extend(gate(conn, blobs, &superseded.collection.0, &remove, None)?);
     }
 
     if kind != "text/calendar" {
         return Ok(partials);
     }
-    gate_vtodo(conn, blobs, collection, action)?;
+    gate_vtodo(conn, blobs, collection, action, body)?;
 
     // NOTE: a calendar write also needs what its resources ask for
     // (Annex B.1), read from the bodies the producer wrote before the
     // enqueue and from the item's current one.
     let new = match action.object_hash() {
-        Some(hash) if !matches!(action, PimdirAction::Unknown { .. }) => blobs.get(hash)?,
+        Some(hash) if !matches!(action, PimdirAction::Unknown { .. }) => {
+            new_body(blobs, body, hash)?
+        }
         _ => None,
     };
     let current = match action {
@@ -250,6 +252,19 @@ pub(crate) fn gate(
     Ok(partials)
 }
 
+/// The new body an action names: `body` when the producer holds it in
+/// hand, not yet staged, else the blob tree's, checked against its name.
+fn new_body(
+    blobs: &PimdirBlobs,
+    body: Option<&[u8]>,
+    hash: &PimdirHash,
+) -> Result<Option<Vec<u8>>, PimdirError> {
+    match body {
+        Some(body) => Ok(Some(body.to_vec())),
+        None => Ok(blobs.get(hash)?),
+    }
+}
+
 /// Refuses a VTODO resource landing in a calendar collection a source
 /// concerned states `x-vtodo` `none` for (§15.6): the new body of an `add`
 /// or `update` in its collection, the item's of a `move` or `copy` in the
@@ -259,14 +274,16 @@ fn gate_vtodo(
     blobs: &PimdirBlobs,
     collection: &str,
     action: &PimdirAction,
+    body: Option<&[u8]>,
 ) -> Result<(), PimdirError> {
     let (body, sources) = match action {
         PimdirAction::Add {
             object: Some(hash), ..
-        } => (blobs.get(hash)?, None),
-        PimdirAction::Update { seq, object } => {
-            (blobs.get(object)?, Some(at_item(conn, collection, *seq)?))
-        }
+        } => (new_body(blobs, body, hash)?, None),
+        PimdirAction::Update { seq, object, .. } => (
+            new_body(blobs, body, object)?,
+            Some(at_item(conn, collection, *seq)?),
+        ),
         PimdirAction::Move { seq, to } | PimdirAction::Copy { seq, to } => {
             let body = match item_object(conn, collection, *seq)? {
                 Some(hash) => blobs.get(&hash)?,
@@ -464,12 +481,12 @@ pub(crate) fn intent_source(payload: &str) -> Option<String> {
 
 /// Whether any source of `account` has declared its capabilities.
 fn account_declared(conn: &Connection, account: Option<&str>) -> Result<bool, PimdirError> {
-    if !declarable(conn)? {
-        return Ok(false);
-    }
     Ok(conn
         .query_row(
-            "SELECT 1 FROM capabilities WHERE account IS :account LIMIT 1",
+            &reconciled(
+                conn,
+                "SELECT 1 FROM capabilities WHERE account IS :account LIMIT 1",
+            )?,
             named_params! { ":account": account },
             |_| Ok(()),
         )
@@ -516,7 +533,7 @@ fn intent_copy(payload: &str) -> Option<String> {
 fn account_of(conn: &Connection, collection: &str) -> Result<Option<String>, PimdirError> {
     Ok(conn
         .query_row(
-            sql::LOAD_ACCOUNT,
+            &reconciled(conn, sql::LOAD_ACCOUNT)?,
             named_params! { ":collection": collection },
             |r| r.get::<_, Option<String>>(0),
         )
@@ -531,7 +548,7 @@ fn item_object(
 ) -> Result<Option<PimdirHash>, PimdirError> {
     let hash = conn
         .query_row(
-            sql::GET_ITEM,
+            &reconciled(conn, sql::GET_ITEM)?,
             named_params! { ":collection": collection, ":seq": seq },
             |r| r.get::<_, Option<String>>(3),
         )
@@ -543,7 +560,7 @@ fn item_object(
 fn item_flags(conn: &Connection, collection: &str, seq: i64) -> Result<PimdirFlags, PimdirError> {
     let flags = conn
         .query_row(
-            sql::GET_ITEM,
+            &reconciled(conn, sql::GET_ITEM)?,
             named_params! { ":collection": collection, ":seq": seq },
             |r| r.get::<_, Option<String>>(2),
         )

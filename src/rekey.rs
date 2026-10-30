@@ -41,12 +41,14 @@ use crate::{
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     coroutine::*,
     load::PimdirLoadScope,
+    object::PimdirHash,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
         PimdirSortKey, PimdirStatus,
     },
     remote::{PimdirEnumerate, PimdirEnumerated, PimdirListing, PimdirRemoteItem},
     summary::{self, PimdirSummary},
+    sync::PimdirParked,
 };
 
 /// What a rekey did.
@@ -61,6 +63,10 @@ pub struct PimdirRekeyReport {
     /// No link id was resolved before the change, or the item is gone
     /// from the new spine.
     pub dropped: usize,
+    /// The rekey this run parked rather than wrote, its listing leaving
+    /// most of the source's based bindings with no member (SYNC §8):
+    /// nothing written, the counts above zero.
+    pub parked: Option<PimdirParked>,
 }
 
 /// I/O-free REKEY coroutine.
@@ -71,6 +77,9 @@ pub struct PimdirRekey {
     checkpoint: Option<PimdirCheckpoint>,
     /// What each member's meta resolved, by new handle.
     resolved: BTreeMap<PimdirHandle, Resolved>,
+    /// Whether the caller confirmed the absences the listing leaves, so a
+    /// mass absence is written rather than parked (SYNC §8).
+    accept_absences: bool,
     report: PimdirRekeyReport,
     state: State,
 }
@@ -87,9 +96,19 @@ impl PimdirRekey {
             items: Vec::new(),
             checkpoint: None,
             resolved: BTreeMap::new(),
+            accept_absences: false,
             report: PimdirRekeyReport::default(),
             state: State::Start,
         }
+    }
+
+    /// Tells the coroutine the caller confirmed the absences its listing
+    /// may leave (SYNC §8): a listing leaving more than half of at least
+    /// 20 based bindings with no member is then written, where it parks
+    /// by default. Per run, never stored.
+    pub fn accept_absences(mut self, accept: bool) -> Self {
+        self.accept_absences = accept;
+        self
     }
 
     /// Asks for the next page of the new spine, from `cursor`.
@@ -139,8 +158,9 @@ impl PimdirRekey {
         items.sort_by(|a, b| a.handle.cmp(&b.handle));
         items.dedup_by(|a, b| a.handle == b.handle);
 
-        let mut written = BTreeSet::new();
         let mut carried_over = BTreeSet::new();
+        let mut restaged = BTreeSet::new();
+        let mut in_place = BTreeSet::new();
         // NOTE: seeded with the pending creates' keys, which stay taken
         // since the rebuild leaves those rows where they are.
         let mut claimed: BTreeSet<PimdirLinkId> = staged
@@ -151,10 +171,11 @@ impl PimdirRekey {
             let resolved = links.get(&item.handle);
             let key = resolved.map(|resolved| {
                 let revision = item.revision.as_deref().or(resolved.revision.as_deref());
+                let body = item.meta.body.as_ref().map(|body| body.hash());
                 Self::key_of(
                     &resolved.link_id,
                     &item.handle,
-                    revision,
+                    (revision, body),
                     &claimed,
                     &old_by_link,
                 )
@@ -164,9 +185,11 @@ impl PimdirRekey {
                 claimed.insert(key);
             }
 
-            written.insert(item.handle.clone());
             match carried {
                 Some(old) => {
+                    if old.handle == item.handle {
+                        in_place.insert(old.handle.clone());
+                    }
                     carried_over.insert(old.handle.clone());
                     writes.push(PimdirWriteOp::UpsertPlacement(
                         self.carry(old, &item, resolved),
@@ -195,13 +218,20 @@ impl PimdirRekey {
                     .as_ref()
                     .is_none_or(|b| b.object != placement.object);
             if edited {
+                // NOTE: re-staged under the provisional handle its key
+                // derives, as a sync re-stages one (SYNC §5): its old
+                // handle is void, and the renumbering may have given it to
+                // another member this batch upserts.
                 let mut resurrected = placement.clone();
+                if let Some(link) = &placement.link_id {
+                    resurrected.handle = link.provisional();
+                    restaged.insert(placement.handle.clone());
+                }
                 resurrected.status = PimdirStatus::Created;
                 resurrected.conflict_revision = None;
                 resurrected.conflict_object = None;
                 resurrected.base = None;
                 resurrected.origin = None;
-                written.insert(resurrected.handle.clone());
                 writes.push(PimdirWriteOp::UpsertPlacement(resurrected));
                 carried_over.insert(placement.handle.clone());
                 self.report.rekeyed += 1;
@@ -212,17 +242,26 @@ impl PimdirRekey {
             .filter(|p| p.status != PimdirStatus::Clean && !carried_over.contains(&p.handle))
             .count();
 
-        // NOTE: never a handle this batch also upserts, or the storage's
-        // apply order would decide. Rekeyed tells a storage sharing items
-        // across sources that a renumbering is not a mass delete.
+        // NOTE: every old handle but one carried onto itself is dropped, and
+        // every drop goes before every upsert, since a new handle may be
+        // one another member held (SYNC §8): a handle the new space reuses
+        // for another member is still dropped, `Deleted` when its member
+        // resolved to none, which the mass-absence guard counts. Rekeyed
+        // tells a storage sharing items across sources that a renumbering
+        // is not a mass delete.
         let mut drops = Vec::new();
         for placement in &old {
-            if written.contains(&placement.handle) {
+            let moved = restaged.contains(&placement.handle);
+            if in_place.contains(&placement.handle) && !moved {
                 continue;
             }
-            let reason = match carried_over.contains(&placement.handle) {
-                true => PimdirDropReason::Rekeyed,
-                false => PimdirDropReason::Deleted,
+            // NOTE: a re-staged edit's binding moves to its provisional
+            // handle, licensed by a `Superseded` drop of the void one, which
+            // goes before any upsert reusing it (SYNC §10).
+            let reason = match (moved, carried_over.contains(&placement.handle)) {
+                (true, _) => PimdirDropReason::Superseded,
+                (false, true) => PimdirDropReason::Rekeyed,
+                (false, false) => PimdirDropReason::Deleted,
             };
             drops.push(PimdirWriteOp::DropPlacement {
                 collection: self.collection.clone(),
@@ -246,17 +285,19 @@ impl PimdirRekey {
 
     /// The key a rebuilt member takes, and the old placement is found under.
     ///
-    /// Where one hint had several old copies, the copy whose base holds the
-    /// member's revision first, so a renumbering that swapped two resources
-    /// under one identity carries each one's state onto itself (SYNC §8);
-    /// then the hint while unclaimed, then the minted key an old copy
-    /// carries in handle order (the handle it was minted from is what the
-    /// change took away), else a mint of the member's own, for a copy with
-    /// no old row to carry.
+    /// Where one hint had several old copies, the unclaimed copy whose
+    /// base holds the member's revision, then among those (or among all
+    /// when none does) the one holding the body the listing carried, in
+    /// handle order among what neither tells apart, so a renumbering that
+    /// swapped two resources under one identity carries each one's state
+    /// onto itself (SYNC §8); then the hint while unclaimed, then the
+    /// minted key an old copy carries in handle order (the handle it was
+    /// minted from is what the change took away), else a mint of the
+    /// member's own, for a copy with no old row to carry.
     fn key_of(
         hint: &PimdirLinkId,
         handle: &PimdirHandle,
-        revision: Option<&str>,
+        (revision, body): (Option<&str>, Option<&PimdirHash>),
         claimed: &BTreeSet<PimdirLinkId>,
         old_by_link: &BTreeMap<PimdirLinkId, PimdirPlacement>,
     ) -> PimdirLinkId {
@@ -267,15 +308,35 @@ impl PimdirRekey {
             })
         };
 
-        if let Some(revision) = revision
-            && let Some(old) = copies().find(|old| {
-                old.base.as_ref().and_then(|b| b.revision.as_deref()) == Some(revision)
-                    && old
-                        .link_id
-                        .as_ref()
-                        .is_some_and(|key| !claimed.contains(key))
+        let mut unclaimed: Vec<&PimdirPlacement> = copies()
+            .filter(|old| {
+                old.link_id
+                    .as_ref()
+                    .is_some_and(|key| !claimed.contains(key))
             })
-        {
+            .collect();
+        unclaimed.sort_by(|a, b| a.handle.cmp(&b.handle));
+        let by_revision: Vec<&PimdirPlacement> = match revision {
+            Some(revision) => unclaimed
+                .iter()
+                .copied()
+                .filter(|old| {
+                    old.base.as_ref().and_then(|b| b.revision.as_deref()) == Some(revision)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let pool = match by_revision.is_empty() {
+            true => &unclaimed,
+            false => &by_revision,
+        };
+        let by_body = body.and_then(|body| {
+            pool.iter().find(|old| {
+                old.base.as_ref().and_then(|b| b.object.as_ref()) == Some(body)
+                    || old.object.as_ref() == Some(body)
+            })
+        });
+        if let Some(old) = by_body.or(by_revision.first()) {
             return old.link_id.clone().expect("a keyed copy");
         }
 
@@ -477,6 +538,22 @@ impl PimdirCoroutine for PimdirRekey {
                 self.enumerate(None)
             }
 
+            (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page))))
+                if !page.complete =>
+            {
+                debug!("a listing that is not a round answered the rekey, refuse it");
+                self.state = State::Done;
+                PimdirCoroutineState::Complete(Err(PimdirArgError::IncompleteListing))
+            }
+
+            (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page))))
+                if !page.last && page.cursor.is_none() =>
+            {
+                debug!("round page neither last nor cursored, refuse it");
+                self.state = State::Done;
+                PimdirCoroutineState::Complete(Err(PimdirArgError::UnresumablePage))
+            }
+
             (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page)))) => {
                 // NOTE: the checkpoint is the one a page hands, the first
                 // where the source gives it up front, the last for Graph.
@@ -500,14 +577,52 @@ impl PimdirCoroutine for PimdirRekey {
                     Some(cursor) => self.enumerate(Some(cursor)),
                     None => {
                         trace!("resolved {} link ids", self.resolved.len());
-                        self.state = State::Writing;
+                        let based: BTreeSet<PimdirHandle> = self
+                            .old
+                            .iter()
+                            .filter(|p| p.base.is_some())
+                            .map(|p| p.handle.clone())
+                            .collect();
                         let writes = self.rebuild();
+
+                        // NOTE: a based binding the rebuild drops `Deleted`
+                        // resolved to no member; a listing leaving most of
+                        // them is read as truncated until the caller
+                        // confirms it, and nothing is written (SYNC §8).
+                        let absent = writes
+                            .iter()
+                            .filter(|op| {
+                                matches!(
+                                    op,
+                                    PimdirWriteOp::DropPlacement {
+                                        handle,
+                                        reason: PimdirDropReason::Deleted,
+                                        ..
+                                    } if based.contains(handle)
+                                )
+                            })
+                            .count();
+                        if let Some(parked) =
+                            PimdirParked::guard(absent, based.len(), self.accept_absences)
+                        {
+                            debug!(
+                                "{} of {} bound members absent, park the rekey",
+                                parked.absent, parked.bound,
+                            );
+                            self.state = State::Done;
+                            return PimdirCoroutineState::Complete(Ok(PimdirRekeyReport {
+                                parked: Some(parked),
+                                ..Default::default()
+                            }));
+                        }
+
+                        self.state = State::Writing;
                         PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes))
                     }
                 }
             }
 
-            (State::Writing, Some(PimdirArg::Write)) => {
+            (State::Writing, Some(PimdirArg::Write | PimdirArg::Written(_))) => {
                 debug!(
                     "rekey done: {} carried, {} pulled, {} pending dropped",
                     self.report.rekeyed, self.report.pulled, self.report.dropped,
@@ -694,7 +809,8 @@ mod tests {
         );
     }
 
-    /// Same hazard without reuse: the edit resurrects under its old handle.
+    /// Same hazard without reuse: the edit resurrects under the provisional
+    /// handle its key derives, the old one being void (SYNC §8).
     #[test]
     fn a_resurrected_edit_is_not_dropped_by_the_batch_that_writes_it() {
         let mut old = synced("1", "a", &[]);
@@ -713,7 +829,9 @@ mod tests {
             vec![fetched("101", "other")],
         );
 
-        let resurrected = upserted(&writes, "1").expect("the edit survives as a create");
+        let provisional = PimdirLinkId::from("a").provisional();
+        let resurrected =
+            upserted(&writes, provisional.as_str()).expect("the edit survives as a create");
         assert_eq!(resurrected.status, PimdirStatus::Created);
         assert_eq!(
             dropped_and_upserted(&writes),
@@ -834,7 +952,8 @@ mod tests {
 
         assert_eq!(report.rekeyed, 1, "carried as a pending create");
         assert_eq!(report.dropped, 0);
-        let resurrected = upserted(&writes, "1").expect("a resurrected placement");
+        let provisional = PimdirLinkId::from("msg-a").provisional();
+        let resurrected = upserted(&writes, provisional.as_str()).expect("a resurrected placement");
         assert_eq!(resurrected.status, PimdirStatus::Created);
         assert!(resurrected.base.is_none());
         assert_eq!(resurrected.object, Some(PimdirHash::from("h2")));
@@ -916,6 +1035,57 @@ mod tests {
             w,
             PimdirWriteOp::SetCheckpoint { checkpoint, .. } if checkpoint.0 == b"v3"
         )));
+    }
+
+    /// Answers a rekey over two old placements with `page`, returning how
+    /// it completed.
+    fn answer(
+        page: PimdirRemoteSnapshot,
+    ) -> PimdirCoroutineState<PimdirYield, Result<PimdirRekeyReport, PimdirArgError>> {
+        crate::testlog::init();
+        let mut rekey = PimdirRekey::new("inbox");
+        let _ = rekey.resume(None);
+        let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: vec![synced("0", "m0", &[]), synced("1", "m1", &[])],
+            ..Default::default()
+        })));
+        rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page))))
+    }
+
+    /// A page neither last nor carrying a cursor is refused rather than
+    /// read as the end of the spine, which would drop the old placements
+    /// it did not name (SYNC §4, §8).
+    #[test]
+    fn a_page_neither_last_nor_cursored_is_refused() {
+        let page = PimdirRemoteSnapshot {
+            items: listed(vec![item("v2-0", &[])], vec![fetched("v2-0", "m0")]),
+            vanished: Vec::new(),
+            complete: true,
+            last: false,
+            cursor: None,
+            checkpoint: None,
+        };
+
+        match answer(page) {
+            PimdirCoroutineState::Complete(Err(PimdirArgError::UnresumablePage)) => {}
+            state => panic!("expected UnresumablePage, got {state:?}"),
+        }
+    }
+
+    /// A delta answering a rekey lists what changed, not the spine: it is
+    /// refused rather than read as the whole collection (SYNC §8).
+    #[test]
+    fn a_delta_answering_a_rekey_is_refused() {
+        let page = PimdirRemoteSnapshot::delta(
+            listed(vec![item("v2-0", &[])], vec![fetched("v2-0", "m0")]),
+            Vec::new(),
+            PimdirCheckpoint(b"v2".to_vec()),
+        );
+
+        match answer(page) {
+            PimdirCoroutineState::Complete(Err(PimdirArgError::IncompleteListing)) => {}
+            state => panic!("expected IncompleteListing, got {state:?}"),
+        }
     }
 
     #[test]

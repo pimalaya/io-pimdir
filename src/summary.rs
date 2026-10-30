@@ -318,6 +318,20 @@ fn unfold(body: &[u8], keep_whitespace: bool) -> Vec<String> {
     lines
 }
 
+/// Whether a member's summary names the message a held item's does: for
+/// mail, the same `subject`, `date` and `sender`, which no server rewrites
+/// (SYNC §6); any other kind, or a summary not read, says nothing against.
+pub(crate) fn same_message(held: Option<&PimdirSummary>, listed: Option<&PimdirSummary>) -> bool {
+    match (held, listed) {
+        (Some(PimdirSummary::Mail(held)), Some(PimdirSummary::Mail(listed))) => {
+            held.subject == listed.subject
+                && held.date == listed.date
+                && held.sender == listed.sender
+        }
+        _ => true,
+    }
+}
+
 /// A mail summary carrying only a subject, for the engine's own tests.
 #[cfg(test)]
 pub(crate) fn stub(subject: &str) -> PimdirSummary {

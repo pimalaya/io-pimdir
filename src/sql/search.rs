@@ -15,32 +15,9 @@ include!(concat!(env!("OUT_DIR"), "/search.rs"));
 /// `index_meta.tokenizer`: an index recording another is rebuilt.
 pub const TOKENIZER: &str = "unicode61 remove_diacritics 2";
 
-/// What this crate's index holds beyond the schema, recorded in its own
-/// `index_build` table: an index built under another, or before the
-/// table existed, is rebuilt like one at another schema version. 1 holds
-/// threads (SEARCH §9); an index without the table predates them.
-pub const BUILD: i64 = 1;
-
-/// The `index_build` table, this crate's own and outside SEARCH.md's
-/// schema, so its statements are not in [`OWN`]: they would not prepare
-/// on the canonical one.
-pub const BUILD_SCHEMA: &str = r#"CREATE TABLE index_build (
-    id    INTEGER PRIMARY KEY CHECK (id = 1),
-    build INTEGER NOT NULL
-) STRICT;"#;
-
-/// Records the build an index was made under.
-pub const SET_BUILD: &str = r#"INSERT INTO index_build(id, build) VALUES(1, :build);"#;
-
-/// Whether an index has the `index_build` table: one predating it has
-/// none.
-pub const HAS_BUILD: &str = r#"SELECT EXISTS (SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'index_build');"#;
-
-/// The build an index was made under; fails without `index_build`.
-pub const LOAD_BUILD: &str = r#"SELECT build FROM index_build WHERE id = 1;"#;
-
-/// Whether a collection was stamped above the cursor: a rename leaves the
-/// old id's placements to the key reconciliation (SEARCH §4).
+/// Whether a collection was stamped above `index_meta.store_reconciled`,
+/// the last completed refresh's cursor: a rename leaves the old id's
+/// placements to the key reconciliation (SEARCH §4).
 pub const COLLECTIONS_MOVED: &str =
     r#"SELECT EXISTS (SELECT 1 FROM store.collections WHERE changed > :since);"#;
 
@@ -87,12 +64,13 @@ LEFT JOIN store.file_summary f ON f.collection = i.collection AND f.link_id = i.
 WHERE i.seq = :seq AND c.account IS :account AND i.deleted = 0 AND i.retained_at IS NULL
 ORDER BY i.collection;"#;
 
-/// The item an `id:` value names, every kind it is held under (SEARCH §8):
-/// by `seq` or by link id, its live placements' kinds and keys, so
+/// The items an `id:` value names, every kind each is held under (SEARCH
+/// §8): the item of `seq`, `NULL` for a value not of digits, and every
+/// item of the link id, their live placements' kinds and keys, so
 /// `linked` is asked once per pair.
 pub const LOAD_ENDS: &str = r#"SELECT DISTINCT c.kind, i.link_id FROM store.items i
 JOIN store.collections c ON c.id = i.collection
-WHERE (:seq IS NULL OR i.seq = :seq) AND (:link_id IS NULL OR i.link_id = :link_id)
+WHERE (i.seq = :seq OR i.link_id = :link_id)
   AND i.deleted = 0 AND i.retained_at IS NULL;"#;
 
 /// The body the index holds for one placement, `NULL` while bodiless: what

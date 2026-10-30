@@ -353,6 +353,8 @@ fn resolve(
     let staged = cluster.sources[source].mutate(
         "inbox",
         PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             handle: handle.clone(),
             object: object.clone(),
             body,
@@ -458,6 +460,8 @@ fn check_conflict_model(ops: Vec<ConflictOp>) -> Result<(), TestCaseError> {
                 let staged = cluster.sources[source].mutate(
                     "inbox",
                     PimdirMutation::Edit {
+                        overrule: false,
+                        if_match: None,
                         handle: placement.handle,
                         object: object.clone(),
                         body,

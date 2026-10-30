@@ -1,20 +1,24 @@
 //! # Intents
 //!
 //! The typed payloads of the Annex B.2 intents this crate validates: a
-//! collection created on a source's server, and the invitation reply and
-//! cancel with their optional occurrence. An intent travels as
-//! [`PimdirAction::Unknown`], so the store keeps its payload verbatim and
-//! skips it; these types build that action for a producer and read it
-//! back for a performer, refusing a malformed payload with the error the
-//! owner parks the row with. I/O-free.
+//! message to send, a collection created on a source's server, and the
+//! invitation reply and cancel with their optional occurrence. An intent
+//! travels as [`PimdirAction::Unknown`], so the store keeps its payload
+//! verbatim and skips it; these types build that action for a producer
+//! and read it back for a performer, refusing a malformed payload with
+//! the error the owner parks the row with. I/O-free.
 
-use alloc::string::{String, ToString};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use serde_json::{Map, Value, json};
 
 use crate::{
     codec::{PimdirAction, PimdirActionError},
     collection::PimdirCollectionId,
+    object::PimdirHash,
     placement::PimdirLinkId,
 };
 
@@ -105,6 +109,104 @@ impl PimdirCollectionCreate {
         };
         create.validate()?;
         Ok(create)
+    }
+}
+
+/// A message to send (Annex B.2, `submit`, capability `mail.submit`).
+///
+/// The message is the action's body, pinned by `object`; the payload
+/// carries the envelope it is sent with, its `Bcc` field removed before
+/// transmission. Anchored on the collection the sent copy belongs to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirSubmit {
+    /// The source performing it, `None` only from a producer predating
+    /// §15.6.
+    pub source: Option<String>,
+    /// The message, the body the row pins.
+    pub object: PimdirHash,
+    /// The envelope sender (`MAIL FROM`), empty for the null path.
+    pub from: String,
+    /// The envelope recipients (`RCPT TO`), at least one.
+    pub rcpts: Vec<String>,
+    /// The subject, for reports only.
+    pub subject: Option<String>,
+    /// The collection a copy is filed in once sent (`mail.submit.copy`),
+    /// `None` for no copy.
+    pub copy: Option<PimdirCollectionId>,
+}
+
+impl PimdirSubmit {
+    /// Checks the payload's own rules: at least one recipient, none
+    /// blank, and a `copy` naming a collection.
+    pub fn validate(&self) -> Result<(), PimdirActionError> {
+        if self.rcpts.is_empty() {
+            return Err(PimdirActionError::Invalid {
+                field: "rcpts",
+                reason: "a submit names at least one recipient",
+            });
+        }
+        if self.rcpts.iter().any(|rcpt| rcpt.trim().is_empty()) {
+            return Err(PimdirActionError::Invalid {
+                field: "rcpts",
+                reason: "a recipient is an address",
+            });
+        }
+        if self.copy.as_ref().is_some_and(|c| c.as_str().is_empty()) {
+            return Err(PimdirActionError::Invalid {
+                field: "copy",
+                reason: "a copy names a collection",
+            });
+        }
+        Ok(())
+    }
+
+    /// The queue action carrying it, validated first, its `object_hash`
+    /// the message.
+    pub fn to_action(&self) -> Result<PimdirAction, PimdirActionError> {
+        self.validate()?;
+        let mut map = versioned();
+        if let Some(source) = &self.source {
+            map.insert("source".into(), json!(source));
+        }
+        map.insert("object".into(), json!(self.object.0));
+        map.insert("from".into(), json!(self.from));
+        map.insert("rcpts".into(), json!(self.rcpts));
+        if let Some(subject) = &self.subject {
+            map.insert("subject".into(), json!(subject));
+        }
+        if let Some(copy) = &self.copy {
+            map.insert("copy".into(), json!(copy.0));
+        }
+        Ok(PimdirAction::Unknown {
+            kind: SUBMIT.to_string(),
+            payload: Value::Object(map).to_string(),
+            object_hash: Some(self.object.clone()),
+        })
+    }
+
+    /// Reads a `submit` payload strictly.
+    pub fn from_payload(payload: &str) -> Result<Self, PimdirActionError> {
+        let map = object(payload)?;
+        let rcpts = match map.get("rcpts") {
+            Some(Value::Array(rcpts)) => rcpts
+                .iter()
+                .map(|rcpt| rcpt.as_str().map(ToString::to_string))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(PimdirActionError::MissingField("rcpts"))?,
+            _ => return Err(PimdirActionError::MissingField("rcpts")),
+        };
+        let submit = Self {
+            source: string(&map, "source")?,
+            object: string(&map, "object")?
+                .map(PimdirHash)
+                .ok_or(PimdirActionError::MissingField("object"))?,
+            from: string(&map, "from")?.ok_or(PimdirActionError::MissingField("from"))?,
+            rcpts,
+            subject: string(&map, "subject")?,
+            copy: string(&map, "copy")?.map(PimdirCollectionId),
+        };
+        submit.validate()?;
+        Ok(submit)
     }
 }
 
@@ -318,8 +420,71 @@ fn string(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::codec;
+
+    #[test]
+    fn a_submit_round_trips_through_the_queue_codec() {
+        let submit = PimdirSubmit {
+            source: Some("smtp".into()),
+            object: PimdirHash("cafebabe".into()),
+            from: "a@x.org".into(),
+            rcpts: vec!["b@y.org".into(), "c@y.org".into()],
+            subject: Some("hi".into()),
+            copy: Some(PimdirCollectionId::from("Sent")),
+        };
+        let action = submit.to_action().unwrap();
+        assert_eq!(action.kind(), SUBMIT);
+        assert_eq!(action.object_hash(), Some(&submit.object));
+
+        let payload = codec::action_to_payload(&action);
+        let decoded = codec::action_from_payload(SUBMIT, &payload).unwrap();
+        assert_eq!(decoded, action);
+        assert_eq!(PimdirSubmit::from_payload(&payload).unwrap(), submit);
+    }
+
+    /// The payload a frontend hand-rolled before the type: no source, no
+    /// copy, `null` read as absent.
+    #[test]
+    fn a_submit_reads_the_payload_frontends_wrote() {
+        let payload = r#"{"v":1,"object":"cafebabe","from":"","rcpts":["b@y.org"],"subject":null}"#;
+        let submit = PimdirSubmit::from_payload(payload).unwrap();
+        assert_eq!(submit.object, PimdirHash("cafebabe".into()));
+        assert_eq!(submit.from, "", "the null path");
+        assert_eq!(submit.rcpts, ["b@y.org"]);
+        assert_eq!(
+            (submit.source, submit.subject, submit.copy),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn a_submit_needs_its_message_and_a_recipient() {
+        let refused = |payload: &str| PimdirSubmit::from_payload(payload).unwrap_err();
+
+        assert_eq!(
+            refused(r#"{"v":1,"from":"a@x.org","rcpts":["b@y.org"]}"#),
+            PimdirActionError::MissingField("object")
+        );
+        assert_eq!(
+            refused(r#"{"v":1,"object":"cafebabe","from":"a@x.org"}"#),
+            PimdirActionError::MissingField("rcpts")
+        );
+        assert_eq!(
+            refused(r#"{"v":1,"object":"cafebabe","from":"a@x.org","rcpts":[1]}"#),
+            PimdirActionError::MissingField("rcpts")
+        );
+        assert!(matches!(
+            refused(r#"{"v":1,"object":"cafebabe","from":"a@x.org","rcpts":[]}"#),
+            PimdirActionError::Invalid { field: "rcpts", .. }
+        ));
+        assert_eq!(
+            refused(r#"{"v":2,"object":"cafebabe","from":"a@x.org","rcpts":["b@y.org"]}"#),
+            PimdirActionError::UnknownVersion(Some(2))
+        );
+    }
 
     #[test]
     fn a_collection_create_round_trips_through_the_queue_codec() {

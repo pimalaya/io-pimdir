@@ -555,13 +555,13 @@ ATTACH:mid:m\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: PimdirObject {
-                    hash: PimdirHash("taskbody".into()),
+                    hash: io_pimdir::hash::PimdirHashAlgo::default().hash(body),
                     size: body.len() as _,
                 },
                 body: Some(body.to_vec()),
             },
             PimdirWriteOp::UpsertPlacement(PimdirPlacement {
-                object: Some(PimdirHash("taskbody".into())),
+                object: Some(io_pimdir::hash::PimdirHashAlgo::default().hash(body)),
                 base: None,
                 summary: io_pimdir::summary::derive("text/calendar", body).and_then(|d| d.summary),
                 ..placement("Cal", "t", "call")

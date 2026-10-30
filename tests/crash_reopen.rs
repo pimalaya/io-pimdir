@@ -9,7 +9,7 @@
 //!
 //! Interruption is simulated by doing the halves separately rather than
 //! by killing a process: the blob write is a public operation
-//! (`PimdirBlobs::writer`), so the state a crash leaves is a state a test
+//! (`PimdirBlobStage::writer`), so the state a crash leaves is a state a test
 //! can construct exactly, and reopening the store from disk is what turns
 //! it back into an observation.
 //!
@@ -55,12 +55,9 @@ fn blob_of(dir: &Path, hash: &PimdirHash) -> std::path::PathBuf {
 /// §14 step 1, and exactly what a process that dies before its
 /// transaction leaves behind.
 fn stage_body_only(store: &PimdirSourceStore, bytes: &[u8]) -> PimdirHash {
-    let hash = store.hash(bytes);
-    let blobs = store.blobs();
-    let mut writer = blobs.writer().unwrap();
+    let mut writer = store.blob_stage().writer().unwrap();
     writer.write_all(bytes).unwrap();
-    writer.commit(&hash).unwrap();
-    hash
+    writer.commit().unwrap().hash
 }
 
 fn placement(

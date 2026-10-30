@@ -384,3 +384,66 @@ fn a_page_stays_full_across_a_staged_removal() {
             .is_empty()
     );
 }
+
+/// The overlay shows the item as the drain will leave it (§15.3, §15.4): an
+/// edit whose `if_match` names a body the item does not hold will park,
+/// so it is not folded, while one naming the body an earlier queued edit
+/// leaves is.
+#[test]
+fn an_edit_that_will_park_is_not_folded() {
+    let dir = tempfile::tempdir().unwrap();
+    let seqs = store(dir.path());
+    let held = PimdirHash("cafe".into());
+
+    let mut producer =
+        io_pimdir::client::producer::PimdirProducer::open(dir.path(), "test").unwrap();
+    let stale = producer.hash(b"a body read long ago");
+    producer
+        .enqueue_with_body("INBOX", b"Subject: lost\r\n\r\nlost", |hash| {
+            PimdirAction::Update {
+                seq: seqs[0],
+                object: hash,
+                if_match: Some(stale),
+            }
+        })
+        .unwrap();
+    let first = producer
+        .enqueue_with_body("INBOX", b"Subject: one\r\n\r\none", |hash| {
+            PimdirAction::Update {
+                seq: seqs[1],
+                object: hash,
+                if_match: Some(held.clone()),
+            }
+        })
+        .unwrap();
+    let first = producer
+        .pending_actions("INBOX")
+        .unwrap()
+        .into_iter()
+        .find(|action| action.id == first)
+        .unwrap();
+    let PimdirAction::Update { object: one, .. } = first.action else {
+        panic!("an update");
+    };
+    producer
+        .enqueue_with_body("INBOX", b"Subject: two\r\n\r\ntwo", |hash| {
+            PimdirAction::Update {
+                seq: seqs[1],
+                object: hash,
+                if_match: Some(one),
+            }
+        })
+        .unwrap();
+    drop(producer);
+
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let kept = reader.get_item("INBOX", seqs[0]).unwrap().unwrap();
+    assert_eq!(
+        kept.object,
+        Some(held),
+        "the edit that will park is not shown"
+    );
+    let chained = reader.get_item("INBOX", seqs[1]).unwrap().unwrap();
+    let two = reader.hash_algo().hash(b"Subject: two\r\n\r\ntwo");
+    assert_eq!(chained.object, Some(two), "an edit over a queued one is");
+}

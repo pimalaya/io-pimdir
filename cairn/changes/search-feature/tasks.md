@@ -46,3 +46,5 @@ Deferred to the 2027 NLnet plan, Task 2 "pimdir Notmuch"; the plan is pimdir cai
 - [x] tests/search.rs over vectors/search (every case, none skipped)
 - [x] Spec: a search capability file (cairn/spec/search.md); cli.md modified
 - [ ] Fold, log, CHANGELOG (M1 logged 2026-10-27-search-index-m1; again at each milestone)
+- [ ] Undocumented extensions (from a-query-only-index): state each in search.md or drop it; the 16 own statements under src/sql/search.rs upstreamed where pimdir takes them
+- [ ] Typed `kind` and status outputs (`PimdirSearchHit::kind: String`, the CLI's `Status(String)`), if the API pass agrees

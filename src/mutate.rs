@@ -23,13 +23,23 @@ use crate::{
     collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoadScope,
-    object::PimdirObject,
+    object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
         PimdirPlacement, PimdirSortKey, PimdirStatus,
     },
     summary::PimdirSummary,
+    sync::PimdirSyncEvent,
 };
+
+/// What a mutation did beyond the edit it staged.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirMutateReport {
+    /// The bodies its write kept that a policy did not adopt, each a
+    /// [`PimdirSyncEvent::Overruled`], once the write committed (SYNC §5,
+    /// §9): the only event a mutation reports.
+    pub events: Vec<PimdirSyncEvent>,
+}
 
 /// A local edit applied offline.
 ///
@@ -75,6 +85,22 @@ pub enum PimdirMutation {
         /// An edit changing what the key derives from has to say so, or
         /// the item stays where it was in the list.
         sort_key: Option<PimdirSortKey>,
+        /// The body the edit was made over, when the producer states it
+        /// (a queued `update`'s `if_match`, STORAGE §15.3): the edit is
+        /// refused, staging nothing, when the placement holds another
+        /// (SYNC §7).
+        if_match: Option<PimdirHash>,
+        /// Whether the edit settles a conflict by a rule of the engine's
+        /// or a connector's rather than a person's choice, a one-way mode
+        /// restating the body its authority holds (SYNC §7): the diverging
+        /// bodies it does not adopt, the binding's `conflict_object` then
+        /// the item's, are kept as retained items and reported
+        /// [`Overruled`](crate::sync::PimdirSyncEvent::Overruled), and the
+        /// write is refused (`PimdirError::Unread`, `conflict-unread`) while
+        /// the conflict holds a body nobody has read. `false` for a
+        /// person's resolution and a queued `update`, which keep nothing
+        /// they discard.
+        overrule: bool,
     },
     /// Copy a placement into `target` as a pending create; the source is kept.
     ///
@@ -171,6 +197,16 @@ pub enum PimdirMutateError {
     Unnamed(String),
     /// An `Add` names a link id a live placement already holds.
     LinkExists(String),
+    /// An `Edit` stating the body it was made over names one the
+    /// placement no longer holds: another write replaced it since.
+    Replaced {
+        /// The handle edited.
+        handle: String,
+        /// The body the edit was made over.
+        read: PimdirHash,
+        /// The body the placement holds, `None` for none.
+        held: Option<PimdirHash>,
+    },
     /// A `Copy` or a `Move` names a placement with neither a body nor a
     /// based binding, which no create could deliver (SYNC §7).
     Undeliverable(String),
@@ -202,6 +238,12 @@ impl fmt::Display for PimdirMutateError {
                     "Pimdir MUTATE failed: handle {handle} holds neither a body nor a base to copy from"
                 )
             }
+            Self::Replaced { handle, read, held } => write!(
+                f,
+                "Pimdir MUTATE failed: handle {handle} was edited over {} and holds {}",
+                read.as_str(),
+                held.as_ref().map_or("no body", PimdirHash::as_str),
+            ),
             Self::Arg(err) => write!(f, "{err}"),
         }
     }
@@ -297,6 +339,7 @@ impl PimdirMutate {
                 body,
                 summary,
                 sort_key,
+                overrule,
                 ..
             } => {
                 source.object = Some(object.hash.clone());
@@ -338,13 +381,20 @@ impl PimdirMutate {
                     }
                 }
 
-                vec![
-                    PimdirWriteOp::StoreObject {
-                        object: object.clone(),
-                        body: Some(body.clone()),
-                    },
-                    PimdirWriteOp::UpsertPlacement(source),
-                ]
+                let mut ops = vec![PimdirWriteOp::StoreObject {
+                    object: object.clone(),
+                    body: Some(body.clone()),
+                }];
+                // NOTE: before the upsert, which the write reads the
+                // conflict's bodies against (SYNC §7, §9).
+                if *overrule {
+                    ops.push(PimdirWriteOp::Overrule {
+                        collection: source.collection.clone(),
+                        handle: source.handle.clone(),
+                    });
+                }
+                ops.push(PimdirWriteOp::UpsertPlacement(source));
+                ops
             }
             PimdirMutation::Copy { target, .. } => {
                 let key = key.expect("the key a staged create takes");
@@ -446,7 +496,7 @@ impl PimdirMutate {
 
 impl PimdirCoroutine for PimdirMutate {
     type Yield = PimdirYield;
-    type Return = Result<(), PimdirMutateError>;
+    type Return = Result<PimdirMutateReport, PimdirMutateError>;
 
     fn resume(
         &mut self,
@@ -484,6 +534,21 @@ impl PimdirCoroutine for PimdirMutate {
                     };
                     if placement.link_id.is_none() {
                         let err = PimdirMutateError::Unnamed(handle.as_str().into());
+                        return PimdirCoroutineState::Complete(Err(err));
+                    }
+                    // NOTE: another write replaced the body this edit was
+                    // made over since its producer read it (SYNC §7).
+                    if let PimdirMutation::Edit {
+                        if_match: Some(read),
+                        ..
+                    } = &self.mutation
+                        && placement.object.as_ref() != Some(read)
+                    {
+                        let err = PimdirMutateError::Replaced {
+                            handle: handle.as_str().into(),
+                            read: read.clone(),
+                            held: placement.object.clone(),
+                        };
                         return PimdirCoroutineState::Complete(Err(err));
                     }
 
@@ -541,10 +606,18 @@ impl PimdirCoroutine for PimdirMutate {
                 self.state = State::Writing;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops))
             }
-            (State::Writing, Some(PimdirArg::Write)) => {
+            (State::Writing, Some(arg @ (PimdirArg::Write | PimdirArg::Written(_)))) => {
                 debug!("local change written");
+                let mut report = PimdirMutateReport::default();
+                if let PimdirArg::Written(written) = arg {
+                    for (handle, link_id) in written.overruled {
+                        report
+                            .events
+                            .push(PimdirSyncEvent::Overruled { handle, link_id });
+                    }
+                }
                 self.state = State::Done;
-                PimdirCoroutineState::Complete(Ok(()))
+                PimdirCoroutineState::Complete(Ok(report))
             }
             (State::Done, _) | (_, Some(_)) => {
                 PimdirCoroutineState::Complete(Err(PimdirArgError::UnexpectedArg.into()))
@@ -862,7 +935,7 @@ mod tests {
         let _ = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
 
         match mutate.resume(Some(PimdirArg::Write)) {
-            PimdirCoroutineState::Complete(Ok(())) => {}
+            PimdirCoroutineState::Complete(Ok(_)) => {}
             state => panic!("expected Complete(Ok), got {state:?}"),
         }
     }
@@ -924,6 +997,8 @@ mod tests {
         use crate::object::{PimdirHash, PimdirObject};
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -960,6 +1035,8 @@ mod tests {
 
         let edit = |sort_key: Option<PimdirSortKey>| {
             let mutation = PimdirMutation::Edit {
+                overrule: false,
+                if_match: None,
                 sort_key,
                 handle: PimdirHandle::from("1"),
                 object: PimdirObject {
@@ -997,6 +1074,8 @@ mod tests {
         use crate::object::{PimdirHash, PimdirObject};
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1031,6 +1110,8 @@ mod tests {
         use crate::object::{PimdirHash, PimdirObject};
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1073,6 +1154,8 @@ mod tests {
         use crate::object::{PimdirHash, PimdirObject};
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1122,6 +1205,8 @@ mod tests {
         use crate::object::{PimdirHash, PimdirObject};
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1161,6 +1246,8 @@ mod tests {
         use crate::object::{PimdirHash, PimdirObject};
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1189,6 +1276,8 @@ mod tests {
         use crate::object::{PimdirHash, PimdirObject};
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1426,6 +1515,8 @@ mod tests {
         });
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: None,
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1463,6 +1554,8 @@ mod tests {
         });
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: None,
             handle: PimdirHandle::from("tmp-1"),
             object: PimdirObject {
@@ -1532,6 +1625,8 @@ mod tests {
         });
 
         let mutation = PimdirMutation::Edit {
+            overrule: false,
+            if_match: None,
             sort_key: None,
             handle: PimdirHandle::from("1"),
             object: PimdirObject {

@@ -251,12 +251,14 @@ fn a_queued_add_restores_a_retained_item() {
     // restore is `Add` over the values retention preserved, with no new
     // action kind and no network, so the duplicate-link-id guard has to
     // exempt the retained row
+    // NOTE: the drain reads the body under its name, so the name is its hash.
+    let abc = store_hash(b"abc");
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
-            store_object("cafebabe", b"abc"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            store_object(&abc, b"abc"),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", &abc, &["\\Seen"])),
         ])
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
@@ -284,7 +286,7 @@ fn a_queued_add_restores_a_retained_item() {
     let items = store.list_items("INBOX", None, 10).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].seq, seq, "restored under its own id");
-    assert_eq!(items[0].object, Some(PimdirHash("cafebabe".into())));
+    assert_eq!(items[0].object, Some(PimdirHash(abc)));
     assert!(store.list_retained(inbox(), None, 10).unwrap().is_empty());
 
     // staged as a local creation, so the next sync pushes it back
@@ -666,4 +668,41 @@ fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
         matches!(collision, Err(PimdirError::Rebind { .. })),
         "{collision:?}"
     );
+}
+
+/// The name a body is filed under in a store of the default algorithm.
+fn store_hash(body: &[u8]) -> String {
+    io_pimdir::hash::PimdirHashAlgo::default().hash(body).0
+}
+
+/// A purge cutoff is an instant written as the stamps are (STORAGE §11.2):
+/// the comparison is textual, so a word, or an instant without its
+/// milliseconds, would purge what was never asked; it is refused, typed,
+/// and nothing is purged.
+#[test]
+fn a_purge_cutoff_not_written_as_the_stamps_are_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    store
+        .write(vec![
+            store_object("cafebabe", b"old"),
+            PimdirWriteOp::UpsertPlacement(placement("1", "mid:old", "cafebabe", &[])),
+        ])
+        .unwrap();
+    store.write(vec![drop_placement("1")]).unwrap();
+    backdate(dir.path(), "mid:old", "2026-06-01T00:00:00.000Z");
+
+    for cutoff in ["now", "2026-06-01T00:00:00Z", "2026-06-01", ""] {
+        let refused = store.purge_retained_before(cutoff).err();
+        assert_eq!(
+            refused.as_ref().map(|err| err.code()),
+            Some("cutoff-invalid"),
+            "{cutoff:?}: {refused:?}"
+        );
+        assert_eq!(store.count_retained(inbox()).unwrap(), 1, "{cutoff:?}");
+    }
+    let report = store
+        .purge_retained_before("2026-06-01T00:00:00.001Z")
+        .unwrap();
+    assert_eq!(report.items, 1);
 }

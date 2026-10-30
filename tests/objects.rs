@@ -158,10 +158,10 @@ fn the_collector_unlinks_only_the_files_at_their_shard_path() {
     let blobs = store.blobs();
 
     // an orphan at its path: a body a crash left with no row
-    let mut writer = blobs.writer().unwrap();
+    let mut writer = store.blob_stage().writer().unwrap();
     writer.write_all(b"orphan").unwrap();
-    let orphan = writer.commit(&blobs.hash(b"orphan")).unwrap();
-    assert_eq!(orphan, 6);
+    let orphan = writer.commit().unwrap();
+    assert_eq!(orphan.size, 6);
     let orphan = blobs.path(&blobs.hash(b"orphan"));
 
     // a temporary, a foreign file at the root and one inside a shard

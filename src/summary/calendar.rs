@@ -135,7 +135,7 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
         })
         .and_then(|component| component.value("UID"));
     let link_id = match &uid {
-        Some(uid) => PimdirLinkId(uid.clone()),
+        Some(uid) => PimdirLinkId::from_hint(uid.as_str()),
         None => hash_key(body),
     };
 
