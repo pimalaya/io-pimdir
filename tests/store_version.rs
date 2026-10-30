@@ -113,8 +113,8 @@ fn released_store_opens_whole(name: &str, receipts: i64, references: i64) {
             &conn,
             "SELECT version * 100 + derivation FROM store_meta WHERE id = 1"
         ),
-        101,
-        "{name}: version 1, derivation 1"
+        102,
+        "{name}: version 1, derivation 2"
     );
     assert_eq!(count(&conn, "PRAGMA user_version"), io_pimdir::sql::VERSION);
     let organised: (Option<i64>, Option<String>) = conn

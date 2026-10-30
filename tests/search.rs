@@ -320,6 +320,45 @@ fn every_search_vector_answers() {
         coverage,
         "the store-wide coverage the vectors state"
     );
+    // NOTE: an agenda's windows (SEARCH §7), one row per occurrence in
+    // the order occurrences_between answers.
+    let windows = vectors["occurrences"].as_array().unwrap();
+    assert!(
+        !windows.is_empty(),
+        "the vectors carry no occurrence window"
+    );
+    for window in windows {
+        let start = window["start"].as_str().unwrap();
+        let end = window["end"].as_str().unwrap();
+        let found: Vec<(String, i64, String, String)> = index
+            .occurrences_between(start, end)
+            .unwrap()
+            .into_iter()
+            .map(|occurrence| {
+                (
+                    occurrence.collection,
+                    occurrence.seq,
+                    occurrence.start,
+                    occurrence.end,
+                )
+            })
+            .collect();
+        let expected: Vec<(String, i64, String, String)> = window["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row[0].as_str().unwrap().into(),
+                    row[1].as_i64().unwrap(),
+                    row[2].as_str().unwrap().into(),
+                    row[3].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(found, expected, "occurrences {start}..{end}");
+    }
+
     let cases = vectors["cases"].as_array().unwrap();
     assert!(!cases.is_empty(), "the vectors carry no case");
 

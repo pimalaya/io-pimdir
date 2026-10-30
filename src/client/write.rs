@@ -979,8 +979,10 @@ impl PimdirSummaryTable {
                         .unwrap_or_default(),
                     parent: text(15)?,
                     mid: text(16)?,
+                    created: text(17)?,
                     organizer: None,
                     attendees: Vec::new(),
+                    contacts: Vec::new(),
                 })
             }
             Self::Journal => {
@@ -1094,6 +1096,7 @@ pub(crate) fn attach_address(
         (PimdirSummary::Event(event), PimdirAddressRole::Attendee) => event.attendees.push(address),
         (PimdirSummary::Task(task), PimdirAddressRole::Organizer) => task.organizer = Some(address),
         (PimdirSummary::Task(task), PimdirAddressRole::Attendee) => task.attendees.push(address),
+        (PimdirSummary::Task(task), PimdirAddressRole::Contact) => task.contacts.push(address),
         (PimdirSummary::Journal(journal), PimdirAddressRole::Organizer) => {
             journal.organizer = Some(address)
         }
@@ -1673,6 +1676,7 @@ fn write_summary(
                 ":categories": codec::ids_to_json(&task.categories),
                 ":parent": task.parent,
                 ":mid": task.mid,
+                ":created": task.created,
             },
         )?,
         PimdirSummary::Journal(journal) => conn.execute(

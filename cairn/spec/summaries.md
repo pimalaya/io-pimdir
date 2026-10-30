@@ -60,3 +60,9 @@ A `VTODO` summary SHALL carry the four columns pimdir STORAGE Annex A.4 reads wi
 - GIVEN a store whose `task_summary` has the 3b4bed8 shape, holding a task stating priority 1 and `CATEGORIES:inbox,home`
 - WHEN a reader lists the collection, reads the item, lists the trash, and a query client asks `category:inbox` and `priority:none`
 - THEN every read answers, the task with no priority and no category, `category:inbox` matching nothing and `priority:none` matching it; once the owner opens the store, the columns are backfilled and read (tests/older_task_summary.rs)
+
+### Requirement: A task carries its capture and its contacts
+A `VTODO` summary SHALL carry `created` (Annex A.4, revision 2), `CREATED` as an instant on Annex A.3's rules, else `DTSTAMP`, else `None`, and `contacts`, every `CONTACT` in document order, filed under `PimdirAddressRole::Contact` (`contact`): its address the one a `mailto:` `ALTREP` names, else its text, canonical either way (A.6); its name the text decoded, `None` when the address was read from a text that is an addr-spec, or when a `mailto:` `ALTREP` comes with an empty text; an empty text with no such `ALTREP` filing nothing. The store writes `created` and the `contact` rows, the readers and the CLI's summary output carry `created`. The search index's extraction keeps no `contact` field (SEARCH §6 reads a task's people from `ORGANIZER` and `ATTENDEE`), so `with:` reaches a waited-on person through `item_address` alone.
+
+#### Scenario: The capture vectors
+- tests/summaries.rs, the cases "todo, captured and waiting on an address" and "todo, waiting on a text" of pimdir vectors/summaries.json and the three earlier task cases' `created`; the unit test `a_task_reads_its_contacts_on_annex_a4s_edges` of src/summary/calendar.rs (a `CREATED` that is no instant, an empty `CONTACT`, a `mailto:` `ALTREP` with no text, another `ALTREP`).

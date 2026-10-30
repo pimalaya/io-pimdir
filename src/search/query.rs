@@ -105,7 +105,14 @@ const IS_VALUES: &[&str] = &[
 ];
 
 /// `has-value` (SEARCH §8.3).
-const HAS_VALUES: &[&str] = &["body", "attachment"];
+const HAS_VALUES: &[&str] = &[
+    "body",
+    "attachment",
+    "phone",
+    "address",
+    "birthday",
+    "photo",
+];
 
 /// `status-value` (SEARCH §8.3): RFC 5545's `VTODO` set, lowercased.
 const STATUS_VALUES: &[&str] = &["needs-action", "in-process", "completed", "cancelled"];
@@ -232,13 +239,17 @@ pub enum PimdirQueryPredicate {
     HasBody,
     /// An attachment (`has:attachment`).
     HasAttachment,
+    /// A card holding a property (`has:phone`, `has:address`,
+    /// `has:birthday`, `has:photo`), as its extraction recorded it.
+    HasProperty(PimdirQueryProperty),
     /// One kind (`kind:`).
     Kind(PimdirQueryKind),
     /// A task's `STATUS`, uppercased as the summary holds it (`status:`).
     Status(String),
     /// A task's `PRIORITY` band (`priority:`).
     Priority(PimdirQueryPriority),
-    /// One of a task's `CATEGORIES`, whole, as written (`category:`).
+    /// One of a task's or a card's `CATEGORIES`, whole, as written
+    /// (`category:`).
     Category(String),
     /// One account (`account:`).
     Account(String),
@@ -290,6 +301,32 @@ pub struct PimdirQueryText {
     pub phrase: bool,
     /// Whether a trailing `*` makes it a prefix.
     pub prefix: bool,
+}
+
+/// The card properties `has:` asks for (SEARCH §6, §8): a card holding
+/// at least one `TEL`, `ADR`, `BDAY`, `PHOTO`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PimdirQueryProperty {
+    /// A `TEL` (`has:phone`).
+    Phone,
+    /// An `ADR` (`has:address`).
+    Address,
+    /// A `BDAY` (`has:birthday`).
+    Birthday,
+    /// A `PHOTO` (`has:photo`).
+    Photo,
+}
+
+impl PimdirQueryProperty {
+    /// The value `has:` names it by, as `holding` takes it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Phone => "phone",
+            Self::Address => "address",
+            Self::Birthday => "birthday",
+            Self::Photo => "photo",
+        }
+    }
 }
 
 /// The bands `priority:` names (SEARCH §8, RFC 5545 §3.8.1.9).
@@ -1040,6 +1077,10 @@ fn field(
         "has" => match value.as_str() {
             "body" => PimdirQueryPredicate::HasBody,
             "attachment" => PimdirQueryPredicate::HasAttachment,
+            "phone" => PimdirQueryPredicate::HasProperty(PimdirQueryProperty::Phone),
+            "address" => PimdirQueryPredicate::HasProperty(PimdirQueryProperty::Address),
+            "birthday" => PimdirQueryPredicate::HasProperty(PimdirQueryProperty::Birthday),
+            "photo" => PimdirQueryPredicate::HasProperty(PimdirQueryProperty::Photo),
             _ => return Err(invalid(PimdirQueryErrorCode::InvalidValue, HAS_VALUES)),
         },
         "kind" => match PimdirQueryKind::parse(&value) {

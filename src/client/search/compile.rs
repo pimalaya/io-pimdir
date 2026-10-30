@@ -308,6 +308,15 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                      OR (c.kind = 'text/calendar' AND (i.collection, i.seq) IN ({attached})))"
                 )
             }
+            PimdirQueryPredicate::HasProperty(property) => {
+                // NOTE: a card by the mark its body's extraction recorded
+                // (SEARCH §6); every other kind records none.
+                let held = self.embed(
+                    search::HOLDING,
+                    vec![(":property", property.as_str().to_string().into())],
+                );
+                format!("SELECT i.collection, i.seq {live} AND (i.collection, i.seq) IN ({held})")
+            }
             PimdirQueryPredicate::Kind(kind) => match kind {
                 PimdirQueryKind::Event | PimdirQueryKind::Task | PimdirQueryKind::Journal => {
                     let table = match kind {
@@ -350,12 +359,17 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             PimdirQueryPredicate::Category(category) => {
                 // NOTE: both sides folded as STORAGE Annex A.2 folds `fn`,
                 // the stored side by the function the connection registers.
-                let category = self.bind(fold(category).into());
+                // NOTE: a card by the values its body's extraction recorded
+                // (SEARCH §6), contact_summary keeping none.
+                let folded = fold(category);
+                let carded =
+                    self.embed(search::CATEGORISED, vec![(":value", folded.clone().into())]);
+                let category = self.bind(folded.into());
                 format!(
-                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                    "SELECT i.collection, i.seq {live} AND (EXISTS (SELECT 1 FROM store.task_summary s \
                          JOIN json_each(s.categories) j \
                          WHERE s.collection = i.collection AND s.link_id = i.link_id \
-                         AND {FOLD}(j.value) = {category})"
+                         AND {FOLD}(j.value) = {category}) OR (i.collection, i.seq) IN ({carded}))"
                 )
             }
             PimdirQueryPredicate::Account(account) => {

@@ -111,6 +111,7 @@ impl PimdirSummary {
                     task.organizer.as_slice(),
                 );
                 push(&mut out, PimdirAddressRole::Attendee, &task.attendees);
+                push(&mut out, PimdirAddressRole::Contact, &task.contacts);
             }
             Self::Journal(journal) => {
                 push(
@@ -184,6 +185,8 @@ pub enum PimdirAddressRole {
     Organizer,
     /// A calendar object's `ATTENDEE`.
     Attendee,
+    /// A task's `CONTACT` (Annex A.4, revision 2).
+    Contact,
 }
 
 impl PimdirAddressRole {
@@ -197,6 +200,7 @@ impl PimdirAddressRole {
             Self::Email => "email",
             Self::Organizer => "organizer",
             Self::Attendee => "attendee",
+            Self::Contact => "contact",
         }
     }
 
@@ -210,6 +214,7 @@ impl PimdirAddressRole {
             "email" => Some(Self::Email),
             "organizer" => Some(Self::Organizer),
             "attendee" => Some(Self::Attendee),
+            "contact" => Some(Self::Contact),
             _ => None,
         }
     }

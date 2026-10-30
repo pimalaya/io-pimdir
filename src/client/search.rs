@@ -216,6 +216,20 @@ pub struct PimdirSearchThreadsOutput {
     pub coverage: PimdirSearchCoverage,
 }
 
+/// One occurrence of a calendar item (SEARCH §7), as an agenda reads a
+/// range: the placement it belongs to and its instants, RFC 3339 in UTC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirSearchOccurrence {
+    /// The collection holding the placement.
+    pub collection: String,
+    /// The placement's `seq` in it.
+    pub seq: i64,
+    /// When the occurrence starts.
+    pub start: String,
+    /// When it ends, its start for one of zero length.
+    pub end: String,
+}
+
 /// The hits of one thread in one account (SEARCH §9), or a hit no thread
 /// holds (an item other than mail) alone.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -498,6 +512,11 @@ impl PimdirIndex {
     /// [`busy`](PimdirIndexReport::busy). A handle opened by
     /// [`open_query`](Self::open_query) refreshes nothing:
     /// [`PimdirError::IndexQueryOnly`].
+    ///
+    /// An owner keeping an index calls it after each write batch it
+    /// commits (SEARCH §4), so its lists' filters trail their rows by one
+    /// batch. The store does not call it itself: the index is optional, a
+    /// feature of its own, and a store never depends on it.
     pub fn refresh(
         &mut self,
         options: &PimdirIndexRefreshOptions,
@@ -806,6 +825,33 @@ impl PimdirIndex {
             last,
             hits,
         }))
+    }
+
+    /// Every occurrence overlapping `[start, end)`, RFC 3339 instants in
+    /// UTC, one each with its instants, by start, then `seq`, then
+    /// collection (`occurrences_between`, SEARCH §7): what an agenda draws
+    /// a window from, each item's row read from its summary.
+    ///
+    /// The index holds occurrences within its horizon alone; a range
+    /// reaching past it lists what the horizon holds.
+    pub fn occurrences_between(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<PimdirSearchOccurrence>, PimdirError> {
+        Ok(rows(
+            &self.conn,
+            search::OCCURRENCES_BETWEEN,
+            named_params! { ":start": start, ":end": end },
+            |row| {
+                Ok(PimdirSearchOccurrence {
+                    collection: row.get(0)?,
+                    seq: row.get(1)?,
+                    start: row.get(2)?,
+                    end: row.get(3)?,
+                })
+            },
+        )?)
     }
 
     /// How many hits a query has, with what the count could not see, its
@@ -1512,9 +1558,19 @@ fn index_object(
             // NOTE: whether any text went into the field (SEARCH §6), which
             // `has:attachment` reads a calendar item by.
             ":attachment": i64::from(!text.attachment.is_empty()),
+            ":tel": i64::from(text.tel),
+            ":adr": i64::from(text.adr),
+            ":bday": i64::from(text.bday),
+            ":photo": i64::from(text.photo),
         },
         |r| r.get(0),
     )?;
+    for value in &text.categories {
+        tx.execute(
+            search::INSERT_OBJECT_CATEGORY,
+            named_params! { ":object": id, ":value": value },
+        )?;
+    }
     tx.execute(
         search::INSERT_OBJECT_TEXT,
         named_params! {

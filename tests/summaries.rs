@@ -95,6 +95,7 @@ fn row(summary: &PimdirSummary) -> (&'static str, Value) {
                     "categories": task.categories,
                     "parent": task.parent,
                     "mid": task.mid,
+                    "created": task.created,
                 }),
             )
         }

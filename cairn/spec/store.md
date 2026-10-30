@@ -1122,7 +1122,7 @@ A migration above version 1 SHALL run after the reconciliation of a version 1 st
 - THEN both stamps read 2, every table keeps its row count, a second open drops nothing it added, and this crate (version 1) refuses it as `Version { found: 2 }` (src/client/schema.rs `migration::a_migration_runs_after_the_reconciliation_and_keeps_every_row`)
 
 ### Requirement: The store records the derivation revision
-The store SHALL record in `store_meta.derivation` the Annex A revision its summaries, addresses and sort keys were derived under (STORAGE §6): `init_store_meta` writes this crate's (`schema::DERIVATION`, revision 1), a reconciliation gives an existing store the column's default 1, and an owner at a later revision re-derives what changed then records it with `set_derivation`, which never lowers it. Raising `DERIVATION` owes that re-derivation.
+The store SHALL record in `store_meta.derivation` the Annex A revision its summaries, addresses and sort keys were derived under (STORAGE §6): `init_store_meta` writes this crate's (`schema::DERIVATION`, revision 2), a reconciliation gives an existing store the column's default 1, and an owner at a later revision re-derives what changed then records it with `set_derivation`, which never lowers it. Raising `DERIVATION` owes that re-derivation.
 
 ### Requirement: A stated identity beginning like a derived key is escaped
 The key a body states (a `Message-ID`, a vCard or iCalendar `UID`) SHALL be filed under `esc:` and the hint when the hint begins with one of the reserved prefixes `alt:`, `hash:`, `dup:`, `part:`, `file:` or `esc:` (STORAGE §9, `PimdirLinkId::RESERVED`, `PimdirLinkId::from_hint`), so it never reads as a key the writer derived. A connector naming the identity to its server strips the one leading `esc:`.
@@ -1185,3 +1185,11 @@ The owner's reconciliation of a version 1 store SHALL drop every table, column, 
 #### Scenario: A collector holds the staging lock
 - GIVEN a store whose objects.lock another process holds exclusively
 - WHEN a producer probes, THEN it answers `Busy` at once; once the lock is released it answers Ok, and objects/ holds no file (tests/staging.rs `a_probe_takes_the_staging_lock_and_writes_nothing`)
+
+### Requirement: A store derived under revision 1 is re-derived on open
+An owner SHALL re-derive, from every held task body, `task_summary.created` and the task's addresses of a store whose `store_meta.derivation` is 1 (Annex A revision 2, STORAGE §6), a page of `list_held_tasks` to a transaction: `backfill_task_capture`, then `replace_addresses`, `insert_address` for every address the derivation yields and `stamp_item`, so an index refresh folds the new rows. Revision 2 SHALL be recorded with `set_derivation` in the transaction writing the last page, the next open resuming from the top until it is. A body the blob directory does not hold leaves its row as it was.
+
+#### Scenario: A draft-05 store
+- GIVEN a store holding a task with `CREATED` and a `CONTACT`, its `task_summary` of the storage-draft-05 shape, no `contact` row, derivation 1
+- WHEN a reader reads it, then the owner opens it
+- THEN the reader reads the capture `NULL` and no contact; after the open `created` and the `contact` row are filled, the item stamped and `store_meta.derivation` is 2, and a second open writes nothing (tests/task_capture.rs; tests/store_version.rs reads derivation 2 after each released store's open)

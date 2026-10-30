@@ -48,7 +48,7 @@ const SCHEMA: [&str; 16] = [
 ///
 /// NOTE: raising it owes a re-derivation of the columns the revisions in
 /// between changed, from every held body, before [`derive`] records it.
-pub(crate) const DERIVATION: i64 = 1;
+pub(crate) const DERIVATION: i64 = 2;
 
 /// Opens a store as its owner, in STORAGE §6's order: a store above this
 /// crate's version and a database that is not a pimdir store are refused
@@ -131,26 +131,104 @@ fn migrate(
     }
 
     check(conn)?;
-    derive(conn)?;
+    derive(conn, &PimdirBlobs::open(dir, algo))?;
     Ok(algo)
 }
 
-/// Records this crate's Annex A revision where the store's is lower
-/// (STORAGE §6), which `set_derivation` never lowers; a store at the same
-/// or a later revision is left as it is, written by no statement.
-fn derive(conn: &Connection) -> Result<(), PimdirError> {
+/// Brings a store derived under an earlier Annex A revision to this
+/// crate's (STORAGE §6): the columns the revisions in between changed
+/// re-derived from every held body, then the revision recorded with
+/// `set_derivation`, which never lowers it. A store at the same or a later
+/// revision is left as it is, written by no statement.
+fn derive(conn: &mut Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
     let stored: i64 =
         conn.query_row("SELECT derivation FROM store_meta WHERE id = 1", [], |r| {
             r.get(0)
         })?;
-    if stored < DERIVATION {
-        conn.execute(
-            sql::SET_DERIVATION,
-            named_params! { ":derivation": DERIVATION },
-        )
-        .map_err(busy_or_sql)?;
+    if stored >= DERIVATION {
+        return Ok(());
     }
-    Ok(())
+    // NOTE: revision 2 is the only one a re-derivation is owed for; its
+    // last page records the revision, so a store at 1 resumes from the
+    // top on the next open until it lands.
+    rederive_task_capture(conn, blobs)
+}
+
+/// Re-derives revision 2's columns (Annex A.4): `task_summary.created`
+/// and every task's addresses, its `contact` rows among them, from every
+/// held task body, a page of `list_held_tasks` to a transaction, recording
+/// the revision in the transaction writing the last page (§6). A body the
+/// blob directory does not hold leaves its row as it was.
+fn rederive_task_capture(conn: &mut Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
+    const PAGE: i64 = 500;
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let page: Vec<(String, String, String)> = rows(
+            &tx,
+            sql::LIST_HELD_TASKS,
+            named_params! {
+                ":after_collection": after.as_ref().map(|(collection, _)| collection.as_str()),
+                ":after_link_id": after.as_ref().map(|(_, link_id)| link_id.as_str()),
+                ":limit": PAGE,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(3)?)),
+        )?;
+        let last = (page.len() as i64) < PAGE;
+        after = page
+            .last()
+            .map(|(collection, link_id, _)| (collection.clone(), link_id.clone()));
+        for (collection, link_id, hash) in page {
+            let Some(body) = blobs.get(&PimdirHash(hash))? else {
+                continue;
+            };
+            let Some(summary) = calendar::derive(&body).summary else {
+                continue;
+            };
+            let PimdirSummary::Task(task) = &summary else {
+                continue;
+            };
+            let key = named_params! { ":collection": collection, ":link_id": link_id };
+            tx.execute(
+                sql::BACKFILL_TASK_CAPTURE,
+                named_params! {
+                    ":collection": collection,
+                    ":link_id": link_id,
+                    ":created": task.created,
+                },
+            )?;
+            tx.execute(sql::REPLACE_ADDRESSES, key)?;
+            let mut position: BTreeMap<&str, i64> = BTreeMap::new();
+            for (role, address) in summary.addresses() {
+                let at = position.entry(role.as_str()).or_insert(0);
+                tx.execute(
+                    sql::INSERT_ADDRESS,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link_id,
+                        ":role": role.as_str(),
+                        ":position": *at,
+                        ":address": address.address,
+                        ":name": address.name,
+                    },
+                )?;
+                *at += 1;
+            }
+            tx.execute(sql::STAMP_ITEM, key)?;
+        }
+        if last {
+            tx.execute(
+                sql::SET_DERIVATION,
+                named_params! { ":derivation": DERIVATION },
+            )?;
+        }
+        tx.commit().map_err(busy_or_sql)?;
+        if last {
+            return Ok(());
+        }
+    }
 }
 
 /// The store's `PRAGMA user_version`, `0` for a fresh database.

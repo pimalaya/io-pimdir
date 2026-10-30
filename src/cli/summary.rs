@@ -109,6 +109,7 @@ fn columns(summary: &PimdirSummary) -> (&'static str, Map<String, Value>) {
             put("categories", json!(task.categories));
             put("parent", json!(task.parent));
             put("mid", json!(task.mid));
+            put("created", json!(task.created));
             "task_summary"
         }
         PimdirSummary::Journal(journal) => {

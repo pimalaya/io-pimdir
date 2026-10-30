@@ -91,10 +91,16 @@ pub struct PimdirTaskSummary {
     pub parent: Option<String>,
     /// The message id the first `mid:` URI of an `ATTACH` or `URL` names.
     pub mid: Option<String>,
+    /// When it was captured: `CREATED` as an instant on Annex A.3's rules,
+    /// else `DTSTAMP` as one, `None` when neither reads (A.4, revision 2).
+    pub created: Option<String>,
     /// The `ORGANIZER`.
     pub organizer: Option<PimdirAddress>,
     /// Every `ATTENDEE`, in document order.
     pub attendees: Vec<PimdirAddress>,
+    /// Every `CONTACT`, in document order: who the task waits on (A.4,
+    /// revision 2), filed under the `contact` role.
+    pub contacts: Vec<PimdirAddress>,
 }
 
 /// The `journal_summary` row of a `VJOURNAL` resource with its people.
@@ -204,6 +210,8 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
                     categories: categories(master),
                     parent: parent(master),
                     mid: mid(master),
+                    created: captured(master, &zones),
+                    contacts: contacts(master),
                     organizer,
                     attendees,
                 }),
@@ -247,6 +255,61 @@ fn person(line: &PimdirContentLine) -> PimdirAddress {
         address: PimdirAddress::canonical(&line.value),
         name: line.param("CN").map(unescape),
     }
+}
+
+/// When a task was captured (A.4, revision 2): `CREATED`, else `DTSTAMP`,
+/// each as an instant on A.3's rules, `None` when neither reads as one.
+fn captured(master: &Component, zones: &[&Component]) -> Option<String> {
+    ["CREATED", "DTSTAMP"].iter().find_map(|name| {
+        master
+            .line(name)
+            .and_then(|line| instant(&time_of(line), zones))
+    })
+}
+
+/// Every `CONTACT` (RFC 5545 §3.8.4.2), in document order (A.4, revision
+/// 2): the address its `ALTREP` names when that is a `mailto:` URI, else
+/// its text, canonical either way (A.6); the text decoded as the name, none
+/// when the address was read from a text that is an addr-spec. One with an
+/// empty text and no such `ALTREP` names nobody.
+fn contacts(master: &Component) -> Vec<PimdirAddress> {
+    master
+        .lines
+        .iter()
+        .filter(|line| line.is("CONTACT"))
+        .filter_map(|line| {
+            let text = unescape(&line.value);
+            let mailto = line.param("ALTREP").filter(|altrep| {
+                altrep
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+            });
+            match mailto {
+                Some(altrep) => Some(PimdirAddress {
+                    address: PimdirAddress::canonical(altrep),
+                    name: (!text.is_empty()).then_some(text),
+                }),
+                None if text.is_empty() => None,
+                None => Some(PimdirAddress {
+                    address: PimdirAddress::canonical(&text),
+                    name: (!addr_spec(&text)).then_some(text),
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Whether a text is a bare addr-spec: one `@` between two runs holding no
+/// space, `@`, `<` or `>`.
+fn addr_spec(text: &str) -> bool {
+    let bare = |part: &str| {
+        !part.is_empty()
+            && !part
+                .chars()
+                .any(|char| char.is_whitespace() || matches!(char, '@' | '<' | '>'))
+    };
+    text.split_once('@')
+        .is_some_and(|(local, domain)| bare(local) && bare(domain))
 }
 
 /// Every `CATEGORIES` value in document order: each property's list split
@@ -727,6 +790,32 @@ URL:MID:x%2Fy%40h/part%zz\r\nATTACH:mid:z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
         assert_eq!(task.parent.as_deref(), Some("p"), "a CHILD skipped");
         assert_eq!(task.mid.as_deref(), Some("x/y@h"), "the id before the part");
         assert_eq!(percent_decoded("a%zz%4"), "a%zz%4", "no escape kept");
+    }
+
+    #[test]
+    fn a_task_reads_its_contacts_on_annex_a4s_edges() {
+        let body = b"BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nCREATED:bad\r\n\
+DTSTAMP:20261029T080000Z\r\nCONTACT:\r\nCONTACT;ALTREP=\"mailto:Ann@X.org\":\r\n\
+CONTACT;ALTREP=\"https://x.org/ann\":Ann <ANN@X.org>\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let Some(PimdirSummary::Task(task)) = derive(body).summary else {
+            panic!("a task summary");
+        };
+        assert_eq!(
+            task.created.as_deref(),
+            Some("2026-10-29T08:00:00Z"),
+            "a CREATED reading as no instant falls back to DTSTAMP"
+        );
+        let contacts: Vec<(&str, Option<&str>)> = task
+            .contacts
+            .iter()
+            .map(|contact| (contact.address.as_str(), contact.name.as_deref()))
+            .collect();
+        assert_eq!(
+            contacts,
+            [("ann@x.org", None), ("ann@x.org", Some("Ann <ANN@X.org>"))],
+            "an empty CONTACT names nobody, a mailto: ALTREP needs no text, \
+             another ALTREP leaves the text canonical as the address"
+        );
     }
 
     #[test]

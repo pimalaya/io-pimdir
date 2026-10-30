@@ -28,6 +28,7 @@ use mail_parser::{
 use vcard::{tree::cst::VcardCst, value::VcardValue};
 
 use crate::{
+    client::search::compile,
     search::chunk,
     summary::{
         PimdirAddress, PimdirAddressRole, PimdirSummary,
@@ -69,6 +70,19 @@ pub struct PimdirExtract {
     pub organizer: String,
     /// The `attendee` role's.
     pub attendee: String,
+    /// Whether a card holds a `TEL`, an `ADR`, a `BDAY`, a `PHOTO`
+    /// (`object.tel`, `adr`, `bday`, `photo`); false for any other kind.
+    pub tel: bool,
+    /// See [`tel`](Self::tel).
+    pub adr: bool,
+    /// See [`tel`](Self::tel).
+    pub bday: bool,
+    /// See [`tel`](Self::tel).
+    pub photo: bool,
+    /// A card's `CATEGORIES` values, folded as STORAGE Annex A.2 folds
+    /// `fn`, each once, in document order (`object_category`); none for
+    /// any other kind.
+    pub categories: Vec<String>,
 }
 
 /// What an extraction could read of a body (SEARCH §6).
@@ -197,10 +211,24 @@ impl PimdirExtract {
                     push(&mut extract.email, &text);
                     push(&mut extract.people, &text);
                 }
-                "ADR" => push(&mut extract.place, &text),
+                "ADR" => {
+                    extract.adr = true;
+                    push(&mut extract.place, &text);
+                }
+                "BDAY" => extract.bday = true,
+                "PHOTO" => extract.photo = true,
+                "CATEGORIES" => {
+                    for value in vcard_values(&prop.value) {
+                        let folded = compile::fold(&value);
+                        if !folded.is_empty() && !extract.categories.contains(&folded) {
+                            extract.categories.push(folded);
+                        }
+                    }
+                }
                 "ORG" | "TITLE" | "ROLE" => push(&mut extract.org, &text),
                 "NOTE" => push(&mut extract.note, &text),
                 "TEL" => {
+                    extract.tel = true;
                     let number = text.strip_prefix("tel:").unwrap_or(&text);
                     let digits: String = number.chars().filter(char::is_ascii_digit).collect();
                     push(&mut extract.note, number);
@@ -330,6 +358,10 @@ impl PimdirExtract {
                 PimdirAddressRole::Email => &mut extract.email,
                 PimdirAddressRole::Organizer => &mut extract.organizer,
                 PimdirAddressRole::Attendee => &mut extract.attendee,
+                // NOTE: the index keeps no contact field and SEARCH §6 reads
+                // a task's people from ORGANIZER and ATTENDEE alone, so a
+                // waited-on person is the store's to seek (item_address).
+                PimdirAddressRole::Contact => continue,
             };
             push(field, &text);
             push(&mut extract.people, &text);
@@ -480,6 +512,16 @@ fn push(field: &mut String, line: &str) {
         field.push('\n');
     }
     field.push_str(line);
+}
+
+/// A vCard value's items: a list's values, a text as one, anything else
+/// none (the values of a `CATEGORIES`, RFC 6350 §6.7.1).
+fn vcard_values(value: &VcardValue) -> Vec<String> {
+    match value {
+        VcardValue::TextList(list) => list.0.iter().map(|value| value.to_string()).collect(),
+        VcardValue::Text(value) => vec![value.0.to_string()],
+        _ => Vec::new(),
+    }
 }
 
 /// A vCard value as text: a text, each component of a list or a

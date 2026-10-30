@@ -102,3 +102,15 @@ Every statement the index runs naming the attached store (its compiled query, it
 - GIVEN the 0.5.1, 0.7.0 or 0.8.0 fixture, unreconciled
 - WHEN it is indexed and asked every field of SEARCH §8
 - THEN every query answers, its task of no priority and no category, and pimdir.db is unwritten (tests/store_version.rs `a_store_released_by_*_is_indexed_and_searched`; 0.5.1 and 0.7.0 failed before: "no such table: store.file_summary")
+
+### Requirement: A card's properties and categories are recorded at extraction
+The extraction of a card SHALL record whether it holds a `TEL`, an `ADR`, a `BDAY` and a `PHOTO` (`PimdirExtract::tel`, `adr`, `bday`, `photo`, written to `object.tel`, `adr`, `bday`, `photo` by `insert_object`) and its `CATEGORIES` values, folded as Annex A.2 folds `fn`, each once (`PimdirExtract::categories`, `insert_object_category`); every other kind records none. `has:phone`, `has:address`, `has:birthday` and `has:photo` SHALL parse to `PimdirQueryPredicate::HasProperty` with `PimdirQueryProperty` and compile to `holding`; `category:` SHALL match a task on `store.task_summary` as before or a card through `categorised`.
+
+#### Scenario: The card vectors
+- tests/search.rs, the cases over item 25 (card-held.vcf) of pimdir vectors/search/queries.json, every one refused (`invalid-value`) or missing the card before this; an index of the earlier shape is rebuilt (`an_index_of_another_shape_is_rebuilt_never_queried`).
+
+### Requirement: An agenda reads a range's occurrences in order
+`PimdirIndex::occurrences_between(start, end)` SHALL answer every occurrence overlapping `[start, end)`, RFC 3339 instants in UTC, one `PimdirSearchOccurrence { collection, seq, start, end }` each, ordered by start, then `seq`, then collection (`occurrences_between`, SEARCH §7), within the index's horizon. An owner keeping an index calls `refresh` after each write batch it commits (SEARCH §4); the store never calls it, the index being optional.
+
+#### Scenario: The occurrence windows
+- tests/search.rs, every window of `occurrences` in pimdir vectors/search/queries.json: a weekly series as three rows in time order, an occurrence running into a range, a zero-length task at a range's start, the same at its end left out.
