@@ -1088,10 +1088,8 @@ fn a_page_across_collections_walks_the_global_order() {
         let mut plan = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
             .unwrap();
-        for (parameter, value) in [(":pattern", "%a%")] {
-            if let Some(index) = plan.parameter_index(parameter).unwrap() {
-                plan.raw_bind_parameter(index, value).unwrap();
-            }
+        if let Some(index) = plan.parameter_index(":pattern").unwrap() {
+            plan.raw_bind_parameter(index, "%a%").unwrap();
         }
         let mut rows = plan.raw_query();
         let mut steps = Vec::new();

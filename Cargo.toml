@@ -3,7 +3,7 @@ name = "io-pimdir"
 description = "Rust implementation of the Pimdir standard: the store and the sync engine"
 version = "0.8.0"
 authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
-rust-version = "1.88"
+rust-version = "1.89"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 categories = ["api-bindings", "command-line-utilities", "database", "no-std"]
@@ -64,7 +64,7 @@ ical-rs = { version = "0.6", default-features = false, features = ["parser", "tz
 log = { version = "0.4", default-features = false }
 mail-parser = { version = "0.11", default-features = false, features = ["full_encoding"], optional = true }
 pimalaya-cli = { version = "0.2", default-features = false, features = ["prompt", "table", "terminal"], optional = true }
-rusqlite = { version = "0.40", default-features = false, optional = true }
+rusqlite = { version = "0.41", default-features = false, optional = true }
 schemars = { version = "1", default-features = false, features = ["derive", "std"], optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
