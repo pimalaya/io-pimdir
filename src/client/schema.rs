@@ -11,10 +11,11 @@ use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params};
 
 use crate::{
-    client::{PimdirError, PimdirNotCurrent, blobs::PimdirBlobs, busy_or_sql, rows},
+    client::{PimdirError, PimdirNotCurrent, blobs::PimdirBlobs, busy_or_sql, rows, write},
     codec,
     hash::PimdirHashAlgo,
     object::PimdirHash,
+    placement::PimdirFlags,
     sql,
     summary::{PimdirSummary, calendar, mail},
 };
@@ -86,6 +87,7 @@ fn migrate(
             // not an earlier one: refused before anything is reconciled.
             check(conn)?;
             format(conn)?;
+            canonical_shape(conn)?;
             hash_algo(conn, declared)?
         }
     };
@@ -265,6 +267,25 @@ fn format(conn: &Connection) -> Result<(), PimdirError> {
     }
 }
 
+/// Refuses a store whose `store_meta.shape` is not the canonical `pimdir`
+/// (STORAGE §4.1, §6): another implementation's own statements wrote it,
+/// and this crate neither reads nor reconciles it. A store lacking the
+/// column, or the row, is of the canonical shape.
+fn canonical_shape(conn: &Connection) -> Result<(), PimdirError> {
+    if !has_column(conn, "store_meta", "shape")? {
+        return Ok(());
+    }
+    let shape: Option<String> = conn
+        .query_row("SELECT shape FROM store_meta WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    match shape {
+        Some(shape) if shape != "pimdir" => Err(PimdirError::Shape(shape)),
+        _ => Ok(()),
+    }
+}
+
 /// One table, index or trigger as `sqlite_schema` declares it.
 struct PimdirSchemaObject {
     /// `table`, `index` or `trigger`.
@@ -318,6 +339,7 @@ fn rebuild(
         has_table(&tx, "task_summary")? && !has_column(&tx, "task_summary", "priority")?;
     let without_shared_object =
         has_table(&tx, "bindings")? && !has_column(&tx, "bindings", "shared_object")?;
+    let lists = PimdirEarlierLists::read(&tx)?;
     let pointers = ["objects", "items", "bindings", "queue"];
     let counted = pointers.iter().all(|table| held.contains_key(*table));
     // NOTE: both name bindings.shared_object, so a store from before it
@@ -424,6 +446,7 @@ fn rebuild(
     if without_organisation {
         backfill_organisation(&tx, blobs)?;
     }
+    lists.write(&tx)?;
     // NOTE: after every rebuild and backfill, so the counts are this
     // schema's, bindings.shared_object and a backfill's pointers counted.
     tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
@@ -485,11 +508,12 @@ fn backfill_invitation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), Pim
     Ok(())
 }
 
-/// Re-derives `task_summary`'s `priority`, `categories`, `parent` and `mid`
-/// from every held task body, a page of `list_held_tasks` at a time, then
-/// records the references they imply (§6, §14.2): the four task rules run
-/// over every item of their end. A body the blob directory does not hold
-/// leaves its row empty.
+/// Re-derives `task_summary`'s `priority`, `parent` and `mid` and the
+/// task's categories from every held task body, a page of
+/// `list_held_tasks` at a time, the categories written with
+/// `replace_categories` and `insert_category`, then records the references
+/// they imply (§6, §14.2): the four task rules run over every item of their
+/// end. A body the blob directory does not hold leaves its row empty.
 fn backfill_organisation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
     let mut after: Option<(String, String)> = None;
     loop {
@@ -520,11 +544,23 @@ fn backfill_organisation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), P
                     ":collection": collection,
                     ":link_id": link_id,
                     ":priority": task.priority,
-                    ":categories": codec::ids_to_json(&task.categories),
                     ":parent": task.parent,
                     ":mid": task.mid,
                 },
             )?;
+            let key = named_params! { ":collection": collection, ":link_id": link_id };
+            conn.execute(sql::REPLACE_CATEGORIES, key)?;
+            for (position, value) in task.categories.iter().enumerate() {
+                conn.execute(
+                    sql::INSERT_CATEGORY,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link_id,
+                        ":position": position as i64,
+                        ":value": value,
+                    },
+                )?;
+            }
         }
     }
     for rule in [
@@ -536,6 +572,171 @@ fn backfill_organisation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), P
         conn.execute(rule, named_params! { ":link_id": None::<String> })?;
     }
     Ok(())
+}
+
+/// What a store from before the list tables (storage-draft-06 or earlier)
+/// holds as JSON arrays (STORAGE §6), read by this crate's own text before
+/// the rebuild drops their columns and written to their tables after it, in
+/// the same transaction: a placement's flags, a binding's base flags, a
+/// message's `In-Reply-To` ids and a task's categories. A flag set held
+/// `NULL`, or not as an array of strings, stays unknown; such a list reads
+/// as none.
+///
+/// The collection a pending move, copy or superseding add targets is read
+/// from its payload beside them, for a queue from before
+/// `target_collection`: the column a rename follows reads `NULL` otherwise,
+/// which contradicts the row (§6).
+#[derive(Default)]
+struct PimdirEarlierLists {
+    /// The known flag sets, by placement.
+    flags: Vec<(String, String, Vec<String>)>,
+    /// The known base flag sets, by placement and source.
+    base_flags: Vec<(String, String, String, Vec<String>)>,
+    /// The `In-Reply-To` ids in document order, by message.
+    in_reply_to: Vec<(String, String, Vec<String>)>,
+    /// The categories in document order, by task.
+    categories: Vec<(String, String, Vec<String>)>,
+    /// The collection each queue row targets, by row id.
+    targets: Vec<(i64, String)>,
+}
+
+impl PimdirEarlierLists {
+    /// Reads every array the store still holds, none on a store holding
+    /// none of the columns.
+    fn read(conn: &Connection) -> Result<Self, PimdirError> {
+        let mut lists = Self::default();
+
+        if has_column(conn, "items", "flags")? {
+            lists.flags = keyed_arrays(
+                conn,
+                "SELECT collection, link_id, flags FROM items WHERE flags IS NOT NULL",
+            )?;
+        }
+        if has_column(conn, "bindings", "base_flags")? {
+            let held: Vec<(String, String, String, String)> = rows(
+                conn,
+                "SELECT collection, link_id, source, base_flags FROM bindings \
+                 WHERE base_flags IS NOT NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            lists.base_flags = held
+                .into_iter()
+                .filter_map(|(collection, link_id, source, json)| {
+                    Some((collection, link_id, source, array(&json)?))
+                })
+                .collect();
+        }
+        if has_column(conn, "mail_summary", "in_reply_to")? {
+            lists.in_reply_to = keyed_arrays(
+                conn,
+                "SELECT collection, link_id, in_reply_to FROM mail_summary",
+            )?;
+        }
+        if has_column(conn, "task_summary", "categories")? {
+            lists.categories = keyed_arrays(
+                conn,
+                "SELECT collection, link_id, categories FROM task_summary",
+            )?;
+        }
+        if has_table(conn, "queue")? && !has_column(conn, "queue", "target_collection")? {
+            let queued: Vec<(i64, String, String)> =
+                rows(conn, "SELECT id, action, payload FROM queue", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+            lists.targets = queued
+                .into_iter()
+                .filter_map(|(id, kind, payload)| {
+                    let action = codec::action_from_payload(&kind, &payload).ok()?;
+                    Some((id, action.target_collection()?.0.clone()))
+                })
+                .collect();
+        }
+
+        Ok(lists)
+    }
+
+    /// Writes what [`read`](Self::read) read to the rebuilt tables: a known
+    /// set marked known (`backfill_flags_known`, `backfill_base_flags_known`)
+    /// then its rows, the ids and the categories in their order. A flag the
+    /// store cannot hold any more refuses the reconciliation, rolled back,
+    /// rather than losing it.
+    fn write(&self, conn: &Connection) -> Result<(), PimdirError> {
+        for (collection, link_id, flags) in &self.flags {
+            let flags = PimdirFlags::from_iter(flags);
+            conn.execute(
+                sql::BACKFILL_FLAGS_KNOWN,
+                named_params! { ":collection": collection, ":link_id": link_id },
+            )?;
+            write::write_flags(conn, collection, link_id, None, &flags)?;
+        }
+        for (collection, link_id, source, flags) in &self.base_flags {
+            let flags = PimdirFlags::from_iter(flags);
+            conn.execute(
+                sql::BACKFILL_BASE_FLAGS_KNOWN,
+                named_params! {
+                    ":collection": collection,
+                    ":link_id": link_id,
+                    ":source": source,
+                },
+            )?;
+            write::write_flags(conn, collection, link_id, Some(source), &flags)?;
+        }
+        for (collection, link_id, ids) in &self.in_reply_to {
+            for (position, id) in ids.iter().enumerate() {
+                conn.execute(
+                    sql::INSERT_IN_REPLY_TO,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link_id,
+                        ":position": position as i64,
+                        ":msg_id": id,
+                    },
+                )?;
+            }
+        }
+        for (collection, link_id, values) in &self.categories {
+            for (position, value) in values.iter().enumerate() {
+                conn.execute(
+                    sql::INSERT_CATEGORY,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link_id,
+                        ":position": position as i64,
+                        ":value": value,
+                    },
+                )?;
+            }
+        }
+        for (id, target) in &self.targets {
+            conn.execute(
+                sql::BACKFILL_TARGET_COLLECTION,
+                named_params! { ":target_collection": target, ":id": id },
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The `(collection, link_id, array)` rows a statement answers, each array
+/// read as [`array`] reads it, a row it cannot read left out.
+fn keyed_arrays(
+    conn: &Connection,
+    statement: &str,
+) -> Result<Vec<(String, String, Vec<String>)>, PimdirError> {
+    let held: Vec<(String, String, String)> = rows(conn, statement, [], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(held
+        .into_iter()
+        .filter_map(|(collection, link_id, json)| Some((collection, link_id, array(&json)?)))
+        .collect())
+}
+
+/// A JSON array of strings as storage-draft-06 wrote its list columns
+/// (§13, Annex A), `None` for any other value.
+fn array(json: &str) -> Option<Vec<String>> {
+    serde_json::from_str(json).ok()
 }
 
 /// Every table, index and trigger a database declares, by name; the
@@ -590,6 +791,7 @@ pub(crate) fn current(conn: &Connection) -> Result<(), PimdirError> {
     }
     check(conn)?;
     format(conn)?;
+    canonical_shape(conn)?;
 
     let canonical = Connection::open_in_memory()?;
     for migration in sql::MIGRATIONS {
@@ -882,11 +1084,31 @@ fn reconciled_table(
             },
         )
         .collect();
-    Ok(Some(match held.is_empty() {
-        true => format!("(SELECT {} WHERE 0)", select.join(", ")),
-        false => format!("(SELECT {} FROM {schema}.\"{table}\")", select.join(", ")),
-    }))
+    if held.is_empty() {
+        return Ok(Some(format!("(SELECT {} WHERE 0)", select.join(", "))));
+    }
+
+    // NOTE: a statement may join a table on its rowid (`items` in
+    // list_attachments_by_account), which a subquery answers only as a
+    // column of its own; a table without one answers none.
+    let rowid = conn
+        .query_row(
+            "SELECT wr FROM pragma_table_list WHERE schema = ?1 AND name = ?2",
+            [schema, table],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|without| without == 0);
+    let rowid = match rowid {
+        true => "rowid, ",
+        false => "",
+    };
+    Ok(Some(format!(
+        "(SELECT {rowid}{} FROM {schema}.\"{table}\")",
+        select.join(", ")
+    )))
 }
+
 /// Refuses a store stamped at the current version that this crate does
 /// not read: a core table or trigger missing, or disagreeing stamps (§4.2).
 ///
@@ -937,7 +1159,8 @@ pub(crate) fn check_version(conn: &Connection) -> Result<(), PimdirError> {
         found if found > sql::VERSION => Err(PimdirError::Version { found }),
         _ => {
             check(conn)?;
-            format(conn)
+            format(conn)?;
+            canonical_shape(conn)
         }
     }
 }
@@ -980,9 +1203,9 @@ mod tests {
 
     use super::as_reconciled;
 
-    /// A store whose `sources` predates the coverage columns, whose
-    /// `task_summary` predates `categories` and which has no
-    /// `supersessions`, as an older release wrote it.
+    /// A store whose `sources` predates the coverage columns and which has
+    /// no `task_category` and no `supersessions`, as an older release wrote
+    /// it.
     fn older() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for migration in crate::sql::MIGRATIONS {
@@ -995,7 +1218,7 @@ mod tests {
              CREATE TABLE sources (collection TEXT NOT NULL, source TEXT NOT NULL,
                  checkpoint BLOB, PRIMARY KEY (collection, source)) STRICT;
              INSERT INTO sources VALUES ('INBOX', 'imap', NULL);
-             ALTER TABLE task_summary DROP COLUMN categories;
+             DROP TABLE task_category;
              INSERT INTO task_summary(collection, link_id, summary) VALUES ('Tasks', 't', 'T');
              DROP TABLE supersessions;",
         )
@@ -1004,7 +1227,8 @@ mod tests {
     }
 
     /// A missing column reads as its `NOT NULL` default or `NULL`, the
-    /// table aliased or not, and a missing table answers no row (§6).
+    /// table aliased or not, and a missing table answers no row, a
+    /// subquery over one none (§6).
     #[test]
     fn a_statement_reads_an_older_store_as_its_reconciliation_leaves_it() {
         let conn = older();
@@ -1024,11 +1248,14 @@ mod tests {
         let categories = as_reconciled(
             &conn,
             "main",
-            "SELECT categories FROM task_summary -- categories",
+            "SELECT t.summary, (SELECT group_concat(c.value, ' ') FROM task_category c \
+             WHERE c.collection = t.collection AND c.link_id = t.link_id) FROM task_summary t",
         )
         .unwrap();
-        let read: String = conn.query_row(&categories, [], |r| r.get(0)).unwrap();
-        assert_eq!(read, "[]", "{categories}");
+        let read: (String, Option<String>) = conn
+            .query_row(&categories, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(read, ("T".into(), None), "{categories}");
 
         let gone = as_reconciled(
             &conn,

@@ -11,7 +11,7 @@
 //!
 //! `PIMDIR_SCALE` sets another number of messages.
 
-#![cfg(feature = "search")]
+#![cfg(all(feature = "client", feature = "search"))]
 
 use std::{
     collections::BTreeSet,

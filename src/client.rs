@@ -22,7 +22,7 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Params, Row, TransactionBehavior,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Params, Row, ToSql, TransactionBehavior,
     named_params,
 };
 
@@ -31,7 +31,7 @@ use crate::{
     client::{
         blobs::{PimdirBlobStage, PimdirBlobs},
         lock::PimdirLock,
-        reader::{PimdirReader, collections_json, reference_from_row},
+        reader::{PimdirReader, reference_from_row},
         write::kind_of,
     },
     codec::{self, PimdirAction, PimdirActionError},
@@ -160,10 +160,11 @@ impl PimdirStore {
     /// created by running the migrations (§6). An existing store is opened
     /// in §6's order, refused before anything is written when it is above
     /// this crate's version ([`PimdirError::Version`]), not a pimdir store
-    /// ([`PimdirError::Foreign`]), missing a core table
-    /// ([`PimdirError::Stale`]) or naming its objects by another algorithm;
-    /// a version 1 store an earlier draft wrote is then reconciled to
-    /// 0001_init.sql, and every migration above its version run.
+    /// ([`PimdirError::Foreign`]), of another shape ([`PimdirError::Shape`]),
+    /// missing a core table ([`PimdirError::Stale`]) or naming its objects
+    /// by another algorithm; a version 1 store an earlier draft wrote is
+    /// then reconciled to 0001_init.sql, and every migration above its
+    /// version run.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         Self::open_with_hash(dir, None)
     }
@@ -196,7 +197,7 @@ impl PimdirStore {
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&db, flags)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+        prepare_connection(&conn)?;
         schema::current(&conn)?;
         let hash = schema::hash_algo(&conn, None)?;
 
@@ -223,7 +224,7 @@ impl PimdirStore {
         let mut conn = Connection::open(dir.join("pimdir.db"))?;
         // NOTE: the journal mode is set by the schema runner once it knows
         // the database is a store it may write (§6).
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+        prepare_connection(&conn)?;
         let hash = schema::init(&mut conn, hash, dir)?;
 
         Ok(Self {
@@ -594,8 +595,8 @@ impl PimdirStore {
 
     /// Gives a collection a new id, its contents following through the
     /// cascades and its items restamped (§14): the only safe way to change
-    /// one. A pending move or copy naming it as a target follows too, its
-    /// payload being what no cascade reaches.
+    /// one. A pending move, copy or superseding add naming it as a target
+    /// follows too, its `target_collection` being what no cascade reaches.
     pub fn rename_collection(
         &mut self,
         collection: impl AsRef<str>,
@@ -805,19 +806,16 @@ impl PimdirStore {
         if self.lock.in_flight() {
             return Err(PimdirError::InFlight(self.dir.clone()));
         }
-        let collections = collections_json(collections)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        tx.execute(
-            sql::RELEASE_BASES_BEFORE,
-            named_params! { ":collections": collections, ":until": until },
-        )?;
+        bind_list(&tx, "collections", collections.iter().map(AsRef::as_ref))?;
+        tx.execute(sql::RELEASE_BASES_BEFORE, named_params! { ":until": until })?;
         let seqs: Vec<i64> = rows(
             &tx,
             sql::RELEASE_BEFORE,
-            named_params! { ":collections": collections, ":until": until },
+            named_params! { ":until": until },
             |row| row.get(0),
         )?;
         tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
@@ -1007,6 +1005,7 @@ impl PimdirStore {
                 ":collection": collection,
                 ":action": action.kind(),
                 ":payload": codec::action_to_payload(action),
+                ":target_collection": action.target_collection().map(|to| to.0.as_str()),
                 ":object_hash": hash.as_ref().map(|h| h.0.as_str()),
             },
         )?;
@@ -1065,6 +1064,35 @@ pub(crate) fn rows<T>(
     conn.prepare(sql)?.query_map(params, map)?.collect()
 }
 
+/// Fills the list parameter `slot` of the canonical statements with
+/// `values` in order (STORAGE §4.4), every slot cleared first: what a
+/// statement reading `temp.param` binds before it runs, in its
+/// transaction. The connection created the table when it opened.
+pub(crate) fn bind_list<V: ToSql>(
+    conn: &Connection,
+    slot: &str,
+    values: impl IntoIterator<Item = V>,
+) -> rusqlite::Result<()> {
+    conn.execute(sql::CLEAR_PARAM, [])?;
+    let mut bind = conn.prepare(sql::BIND_PARAM)?;
+    for (position, value) in values.into_iter().enumerate() {
+        bind.execute(named_params! {
+            ":slot": slot,
+            ":position": position as i64,
+            ":value": value,
+        })?;
+    }
+    Ok(())
+}
+
+/// Sets up a connection to a store as every role does (STORAGE §4.1,
+/// §4.4): foreign keys on, a busy timeout, and the list parameters'
+/// temporary table, which a read-only connection creates too.
+pub(crate) fn prepare_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+    conn.execute_batch(sql::CREATE_PARAM)
+}
+
 /// Deletes one queue row by id (`cancel_action`, §15.5), answering the
 /// pin it held, `None` when no row had that id.
 fn cancel_queued(conn: &Connection, id: i64) -> Result<Option<Option<String>>, PimdirError> {
@@ -1110,10 +1138,8 @@ pub(crate) fn release_pins(
     if hashes.is_empty() {
         return Ok(());
     }
-    conn.execute(
-        sql::RELEASE_PINS,
-        named_params! { ":hashes": serde_json::to_string(&hashes)? },
-    )?;
+    bind_list(conn, "hashes", &hashes)?;
+    conn.execute(sql::RELEASE_PINS, [])?;
     Ok(())
 }
 
@@ -1376,6 +1402,14 @@ pub enum PimdirError {
         /// The sources declaring it.
         candidates: Vec<String>,
     },
+    /// A flag set holds a flag the store cannot (STORAGE §13): empty, or
+    /// holding a space, a control or a non-ASCII character. Refused before
+    /// anything is written or queued.
+    Flag(String),
+    /// The store is written in a shape this crate does not implement
+    /// (STORAGE §4.1): its `store_meta.shape` names another than the
+    /// canonical `pimdir`. Nothing in it is read, reconciled or written.
+    Shape(String),
     /// A purge cutoff is not an instant written as the store's stamps are,
     /// UTC with milliseconds (§11.2), which a textual comparison needs.
     Cutoff(String),
@@ -1386,7 +1420,7 @@ pub enum PimdirError {
     /// A tag's flag change was refused (SEARCH §10) before anything was
     /// read or staged.
     #[cfg(feature = "search")]
-    Tag(crate::client::search::tag::PimdirSearchTagError),
+    Tag(crate::search::tag::PimdirSearchTagError),
     /// The SQLite linked in lacks what the index requires (SEARCH §2):
     /// FTS5, or the version 3.43 `contentless_delete` arrived in.
     #[cfg(feature = "search")]
@@ -1416,6 +1450,10 @@ pub enum PimdirError {
     /// §3).
     #[cfg(feature = "search")]
     IndexQueryOnly(PathBuf),
+    /// The index refresh was resumed out of turn (SEARCH §4): a bug in
+    /// `PimdirIndex::refresh`, never in the store or the index.
+    #[cfg(feature = "search")]
+    Refresh(crate::coroutine::PimdirArgError),
 }
 
 impl PimdirError {
@@ -1455,6 +1493,8 @@ impl PimdirError {
     /// | `no-performer` | [`NoPerformer`](Self::NoPerformer) |
     /// | `ambiguous-performer` | [`Ambiguous`](Self::Ambiguous) |
     /// | `cutoff-invalid` | [`Cutoff`](Self::Cutoff) |
+    /// | `flag-invalid` | [`Flag`](Self::Flag) |
+    /// | `store-shape` | [`Shape`](Self::Shape) |
     /// | `query-refused` | `Query` (feature `search`) |
     /// | `tag-refused` | `Tag` (feature `search`) |
     /// | `index-fts5-missing` | `Fts5` (feature `search`) |
@@ -1463,6 +1503,7 @@ impl PimdirError {
     /// | `index-missing` | `IndexMissing` (feature `search`) |
     /// | `index-outdated` | `IndexOutdated` (feature `search`) |
     /// | `index-query-only` | `IndexQueryOnly` (feature `search`) |
+    /// | `index-refresh-broken` | `Refresh` (feature `search`) |
     pub fn code(&self) -> &'static str {
         match self {
             Self::Sql(_) => "sql",
@@ -1498,6 +1539,8 @@ impl PimdirError {
             Self::NoPerformer { .. } => "no-performer",
             Self::Ambiguous { .. } => "ambiguous-performer",
             Self::Cutoff(_) => "cutoff-invalid",
+            Self::Flag(_) => "flag-invalid",
+            Self::Shape(_) => "store-shape",
             #[cfg(feature = "search")]
             Self::Query(_) => "query-refused",
             #[cfg(feature = "search")]
@@ -1514,6 +1557,8 @@ impl PimdirError {
             Self::IndexOutdated(_) => "index-outdated",
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(_) => "index-query-only",
+            #[cfg(feature = "search")]
+            Self::Refresh(_) => "index-refresh-broken",
         }
     }
 }
@@ -1673,6 +1718,14 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir purge cutoff {cutoff:?} is not an instant written as the stamps are, UTC with milliseconds (2026-06-01T00:00:00.000Z)"
             ),
+            Self::Flag(flag) => write!(
+                f,
+                "Pimdir flag {flag:?} refused: a flag is printable ASCII without a space"
+            ),
+            Self::Shape(shape) => write!(
+                f,
+                "Pimdir store is written in shape {shape:?}, which this program does not implement"
+            ),
             #[cfg(feature = "search")]
             Self::Query(err) => write!(f, "Pimdir search query refused: {err}"),
             #[cfg(feature = "search")]
@@ -1711,6 +1764,8 @@ impl fmt::Display for PimdirError {
                 "Pimdir search index {} is open for queries alone: only its indexer refreshes it",
                 index.display()
             ),
+            #[cfg(feature = "search")]
+            Self::Refresh(err) => write!(f, "Pimdir index refresh failed: {err}"),
         }
     }
 }
@@ -1723,6 +1778,8 @@ impl std::error::Error for PimdirError {
             Self::Json(err) => Some(err),
             #[cfg(feature = "search")]
             Self::Unanswerable(err) => Some(err),
+            #[cfg(feature = "search")]
+            Self::Refresh(err) => Some(err),
             _ => None,
         }
     }
@@ -1761,8 +1818,8 @@ impl From<PimdirActionError> for PimdirError {
 }
 
 #[cfg(feature = "search")]
-impl From<crate::client::search::tag::PimdirSearchTagError> for PimdirError {
-    fn from(err: crate::client::search::tag::PimdirSearchTagError) -> Self {
+impl From<crate::search::tag::PimdirSearchTagError> for PimdirError {
+    fn from(err: crate::search::tag::PimdirSearchTagError) -> Self {
         Self::Tag(err)
     }
 }

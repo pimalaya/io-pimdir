@@ -15,6 +15,8 @@
 //! The spec is a sibling checkout rather than a vendored copy, so the
 //! test skips when it is absent and runs when the two sit side by side.
 
+#![cfg(feature = "client")]
+
 use std::{fs, io::Write, path::PathBuf};
 
 use io_pimdir::object::PimdirHash;

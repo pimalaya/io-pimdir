@@ -4,6 +4,8 @@
 //! open from the held bodies: `created`, the `contact` rows, revision 2
 //! recorded (STORAGE §6, Annex A.4).
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     client::{PimdirStore, reader::PimdirReader},
     summary::{PimdirSummary, calendar::PimdirTaskSummary},
@@ -43,8 +45,8 @@ const DRAFT_05: &str = "CREATE TABLE task_summary (
 ) STRICT;";
 
 /// A store holding [`TASK`], brought back to what a revision 1 owner at
-/// storage-draft-05 left: the column gone, the contact row gone, the
-/// derivation 1. Answers the task's seq.
+/// storage-draft-05 left: the column gone, the categories a JSON array, the
+/// contact row gone, the derivation 1. Answers the task's seq.
 fn revision_1_store() -> (tempfile::TempDir, i64) {
     let dir = tempfile::tempdir().unwrap();
     let seq = {
@@ -68,9 +70,10 @@ fn revision_1_store() -> (tempfile::TempDir, i64) {
          INSERT INTO task_summary SELECT collection, link_id, uid, summary,
              dtstart, dtstart_tzid, dtstart_value, due, due_tzid, due_value,
              status, completed, percent, recurring, until, priority,
-             categories, parent, mid
+             '[\"waiting\"]', parent, mid
          FROM task_summary_aside;
          DROP TABLE task_summary_aside;
+         DROP TABLE task_category;
          {};
          DELETE FROM item_address WHERE role = 'contact';
          UPDATE store_meta SET derivation = 1 WHERE id = 1;
@@ -128,6 +131,7 @@ fn the_owner_re_derives_a_revision_1_store_on_open() {
     let reader = PimdirReader::open(dir.path()).unwrap();
     let read = task(reader.get_item("tasks", seq).unwrap().unwrap().summary);
     assert_eq!(read.created.as_deref(), Some("2026-10-28T09:00:00Z"));
+    assert_eq!(read.categories, ["waiting"], "the array moved to its table");
     assert_eq!(
         contacts(dir.path()),
         [(

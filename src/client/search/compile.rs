@@ -20,28 +20,26 @@ use rusqlite::types::Value;
 
 use crate::{
     client::search::PimdirSearchSort,
-    search::query::{
-        PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryDateUnit, PimdirQueryId,
-        PimdirQueryKind, PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm,
-        PimdirQueryText, PimdirQueryTextField,
+    search::{
+        fold,
+        query::{
+            PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryDateUnit, PimdirQueryId,
+            PimdirQueryKind, PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm,
+            PimdirQueryText, PimdirQueryTextField,
+        },
     },
     sql::{self, search},
     summary::{file, time},
 };
 
-/// The SQL function folding a stored value as [`fold`] folds a query's,
-/// registered on every search connection.
-pub(crate) const FOLD: &str = "pimdir_fold";
-
-/// A value folded as STORAGE Annex A.2 folds `fn`: the Unicode default
-/// full lowercase mapping, locale-independent, then trimmed.
-pub(crate) fn fold(value: &str) -> String {
-    value.to_lowercase().trim().to_string()
-}
-
 /// The items each `linked:` term names, as `(kind, link id)` pairs per
 /// named id (STORAGE §14.2).
 pub(crate) type Ends = Vec<(PimdirQueryId, Vec<(String, String)>)>;
+
+/// The task categories each `category:` term names: its value folded as
+/// STORAGE Annex A.2 folds `fn`, and every value a task states that folds
+/// to it, as stated.
+pub(crate) type Categories = Vec<(String, Vec<String>)>;
 
 /// A compiled query: its common table expressions, the condition a live
 /// hit meets, the parameters both bind, and what an answer reports
@@ -61,14 +59,18 @@ pub(crate) struct Compiled {
     /// The items each `linked:` term names, as `(kind, link id)` pairs
     /// (STORAGE §14.2), resolved against the store by the caller.
     ends: Ends,
+    /// The task categories each `category:` term names, resolved against
+    /// the store by the caller.
+    categories: Categories,
     /// The instant relative dates resolve against, Unix seconds.
     now: i64,
 }
 
 impl Compiled {
     /// Compiles a query, `ends` holding the items each `linked:` term
+    /// names and `categories` the task categories each `category:` term
     /// names, its relative dates resolved against `now` (Unix seconds).
-    pub(crate) fn new(query: &PimdirQuery, ends: Ends, now: i64) -> Self {
+    pub(crate) fn new(query: &PimdirQuery, ends: Ends, categories: Categories, now: i64) -> Self {
         let undated: Vec<&str> = query
             .terms()
             .into_iter()
@@ -85,6 +87,7 @@ impl Compiled {
             params: Vec::new(),
             words: Vec::new(),
             ends,
+            categories,
             now,
         };
         compiled.condition = compiled.node(query, false, &undated);
@@ -358,18 +361,33 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             }
             PimdirQueryPredicate::Category(category) => {
                 // NOTE: both sides folded as STORAGE Annex A.2 folds `fn`,
-                // the stored side by the function the connection registers.
+                // in Rust: a task by the `task_category` values the caller
+                // found folding to the term's, compared as stated.
                 // NOTE: a card by the values its body's extraction recorded
-                // (SEARCH §6), contact_summary keeping none.
-                let folded = fold(category);
+                // (SEARCH §6), folded already, contact_summary keeping none.
+                let folded = fold::value(category);
+                let stated: Vec<String> = self
+                    .categories
+                    .iter()
+                    .find(|(term, _)| *term == folded)
+                    .map(|(_, values)| values.clone())
+                    .unwrap_or_default();
                 let carded =
                     self.embed(search::CATEGORISED, vec![(":value", folded.clone().into())]);
-                let category = self.bind(folded.into());
+                let stated = match stated.is_empty() {
+                    true => String::from("0"),
+                    false => {
+                        let values: Vec<String> = stated
+                            .into_iter()
+                            .map(|value| self.bind(value.into()))
+                            .collect();
+                        format!("s.value IN ({})", values.join(", "))
+                    }
+                };
                 format!(
-                    "SELECT i.collection, i.seq {live} AND (EXISTS (SELECT 1 FROM store.task_summary s \
-                         JOIN json_each(s.categories) j \
+                    "SELECT i.collection, i.seq {live} AND (EXISTS (SELECT 1 FROM store.task_category s \
                          WHERE s.collection = i.collection AND s.link_id = i.link_id \
-                         AND {FOLD}(j.value) = {category}) OR (i.collection, i.seq) IN ({carded}))"
+                         AND {stated}) OR (i.collection, i.seq) IN ({carded}))"
                 )
             }
             PimdirQueryPredicate::Account(account) => {
@@ -398,7 +416,16 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 );
                 let since = self.bind(since.into());
                 let until = self.bind(until.into());
-                let undated = self.bind(serde_json::to_string(undated).unwrap_or_default().into());
+                // NOTE: the undated kinds a `kind:` term names, each bound,
+                // `NULL` alone for none, which no kind equals.
+                let mut kinds = Vec::new();
+                for kind in undated {
+                    kinds.push(self.bind(kind.to_string().into()));
+                }
+                let undated = match kinds.is_empty() {
+                    true => String::from("NULL"),
+                    false => kinds.join(", "),
+                };
                 format!(
                     "SELECT i.collection, i.seq {live} AND ((c.kind = 'message/rfc822' \
                      OR (c.kind = 'text/calendar' AND i.object_hash IS NULL)) \
@@ -406,7 +433,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                      AND ({until} IS NULL OR i.sort_key < {until})) \
                      UNION SELECT collection, seq FROM ({occurring}) \
                      UNION SELECT i.collection, i.seq {live} \
-                     AND c.kind IN (SELECT value FROM json_each({undated}))"
+                     AND c.kind IN ({undated})"
                 )
             }
             PimdirQueryPredicate::Changed { since, until } => {
@@ -632,16 +659,18 @@ fn span(point: &PimdirQueryDate, now: i64) -> (i64, i64) {
     }
 }
 
-/// The FTS5 expression of a text term: the text as one escaped string, so
-/// the tokenizer reads its words as a phrase and nothing as syntax, a
-/// prefix starred, filtered to a column. `None` for a text holding no
-/// word, which matches nothing.
+/// The FTS5 expression of a text term: the text folded as the indexer
+/// folds it (SEARCH §5) and written as one escaped string, so the
+/// tokenizer reads its words as a phrase and nothing as syntax, a prefix
+/// starred, filtered to a column. `None` for a text holding no word,
+/// which matches nothing.
 fn fts(column: Option<&str>, text: &PimdirQueryText) -> Option<String> {
     if !text.text.chars().any(char::is_alphanumeric) {
         return None;
     }
 
-    let mut expression = format!("\"{}\"", text.text.replace('"', "\"\""));
+    let folded = fold::text(&text.text);
+    let mut expression = format!("\"{}\"", folded.replace('"', "\"\""));
     if text.prefix {
         expression += " *";
     }
@@ -677,12 +706,6 @@ mod tests {
         search::query::{PimdirQueryPredicate, PimdirQueryTerm},
         summary::time,
     };
-
-    #[test]
-    fn a_category_folds_by_the_full_unicode_lowercase_mapping() {
-        assert_eq!(fold(" ÉCOLE "), "école");
-        assert_eq!(fold("İ"), "i\u{307}");
-    }
 
     fn bounds_of(value: &str, now: i64) -> (Option<String>, Option<String>) {
         match PimdirQuery::parse(&format!("date:{value}")).unwrap() {

@@ -29,7 +29,7 @@ use std::{collections::BTreeMap, io::Read};
 use rusqlite::{Connection, OptionalExtension, named_params};
 
 use crate::{
-    client::{PimdirError, blobs::PimdirBlobs, write::kind_of},
+    client::{PimdirError, bind_list, blobs::PimdirBlobs, write::kind_of},
     hub::PimdirHub,
     object::PimdirHash,
     placement::PimdirLinkId,
@@ -109,21 +109,15 @@ pub(crate) fn gaining(
     // NOTE: lookup_objects answers the bodies a link id already has in
     // the account, which is what a move, a copy or a second label carry;
     // a writer-derived key never matches, so its body is always read.
-    let links: Vec<&str> = bodies.iter().map(|(link, _)| link.as_str()).collect();
+    bind_list(conn, "links", bodies.iter().map(|(link, _)| link.as_str()))?;
     let mut stmt = conn.prepare(sql::LOOKUP_OBJECTS)?;
     let held: BTreeMap<(String, String), i64> = stmt
-        .query_map(
-            named_params! {
-                ":links": serde_json::to_string(&links)?,
-                ":account": account.as_deref(),
-            },
-            |row| {
-                Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )?
+        .query_map(named_params! { ":account": account.as_deref() }, |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, i64>(2)?,
+            ))
+        })?
         .collect::<Result<_, _>>()?;
 
     let mut entering = Vec::new();
@@ -403,7 +397,7 @@ pub(crate) fn insert_file(
             ":collection": collection,
             ":link_id": link.as_str(),
             ":seq": seq,
-            ":flags": "[]",
+            ":flags_known": 1,
             ":object_hash": None::<String>,
             ":sort_key": summary.sort_key().0,
             ":level": 1,

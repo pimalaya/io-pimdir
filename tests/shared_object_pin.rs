@@ -8,6 +8,8 @@
 //! binding agrees with another. An earlier draft left it unpinned, and a
 //! collector could sweep the very ancestor a later merge needed.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::client::{PimdirSourceStore, PimdirStore};

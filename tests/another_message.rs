@@ -3,6 +3,8 @@
 //! §9): another message reusing the identifier is minted apart, whatever
 //! listing named it, so the held item's body never stands for both.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::PimdirWriteOp,
     client::{PimdirSourceStore, PimdirStore},

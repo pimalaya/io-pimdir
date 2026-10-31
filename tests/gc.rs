@@ -6,6 +6,8 @@
 //! refcount-zero objects would destroy the body the second batch was
 //! going to reference, silently and bytes included.
 
+#![cfg(feature = "client")]
+
 use std::fs;
 
 use io_pimdir::{

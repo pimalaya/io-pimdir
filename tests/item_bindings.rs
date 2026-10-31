@@ -7,6 +7,8 @@
 //! placement diverged, has nowhere else to look, which is what
 //! `PimdirReader::item_bindings` answers.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::PimdirWriteOp,
     collection::PimdirCollectionId,

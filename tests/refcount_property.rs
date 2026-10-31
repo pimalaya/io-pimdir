@@ -18,6 +18,8 @@
 //! Asserting one direction alone passes on a collector that takes
 //! everything, or on one that takes nothing.
 
+#![cfg(feature = "client")]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},

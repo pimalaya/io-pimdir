@@ -12,6 +12,8 @@
 //! one of them an `add` pinning its body; the 0.8.0 one an invitation
 //! reference too.
 
+#![cfg(feature = "client")]
+
 use std::{fs, path::Path};
 
 use io_pimdir::{
@@ -118,13 +120,16 @@ fn released_store_opens_whole(name: &str, receipts: i64, references: i64) {
     );
     assert_eq!(count(&conn, "PRAGMA user_version"), io_pimdir::sql::VERSION);
     let organised: (Option<i64>, Option<String>) = conn
-        .query_row("SELECT priority, categories FROM task_summary", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT priority, (SELECT group_concat(value, ',') FROM (SELECT value \
+             FROM task_category ORDER BY position)) FROM task_summary",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
     assert_eq!(
         organised,
-        (Some(1), Some(r#"["work","home"]"#.into())),
+        (Some(1), Some("work,home".into())),
         "{name}: the task organisation re-derived from the held body"
     );
     assert_eq!(

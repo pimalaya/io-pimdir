@@ -20,9 +20,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: io-pimdir
+      # At the tag the crate claims, so a later spec edit cannot turn a
+      # released crate red: storage-draft-07, sync-draft-06 and
+      # search-draft-07 name one commit. Move it with spec/.
       - uses: actions/checkout@v4
         with:
           repository: pimalaya/pimdir
+          ref: storage-draft-07
           path: pimdir
       # The system link, the one Nix builds and consumers turning `vendored`
       # off take, needs the library before anything compiles.

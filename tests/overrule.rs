@@ -4,6 +4,8 @@
 //! nothing, until the upgrade fetches it. The binding-level case is vector
 //! 101.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::PimdirWriteOp,
     client::{PimdirRunError, PimdirStore},

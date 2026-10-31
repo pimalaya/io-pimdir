@@ -1,7 +1,10 @@
 //! A store whose `task_summary` predates the task columns (`priority`,
-//! `categories`, `parent`, `mid`), as an owner at io-pimdir 3b4bed8 writes
-//! and reconciles it, is read with those columns `NULL` (STORAGE §6): a
-//! reader never fails a listing on a column the owner has not added yet.
+//! `parent`, `mid`) and holds no `task_category`, as an owner at io-pimdir
+//! 3b4bed8 writes and reconciles it, is read with those columns `NULL` and
+//! no categories (STORAGE §6): a reader never fails a listing on a column
+//! the owner has not added yet.
+
+#![cfg(feature = "client")]
 
 use io_pimdir::{
     client::{PimdirStore, reader::PimdirReader},
@@ -56,6 +59,7 @@ fn older_store() -> (tempfile::TempDir, i64, i64) {
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys = OFF;
+         DROP TABLE task_category;
          DROP INDEX task_summary_by_parent;
          DROP INDEX task_summary_by_mid;
          ALTER TABLE task_summary RENAME TO task_summary_aside;

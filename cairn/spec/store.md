@@ -1193,3 +1193,33 @@ An owner SHALL re-derive, from every held task body, `task_summary.created` and 
 - GIVEN a store holding a task with `CREATED` and a `CONTACT`, its `task_summary` of the storage-draft-05 shape, no `contact` row, derivation 1
 - WHEN a reader reads it, then the owner opens it
 - THEN the reader reads the capture `NULL` and no contact; after the open `created` and the `contact` row are filled, the item stamped and `store_meta.derivation` is 2, and a second open writes nothing (tests/task_capture.rs; tests/store_version.rs reads derivation 2 after each released store's open)
+
+### Requirement: Flags are rows, read as a set
+A placement's flags and a binding's base flags SHALL be rows (`placement_flag`, `binding_base_flag`, pimdir STORAGE §4.3, §13, storage-draft-07), the set marked known by `items.flags_known` and `bindings.base_flags_known`, written after their row by `retain_flags` and `add_flags` and their base twins, and read back as one text joined by spaces, `''` known and empty, `NULL` unknown, so every read keeps its columns; a set written again as it was SHALL draw no stamp. A flag the store cannot hold, empty or holding a space, a control or a non-ASCII character, SHALL be refused as `PimdirError::Flag` (`flag-invalid`) by a producer's enqueue and by an owner's write before anything is written, and SHALL park a queued row another producer wrote, never trimmed (`codec::is_flag`, `PimdirFlags::invalid`).
+
+#### Scenario: A set and a flag the store refuses
+- tests/flag_rows.rs `a_set_reads_back_whole_and_a_restatement_stamps_nothing`, `a_flag_the_store_cannot_hold_is_refused_at_the_write`, `a_flag_the_store_cannot_hold_is_refused_at_the_enqueue_and_parked_by_the_drain`
+
+### Requirement: A message's In-Reply-To ids and a task's categories are rows
+`mail_in_reply_to` and `task_category` SHALL hold a message's `In-Reply-To` ids and a task's categories, each `(collection, link_id, position)` under its summary row (STORAGE §4.3, Annex A.1, A.4), written by `replace_in_reply_to`, `insert_in_reply_to`, `replace_categories` and `insert_category` and read per page by `load_in_reply_to` and `load_categories` as the addresses are, the public summary types keeping their `Vec` fields.
+
+### Requirement: A list parameter is bound through temp.param
+Every statement taking a list SHALL read it from `temp.param(slot, position, value)` (STORAGE §4.4), which `create_param` makes on every connection the crate opens and `clear_param` and `bind_param` fill inside the statement's transaction; an optional list takes `:scoped`. The canonical text calls no JSON function.
+
+### Requirement: A queued action's target is a column a rename follows
+`queue.target_collection` SHALL hold the target a move, a copy or a superseding add names (STORAGE §4.3, §15.3), written by `enqueue_action` from `PimdirAction::target_collection`, read by the queue loads in place of the payload's, which keeps the id it was enqueued with, and followed by `rename_queue_targets`. A row whose target is `NULL`, from a producer predating the column, SHALL be read from its payload, and parks on a renamed id rather than land elsewhere.
+
+#### Scenario: A rename behind a pending move
+- tests/earlier_lists.rs `a_draft_06_store_keeps_its_lists_through_the_reconciliation`: a rename after the reconciliation follows the queued move's target; pimdir checks/invariants.sh `queue: a rename follows into a pending move`
+
+### Requirement: A store of another shape is refused
+Every profile SHALL refuse a store whose `store_meta.shape` is not `pimdir`, the canonical shape, as `PimdirError::Shape` (`store-shape`), naming it and reading, reconciling and writing nothing (STORAGE §4.1, §6 step 2); a store lacking the column is of the canonical shape.
+
+#### Scenario: Another shape
+- tests/store_shape.rs `a_store_of_another_shape_is_refused_by_every_profile`
+
+### Requirement: A storage-draft-06 store is reconciled with its lists
+The owner's reconciliation of a store storage-draft-06 wrote SHALL read its four JSON arrays (`items.flags`, `bindings.base_flags`, `mail_summary.in_reply_to`, `task_summary.categories`) before the rebuild, by text of its own, and write them after it in the same transaction: a known set marked known (`backfill_flags_known`, `backfill_base_flags_known`) then its rows, the ids and the categories in their order, a `NULL` set staying unknown. A rebuilt queue SHALL take each row's target from its payload (`backfill_target_collection`). A flag the earlier draft held that §13 refuses SHALL refuse the reconciliation, naming it, the store left as it was. A reader of an unreconciled store reads a list table it lacks as answering none.
+
+#### Scenario: A draft-06 store
+- tests/earlier_lists.rs `a_draft_06_store_keeps_its_lists_through_the_reconciliation`, `a_draft_06_flag_the_store_cannot_hold_refuses_the_reconciliation`

@@ -2,6 +2,8 @@
 //! `list_replied`): a waiting task's source mail answered (pimdir GUIDE.md
 //! §17), the person's own replies aside.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::PimdirWriteOp,
     client::{PimdirStore, reader::PimdirReader},

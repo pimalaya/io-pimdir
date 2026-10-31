@@ -3,6 +3,8 @@
 //! refcount pinning of queued bodies, generation bumps, and the refusal
 //! of a store stamped with an unserviced schema version.
 
+#![cfg(feature = "client")]
+
 use std::{fs, path::Path, sync::mpsc, thread, time::Duration};
 
 use io_pimdir::{

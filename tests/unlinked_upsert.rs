@@ -7,6 +7,8 @@
 //! would hand the engine two placements for one handle, which is where
 //! a spurious `dup:` key comes from.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::client::{PimdirError, PimdirSourceStore, PimdirStore};
 use io_pimdir::{
     change::PimdirWriteOp,

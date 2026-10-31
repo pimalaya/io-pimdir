@@ -14,6 +14,8 @@
 //! absorb that would file the conflict and the edit that settles it are
 //! different runs.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::PimdirWriteOp,
     collection::PimdirCollectionId,

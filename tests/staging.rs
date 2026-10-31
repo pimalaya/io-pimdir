@@ -3,6 +3,8 @@
 //! create naming a link id the collection holds or has queued is refused
 //! before anything is appended.
 
+#![cfg(feature = "client")]
+
 use std::{io::Write, path::Path};
 
 use io_pimdir::{

@@ -27,10 +27,11 @@ use crate::{
     capability::{COLLECTION_CREATE, PimdirPartial, PimdirSourceCapabilities},
     change::PimdirWriteOp,
     client::{
-        PimdirDuplicate, PimdirError, PimdirSourceStore,
+        PimdirDuplicate, PimdirError, PimdirSourceStore, bind_list,
         blobs::{PimdirBlobStage, PimdirBlobWriter, PimdirBlobs},
         busy_or_sql, capability,
         lock::PimdirLock,
+        prepare_connection,
         reader::{PimdirItem, item_from_row},
         record_receipt, rows, schema, write,
     },
@@ -116,7 +117,7 @@ impl PimdirProducer {
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+        prepare_connection(&conn)?;
         // NOTE: the journal mode is the owner's, chosen when it created the
         // store (§8): a producer writes no database header.
         schema::check_version(&conn)?;
@@ -358,6 +359,13 @@ impl PimdirProducer {
         body: Option<&[u8]>,
         fresh: Option<&PimdirLinkId>,
     ) -> Result<PimdirEnqueued, PimdirError> {
+        // NOTE: a set the store cannot hold is refused before the gate,
+        // never queued for the drain to park (STORAGE §13).
+        if let PimdirAction::Add { flags, .. } | PimdirAction::SetFlags { flags, .. } = action
+            && let Some(flag) = flags.invalid()
+        {
+            return Err(PimdirError::Flag(flag.into()));
+        }
         let partial = capability::gate(&self.conn, &self.blobs, collection, action, body)?;
         let hash = action.object_hash().cloned();
         // NOTE: before the transaction, so waiting out a collector never
@@ -405,6 +413,7 @@ impl PimdirProducer {
                 ":collection": collection,
                 ":action": action.kind(),
                 ":payload": codec::action_to_payload(action),
+                ":target_collection": action.target_collection().map(|to| to.0.as_str()),
                 ":object_hash": hash.as_ref().map(|h| h.0.as_str()),
             },
         )?;
@@ -548,8 +557,8 @@ pub(crate) fn action_status(conn: &Connection, id: i64) -> Result<PimdirActionSt
                 Ok((
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             },
         )
@@ -688,19 +697,33 @@ struct PimdirQueueRow {
     collection: String,
     action: String,
     payload: String,
+    /// The collection a move, a copy or a superseding add targets, which
+    /// the owner reads in place of the payload's (§15.3).
+    target_collection: Option<String>,
     object_hash: Option<String>,
     attempts: i64,
 }
 
 impl PimdirQueueRow {
-    /// The row with its payload decoded.
+    /// The row's action, its payload decoded and its target read from
+    /// `target_collection` where the row holds one (§15.3): a rename
+    /// followed the column, never the payload.
+    fn action(&self) -> Result<PimdirAction, PimdirActionError> {
+        let mut action = codec::action_from_payload(&self.action, &self.payload)?;
+        if let Some(target) = &self.target_collection {
+            action.retarget(PimdirCollectionId(target.clone()));
+        }
+        Ok(action)
+    }
+
+    /// The row with its action decoded.
     fn decode(&self) -> Result<PimdirPendingAction, PimdirActionError> {
         Ok(PimdirPendingAction {
             id: self.id,
             created_at: self.created_at.clone(),
             producer: self.producer.clone(),
             collection: self.collection.clone(),
-            action: codec::action_from_payload(&self.action, &self.payload)?,
+            action: self.action()?,
             attempts: self.attempts,
         })
     }
@@ -726,8 +749,9 @@ fn pending_rows(
                     collection: collection.to_string(),
                     action: r.get(3)?,
                     payload: r.get(4)?,
-                    object_hash: r.get(5)?,
-                    attempts: r.get(6)?,
+                    target_collection: r.get(5)?,
+                    object_hash: r.get(6)?,
+                    attempts: r.get(7)?,
                 })
             },
         )?),
@@ -743,8 +767,9 @@ fn pending_rows(
                     collection: r.get(3)?,
                     action: r.get(4)?,
                     payload: r.get(5)?,
-                    object_hash: r.get(6)?,
-                    attempts: r.get(7)?,
+                    target_collection: r.get(6)?,
+                    object_hash: r.get(7)?,
+                    attempts: r.get(8)?,
                 })
             },
         )?),
@@ -832,7 +857,7 @@ impl PimdirSourceStore {
 
         let mut report = PimdirDrainReport::default();
         for row in pending {
-            let action = match codec::action_from_payload(&row.action, &row.payload) {
+            let action = match row.action() {
                 Ok(action) => action,
                 // NOTE: a version this owner does not know is a later
                 // producer's, skipped as an unknown kind is (§15.2); one
@@ -1288,13 +1313,11 @@ fn stage_action(
     let (source, handle) = match handle {
         Some(handle) => (source.clone(), PimdirHandle(handle)),
         None => {
+            bind_list(tx, "links", [&item.link_id.0])?;
             let bound = tx
                 .query_row(
                     sql::LOAD_BINDINGS_BY_LINK,
-                    named_params! {
-                        ":collection": collection,
-                        ":links": serde_json::to_string(&[&item.link_id.0])?,
-                    },
+                    named_params! { ":collection": collection },
                     |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
                 )
                 .optional()?;

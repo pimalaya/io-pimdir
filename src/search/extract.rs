@@ -28,8 +28,7 @@ use mail_parser::{
 use vcard::{tree::cst::VcardCst, value::VcardValue};
 
 use crate::{
-    client::search::compile,
-    search::chunk,
+    search::{chunk, fold},
     summary::{
         PimdirAddress, PimdirAddressRole, PimdirSummary,
         mail::{MIME_DEPTH_MAX, attachments},
@@ -219,7 +218,7 @@ impl PimdirExtract {
                 "PHOTO" => extract.photo = true,
                 "CATEGORIES" => {
                     for value in vcard_values(&prop.value) {
-                        let folded = compile::fold(&value);
+                        let folded = fold::value(&value);
                         if !folded.is_empty() && !extract.categories.contains(&folded) {
                             extract.categories.push(folded);
                         }

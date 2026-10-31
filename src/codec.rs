@@ -7,10 +7,7 @@
 
 use core::fmt;
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::string::{String, ToString};
 
 use serde_json::{Map, Value, json};
 
@@ -21,34 +18,27 @@ use crate::{
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
 };
 
-/// A flag set as its canonical JSON array, or `None` for the column's
-/// `NULL`: a known-empty set is `"[]"`, a set nobody has read is `NULL`.
-pub fn flags_to_json(flags: &PimdirFlags) -> Option<String> {
-    let items: Vec<&String> = flags.known()?.iter().collect();
-    Some(serde_json::to_string(&items).unwrap_or_else(|_| String::from("[]")))
-}
-
-/// The inverse of [`flags_to_json`]: `NULL` and a column this cannot read
-/// both decode to the unknown set, which holds no opinion in a merge.
-pub fn flags_from_json(json: Option<&str>) -> PimdirFlags {
-    let Some(json) = json else {
+/// A flag set as a read statement answers it (STORAGE §4.4, §13): the
+/// flags joined by single spaces in no order, `''` the known-empty set and
+/// `NULL` the unknown one, which holds no opinion in a merge.
+pub fn flags_from_column(joined: Option<&str>) -> PimdirFlags {
+    let Some(joined) = joined else {
         return PimdirFlags::Unknown;
     };
-    match serde_json::from_str::<Vec<String>>(json) {
-        Ok(items) => PimdirFlags::Known(items.into_iter().collect()),
-        Err(_) => PimdirFlags::Unknown,
-    }
+    PimdirFlags::Known(
+        joined
+            .split(' ')
+            .filter(|flag| !flag.is_empty())
+            .map(String::from)
+            .collect(),
+    )
 }
 
-/// A list of ids, or of values, as the JSON array columns `in_reply_to` and
-/// `categories` hold.
-pub fn ids_to_json(ids: &[String]) -> String {
-    serde_json::to_string(ids).unwrap_or_else(|_| String::from("[]"))
-}
-
-/// The inverse of [`ids_to_json`]; an unreadable column is an empty list.
-pub fn ids_from_json(json: &str) -> Vec<String> {
-    serde_json::from_str(json).unwrap_or_default()
+/// Whether the store holds `flag` (STORAGE §13): non-empty and printable
+/// ASCII without a space, as IMAP flags and JMAP keywords are. A set
+/// holding another is refused before it is written.
+pub fn is_flag(flag: &str) -> bool {
+    !flag.is_empty() && flag.bytes().all(|byte| matches!(byte, b'!'..=b'~'))
 }
 
 /// The detail ladder as its column integer.
@@ -190,6 +180,35 @@ impl PimdirAction {
             Self::Update { .. } => "update",
             Self::SetPerformer { .. } => "set-performer",
             Self::Unknown { kind, .. } => kind,
+        }
+    }
+
+    /// The collection the action names beside its own (§15.3), which the
+    /// producer writes as `queue.target_collection`: a `move` or a
+    /// `copy`'s `to`, a superseding `add`'s `supersedes.collection`, `None`
+    /// for any other action.
+    pub fn target_collection(&self) -> Option<&PimdirCollectionId> {
+        match self {
+            Self::Move { to, .. } | Self::Copy { to, .. } => Some(to),
+            Self::Add {
+                supersedes: Some(supersedes),
+                ..
+            } => Some(&supersedes.collection),
+            _ => None,
+        }
+    }
+
+    /// Points the action at `target`, the `queue.target_collection` a
+    /// rename followed (§14): the owner reads it in place of the payload's
+    /// own. An action naming no collection beside its own is left as it is.
+    pub fn retarget(&mut self, target: PimdirCollectionId) {
+        match self {
+            Self::Move { to, .. } | Self::Copy { to, .. } => *to = target,
+            Self::Add {
+                supersedes: Some(supersedes),
+                ..
+            } => supersedes.collection = target,
+            _ => {}
         }
     }
 
@@ -435,25 +454,55 @@ fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
 
     #[test]
-    fn a_flag_set_round_trips_and_keeps_its_two_absences_apart() {
-        let flags = PimdirFlags::from_iter(["\\Seen", "$flagged", "a\"b"]);
-        let json = flags_to_json(&flags).expect("a known set encodes");
-        assert_eq!(flags_from_json(Some(&json)), flags);
-        assert!(json.contains("\\\\Seen"));
-
-        assert_eq!(flags_to_json(&PimdirFlags::Unknown), None);
-        assert_eq!(flags_from_json(None), PimdirFlags::Unknown);
+    fn a_joined_flag_set_reads_in_no_order_and_keeps_its_two_absences_apart() {
         assert_eq!(
-            flags_to_json(&PimdirFlags::default()).as_deref(),
-            Some("[]")
+            flags_from_column(Some("$flagged \\Seen")),
+            flags_from_column(Some("\\Seen $flagged")),
         );
-        assert_eq!(flags_from_json(Some("[]")), PimdirFlags::default());
-        assert_eq!(flags_from_json(Some("not json")), PimdirFlags::Unknown);
+        assert!(flags_from_column(Some("$flagged \\Seen")).contains("\\Seen"));
+        assert_eq!(flags_from_column(Some("")), PimdirFlags::default());
+        assert_eq!(flags_from_column(None), PimdirFlags::Unknown);
+    }
+
+    #[test]
+    fn a_flag_is_printable_ascii_without_a_space() {
+        for flag in ["\\Seen", "$label", "a\"b", "!", "~"] {
+            assert!(is_flag(flag), "{flag:?}");
+        }
+        for flag in ["", "two words", "tab\t", "\u{7f}", "café", "\n"] {
+            assert!(!is_flag(flag), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn a_move_a_copy_and_a_superseding_add_carry_their_target() {
+        let to = PimdirCollectionId("Archive".into());
+        let mut moved = PimdirAction::Move {
+            seq: 1,
+            to: PimdirCollectionId("Old".into()),
+        };
+        moved.retarget(to.clone());
+        assert_eq!(moved.target_collection(), Some(&to));
+
+        let mut added = PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: None,
+            supersedes: Some(PimdirSupersedes {
+                collection: PimdirCollectionId("Old".into()),
+                seq: 2,
+            }),
+        };
+        added.retarget(to.clone());
+        assert_eq!(added.target_collection(), Some(&to));
+
+        let mut removed = PimdirAction::Remove { seq: 3 };
+        removed.retarget(to);
+        assert_eq!(removed.target_collection(), None);
+        assert_eq!(removed, PimdirAction::Remove { seq: 3 });
     }
 
     #[test]
@@ -469,10 +518,6 @@ mod tests {
         ] {
             assert_eq!(conflict_from_str(conflict_to_str(policy)), policy);
         }
-        assert_eq!(
-            ids_from_json(&ids_to_json(&["a".into(), "b".into()])),
-            vec!["a", "b"]
-        );
     }
 
     #[test]

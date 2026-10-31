@@ -98,13 +98,14 @@ DELETE_DANGLING_BINDINGS = r#"DELETE FROM bindings WHERE NOT EXISTS (
   WHERE i.collection = bindings.collection AND i.link_id = bindings.link_id);"#;
 
 /// The live items holding no body per collection kind, over the collections
-/// of a JSON array: the canonical search `coverage` narrowed to a scope
-/// (SEARCH §8.2), which the store's own reads answer too. Files are read
-/// from their summary alone, so a bodiless one hides nothing.
+/// of the `collections` slot (STORAGE §4.4): the canonical search `coverage`
+/// narrowed to a scope (SEARCH §8.2), which the store's own reads answer
+/// too. Files are read from their summary alone, so a bodiless one hides
+/// nothing.
 COUNT_BODILESS = r#"SELECT c.kind, count(*) FROM items i JOIN collections c ON c.id = i.collection
 WHERE i.object_hash IS NULL AND i.deleted = 0 AND i.retained_at IS NULL
   AND c.kind <> 'application/octet-stream'
-  AND i.collection IN (SELECT value FROM json_each(:collections))
+  AND i.collection IN (SELECT value FROM temp.param WHERE slot = 'collections')
 GROUP BY c.kind;"#;
 }
 

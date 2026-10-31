@@ -4,6 +4,8 @@
 //! reader lists with the collection, the owner collects below a date,
 //! and the mail readers count, page and search across collections.
 
+#![cfg(feature = "client")]
+
 use std::collections::BTreeMap;
 
 use io_pimdir::{
@@ -1064,6 +1066,18 @@ fn a_page_across_collections_walks_the_global_order() {
     drop(store);
 
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch(io_pimdir::sql::CREATE_PARAM).unwrap();
+    for (position, collection) in ["INBOX", "Archive"].into_iter().enumerate() {
+        conn.execute(
+            io_pimdir::sql::BIND_PARAM,
+            rusqlite::named_params! {
+                ":slot": "collections",
+                ":position": position as i64,
+                ":value": collection,
+            },
+        )
+        .unwrap();
+    }
     for (name, statement) in [
         (
             "list_mail_page_filtered",
@@ -1074,10 +1088,7 @@ fn a_page_across_collections_walks_the_global_order() {
         let mut plan = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
             .unwrap();
-        for (parameter, value) in [
-            (":collections", r#"["INBOX","Archive"]"#),
-            (":pattern", "%a%"),
-        ] {
+        for (parameter, value) in [(":pattern", "%a%")] {
             if let Some(index) = plan.parameter_index(parameter).unwrap() {
                 plan.raw_bind_parameter(index, value).unwrap();
             }

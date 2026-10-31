@@ -18,6 +18,8 @@
 //! The spec is a sibling checkout, so the comparisons skip when it is
 //! absent and run whenever the two sit side by side.
 
+#![cfg(feature = "client")]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -42,6 +44,9 @@ fn applied(ddl: &str) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(ddl)
         .expect("the schema applies to an empty database");
+    // NOTE: the list parameters' table, per connection (STORAGE §4.4).
+    conn.execute_batch(sql::CREATE_PARAM)
+        .expect("the list parameters' table creates");
     conn
 }
 
@@ -211,6 +216,7 @@ fn index(store: &str, index: &str) -> (tempfile::TempDir, Connection) {
         [path("pimdir.db").to_str().unwrap()],
     )
     .unwrap();
+    conn.execute_batch(sql::CREATE_PARAM).unwrap();
     (dir, conn)
 }
 

@@ -6,6 +6,8 @@
 //! is the store: a name invented to satisfy a constructor is a side that
 //! never synced anything, one write away from being recorded as one.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
     collection::PimdirCollectionId,

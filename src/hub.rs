@@ -1836,8 +1836,9 @@ mod tests {
 
     /// Flags carry the same unknown state a sort key does, and the same rule.
     ///
-    /// Per pimdir STORAGE §13 the store's `flags` column is `NULL` until
-    /// something reads them, distinct from a known-empty `'[]'`.
+    /// Per pimdir STORAGE §13 a placement's flag set is unknown
+    /// (`flags_known` 0) until something reads it, distinct from a
+    /// known-empty one.
     mod flags_tests {
 
         use crate::{

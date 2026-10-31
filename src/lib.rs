@@ -51,10 +51,13 @@
 //!
 //! [`search`](mod@search) holds what a search answers about what it
 //! could not see, which the store's own reads answer too, and behind the
-//! `search` feature the query language of SEARCH.md parsed to an AST and
-//! the chunk boundaries of an indexed body. The index itself, index.db
-//! beside the store and its refresh from the change feed, is
-//! `client::search` (feature `search`).
+//! `search` feature everything the index derives without a database: the
+//! query language of SEARCH.md parsed to an AST, the text folds, a body's
+//! text by field and its chunks, calendar occurrences, and the refresh
+//! folding the change feed into the index as an I/O-free coroutine
+//! yielding typed reads and writes. The index over SQLite, index.db beside
+//! the store, is `client::search` (features `client` and `search`), which
+//! answers that coroutine through the canonical statements.
 //!
 //! ## Conventions
 //!

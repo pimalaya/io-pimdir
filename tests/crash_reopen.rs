@@ -19,6 +19,8 @@
 //! separates them is how long the writer lock is held, which is not a
 //! state a store can be read for.
 
+#![cfg(feature = "client")]
+
 use std::{io::Write, path::Path};
 
 use io_pimdir::{

@@ -12,6 +12,10 @@
 //! held elsewhere is reported, never waited out. The index is derived:
 //! dropping index.db loses nothing.
 //!
+//! The refresh is [`PimdirIndexRefresh`], the I/O-free coroutine an owner
+//! holding its own database runs too, answered here through the canonical
+//! statements one transaction per run.
+//!
 //! A refresh also keeps calendar time: every occurrence of a calendar
 //! item within the horizon around its `now`, re-expanded as the horizon
 //! rolls or the time zone database moves (SEARCH §7).
@@ -21,10 +25,8 @@
 //! [`refresh`](PimdirIndex::refresh) whenever the store moves.
 
 mod compile;
-pub mod extract;
-mod occurrence;
-pub mod tag;
-mod thread;
+mod refresh;
+mod tag;
 
 use alloc::{
     borrow::Cow,
@@ -45,32 +47,32 @@ use std::{
 use fs4::FileExt;
 use log::{debug, trace};
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
-    functions::FunctionFlags, named_params, params_from_iter,
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params, params_from_iter,
 };
 
 use crate::{
     client::{
-        PimdirError, busy_or_sql,
+        PimdirError, bind_list, busy_or_sql, prepare_connection,
         reader::PimdirReader,
         rows, schema,
         schema::StoreShape,
         search::{
-            compile::{Compiled, Ends},
-            extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
-            occurrence::Horizon,
+            compile::{Categories, Compiled, Ends},
+            refresh::Statements,
         },
-        write::tables_of,
     },
     codec,
+    coroutine::PimdirCoroutineState,
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
     search::{
         coverage::PimdirSearchCoverage,
+        extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
+        fold,
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
+        refresh::PimdirIndexRefresh,
     },
-    sql::{self, search},
-    summary::{PimdirAddress, PimdirAddressRole, file},
+    sql::search,
 };
 
 /// The file a refresh locks exclusively (SEARCH §3).
@@ -366,20 +368,6 @@ struct Found {
     matched: Option<String>,
 }
 
-/// One row of the change feed as `load_changed_items` answers it.
-struct FeedRow {
-    collection: String,
-    link_id: String,
-    seq: i64,
-    object: Option<String>,
-    flags: PimdirFlags,
-    gone: bool,
-    kind: String,
-    /// The stamp the row took, which a batch records as the cursor it
-    /// reached (SEARCH §4).
-    changed: i64,
-}
-
 impl PimdirIndex {
     /// Opens the index of the store rooted at `dir`, creating index.db
     /// when absent and rebuilding it when its version, tokenizer or shape is
@@ -503,14 +491,16 @@ impl PimdirIndex {
     /// transactions of at most `options.batch` rows, until the feed is
     /// exhausted or the deadline passes.
     ///
-    /// Each transaction writes the cursor it reached, so a pass cut short
-    /// resumes there; the one exhausting the feed also reconciles keys
-    /// when the store's purge count or a collection stamp moved, meets
-    /// again the bodies an earlier pass could not read, and writes the
-    /// cursor read before the pass, so a crash replays and skips nothing.
-    /// Another indexer holding index.lock makes this one return at once,
-    /// [`busy`](PimdirIndexReport::busy). A handle opened by
-    /// [`open_query`](Self::open_query) refreshes nothing:
+    /// Each transaction is one run of [`PimdirIndexRefresh`], its yields
+    /// answered and its ops written through the canonical statements, so
+    /// this index and one an owner keeps on its own SQLite fold alike. Each
+    /// writes the cursor it reached, so a pass cut short resumes there; the
+    /// one exhausting the feed also reconciles keys when the store's purge
+    /// count or a collection stamp moved, meets again the bodies an earlier
+    /// pass could not read, and writes the cursor read before it, so a
+    /// crash replays and skips nothing. Another indexer holding index.lock
+    /// makes this one return at once, [`busy`](PimdirIndexReport::busy). A
+    /// handle opened by [`open_query`](Self::open_query) refreshes nothing:
     /// [`PimdirError::IndexQueryOnly`].
     ///
     /// An owner keeping an index calls it after each write batch it
@@ -528,8 +518,7 @@ impl PimdirIndex {
             cursor: self.cursor()?,
             ..Default::default()
         };
-        let head = self.reader.change_cursor()?;
-        report.head = head.changed;
+        report.head = self.reader.change_cursor()?.changed;
 
         let Some(_lock) = lock(&self.dir)? else {
             debug!("another indexer holds {LOCK}, skipping the refresh");
@@ -538,26 +527,12 @@ impl PimdirIndex {
         };
         debug!(
             "refreshing search index from stamp {} to {}",
-            report.cursor, head.changed
+            report.cursor, report.head
         );
 
-        // NOTE: the stamp of the last completed pass, which no batch
-        // advances: the cursor a deadline-cut pass left may already be past
-        // a rename's stamp (SEARCH §4).
-        let (purges, reconciled): (i64, i64) =
-            self.conn
-                .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(3)?, r.get(7)?)))?;
         let batch = options.batch.max(1);
         let blobs = self.reader.blobs();
         let now = options.now.unwrap_or_else(unix_now);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
-        let shape = self.shape;
-        let horizon = occurrence::roll(&tx, &blobs, shape, now, &mut report)?;
-        tx.commit().map_err(busy_or_sql)?;
-
         loop {
             if options
                 .deadline
@@ -571,65 +546,33 @@ impl PimdirIndex {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(busy_or_sql)?;
-            let changed = feed(
-                &tx,
-                &shape.sql(&tx, search::LOAD_CHANGED_ITEMS)?,
-                named_params! { ":since": report.cursor, ":limit": batch as i64 },
-            )?;
-            let end = changed.last().map(|row| row.changed);
-            trace!("folding {} feed rows", changed.len());
-
-            let mut touched = BTreeSet::new();
-            for row in &changed {
-                fold(&tx, &blobs, shape, &horizon, row, &mut report, &mut touched)?;
-            }
-            report.folded += changed.len() as u64;
-
-            if changed.len() == batch {
-                thread::relink(&tx, &blobs, shape, &touched)?;
-                report.cursor = end.unwrap_or(report.cursor);
-                tx.execute(
-                    search::SET_INDEX_CURSOR,
-                    named_params! {
-                        ":store_change": report.cursor,
-                        ":store_purges": purges,
-                        ":store_reconciled": reconciled,
-                    },
-                )?;
-                tx.commit().map_err(busy_or_sql)?;
-                continue;
-            }
-
-            let moved: bool = tx.query_row(
-                &shape.sql(&tx, search::COLLECTIONS_MOVED)?,
-                named_params! { ":since": reconciled },
-                |r| r.get(0),
-            )?;
-            if head.purges != purges || moved {
-                reconcile(&tx, shape, &mut report, &mut touched)?;
-            }
-
-            let unread = feed(
-                &tx,
-                &shape.sql(&tx, search::LOAD_UNREAD_BODIES)?,
-                named_params! { ":limit": batch as i64 },
-            )?;
-            for row in &unread {
-                fold(&tx, &blobs, shape, &horizon, row, &mut report, &mut touched)?;
-            }
-            thread::relink(&tx, &blobs, shape, &touched)?;
-
-            report.cursor = end.unwrap_or(report.cursor).max(head.changed);
-            tx.execute(
-                search::SET_INDEX_CURSOR,
-                named_params! {
-                    ":store_change": report.cursor,
-                    ":store_purges": head.purges,
-                    ":store_reconciled": head.changed,
-                },
-            )?;
+            let statements = Statements {
+                tx: &tx,
+                shape: self.shape,
+                blobs: &blobs,
+            };
+            let mut run = PimdirIndexRefresh::new(now, batch);
+            let mut arg = None;
+            let output = loop {
+                match run.resume(arg.take()) {
+                    PimdirCoroutineState::Yielded(want) => arg = Some(statements.answer(want)?),
+                    PimdirCoroutineState::Complete(output) => {
+                        break output.map_err(PimdirError::Refresh)?;
+                    }
+                }
+            };
             tx.commit().map_err(busy_or_sql)?;
-            break;
+
+            report.folded += output.folded;
+            report.indexed += output.indexed;
+            report.expanded += output.expanded;
+            report.bounded += output.bounded;
+            report.removed += output.removed;
+            report.reconciled |= output.reconciled;
+            report.cursor = output.cursor;
+            if output.exhausted {
+                break;
+            }
         }
 
         debug!(
@@ -970,7 +913,7 @@ impl PimdirIndex {
         if sort == PimdirSearchSort::Name {
             // NOTE: the title folded as STORAGE Annex A.2 folds `fn`,
             // ties to the seq then the account, as the SQL order gave.
-            found.sort_by_cached_key(|(_, _, _, title)| title.to_lowercase().trim().to_string());
+            found.sort_by_cached_key(|(_, _, _, title)| fold::value(title));
             if let Some((limit, offset)) = page {
                 found = found.into_iter().skip(offset).take(limit).collect();
             }
@@ -1017,11 +960,52 @@ impl PimdirIndex {
         })
     }
 
-    /// A query compiled with its `linked:` ends resolved; what it reads of
-    /// the store is read as the store answers it when it runs
-    /// ([`store_sql`](Self::store_sql)).
+    /// A query compiled with its `linked:` ends and its `category:` values
+    /// resolved; what it reads of the store is read as the store answers it
+    /// when it runs ([`store_sql`](Self::store_sql)).
     fn compile(&self, query: &PimdirQuery, now: i64) -> Result<Compiled, PimdirError> {
-        Ok(Compiled::new(query, self.ends(query)?, now))
+        let ends = self.ends(query)?;
+        let categories = self.categories(query)?;
+        Ok(Compiled::new(query, ends, categories, now))
+    }
+
+    /// The task categories each `category:` term of a query names (SEARCH
+    /// §8): every value a task states whose fold, as STORAGE Annex A.2
+    /// folds `fn`, is the term's. Both sides are folded here, in Rust, so
+    /// no SQL function folds the stored side; the store's distinct values
+    /// are few, read once per query that names a category.
+    fn categories(&self, query: &PimdirQuery) -> Result<Categories, PimdirError> {
+        let mut categories = Vec::new();
+        let mut stored: Option<Vec<(String, String)>> = None;
+        for (term, _) in query.terms() {
+            let PimdirQueryPredicate::Category(category) = &term.predicate else {
+                continue;
+            };
+            let stored = match &mut stored {
+                Some(stored) => stored,
+                None => {
+                    let values: Vec<String> = rows(
+                        &self.conn,
+                        &self.store_sql(search::TASK_CATEGORY_VALUES)?,
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    let folded = values
+                        .into_iter()
+                        .map(|value| (fold::value(&value), value))
+                        .collect();
+                    stored.insert(folded)
+                }
+            };
+            let folded = fold::value(category);
+            let values = stored
+                .iter()
+                .filter(|(stored, _)| *stored == folded)
+                .map(|(_, value)| value.clone())
+                .collect();
+            categories.push((folded, values));
+        }
+        Ok(categories)
     }
 
     /// The items each `linked:` term of a query names, every kind each is
@@ -1061,7 +1045,9 @@ impl PimdirIndex {
                     PimdirSearchPlacement {
                         collection: row.get(0)?,
                         link_id: PimdirLinkId(row.get(1)?),
-                        flags: codec::flags_from_json(row.get::<_, Option<String>>(2)?.as_deref()),
+                        flags: codec::flags_from_column(
+                            row.get::<_, Option<String>>(2)?.as_deref(),
+                        ),
                         object: row.get::<_, Option<String>>(3)?.map(PimdirHash),
                         sort_key: row.get(4)?,
                         level: codec::level_from_int(row.get(5)?),
@@ -1123,22 +1109,21 @@ impl PimdirIndex {
         let Some(extract) = PimdirExtract::body(media_type, &blob) else {
             return Ok(None);
         };
-        let words: Vec<String> = words.iter().map(|word| fold_text(word)).collect();
+        let words: Vec<String> = words.iter().map(|word| fold::text(word)).collect();
         let texts: Vec<&str> = chunks
             .iter()
             .filter_map(|(field, start, end)| extract.field(field)?.get(*start..*end))
             .collect();
 
         for text in &texts {
-            let folded = fold_text(text);
+            let (folded, origin) = fold_chars(text);
             if let Some(at) = words
                 .iter()
                 .filter(|word| !word.is_empty())
                 .filter_map(|word| folded.find(word.as_str()))
                 .min()
             {
-                let at = folded[..at].chars().count();
-                return Ok(Some(trim(text, at)));
+                return Ok(Some(trim(text, origin[at])));
             }
         }
         Ok(texts.first().map(|text| trim(text, 0)))
@@ -1189,12 +1174,10 @@ impl PimdirIndex {
             .reader
             .search_coverage(&ids, since.as_deref(), until.as_deref())?;
 
+        bind_list(&self.conn, "collections", &ids)?;
         let unindexed: i64 = self.conn.query_row(
             &self.store_sql(search::COUNT_UNINDEXED)?,
-            named_params! {
-                ":since": self.cursor()?,
-                ":collections": serde_json::to_string(&ids)?,
-            },
+            named_params! { ":since": self.cursor()? },
             |r| r.get(0),
         )?;
         coverage.local.unindexed = unindexed as u64;
@@ -1237,7 +1220,7 @@ fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     };
     let flags = access | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(dir.join("index.db"), flags)?;
-    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+    prepare_connection(&conn)?;
     if !query_only {
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     }
@@ -1246,16 +1229,6 @@ fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     conn.execute(
         "ATTACH DATABASE ?1 AS store",
         [format!("file:{}?mode=ro", uri_path(&store))],
-    )?;
-    conn.create_scalar_function(
-        compile::FOLD,
-        1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            Ok(ctx
-                .get::<Option<String>>(0)?
-                .map(|value| compile::fold(&value)))
-        },
     )?;
     Ok(conn)
 }
@@ -1387,227 +1360,6 @@ fn uri_path(path: &Path) -> String {
     out
 }
 
-/// Reads feed rows through a statement answering `load_changed_items`'
-/// columns.
-fn feed(
-    tx: &Transaction,
-    statement: &str,
-    params: &[(&str, &dyn rusqlite::ToSql)],
-) -> Result<Vec<FeedRow>, PimdirError> {
-    Ok(rows(tx, statement, params, |r| {
-        Ok(FeedRow {
-            collection: r.get(0)?,
-            link_id: r.get(1)?,
-            seq: r.get(2)?,
-            object: r.get(3)?,
-            flags: codec::flags_from_json(r.get::<_, Option<String>>(4)?.as_deref()),
-            gone: r.get::<_, i64>(5)? != 0 || r.get::<_, Option<String>>(6)?.is_some(),
-            kind: r.get(7)?,
-            changed: r.get(9)?,
-        })
-    })?)
-}
-
-/// Folds one feed row (SEARCH §4): a gone row loses its placement, a live
-/// one has its body indexed when new, its placement upserted, its summary
-/// text written while it has no body, and its flags replaced. A message
-/// placed, rebodied, rekeyed or dropped is added to `touched`, to be
-/// rethreaded before the batch commits (SEARCH §9).
-fn fold(
-    tx: &Transaction,
-    blobs: &crate::client::blobs::PimdirBlobs,
-    shape: StoreShape,
-    horizon: &Horizon,
-    row: &FeedRow,
-    report: &mut PimdirIndexReport,
-    touched: &mut BTreeSet<String>,
-) -> Result<(), PimdirError> {
-    let key = named_params! { ":collection": row.collection, ":seq": row.seq };
-
-    if row.gone {
-        remove(tx, &row.collection, row.seq, report, touched)?;
-        return Ok(());
-    }
-
-    let hash = match &row.object {
-        Some(hash) if row.kind != file::KIND => index_object(tx, blobs, shape, row, hash, report)?,
-        _ => None,
-    };
-    let calendar = row.kind == "text/calendar";
-    let mail = row.kind == "message/rfc822";
-    let held: Option<Option<String>> = match calendar || mail {
-        true => tx
-            .query_row(search::PLACEMENT_HASH, key, |r| r.get(0))
-            .optional()?,
-        false => None,
-    };
-    if mail {
-        let keyed: Option<String> = tx
-            .query_row(search::PLACEMENT_LINK_ID, key, |r| r.get(0))
-            .optional()?;
-        if held.as_ref() != Some(&hash) || keyed.as_ref() != Some(&row.link_id) {
-            touched.extend(keyed);
-            touched.insert(row.link_id.clone());
-        }
-    }
-
-    let id: i64 = tx.query_row(
-        search::UPSERT_PLACEMENT,
-        named_params! {
-            ":collection": row.collection,
-            ":seq": row.seq,
-            ":link_id": row.link_id,
-            ":hash": hash,
-        },
-        |r| r.get(0),
-    )?;
-    tx.execute(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
-    if hash.is_none() {
-        let text = extract(tx, shape, &row.collection, row.seq, &row.kind, None)?;
-        tx.execute(
-            search::INSERT_SUMMARY_TEXT,
-            named_params! {
-                ":rowid": id,
-                ":title": text.title,
-                ":people": text.people,
-                ":from": text.from,
-                ":to": text.to,
-                ":cc": text.cc,
-                ":bcc": text.bcc,
-                ":email": text.email,
-                ":organizer": text.organizer,
-                ":attendee": text.attendee,
-            },
-        )?;
-    }
-
-    if calendar && held.flatten() != hash {
-        occurrence::expand(tx, blobs, &row.collection, row.seq, horizon, report)?;
-    }
-
-    tx.execute(search::REPLACE_FLAGS, key)?;
-    for flag in row.flags.known().into_iter().flatten() {
-        tx.execute(
-            search::INSERT_FLAG,
-            named_params! { ":flag": flag, ":collection": row.collection, ":seq": row.seq },
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Drops a placement, its flags and occurrences by cascade and its
-/// summary text by the rowid the delete returns (SEARCH §4), adding the
-/// message it held to `touched`.
-fn remove(
-    tx: &Transaction,
-    collection: &str,
-    seq: i64,
-    report: &mut PimdirIndexReport,
-    touched: &mut BTreeSet<String>,
-) -> Result<(), PimdirError> {
-    let key = named_params! { ":collection": collection, ":seq": seq };
-    let keyed: Option<String> = tx
-        .query_row(search::PLACEMENT_LINK_ID, key, |r| r.get(0))
-        .optional()?;
-    touched.extend(keyed);
-
-    let id: Option<i64> = tx
-        .query_row(search::DELETE_PLACEMENT, key, |r| r.get(0))
-        .optional()?;
-    if let Some(id) = id {
-        tx.execute(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
-        report.removed += 1;
-    }
-    Ok(())
-}
-
-/// Indexes a body once per hash (SEARCH §6), answering the hash when it
-/// is indexed, `None` when the blob directory no longer holds it: no
-/// object row is written, and the row is met again on the next pass.
-fn index_object(
-    tx: &Transaction,
-    blobs: &crate::client::blobs::PimdirBlobs,
-    shape: StoreShape,
-    row: &FeedRow,
-    hash: &str,
-    report: &mut PimdirIndexReport,
-) -> Result<Option<String>, PimdirError> {
-    let indexed = tx
-        .query_row(
-            search::OBJECT_INDEXED,
-            named_params! { ":hash": hash },
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?;
-    if indexed.is_some() {
-        return Ok(Some(hash.into()));
-    }
-
-    let Some(body) = blobs.get(&PimdirHash(hash.into()))? else {
-        debug!("blob {hash} is missing, indexing {} later", row.seq);
-        return Ok(None);
-    };
-    let text = extract(tx, shape, &row.collection, row.seq, &row.kind, Some(&body))?;
-
-    let id: i64 = tx.query_row(
-        search::INSERT_OBJECT,
-        named_params! {
-            ":hash": hash,
-            ":status": text.status.as_str(),
-            // NOTE: whether any text went into the field (SEARCH §6), which
-            // `has:attachment` reads a calendar item by.
-            ":attachment": i64::from(!text.attachment.is_empty()),
-            ":tel": i64::from(text.tel),
-            ":adr": i64::from(text.adr),
-            ":bday": i64::from(text.bday),
-            ":photo": i64::from(text.photo),
-        },
-        |r| r.get(0),
-    )?;
-    for value in &text.categories {
-        tx.execute(
-            search::INSERT_OBJECT_CATEGORY,
-            named_params! { ":object": id, ":value": value },
-        )?;
-    }
-    tx.execute(
-        search::INSERT_OBJECT_TEXT,
-        named_params! {
-            ":rowid": id,
-            ":title": text.title,
-            ":people": text.people,
-            ":body": text.body,
-            ":attachment": text.attachment,
-            ":place": text.place,
-            ":org": text.org,
-            ":note": text.note,
-            ":from": text.from,
-            ":to": text.to,
-            ":cc": text.cc,
-            ":bcc": text.bcc,
-            ":email": text.email,
-            ":organizer": text.organizer,
-            ":attendee": text.attendee,
-        },
-    )?;
-    for (ord, chunk) in text.chunks().into_iter().enumerate() {
-        tx.execute(
-            search::INSERT_CHUNK,
-            named_params! {
-                ":object": id,
-                ":ord": ord as i64,
-                ":field": chunk.field,
-                ":start": chunk.range.start as i64,
-                ":end": chunk.range.end as i64,
-            },
-        )?;
-    }
-
-    report.indexed += 1;
-    Ok(Some(hash.into()))
-}
-
 /// Extracts an item's text (SEARCH §6): a message, a card or a calendar
 /// resource through its parser, an unparseable one from what its summary
 /// could read; a file, and an item holding no body, from its summary and
@@ -1627,115 +1379,28 @@ fn extract(
         return Ok(parsed.unwrap_or_default());
     }
 
-    // NOTE: one live item by its key, a seek on both statements, where
-    // the load statements filtered by `:links` scan the whole collection.
-    let key = named_params! { ":collection": collection, ":seq": seq };
-    let mut link_id = None;
-    let mut summary = None;
-    for table in tables_of(kind) {
-        let item = conn
-            .prepare(&shape.sql(conn, table.get_sql())?)?
-            .query_row(key, |row| {
-                Ok((row.get::<_, String>(1)?, table.read_row(row, 6)?))
-            })
-            .optional()?;
-        let Some((link, found)) = item else {
-            break;
-        };
-        link_id = Some(link);
-        if found.is_some() {
-            summary = found;
-            break;
-        }
-    }
-    let mut addresses = Vec::new();
-    if let Some(link_id) = link_id {
-        let mut stmt = conn.prepare(&shape.sql(conn, sql::LOAD_ADDRESSES)?)?;
-        let found = stmt.query_map(
-            named_params! { ":collection": collection, ":link_id": link_id },
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    PimdirAddress {
-                        address: row.get(2)?,
-                        name: row.get(3)?,
-                    },
-                ))
-            },
-        )?;
-        for row in found {
-            let (role, address) = row?;
-            if let Some(role) = PimdirAddressRole::parse(&role) {
-                addresses.push((role, address));
-            }
-        }
-    }
-
-    let mut extract = PimdirExtract::summary(summary.as_ref(), &addresses);
+    let found = refresh::summary(conn, shape, collection, seq, kind)?;
+    let mut extract = PimdirExtract::summary(found.summary.as_ref(), &found.addresses);
     if parsed.is_some() {
         extract.status = PimdirExtractStatus::Unparseable;
     }
     Ok(extract)
 }
 
-/// Drops the placements and the bodies the store no longer holds (SEARCH
-/// §4): purged rows, a renamed collection's old id, collected objects, the
-/// messages they held added to `touched`.
-fn reconcile(
-    tx: &Transaction,
-    shape: StoreShape,
-    report: &mut PimdirIndexReport,
-    touched: &mut BTreeSet<String>,
-) -> Result<(), PimdirError> {
-    debug!("reconciling search index keys");
-    report.reconciled = true;
-
-    let gone = rows(tx, &shape.sql(tx, search::PLACEMENTS_GONE)?, [], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    })?;
-    for (collection, seq) in gone {
-        remove(tx, &collection, seq, report, touched)?;
+/// A text folded for a snippet's word search as the index folds it
+/// (SEARCH §5), each character alone, with the character of `text` each
+/// byte of the fold came from, so a word found in the fold is placed in
+/// the text. A mark the fold drops maps to nothing.
+fn fold_chars(text: &str) -> (String, Vec<usize>) {
+    let mut folded = String::with_capacity(text.len());
+    let mut origin = Vec::with_capacity(text.len());
+    for (at, c) in text.chars().enumerate() {
+        let mut buf = [0; 4];
+        let one = fold::text(c.encode_utf8(&mut buf));
+        origin.extend(core::iter::repeat_n(at, one.len()));
+        folded.push_str(&one);
     }
-
-    let objects = rows(tx, &shape.sql(tx, search::OBJECTS_GONE)?, [], |r| {
-        r.get::<_, String>(0)
-    })?;
-    for hash in objects {
-        let id: Option<i64> = tx
-            .query_row(
-                search::OBJECT_INDEXED,
-                named_params! { ":hash": hash },
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = id {
-            tx.execute(search::DELETE_OBJECT, named_params! { ":rowid": id })?;
-        }
-        tx.execute(search::DELETE_OBJECT_ROW, named_params! { ":hash": hash })?;
-    }
-    Ok(())
-}
-
-/// A text folded for a snippet's word search: lowercased, the common
-/// Latin diacritics stripped, one character for one so offsets in
-/// characters agree with the text's.
-fn fold_text(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            let lower = c.to_lowercase().next().unwrap_or(c);
-            match lower {
-                'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
-                'ç' => 'c',
-                'è' | 'é' | 'ê' | 'ë' => 'e',
-                'ì' | 'í' | 'î' | 'ï' => 'i',
-                'ñ' => 'n',
-                'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => 'o',
-                'ù' | 'ú' | 'û' | 'ü' => 'u',
-                'ý' | 'ÿ' => 'y',
-                c => c,
-            }
-        })
-        .collect()
+    (folded, origin)
 }
 
 /// About [`SNIPPET_LEN`] characters of a chunk around the character at

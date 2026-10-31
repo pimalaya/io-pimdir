@@ -3,6 +3,8 @@
 //! exactly as this crate writes it, and refuses any other, leaving it as it
 //! was, where `PimdirStore::open` would bring it to this crate's schema.
 
+#![cfg(feature = "client")]
+
 use std::fs;
 
 use io_pimdir::{
@@ -111,7 +113,6 @@ fn a_store_needing_a_reconcile_is_refused_and_left_as_it_was() {
          DROP INDEX task_summary_by_mid;
          ALTER TABLE task_summary DROP COLUMN mid;
          ALTER TABLE task_summary DROP COLUMN parent;
-         ALTER TABLE task_summary DROP COLUMN categories;
          ALTER TABLE task_summary DROP COLUMN priority;",
     )
     .unwrap();

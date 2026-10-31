@@ -6,6 +6,8 @@
 //! message and part, tied to the message by an `attachment` reference,
 //! and gone once no reference names it.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{

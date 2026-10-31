@@ -7,6 +7,8 @@
 //! one transaction, and refuses a collection a source syncs, whose items
 //! are that source's.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::PimdirWriteOp,
     client::{PimdirError, PimdirStore, TIME_COLLECTION},

@@ -1,6 +1,8 @@
 //! The reader role and its pending-action overlay (spec §8, §15.4): what
 //! a frontend sees between staging a write and the owner applying it.
 
+#![cfg(feature = "client")]
+
 use std::fs::File;
 
 use fs4::FileExt;

@@ -5,6 +5,8 @@
 //! loop, so the quiescence tests here run the real sync verb against a
 //! fake source.
 
+#![cfg(feature = "client")]
+
 use std::{collections::BTreeMap, convert::Infallible, path::Path};
 
 use io_pimdir::{

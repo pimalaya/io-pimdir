@@ -4,8 +4,10 @@
 //!
 //! The spec is a sibling checkout, so the suite skips when it is absent.
 
+#![cfg(feature = "client")]
+
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -92,11 +94,42 @@ fn flags(value: &Value) -> PimdirFlags {
     }
 }
 
+/// A flag set as a read answers it (STORAGE §4.4), joined by spaces in no
+/// order, as the array a case states, sorted so a comparison reads it as
+/// a set; `NULL` unknown.
 fn flags_json(flags: &Option<String>) -> Value {
     match flags {
         None => Value::Null,
-        Some(json) => serde_json::from_str(json).unwrap_or(Value::Null),
+        Some(joined) => {
+            let set: BTreeSet<&str> = joined.split(' ').filter(|f| !f.is_empty()).collect();
+            json!(set)
+        }
     }
+}
+
+/// Writes a case's flag array to the rows of `retain` and `add` (STORAGE
+/// §13), after the row they belong to: the set in the `flags` slot.
+fn seed_flags(
+    conn: &Connection,
+    value: &Value,
+    retain: &str,
+    add: &str,
+    key: &[(&str, &dyn rusqlite::ToSql)],
+) {
+    conn.execute(sql::CLEAR_PARAM, []).unwrap();
+    for (position, flag) in value.as_array().into_iter().flatten().enumerate() {
+        conn.execute(
+            sql::BIND_PARAM,
+            named_params! {
+                ":slot": "flags",
+                ":position": position as i64,
+                ":value": flag.as_str().unwrap(),
+            },
+        )
+        .unwrap();
+    }
+    conn.execute(retain, key).unwrap();
+    conn.execute(add, key).unwrap();
 }
 
 /// Seeds a store from a case's `store` object.
@@ -131,6 +164,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
 
     let conn = Connection::open(dir.join("pimdir.db")).unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    conn.execute_batch(sql::CREATE_PARAM).unwrap();
     for collection in store["collections"].as_array().unwrap() {
         conn.execute(
             sql::SET_COLLECTION_KIND,
@@ -170,7 +204,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":collection": item["collection"].as_str().unwrap(),
                 ":link_id": item["link_id"].as_str().unwrap(),
                 ":seq": seq,
-                ":flags": item.get("flags").map(|f| f.to_string()),
+                ":flags_known": item.get("flags").is_some_and(|f| !f.is_null()),
                 ":object_hash": bodies.hash(&item["object"]),
                 ":sort_key": item["sort_key"].as_str().unwrap_or(""),
                 ":level": item["level"].as_i64().unwrap_or(0),
@@ -180,6 +214,18 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             },
         )
         .unwrap();
+        if let Some(flags) = item.get("flags").filter(|f| !f.is_null()) {
+            seed_flags(
+                &conn,
+                flags,
+                sql::RETAIN_FLAGS,
+                sql::ADD_FLAGS,
+                named_params! {
+                    ":collection": item["collection"].as_str().unwrap(),
+                    ":link_id": item["link_id"].as_str().unwrap(),
+                },
+            );
+        }
         if item["retained"].as_bool() == Some(true) {
             conn.execute(
                 sql::RETAIN_ITEM,
@@ -217,7 +263,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":link_id": binding["link_id"].as_str().unwrap(),
                 ":source": binding["source"].as_str().unwrap(),
                 ":handle": binding["handle"].as_str().unwrap(),
-                ":base_flags": binding.get("base_flags").filter(|f| !f.is_null()).map(|f| f.to_string()),
+                ":base_flags_known": binding.get("base_flags").is_some_and(|f| !f.is_null()),
                 ":base_object": bodies.hash(&binding["base_object"]),
                 ":base_revision": binding["base_revision"].as_str(),
                 ":base_present": binding["base_present"].as_i64().unwrap_or(0),
@@ -228,6 +274,19 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             },
         )
         .unwrap();
+        if let Some(flags) = binding.get("base_flags").filter(|f| !f.is_null()) {
+            seed_flags(
+                &conn,
+                flags,
+                sql::RETAIN_BASE_FLAGS,
+                sql::ADD_BASE_FLAGS,
+                named_params! {
+                    ":collection": binding["collection"].as_str().unwrap(),
+                    ":link_id": binding["link_id"].as_str().unwrap(),
+                    ":source": binding["source"].as_str().unwrap(),
+                },
+            );
+        }
     }
     // NOTE: what an add carrying `supersedes` recorded (STORAGE §15.3).
     for pair in store["supersessions"].as_array().into_iter().flatten() {
@@ -258,11 +317,15 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
     }
     for entry in store["summaries"].as_array().into_iter().flatten() {
         let table = entry["table"].as_str().unwrap();
-        let row = entry["row"].as_object().unwrap();
-        let columns: Vec<&String> = row.keys().collect();
+        let (row, lists): (Vec<Column>, Vec<Column>) = entry["row"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .partition(|(column, _)| list_table(table, column).is_none());
+        let columns: Vec<&String> = row.iter().map(|(column, _)| *column).collect();
         let values: Vec<rusqlite::types::Value> = row
-            .values()
-            .map(|value| match value {
+            .iter()
+            .map(|(_, value)| match value {
                 Value::Null => rusqlite::types::Value::Null,
                 Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
                 Value::Number(n) => rusqlite::types::Value::Integer(n.as_i64().unwrap()),
@@ -289,6 +352,26 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
         bound.extend(values);
         conn.execute(&query, rusqlite::params_from_iter(bound))
             .unwrap();
+        // NOTE: a case states a summary's lists as arrays, whichever table
+        // a shape keeps them in (STORAGE §16).
+        for (column, values) in lists {
+            let (list, value_column) = list_table(table, column).unwrap();
+            for (position, value) in values.as_array().into_iter().flatten().enumerate() {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {list} (collection, link_id, position, {value_column}) \
+                         VALUES (?1, ?2, ?3, ?4)"
+                    ),
+                    params![
+                        entry["collection"].as_str().unwrap(),
+                        entry["link_id"].as_str().unwrap(),
+                        position as i64,
+                        value.as_str().unwrap(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
     }
     for source in store["sources"].as_array().unwrap() {
         conn.execute(
@@ -900,10 +983,10 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
 
     let query = match table {
         "items" => {
-            "SELECT collection, link_id, seq, flags, object_hash, level, deleted, retained_at, retained_by, sort_key, conflicted, conflict_object FROM items ORDER BY collection, link_id"
+            "SELECT collection, link_id, seq, CASE WHEN flags_known = 1 THEN coalesce((SELECT group_concat(f.flag, ' ') FROM placement_flag f WHERE f.collection = items.collection AND f.link_id = items.link_id), '') END, object_hash, level, deleted, retained_at, retained_by, sort_key, conflicted, conflict_object FROM items ORDER BY collection, link_id"
         }
         "bindings" => {
-            "SELECT collection, link_id, source, handle, base_flags, base_object, base_revision, base_present, conflicted, conflict_revision, conflict_object, shared_object, round FROM bindings ORDER BY collection, link_id, source"
+            "SELECT collection, link_id, source, handle, CASE WHEN base_flags_known = 1 THEN coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.collection = bindings.collection AND g.link_id = bindings.link_id AND g.source = bindings.source), '') END, base_object, base_revision, base_present, conflicted, conflict_revision, conflict_object, shared_object, round FROM bindings ORDER BY collection, link_id, source"
         }
         "sources" => {
             "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until, round_band FROM sources ORDER BY collection, source"
@@ -1036,7 +1119,16 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
         .iter()
         .map(|entry| {
             let table = entry["table"].as_str().unwrap();
-            let columns: Vec<String> = entry["row"].as_object().unwrap().keys().cloned().collect();
+            let (columns, lists): (Vec<String>, Vec<String>) = entry["row"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .partition(|column| list_table(table, column).is_none());
+            let key = params![
+                entry["collection"].as_str().unwrap(),
+                entry["link_id"].as_str().unwrap()
+            ];
             let query = format!(
                 "SELECT {} FROM {table} WHERE collection = ?1 AND link_id = ?2",
                 columns.join(", ")
@@ -1056,9 +1148,6 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
                                 rusqlite::types::Value::Null => Value::Null,
                                 rusqlite::types::Value::Integer(i) => json!(i),
                                 rusqlite::types::Value::Real(f) => json!(f),
-                                rusqlite::types::Value::Text(t) if column == "in_reply_to" => {
-                                    serde_json::from_str(&t).unwrap_or(Value::Null)
-                                }
                                 rusqlite::types::Value::Text(t) => json!(t),
                                 rusqlite::types::Value::Blob(_) => Value::Null,
                             };
@@ -1068,6 +1157,23 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
                     },
                 )
                 .unwrap_or(Value::Null);
+            let mut row = row;
+            if let Value::Object(object) = &mut row {
+                for column in lists {
+                    let (list, value_column) = list_table(table, &column).unwrap();
+                    let values: Vec<String> = conn
+                        .prepare(&format!(
+                            "SELECT {value_column} FROM {list} \
+                             WHERE collection = ?1 AND link_id = ?2 ORDER BY position"
+                        ))
+                        .unwrap()
+                        .query_map(key, |r| r.get(0))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    object.insert(column, json!(values));
+                }
+            }
             json!({
                 "table": table,
                 "collection": entry["collection"],
@@ -1076,6 +1182,19 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// One column of a case's summary row and its value.
+type Column<'a> = (&'a String, &'a Value);
+
+/// The table and value column a summary list a case states as an array
+/// is kept in (STORAGE §4.3), `None` for a column of the summary's own.
+fn list_table(table: &str, column: &str) -> Option<(&'static str, &'static str)> {
+    match (table, column) {
+        ("mail_summary", "in_reply_to") => Some(("mail_in_reply_to", "msg_id")),
+        ("task_summary", "categories") => Some(("task_category", "value")),
+        _ => None,
+    }
 }
 
 fn assert_same_set(label: &str, table: &str, mut expected: Vec<Value>, actual: Vec<Value>) {

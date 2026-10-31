@@ -3,6 +3,8 @@
 //! sum counting a message once, no reference under a derived key, and the
 //! invitation an older store gains on open.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{

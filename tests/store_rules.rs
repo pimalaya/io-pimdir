@@ -4,6 +4,8 @@
 //! version is skipped, an edit names the body it replaced, and a body is
 //! checked against its name when read.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{

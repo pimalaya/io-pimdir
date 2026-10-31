@@ -7,6 +7,8 @@
 //! about who runs what, and the roles that are not owners, a reader or a
 //! producer appending to the queue, go on working while it is held.
 
+#![cfg(feature = "client")]
+
 use std::{fs::File, fs::OpenOptions, path::Path};
 
 use fs4::FileExt;

@@ -2,6 +2,8 @@
 //! two-source propagation (a copy appears on the other side, a delete
 //! lingers as a tombstone): the N=1 and N=2 cases of the same store.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{
@@ -860,7 +862,7 @@ fn a_handles_load_reads_only_its_own_handles() {
 }
 
 #[test]
-fn an_unknown_flag_set_stores_as_null_and_loads_back_unknown() {
+fn an_unknown_flag_set_stores_no_row_and_loads_back_unknown() {
     // spec §13 keeps the two absences apart: NULL means nothing has read
     // the markers, '[]' that the item carries none. A placement read so
     // storing '[]' would claim the second while only the first is true.
@@ -881,14 +883,18 @@ fn an_unknown_flag_set_stores_as_null_and_loads_back_unknown() {
         .unwrap();
 
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    let stored: Vec<Option<String>> = conn
-        .prepare("SELECT flags FROM items ORDER BY link_id")
+    let stored: Vec<(i64, i64)> = conn
+        .prepare(
+            "SELECT flags_known, (SELECT count(*) FROM placement_flag f \
+             WHERE f.collection = i.collection AND f.link_id = i.link_id) \
+             FROM items i ORDER BY link_id",
+        )
         .unwrap()
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(stored, vec![None, Some(String::from("[]"))]);
+    assert_eq!(stored, vec![(0, 0), (1, 0)], "unknown, then known-empty");
     drop(conn);
 
     let loaded = store.load(&inbox(), &PimdirLoadScope::All).unwrap();

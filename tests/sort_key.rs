@@ -7,6 +7,8 @@
 //! show fifty rows, and one that cannot rename forces a full re-download
 //! to change one string.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::client::{PimdirSourceStore, PimdirStore};
 use io_pimdir::{
     change::PimdirWriteOp,

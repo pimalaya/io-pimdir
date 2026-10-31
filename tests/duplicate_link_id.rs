@@ -7,6 +7,8 @@
 //! own writes reaches the same rows, and a rebuilt handle space resolves
 //! two placements to one key without minting anything.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
     collection::PimdirCollectionId,

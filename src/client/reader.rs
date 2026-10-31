@@ -27,9 +27,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params};
 use crate::{
     capability::PimdirSourceCapabilities,
     client::{
-        PimdirError,
+        PimdirError, bind_list,
         blobs::PimdirBlobs,
-        capability,
+        capability, prepare_connection,
         producer::{
             PimdirActionStatus, PimdirParkedAction, PimdirPendingAction, action_status,
             overlaid_actions, pending_actions,
@@ -37,8 +37,8 @@ use crate::{
         rows,
         schema::{self, StoreShape},
         write::{
-            PimdirSummaryTable, attach_address, binding_from_row, load_addresses,
-            load_summaries_by, tables_of,
+            PimdirSummaryTable, attach_address, attach_list_value, binding_from_row, list_sql,
+            load_addresses, load_list, load_summaries_by, tables_of,
         },
     },
     codec::{self, PimdirAction},
@@ -451,7 +451,7 @@ impl PimdirReader {
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+        prepare_connection(&conn)?;
         schema::check_version(&conn)?;
         let hash = schema::hash_algo(&conn, None)?;
 
@@ -976,7 +976,7 @@ impl PimdirReader {
                     seq: r.get(2)?,
                     link_id: PimdirLinkId(link_id.to_string()),
                     object: r.get::<_, Option<String>>(3)?.map(PimdirHash),
-                    flags: codec::flags_from_json(r.get::<_, Option<String>>(4)?.as_deref()),
+                    flags: codec::flags_from_column(r.get::<_, Option<String>>(4)?.as_deref()),
                     level: codec::level_from_int(r.get(5)?),
                 })
             },
@@ -996,7 +996,7 @@ impl PimdirReader {
                     seq: r.get(2)?,
                     link_id: PimdirLinkId(r.get(3)?),
                     object: Some(PimdirHash(hash.to_string())),
-                    flags: codec::flags_from_json(r.get::<_, Option<String>>(4)?.as_deref()),
+                    flags: codec::flags_from_column(r.get::<_, Option<String>>(4)?.as_deref()),
                     level: codec::level_from_int(r.get(5)?),
                 })
             },
@@ -1039,11 +1039,10 @@ impl PimdirReader {
     /// source mail (its `mid`) was answered. Mail under the `sent` or
     /// `drafts` role is the person's own and answers nothing.
     ///
-    /// Ids compare bare and exactly, as Annex A.1 stores `in_reply_to` and
-    /// A.4 a task's `mid`: each one given is trimmed and stripped of one pair
-    /// of enclosing angle brackets, an empty one dropped. The answer holds
-    /// each id answered once, bare, in code point order. A scan of every
-    /// mail summary.
+    /// Ids compare bare and exactly, as Annex A.1 stores `mail_in_reply_to`
+    /// and A.4 a task's `mid`: each one given is trimmed and stripped of one
+    /// pair of enclosing angle brackets, an empty one dropped. The answer
+    /// holds each id answered once, bare, in code point order. A seek per id.
     pub fn replied(&self, message_ids: &[String]) -> Result<Vec<String>, PimdirError> {
         let ids: Vec<&str> = message_ids
             .iter()
@@ -1062,10 +1061,11 @@ impl PimdirReader {
 
         // NOTE: a store whose owner has not reconciled `collections.role`
         // yet reads it as NULL (§6), every mail then answering.
+        bind_list(&self.conn, "ids", &ids)?;
         Ok(rows(
             &self.conn,
             &self.reconciled_sql(sql::LIST_REPLIED)?,
-            named_params! { ":ids": serde_json::to_string(&ids)? },
+            [],
             |r| r.get(0),
         )?)
     }
@@ -1220,8 +1220,8 @@ impl PimdirReader {
                     collection: r.get(3)?,
                     action: r.get(4)?,
                     payload: r.get(5)?,
-                    attempts: r.get(6)?,
-                    error: r.get(7)?,
+                    attempts: r.get(7)?,
+                    error: r.get(8)?,
                 })
             },
         )?)
@@ -1423,10 +1423,14 @@ impl PimdirReader {
         filter: PimdirMailFilter,
         since: Option<&str>,
     ) -> Result<u64, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         let count: i64 = self.conn.query_row(
             &self.reconciled_sql(sql::COUNT_MAIL)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
                 ":since": since,
@@ -1447,11 +1451,15 @@ impl PimdirReader {
         since: Option<&str>,
         shift: Option<&str>,
     ) -> Result<Vec<PimdirDayCount>, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         Ok(rows(
             &self.conn,
             &self.reconciled_sql(sql::COUNT_MAIL_BY_DAY)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
                 ":since": since,
@@ -1475,11 +1483,15 @@ impl PimdirReader {
         attachment: Option<bool>,
         since: Option<&str>,
     ) -> Result<BTreeMap<String, u64>, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         let counted = rows(
             &self.conn,
             &self.reconciled_sql(sql::COUNT_UNREAD)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":attachment": attachment,
                 ":since": since,
             },
@@ -1500,10 +1512,14 @@ impl PimdirReader {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<PimdirMailSum, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         let (count, size, unknown): (i64, i64, i64) = self.conn.query_row(
             &self.reconciled_sql(sql::SUM_MAIL)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
                 ":held": held,
@@ -1547,11 +1563,15 @@ impl PimdirReader {
         after: Option<&PimdirMailCursor>,
         limit: usize,
     ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         let mut entries = rows(
             &self.conn,
             &self.reconciled_sql(sql::SEARCH_CONTACTS)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":pattern": pattern,
                 ":after_key": after.map(|after| after.sort_key.as_str()),
                 ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
@@ -1574,11 +1594,15 @@ impl PimdirReader {
         after: Option<&PimdirMailCursor>,
         limit: usize,
     ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         Ok(rows(
             &self.conn,
             &self.reconciled_sql(sql::SEARCH_FILES)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":pattern": pattern,
                 ":after_key": after.map(|after| after.sort_key.as_str()),
                 ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
@@ -1600,11 +1624,15 @@ impl PimdirReader {
         after: Option<&PimdirMailCursor>,
         limit: usize,
     ) -> Result<Vec<PimdirCalendarHit>, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         Ok(rows(
             &self.conn,
             &self.reconciled_sql(sql::SEARCH_CALENDAR)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":pattern": pattern,
                 ":after_key": after.map(|after| after.sort_key.as_str()),
                 ":after_seq": after.map(|after| after.seq).unwrap_or_default(),
@@ -1697,11 +1725,15 @@ impl PimdirReader {
         after: Option<&PimdirMailCursor>,
         limit: usize,
     ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         let mut entries = rows(
             &self.conn,
             &self.reconciled_sql(sql::LIST_MAIL_PAGE_FILTERED)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
                 ":since": since,
@@ -1729,11 +1761,15 @@ impl PimdirReader {
         after: Option<&PimdirMailCursor>,
         limit: usize,
     ) -> Result<Vec<PimdirMailEntry>, PimdirError> {
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         let mut entries = rows(
             &self.conn,
             &self.reconciled_sql(sql::SEARCH_MAIL)?,
             named_params! {
-                ":collections": collections_json(collections)?,
                 ":pattern": pattern,
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
@@ -1762,10 +1798,15 @@ impl PimdirReader {
     ) -> Result<PimdirSearchCoverage, PimdirError> {
         let mut coverage = PimdirSearchCoverage::default();
 
+        bind_list(
+            &self.conn,
+            "collections",
+            collections.iter().map(|c| c.as_ref()),
+        )?;
         let bodiless = rows(
             &self.conn,
             &self.reconciled_sql(sql::COUNT_BODILESS)?,
-            named_params! { ":collections": collections_json(collections)? },
+            [],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )?;
         for (kind, count) in bodiless {
@@ -1845,12 +1886,6 @@ pub(crate) fn reference_from_row(row: &Row) -> rusqlite::Result<PimdirReference>
     })
 }
 
-/// A set of collection ids as the JSON array the mail reads bind.
-pub(crate) fn collections_json(collections: &[impl AsRef<str>]) -> Result<String, PimdirError> {
-    let ids: Vec<&str> = collections.iter().map(AsRef::as_ref).collect();
-    Ok(serde_json::to_string(&ids)?)
-}
-
 /// Maps a row spanning collections: the collection, the item columns,
 /// then `table`'s summary columns when it names one.
 fn entry_from_row(
@@ -1864,7 +1899,7 @@ fn entry_from_row(
         item: PimdirItem {
             seq: row.get(1)?,
             link_id: PimdirLinkId(row.get(2)?),
-            flags: codec::flags_from_json(flags.as_deref()),
+            flags: codec::flags_from_column(flags.as_deref()),
             object: object.map(PimdirHash),
             sort_key: row.get(5)?,
             level: codec::level_from_int(row.get(6)?),
@@ -1953,12 +1988,15 @@ impl PimdirReader {
             return Ok(());
         }
         let tables = tables_of(&self.collection_kind(collection)?.unwrap_or_default());
-        let links: Vec<String> = items.iter().map(|item| item.link_id.0.clone()).collect();
-        let scope = serde_json::to_string(&links)?;
+        bind_list(
+            &self.conn,
+            "links",
+            items.iter().map(|item| item.link_id.0.as_str()),
+        )?;
         for table in &tables {
             let statement = self.reconciled_sql(table.load_sql())?;
             for (link, summary) in
-                load_summaries_by(&self.conn, &statement, *table, collection, Some(&scope))?
+                load_summaries_by(&self.conn, &statement, *table, collection, true)?
             {
                 if let Some(item) = items.iter_mut().find(|item| item.link_id == link) {
                     item.summary = Some(summary);
@@ -1968,7 +2006,8 @@ impl PimdirReader {
         self.attach_addresses(collection, &tables, items)
     }
 
-    /// Joins the address rows onto a page's summaries, one query per page.
+    /// Joins the address rows and the lists (§4.4) onto a page's
+    /// summaries, one query each per page.
     fn attach_addresses(
         &self,
         collection: &str,
@@ -1978,13 +2017,16 @@ impl PimdirReader {
         if tables.is_empty() || items.iter().all(|item| item.summary.is_none()) {
             return Ok(());
         }
-        let links: Vec<String> = items.iter().map(|item| item.link_id.0.clone()).collect();
-        let scope = serde_json::to_string(&links)?;
+        bind_list(
+            &self.conn,
+            "links",
+            items.iter().map(|item| item.link_id.0.as_str()),
+        )?;
         for (link, role, address) in load_addresses(
             &self.conn,
             &self.reconciled_sql(sql::LOAD_ADDRESSES_BY_LINK)?,
             collection,
-            Some(&scope),
+            true,
         )? {
             if let Some(summary) = items
                 .iter_mut()
@@ -1992,6 +2034,18 @@ impl PimdirReader {
                 .and_then(|item| item.summary.as_mut())
             {
                 attach_address(summary, role, address);
+            }
+        }
+        for statement in list_sql(tables) {
+            let statement = self.reconciled_sql(statement)?;
+            for (link, value) in load_list(&self.conn, &statement, collection, true)? {
+                if let Some(summary) = items
+                    .iter_mut()
+                    .find(|item| item.link_id == link)
+                    .and_then(|item| item.summary.as_mut())
+                {
+                    attach_list_value(summary, value);
+                }
             }
         }
         Ok(())
@@ -2175,7 +2229,7 @@ pub(crate) fn item_from_row(row: &Row) -> rusqlite::Result<PimdirItem> {
     Ok(PimdirItem {
         seq,
         link_id: PimdirLinkId(link),
-        flags: codec::flags_from_json(flags.as_deref()),
+        flags: codec::flags_from_column(flags.as_deref()),
         sort_key,
         object: object.map(PimdirHash),
         level: codec::level_from_int(level),

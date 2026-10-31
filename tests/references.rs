@@ -5,6 +5,8 @@
 //! with the last. Recording one again changes nothing, save a person's
 //! taking over a rule's.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{
@@ -584,7 +586,7 @@ ATTACH:mid:m\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
          DROP INDEX task_summary_by_parent;
          DROP INDEX task_summary_by_mid;
          ALTER TABLE task_summary DROP COLUMN priority;
-         ALTER TABLE task_summary DROP COLUMN categories;
+         DROP TABLE task_category;
          ALTER TABLE task_summary DROP COLUMN parent;
          ALTER TABLE task_summary DROP COLUMN mid;",
     )
@@ -593,7 +595,8 @@ ATTACH:mid:m\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
     let store = PimdirStore::open(dir.path()).unwrap();
     let row: (Option<i64>, String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT priority, categories, parent, mid FROM task_summary WHERE link_id = 'call'",
+            "SELECT priority, (SELECT group_concat(value, '|') FROM (SELECT value FROM task_category \
+             WHERE link_id = 'call' ORDER BY position)), parent, mid FROM task_summary WHERE link_id = 'call'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -602,7 +605,7 @@ ATTACH:mid:m\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
         row,
         (
             Some(1),
-            r#"["@phone","Errands, small"]"#.into(),
+            "@phone|Errands, small".into(),
             Some("proj".into()),
             Some("m".into())
         ),

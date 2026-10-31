@@ -7,6 +7,8 @@
 //! reads are the store's whole answer to "the same thing is in two
 //! accounts": they report it, and every merge policy is built on top.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::client::PimdirStore;
 use io_pimdir::{
     change::PimdirWriteOp,

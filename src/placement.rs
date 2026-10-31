@@ -14,7 +14,7 @@ use alloc::{
     string::{String, ToString},
 };
 
-use crate::{collection::PimdirCollectionId, object::PimdirHash, summary::PimdirSummary};
+use crate::{codec, collection::PimdirCollectionId, object::PimdirHash, summary::PimdirSummary};
 
 crate::pimdir_id! {
     /// The protocol's per-collection location of an item.
@@ -169,6 +169,16 @@ impl PimdirFlags {
             Self::Unknown => None,
             Self::Known(flags) => Some(flags),
         }
+    }
+
+    /// The first marker the store cannot hold (STORAGE §13), one
+    /// [`codec::is_flag`] refuses, `None` when every one
+    /// is held or the set is unknown.
+    pub fn invalid(&self) -> Option<&str> {
+        self.known()?
+            .iter()
+            .find(|flag| !codec::is_flag(flag))
+            .map(String::as_str)
     }
 
     /// Three-way merges two flag sets element-wise against their base.

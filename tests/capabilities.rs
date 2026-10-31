@@ -3,6 +3,8 @@
 //! performer and the user's choice among several, the owner parks what
 //! slipped past the gate, and a store from 0.5 gains the tables on open.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{

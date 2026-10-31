@@ -32,7 +32,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["client", "vendored"]
 client = ["dep:fs4", "dep:rusqlite"]
-search = ["client", "rusqlite/functions", "dep:ical-rs", "dep:mail-parser", "dep:vcard-rs"]
+search = ["dep:ical-rs", "dep:mail-parser", "dep:unicode-normalization", "dep:vcard-rs"]
 cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars"]
 vendored = ["rusqlite?/bundled"]
 
@@ -69,6 +69,7 @@ schemars = { version = "1", default-features = false, features = ["derive", "std
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11", default-features = false }
+unicode-normalization = { version = "0.1", default-features = false, optional = true }
 vcard-rs = { version = "0.5", default-features = false, features = ["parser"], optional = true }
 
 [patch.crates-io]

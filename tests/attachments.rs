@@ -4,6 +4,8 @@
 //! the message, in the transaction storing the body, whatever path
 //! stores it, once.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{

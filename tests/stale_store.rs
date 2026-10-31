@@ -6,6 +6,8 @@
 //! a store looks current to the version check alone. Every role opening it
 //! says so instead of failing on the first statement that names the table.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::client::{PimdirError, PimdirStore, producer::PimdirProducer, reader::PimdirReader};
 
 #[test]

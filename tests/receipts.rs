@@ -4,6 +4,8 @@
 //! predates receipts gains the table on open. An intent its performer
 //! acknowledges leaves one too (§15.5), a withdrawn row none.
 
+#![cfg(feature = "client")]
+
 use std::path::Path;
 
 use io_pimdir::{

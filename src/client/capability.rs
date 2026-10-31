@@ -566,7 +566,7 @@ fn item_flags(conn: &Connection, collection: &str, seq: i64) -> Result<PimdirFla
         )
         .optional()?
         .flatten();
-    Ok(codec::flags_from_json(flags.as_deref()))
+    Ok(codec::flags_from_column(flags.as_deref()))
 }
 
 type DeclarationRow = (String, Option<String>, Option<String>, Option<String>);

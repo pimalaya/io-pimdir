@@ -3,6 +3,8 @@
 //! The sync engine run end to end against the real store through the
 //! fake remote in `common`: one binary, one module per scenario.
 
+#![cfg(feature = "client")]
+
 mod common;
 
 mod chunked_pushes;

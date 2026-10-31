@@ -22,12 +22,13 @@ use io_pimdir::{
     client::search::{
         PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchHit,
         PimdirSearchMatched, PimdirSearchOptions, PimdirSearchPlacement, PimdirSearchSort,
-        PimdirSearchThread, tag::PimdirSearchTagSource,
+        PimdirSearchThread,
     },
     placement::PimdirLevel,
     search::{
         coverage::{PimdirSearchCoverage, PimdirSearchRemote, PimdirSearchTemporal},
         query::{PimdirQuery, PimdirQueryError},
+        tag::PimdirSearchTagSource,
     },
 };
 use pimalaya_cli::printer::Printer;

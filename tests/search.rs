@@ -8,7 +8,7 @@
 //!
 //! The spec is a sibling checkout, so the suite skips when it is absent.
 
-#![cfg(feature = "search")]
+#![cfg(all(feature = "client", feature = "search"))]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,7 +25,6 @@ use io_pimdir::{
         search::{
             PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchMatched,
             PimdirSearchOptions, PimdirSearchSort,
-            tag::{PimdirSearchTagError, PimdirSearchTagPlan},
         },
     },
     collection::{PimdirCollectionId, PimdirScope},
@@ -39,6 +38,7 @@ use io_pimdir::{
         chunk,
         coverage::PimdirSearchTemporal,
         query::{PimdirQuery, PimdirQueryPredicate},
+        tag::{PimdirSearchTagError, PimdirSearchTagPlan},
     },
     summary::{
         self, PimdirAddress, PimdirSummary, file::PimdirFileSummary, mail::PimdirMailSummary,
@@ -1627,4 +1627,743 @@ fn an_id_of_digits_names_the_seq_and_the_link_id() {
     let mut both = hits(&index, &format!("id:{} or id:777", alpha[0]));
     both.sort();
     assert_eq!(both.len(), 2);
+}
+
+/// The refresh coroutine answered over an index held in plain maps, as an
+/// owner holding its own database in another language answers it: every
+/// yield answered from the store and from the maps, every op mapped to
+/// them, never through the crate's `PimdirIndex`. The index it leaves must
+/// be the one `PimdirIndex` builds, row for row.
+mod memory {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::Path,
+    };
+
+    use io_pimdir::{
+        client::{PimdirStore, reader::PimdirReader, search::PimdirIndex},
+        codec,
+        coroutine::PimdirCoroutineState,
+        object::PimdirHash,
+        placement::PimdirLinkId,
+        search::refresh::{
+            PimdirIndexFeedRow, PimdirIndexGone, PimdirIndexHorizon, PimdirIndexKey,
+            PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexMeta, PimdirIndexObject,
+            PimdirIndexOp, PimdirIndexPlacement, PimdirIndexPresence, PimdirIndexRefresh,
+            PimdirIndexRefreshArg, PimdirIndexRefreshYield, PimdirIndexSummary, PimdirIndexText,
+        },
+        sql,
+        summary::{PimdirAddress, PimdirAddressRole},
+    };
+    use rusqlite::{Connection, OptionalExtension, params};
+
+    use crate::{PimdirIndexRefreshOptions, build, json, spec_dir, unix};
+
+    type Key = (String, i64);
+
+    /// An index in maps, and the store it reads.
+    struct Memory {
+        store: Connection,
+        reader: PimdirReader,
+        meta: PimdirIndexMeta,
+        placements: BTreeMap<Key, (String, Option<String>)>,
+        objects: BTreeMap<String, PimdirIndexObject>,
+        summary_text: BTreeMap<Key, PimdirIndexText>,
+        flags: BTreeMap<Key, BTreeSet<String>>,
+        occurrences: BTreeMap<Key, Vec<(String, String)>>,
+        messages: BTreeMap<String, (String, Option<String>)>,
+        threads: BTreeMap<String, (String, String, i64)>,
+    }
+
+    impl Memory {
+        fn new(dir: &Path) -> Self {
+            let store = Connection::open_in_memory().unwrap();
+            store
+                .execute(
+                    "ATTACH DATABASE ?1 AS store",
+                    [dir.join("pimdir.db").to_str().unwrap()],
+                )
+                .unwrap();
+            Self {
+                store,
+                reader: PimdirReader::open(dir).unwrap(),
+                meta: PimdirIndexMeta::default(),
+                placements: BTreeMap::new(),
+                objects: BTreeMap::new(),
+                summary_text: BTreeMap::new(),
+                flags: BTreeMap::new(),
+                occurrences: BTreeMap::new(),
+                messages: BTreeMap::new(),
+                threads: BTreeMap::new(),
+            }
+        }
+
+        /// Folds the whole feed, one run per batch.
+        fn refresh(&mut self, now: i64, batch: usize) {
+            loop {
+                let mut run = PimdirIndexRefresh::new(now, batch);
+                let mut arg = None;
+                let output = loop {
+                    match run.resume(arg.take()) {
+                        PimdirCoroutineState::Yielded(want) => arg = Some(self.answer(want)),
+                        PimdirCoroutineState::Complete(output) => break output.unwrap(),
+                    }
+                };
+                if output.exhausted {
+                    break;
+                }
+            }
+        }
+
+        fn kind(&self, collection: &str) -> String {
+            self.store
+                .query_row(
+                    "SELECT kind FROM store.collections WHERE id = ?1",
+                    [collection],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+                .unwrap_or_default()
+        }
+
+        /// A live store item's sort key, `None` once it is gone.
+        fn sort_key(&self, (collection, seq): &Key) -> Option<String> {
+            self.store
+                .query_row(
+                    "SELECT sort_key FROM store.items WHERE collection = ?1 AND seq = ?2",
+                    params![collection, seq],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        }
+
+        fn feed(&self, statement: &str, params: impl rusqlite::Params) -> Vec<PimdirIndexFeedRow> {
+            let mut stmt = self.store.prepare(statement).unwrap();
+            let rows: Vec<PimdirIndexFeedRow> = stmt
+                .query_map(params, |r| {
+                    Ok(PimdirIndexFeedRow {
+                        collection: r.get(0)?,
+                        link_id: PimdirLinkId(r.get(1)?),
+                        seq: r.get(2)?,
+                        object: r.get::<_, Option<String>>(3)?.map(PimdirHash),
+                        flags: codec::flags_from_column(r.get::<_, Option<String>>(4)?.as_deref()),
+                        deleted: r.get::<_, i64>(5)? != 0,
+                        retained: r.get::<_, Option<String>>(6)?.is_some(),
+                        kind: r.get(7)?,
+                        account: r.get(8)?,
+                        changed: r.get(9)?,
+                        summary: None,
+                    })
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            rows.into_iter()
+                .map(|mut row| {
+                    if row.needs_summary() {
+                        row.summary = Some(self.summary(&row.collection, row.seq));
+                    }
+                    row
+                })
+                .collect()
+        }
+
+        /// An item's summary through the reader, its address rows read
+        /// beside it.
+        fn summary(&self, collection: &str, seq: i64) -> PimdirIndexSummary {
+            let Some(item) = self.reader.get_item(collection, seq).unwrap() else {
+                return PimdirIndexSummary::default();
+            };
+            let mut stmt = self
+                .store
+                .prepare(
+                    "SELECT role, address, name FROM store.item_address \
+                     WHERE collection = ?1 AND link_id = ?2 ORDER BY role, position",
+                )
+                .unwrap();
+            let addresses = stmt
+                .query_map(params![collection, item.link_id.0], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        PimdirAddress {
+                            address: r.get(1)?,
+                            name: r.get(2)?,
+                        },
+                    ))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .filter_map(|(role, address)| Some((PimdirAddressRole::parse(&role)?, address)))
+                .collect();
+            PimdirIndexSummary {
+                summary: item.summary,
+                addresses,
+            }
+        }
+
+        fn held(&self, (collection, seq): &Key) -> Option<PimdirIndexPlacement> {
+            let (link_id, hash) = self.placements.get(&(collection.clone(), *seq))?;
+            Some(PimdirIndexPlacement {
+                collection: collection.clone(),
+                seq: *seq,
+                link_id: PimdirLinkId(link_id.clone()),
+                hash: hash.clone().map(PimdirHash),
+            })
+        }
+
+        fn message(&self, link_id: &str) -> PimdirIndexMessage {
+            let mail: Vec<&Key> = self
+                .placements
+                .iter()
+                .filter(|(key, (link, _))| link == link_id && self.kind(&key.0) == "message/rfc822")
+                .map(|(key, _)| key)
+                .collect();
+            let keys: Vec<String> = mail.iter().filter_map(|key| self.sort_key(key)).collect();
+            let dated = keys.iter().filter(|key| !key.is_empty());
+            let in_reply_to = self
+                .placements
+                .iter()
+                .filter(|(_, (link, _))| link == link_id)
+                .find_map(|((collection, _), _)| {
+                    self.store
+                        .query_row(
+                            "SELECT msg_id FROM store.mail_in_reply_to \
+                             WHERE collection = ?1 AND link_id = ?2 ORDER BY position LIMIT 1",
+                            params![collection, link_id],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .unwrap()
+                });
+
+            PimdirIndexMessage {
+                row: self
+                    .messages
+                    .get(link_id)
+                    .map(|(thread, parent)| PimdirIndexMessageRow {
+                        thread: thread.clone(),
+                        parent: parent.clone(),
+                    }),
+                children: self
+                    .messages
+                    .iter()
+                    .filter(|(_, (_, parent))| parent.as_deref() == Some(link_id))
+                    .map(|(child, _)| child.clone())
+                    .collect(),
+                presence: (!keys.is_empty()).then(|| PimdirIndexPresence {
+                    sort_key: keys.iter().min().cloned().unwrap_or_default(),
+                    first: dated.clone().min().cloned(),
+                    last: dated.max().cloned(),
+                }),
+                hash: mail
+                    .iter()
+                    .find_map(|key| self.placements[*key].1.clone())
+                    .map(PimdirHash),
+                in_reply_to,
+            }
+        }
+
+        fn answer(&mut self, want: PimdirIndexRefreshYield) -> PimdirIndexRefreshArg {
+            match want {
+                PimdirIndexRefreshYield::WantsIndexState => {
+                    let mut meta = self.meta.clone();
+                    (meta.head, meta.purges) = self
+                        .store
+                        .query_row(
+                            "SELECT next_change - 1, purges FROM store.store_meta WHERE id = 1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .unwrap();
+                    meta.moved = self
+                        .store
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM store.collections WHERE changed > ?1)",
+                            [meta.store_reconciled],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    PimdirIndexRefreshArg::IndexState(meta)
+                }
+                PimdirIndexRefreshYield::WantsReexpand {
+                    old,
+                    new,
+                    tzdb_version,
+                } => {
+                    let every = tzdb_version != self.meta.tzdb_version;
+                    let mut stmt = self
+                        .store
+                        .prepare(
+                            "SELECT i.collection, i.seq, i.sort_key, \
+                                    coalesce(e.recurring, t.recurring), coalesce(e.until, t.until) \
+                             FROM store.items i JOIN store.collections c ON c.id = i.collection \
+                             LEFT JOIN store.event_summary e \
+                               ON e.collection = i.collection AND e.link_id = i.link_id \
+                             LEFT JOIN store.task_summary t \
+                               ON t.collection = i.collection AND t.link_id = i.link_id \
+                             WHERE c.kind = 'text/calendar' AND i.deleted = 0",
+                        )
+                        .unwrap();
+                    let old_end = old.end[..10].replace('-', "");
+                    let keys = stmt
+                        .query_map([], |r| {
+                            Ok((
+                                PimdirIndexKey {
+                                    collection: r.get(0)?,
+                                    seq: r.get(1)?,
+                                },
+                                r.get::<_, String>(2)?,
+                                r.get::<_, Option<i64>>(3)? == Some(1),
+                                r.get::<_, Option<String>>(4)?,
+                            ))
+                        })
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .filter(|(_, sort_key, recurring, until)| {
+                            let key = sort_key.as_str();
+                            every
+                                || (*recurring
+                                    && until.as_ref().is_none_or(|until| {
+                                        until.get(..8).unwrap_or(until) >= old_end.as_str()
+                                    }))
+                                || (!*recurring
+                                    && ((key >= old.end.as_str() && key < new.end.as_str())
+                                        || (key >= new.start.as_str() && key < old.start.as_str())))
+                        })
+                        .map(|(key, ..)| key)
+                        .collect();
+                    PimdirIndexRefreshArg::Reexpand(keys)
+                }
+                PimdirIndexRefreshYield::WantsFeed { since, limit } => {
+                    PimdirIndexRefreshArg::Feed(self.feed(
+                        sql::search::LOAD_CHANGED_ITEMS,
+                        rusqlite::named_params! { ":since": since, ":limit": limit as i64 },
+                    ))
+                }
+                PimdirIndexRefreshYield::WantsUnread { limit } => {
+                    let mut rows = Vec::new();
+                    for ((collection, seq), _) in
+                        self.placements.iter().filter(|(_, p)| p.1.is_none())
+                    {
+                        rows.extend(self.feed(
+                            "SELECT i.collection, i.link_id, i.seq, i.object_hash, \
+                               CASE WHEN i.flags_known = 1 THEN coalesce((SELECT group_concat(f.flag, ' ') \
+                                 FROM store.placement_flag f WHERE f.collection = i.collection \
+                                 AND f.link_id = i.link_id), '') END, \
+                               i.deleted, i.retained_at, c.kind, c.account, i.changed \
+                             FROM store.items i JOIN store.collections c ON c.id = i.collection \
+                             WHERE i.collection = ?1 AND i.seq = ?2 AND i.object_hash IS NOT NULL \
+                               AND i.deleted = 0 AND c.kind != 'application/octet-stream'",
+                            params![collection, seq],
+                        ));
+                    }
+                    rows.truncate(limit);
+                    PimdirIndexRefreshArg::Feed(rows)
+                }
+                PimdirIndexRefreshYield::WantsHeld {
+                    placements,
+                    objects,
+                } => PimdirIndexRefreshArg::Held {
+                    placements: placements
+                        .into_iter()
+                        .filter_map(|key| self.held(&(key.collection, key.seq)))
+                        .collect(),
+                    objects: objects
+                        .into_iter()
+                        .filter(|hash| self.objects.contains_key(hash.as_str()))
+                        .collect(),
+                },
+                PimdirIndexRefreshYield::WantsBodies { hashes } => {
+                    let blobs = self.reader.blobs();
+                    PimdirIndexRefreshArg::Bodies(
+                        hashes
+                            .into_iter()
+                            .filter_map(|hash| Some((hash.clone(), blobs.get(&hash).unwrap()?)))
+                            .collect(),
+                    )
+                }
+                PimdirIndexRefreshYield::WantsSummaries { placements } => {
+                    PimdirIndexRefreshArg::Summaries(
+                        placements
+                            .into_iter()
+                            .map(|key| {
+                                let summary = self.summary(&key.collection, key.seq);
+                                (key, summary)
+                            })
+                            .collect(),
+                    )
+                }
+                PimdirIndexRefreshYield::WantsMessages { link_ids } => {
+                    PimdirIndexRefreshArg::Messages(
+                        link_ids
+                            .into_iter()
+                            .map(|link_id| {
+                                let message = self.message(&link_id);
+                                (link_id, message)
+                            })
+                            .collect(),
+                    )
+                }
+                PimdirIndexRefreshYield::WantsGone => {
+                    let placements = self
+                        .placements
+                        .keys()
+                        .filter(|(collection, seq)| {
+                            self.store
+                                .query_row(
+                                    "SELECT 1 FROM store.items WHERE collection = ?1 AND seq = ?2",
+                                    params![collection, seq],
+                                    |_| Ok(()),
+                                )
+                                .optional()
+                                .unwrap()
+                                .is_none()
+                        })
+                        .filter_map(|key| self.held(key))
+                        .collect();
+                    let objects = self
+                        .objects
+                        .keys()
+                        .filter(|hash| {
+                            self.store
+                                .query_row(
+                                    "SELECT 1 FROM store.objects WHERE hash = ?1",
+                                    [hash],
+                                    |_| Ok(()),
+                                )
+                                .optional()
+                                .unwrap()
+                                .is_none()
+                        })
+                        .map(|hash| PimdirHash(hash.clone()))
+                        .collect();
+                    PimdirIndexRefreshArg::Gone(PimdirIndexGone {
+                        placements,
+                        objects,
+                    })
+                }
+                PimdirIndexRefreshYield::Writes(ops) => {
+                    for op in ops {
+                        self.write(op);
+                    }
+                    PimdirIndexRefreshArg::Written
+                }
+            }
+        }
+
+        fn write(&mut self, op: PimdirIndexOp) {
+            match op {
+                PimdirIndexOp::PutObject(object) => {
+                    self.objects.insert(object.hash.0.clone(), object);
+                }
+                PimdirIndexOp::DropObject(hash) => {
+                    self.objects.remove(&hash.0);
+                }
+                PimdirIndexOp::PutPlacement(placement) => {
+                    self.placements.insert(
+                        (placement.collection, placement.seq),
+                        (placement.link_id.0, placement.hash.map(|hash| hash.0)),
+                    );
+                }
+                PimdirIndexOp::DropPlacement { collection, seq } => {
+                    let key = (collection, seq);
+                    self.placements.remove(&key);
+                    self.summary_text.remove(&key);
+                    self.flags.remove(&key);
+                    self.occurrences.remove(&key);
+                }
+                PimdirIndexOp::PutSummaryText {
+                    collection,
+                    seq,
+                    text,
+                } => {
+                    let key = (collection, seq);
+                    if self.placements.contains_key(&key) {
+                        self.summary_text.insert(key, text);
+                    }
+                }
+                PimdirIndexOp::DropSummaryText { collection, seq } => {
+                    self.summary_text.remove(&(collection, seq));
+                }
+                PimdirIndexOp::ReplaceFlags {
+                    collection,
+                    seq,
+                    flags,
+                } => {
+                    let key = (collection, seq);
+                    self.flags.remove(&key);
+                    if !flags.is_empty() {
+                        self.flags.insert(key, flags);
+                    }
+                }
+                PimdirIndexOp::ReplaceOccurrences {
+                    collection,
+                    seq,
+                    occurrences,
+                } => {
+                    let key = (collection, seq);
+                    self.occurrences.remove(&key);
+                    if !occurrences.is_empty() {
+                        let rows = occurrences.into_iter().map(|o| (o.start, o.end)).collect();
+                        self.occurrences.insert(key, rows);
+                    }
+                }
+                PimdirIndexOp::PutMessage {
+                    link_id,
+                    thread,
+                    parent,
+                } => {
+                    assert!(
+                        self.threads.contains_key(&thread),
+                        "{thread} is written first"
+                    );
+                    self.messages.insert(link_id, (thread, parent));
+                }
+                PimdirIndexOp::DropMessage(link_id) => {
+                    self.messages.remove(&link_id);
+                }
+                PimdirIndexOp::PutThread {
+                    id,
+                    first,
+                    last,
+                    count,
+                } => {
+                    self.threads.insert(id, (first, last, count as i64));
+                }
+                PimdirIndexOp::DropThread(id) => {
+                    if !self.messages.values().any(|(thread, _)| *thread == id) {
+                        self.threads.remove(&id);
+                    }
+                }
+                PimdirIndexOp::SetCursor {
+                    store_change,
+                    store_purges,
+                    store_reconciled,
+                } => {
+                    self.meta.store_change = store_change;
+                    self.meta.store_purges = store_purges;
+                    self.meta.store_reconciled = store_reconciled;
+                }
+                PimdirIndexOp::SetHorizon(horizon) => self.meta.horizon = Some(horizon),
+                PimdirIndexOp::SetTzdbVersion(version) => self.meta.tzdb_version = version,
+            }
+        }
+    }
+
+    /// The index.db `PimdirIndex` built, row for row, against the maps.
+    fn agree(dir: &Path, memory: &Memory) {
+        let conn = Connection::open(dir.join("index.db")).unwrap();
+        let rows = |sql: &str| -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let width = stmt.column_count();
+            stmt.query_map([], |r| (0..width).map(|at| r.get(at)).collect())
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let text = |value: &rusqlite::types::Value| match value {
+            rusqlite::types::Value::Text(text) => text.clone(),
+            value => panic!("not a text: {value:?}"),
+        };
+        let int = |value: &rusqlite::types::Value| match value {
+            rusqlite::types::Value::Integer(int) => *int,
+            value => panic!("not an integer: {value:?}"),
+        };
+        let maybe = |value: &rusqlite::types::Value| match value {
+            rusqlite::types::Value::Null => None,
+            value => Some(text(value)),
+        };
+
+        let placements: BTreeMap<Key, (String, Option<String>)> =
+            rows("SELECT collection, seq, link_id, hash FROM placement")
+                .iter()
+                .map(|r| ((text(&r[0]), int(&r[1])), (text(&r[2]), maybe(&r[3]))))
+                .collect();
+        assert_eq!(placements, memory.placements, "placements");
+
+        let objects: BTreeMap<String, Vec<i64>> =
+            rows("SELECT hash, attachment, tel, adr, bday, photo, status FROM object")
+                .iter()
+                .map(|r| (text(&r[0]), (1..6).map(|at| int(&r[at])).collect()))
+                .collect();
+        let held: BTreeMap<String, Vec<i64>> = memory
+            .objects
+            .iter()
+            .map(|(hash, o)| {
+                let marks = [o.attachment, o.tel, o.adr, o.bday, o.photo];
+                (hash.clone(), marks.into_iter().map(i64::from).collect())
+            })
+            .collect();
+        assert_eq!(objects, held, "objects");
+        let statuses: BTreeMap<String, String> = rows("SELECT hash, status FROM object")
+            .iter()
+            .map(|r| (text(&r[0]), text(&r[1])))
+            .collect();
+        let held: BTreeMap<String, String> = memory
+            .objects
+            .iter()
+            .map(|(hash, o)| (hash.clone(), o.status.as_str().to_string()))
+            .collect();
+        assert_eq!(statuses, held, "object statuses");
+
+        let categories: BTreeSet<(String, String)> =
+            rows("SELECT o.hash, c.value FROM object_category c JOIN object o ON o.id = c.object")
+                .iter()
+                .map(|r| (text(&r[0]), text(&r[1])))
+                .collect();
+        let held: BTreeSet<(String, String)> = memory
+            .objects
+            .iter()
+            .flat_map(|(hash, o)| {
+                o.categories
+                    .iter()
+                    .map(|value| (hash.clone(), value.clone()))
+            })
+            .collect();
+        assert_eq!(categories, held, "card categories");
+
+        let chunks: BTreeSet<(String, i64, String, i64, i64)> = rows(
+            "SELECT o.hash, c.ord, c.field, c.start, c.end FROM chunk c JOIN object o ON o.id = c.object",
+        )
+        .iter()
+        .map(|r| (text(&r[0]), int(&r[1]), text(&r[2]), int(&r[3]), int(&r[4])))
+        .collect();
+        let held: BTreeSet<(String, i64, String, i64, i64)> = memory
+            .objects
+            .iter()
+            .flat_map(|(hash, o)| {
+                o.chunks.iter().enumerate().map(|(ord, chunk)| {
+                    (
+                        hash.clone(),
+                        ord as i64,
+                        chunk.field.to_string(),
+                        chunk.range.start as i64,
+                        chunk.range.end as i64,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(chunks, held, "chunks");
+
+        let texts: BTreeSet<String> =
+            rows("SELECT o.hash FROM object_text t JOIN object o ON o.id = t.rowid")
+                .iter()
+                .map(|r| text(&r[0]))
+                .collect();
+        let held: BTreeSet<String> = memory.objects.keys().cloned().collect();
+        assert_eq!(texts, held, "the bodies holding text");
+        let summaries: BTreeSet<Key> = rows(
+            "SELECT p.collection, p.seq FROM summary_text t JOIN placement p ON p.id = t.rowid",
+        )
+        .iter()
+        .map(|r| (text(&r[0]), int(&r[1])))
+        .collect();
+        let held: BTreeSet<Key> = memory.summary_text.keys().cloned().collect();
+        assert_eq!(summaries, held, "the placements holding summary text");
+
+        let flags: BTreeMap<Key, BTreeSet<String>> = rows("SELECT collection, seq, flag FROM flag")
+            .iter()
+            .fold(BTreeMap::new(), |mut flags, r| {
+                flags
+                    .entry((text(&r[0]), int(&r[1])))
+                    .or_insert_with(BTreeSet::new)
+                    .insert(text(&r[2]));
+                flags
+            });
+        assert_eq!(flags, memory.flags, "flags");
+
+        let occurrences: BTreeMap<Key, Vec<(String, String)>> = rows(
+            "SELECT collection, seq, start, end FROM occurrence ORDER BY collection, seq, start, end",
+        )
+        .iter()
+        .fold(BTreeMap::new(), |mut occurrences, r| {
+            occurrences
+                .entry((text(&r[0]), int(&r[1])))
+                .or_insert_with(Vec::new)
+                .push((text(&r[2]), text(&r[3])));
+            occurrences
+        });
+        let mut held = memory.occurrences.clone();
+        held.values_mut().for_each(|rows| rows.sort());
+        assert_eq!(occurrences, held, "occurrences");
+
+        let messages: BTreeMap<String, (String, Option<String>)> =
+            rows("SELECT link_id, thread, parent FROM message")
+                .iter()
+                .map(|r| (text(&r[0]), (text(&r[1]), maybe(&r[2]))))
+                .collect();
+        assert_eq!(messages, memory.messages, "messages");
+        let threads: BTreeMap<String, (String, String, i64)> =
+            rows("SELECT id, first, last, count FROM thread")
+                .iter()
+                .map(|r| (text(&r[0]), (text(&r[1]), text(&r[2]), int(&r[3]))))
+                .collect();
+        assert_eq!(threads, memory.threads, "threads");
+
+        let meta = &rows(
+            "SELECT store_change, store_purges, store_reconciled, horizon_start, horizon_end, \
+             tzdb_version FROM index_meta",
+        )[0];
+        let held = &memory.meta;
+        assert_eq!(
+            (int(&meta[0]), int(&meta[1]), int(&meta[2])),
+            (held.store_change, held.store_purges, held.store_reconciled),
+            "the cursor"
+        );
+        assert_eq!(
+            Some(PimdirIndexHorizon {
+                start: text(&meta[3]),
+                end: text(&meta[4]),
+            }),
+            held.horizon,
+            "the horizon"
+        );
+        assert_eq!(text(&meta[5]), held.tzdb_version, "the tzdb version");
+    }
+
+    /// The vectors' fixture store, indexed by `PimdirIndex` and by
+    /// a consumer holding its index in maps, agrees row for row: once
+    /// whole in small batches, then after a rename, which the key
+    /// reconciliation follows, and a horizon rolled a week later.
+    #[test]
+    fn a_consumer_of_its_own_shape_folds_the_canonical_index() {
+        let Some(spec) = spec_dir() else {
+            eprintln!("skipped: no pimdir spec checkout beside this one");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        build(&spec, dir.path());
+        let vectors = json(&spec.join("vectors/search/queries.json"));
+        let now = unix(vectors["now"].as_str().unwrap());
+
+        let mut index = PimdirIndex::open(dir.path()).unwrap();
+        let options = PimdirIndexRefreshOptions {
+            batch: 4,
+            now: Some(now),
+            ..Default::default()
+        };
+        assert!(index.refresh(&options).unwrap().is_current());
+        let mut memory = Memory::new(dir.path());
+        memory.refresh(now, 4);
+        assert!(!memory.placements.is_empty() && !memory.messages.is_empty());
+        assert!(!memory.occurrences.is_empty());
+        agree(dir.path(), &memory);
+
+        PimdirStore::open(dir.path())
+            .unwrap()
+            .rename_collection("work/INBOX", "work/Mail")
+            .unwrap();
+        let later = now + 7 * 86_400;
+        let report = index
+            .refresh(&PimdirIndexRefreshOptions {
+                now: Some(later),
+                ..options
+            })
+            .unwrap();
+        assert!(report.reconciled && report.removed > 0, "{report:?}");
+        memory.refresh(later, 4);
+        agree(dir.path(), &memory);
+    }
 }

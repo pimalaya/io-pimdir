@@ -14,15 +14,13 @@ use std::{
     sync::Arc,
 };
 
-use rusqlite::{
-    Connection, OptionalExtension, Row, TransactionBehavior, named_params, types::ToSql,
-};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, named_params};
 
 use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
-        PimdirError, PimdirSourceStore, attachments, blobs::PimdirBlobs, busy_or_sql, release_pins,
-        rows, schema,
+        PimdirError, PimdirSourceStore, attachments, bind_list, blobs::PimdirBlobs, busy_or_sql,
+        release_pins, rows, schema,
     },
     codec,
     collection::{
@@ -183,14 +181,12 @@ impl PimdirSourceStore {
         &self,
         links: &[PimdirLinkId],
     ) -> Result<BTreeMap<PimdirLinkId, PimdirObject>, PimdirError> {
-        let ids: Vec<&str> = links.iter().map(|l| l.0.as_str()).collect();
+        let conn = &self.store.reader.conn;
+        bind_list(conn, "links", links.iter().map(|l| l.0.as_str()))?;
         let found = rows(
-            &self.store.reader.conn,
+            conn,
             sql::LOOKUP_OBJECTS,
-            named_params! {
-                ":links": serde_json::to_string(&ids)?,
-                ":account": self.store.account.as_deref(),
-            },
+            named_params! { ":account": self.store.account.as_deref() },
             |r| {
                 Ok((
                     PimdirLinkId(r.get::<_, String>(0)?),
@@ -472,14 +468,14 @@ pub(crate) fn apply(
     // NOTE: after the upserts, so a binding the batch inserted is stamped
     // too (SYNC §5).
     for (collection, handles) in stamps {
-        let handles: Vec<&str> = handles.iter().map(|handle| handle.0.as_str()).collect();
+        bind_list(
+            tx,
+            "handles",
+            handles.iter().map(|handle| handle.0.as_str()),
+        )?;
         tx.execute(
             sql::STAMP_BINDINGS,
-            named_params! {
-                ":collection": collection.0,
-                ":source": source.0,
-                ":handles": serde_json::to_string(&handles)?,
-            },
+            named_params! { ":collection": collection.0, ":source": source.0 },
         )?;
     }
 
@@ -746,45 +742,56 @@ pub(crate) fn read_hub(
         hub.conflict = codec::conflict_from_str(&policy);
     }
 
-    let scope = links.map(serde_json::to_string).transpose()?;
-    let (items_sql, bindings_sql) = match scope {
-        Some(_) => (sql::LOAD_ITEMS_BY_LINK, sql::LOAD_BINDINGS_BY_LINK),
-        None => (sql::LOAD_ITEMS, sql::LOAD_BINDINGS),
-    };
-    let mut params: Vec<(&str, &dyn ToSql)> = vec![(":collection", &collection)];
-    if let Some(scope) = &scope {
-        params.push((":links", scope));
+    let kind = kind_of(conn, collection)?;
+    let tables = tables_of(&kind);
+    // NOTE: one fill of the `links` slot serves every read below, none of
+    // which binds another slot.
+    if let Some(links) = links {
+        bind_list(conn, "links", links)?;
     }
+    let scoped = links.is_some();
+    let (items_sql, bindings_sql) = match scoped {
+        true => (sql::LOAD_ITEMS_BY_LINK, sql::LOAD_BINDINGS_BY_LINK),
+        false => (sql::LOAD_ITEMS, sql::LOAD_BINDINGS),
+    };
+    let key = named_params! { ":collection": collection };
 
-    for (link, item) in rows(conn, items_sql, params.as_slice(), item_from_row)? {
+    for (link, item) in rows(conn, items_sql, key, item_from_row)? {
         hub.items.insert(link, item);
     }
-    for (link, source, binding) in rows(conn, bindings_sql, params.as_slice(), binding_from_row)? {
+    for (link, source, binding) in rows(conn, bindings_sql, key, binding_from_row)? {
         if let Some(item) = hub.items.get_mut(&link) {
             item.sources.insert(source, binding);
         }
     }
 
-    let kind = kind_of(conn, collection)?;
-    for table in tables_of(&kind) {
-        for (link, summary) in load_summaries(conn, table, collection, scope.as_deref())? {
+    for table in &tables {
+        for (link, summary) in load_summaries(conn, *table, collection, scoped)? {
             if let Some(item) = hub.items.get_mut(&link) {
                 item.summary = Some(summary);
             }
         }
     }
-    for (link, role, address) in load_addresses(
-        conn,
-        sql::LOAD_ADDRESSES_BY_LINK,
-        collection,
-        scope.as_deref(),
-    )? {
+    for (link, role, address) in
+        load_addresses(conn, sql::LOAD_ADDRESSES_BY_LINK, collection, scoped)?
+    {
         if let Some(summary) = hub
             .items
             .get_mut(&link)
             .and_then(|item| item.summary.as_mut())
         {
             attach_address(summary, role, address);
+        }
+    }
+    for statement in list_sql(&tables) {
+        for (link, value) in load_list(conn, statement, collection, scoped)? {
+            if let Some(summary) = hub
+                .items
+                .get_mut(&link)
+                .and_then(|item| item.summary.as_mut())
+            {
+                attach_list_value(summary, value);
+            }
         }
     }
 
@@ -864,7 +871,7 @@ impl PimdirSummaryTable {
 
     /// The read of one live item by `:collection` and `:seq` with its row
     /// of this table (`get_mail` and its siblings, §14.1), a seek where the
-    /// load statements filtered by `:links` scan the collection.
+    /// load statements filtered by the `links` slot scan the collection.
     pub(crate) fn get_sql(self) -> &'static str {
         match self {
             Self::Mail => sql::GET_MAIL,
@@ -887,7 +894,8 @@ impl PimdirSummaryTable {
         }
     }
 
-    /// Maps a row whose summary columns start at `at`, addresses empty.
+    /// Maps a row whose summary columns start at `at`, its addresses and
+    /// its lists (§4.4) empty.
     pub(crate) fn read_row(self, row: &Row, at: usize) -> rusqlite::Result<Option<PimdirSummary>> {
         let text = |offset: usize| row.get::<_, Option<String>>(at + offset);
         let flag = |offset: usize| {
@@ -907,22 +915,19 @@ impl PimdirSummaryTable {
 
         let summary = match self {
             Self::Mail => {
-                let Some(subject) = present(2)? else {
+                let Some(subject) = present(1)? else {
                     return Ok(None);
                 };
                 PimdirSummary::Mail(PimdirMailSummary {
                     message_id: text(0)?,
-                    in_reply_to: text(1)?
-                        .map(|ids| codec::ids_from_json(&ids))
-                        .unwrap_or_default(),
                     subject,
-                    sender: text(3)?,
-                    sender_name: text(4)?,
-                    date: text(5)?,
+                    sender: text(2)?,
+                    sender_name: text(3)?,
+                    date: text(4)?,
                     size: row
-                        .get::<_, Option<i64>>(at + 6)?
+                        .get::<_, Option<i64>>(at + 5)?
                         .map(|size| size.max(0) as u64),
-                    attachment: flag(7)?,
+                    attachment: flag(6)?,
                     // NOTE: owner loads only; a reader's statements leave it out.
                     invitation: match row.as_ref().column_index("invitation") {
                         Ok(at) => row.get(at)?,
@@ -974,12 +979,10 @@ impl PimdirSummaryTable {
                     recurring: flag(11)?,
                     until: text(12)?,
                     priority: row.get(at + 13)?,
-                    categories: text(14)?
-                        .map(|values| codec::ids_from_json(&values))
-                        .unwrap_or_default(),
-                    parent: text(15)?,
-                    mid: text(16)?,
-                    created: text(17)?,
+                    categories: Vec::new(),
+                    parent: text(14)?,
+                    mid: text(15)?,
+                    created: text(16)?,
                     organizer: None,
                     attendees: Vec::new(),
                     contacts: Vec::new(),
@@ -1016,14 +1019,15 @@ impl PimdirSummaryTable {
     }
 }
 
-/// The summaries a table holds for a collection, or for `:links`.
+/// The summaries a table holds for a collection, or with `scoped` for the
+/// link ids of the `links` slot (§4.4), which the caller filled.
 pub(crate) fn load_summaries(
     conn: &Connection,
     table: PimdirSummaryTable,
     collection: &str,
-    links: Option<&str>,
+    scoped: bool,
 ) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirSummary)>> {
-    load_summaries_by(conn, table.load_sql(), table, collection, links)
+    load_summaries_by(conn, table.load_sql(), table, collection, scoped)
 }
 
 /// [`load_summaries`] through `statement`, a load of `table` as a reader
@@ -1033,12 +1037,12 @@ pub(crate) fn load_summaries_by(
     statement: &str,
     table: PimdirSummaryTable,
     collection: &str,
-    links: Option<&str>,
+    scoped: bool,
 ) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirSummary)>> {
     let loaded = rows(
         conn,
         statement,
-        named_params! { ":collection": collection, ":links": links },
+        named_params! { ":collection": collection, ":scoped": scoped },
         |row| Ok((PimdirLinkId(row.get(0)?), table.read_row(row, 1)?)),
     )?;
 
@@ -1048,18 +1052,19 @@ pub(crate) fn load_summaries_by(
         .collect())
 }
 
-/// The addresses of a collection's items, or of `:links`, in document order,
-/// through `statement`, `load_addresses_by_link` as the store answers it.
+/// The addresses of a collection's items, or with `scoped` of the `links`
+/// slot's, in document order, through `statement`,
+/// `load_addresses_by_link` as the store answers it.
 pub(crate) fn load_addresses(
     conn: &Connection,
     statement: &str,
     collection: &str,
-    links: Option<&str>,
+    scoped: bool,
 ) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirAddressRole, PimdirAddress)>> {
     let loaded = rows(
         conn,
         statement,
-        named_params! { ":collection": collection, ":links": links },
+        named_params! { ":collection": collection, ":scoped": scoped },
         |row| {
             Ok((
                 PimdirLinkId(row.get(0)?),
@@ -1076,6 +1081,47 @@ pub(crate) fn load_addresses(
         .into_iter()
         .filter_map(|(link, role, address)| Some((link, PimdirAddressRole::parse(&role)?, address)))
         .collect())
+}
+
+/// The list statements the summaries of `tables` read beside their rows
+/// (§4.4): `load_in_reply_to` for mail, `load_categories` for tasks.
+pub(crate) fn list_sql(tables: &[PimdirSummaryTable]) -> Vec<&'static str> {
+    let mut statements = Vec::new();
+    if tables.contains(&PimdirSummaryTable::Mail) {
+        statements.push(sql::LOAD_IN_REPLY_TO);
+    }
+    if tables.contains(&PimdirSummaryTable::Task) {
+        statements.push(sql::LOAD_CATEGORIES);
+    }
+    statements
+}
+
+/// The values of a list Annex A derives (§4.4), a collection's or with
+/// `scoped` the `links` slot's, through `statement`, `load_in_reply_to` or
+/// `load_categories` as the store answers it: each by its item, in
+/// document order.
+pub(crate) fn load_list(
+    conn: &Connection,
+    statement: &str,
+    collection: &str,
+    scoped: bool,
+) -> rusqlite::Result<Vec<(PimdirLinkId, String)>> {
+    rows(
+        conn,
+        statement,
+        named_params! { ":collection": collection, ":scoped": scoped },
+        |row| Ok((PimdirLinkId(row.get(0)?), row.get(2)?)),
+    )
+}
+
+/// Files a list value under the field its summary keeps it in: an
+/// `In-Reply-To` id on a message, a category on a task.
+pub(crate) fn attach_list_value(summary: &mut PimdirSummary, value: String) {
+    match summary {
+        PimdirSummary::Mail(mail) => mail.in_reply_to.push(value),
+        PimdirSummary::Task(task) => task.categories.push(value),
+        _ => {}
+    }
 }
 
 /// Files an address row under the field its role names.
@@ -1351,7 +1397,7 @@ fn keep_overruled(
             ":collection": collection,
             ":link_id": key.0,
             ":seq": seq,
-            ":flags": codec::flags_to_json(&lost.flags),
+            ":flags_known": lost.flags.known().is_some(),
             ":object_hash": lost.object.0,
             ":sort_key": lost.sort_key.0.as_str(),
             ":level": codec::level_to_int(PimdirLevel::Full),
@@ -1360,6 +1406,7 @@ fn keep_overruled(
             ":conflict_object": None::<&str>,
         },
     )?;
+    write_flags(conn, collection, &key.0, None, &lost.flags)?;
     write_summary(conn, collection, &key, None, lost.summary.as_ref())?;
     conn.execute(
         sql::RETAIN_ITEM,
@@ -1423,7 +1470,7 @@ fn insert_item(
     collection: &str,
     link: &PimdirLinkId,
     item: &mut PimdirHubItem,
-) -> rusqlite::Result<()> {
+) -> Result<(), PimdirError> {
     if revive_item(conn, collection, link, item)? {
         return Ok(());
     }
@@ -1450,7 +1497,7 @@ fn insert_item(
             ":collection": collection,
             ":link_id": link.0,
             ":seq": seq,
-            ":flags": codec::flags_to_json(&item.flags),
+            ":flags_known": item.flags.known().is_some(),
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
@@ -1459,6 +1506,7 @@ fn insert_item(
             ":conflict_object": item.conflict_object.as_ref().map(|o| o.0.as_str()),
         },
     )?;
+    write_flags(conn, collection, &link.0, None, &item.flags)?;
     for (source, binding) in &item.sources {
         insert_binding(conn, collection, link, source, binding)?;
     }
@@ -1476,7 +1524,7 @@ fn revive_item(
     collection: &str,
     link: &PimdirLinkId,
     item: &mut PimdirHubItem,
-) -> rusqlite::Result<bool> {
+) -> Result<bool, PimdirError> {
     let pinned: Option<(Option<String>, Option<String>)> = conn
         .query_row(
             sql::RETAINED_ITEM,
@@ -1521,18 +1569,20 @@ fn revive_item(
     Ok(true)
 }
 
+/// Updates an item's row, then its flag set ([`write_flags`]): the
+/// triggers stamp it only when a column or a flag moved (§4.5).
 fn update_item(
     conn: &Connection,
     collection: &str,
     link: &PimdirLinkId,
     item: &PimdirHubItem,
-) -> rusqlite::Result<()> {
+) -> Result<(), PimdirError> {
     conn.execute(
         sql::UPDATE_ITEM,
         named_params! {
             ":collection": collection,
             ":link_id": link.0,
-            ":flags": codec::flags_to_json(&item.flags),
+            ":flags_known": item.flags.known().is_some(),
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
@@ -1541,6 +1591,43 @@ fn update_item(
             ":conflict_object": item.conflict_object.as_ref().map(|o| o.0.as_str()),
         },
     )?;
+    write_flags(conn, collection, &link.0, None, &item.flags)
+}
+
+/// Writes a flag set to its rows after the row it belongs to (§13, §14):
+/// a placement's with no `source`, else that source's base. The set fills
+/// the `flags` slot, empty for an unknown one, then `retain_flags` and
+/// `add_flags`, or their base twins, run; a set written as it was moves
+/// no row and draws no stamp. A flag the store cannot hold is
+/// [`PimdirError::Flag`], refused before any is written, never trimmed.
+pub(crate) fn write_flags(
+    conn: &Connection,
+    collection: &str,
+    link_id: &str,
+    source: Option<&str>,
+    flags: &PimdirFlags,
+) -> Result<(), PimdirError> {
+    if let Some(flag) = flags.invalid() {
+        return Err(PimdirError::Flag(flag.into()));
+    }
+    bind_list(conn, "flags", flags.known().into_iter().flatten())?;
+
+    match source {
+        None => {
+            let key = named_params! { ":collection": collection, ":link_id": link_id };
+            conn.execute(sql::RETAIN_FLAGS, key)?;
+            conn.execute(sql::ADD_FLAGS, key)?;
+        }
+        Some(source) => {
+            let key = named_params! {
+                ":collection": collection,
+                ":link_id": link_id,
+                ":source": source,
+            };
+            conn.execute(sql::RETAIN_BASE_FLAGS, key)?;
+            conn.execute(sql::ADD_BASE_FLAGS, key)?;
+        }
+    }
     Ok(())
 }
 
@@ -1583,9 +1670,10 @@ fn link_references(
     Ok(())
 }
 
-/// Writes the summary and address rows when they moved, reporting
+/// Writes the summary, address and list rows when they moved, reporting
 /// whether they did: the row of the old variant goes when the variant
-/// changed, the addresses are replaced as a set (Annex A.6).
+/// changed, its lists with it by cascade, the addresses and the lists are
+/// replaced as sets (Annex A.1, A.4, A.6).
 fn write_summary(
     conn: &Connection,
     collection: &str,
@@ -1617,7 +1705,6 @@ fn write_summary(
                 ":collection": collection,
                 ":link_id": link.0,
                 ":message_id": mail.message_id,
-                ":in_reply_to": codec::ids_to_json(&mail.in_reply_to),
                 ":subject": mail.subject,
                 ":sender": mail.sender,
                 ":sender_name": mail.sender_name,
@@ -1673,7 +1760,6 @@ fn write_summary(
                 ":recurring": task.recurring.map(i64::from),
                 ":until": task.until,
                 ":priority": task.priority,
-                ":categories": codec::ids_to_json(&task.categories),
                 ":parent": task.parent,
                 ":mid": task.mid,
                 ":created": task.created,
@@ -1703,6 +1789,38 @@ fn write_summary(
             },
         )?,
     };
+
+    match new {
+        PimdirSummary::Mail(mail) => {
+            conn.execute(sql::REPLACE_IN_REPLY_TO, key)?;
+            for (position, id) in mail.in_reply_to.iter().enumerate() {
+                conn.execute(
+                    sql::INSERT_IN_REPLY_TO,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link.0,
+                        ":position": position as i64,
+                        ":msg_id": id,
+                    },
+                )?;
+            }
+        }
+        PimdirSummary::Task(task) => {
+            conn.execute(sql::REPLACE_CATEGORIES, key)?;
+            for (position, value) in task.categories.iter().enumerate() {
+                conn.execute(
+                    sql::INSERT_CATEGORY,
+                    named_params! {
+                        ":collection": collection,
+                        ":link_id": link.0,
+                        ":position": position as i64,
+                        ":value": value,
+                    },
+                )?;
+            }
+        }
+        _ => {}
+    }
 
     let mut position: HashMap<PimdirAddressRole, i64> = HashMap::new();
     for (role, address) in new.addresses() {
@@ -1793,7 +1911,7 @@ fn insert_binding(
     link: &PimdirLinkId,
     source: &PimdirSourceId,
     binding: &PimdirBinding,
-) -> rusqlite::Result<()> {
+) -> Result<(), PimdirError> {
     conn.execute(
         sql::INSERT_BINDING,
         named_params! {
@@ -1801,7 +1919,7 @@ fn insert_binding(
             ":link_id": link.0,
             ":source": source.0,
             ":handle": binding.handle.0,
-            ":base_flags": binding.base.as_ref().map(|b| codec::flags_to_json(&b.flags)),
+            ":base_flags_known": base_flags(binding).known().is_some(),
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
             ":base_present": binding.base.is_some() as i64,
@@ -1811,7 +1929,13 @@ fn insert_binding(
             ":shared_object": binding.shared_object.as_ref().map(|hash| hash.0.as_str()),
         },
     )?;
-    Ok(())
+    write_flags(
+        conn,
+        collection,
+        &link.0,
+        Some(&source.0),
+        base_flags(binding),
+    )
 }
 
 fn update_binding(
@@ -1820,14 +1944,14 @@ fn update_binding(
     link: &PimdirLinkId,
     source: &PimdirSourceId,
     binding: &PimdirBinding,
-) -> rusqlite::Result<()> {
+) -> Result<(), PimdirError> {
     conn.execute(
         sql::UPDATE_BINDING,
         named_params! {
             ":collection": collection,
             ":link_id": link.0,
             ":source": source.0,
-            ":base_flags": binding.base.as_ref().map(|b| codec::flags_to_json(&b.flags)),
+            ":base_flags_known": base_flags(binding).known().is_some(),
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
             ":base_present": binding.base.is_some() as i64,
@@ -1837,7 +1961,20 @@ fn update_binding(
             ":shared_object": binding.shared_object.as_ref().map(|hash| hash.0.as_str()),
         },
     )?;
-    Ok(())
+    write_flags(
+        conn,
+        collection,
+        &link.0,
+        Some(&source.0),
+        base_flags(binding),
+    )
+}
+
+/// A binding's base flag set as its rows hold it (§13): no base holds an
+/// unknown one.
+fn base_flags(binding: &PimdirBinding) -> &PimdirFlags {
+    const UNKNOWN: &PimdirFlags = &PimdirFlags::Unknown;
+    binding.base.as_ref().map_or(UNKNOWN, |base| &base.flags)
 }
 
 /// The diverging body a binding is stuck on, as the column holds it:
@@ -1920,7 +2057,7 @@ fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem)> {
     Ok((
         PimdirLinkId(link),
         PimdirHubItem {
-            flags: codec::flags_from_json(flags.as_deref()),
+            flags: codec::flags_from_column(flags.as_deref()),
             object: object.map(PimdirHash),
             summary: None,
             sort_key: PimdirSortKey(sort_key),
@@ -1957,7 +2094,7 @@ pub(crate) fn binding_from_row(
         || base_revision.is_some()
     {
         Some(PimdirBase {
-            flags: codec::flags_from_json(base_flags.as_deref()),
+            flags: codec::flags_from_column(base_flags.as_deref()),
             revision: base_revision,
             object: base_object.map(PimdirHash),
         })

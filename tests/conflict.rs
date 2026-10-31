@@ -12,6 +12,8 @@
 //! that found the divergence, and a body swept in between leaves a revision
 //! naming bytes nobody holds.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::client::{PimdirSourceStore, PimdirStore};
 use io_pimdir::{
     change::PimdirWriteOp,

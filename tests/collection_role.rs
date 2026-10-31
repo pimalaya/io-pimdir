@@ -5,6 +5,8 @@
 //! calendar), one holder per role in an account, so a reader learns the
 //! sent folder or the default calendar without asking the server.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::client::{PimdirStore, reader::PimdirReader};
 
 fn role_of(reader: &PimdirReader, id: &str) -> Option<String> {

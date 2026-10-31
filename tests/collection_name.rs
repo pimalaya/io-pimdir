@@ -6,6 +6,8 @@
 //! the owner's own convention, and a DAV collection addressed by a UUID
 //! still has something to show.
 
+#![cfg(feature = "client")]
+
 use io_pimdir::client::{PimdirStore, reader::PimdirReader};
 
 #[test]
