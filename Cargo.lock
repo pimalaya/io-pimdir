@@ -582,6 +582,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "encoding_rs",
  "fs4",
  "humantime",
  "ical-rs",

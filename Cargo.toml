@@ -34,6 +34,7 @@ default = ["client", "vendored"]
 client = ["dep:fs4", "dep:rusqlite"]
 search = ["dep:ical-rs", "dep:mail-parser", "dep:unicode-normalization", "dep:vcard-rs"]
 cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars"]
+charset-tables = ["dep:encoding_rs"]
 vendored = ["rusqlite?/bundled"]
 
 [profile.release]
@@ -58,6 +59,7 @@ tempfile = { version = "3", default-features = false }
 anyhow = { version = "1", default-features = false, features = ["std"], optional = true }
 blake3 = { version = "1", default-features = false }
 clap = { version = "4.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "wrap_help"], optional = true }
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"], optional = true }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 humantime = { version = "2.2", default-features = false, optional = true }
 ical-rs = { version = "0.6", default-features = false, features = ["parser", "tzdb"], optional = true }

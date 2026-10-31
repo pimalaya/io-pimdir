@@ -223,8 +223,16 @@ fn encoded_word(text: &str) -> Option<(String, usize)> {
 
 /// Bytes under a MIME charset as text: `iso-8859-1` and `us-ascii` by
 /// the byte, `windows-1252` by its table, and every other charset as
-/// UTF-8, replacing what does not decode (Annex A.0). The crate carries
-/// no charset tables beyond these, so another 8-bit charset reads lossily.
+/// UTF-8, replacing what does not decode (Annex A.0). The default build
+/// carries no charset tables beyond these, so another 8-bit charset
+/// reads lossily; the `charset-tables` feature first consults the
+/// WHATWG label table (`encoding_rs`), whose labels name gbk, big5,
+/// euc-jp, iso-2022-jp, shift_jis, euc-kr, the windows-125x and
+/// iso-8859-x rows, utf-16 and their aliases. The label holds: the
+/// bytes are decoded by the encoding it names, a byte-order mark
+/// among them reading as the character it is. A label the table names
+/// with no encoding behind it (iso-2022-kr among them) and a label it
+/// does not name at all read as UTF-8, lossily, as they do by default.
 fn charset_decode(charset: &str, bytes: &[u8]) -> String {
     let charset = charset.split('*').next().unwrap_or_default().to_lowercase();
     match charset.as_str() {
@@ -232,6 +240,12 @@ fn charset_decode(charset: &str, bytes: &[u8]) -> String {
             bytes.iter().map(|byte| char::from(*byte)).collect()
         }
         "windows-1252" | "cp1252" => bytes.iter().map(|byte| cp1252(*byte)).collect(),
+        #[cfg(feature = "charset-tables")]
+        _ => match encoding_rs::Encoding::for_label_no_replacement(charset.as_bytes()) {
+            Some(encoding) => encoding.decode_without_bom_handling(bytes).0.into_owned(),
+            None => String::from_utf8_lossy(bytes).into_owned(),
+        },
+        #[cfg(not(feature = "charset-tables"))]
         _ => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
@@ -785,5 +799,56 @@ mod tests {
             "alt:Hi|2026-08-01T10:00:00Z|a@x.y"
         );
         assert_eq!(derivation.sort_key.as_str(), "2026-08-01T10:00:00Z");
+    }
+}
+
+#[cfg(test)]
+mod charset_table_tests {
+    use super::decode;
+
+    /// A legacy GBK subject of the kind older CN mail servers still
+    /// emit by the thousand a week: the default build replaces their
+    /// octets, the feature reads them.
+    #[test]
+    fn a_gbk_subject_is_lossy_by_default_and_read_with_the_tables() {
+        let out = decode("=?gbk?B?1PbBv8r9vt3NrLK9sai45i0yNjEwMjk?=");
+        #[cfg(feature = "charset-tables")]
+        assert_eq!(out, "增量数据同步报告-261029");
+        #[cfg(not(feature = "charset-tables"))]
+        assert!(!out.contains('增'));
+    }
+
+    #[test]
+    #[cfg(feature = "charset-tables")]
+    fn the_other_cjk_labels_read() {
+        assert_eq!(decode("=?gb2312?B?uqO52A==?="), "海关");
+        assert_eq!(decode("=?big5?B?rvzD9g==?="), "海關");
+        assert_eq!(decode("=?shift_jis?B?k4yLng==?="), "東京");
+    }
+
+    /// The table names iso-2022-kr with no encoding behind it: the octets
+    /// read as UTF-8, lossily, not as the single replacement character a
+    /// lookup through the WHATWG replacement would give.
+    #[test]
+    fn a_label_the_table_names_without_an_encoding_reads_lossily() {
+        let out = decode("=?iso-2022-kr?B?GyQpQw5HUTE5Pm4P?=");
+        assert!(out.contains("\u{1B}$)C"));
+    }
+
+    /// A label no table names at all falls back the same way, its lossy
+    /// read longer than one replacement character.
+    #[test]
+    fn a_label_no_table_names_reads_lossily() {
+        let out = decode("=?x-legacy-cjk?B?1PbBv8r9vt3NrLK9sai45i0yNjEwMjk?=");
+        assert!(!out.contains('增'));
+        assert!(out.chars().count() > 1);
+    }
+
+    /// The label holds against a byte-order mark: utf-8 decodes its BOM
+    /// as the character it is, never as a sniff that overrides the label.
+    #[test]
+    #[cfg(feature = "charset-tables")]
+    fn a_byte_order_mark_decodes_under_its_label() {
+        assert_eq!(decode("=?utf-8?B?77u/5aSp5aSp?="), "\u{FEFF}天天");
     }
 }
