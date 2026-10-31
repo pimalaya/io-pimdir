@@ -1,0 +1,5 @@
+# The fixtures are byte-exact: an object is named by the hash of its raw bytes
+# (pimdir STORAGE §5), and mail and calendar bodies are CRLF. Without this git
+# normalises them under core.autocrlf and no body a clone holds matches its
+# name.
+tests/fixtures/** -text
