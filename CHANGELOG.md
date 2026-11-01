@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Added pimdir storage-draft-08, sync-draft-07 and search-draft-08, vendored at pimdir d671bbd with vectors/ and payloads/ (spec/REVISION). **Breaking.**
+- Added pimdir storage-draft-08, sync-draft-07 and search-draft-08, vendored at pimdir d30d3c6 with vectors/ and payloads/ (spec/REVISION). **Breaking.**
 
   A store an earlier draft or an earlier release of this crate wrote is refused by every profile, never reconciled nor migrated: move it aside and let its sync engine create a new one, every app built on this crate reinstalling its store.
 
