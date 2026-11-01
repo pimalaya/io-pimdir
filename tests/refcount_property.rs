@@ -582,6 +582,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     seq,
                     object,
                     if_match: None,
+                    resolves: None,
                 }),
                 // NOTE: an owner-defined intent this store cannot apply.
                 // Its drain skips the row, which must leave the pin the

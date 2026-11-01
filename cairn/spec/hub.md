@@ -100,7 +100,7 @@ Flags are unaffected (element-wise, never conflicting).
 #### Scenario: Every binding projects the item's conflict
 - GIVEN an item flagged conflicted under `Manual`
 - WHEN any source's placements are projected
-- THEN each projects `Conflict` with no revision, and an edit through any of them settles the item for all
+- THEN each projects `Conflict` with no revision, the load stating the item's diverging body in `PimdirLoaded::conflicted` (`PimdirHub::conflicted`), and a person's resolution through any of them, naming that body ([mutate](mutate.md)), settles the item for all
 
 #### Scenario: A person's settle is its own upsert's
 - GIVEN an item conflicted under `Manual`

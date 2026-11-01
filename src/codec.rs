@@ -11,6 +11,7 @@ use alloc::{
     collections::BTreeSet,
     format,
     string::{String, ToString},
+    vec::Vec,
 };
 
 use serde_json::{Map, Value, json};
@@ -150,6 +151,13 @@ pub enum PimdirAction {
         /// the row when the item holds another, a write it would otherwise
         /// drop without a merge; `None` applies over whatever it holds.
         if_match: Option<PimdirHash>,
+        /// The diverging bodies a person's resolution was decided over
+        /// (§15.3), the `conflict_object` of each conflict the producer
+        /// showed, at least one and each once: the update settles the
+        /// conflicts it meets only when it names each, and parks when it
+        /// meets none. `None` for an ordinary edit, which parks over any
+        /// conflict.
+        resolves: Option<Vec<PimdirHash>>,
     },
     /// Record the source performing an intent capability for the account
     /// of the collection the action is anchored on (§15.6), or withdraw
@@ -336,11 +344,16 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             seq,
             object,
             if_match,
+            resolves,
         } => {
             map.insert("seq".into(), json!(seq));
             map.insert("object".into(), json!(object.0));
             if let Some(if_match) = if_match {
                 map.insert("if_match".into(), json!(if_match.0));
+            }
+            if let Some(resolves) = resolves {
+                let names: Vec<&str> = resolves.iter().map(PimdirHash::as_str).collect();
+                map.insert("resolves".into(), json!(names));
             }
         }
         PimdirAction::SetPerformer { capability, source } => {
@@ -399,11 +412,12 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
             }
         }
         "update" => {
-            let map = members(payload, &["seq", "object", "if_match"])?;
+            let map = members(payload, &["seq", "object", "if_match", "resolves"])?;
             PimdirAction::Update {
                 seq: required(seq(map.get("seq"), "seq")?, "seq")?,
                 object: required(hash(map.get("object"), "object")?, "object")?,
                 if_match: hash(map.get("if_match"), "if_match")?,
+                resolves: hashes(map.get("resolves"), "resolves")?,
             }
         }
         "set-performer" => {
@@ -563,6 +577,33 @@ fn hash(
     Ok(Some(hash))
 }
 
+/// A `[hash…]` member: a non-empty array of distinct object names (§15.3).
+fn hashes(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<Vec<PimdirHash>>, PimdirActionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let invalid = PimdirActionError::Invalid {
+        field,
+        reason: "a non-empty array of distinct object names is expected",
+    };
+    let Some(items) = value.as_array().filter(|items| !items.is_empty()) else {
+        return Err(invalid);
+    };
+
+    let mut names: Vec<PimdirHash> = Vec::with_capacity(items.len());
+    for item in items {
+        let name = required(hash(Some(item), field)?, field)?;
+        if names.contains(&name) {
+            return Err(invalid);
+        }
+        names.push(name);
+    }
+    Ok(Some(names))
+}
+
 /// A `[…]` member: a flag set as distinct flags, each one the store holds
 /// (§13).
 fn flags(
@@ -623,6 +664,8 @@ fn supersedes(value: Option<&Value>) -> Result<Option<PimdirSupersedes>, PimdirA
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     #[test]
@@ -768,11 +811,19 @@ mod tests {
                 seq: 8,
                 object: PimdirHash(LEN_1.into()),
                 if_match: None,
+                resolves: None,
             },
             PimdirAction::Update {
                 seq: 9,
                 object: PimdirHash(LEN_1.into()),
                 if_match: Some(PimdirHash(EMPTY.into())),
+                resolves: None,
+            },
+            PimdirAction::Update {
+                seq: 9,
+                object: PimdirHash(LEN_1.into()),
+                if_match: Some(PimdirHash(EMPTY.into())),
+                resolves: Some(vec![PimdirHash(EMPTY.into()), PimdirHash(LEN_1.into())]),
             },
             PimdirAction::SetPerformer {
                 capability: "mail.submit".into(),

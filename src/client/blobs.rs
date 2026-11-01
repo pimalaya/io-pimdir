@@ -28,6 +28,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use log::warn;
+
 use crate::{
     change::PimdirWriteOp,
     client::{lock::PimdirLock, modes},
@@ -300,9 +302,14 @@ impl PimdirBlobs {
     /// Writes a body without ever replacing a file (§5): a temporary file
     /// named uniquely to this writer in the shard directory, `fsync`, a
     /// hard link onto the final name, then the temporary unlinked and the
-    /// shard directory flushed, objects/ too when the shard is new. A name
-    /// already taken keeps the file there, whose bytes are checked when
-    /// read; any other failure fails the write.
+    /// shard directory flushed, objects/ too when the shard is new.
+    ///
+    /// A name already taken is verified (§5): a file hashing to it is kept,
+    /// the write skipped; one failing it, part of a body a crashed copy
+    /// left or other bytes, fails the write as [`ErrorKind::InvalidData`]
+    /// naming it ([`held_name`]), never kept in place of the bytes in hand,
+    /// for an owner to move it into quarantine/ and write again and a
+    /// producer to fail. Any other failure fails the write.
     pub(crate) fn write(&self, hash: &PimdirHash, body: &[u8]) -> io::Result<()> {
         let (shard, name) = self.locate(hash)?;
         let path = shard.join(name);
@@ -310,7 +317,12 @@ impl PimdirBlobs {
         // link where the shard belongs.
         let created = self.shard(&shard)?;
         if fs::symlink_metadata(&path).is_ok() {
-            return Ok(());
+            match self.check(hash)? {
+                PimdirBlobCheck::Sound => return Ok(()),
+                PimdirBlobCheck::Failing => return Err(held(hash)),
+                // NOTE: gone since it was found, so written after all.
+                PimdirBlobCheck::Missing => (),
+            }
         }
 
         // NOTE: unique to this writer, so two processes storing one body
@@ -329,21 +341,51 @@ impl PimdirBlobs {
             return Err(err);
         }
 
-        self.settle(&tmp, &shard, &path, created)
+        let settled = self.settle(hash, &tmp, &shard, &path, created);
+        if settled.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        settled
     }
 
     /// Moves a written temporary onto its final name without replacing a
     /// file there, `link(2)` then `unlink(2)` of the temporary, and
-    /// flushes what the move changed (§5). A name already taken discards
-    /// the temporary and keeps the file.
-    fn settle(&self, tmp: &Path, shard: &Path, path: &Path, created: bool) -> io::Result<()> {
-        let linked = fs::hard_link(tmp, path);
-        let removed = fs::remove_file(tmp);
-        match linked {
-            Ok(()) => removed?,
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(()),
-            Err(err) => return Err(err),
+    /// flushes what the move changed (§5). A name already taken is
+    /// verified (§5): a file hashing to it is kept and the temporary
+    /// unlinked; one failing it fails the move ([`held_name`]), the
+    /// temporary left in place for the caller to unlink, or to move again
+    /// once the owner set the file aside. Any other failure unlinks it.
+    fn settle(
+        &self,
+        hash: &PimdirHash,
+        tmp: &Path,
+        shard: &Path,
+        path: &Path,
+        created: bool,
+    ) -> io::Result<()> {
+        // NOTE: a name found held, then gone before its check, is linked
+        // again, once.
+        let mut tries = 2;
+        loop {
+            tries -= 1;
+            match fs::hard_link(tmp, path) {
+                Ok(()) => break,
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => match self.check(hash)? {
+                    PimdirBlobCheck::Sound => {
+                        let _ = fs::remove_file(tmp);
+                        return Ok(());
+                    }
+                    PimdirBlobCheck::Failing => return Err(held(hash)),
+                    PimdirBlobCheck::Missing if tries > 0 => continue,
+                    PimdirBlobCheck::Missing => return Err(err),
+                },
+                Err(err) => {
+                    let _ = fs::remove_file(tmp);
+                    return Err(err);
+                }
+            }
         }
+        fs::remove_file(tmp)?;
 
         sync_dir(shard)?;
         if created {
@@ -574,10 +616,20 @@ impl PimdirBlobStage {
 
     /// Hashes a whole body and writes it without replacing a file (§5),
     /// answering the object an enqueue or a byteless `StoreObject` names.
-    /// A body already present keeps the stored copy.
+    /// A body already present keeps the stored copy, verified first.
+    ///
+    /// A name held by a file failing it (§5) is moved into quarantine/ by
+    /// an owner's stage, the body then written again; a producer's write
+    /// fails as [`ErrorKind::InvalidData`] naming it, its bytes staying
+    /// with the caller until the owner frees the name.
     pub fn stage_body(&self, bytes: &[u8]) -> io::Result<PimdirObject> {
         let hash = self.blobs.hash(bytes);
-        self.blobs.write(&hash, bytes)?;
+        match self.blobs.write(&hash, bytes) {
+            Err(err) if held_name(&err).is_some() && set_aside(&self.blobs, &self.lock, &hash)? => {
+                self.blobs.write(&hash, bytes)?
+            }
+            written => written?,
+        }
         Ok(PimdirObject {
             hash,
             size: bytes.len(),
@@ -623,7 +675,13 @@ pub struct PimdirBlobWriter {
 impl PimdirBlobWriter {
     /// Finalises the body under the hash of the bytes written: `fsync`,
     /// then a move onto its path that never replaces a file (§5). A body
-    /// already present keeps the stored copy. Answers the object it names.
+    /// already present keeps the stored copy, verified first. Answers the
+    /// object it names.
+    ///
+    /// A name held by a file failing it (§5) is moved into quarantine/ by
+    /// an owner's writer, the move then made again; a producer's commit
+    /// fails as [`ErrorKind::InvalidData`] naming it, the temporary
+    /// unlinked.
     pub fn commit(mut self) -> io::Result<PimdirObject> {
         let file = self.file.take().expect("writer open");
         let synced = file.sync_all();
@@ -649,11 +707,19 @@ impl PimdirBlobWriter {
                 return Err(err);
             }
         };
-        if fs::symlink_metadata(&path).is_ok() {
+        let hash = &object.hash;
+        let settled = match blobs.settle(hash, &self.tmp, &shard, &path, created) {
+            Err(err) if held_name(&err).is_some() => match set_aside(blobs, &self._lock, hash) {
+                Ok(true) => blobs.settle(hash, &self.tmp, &shard, &path, created),
+                Ok(false) => Err(err),
+                Err(failed) => Err(failed),
+            },
+            settled => settled,
+        };
+        if settled.is_err() {
             let _ = fs::remove_file(&self.tmp);
-            return Ok(object);
         }
-        blobs.settle(&self.tmp, &shard, &path, created)?;
+        settled?;
 
         Ok(object)
     }
@@ -702,6 +768,66 @@ pub(crate) enum PimdirBlobCheck {
     /// What sits there is no body: bytes hashing to another name, or a
     /// link.
     Failing,
+}
+
+/// A final name held by a file failing it (§5): what a write finding it
+/// fails with, as [`ErrorKind::InvalidData`], never keeping the file in
+/// place of the bytes in hand.
+#[derive(Debug)]
+struct PimdirHeldName(PimdirHash);
+
+impl core::fmt::Display for PimdirHeldName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Blob name {} is held by a file failing it: the owner sets it aside",
+            self.0.0
+        )
+    }
+}
+
+impl core::error::Error for PimdirHeldName {}
+
+/// The write failure of a name `hash` held by a file failing it.
+fn held(hash: &PimdirHash) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, PimdirHeldName(hash.clone()))
+}
+
+/// The name a write found held by a file failing it (§5), when `err` is
+/// that failure: what an owner moves into quarantine/ before it writes
+/// again.
+pub(crate) fn held_name(err: &io::Error) -> Option<&PimdirHash> {
+    err.get_ref()?
+        .downcast_ref::<PimdirHeldName>()
+        .map(|held| &held.0)
+}
+
+/// Moves the file failing `hash`'s name into quarantine/ for an owner's
+/// stage (§5, §7), the staging lock taken exclusively and the process's
+/// writer lock, the file verified again under them, answering whether it
+/// moved. A producer's stage moves nothing (§7), nor does an owner's while
+/// a producer stages or a write of the process is open: the write fails.
+fn set_aside(blobs: &PimdirBlobs, lock: &PimdirLock, hash: &PimdirHash) -> io::Result<bool> {
+    if !lock.owns() {
+        return Ok(false);
+    }
+    let store = blobs.root.parent().unwrap_or(&blobs.root);
+    let Ok(_staging) = PimdirLock::collect(store) else {
+        return Ok(false);
+    };
+    let Some(_collecting) = lock.try_collecting() else {
+        return Ok(false);
+    };
+
+    let moved = blobs.quarantine(hash)?;
+    if let Some(target) = &moved {
+        warn!(
+            "body {} fails its name, moved to {}",
+            hash.0,
+            target.display()
+        );
+    }
+    Ok(moved.is_some())
 }
 
 /// Whether a directory name is a shard's: two characters of the name

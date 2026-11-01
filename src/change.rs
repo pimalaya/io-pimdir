@@ -396,9 +396,9 @@ pub enum PimdirWriteOp {
     /// person's resolution (SYNC §7): the item takes the upsert's body
     /// whatever body it keeps, `items.conflicted` cleared and its
     /// `conflict_object` released, keeping nothing it discards. What a
-    /// non-overruling [`Edit`](crate::mutate::PimdirMutation::Edit) of a
-    /// placement projecting `Conflict` or `Tombstone` stages before its
-    /// upsert; an item in no conflict ignores it.
+    /// person's resolution, an [`Edit`](crate::mutate::PimdirMutation::Edit)
+    /// stating `resolves` that names the item's diverging body, stages
+    /// before its upsert; an item in no conflict ignores it.
     Settle {
         /// The collection holding the placement.
         collection: PimdirCollectionId,

@@ -17,7 +17,7 @@ use std::{
 
 use io_pimdir::{
     change::{PimdirChange, PimdirChangeKind},
-    client::{PimdirSourceStore, PimdirStore},
+    client::{PimdirSourceStore, PimdirStore, blobs::PimdirBlobs},
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     coroutine::{PimdirArg, PimdirCoroutine, PimdirCoroutineState, PimdirYield},
     hash,
@@ -826,6 +826,14 @@ fn mutation(
                 body,
                 if_match: bodies.hash(&value["if_match"]).map(PimdirHash::from),
                 overrule: value["overrule"].as_bool().unwrap_or(false),
+                // NOTE: the diverging bodies a person's resolution names,
+                // by label (SYNC §7, §11).
+                resolves: value["resolves"].as_array().map(|labels| {
+                    labels
+                        .iter()
+                        .map(|label| PimdirHash::from(bodies.hash(label).expect("a body label")))
+                        .collect()
+                }),
             }
         }
         "Copy" => PimdirMutation::Copy {
@@ -1221,6 +1229,42 @@ fn list_table(table: &str, column: &str) -> Option<(&'static str, &'static str)>
     }
 }
 
+/// Compares the objects a case states after its run (SYNC §11): each one's
+/// row, and the file the run leaves under its name, missing for `blob`
+/// false, failing its name for `corrupt` true, else holding bytes that hash
+/// to it.
+fn assert_objects(label: &str, dir: &Path, conn: &Connection, spec: &Path, objects: &Value) {
+    let blobs = PimdirBlobs::open(dir);
+    for (object, stated) in objects.as_object().expect("objects by label") {
+        let fixture = stated["body"].as_str().expect("the object's body");
+        let body = fs::read(spec.join("vectors").join(fixture)).unwrap();
+        let name = hash::hash(&body);
+        let row = conn
+            .query_row(
+                "SELECT count(*) FROM objects WHERE hash = ?1",
+                [&name.0],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(row, 1, "{label}: object {object} keeps its row");
+
+        let held = fs::read(blobs.path(&name).unwrap()).ok();
+        match (stated["blob"].as_bool(), stated["corrupt"].as_bool()) {
+            (Some(false), _) => {
+                assert!(held.is_none(), "{label}: object {object} has no file")
+            }
+            (_, Some(true)) => assert!(
+                held.is_some_and(|held| hash::hash(&held) != name),
+                "{label}: object {object} holds bytes failing its name"
+            ),
+            _ => assert!(
+                held.is_some_and(|held| hash::hash(&held) == name),
+                "{label}: object {object} holds bytes hashing to its name"
+            ),
+        }
+    }
+}
+
 fn assert_same_set(label: &str, table: &str, mut expected: Vec<Value>, actual: Vec<Value>) {
     // NOTE: each row is compared on the columns its own expected row names
     // (SYNC §11), the two paired by the columns naming the row.
@@ -1313,7 +1357,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 2, "{label}: the sync format's version");
+        assert_eq!(case["v"], 3, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 
@@ -1421,6 +1465,10 @@ fn reproduce(spec: &Path, path: &Path) {
         let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
         let expect = case["expect"]["store"].as_object().unwrap();
         for (table, rows) in expect {
+            if table == "objects" {
+                assert_objects(&label, dir.path(), &conn, spec, rows);
+                continue;
+            }
             let expected = rows.as_array().cloned().unwrap_or_default();
             let actual = match table.as_str() {
                 "summaries" => actual_summaries(&conn, &expected),

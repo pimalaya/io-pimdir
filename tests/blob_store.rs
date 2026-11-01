@@ -135,8 +135,9 @@ fn a_malformed_name_is_refused_before_a_path_is_built() {
 
 /// A write moves its temporary onto the name by a move that fails when the
 /// name exists, never by a rename replacing it (§5): what sits there is
-/// kept, the temporary discarded, and the body reads as missing until the
-/// owner moves the stray aside and the next write lands.
+/// verified, and a link, which holds no body, is moved aside whole by the
+/// owner's write, never written through nor replaced in place, before the
+/// body lands, staged or streamed.
 #[cfg(unix)]
 #[test]
 fn a_write_never_replaces_what_holds_the_name() {
@@ -152,11 +153,28 @@ fn a_write_never_replaces_what_holds_the_name() {
     std::os::unix::fs::symlink(dir.path().join("nowhere"), &path).unwrap();
 
     store.blob_stage().stage_body(CARD).unwrap();
-    assert!(fs::symlink_metadata(&path).unwrap().is_symlink(), "kept");
+    assert!(
+        !dir.path().join("nowhere").exists(),
+        "never written through"
+    );
+    assert_eq!(store.blobs().get(&hash).unwrap().as_deref(), Some(CARD));
+    let moved = quarantined(dir.path());
+    assert_eq!(moved.len(), 1, "the link set aside: {moved:?}");
+    assert!(fs::symlink_metadata(&moved[0]).unwrap().is_symlink());
+
+    // the streamed writer the same
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &path).unwrap();
     let mut writer = store.blob_stage().writer().unwrap();
     std::io::Write::write_all(&mut writer, CARD).unwrap();
     assert_eq!(writer.commit().unwrap().hash, hash);
-    assert!(fs::symlink_metadata(&path).unwrap().is_symlink(), "kept");
+    assert_eq!(store.blobs().get(&hash).unwrap().as_deref(), Some(CARD));
+    assert_eq!(
+        quarantined(dir.path()).len(),
+        2,
+        "the second link set aside"
+    );
+
     let leftovers: Vec<_> = fs::read_dir(&shard).unwrap().collect();
     assert_eq!(leftovers.len(), 1, "no temporary left in the shard");
     assert!(
@@ -169,13 +187,57 @@ fn a_write_never_replaces_what_holds_the_name() {
                 .starts_with('.')),
         "no temporary left in objects/"
     );
-    assert_eq!(store.blobs().get(&hash).unwrap(), None, "a link is no body");
+}
 
-    // the owner moves the link aside, and the next write lands
-    let moved = store.quarantine(&hash).unwrap().expect("moved");
-    assert!(fs::symlink_metadata(&moved).unwrap().is_symlink());
+/// A name held by a file failing it is verified by every write finding it
+/// (§5): a producer moves nothing, so its staged, streamed or enqueued
+/// write fails naming it and enqueues nothing, the file left where it is;
+/// the owner's next write sets it aside and lands the body.
+#[test]
+fn a_producer_meeting_a_failing_held_name_fails_its_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = opened(dir.path());
+    let hash = store.blob_stage().stage_body(CARD).unwrap().hash;
+    let path = store.blobs().path(&hash).unwrap();
+    // NOTE: part of the body, as a crash in an exclusive create and copy
+    // leaves it.
+    fs::write(&path, &CARD[..CARD.len() / 2]).unwrap();
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let held = |err: &PimdirError| matches!(err, PimdirError::Io(err) if err.kind() == ErrorKind::InvalidData && err.to_string().contains(&hash.0));
+    let staged = producer.stage_body(CARD).unwrap_err();
+    assert!(held(&staged), "{staged}");
+    let mut writer = producer.blob_writer().unwrap();
+    std::io::Write::write_all(&mut writer, CARD).unwrap();
+    let streamed = writer.commit().unwrap_err();
+    assert_eq!(streamed.kind(), ErrorKind::InvalidData, "{streamed}");
+    let enqueued = producer
+        .enqueue_with_body("INBOX", CARD, |object| PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: Some(object),
+            supersedes: None,
+        })
+        .unwrap_err();
+    assert!(held(&enqueued), "{enqueued}");
+    assert!(
+        store.list_pending_actions().unwrap().is_empty(),
+        "nothing enqueued"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        &CARD[..CARD.len() / 2],
+        "left in place"
+    );
+    assert!(
+        quarantined(dir.path()).is_empty(),
+        "a producer moves nothing"
+    );
+    drop(producer);
+
     store.blob_stage().stage_body(CARD).unwrap();
     assert_eq!(store.blobs().get(&hash).unwrap().as_deref(), Some(CARD));
+    assert_eq!(quarantined(dir.path()).len(), 1, "the owner set it aside");
 }
 
 /// A link where a body belongs holds no body (§5): never read through, by

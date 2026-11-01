@@ -61,12 +61,16 @@ fn edit(client: &mut Client, body: &[u8]) {
         hash: hash(body),
         size: body.len(),
     };
+    // NOTE: a person's resolution names the conflicts it was shown (SYNC
+    // §7); an edit of a placement in none states nothing.
+    let resolves = client.shown("inbox", &PimdirHandle::from("m1"));
     client
         .mutate(
             "inbox",
             PimdirMutation::Edit {
                 overrule: false,
                 if_match: None,
+                resolves,
                 handle: PimdirHandle::from("m1"),
                 object,
                 body: body.to_vec(),

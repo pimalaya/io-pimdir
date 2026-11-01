@@ -298,6 +298,7 @@ proptest! {
                         let body = format!("local-{n}-{}", handle.as_str()).into_bytes();
                         let _ = client.mutate("inbox", PimdirMutation::Edit { overrule: false,
                             if_match: None,
+                            resolves: None,
                             handle,
                             object: PimdirObject { hash: hash(&body), size: body.len() },
                             body,

@@ -48,7 +48,7 @@ The sync SHALL emit a `PimdirSyncEvent` for each per-item outcome it produces (a
 - THEN the report carries a `Created` event for the server-assigned handle
 
 ### Requirement: Headless conflict resolution
-`PimdirSyncOptions` SHALL carry a `PimdirConflictPolicy` (`Manual`, `PreferLocal`, `PreferRemote`; default `Manual`) applied when content diverges on both sides of a based placement. `Manual` marks the placement conflicted and waits for the consumer's edit, recording the observed remote revision as `conflict_revision` and the diverging remote body as `conflict_object` beside it. `PreferRemote` pulls the remote, the local edit it drops kept by the write as a retained item and reported `Overruled` (pimdir SYNC §5, §9, vectors/sync/14); a pull the write cannot let replace another source's body is recorded as the item's conflict instead and reported `Conflicted` in place of `ContentChanged` (vectors/sync/83). `PreferLocal` keeps the member's body and pushes the local one over it ("PreferLocal keeps the body it pushes over" below), and falls back to `Manual` when the source may not push content. No policy settles against a body nobody read ("No policy settles against an unread body" below). Immutable-content backends report no revision and so never reach a content conflict.
+`PimdirSyncOptions` SHALL carry a `PimdirConflictPolicy` (`Manual`, `PreferLocal`, `PreferRemote`; default `Manual`) applied when content diverges on both sides of a based placement. `Manual` marks the placement conflicted and waits for the consumer's resolution, an `Edit` naming the diverging body in `resolves` ([mutate](mutate.md)), recording the observed remote revision as `conflict_revision` and the diverging remote body as `conflict_object` beside it. `PreferRemote` pulls the remote, the local edit it drops kept by the write as a retained item and reported `Overruled` (pimdir SYNC §5, §9, vectors/sync/14); a pull the write cannot let replace another source's body is recorded as the item's conflict instead and reported `Conflicted` in place of `ContentChanged` (vectors/sync/83). `PreferLocal` keeps the member's body and pushes the local one over it ("PreferLocal keeps the body it pushes over" below), and falls back to `Manual` when the source may not push content. No policy settles against a body nobody read ("No policy settles against an unread body" below). Immutable-content backends report no revision and so never reach a content conflict.
 
 #### Scenario: PreferRemote discards the local edit
 - GIVEN a based placement edited locally and changed on the remote, `conflict = PreferRemote`
@@ -152,12 +152,12 @@ A `Created` placement SHALL derive no `Add` from a page before the last of a rou
 - THEN the create lands conflicted, its body the staged one and the server's recorded as the divergence, the base holding no body, and nothing is pushed
 
 ### Requirement: An item-level conflict is held, a binding conflict is reconciled
-`reconcile_content` SHALL take its conflict branch for a placement carrying a `conflict_revision`, the divergence between this source and its own remote. A `Conflict` placement carrying none is the item's cross-source conflict projected onto this source ([hub](hub.md)): it SHALL derive no push, a pending create under it included, until an `Edit` or a `Remove` settles the item (pimdir SYNC §3, §7). A remote revision its base does not hold SHALL still be recorded, whatever the conflict policy: the binding is marked conflicted with that revision and its diverging body wanted, reported as `Conflicted`, since an incremental enumeration never lists the member again (pimdir SYNC §5, vectors/sync/33).
+`reconcile_content` SHALL take its conflict branch for a placement carrying a `conflict_revision`, the divergence between this source and its own remote. A `Conflict` placement carrying none is the item's cross-source conflict projected onto this source ([hub](hub.md)): it SHALL derive no push, a pending create under it included, until a person's resolution (an `Edit` stating `resolves`, [mutate](mutate.md)), an overruling `Edit` or a `Remove` settles the item (pimdir SYNC §3, §7). A remote revision its base does not hold SHALL still be recorded, whatever the conflict policy: the binding is marked conflicted with that revision and its diverging body wanted, reported as `Conflicted`, since an incremental enumeration never lists the member again (pimdir SYNC §5, vectors/sync/33).
 
 #### Scenario: Two sources diverged under `manual`
 - GIVEN an item flagged conflicted by the hub, every binding projecting `Conflict` with no revision
 - WHEN either source is synced and its remote lists nothing new
-- THEN nothing is pushed and nothing is re-marked, until an edit through one source settles it
+- THEN nothing is pushed and nothing is re-marked, until a person's resolution through one source settles it
 
 #### Scenario: A server edit lands while the item is conflicted
 - GIVEN an item flagged conflicted by the hub, and one source's remote listing the member at a revision past that binding's base
@@ -496,3 +496,9 @@ Before `PreferLocal` pushes over a body a member carried, the engine SHALL keep 
 - GIVEN a local edit `c2` over `c1` at `r1`, and a listing at `r2` carrying `c3`, under `prefer-local`
 - WHEN the collection is synced
 - THEN `c3` is a retained item under `dup:<link>#a.vcf`, reported `Overruled`, `c2` is pushed gated on `r2` and, accepted at `r3`, becomes the base (vectors/sync/117; src/sync.rs `prefer_local_keeps_the_body_it_overwrites`, `a_rejected_prefer_local_push_keeps_its_body_once`)
+
+### Requirement: The sync vectors run at format 3
+tests/vectors_sync.rs SHALL run every case of the vendored spec/vectors/sync/ at the format SYNC §11 describes, `v` 3, refusing a case stating another version rather than reading its fields under another meaning: an `Edit`'s `resolves`, a list of object labels, is passed as `PimdirMutation::Edit::resolves`, and an `objects` table a case states under `expect.store` is compared as the row and the file the run leaves under each name, `blob` false a missing file, `corrupt` true bytes failing the name, neither bytes hashing to it (vectors/README.md). The 130 cases at pimdir 3d6a04e pass, none on tests/pending_vectors.txt.
+
+#### Scenario: A refused resolution and a failing held name
+- vectors/sync/124 to 129 (an `Edit` settling a conflict its `resolves` does not name, or stating it over none, fails with the rows unchanged) and 130 (a fetch meeting a file failing its name under it sets the file aside and lands, `expect.store.objects` stating `c2` sound)

@@ -135,6 +135,30 @@ where
             .map_err(|err| err.to_string())
     }
 
+    /// What a person's resolution form shows for `handle` (SYNC §7): the
+    /// diverging body of each conflict an edit of it meets, the item's
+    /// then its binding's, as a resolution states them in `resolves`;
+    /// `None` when it meets none, an ordinary edit settling nothing.
+    pub fn shown(&self, collection: &str, handle: &PimdirHandle) -> Option<Vec<PimdirHash>> {
+        let selection = PimdirLoadSelection::Handles(vec![handle.clone()]);
+        let loaded = self
+            .store
+            .load(&collection.into(), &selection)
+            .expect("the placement loads");
+        let placement = loaded.placements.iter().find(|p| &p.handle == handle)?;
+        let item = loaded
+            .conflicted
+            .iter()
+            .filter(|(conflicted, _)| conflicted == handle)
+            .map(|(_, body)| body.clone());
+        let binding = placement
+            .conflict_revision
+            .is_some()
+            .then(|| placement.conflict_object.clone());
+        let shown: Vec<PimdirHash> = item.chain(binding).flatten().collect();
+        (!shown.is_empty()).then_some(shown)
+    }
+
     pub fn rekey(&mut self, collection: &str) -> Result<PimdirRekeyReport, String> {
         self.store
             .rekey(collection, false, &mut self.remote)

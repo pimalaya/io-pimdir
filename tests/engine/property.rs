@@ -643,6 +643,7 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                         PimdirMutation::Edit {
                             overrule: false,
                             if_match: None,
+                            resolves: None,
                             sort_key: Default::default(),
                             handle: handle.clone(),
                             object,
@@ -918,12 +919,14 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
             if owed {
                 ledger.edits.insert(handle.clone(), hash(&body));
             }
+            let resolves = client.shown("inbox", &handle);
             client
                 .mutate(
                     "inbox",
                     PimdirMutation::Edit {
                         overrule: false,
                         if_match: None,
+                        resolves,
                         sort_key: Default::default(),
                         handle,
                         object,
@@ -965,12 +968,14 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                 hash,
                 size: body.len(),
             };
+            let resolves = client.shown("archive", &handle);
             client
                 .mutate(
                     "archive",
                     PimdirMutation::Edit {
                         overrule: false,
                         if_match: None,
+                        resolves,
                         sort_key: Default::default(),
                         handle,
                         object,
@@ -1391,20 +1396,26 @@ fn duo_edit(client: &mut Replica, index: usize, tag: &str, n: u8) {
             hash: hash(&body),
             size: body.len(),
         };
-        client
-            .mutate(
-                "inbox",
-                PimdirMutation::Edit {
-                    overrule: false,
-                    if_match: None,
-                    sort_key: Default::default(),
-                    handle,
-                    object,
-                    body,
-                    summary: None,
-                },
-            )
-            .unwrap();
+        let shown = client.shown("inbox", &handle);
+        let staged = client.mutate(
+            "inbox",
+            PimdirMutation::Edit {
+                overrule: false,
+                if_match: None,
+                resolves: None,
+                sort_key: Default::default(),
+                handle,
+                object,
+                body,
+                summary: None,
+            },
+        );
+        // NOTE: an ordinary edit settles no conflict, so one over a
+        // conflict is refused, staging nothing (SYNC §7).
+        match shown {
+            Some(_) => assert!(staged.is_err(), "an ordinary edit over a conflict"),
+            None => staged.unwrap(),
+        }
     }
 }
 
@@ -1426,12 +1437,14 @@ fn duo_resolve(client: &mut Replica, tag: &str) -> bool {
             hash: hash(&body),
             size: body.len(),
         };
+        let resolves = client.shown("inbox", &handle);
         client
             .mutate(
                 "inbox",
                 PimdirMutation::Edit {
                     overrule: false,
                     if_match: None,
+                    resolves,
                     sort_key: Default::default(),
                     handle,
                     object,

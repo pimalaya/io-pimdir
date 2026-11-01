@@ -70,9 +70,16 @@ pub enum PimdirMutation {
     ///
     /// The new object is stored, the placement repointed at it and marked
     /// dirty, its base keeping the synced body so the next sync derives
-    /// the push. Editing a conflict resolves it, a tombstone is revived.
-    /// A person's edit settles the item's conflict too, whatever body it
-    /// keeps, stating [`Settle`](PimdirWriteOp::Settle) before its upsert.
+    /// the push. A tombstone is revived.
+    ///
+    /// A conflict, the item's or its binding's, is settled only by an
+    /// overrule or by a person's resolution naming it in `resolves`
+    /// (SYNC §7): an edit meeting one its `resolves` does not name, or
+    /// stating `resolves` and meeting none, is refused, staging nothing
+    /// ([`PimdirMutateError::Unresolved`]). A resolution settles the
+    /// item's conflict whatever body it keeps, stating
+    /// [`Settle`](PimdirWriteOp::Settle) before its upsert, and its
+    /// binding's, the base adopting the conflict's revision and body.
     Edit {
         /// The placement to update.
         handle: PimdirHandle,
@@ -103,6 +110,12 @@ pub enum PimdirMutation {
         /// person's resolution and a queued `update`, which keep nothing
         /// they discard.
         overrule: bool,
+        /// The diverging bodies a person's resolution was decided over,
+        /// the `conflict_object` of each conflict it was shown (a queued
+        /// `update`'s `resolves`, STORAGE §15.3); `None` for an ordinary
+        /// edit, which settles no conflict (SYNC §7). An overruling edit
+        /// ignores it.
+        resolves: Option<Vec<PimdirHash>>,
     },
     /// Copy a placement into `target` as a pending create; the source is kept.
     ///
@@ -209,11 +222,53 @@ pub enum PimdirMutateError {
         /// The body the placement holds, `None` for none.
         held: Option<PimdirHash>,
     },
+    /// An `Edit` stating no `overrule` meets a conflict its `resolves` does
+    /// not name, or states `resolves` and meets none (SYNC §7): settling
+    /// it would discard a diverging body nobody decided over.
+    Unresolved {
+        /// The handle edited.
+        handle: String,
+        /// The diverging body of each conflict the edit meets, the item's
+        /// then its binding's, `None` for one nobody has read; empty when
+        /// it meets none.
+        met: Vec<Option<PimdirHash>>,
+        /// The bodies the edit's resolution names, `None` for an ordinary
+        /// edit.
+        resolves: Option<Vec<PimdirHash>>,
+    },
     /// A `Copy` or a `Move` names a placement with neither a body nor a
     /// based binding, which no create could deliver (SYNC §7).
     Undeliverable(String),
     /// The caller broke the coroutine contract.
     Arg(PimdirArgError),
+}
+
+impl PimdirMutateError {
+    /// The failure's stable kebab-case code, for a consumer to map to its
+    /// own output instead of matching the message, as
+    /// `PimdirError::code` answers for the store. A code never changes
+    /// meaning; a new failure gets a new one.
+    ///
+    /// | Code | Failure |
+    /// |---|---|
+    /// | `handle-unknown` | [`UnknownHandle`](Self::UnknownHandle) |
+    /// | `placement-unnamed` | [`Unnamed`](Self::Unnamed) |
+    /// | `item-duplicate` | [`LinkExists`](Self::LinkExists) |
+    /// | `body-replaced` | [`Replaced`](Self::Replaced) |
+    /// | `conflict-unresolved` | [`Unresolved`](Self::Unresolved) |
+    /// | `placement-undeliverable` | [`Undeliverable`](Self::Undeliverable) |
+    /// | `coroutine-arg` | [`Arg`](Self::Arg) |
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownHandle(_) => "handle-unknown",
+            Self::Unnamed(_) => "placement-unnamed",
+            Self::LinkExists(_) => "item-duplicate",
+            Self::Replaced { .. } => "body-replaced",
+            Self::Unresolved { .. } => "conflict-unresolved",
+            Self::Undeliverable(_) => "placement-undeliverable",
+            Self::Arg(_) => "coroutine-arg",
+        }
+    }
 }
 
 impl fmt::Display for PimdirMutateError {
@@ -246,6 +301,28 @@ impl fmt::Display for PimdirMutateError {
                 read.as_str(),
                 held.as_ref().map_or("no body", PimdirHash::as_str),
             ),
+            Self::Unresolved {
+                handle,
+                met,
+                resolves,
+            } if met.is_empty() => write!(
+                f,
+                "Pimdir MUTATE failed: handle {handle} states a resolution of {} and meets no conflict, settled already",
+                names(resolves.iter().flatten().map(Some)),
+            ),
+            Self::Unresolved {
+                handle,
+                met,
+                resolves,
+            } => write!(
+                f,
+                "Pimdir MUTATE failed: handle {handle} meets a conflict over {} its resolution does not name ({})",
+                names(met.iter().map(Option::as_ref)),
+                match resolves {
+                    Some(resolves) => names(resolves.iter().map(Some)),
+                    None => String::from("none stated"),
+                },
+            ),
             Self::Arg(err) => write!(f, "{err}"),
         }
     }
@@ -266,12 +343,53 @@ impl From<PimdirArgError> for PimdirMutateError {
     }
 }
 
+/// Object names joined by commas, an unread body as `an unread body`.
+pub(crate) fn names<'a>(bodies: impl Iterator<Item = Option<&'a PimdirHash>>) -> String {
+    bodies
+        .map(|body| body.map_or("an unread body", PimdirHash::as_str))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The diverging bodies of the conflicts an `Edit` of `placement` meets
+/// (SYNC §7): its item's when `item` names one, `Some(None)` when nobody
+/// has read it, then its binding's while the placement carries one.
+fn conflicts_met(
+    placement: &PimdirPlacement,
+    item: Option<Option<PimdirHash>>,
+) -> Vec<Option<PimdirHash>> {
+    let binding = placement
+        .conflict_revision
+        .is_some()
+        .then(|| placement.conflict_object.clone());
+    item.into_iter().chain(binding).collect()
+}
+
+/// Whether an `Edit` stating `resolves` may settle the conflicts it
+/// `met` (SYNC §7): an ordinary edit only when it meets none, a
+/// resolution only when it names the diverging body of each one it
+/// meets, and meets one; a body nobody has read is named by none.
+pub(crate) fn resolved(met: &[Option<PimdirHash>], resolves: Option<&Vec<PimdirHash>>) -> bool {
+    match resolves {
+        None => met.is_empty(),
+        Some(resolves) => {
+            !met.is_empty()
+                && met
+                    .iter()
+                    .all(|body| body.as_ref().is_some_and(|body| resolves.contains(body)))
+        }
+    }
+}
+
 /// I/O-free MUTATE coroutine.
 pub struct PimdirMutate {
     collection: PimdirCollectionId,
     mutation: PimdirMutation,
     /// The source of a staged create, held while the target's keys are read.
     source: Option<PimdirPlacement>,
+    /// Whether the edited placement's item is conflicted, which a
+    /// resolution settles (SYNC §7).
+    item_conflicted: bool,
     state: State,
 }
 
@@ -285,6 +403,7 @@ impl PimdirMutate {
             collection,
             mutation,
             source: None,
+            item_conflicted: false,
             state: State::Start,
         }
     }
@@ -344,15 +463,10 @@ impl PimdirMutate {
                 overrule,
                 ..
             } => {
-                // NOTE: an item's conflict projects `Conflict` for every
-                // live binding and `Tombstone` once another source deleted
-                // it (SYNC §3), and the item is not loaded here: the write
-                // settles it, when one stands (SYNC §7).
-                let settling = !*overrule
-                    && matches!(
-                        source.status,
-                        PimdirStatus::Conflict | PimdirStatus::Tombstone
-                    );
+                // NOTE: an edit reaching here without `overrule` meets no
+                // conflict or is a resolution naming each it meets, so it
+                // settles the item's when it met one (SYNC §7).
+                let settling = !*overrule && self.item_conflicted;
                 source.object = Some(object.hash.clone());
                 source.level = PimdirLevel::Full;
                 if summary.is_some() {
@@ -567,6 +681,38 @@ impl PimdirCoroutine for PimdirMutate {
                             held: placement.object.clone(),
                         };
                         return PimdirCoroutineState::Complete(Err(err));
+                    }
+                    // NOTE: a conflict is settled by an overrule or by a
+                    // person's resolution naming it (SYNC §7). A storage
+                    // stating no item conflict for a placement it projects
+                    // `Conflict` with no binding conflict reads as one
+                    // nobody has read, never as none.
+                    if let PimdirMutation::Edit {
+                        overrule: false,
+                        resolves,
+                        ..
+                    } = &self.mutation
+                    {
+                        let item = loaded
+                            .conflicted
+                            .iter()
+                            .find(|(conflicted, _)| conflicted == handle)
+                            .map(|(_, body)| body.clone())
+                            .or_else(|| {
+                                let projected = placement.status == PimdirStatus::Conflict
+                                    && placement.conflict_revision.is_none();
+                                projected.then_some(None)
+                            });
+                        self.item_conflicted = item.is_some();
+                        let met = conflicts_met(&placement, item);
+                        if !resolved(&met, resolves.as_ref()) {
+                            let err = PimdirMutateError::Unresolved {
+                                handle: handle.as_str().into(),
+                                met,
+                                resolves: resolves.clone(),
+                            };
+                            return PimdirCoroutineState::Complete(Err(err));
+                        }
                     }
 
                     if let Some(target) = self.mutation.create_target()
@@ -1016,6 +1162,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1054,6 +1201,7 @@ mod tests {
             let mutation = PimdirMutation::Edit {
                 overrule: false,
                 if_match: None,
+                resolves: None,
                 sort_key,
                 handle: PimdirHandle::from("1"),
                 object: PimdirObject {
@@ -1093,6 +1241,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1129,6 +1278,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: Some(vec![PimdirHash::from("h-remote")]),
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1153,8 +1303,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[2]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
         assert_eq!(p.status, PimdirStatus::Dirty);
         assert_eq!(p.conflict_revision, None);
@@ -1173,6 +1323,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: Some(vec![PimdirHash::from("h-remote")]),
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1199,8 +1350,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[2]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
         let base = p.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
@@ -1224,6 +1375,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: Some(vec![PimdirHash::from("h-remote")]),
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1248,8 +1400,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[2]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
         let base = p.base.as_ref().expect("the resolution establishes a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
@@ -1265,6 +1417,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: None,
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1295,6 +1448,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: Some(vec![PimdirHash::from("h-remote")]),
             sort_key: Default::default(),
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1316,8 +1470,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[2]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
 
         assert_eq!(p.status, PimdirStatus::Dirty);
@@ -1330,51 +1484,119 @@ mod tests {
         assert_eq!(base.revision.as_deref(), Some("r2"));
     }
 
-    /// A person's edit of a placement an item conflict may project states
-    /// the settle before its upsert (SYNC §7); an overruling one states
-    /// the overrule instead, and one of a placement in no conflict neither.
-    #[test]
-    fn a_persons_edit_of_a_conflict_states_the_settle() {
-        use crate::object::{PimdirHash, PimdirObject};
-
-        let ops = |status, overrule| {
-            let mutation = PimdirMutation::Edit {
-                overrule,
-                if_match: None,
-                sort_key: Default::default(),
-                handle: PimdirHandle::from("1"),
-                object: PimdirObject {
-                    hash: PimdirHash::from("h3"),
-                    size: 6,
-                },
-                body: b"merged".to_vec(),
-                summary: None,
-            };
-            let mut mutate = PimdirMutate::new("inbox", mutation);
-            let _ = mutate.resume(None);
-            let mut loaded = loaded("1");
-            loaded.placements[0].status = status;
-            match mutate.resume(Some(PimdirArg::Load(loaded))) {
-                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops
-                    .iter()
-                    .map(|op| match op {
-                        PimdirWriteOp::StoreObject { .. } => "store",
-                        PimdirWriteOp::Settle { handle, .. } if handle.as_str() == "1" => "settle",
-                        PimdirWriteOp::Overrule { .. } => "overrule",
-                        PimdirWriteOp::UpsertPlacement(_) => "upsert",
-                        op => panic!("unexpected {op:?}"),
-                    })
-                    .collect::<Vec<_>>(),
-                state => panic!("expected WantsWrite, got {state:?}"),
-            }
+    /// An `Edit` of `loaded`'s placement "1", answering its ops or the
+    /// error it was refused with.
+    fn edit_ops(
+        loaded: PimdirLoaded,
+        overrule: bool,
+        resolves: Option<Vec<PimdirHash>>,
+    ) -> Result<Vec<&'static str>, PimdirMutateError> {
+        let mutation = PimdirMutation::Edit {
+            overrule,
+            if_match: None,
+            resolves,
+            sort_key: Default::default(),
+            handle: PimdirHandle::from("1"),
+            object: PimdirObject {
+                hash: PimdirHash::from("h3"),
+                size: 6,
+            },
+            body: b"merged".to_vec(),
+            summary: None,
         };
+        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+        match mutate.resume(Some(PimdirArg::Load(loaded))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => Ok(ops
+                .iter()
+                .map(|op| match op {
+                    PimdirWriteOp::StoreObject { .. } => "store",
+                    PimdirWriteOp::Settle { handle, .. } if handle.as_str() == "1" => "settle",
+                    PimdirWriteOp::Overrule { .. } => "overrule",
+                    PimdirWriteOp::UpsertPlacement(_) => "upsert",
+                    op => panic!("unexpected {op:?}"),
+                })
+                .collect()),
+            PimdirCoroutineState::Complete(Err(err)) => Err(err),
+            state => panic!("expected WantsWrite, got {state:?}"),
+        }
+    }
 
+    /// `loaded("1")` projected over an item conflicted over `body`, as a
+    /// storage states it (SYNC §7).
+    fn item_conflicted(status: PimdirStatus, body: Option<&str>) -> PimdirLoaded {
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = status;
+        loaded.conflicted = vec![(PimdirHandle::from("1"), body.map(PimdirHash::from))];
+        loaded
+    }
+
+    /// A person's resolution of an item conflict states the settle before
+    /// its upsert (SYNC §7); an overruling edit states the overrule
+    /// instead, and an edit of an item in no conflict neither.
+    #[test]
+    fn a_persons_resolution_of_an_item_conflict_states_the_settle() {
+        let named = || Some(vec![PimdirHash::from("h2")]);
         for status in [PimdirStatus::Conflict, PimdirStatus::Tombstone] {
-            assert_eq!(ops(status, false), ["store", "settle", "upsert"]);
-            assert_eq!(ops(status, true), ["store", "overrule", "upsert"]);
+            let conflicted = || item_conflicted(status, Some("h2"));
+            assert_eq!(
+                edit_ops(conflicted(), false, named()).unwrap(),
+                ["store", "settle", "upsert"]
+            );
+            assert_eq!(
+                edit_ops(conflicted(), true, None).unwrap(),
+                ["store", "overrule", "upsert"]
+            );
         }
         for status in [PimdirStatus::Clean, PimdirStatus::Dirty] {
-            assert_eq!(ops(status, false), ["store", "upsert"]);
+            let mut loaded = loaded("1");
+            loaded.placements[0].status = status;
+            assert_eq!(edit_ops(loaded, false, None).unwrap(), ["store", "upsert"]);
+        }
+    }
+
+    /// An edit settles a conflict only as a resolution naming its body
+    /// (SYNC §7): an ordinary one, one naming another body, one meeting no
+    /// conflict and one over a body nobody has read are refused, staging
+    /// nothing, as `conflict-unresolved`.
+    #[test]
+    fn an_edit_settles_only_the_conflict_it_names() {
+        let refused = |loaded, resolves: Option<&[&str]>| {
+            let resolves =
+                resolves.map(|names| names.iter().map(|n| PimdirHash::from(*n)).collect());
+            match edit_ops(loaded, false, resolves) {
+                Err(err @ PimdirMutateError::Unresolved { .. }) => err.code(),
+                result => panic!("expected Unresolved, got {result:?}"),
+            }
+        };
+        let conflicted = || item_conflicted(PimdirStatus::Conflict, Some("h2"));
+        assert_eq!(refused(conflicted(), None), "conflict-unresolved");
+        assert_eq!(refused(conflicted(), Some(&["h4"])), "conflict-unresolved");
+        assert_eq!(refused(loaded("1"), Some(&["h2"])), "conflict-unresolved");
+        let unread = item_conflicted(PimdirStatus::Conflict, None);
+        assert_eq!(refused(unread, Some(&["h2"])), "conflict-unresolved");
+
+        let mut both = conflicted();
+        both.placements[0].conflict_revision = Some("r2".into());
+        both.placements[0].conflict_object = Some(PimdirHash::from("h4"));
+        assert_eq!(refused(both.clone(), Some(&["h2"])), "conflict-unresolved");
+        let resolves = Some(vec![PimdirHash::from("h4"), PimdirHash::from("h2")]);
+        assert_eq!(
+            edit_ops(both, false, resolves).unwrap(),
+            ["store", "settle", "upsert"]
+        );
+    }
+
+    /// A storage stating no item conflict for a placement it projects
+    /// `Conflict` without a binding conflict leaves the conflict unknown,
+    /// read as one nobody has read: no edit settles it.
+    #[test]
+    fn a_projected_conflict_the_storage_does_not_state_is_unread() {
+        let mut loaded = loaded("1");
+        loaded.placements[0].status = PimdirStatus::Conflict;
+        match edit_ops(loaded, false, Some(vec![PimdirHash::from("h2")])) {
+            Err(PimdirMutateError::Unresolved { met, .. }) => assert_eq!(met, [None]),
+            result => panic!("expected Unresolved, got {result:?}"),
         }
     }
 
@@ -1585,6 +1807,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: None,
             sort_key: None,
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1601,8 +1824,8 @@ mod tests {
             state => panic!("expected WantsWrite, got {state:?}"),
         };
 
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[2]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
         assert_eq!(p.status, PimdirStatus::Dirty);
         assert_eq!(p.origin, None, "a revived row is going nowhere: {p:?}",);
@@ -1624,6 +1847,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: None,
             sort_key: None,
             handle: PimdirHandle::from("tmp-1"),
             object: PimdirObject {
@@ -1695,6 +1919,7 @@ mod tests {
         let mutation = PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves: Some(vec![PimdirHash::from("remote")]),
             sort_key: None,
             handle: PimdirHandle::from("1"),
             object: PimdirObject {
@@ -1711,8 +1936,8 @@ mod tests {
             state => panic!("expected WantsWrite, got {state:?}"),
         };
 
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[2]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[1]);
         };
         assert_eq!(p.status, PimdirStatus::Dirty);
         assert_eq!(p.conflict_revision, None, "the divergence is settled");

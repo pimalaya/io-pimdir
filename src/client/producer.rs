@@ -43,7 +43,7 @@ use crate::{
     hub::PimdirSourceId,
     intent::PimdirCollectionCreate,
     load::{PimdirLoadSelection, PimdirLoaded},
-    mutate::{PimdirMutate, PimdirMutation},
+    mutate::{self, PimdirMutate, PimdirMutation},
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey,
@@ -1380,19 +1380,49 @@ fn stage_action(
         ))));
     }
 
-    let handle = tx
-        .query_row(
-            sql::HANDLE_FOR_LINK,
-            named_params! {
-                ":collection": collection,
-                ":link_id": item.link_id.0,
-                ":source": source.0,
-            },
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?;
+    // NOTE: a resolution runs through a conflicted binding whose diverging
+    // body it names, when the item has one: its producer named every
+    // conflict it showed and cannot know which binding the drain picks
+    // (§15.2).
+    let hub = write::read_hub(tx, collection, Some(slice::from_ref(&item.link_id.0)))?;
+    let named = match action {
+        PimdirAction::Update {
+            resolves: Some(resolves),
+            ..
+        } => hub.items.get(&item.link_id).and_then(|shared| {
+            shared
+                .sources
+                .iter()
+                .find(|(_, binding)| {
+                    binding.conflicted
+                        && binding
+                            .conflict_object
+                            .as_ref()
+                            .is_some_and(|body| resolves.contains(body))
+                })
+                .map(|(source, binding)| (source.clone(), binding.handle.clone()))
+        }),
+        _ => None,
+    };
+    let handle = match &named {
+        Some((_, handle)) => Some(handle.0.clone()),
+        None => tx
+            .query_row(
+                sql::HANDLE_FOR_LINK,
+                named_params! {
+                    ":collection": collection,
+                    ":link_id": item.link_id.0,
+                    ":source": source.0,
+                },
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+    };
     let (source, handle) = match handle {
-        Some(handle) => (source.clone(), PimdirHandle(handle)),
+        Some(handle) => (
+            named.map_or_else(|| source.clone(), |(named, _)| named),
+            PimdirHandle(handle),
+        ),
         None => {
             bind_list(tx, "links", [&item.link_id.0])?;
             let bound = tx
@@ -1403,6 +1433,21 @@ fn stage_action(
                 )
                 .optional()?;
             let Some((source, handle)) = bound else {
+                // NOTE: an unbound item's update takes `resolves` on the
+                // terms a bound one does, its item's conflict the only
+                // one it meets (§15.3).
+                if let PimdirAction::Update { resolves, .. } = action {
+                    let met: Vec<Option<PimdirHash>> = hub
+                        .items
+                        .get(&item.link_id)
+                        .filter(|shared| shared.conflicted)
+                        .map(|shared| shared.conflict_object.clone())
+                        .into_iter()
+                        .collect();
+                    if !mutate::resolved(&met, resolves.as_ref()) {
+                        return Ok(Err(PimdirOutcome::Parked(unresolved(seq, &met, resolves))));
+                    }
+                }
                 return unbound(tx, collection, seq, &item.link_id, action);
             };
             (PimdirSourceId(source), PimdirHandle(handle))
@@ -1425,7 +1470,10 @@ fn stage_action(
             target: to.clone(),
         },
         PimdirAction::Update {
-            object, if_match, ..
+            object,
+            if_match,
+            resolves,
+            ..
         } => {
             let derivation = summary::derive(&kind, &queued_body(blobs, object)?);
             let (summary, sort_key) = match derivation {
@@ -1445,6 +1493,7 @@ fn stage_action(
                 summary,
                 sort_key,
                 if_match: if_match.clone(),
+                resolves: resolves.clone(),
             }
         }
         PimdirAction::Add { .. } => unreachable!("add staged above"),
@@ -1454,11 +1503,11 @@ fn stage_action(
 
     let mut mutate = PimdirMutate::new(collection_id.clone(), mutation);
     let _ = mutate.resume(None);
-    let link: PimdirLinkId = item.link_id.clone();
-    let placements = write::read_hub(tx, collection, Some(slice::from_ref(&link.0)))?
-        .project(&collection_id, source);
+    let placements = hub.project(&collection_id, source);
+    let conflicted = hub.conflicted(&placements);
     let mut state = mutate.resume(Some(PimdirArg::Load(PimdirLoaded {
         placements,
+        conflicted,
         ..Default::default()
     })));
 
@@ -1494,6 +1543,25 @@ fn stage_action(
         state => Ok(Err(PimdirOutcome::Parked(format!(
             "unexpected mutate state: {state:?}"
         )))),
+    }
+}
+
+/// Why an `update` of item `seq` parks over the conflict it `met`, or over
+/// none, its resolution naming another (§15.3): the `conflict-unresolved`
+/// refusal of the engine's `Edit` (SYNC §7), for an item no source binds.
+fn unresolved(seq: i64, met: &[Option<PimdirHash>], resolves: &Option<Vec<PimdirHash>>) -> String {
+    let resolves = match resolves {
+        Some(resolves) => mutate::names(resolves.iter().map(Some)),
+        None => String::from("none stated"),
+    };
+    match met.is_empty() {
+        true => format!(
+            "item {seq} states a resolution of {resolves} and meets no conflict, settled already"
+        ),
+        false => format!(
+            "item {seq} meets a conflict over {} its resolution does not name ({resolves})",
+            mutate::names(met.iter().map(Option::as_ref)),
+        ),
     }
 }
 

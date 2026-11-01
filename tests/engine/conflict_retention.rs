@@ -66,6 +66,7 @@ fn edit(client: &mut Client, body: &[u8]) {
             PimdirMutation::Edit {
                 overrule: false,
                 if_match: None,
+                resolves: None,
                 handle: PimdirHandle::from("m1"),
                 object,
                 body: body.to_vec(),

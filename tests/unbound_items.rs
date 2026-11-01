@@ -219,6 +219,7 @@ fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
                 seq,
                 object: hash,
                 if_match: None,
+                resolves: None,
             }
         })
         .unwrap();
@@ -294,6 +295,7 @@ fn an_unbound_edit_over_a_replaced_body_parks() {
                 seq,
                 object: hash,
                 if_match: Some(read),
+                resolves: None,
             }
         })
         .unwrap();

@@ -96,12 +96,23 @@ No symbolic link SHALL be followed under objects/: on Unix a body is opened by `
 - THEN each answers no body, no write lands through the shard link, and the owner moves the link into quarantine/, its target untouched (tests/blob_store.rs `a_link_as_a_blob_is_not_followed`, `a_link_as_a_shard_is_not_followed`)
 
 ### Requirement: A blob write never replaces a file
-A blob SHALL move onto its name by a move that fails when the name exists: the temporary is `fsync`ed, linked to the final name (`std::fs::hard_link`, `link(2)`, `CreateHardLinkW` on Windows), then unlinked. When the name exists, whatever holds it is kept and the temporary discarded, its bytes checked when read; any other failure fails the write. The shard is made sure of first, so no name is looked up through a link where a shard belongs. A body streamed through `PimdirBlobWriter` is written the same way, from a temporary in objects/ (STORAGE §5).
+A blob SHALL move onto its name by a move that fails when the name exists: the temporary is `fsync`ed, linked to the final name (`std::fs::hard_link`, `link(2)`, `CreateHardLinkW` on Windows), then unlinked. When the name exists, whatever holds it is never replaced in place; any other failure fails the write. The shard is made sure of first, so no name is looked up through a link where a shard belongs. A body streamed through `PimdirBlobWriter` is written the same way, from a temporary in objects/ (STORAGE §5).
+
+### Requirement: A name held is verified
+A write finding its final name held, by the move failing or by the write skipping a body whose name it finds, SHALL verify the file there against its name before it keeps it (STORAGE §5, §7): one hashing to it is kept and the temporary unlinked; one failing it, part of a body a crashed exclusive create and copy left, other bytes or a link, is never kept in place of the bytes in hand. An owner's write (`PimdirSourceStore::write` staging its batch's bodies, `PimdirStore::put_item`, a `PimdirBlobStage` an owner handed out) SHALL move it into quarantine/ as `PimdirStore::quarantine` does, under the staging lock taken exclusively and the process's own writer lock, verified again under them, then write again, once per name; `PimdirSourceStore::write` releases its share of the writer lock for the move. A producer's write (`stage_body`, a `blob_writer` commit, an enqueue carrying its body) SHALL fail as `PimdirError::Io` (`InvalidData`) naming the name, enqueueing nothing, its bytes staying with its caller until the owner frees the name; so SHALL an owner's whose move a producer holding the staging lock prevents. A write skipping a body already held reads it whole once, which is why the write of a batch's bodies happens once, before its transaction, and `write::apply` does not write them again.
 
 #### Scenario: A name already held
 - GIVEN a dangling link holding a body's name
-- WHEN the body is staged whole and streamed
-- THEN the link is kept, no temporary is left, the body reads as missing, and once the owner moved the link aside the next write lands (tests/blob_store.rs `a_write_never_replaces_what_holds_the_name`)
+- WHEN the owner stages the body whole and streams it
+- THEN neither writes through the link, each moves it into quarantine/ and lands the body, and no temporary is left (tests/blob_store.rs `a_write_never_replaces_what_holds_the_name`)
+
+#### Scenario: A producer meets a failing file
+- GIVEN part of a body under its name
+- WHEN a producer stages it, streams it and enqueues it with its body
+- THEN each fails naming it, nothing is enqueued and nothing moved; the owner's next write sets the file aside and lands the body (tests/blob_store.rs `a_producer_meeting_a_failing_held_name_fails_its_write`)
+
+#### Scenario: A fetch meets a failing file
+- vectors/sync/130 through tests/vectors_sync.rs, which compares `expect.store.objects`
 
 ### Requirement: A body failing its name is quarantined
 A body failing its name SHALL read as missing to everyone. `PimdirStore::quarantine` SHALL move it, or a link where it or its shard belongs, into quarantine/ (beside objects/, created by the first move) under its name, a period and a suffix unique to the move (process id, counter, time), never replacing a quarantined file and never unlinking it, after checking it again under the staging lock taken exclusively and the process's own writer lock, as the collector holds them; a producer holding the staging lock leaves the move to the next read. The owner moves on its reads outside a write transaction: the drain after rolling back a row whose body failed, the verification before a push, the upgrade's verification and the dedup lookup. A reader or a producer moves nothing. Nothing reads quarantine/ as bodies, the collector never walks it, and `pimdir check` lists it (STORAGE §3, §7). Only the user empties it: `PimdirStore::empty_quarantine` (`pimdir quarantine empty`) SHALL unlink every file and link in it, leaving anything else, under the staging lock taken exclusively and the process's own writer lock, a producer holding the staging lock refusing it as `PimdirError::Staging`.
@@ -509,7 +520,7 @@ A pending `add` SHALL NOT be projected as an item: it has no `seq` until the
 owner applies it, and it is a request to create an item rather than one. The
 reader SHALL report pending creates apart, as rows and as a count.
 
-An `update` stating `if_match` SHALL fold only when it names the body the item holds at that point of the fold, the edits folded before it included: one naming another will park at the drain (STORAGE §15.3), so the overlay shows the item as the drain will leave it (tests/overlay.rs `an_edit_that_will_park_is_not_folded`).
+An `update` stating `if_match` SHALL fold only when it names the body the item holds at that point of the fold, the edits folded before it included: one naming another will park at the drain (STORAGE §15.3), so the overlay shows the item as the drain will leave it (tests/overlay.rs `an_edit_that_will_park_is_not_folded`). An `update` meeting a conflict its `resolves` does not name, or stating it over none, parks too (STORAGE §15.3), and the binding the drain runs it through is the owner's choice, which a reader does not know: an ordinary `update` SHALL fold only while the item and every binding of it are in no conflict, and a resolution only when it names the item's diverging body where the item is conflicted and either names a conflicted binding's or finds none conflicted with the item conflicted, each conflict it settles read as settled by the rows after it (tests/item_conflict_settle.rs `a_queued_update_settles_only_the_conflict_it_resolves`, `a_queued_resolution_runs_through_the_binding_it_names`). The overlay may so hide an ordinary `update` the drain applies through a binding in no conflict, never show one it parks.
 
 A parked row SHALL NOT overlay, its error asserting that it will not be applied
 without an operator. A pending row whose payload the reader cannot decode
@@ -1239,6 +1250,22 @@ The key a body states (a `Message-ID`, a vCard or iCalendar `UID`) SHALL be file
 
 #### Scenario: Two producers edit one read
 - tests/store_rules.rs `an_update_whose_read_body_was_replaced_parks`
+
+### Requirement: A resolution names the conflicts it settles
+`PimdirAction::Update` SHALL carry `resolves: Option<Vec<PimdirHash>>`, encoded as the payload's optional `resolves` and read strictly as a non-empty array of distinct object names (STORAGE §15.3): the diverging bodies a person's resolution was decided over, which a producer deciding a conflict states, the `conflict_object` of each conflict it showed (`list_item_conflicts`, `list_conflicts`), and no other update. The drain SHALL run it as the engine's `Edit` with `resolves` (mutate.md), parking the row with the refusal's message, which names the conflict, when it meets a conflict, the item's or that of the binding it runs through, that `resolves` does not name, or states `resolves` and meets none. A resolution SHALL run through a conflicted binding whose diverging body it names when the item has one, in source order, the producer not knowing which binding the drain picks; any other `update` runs as before. An `update` of an item no source binds takes `resolves` on the same terms, its item's conflict the only one it meets.
+
+#### Scenario: A queued edit predating the conflict
+- GIVEN an item conflicted under `manual` and an `update` queued over the body it keeps, stating no `resolves`, or naming another body
+- WHEN the owner drains
+- THEN each parks naming the diverging body, the conflict and both bodies kept; a resolution naming it applies and settles it, and one naming it once it is settled parks (tests/item_conflict_settle.rs `a_queued_update_settles_only_the_conflict_it_resolves`)
+
+#### Scenario: A resolution of a binding's conflict through another source
+- GIVEN the owner draining as a source in no conflict, another source's binding conflicted with its remote
+- WHEN a resolution naming that binding's body drains
+- THEN it runs through that binding, its base adopting the conflict's revision and body (tests/item_conflict_settle.rs `a_queued_resolution_runs_through_the_binding_it_names`)
+
+#### Scenario: The payloads
+- vectors/payloads.json, its two valid `resolves` cases and five malformed ones, through tests/payloads.rs
 
 ### Requirement: A write staged with its body stages nothing when refused
 `PimdirProducer::enqueue_with_body(collection, body, |hash| action)` SHALL hash the body, build the action from its hash, run the gate of §15.6 on the bytes in hand and, for an `add`, the duplicate check of `enqueue_add` on its link id or on the key the drain would derive from the body, then write the body and append the row in one transaction, answering the row id. A refused write SHALL leave objects/ as it was. `stage_body` with `enqueue` or `enqueue_add` keep working, a refused write there leaving its body for the collector.

@@ -264,6 +264,24 @@ impl PimdirHub {
         out
     }
 
+    /// The item conflicts of `placements`, a projection of this hub, for
+    /// [`PimdirLoaded::conflicted`](crate::load::PimdirLoaded::conflicted):
+    /// each placement whose item is conflicted, with the item's diverging
+    /// body, `None` while nobody has read it (SYNC §7).
+    pub fn conflicted(
+        &self,
+        placements: &[PimdirPlacement],
+    ) -> Vec<(PimdirHandle, Option<PimdirHash>)> {
+        placements
+            .iter()
+            .filter_map(|placement| {
+                let item = self.items.get(placement.link_id.as_ref()?)?;
+                item.conflicted
+                    .then(|| (placement.handle.clone(), item.conflict_object.clone()))
+            })
+            .collect()
+    }
+
     /// The placement for an item this source already holds.
     ///
     /// A recorded conflict outranks the base comparison, else the merge

@@ -388,6 +388,7 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                     PimdirMutation::Edit {
                         overrule: false,
                         if_match: None,
+                        resolves: None,
                         handle,
                         object: object.clone(),
                         body,

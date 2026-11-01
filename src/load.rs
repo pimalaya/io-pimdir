@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::{
     collection::{PimdirCheckpoint, PimdirCoverage, PimdirRound},
+    object::PimdirHash,
     placement::{PimdirHandle, PimdirLinkId, PimdirPlacement, PimdirSuperseded},
 };
 
@@ -72,4 +73,12 @@ pub struct PimdirLoaded {
     /// The member each loaded pending create may be moved from, keyed by
     /// the create's handle (`list_superseded_bindings`, SYNC §3).
     pub superseded: Vec<(PimdirHandle, PimdirSuperseded)>,
+    /// The loaded placements whose item is conflicted (`items.conflicted`,
+    /// SYNC §9), each with the item's diverging body, `None` while nobody
+    /// has read it, as [`PimdirHub::conflicted`] answers: what an
+    /// [`Edit`](crate::mutate::PimdirMutation::Edit) meets beside its
+    /// binding's conflict, which the placement carries (SYNC §7).
+    ///
+    /// [`PimdirHub::conflicted`]: crate::hub::PimdirHub::conflicted
+    pub conflicted: Vec<(PimdirHandle, Option<PimdirHash>)>,
 }

@@ -264,6 +264,7 @@ fn an_update_whose_read_body_was_replaced_parks() {
                     seq,
                     object: object.hash.clone(),
                     if_match: Some(store.hash(read)),
+                    resolves: None,
                 },
                 Some(&object),
             )
@@ -297,6 +298,7 @@ fn an_update_whose_read_body_was_replaced_parks() {
                 seq,
                 object: object.hash.clone(),
                 if_match: None,
+                resolves: None,
             },
             Some(&object),
         )

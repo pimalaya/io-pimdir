@@ -77,6 +77,7 @@ fn an_overruling_edit_over_an_unread_item_conflict_is_refused() {
         summary: None,
         sort_key: None,
         if_match: None,
+        resolves: None,
         overrule: true,
     };
     let Err(PimdirRunError::Store(err)) = store.mutate("Contacts", mutation) else {

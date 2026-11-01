@@ -544,6 +544,7 @@ mod tests {
             seq: 1,
             object: crate::object::PimdirHash::from("h"),
             if_match: None,
+            resolves: None,
         };
         let required = |current: &str, new: &str| {
             required_by_content(

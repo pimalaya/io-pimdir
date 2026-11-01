@@ -28,6 +28,7 @@ fn edit(client: &mut Client, body: &[u8]) {
             PimdirMutation::Edit {
                 overrule: false,
                 if_match: None,
+                resolves: None,
                 handle: PimdirHandle::from("m1"),
                 object,
                 body: body.to_vec(),
@@ -160,6 +161,7 @@ fn a_rekey_restages_an_uncarried_edit_under_a_provisional_handle() {
             PimdirMutation::Edit {
                 overrule: false,
                 if_match: None,
+                resolves: None,
                 handle: PimdirHandle::from("v1-0"),
                 object,
                 body: LOCAL.to_vec(),

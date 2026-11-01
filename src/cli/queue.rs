@@ -297,13 +297,19 @@ fn summary(action: &PimdirAction) -> String {
         PimdirAction::Update {
             seq,
             object,
-            if_match: None,
-        } => format!("seq {seq}, object {}", object.0),
-        PimdirAction::Update {
-            seq,
-            object,
-            if_match: Some(read),
-        } => format!("seq {seq}, object {}, if-match {}", object.0, read.0),
+            if_match,
+            resolves,
+        } => {
+            let mut summary = format!("seq {seq}, object {}", object.0);
+            if let Some(read) = if_match {
+                summary.push_str(&format!(", if-match {}", read.0));
+            }
+            if let Some(resolves) = resolves {
+                let names: Vec<&str> = resolves.iter().map(|hash| hash.0.as_str()).collect();
+                summary.push_str(&format!(", resolves {}", names.join(" ")));
+            }
+            summary
+        }
         PimdirAction::SetPerformer { capability, source } => {
             format!("{capability} -> {}", source.as_deref().unwrap_or("none"))
         }

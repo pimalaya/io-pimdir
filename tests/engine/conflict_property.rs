@@ -350,11 +350,15 @@ fn resolve(
     let body = picked.unwrap_or(merged);
     let object = object_of(&body);
 
+    // NOTE: a person's resolution names the conflicts it was shown (SYNC
+    // §7).
+    let resolves = cluster.sources[source].shown("inbox", &handle);
     let staged = cluster.sources[source].mutate(
         "inbox",
         PimdirMutation::Edit {
             overrule: false,
             if_match: None,
+            resolves,
             handle: handle.clone(),
             object: object.clone(),
             body,
@@ -462,6 +466,7 @@ fn check_conflict_model(ops: Vec<ConflictOp>) -> Result<(), TestCaseError> {
                     PimdirMutation::Edit {
                         overrule: false,
                         if_match: None,
+                        resolves: None,
                         handle: placement.handle,
                         object: object.clone(),
                         body,

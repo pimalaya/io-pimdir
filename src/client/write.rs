@@ -20,7 +20,7 @@ use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
         PimdirError, PimdirSourceStore, attachments, bind_list,
-        blobs::{PimdirBlobCheck, PimdirBlobs},
+        blobs::{self, PimdirBlobCheck, PimdirBlobs},
         busy_or_sql, release_pins, rows, schema,
     },
     codec,
@@ -182,6 +182,8 @@ impl PimdirSourceStore {
             })
             .collect();
 
+        let conflicted = hub.conflicted(&placements);
+
         Ok(PimdirLoaded {
             placements,
             checkpoint: state.checkpoint,
@@ -190,6 +192,7 @@ impl PimdirSourceStore {
             unstamped,
             held,
             superseded,
+            conflicted,
         })
     }
 
@@ -258,11 +261,31 @@ impl PimdirSourceStore {
     /// front so contention fails fast as [`PimdirError::Busy`]. The first
     /// write records [`SYNC_VERSION`] in `store_meta.sync_version`; a store
     /// naming another is [`PimdirError::SyncVersion`], nothing written.
+    ///
+    /// A body's name held by a file failing it (§5) is moved into
+    /// quarantine/ and the bodies written again, once per name; one the
+    /// owner cannot move, a producer staging, fails the write.
     pub fn write(&mut self, ops: Vec<PimdirWriteOp>) -> Result<PimdirWritten, PimdirError> {
         let blobs = self.store.reader.blobs();
         let lock = Arc::clone(&self.store.lock);
-        let _writing = lock.writing();
-        blobs.stage(&ops)?;
+        let mut moved = BTreeSet::new();
+        let _writing = loop {
+            let writing = lock.writing();
+            let staged = blobs.stage(&ops);
+            let Err(err) = staged else {
+                break writing;
+            };
+            match blobs::held_name(&err) {
+                // NOTE: the move takes the writer lock exclusively, so
+                // this write's share of it goes first (§7).
+                Some(held) if moved.insert(held.clone()) => {
+                    let held = held.clone();
+                    drop(writing);
+                    self.store.quarantine(&held)?;
+                }
+                _ => return Err(err.into()),
+            }
+        };
 
         let tx = self
             .store
@@ -292,8 +315,10 @@ impl PimdirSourceStore {
 
 /// Applies a batch inside the caller's transaction.
 ///
-/// Objects, checkpoints and the round ops are written as they come, but
-/// for the round's stamps, which follow the batch's upserts. A placement
+/// Object rows, checkpoints and the round ops are written as they come,
+/// but for the round's stamps, which follow the batch's upserts; the
+/// bodies the batch carries the caller stages first ([`PimdirBlobs::stage`]),
+/// outside the transaction. A placement
 /// with no link id lands on the binding its handle holds (§10) and is
 /// refused when none does, nothing reaching the store unnamed; one whose handle is bound to another link
 /// id retires that binding first, as a `Deleted` drop of the handle
@@ -328,10 +353,10 @@ pub(crate) fn apply(
                     .or_default()
                     .push(PimdirWriteOp::Settle { collection, handle });
             }
-            PimdirWriteOp::StoreObject { object, body } => {
-                if let Some(body) = body {
-                    blobs.write(&object.hash, &body)?;
-                }
+            // NOTE: the bytes landed before the transaction opened
+            // (`PimdirBlobs::stage`); writing them again would read the
+            // whole body back to verify the name it finds held (§5).
+            PimdirWriteOp::StoreObject { object, .. } => {
                 tx.execute(
                     sql::STORE_OBJECT,
                     named_params! { ":hash": object.hash.0, ":size": object.size as i64 },

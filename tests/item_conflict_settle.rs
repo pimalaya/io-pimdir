@@ -1,8 +1,8 @@
-//! A person's `Edit` settles the item's conflict whatever body it keeps
-//! (SYNC §7): `items.conflicted` cleared and its `conflict_object` released,
-//! nothing it discards kept. The item takes the edit's body, the editing
-//! source agrees on it, and every other source then owes it where its base
-//! differs.
+//! A person's resolution, an `Edit` naming the diverging body in `resolves`,
+//! settles the item's conflict whatever body it keeps (SYNC §7):
+//! `items.conflicted` cleared and its `conflict_object` released, nothing it
+//! discards kept. The item takes the edit's body, the editing source agrees
+//! on it, and every other source then owes it where its base differs.
 //!
 //! Two sources diverge on one card: the phone pulled its server's edit P
 //! into the item, then the server's own edit S met it under `manual`, so
@@ -15,10 +15,14 @@
 
 use std::path::Path;
 
-use io_pimdir::client::{PimdirSourceStore, PimdirStore};
+use io_pimdir::client::{
+    PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
+};
 use io_pimdir::{
     change::PimdirWriteOp,
+    codec::PimdirAction,
     collection::PimdirCollectionId,
+    hash,
     hub::PimdirSourceId,
     load::PimdirLoadSelection,
     mutate::PimdirMutation,
@@ -156,6 +160,13 @@ fn settle(through: &str, (kept, pick): (&str, &[u8])) {
         _ => (&mut server, "a.vcf"),
     };
 
+    // NOTE: the diverging body the person was shown (SYNC §7).
+    let shown: Vec<PimdirHash> = editor
+        .list_item_conflicts(None)
+        .unwrap()
+        .into_iter()
+        .filter_map(|conflict| conflict.conflict_object)
+        .collect();
     let picked = editor.hash(pick);
     let report = editor
         .mutate(
@@ -170,6 +181,7 @@ fn settle(through: &str, (kept, pick): (&str, &[u8])) {
                 summary: None,
                 sort_key: None,
                 if_match: None,
+                resolves: Some(shown),
                 overrule: false,
             },
         )
@@ -240,4 +252,187 @@ fn taking_the_diverging_body_through_the_source_it_left_settles() {
 #[test]
 fn a_merge_through_the_source_it_left_settles() {
     settle("server", ("X", MERGED));
+}
+
+/// The card's public id.
+fn seq(store: &PimdirSourceStore) -> i64 {
+    store
+        .seq_for_link(CONTACTS, LINK)
+        .unwrap()
+        .expect("the card has a public id")
+}
+
+/// Queues an `update` of the card to `bytes` over the phone's body, a
+/// resolution of `resolves` when it states one, answering the row's id.
+fn queue_update(dir: &Path, seq: i64, bytes: &[u8], resolves: Option<&[&[u8]]>) -> i64 {
+    let mut producer = PimdirProducer::open(dir, "test").unwrap();
+    let if_match = Some(hash::hash(PHONE));
+    let resolves = resolves.map(|bodies| bodies.iter().map(|body| hash::hash(body)).collect());
+    producer
+        .enqueue_with_body(CONTACTS, bytes, |object| PimdirAction::Update {
+            seq,
+            object,
+            if_match,
+            resolves,
+        })
+        .unwrap()
+}
+
+/// The card's body as a reader overlaying the queue reads it (§15.4).
+fn overlaid(dir: &Path, seq: i64) -> Option<PimdirHash> {
+    let reader = PimdirReader::open(dir).unwrap().with_pending();
+    reader.get_item(CONTACTS, seq).unwrap().unwrap().object
+}
+
+/// A queued `update` meeting the item's conflict parks naming it unless it
+/// resolves it, and one resolving a conflict that no longer stands parks
+/// too (STORAGE §15.3, SYNC §7): an ordinary edit queued before the
+/// conflict arose never discards the diverging body. The overlay folds
+/// only what the drain applies.
+#[test]
+fn a_queued_update_settles_only_the_conflict_it_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut phone, _server) = diverged(dir.path());
+    let seq = seq(&phone);
+    let server_body = phone.hash(SERVER);
+
+    // NOTE: an ordinary edit, made over the body the item keeps.
+    queue_update(dir.path(), seq, MERGED, None);
+    assert_eq!(
+        overlaid(dir.path(), seq),
+        Some(phone.hash(PHONE)),
+        "not folded"
+    );
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = phone.parked_actions().unwrap();
+    assert!(
+        parked[0].error.contains(&server_body.0),
+        "{}",
+        parked[0].error
+    );
+    let conflicts = phone.list_item_conflicts(None).unwrap();
+    assert_eq!(conflicts.len(), 1, "the conflict stands");
+    assert_eq!(conflicts[0].conflict_object, Some(server_body.clone()));
+    assert_eq!(conflicts[0].object, Some(phone.hash(PHONE)));
+
+    // a resolution naming another body parks the same
+    queue_update(dir.path(), seq, MERGED, Some(&[ANCESTOR]));
+    assert_eq!(
+        overlaid(dir.path(), seq),
+        Some(phone.hash(PHONE)),
+        "not folded"
+    );
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+
+    // the person's resolution of the conflict shown settles it
+    queue_update(dir.path(), seq, MERGED, Some(&[SERVER]));
+    assert_eq!(
+        overlaid(dir.path(), seq),
+        Some(phone.hash(MERGED)),
+        "folded"
+    );
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (1, 0));
+    assert!(phone.list_item_conflicts(None).unwrap().is_empty());
+    let item = phone.get_item(CONTACTS, seq).unwrap().unwrap();
+    assert_eq!(item.object, Some(phone.hash(MERGED)));
+
+    // and one resolving it again meets no conflict: parked
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    producer
+        .enqueue_with_body(CONTACTS, PHONE, |object| PimdirAction::Update {
+            seq,
+            object,
+            if_match: Some(hash::hash(MERGED)),
+            resolves: Some(vec![server_body.clone()]),
+        })
+        .unwrap();
+    drop(producer);
+    assert_eq!(
+        overlaid(dir.path(), seq),
+        Some(phone.hash(MERGED)),
+        "not folded"
+    );
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let item = phone.get_item(CONTACTS, seq).unwrap().unwrap();
+    assert_eq!(item.object, Some(phone.hash(MERGED)));
+}
+
+/// A queued resolution runs through the conflicted binding whose body it
+/// names (STORAGE §15.2): the owner draining as the phone, whose binding
+/// is in no conflict, settles the server's, the base adopting the
+/// revision and body it recorded.
+#[test]
+fn a_queued_resolution_runs_through_the_binding_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut phone = store(dir.path(), "phone");
+    let mut server = store(dir.path(), "server");
+    phone
+        .write(vec![
+            body(&phone, ANCESTOR),
+            card(&phone, "1", ANCESTOR, "v1"),
+        ])
+        .unwrap();
+    server
+        .write(vec![
+            body(&server, ANCESTOR),
+            card(&server, "a.vcf", ANCESTOR, "e1"),
+        ])
+        .unwrap();
+    // NOTE: the server's own edit S at e2 met the store's, recorded on its
+    // binding alone.
+    let PimdirWriteOp::UpsertPlacement(mut diverged) = card(&server, "a.vcf", ANCESTOR, "e1")
+    else {
+        unreachable!()
+    };
+    diverged.status = PimdirStatus::Conflict;
+    diverged.conflict_revision = Some("e2".into());
+    diverged.conflict_object = Some(server.hash(SERVER));
+    server
+        .write(vec![
+            body(&server, SERVER),
+            PimdirWriteOp::UpsertPlacement(diverged),
+        ])
+        .unwrap();
+    assert!(phone.list_item_conflicts(None).unwrap().is_empty());
+    assert_eq!(phone.list_conflicts(None).unwrap().len(), 1);
+    drop(server);
+
+    let seq = seq(&phone);
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    producer
+        .enqueue_with_body(CONTACTS, MERGED, |object| PimdirAction::Update {
+            seq,
+            object,
+            if_match: Some(hash::hash(ANCESTOR)),
+            resolves: Some(vec![hash::hash(SERVER)]),
+        })
+        .unwrap();
+    drop(producer);
+    assert_eq!(
+        overlaid(dir.path(), seq),
+        Some(phone.hash(MERGED)),
+        "folded"
+    );
+
+    let report = phone.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked),
+        (1, 0),
+        "{:?}",
+        phone.parked_actions()
+    );
+    assert!(phone.list_conflicts(None).unwrap().is_empty(), "settled");
+    let hub = phone.load_hub(CONTACTS).unwrap();
+    let item = &hub.items[&PimdirLinkId(LINK.into())];
+    assert_eq!(item.object, Some(phone.hash(MERGED)));
+    let base = item.sources[&PimdirSourceId("server".into())]
+        .base
+        .clone()
+        .expect("a base");
+    assert_eq!(base.revision.as_deref(), Some("e2"));
+    assert_eq!(base.object, Some(phone.hash(SERVER)));
 }

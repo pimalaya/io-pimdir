@@ -619,6 +619,8 @@ impl PimdirStore {
             size: body.len(),
         };
         let blobs = PimdirBlobs::open(&self.dir);
+        let dir = self.dir.clone();
+        let lock = Arc::clone(&self.lock);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -632,8 +634,26 @@ impl PimdirStore {
             });
         }
         // NOTE: inside the transaction, so no collector runs between the
-        // blob landing and the row pinning it (§5).
-        blobs.write(&object.hash, body)?;
+        // blob landing and the row pinning it (§5); a name held by a file
+        // failing it is set aside and the body written again.
+        match blobs.write(&object.hash, body) {
+            Err(err) if blobs::held_name(&err).is_some() => {
+                let Ok(staging) = PimdirLock::collect(&dir) else {
+                    return Err(err.into());
+                };
+                let collecting = lock.collecting();
+                if let Some(target) = blobs.quarantine(&object.hash)? {
+                    warn!(
+                        "body {} fails its name, moved to {}",
+                        object.hash.0,
+                        target.display()
+                    );
+                }
+                drop((collecting, staging));
+                blobs.write(&object.hash, body)?;
+            }
+            written => written?,
+        }
         let link = derivation.link_id.clone();
         let seq = write::put_unbound(&tx, collection, &object, derivation)?;
         tx.commit().map_err(busy_or_sql)?;

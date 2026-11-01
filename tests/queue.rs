@@ -434,6 +434,7 @@ fn update_repoints_the_body() {
                 seq,
                 object: object.hash.clone(),
                 if_match: None,
+                resolves: None,
             },
             Some(&object),
         )
@@ -1248,6 +1249,7 @@ fn a_queued_update_missing_its_body_is_retried_then_parked() {
         seq,
         object: object.hash.clone(),
         if_match: None,
+        resolves: None,
     };
     producer.enqueue("INBOX", &update, Some(&object)).unwrap();
     drop(producer);
@@ -1337,6 +1339,7 @@ fn a_body_a_policy_overrules_during_a_drain_is_reported() {
                 seq,
                 object: hash,
                 if_match: None,
+                resolves: None,
             }
         })
         .unwrap();

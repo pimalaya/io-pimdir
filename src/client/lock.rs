@@ -23,7 +23,9 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        Arc, LazyLock, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+    },
 };
 
 // NOTE: std grew these locks in 1.89 and its inherent methods would
@@ -213,6 +215,21 @@ impl PimdirLock {
             .writers
             .write()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`collecting`](Self::collecting) without waiting, `None` while a
+    /// writer of this process holds it, this thread's own included.
+    pub(crate) fn try_collecting(&self) -> Option<RwLockWriteGuard<'_, ()>> {
+        match self.shared.writers.try_write() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(err)) => Some(err.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Whether this is an owner lock, not a staging one (STORAGE §8).
+    pub(crate) fn owns(&self) -> bool {
+        self.registered.is_some()
     }
 
     /// Counts a verb in flight until the guard drops, so the collector

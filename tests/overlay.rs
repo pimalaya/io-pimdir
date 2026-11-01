@@ -411,6 +411,7 @@ fn an_edit_that_will_park_is_not_folded() {
                 seq: seqs[0],
                 object: hash,
                 if_match: Some(stale),
+                resolves: None,
             }
         })
         .unwrap();
@@ -420,6 +421,7 @@ fn an_edit_that_will_park_is_not_folded() {
                 seq: seqs[1],
                 object: hash,
                 if_match: Some(held.clone()),
+                resolves: None,
             }
         })
         .unwrap();
@@ -438,6 +440,7 @@ fn an_edit_that_will_park_is_not_folded() {
                 seq: seqs[1],
                 object: hash,
                 if_match: Some(one),
+                resolves: None,
             }
         })
         .unwrap();

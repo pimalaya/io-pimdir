@@ -8,7 +8,7 @@
 //!
 //! [`with_pending`]: PimdirReader::with_pending
 
-use core::cmp::Ordering;
+use core::{cmp::Ordering, slice};
 
 use alloc::{
     string::{String, ToString},
@@ -36,7 +36,7 @@ use crate::{
         rows, schema,
         write::{
             PimdirSummaryTable, attach_address, attach_list_value, binding_from_row, list_sql,
-            load_addresses, load_list, load_summaries, tables_of,
+            load_addresses, load_list, load_summaries, read_hub, tables_of,
         },
     },
     codec::{self, PimdirAction},
@@ -875,7 +875,7 @@ impl PimdirReader {
                 None => None,
             },
         };
-        Ok(item.and_then(|item| fold(item, pending.edits.get(&seq))))
+        Ok(item.and_then(|item| fold(item, pending.edits.get(&seq), pending.standing.get(&seq))))
     }
 
     /// Resolves an item's public id from its key, for a consumer that
@@ -979,7 +979,7 @@ impl PimdirReader {
             let Some(item) = self.committed_item(collection, *seq)? else {
                 continue;
             };
-            if fold(item, Some(edits)).is_none() {
+            if fold(item, Some(edits), pending.standing.get(seq)).is_none() {
                 count -= 1;
             }
         }
@@ -1972,6 +1972,49 @@ struct PimdirPending {
     /// Items another collection's pending move or copy brings in, mapped
     /// to the collection their row is still read from.
     arrivals: BTreeMap<i64, String>,
+    /// The conflicts of the items a pending `update` edits, by public id,
+    /// which decide whether the drain applies it or parks it (§15.3).
+    standing: BTreeMap<i64, PimdirStanding>,
+}
+
+/// The conflicts an item stands in (SYNC §7), as the overlay reads what a
+/// pending `update` meets.
+#[derive(Clone, Debug, Default)]
+struct PimdirStanding {
+    /// The item's diverging body while it is conflicted, `None` within for
+    /// one nobody has read.
+    item: Option<Option<PimdirHash>>,
+    /// The diverging body of each of its conflicted bindings.
+    bindings: Vec<Option<PimdirHash>>,
+}
+
+impl PimdirStanding {
+    /// Whether the drain applies an `update` stating `resolves` (§15.3),
+    /// settling what it meets when it does. The binding it runs through is
+    /// the owner's choice, which a reader does not know: an ordinary update
+    /// applies only over no conflict at all, and a resolution only through
+    /// a conflicted binding it names or, its item conflicted, beside no
+    /// conflicted binding, so the overlay never shows a body the drain
+    /// parks.
+    fn settle(&mut self, resolves: Option<&Vec<PimdirHash>>) -> bool {
+        let Some(resolves) = resolves else {
+            return self.item.is_none() && self.bindings.is_empty();
+        };
+        let named =
+            |body: &Option<PimdirHash>| body.as_ref().is_some_and(|body| resolves.contains(body));
+        if self.item.as_ref().is_some_and(|body| !named(body)) {
+            return false;
+        }
+        match self.bindings.iter().position(named) {
+            Some(at) => {
+                self.bindings.remove(at);
+            }
+            None if !self.bindings.is_empty() || self.item.is_none() => return false,
+            None => {}
+        }
+        self.item = None;
+        true
+    }
 }
 
 impl PimdirPending {
@@ -2139,6 +2182,42 @@ impl PimdirReader {
                 _ => {}
             }
         }
+
+        // NOTE: an update meeting a conflict its `resolves` does not name
+        // parks (§15.3), so the conflicts it meets are read with it.
+        let updated: Vec<i64> = pending
+            .edits
+            .iter()
+            .filter(|(_, actions)| {
+                actions
+                    .iter()
+                    .any(|action| matches!(action, PimdirAction::Update { .. }))
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in updated {
+            let Some(item) = self.committed_item(collection, seq)? else {
+                continue;
+            };
+            let hub = read_hub(
+                &self.conn,
+                collection,
+                Some(slice::from_ref(&item.link_id.0)),
+            )?;
+            let Some(shared) = hub.items.get(&item.link_id) else {
+                continue;
+            };
+            let standing = PimdirStanding {
+                item: shared.conflicted.then(|| shared.conflict_object.clone()),
+                bindings: shared
+                    .sources
+                    .values()
+                    .filter(|binding| binding.conflicted)
+                    .map(|binding| binding.conflict_object.clone())
+                    .collect(),
+            };
+            pending.standing.insert(seq, standing);
+        }
         Ok(pending)
     }
 
@@ -2149,7 +2228,7 @@ impl PimdirReader {
             let Some(item) = self.committed_item(from, *seq)? else {
                 continue;
             };
-            if let Some(item) = fold(item, pending.edits.get(seq)) {
+            if let Some(item) = fold(item, pending.edits.get(seq), pending.standing.get(seq)) {
                 items.push(item);
             }
         }
@@ -2177,7 +2256,8 @@ impl PimdirReader {
             .into_iter()
             .filter_map(|item| {
                 let edits = pending.edits.get(&item.seq);
-                fold(item, edits)
+                let standing = pending.standing.get(&item.seq);
+                fold(item, edits, standing)
             })
             .collect();
 
@@ -2194,17 +2274,26 @@ impl PimdirReader {
 }
 
 /// Folds an item's pending actions into it, `None` when they take it out
-/// of the collection: `set-flags` is absolute, `update` repoints the body.
-fn fold(mut item: PimdirItem, actions: Option<&Vec<PimdirAction>>) -> Option<PimdirItem> {
+/// of the collection: `set-flags` is absolute, `update` repoints the body,
+/// over the conflicts the item stands in.
+fn fold(
+    mut item: PimdirItem,
+    actions: Option<&Vec<PimdirAction>>,
+    standing: Option<&PimdirStanding>,
+) -> Option<PimdirItem> {
+    let mut standing = standing.cloned().unwrap_or_default();
     for action in actions.into_iter().flatten() {
         match action {
             PimdirAction::SetFlags { flags, .. } => item.flags = flags.clone(),
             // NOTE: an edit naming a body the item will not hold when its
-            // turn comes parks (§15.3), so the item reads as it will be.
+            // turn comes parks (§15.3), so the item reads as it will be;
+            // so does one meeting a conflict its `resolves` does not name,
+            // or stating it over none.
             PimdirAction::Update {
                 if_match: Some(read),
                 ..
             } if item.object.as_ref() != Some(read) => {}
+            PimdirAction::Update { resolves, .. } if !standing.settle(resolves.as_ref()) => {}
             PimdirAction::Update { object, .. } => {
                 item.object = Some(object.clone());
                 item.level = PimdirLevel::Full;
