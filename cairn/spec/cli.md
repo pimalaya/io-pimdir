@@ -75,22 +75,22 @@ rather than failing. The action is in the queue by then, and the owner holding
 the store is the one that will drain it.
 
 ### Requirement: Terminal operations take the owner role directly
-Purge, queue cancellation, repair and collection have no action kind and
+Purge, erasure, queue cancellation, repair, collection and emptying quarantine/ have no action kind and
 cannot be queued: they SHALL take the owner role directly, without naming a
 source, and fail if the role is unavailable. When another process owns the
 store, or another writer holds its write lock, the CLI SHALL report it as a
 plain sentence naming the likely cause (a running sync) and never as a raw SQL
 or debug error dump.
 
-The CLI's owner role SHALL open the store through `open_current`: the CLI is never the store's sync engine, so it SHALL NOT create, migrate or reconcile a store, and a store of another version or shape fails the verb with `NotCurrent`'s sentence, written nothing. A verb that enqueues then drains (`item restore`, `tag`) SHALL leave its action queued and report it `queued`, as when another process owns the store: the store's sync engine applies it once it has brought the store to its schema.
+The CLI's owner role SHALL open the store through `open_current`: the CLI is never the store's sync engine, so it SHALL NOT create a store. A store of another draft, a damaged one or a foreign one fails every verb, whatever its role, with the library's sentence, which names both versions for another draft, written nothing. A verb that enqueues then drains (`item restore`, `tag`) SHALL leave its action queued and report it `queued` when another process owns the store or the database holds no schema yet.
 
-#### Scenario: An older binary over a newer store
-- GIVEN a store whose schema text differs from the binary's
-- WHEN `pimdir queue cancel` or `pimdir gc` runs
-- THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`); `pimdir item restore` reports its action `queued` and exits 0 (`a_restore_over_a_store_of_another_revision_stays_queued`)
+#### Scenario: A binary over another draft's store
+- GIVEN a store marked `storage-draft-09` whose `task_summary` carries a column that draft added
+- WHEN `pimdir queue cancel`, `pimdir gc` or `pimdir item restore` runs
+- THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`, `a_restore_over_a_store_of_another_draft_is_refused`, its error naming `storage-draft-09`)
 
 ### Requirement: Destroying data is confirmed
-`item purge` and `queue cancel` SHALL confirm interactively before destroying
+`item purge`, `item erase`, `quarantine empty` and `queue cancel` SHALL confirm interactively before destroying
 anything, stating what will be destroyed (how many items, how many bytes)
 whenever the store can tell. `--yes` SHALL skip the confirmation. When the output
 is not a terminal, or `--json` is set, the CLI SHALL refuse to proceed without
@@ -122,26 +122,32 @@ The CLI SHALL expose, at minimum:
 - `item show`: one item by its public `seq`, across every collection that holds
   it, retained placements included, each with its summary row and addresses as
   stored and the bindings its sources hold it under.
-- `item export`: an item's body as raw bytes on stdout, or to a file.
+- `item export`: an item's body as raw bytes on stdout, or to a file, read whole and checked against its name before a byte is served, a body failing it refused as missing (STORAGE §7).
 - `item restore`: revive a retained item (see the enqueue-then-drain
   requirement above).
 - `item purge`: destroy retained items, one `seq`, everything older than a
   human duration, or all of them. A live item SHALL be refused: purge empties
   the trash, it does not delete synced data.
+- `item erase`: erase one item's bytes from the store's files (STORAGE §11.5): `PimdirStore::erase` (the purge of a retained item, or the delete of a live one no source binds, the collector, a `TRUNCATE` checkpoint of pimdir.db), then, when index.db exists, `PimdirIndex::erase` (the refresh with its thread prune, `optimize_text`, a `TRUNCATE` checkpoint of index.db), reporting the blob files unlinked and whether the index was erased (`pimdir-item-erase`). A live item a source binds SHALL be refused: remove it first.
 - `queue list`: pending actions, or parked ones with `--parked`.
 - `queue cancel`: drop one queue row by id.
 - `queue status`: where one queue row stands by id: pending, parked with its
   error, applied with the item an add created, or unknown.
-- `store info`: the schema version (one figure: the reader verified the store
-  is stamped with the version this build services, refusing any other), sources,
-  per-collection live and retained counts, object count and bytes live versus
-  retained, and the change cursor, the last stamp drawn.
+- `store info`: the store's id and incarnation, its format version (the reader
+  verified it is the one this build opens, refusing any other), the schema
+  version with the read and produce versions, the derivation revision and the
+  sync version, sources, per-collection live and retained counts, object count
+  and bytes live versus retained, and the change cursor, the last stamp drawn
+  and the purge count (`StoreInfoOutput`: `storeId`, `incarnation`,
+  `formatVersion`, `schemaVersion`, `readVersion`, `produceVersion`,
+  `derivation`, `syncVersion`).
 - `check`: object rows whose body is missing, refcount drift, dangling
   references and orphan blob files, with `--fix` repairing the drift and the
   dangling bindings, plus an informational count of the minted keys each
-  collection holds, which is a fact rather than a problem.
+  collection holds, which is a fact rather than a problem. It also lists the entries of objects/ that are no body (`strays`, each a `temporary`, a `link` or a `foreign` path) and the files quarantine/ holds (`quarantined`), both counted as problems.
 - `gc`: reclaim the object rows nothing references, their bodies, and the orphan
-  blob files a crash left, reporting what it freed.
+  blob files a crash left, reporting what it freed and how many entries of objects/ it left as no body (`strays`).
+- `quarantine empty`: unlink every file of quarantine/ (STORAGE §7) through `PimdirStore::empty_quarantine`, under the staging lock, reporting the files and bytes freed and the entries left that are no file (`pimdir-quarantine-empty`). `gc` never touches quarantine/.
 - `export`: a portable dump of the store.
 - `index` folds the store's change feed into index.db; `search` and `count` answer a SEARCH.md §8 query, each hit addressed as `(account, seq)` with its placements, what it matched (`body`, `summary` or none) and a snippet, every answer with its coverage, after refreshing the index within `--refresh-timeout`; `show SEQ --account ACCOUNT` prints a hit's item as extraction reads it. `search --threads` collapses hits to threads (`pimdir-search-threads`), `--limit` and `--offset` then counting threads. `thread SEQ --account ACCOUNT` prints the item's thread (`pimdir-thread`). `tag QUERY --add FLAG --remove FLAG` stages one `set-flags` per placement that changes, each as the source syncing its collection, previews it with `--dry-run`, and reads each placement's outcome back from the store (`pimdir-tag`). A refused query prints SEARCH §8.4's refusal object (`pimdir-query-error` in `json-schema`) and exits with status 1.
 
@@ -190,9 +196,9 @@ JSON-lines file of items per collection, and a copy of the blob tree. Items
 SHALL be dumped exactly as stored, a live item's line carrying its summary
 columns and address rows, and bodies byte for byte. Collection files
 SHALL be numbered and mapped in the manifest rather than named after collection
-ids, since an id may hold anything a mailbox name may hold.
+ids, since an id may hold anything a mailbox name may hold: no path of the dump is built from a name (STORAGE §18). The dump's directories are created `0700` and its files `0600`, as the store's: it holds what the store holds.
 
-The manifest SHALL carry `format_version`, bumped whenever the dump's shape changes. Version 2 carries an item's summary columns and address rows where version 1 carried a raw meta string.
+The manifest SHALL carry `format_version`, bumped whenever the dump's shape changes. Version 2 carries an item's summary columns and address rows where version 1 carried a raw meta string; version 3 lays the blob tree at one shard level, `objects/<hash[0:2]>/<hash>`, as the store does, each body read whole and checked against its name before it is copied, one failing it listed among the missing objects.
 
 ### Requirement: Import is not the CLI's job
 Converting a Maildir, m2dir or vdir tree into a store (`cairn/spec/import.md`)

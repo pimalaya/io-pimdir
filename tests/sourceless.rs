@@ -56,12 +56,16 @@ fn a_source_less_handle_reads_purges_and_cancels() {
     sync.write(vec![
         PimdirWriteOp::StoreObject {
             object: PimdirObject {
-                hash: PimdirHash("cafebabe".into()),
+                hash: PimdirHash("cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()),
                 size: 4,
             },
             body: Some(b"body".to_vec()),
         },
-        PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+        PimdirWriteOp::UpsertPlacement(placement(
+            "1",
+            "mid:a",
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+        )),
     ])
     .unwrap();
     let seq = sync.list_items("INBOX", None, 10).unwrap()[0].seq;

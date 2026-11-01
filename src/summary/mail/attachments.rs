@@ -6,12 +6,12 @@
 //! decoded size.
 //!
 //! The walk is the mark's own, boundary by boundary down to
-//! [`MIME_DEPTH_MAX`], but fed the body a chunk
-//! at a time, so a writer reads a stored body from its blob file with
-//! bounded memory: a header block of at most [`HEADER_MAX`] octets per
-//! part, the first [`LINE_HEAD`] octets of any other line, one boundary
-//! per open level, and at most [`ATTACHMENTS_MAX`] summaries. A part's
-//! bytes are counted, never kept.
+//! [`MIME_DEPTH_MAX`] and through [`MIME_ENTITIES_MAX`] entities, but fed
+//! the body a chunk at a time, so a writer reads a stored body from its
+//! blob file with bounded memory: a header block of at most [`HEADER_MAX`]
+//! octets per part, the first [`LINE_HEAD`] octets of any other line, one
+//! boundary per open level, and at most [`ATTACHMENTS_MAX`] summaries. A
+//! part's bytes are counted, never kept.
 //!
 //! The same walk reads the message's invitation (Annex A.1), the first
 //! `UID` of the first `text/calendar` part stating one, its transfer
@@ -26,12 +26,15 @@ use alloc::{
     vec::Vec,
 };
 
-use super::{MIME_DEPTH_MAX, boundary, charset_decode, decode, field, header_fields, hex_pair};
+use super::{
+    MIME_DEPTH_MAX, MIME_ENTITIES_MAX, boundary, charset_decode, decode, delimits, field,
+    header_fields, hex_pair,
+};
 use crate::summary::file::PimdirFileSummary;
 
-/// The most attachments one message stands for, the first in document
-/// order (STORAGE §14.3): no mail agent attaches near it, while a sender
-/// attaching more would otherwise cost a stand-in per part.
+/// The most attachments one message stands for, the first the walk marks
+/// in document order (STORAGE §14.3): a reader finding this many reads the
+/// rest from the body.
 pub const ATTACHMENTS_MAX: usize = 1000;
 
 /// The octets of a part's header block the walk keeps; the rest of a
@@ -112,6 +115,9 @@ pub struct PimdirAttachmentWalk {
     /// Whether the message's own header block disposes it as an
     /// attachment: a multipart one has no section, so no summary.
     disposed: bool,
+    /// The entities read, the message's own counted: a part beginning
+    /// past [`MIME_ENTITIES_MAX`] is skipped, its delimiters still read.
+    read: usize,
 }
 
 /// Where the octets of a line past its head go.
@@ -187,6 +193,7 @@ impl PimdirAttachmentWalk {
             calendar: None,
             invitation: None,
             disposed: false,
+            read: 1,
         }
     }
 
@@ -405,10 +412,10 @@ impl PimdirAttachmentWalk {
     /// The level whose delimiter the head opens with, outermost first as
     /// the mark's walk slices them, and whether it closes that level.
     fn delimiter(&self) -> Option<(usize, bool)> {
-        self.frames.iter().enumerate().find_map(|(level, frame)| {
-            let rest = self.head.strip_prefix(frame.delimiter.as_slice())?;
-            Some((level, rest.starts_with(b"--")))
-        })
+        self.frames
+            .iter()
+            .enumerate()
+            .find_map(|(level, frame)| Some((level, delimits(&self.head, &frame.delimiter)?)))
     }
 
     /// A delimiter of the level `level`: the part under way ends, and the
@@ -443,6 +450,14 @@ impl PimdirAttachmentWalk {
         frame.children += 1;
         frame.child_start = Some(found);
         frame.invited_before = invited;
+
+        // NOTE: a part past the bound is no entity read, but the levels
+        // stay open: a part they never end is still no part.
+        if self.read >= MIME_ENTITIES_MAX {
+            self.mode = Mode::Skip;
+            return;
+        }
+        self.read += 1;
         self.mode = Mode::Header {
             block: Vec::new(),
             section: Some(format!("{}{}", frame.prefix, frame.children)),
@@ -648,10 +663,10 @@ fn extended_value(segments: &[(bool, String)]) -> String {
         }
     }
 
-    match charset.is_empty() {
-        true => String::from_utf8_lossy(&octets).into_owned(),
-        false => charset_decode(&charset, &octets),
-    }
+    // NOTE: Annex A.7 names no reading for a charset no WHATWG label
+    // names: the octets read as UTF-8, as with no charset stated.
+    charset_decode(&charset, &octets)
+        .unwrap_or_else(|| String::from_utf8_lossy(&octets).into_owned())
 }
 
 /// The parameters of a structured header value, its leading value

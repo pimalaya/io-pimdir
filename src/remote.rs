@@ -9,7 +9,9 @@
 //! resumed from a cursor. It is answered one page at a time, a
 //! [`PimdirRemoteSnapshot`] whose every member arrives named by its
 //! [`PimdirRemoteMeta`], or by [`PimdirEnumerated::CursorRejected`] when
-//! the source refuses the cursor a resumed round handed it.
+//! the source refuses the cursor a resumed round handed it. A round a date
+//! filter narrowed says so on every page, and may hand on its last page the
+//! collection's handles listed unfiltered (SYNC §4, §5).
 //!
 //! While a round is open, a run resuming it first asks for the round's
 //! head ([`PimdirListing::Head`], SYNC §4, §5): what changed since the
@@ -147,6 +149,26 @@ pub struct PimdirRemoteSnapshot {
     /// a round's first where the source gives it up front (IMAP
     /// `HIGHESTMODSEQ`, Gmail's `historyId`), its last for Graph.
     pub checkpoint: Option<PimdirCheckpoint>,
+    /// Whether a date filter narrowed the round's listing, set on every
+    /// page of such a round and on no other page (SYNC §4, §5).
+    ///
+    /// A filter lists a member only when it matches, so it misses an
+    /// undated member received before its window and one whose `Date`
+    /// runs ahead of its arrival: IMAP `SENTSINCE`, JMAP `after`, Graph's
+    /// `receivedDateTime` and Gmail's `after:` each narrow. The round
+    /// then finds absent only a member dated before it opened, or one
+    /// [`enumerated`](Self::enumerated) lacks.
+    pub narrowed: bool,
+    /// Every handle the collection holds on the source, read by an
+    /// enumeration no date filter narrowed, on the last page of a narrowed
+    /// round; `None` elsewhere, or where the source offers none (SYNC §4).
+    ///
+    /// A connector offering such an enumeration SHOULD hand it: IMAP's
+    /// `UID SEARCH ALL`, JMAP's `Email/query` filtered by the mailbox
+    /// alone, Graph's message ids of the folder. The round finds absent
+    /// any member, undated or dated after it opened included, whose
+    /// handle it lacks.
+    pub enumerated: Option<Vec<PimdirHandle>>,
 }
 
 impl PimdirRemoteSnapshot {
@@ -159,6 +181,8 @@ impl PimdirRemoteSnapshot {
             last: true,
             cursor: None,
             checkpoint,
+            narrowed: false,
+            enumerated: None,
         }
     }
 
@@ -175,6 +199,8 @@ impl PimdirRemoteSnapshot {
             last: cursor.is_none(),
             cursor,
             checkpoint,
+            narrowed: false,
+            enumerated: None,
         }
     }
 
@@ -191,6 +217,8 @@ impl PimdirRemoteSnapshot {
             last: true,
             cursor: None,
             checkpoint: Some(checkpoint),
+            narrowed: false,
+            enumerated: None,
         }
     }
 
@@ -205,6 +233,8 @@ impl PimdirRemoteSnapshot {
             last: true,
             cursor: None,
             checkpoint: None,
+            narrowed: false,
+            enumerated: None,
         }
     }
 }

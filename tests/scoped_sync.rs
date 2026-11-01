@@ -15,7 +15,7 @@ use io_pimdir::{
         reader::{PimdirMailFilter, PimdirMailSum, PimdirReader, like_pattern},
     },
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
-    hash::PimdirHashAlgo,
+    hash,
     mutate::PimdirMutation,
     placement::{PimdirFlags, PimdirHandle, PimdirLevel},
     remote::{
@@ -414,7 +414,7 @@ fn releasing_bodies_below_a_date_keeps_the_headers() {
         let mut item = member(handle, &[], body);
         item.meta =
             PimdirRemoteMeta::new(mail::derive(body)).with_body(PimdirFetchedBody::Inline {
-                hash: PimdirHashAlgo::Blake3.hash(body),
+                hash: hash::hash(body),
                 bytes: body.to_vec(),
             });
         item
@@ -576,7 +576,7 @@ fn the_mail_readers_count_page_and_search_across_collections() {
     assert_eq!(days[&Some("2026-10-05".into())], 2);
     assert_eq!(days[&Some("2026-10-03".into())], 1);
     let shifted = reader
-        .count_mail_by_day(&["INBOX"], any, None, Some("-11 hours"))
+        .count_mail_by_day(&["INBOX"], any, None, Some(-660))
         .unwrap();
     assert_eq!(shifted[0].day.as_deref(), Some("2026-10-05"));
     assert_eq!(shifted[0].count, 1, "10:00 UTC falls the day before");
@@ -741,109 +741,6 @@ fn the_mail_readers_take_a_floor_and_sum_a_range() {
     );
 }
 
-/// A store an earlier draft wrote (probes, no coverage, rows at level 0)
-/// is read by a reader as it is and reconciled by its owner on open
-/// (STORAGE §6): the columns, the trigger and the global order's index
-/// added, the probes dropped, and a level-0 row repaired to `Meta`
-/// (`repair_levels`).
-#[test]
-fn an_earlier_draft_store_is_reconciled_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let body = message("a@x", "Hi", "Mon, 5 Oct 2026 10:00:00 +0000", "text/plain");
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
-    store.ensure_collection("INBOX", "message/rfc822").unwrap();
-    let mut remote = Paged {
-        pages: vec![page(vec![member("1", &[], &body)], None)],
-        ..Default::default()
-    };
-    store
-        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
-        .unwrap();
-    drop(store);
-
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch(
-        "PRAGMA foreign_keys = OFF;
-         DROP TRIGGER sources_stamp_coverage;
-         ALTER TABLE bindings DROP COLUMN round;
-         CREATE TABLE old_sources (
-             collection TEXT NOT NULL REFERENCES collections(id) ON UPDATE CASCADE ON DELETE CASCADE,
-             source TEXT NOT NULL, checkpoint BLOB, PRIMARY KEY (collection, source)) STRICT;
-         INSERT INTO old_sources SELECT collection, source, checkpoint FROM sources;
-         DROP TABLE sources;
-         ALTER TABLE old_sources RENAME TO sources;
-         CREATE TABLE probes (collection TEXT NOT NULL, source TEXT NOT NULL,
-             handle TEXT NOT NULL, flags TEXT, PRIMARY KEY (collection, source, handle)) STRICT;
-         INSERT INTO probes VALUES ('INBOX', 'imap', '2', NULL);
-         DROP INDEX items_by_sort_global;
-         PRAGMA ignore_check_constraints = ON;
-         UPDATE items SET level = 0;",
-    )
-    .unwrap();
-    drop(conn);
-
-    let reader = PimdirReader::open(dir.path()).unwrap();
-    let collections = reader.list_collections().unwrap();
-    assert_eq!(collections[0].coverage, None, "read as NULL, unreconciled");
-    let sources = reader.list_coverage("INBOX").unwrap();
-    assert_eq!(sources.len(), 1, "the source is listed");
-    assert_eq!(sources[0].coverage, None, "never closed, filling (§6)");
-    let page = reader
-        .list_mail_page_filtered(&["INBOX"], PimdirMailFilter::default(), None, None, 10)
-        .unwrap();
-    assert_eq!(page.len(), 1, "paged without the global order's index");
-    drop(reader);
-
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    let probes: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'probes'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(probes, 0, "the probes table is dropped");
-    let trigger: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'sources_stamp_coverage'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(trigger, 1);
-    let band: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM pragma_table_info('sources') WHERE name = 'round_band'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(band, 1, "the band column is added");
-    let index: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'items_by_sort_global'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(index, 1, "the global order's index is created");
-
-    let loaded = store
-        .load(
-            &PimdirCollectionId::from("INBOX"),
-            &io_pimdir::load::PimdirLoadScope::All,
-        )
-        .unwrap();
-    assert_eq!(loaded.coverage, None, "a store from an earlier draft");
-    assert_eq!(loaded.checkpoint, Some(PimdirCheckpoint(b"c1".to_vec())));
-    assert_eq!(loaded.placements[0].level, PimdirLevel::Meta);
-    assert!(
-        loaded.placements[0].summary.is_some(),
-        "a level 0 row repaired to 1 (repair_levels), a Meta row like any other"
-    );
-}
-
 /// A based member with no usable date is in every scope (SYNC §5): a
 /// complete round that does not list it finds it deleted, whether the
 /// round opens and closes in one run or resumes one an earlier run
@@ -1004,7 +901,12 @@ fn a_band_round_keeps_an_undated_member_it_does_not_list() {
                 .unwrap();
             assert_eq!(store.count_items("INBOX").unwrap(), 3);
 
-            let wider = since("2026-07-01T00:00:00Z");
+            // NOTE: the band lists nothing, which parks a round until the
+            // caller confirms its absences (SYNC §5): confirmed here.
+            let wider = PimdirSyncOptions {
+                accept_absences: true,
+                ..since("2026-07-01T00:00:00Z")
+            };
             match resumed {
                 false => {
                     remote.pages = vec![page(Vec::new(), None)];
@@ -1055,12 +957,13 @@ fn a_band_round_keeps_an_undated_member_it_does_not_list() {
     }
 }
 
-/// A page over a set of collections walks `items_by_sort_global` (STORAGE
-/// §9.3) rather than reading every live row of the set and sorting it,
-/// on a store without statistics as every writer leaves one: the plan of
-/// both mail pages over two collections, by `EXPLAIN QUERY PLAN`.
+/// A page over a set of collections merges each collection's order, a
+/// seek on `items_by_sort` per collection (STORAGE §9.3), rather than
+/// reading every live row of the set and sorting it, on a store without
+/// statistics as every writer leaves one: the plan of both mail pages over
+/// two collections, by `EXPLAIN QUERY PLAN`, scanning no table.
 #[test]
-fn a_page_across_collections_walks_the_global_order() {
+fn a_page_across_collections_merges_each_collections_order() {
     let dir = tempfile::tempdir().unwrap();
     let store = PimdirStore::open(dir.path()).unwrap();
     drop(store);
@@ -1099,14 +1002,150 @@ fn a_page_across_collections_walks_the_global_order() {
         assert!(
             steps
                 .iter()
-                .any(|step| step.contains("USING INDEX items_by_sort_global")),
-            "{name} walks the global order: {steps:?}"
+                .any(|step| step.contains("USING INDEX items_by_sort (collection=?")),
+            "{name} seeks each collection's order: {steps:?}"
         );
+        // NOTE: the merge orders the union of the per-collection pages,
+        // at most the set's size times the limit, which is the one sort.
         assert!(
             !steps
                 .iter()
-                .any(|step| step.contains("TEMP B-TREE FOR ORDER BY")),
-            "{name} sorts nothing: {steps:?}"
+                .any(|step| step.starts_with("SCAN") && step != "SCAN p"),
+            "{name} scans no table: {steps:?}"
         );
     }
+}
+
+/// Three members, the first dated now, the second undated, the third
+/// dated by a sender's clock in 2035, each listed by a first round that
+/// closes; then a round opening on a page naming `first`, interrupted
+/// before its last page. Answers the store and the remote holding the
+/// open round.
+fn round_left_open(
+    dir: &std::path::Path,
+    first: bool,
+) -> (io_pimdir::client::PimdirSourceStore, Paged) {
+    let mut store = PimdirStore::open(dir).unwrap().for_source("graph");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let recent = message(
+        "recent@x",
+        "Recent",
+        "Mon, 5 Oct 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let undated = message("undated@x", "Draft", "not a date", "text/plain");
+    let ahead = message(
+        "ahead@x",
+        "Ahead",
+        "Mon, 1 Jan 2035 10:00:00 +0000",
+        "text/plain",
+    );
+    let mut remote = Paged {
+        pages: vec![page(
+            vec![
+                member("1", &[], &recent),
+                member("2", &[], &undated),
+                member("3", &[], &ahead),
+            ],
+            None,
+        )],
+        ..Default::default()
+    };
+    store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+
+    let listed = match first {
+        true => vec![member("1", &[], &recent)],
+        false => Vec::new(),
+    };
+    remote.pages = vec![page(listed, Some("p1"))];
+    let full = PimdirSyncOptions {
+        full: true,
+        ..Default::default()
+    };
+    let interrupted = store.sync("INBOX", full, &mut remote);
+    assert!(matches!(interrupted, Err(PimdirRunError::Remote(_))));
+
+    (store, remote)
+}
+
+/// The live link ids of the collection, sorted.
+fn live(dir: &std::path::Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(dir.join("pimdir.db")).unwrap();
+    let mut live = conn
+        .prepare("SELECT link_id FROM items WHERE deleted = 0 ORDER BY link_id")
+        .unwrap();
+    live.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A round whose pages name no member parks while any based binding is
+/// absent, whatever their number, across the runs listing it: the caller
+/// alone tells an emptied mailbox from a failing connector (SYNC §5).
+#[test]
+fn a_resumed_round_naming_no_member_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, mut remote) = round_left_open(dir.path(), false);
+
+    remote.pages = vec![page(Vec::new(), None)];
+    let report = store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+    assert_eq!(
+        report.parked,
+        Some(io_pimdir::sync::PimdirParked {
+            absent: 3,
+            bound: 3
+        })
+    );
+    assert_eq!(live(dir.path()), ["ahead@x", "recent@x", "undated@x"]);
+
+    remote.pages = vec![page(Vec::new(), None)];
+    let confirmed = PimdirSyncOptions {
+        accept_absences: true,
+        ..Default::default()
+    };
+    let report = store.sync("INBOX", confirmed, &mut remote).unwrap();
+    assert_eq!(report.parked, None);
+    assert!(live(dir.path()).is_empty(), "confirmed, the absences drop");
+}
+
+/// A round an earlier run's page named a member in closes on an empty last
+/// page, the store's stamps saying it named one (SYNC §5).
+#[test]
+fn a_resumed_round_an_earlier_page_named_closes_on_an_empty_last_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, mut remote) = round_left_open(dir.path(), true);
+
+    remote.pages = vec![page(Vec::new(), None)];
+    let report = store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+    assert_eq!(report.parked, None);
+    assert_eq!(live(dir.path()), ["recent@x"]);
+}
+
+/// A resumed round whose listing a date filter narrowed finds absent what
+/// its unfiltered enumeration lacks, the 2035-dated member its filter
+/// could not list, and keeps the undated one the enumeration holds, the
+/// store binding what the last page states (SYNC §4, §5; STORAGE §10).
+#[test]
+fn a_resumed_narrowed_round_drops_only_what_its_enumeration_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, mut remote) = round_left_open(dir.path(), true);
+
+    let PimdirEnumerated::Page(mut last) = page(Vec::new(), None) else {
+        unreachable!("a page");
+    };
+    last.narrowed = true;
+    last.enumerated = Some(vec![PimdirHandle::from("1"), PimdirHandle::from("2")]);
+    remote.pages = vec![PimdirEnumerated::Page(last)];
+    let report = store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+    assert_eq!(report.parked, None);
+    assert_eq!(live(dir.path()), ["recent@x", "undated@x"]);
 }

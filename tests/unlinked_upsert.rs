@@ -13,7 +13,7 @@ use io_pimdir::client::{PimdirError, PimdirSourceStore, PimdirStore};
 use io_pimdir::{
     change::PimdirWriteOp,
     collection::PimdirCollectionId,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
         PimdirStatus,
@@ -74,7 +74,7 @@ fn unnamed(handle: &str, revision: &str) -> PimdirPlacement {
 
 fn projected(store: &PimdirSourceStore) -> Vec<PimdirPlacement> {
     let mut placements = store
-        .load(&inbox(), &PimdirLoadScope::All)
+        .load(&inbox(), &PimdirLoadSelection::All)
         .unwrap()
         .placements;
     placements.sort_by(|a, b| a.handle.cmp(&b.handle));

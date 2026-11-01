@@ -22,6 +22,7 @@ mod integration;
 mod membership;
 mod policy_property;
 mod property;
+mod quarantine;
 mod soft_delete;
 mod supersedes;
 mod sync_audit;

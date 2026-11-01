@@ -19,7 +19,7 @@ use crate::{
         CALENDAR_REPLY_OCCURRENCE, COLLECTION_CREATE, MAIL_SUBMIT, MAIL_SUBMIT_COPY,
         PimdirCapability, PimdirPartial, PimdirRefusal, PimdirSourceCapabilities, PimdirSupport,
     },
-    client::{PimdirError, blobs::PimdirBlobs, rows, schema, write},
+    client::{PimdirError, blobs::PimdirBlobs, rows, write},
     codec::{self, PimdirAction, PimdirActionError},
     intent::{self, PimdirCollectionCreate},
     object::PimdirHash,
@@ -27,25 +27,13 @@ use crate::{
     sql,
 };
 
-/// A canonical statement as the store answers it (§6): one from an owner
-/// predating §15.6 holds no declaration table, read as empty, and every
-/// source in it is undeclared.
-fn reconciled(conn: &Connection, statement: &str) -> Result<String, PimdirError> {
-    schema::as_reconciled(conn, "main", statement)
-}
-
 /// What every source syncing `collection` can do there.
 pub(crate) fn at_collection(
     conn: &Connection,
     collection: &str,
 ) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
     let params = named_params! { ":collection": collection };
-    group(rows(
-        conn,
-        &reconciled(conn, sql::LOAD_CAPABILITIES)?,
-        params,
-        declaration_row,
-    )?)
+    group(rows(conn, sql::LOAD_CAPABILITIES, params, declaration_row)?)
 }
 
 /// What every source binding the item `seq` of `collection` can do there.
@@ -57,7 +45,7 @@ pub(crate) fn at_item(
     let params = named_params! { ":collection": collection, ":seq": seq };
     group(rows(
         conn,
-        &reconciled(conn, sql::LOAD_ITEM_CAPABILITIES)?,
+        sql::LOAD_ITEM_CAPABILITIES,
         params,
         declaration_row,
     )?)
@@ -78,12 +66,9 @@ pub(crate) fn candidates(
         ":collection": collection,
         ":capability": capability,
     };
-    Ok(rows(
-        conn,
-        &reconciled(conn, sql::LIST_CAPABILITY_SOURCES)?,
-        params,
-        |r| r.get(0),
-    )?)
+    Ok(rows(conn, sql::LIST_CAPABILITY_SOURCES, params, |r| {
+        r.get(0)
+    })?)
 }
 
 /// The source the user chose to perform `capability` for `account`.
@@ -94,7 +79,7 @@ pub(crate) fn performer(
 ) -> Result<Option<String>, PimdirError> {
     Ok(conn
         .query_row(
-            &reconciled(conn, sql::LOAD_PERFORMER)?,
+            sql::LOAD_PERFORMER,
             named_params! { ":account": account, ":capability": capability },
             |r| r.get(0),
         )
@@ -110,18 +95,13 @@ pub(crate) fn chosen(
     account: Option<&str>,
     capability: &str,
 ) -> Result<Option<String>, PimdirError> {
-    let queued = rows(
-        conn,
-        &reconciled(conn, sql::LIST_PENDING_ACTIONS)?,
-        [],
-        |r| {
-            Ok((
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-            ))
-        },
-    )?;
+    let queued = rows(conn, sql::LIST_PENDING_ACTIONS, [], |r| {
+        Ok((
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+        ))
+    })?;
 
     let mut pending = None;
     for (collection, kind, payload) in queued {
@@ -266,9 +246,10 @@ fn new_body(
 }
 
 /// Refuses a VTODO resource landing in a calendar collection a source
-/// concerned states `x-vtodo` `none` for (§15.6): the new body of an `add`
-/// or `update` in its collection, the item's of a `move` or `copy` in the
-/// target. Every other action, and every other component, passes.
+/// concerned states `calendar.component.vtodo` `none` for (§15.6): the
+/// new body of an `add` or `update` in its collection, the item's of a
+/// `move` or `copy` in the target. Every other action, and every other
+/// component, passes.
 fn gate_vtodo(
     conn: &Connection,
     blobs: &PimdirBlobs,
@@ -327,14 +308,7 @@ fn gate_by_kind(
                     collection_create_anchor(conn, collection, &create)?;
                     None
                 }
-                MAIL_SUBMIT => intent_copy(payload).map(|_| MAIL_SUBMIT_COPY),
-                CALENDAR_REPLY => {
-                    intent::recurrence_id(payload)?.map(|_| CALENDAR_REPLY_OCCURRENCE)
-                }
-                CALENDAR_CANCEL => {
-                    intent::recurrence_id(payload)?.map(|_| CALENDAR_CANCEL_OCCURRENCE)
-                }
-                _ => None,
+                _ => intent_option(capability, payload)?,
             };
 
             // NOTE: an account whose sources declare nothing predates §15.6,
@@ -414,6 +388,52 @@ fn gate_by_kind(
     }
 }
 
+/// The owner's backstop for an intent (§15.6): one naming a source that
+/// declares something, but not the intent's capability at the anchor
+/// `collection` or the option its payload asks for beside it (Annex B.2),
+/// is [`PimdirError::Unsupported`], naming both. A source declaring
+/// nothing is not this owner's to judge, and an application's own kind
+/// passes: the drain leaves either to its performer.
+pub(crate) fn backstop_intent(
+    conn: &Connection,
+    collection: &str,
+    kind: &str,
+    payload: &str,
+) -> Result<(), PimdirError> {
+    let (Some(capability), Some(source)) =
+        (capability::intent_capability(kind), intent_source(payload))
+    else {
+        return Ok(());
+    };
+    let declared = conn
+        .query_row(
+            "SELECT 1 FROM capabilities WHERE source = :source LIMIT 1",
+            named_params! { ":source": source },
+            |_| Ok(()),
+        )
+        .optional()?;
+    if declared.is_none() {
+        return Ok(());
+    }
+
+    let account = account_of(conn, collection)?;
+    let option = match capability {
+        COLLECTION_CREATE => None,
+        _ => intent_option(capability, payload)?,
+    };
+    for needed in [Some(capability), option].into_iter().flatten() {
+        if !candidates(conn, account.as_deref(), Some(collection), needed)?.contains(&source) {
+            return Err(PimdirError::Unsupported(PimdirRefusal {
+                capability: needed.to_string(),
+                source,
+                detail: None,
+            }));
+        }
+    }
+
+    Ok(())
+}
+
 /// Replaces `source`'s declaration with `capabilities` (§15.6), under the
 /// account it syncs for.
 pub(crate) fn declare(
@@ -483,10 +503,7 @@ pub(crate) fn intent_source(payload: &str) -> Option<String> {
 fn account_declared(conn: &Connection, account: Option<&str>) -> Result<bool, PimdirError> {
     Ok(conn
         .query_row(
-            &reconciled(
-                conn,
-                "SELECT 1 FROM capabilities WHERE account IS :account LIMIT 1",
-            )?,
+            "SELECT 1 FROM capabilities WHERE account IS :account LIMIT 1",
             named_params! { ":account": account },
             |_| Ok(()),
         )
@@ -523,6 +540,19 @@ fn collection_create_anchor(
     Ok(())
 }
 
+/// The option an intent's payload asks for beside its capability, from
+/// the same performer (Annex B.2): a `submit`'s copy, a reply's or a
+/// cancel's occurrence.
+fn intent_option(capability: &str, payload: &str) -> Result<Option<&'static str>, PimdirError> {
+    let option = match capability {
+        MAIL_SUBMIT => intent_copy(payload).map(|_| MAIL_SUBMIT_COPY),
+        CALENDAR_REPLY => intent::recurrence_id(payload)?.map(|_| CALENDAR_REPLY_OCCURRENCE),
+        CALENDAR_CANCEL => intent::recurrence_id(payload)?.map(|_| CALENDAR_CANCEL_OCCURRENCE),
+        _ => None,
+    };
+    Ok(option)
+}
+
 /// The collection a `submit` asks its copy filed in, `None` when it asks
 /// for none.
 fn intent_copy(payload: &str) -> Option<String> {
@@ -533,7 +563,7 @@ fn intent_copy(payload: &str) -> Option<String> {
 fn account_of(conn: &Connection, collection: &str) -> Result<Option<String>, PimdirError> {
     Ok(conn
         .query_row(
-            &reconciled(conn, sql::LOAD_ACCOUNT)?,
+            sql::LOAD_ACCOUNT,
             named_params! { ":collection": collection },
             |r| r.get::<_, Option<String>>(0),
         )
@@ -548,7 +578,7 @@ fn item_object(
 ) -> Result<Option<PimdirHash>, PimdirError> {
     let hash = conn
         .query_row(
-            &reconciled(conn, sql::GET_ITEM)?,
+            sql::GET_ITEM,
             named_params! { ":collection": collection, ":seq": seq },
             |r| r.get::<_, Option<String>>(3),
         )
@@ -560,7 +590,7 @@ fn item_object(
 fn item_flags(conn: &Connection, collection: &str, seq: i64) -> Result<PimdirFlags, PimdirError> {
     let flags = conn
         .query_row(
-            &reconciled(conn, sql::GET_ITEM)?,
+            sql::GET_ITEM,
             named_params! { ":collection": collection, ":seq": seq },
             |r| r.get::<_, Option<String>>(2),
         )

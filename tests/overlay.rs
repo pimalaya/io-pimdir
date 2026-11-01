@@ -29,7 +29,9 @@ fn placement(collection: &str, handle: &str, link: &str, key: &str) -> PimdirPla
         collection: PimdirCollectionId(collection.into()),
         handle: PimdirHandle(handle.into()),
         link_id: Some(PimdirLinkId(link.into())),
-        object: Some(PimdirHash("cafe".into())),
+        object: Some(PimdirHash(
+            "cafecafecafecafecafecafecafecafecafecafecafecafecafe".into(),
+        )),
         level: PimdirLevel::Full,
         summary: None,
         flags: flags.clone(),
@@ -39,7 +41,9 @@ fn placement(collection: &str, handle: &str, link: &str, key: &str) -> PimdirPla
         base: Some(PimdirBase {
             flags,
             revision: None,
-            object: Some(PimdirHash("cafe".into())),
+            object: Some(PimdirHash(
+                "cafecafecafecafecafecafecafecafecafecafecafecafecafe".into(),
+            )),
         }),
         origin: None,
     }
@@ -57,7 +61,7 @@ fn store(dir: &std::path::Path) -> Vec<i64> {
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: PimdirObject {
-                    hash: PimdirHash("cafe".into()),
+                    hash: PimdirHash("cafecafecafecafecafecafecafecafecafecafecafecafecafe".into()),
                     size: 4,
                 },
                 body: Some(b"body".to_vec()),
@@ -260,16 +264,17 @@ fn a_staged_create_is_counted_and_never_listed() {
     let dir = tempfile::tempdir().unwrap();
     let seqs = store(dir.path());
 
-    enqueue(
-        dir.path(),
-        "INBOX",
-        &PimdirAction::Add {
-            link_id: Some(PimdirLinkId("mid:draft".into())),
-            flags: PimdirFlags::from_iter(["\\Draft"]),
-            object: None,
-            supersedes: None,
-        },
-    );
+    io_pimdir::client::producer::PimdirProducer::open(dir.path(), "test")
+        .unwrap()
+        .enqueue_with_body("INBOX", b"Subject: draft\r\n\r\nx\r\n", |hash| {
+            PimdirAction::Add {
+                link_id: Some(PimdirLinkId("mid:draft".into())),
+                flags: PimdirFlags::from_iter(["\\Draft"]),
+                object: Some(hash),
+                supersedes: None,
+            }
+        })
+        .unwrap();
 
     let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
     assert_eq!(overlaid.list_items("INBOX", None, 10).unwrap().len(), 3);
@@ -395,7 +400,7 @@ fn a_page_stays_full_across_a_staged_removal() {
 fn an_edit_that_will_park_is_not_folded() {
     let dir = tempfile::tempdir().unwrap();
     let seqs = store(dir.path());
-    let held = PimdirHash("cafe".into());
+    let held = PimdirHash("cafecafecafecafecafecafecafecafecafecafecafecafecafe".into());
 
     let mut producer =
         io_pimdir::client::producer::PimdirProducer::open(dir.path(), "test").unwrap();
@@ -446,6 +451,6 @@ fn an_edit_that_will_park_is_not_folded() {
         "the edit that will park is not shown"
     );
     let chained = reader.get_item("INBOX", seqs[1]).unwrap().unwrap();
-    let two = reader.hash_algo().hash(b"Subject: two\r\n\r\ntwo");
+    let two = reader.hash(b"Subject: two\r\n\r\ntwo");
     assert_eq!(chained.object, Some(two), "an edit over a queued one is");
 }

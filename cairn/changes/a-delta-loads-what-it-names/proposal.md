@@ -9,7 +9,7 @@ created: 2026-10-18
 
 ## Why
 
-The 2026-10-11 performance audit (p1p2-report #2) found every delta page and every round's last page loading the whole collection: src/sync.rs:589, `PageKind::Delta | PageKind::Last => PimdirLoadScope::All`, re-verified on 2026-10-18 at 3b4bed8. A step of 50 messages into a 425k-message account loads 92.8 MiB of placements and spends 22.5 s of its 28 s in loads at 1M; at 100k it is 1.3 to 1.7 s. An incremental pass therefore scales with the mailbox, not with what changed. android cairn/changes/store-performance lists it as library proposal L3.
+The 2026-10-11 performance audit (p1p2-report #2) found every delta page and every round's last page loading the whole collection: src/sync.rs:589, `PageKind::Delta | PageKind::Last => PimdirLoadSelection::All`, re-verified on 2026-10-18 at 3b4bed8. A step of 50 messages into a 425k-message account loads 92.8 MiB of placements and spends 22.5 s of its 28 s in loads at 1M; at 100k it is 1.3 to 1.7 s. An incremental pass therefore scales with the mailbox, not with what changed. android cairn/changes/store-performance lists it as library proposal L3.
 
 The whole collection is loaded because a delta joins every local placement against what the source listed: a placement the source did not list may still owe a push (a flag change, a local edit, a tombstone, a pending create, a `Created` projection of another source's item), and naming a member needs the link ids the collection holds (SYNC §6). The last page also reads what the round did not stamp, which `PimdirLoaded::unstamped` already answers by statement.
 

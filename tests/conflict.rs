@@ -16,16 +16,22 @@
 
 use io_pimdir::client::{PimdirSourceStore, PimdirStore};
 use io_pimdir::{
-    change::PimdirWriteOp,
+    change::{PimdirChange, PimdirWriteOp},
     collection::PimdirCollectionId,
-    hash::PimdirHashAlgo,
+    hash,
     hub::PimdirSourceId,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
         PimdirStatus,
     },
+    remote::{
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushResult,
+        PimdirRemote, PimdirTier,
+    },
+    sync::{PimdirConflictPolicy, PimdirSyncEvent},
+    upgrade::PimdirUpgradeOptions,
 };
 
 fn contacts() -> PimdirCollectionId {
@@ -84,11 +90,7 @@ fn store_object(name: &str) -> PimdirWriteOp {
 fn blob_exists(dir: &std::path::Path, name: &str) -> bool {
     let hash = hashed(name).0;
     let hash = hash.as_str();
-    dir.join("objects")
-        .join(&hash[0..2])
-        .join(&hash[2..4])
-        .join(hash)
-        .exists()
+    dir.join("objects").join(&hash[0..2]).join(hash).exists()
 }
 
 fn seed(dir: &std::path::Path) -> PimdirSourceStore {
@@ -105,7 +107,7 @@ fn body_of(hash: &str) -> Vec<u8> {
 
 /// The content hash of the body filed under a name, as the store names it.
 fn hashed(name: &str) -> PimdirHash {
-    PimdirHashAlgo::default().hash(&body_of(name))
+    hash::hash(&body_of(name))
 }
 
 /// A placement plus the bodies it points at, as one batch.
@@ -155,7 +157,7 @@ fn a_conflict_survives_a_reopen() {
     // Reopened from disk: the merge must still see the conflict, or it
     // re-derives the push the remote already rejected.
     let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
+    let loaded = store.load(&contacts(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(loaded.placements.len(), 1);
     assert_eq!(loaded.placements[0].status, PimdirStatus::Conflict);
     assert_eq!(
@@ -202,7 +204,7 @@ fn resolving_the_conflict_clears_it_and_adopts_the_merged_body() {
     drop(store);
 
     let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
+    let loaded = store.load(&contacts(), &PimdirLoadSelection::All).unwrap();
     assert_ne!(loaded.placements[0].status, PimdirStatus::Conflict);
     assert_eq!(
         loaded.placements[0].conflict_revision, None,
@@ -259,7 +261,7 @@ fn a_conflict_body_outlives_a_collection() {
         "the divergence a person has not looked at yet is still readable"
     );
 
-    let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
+    let loaded = store.load(&contacts(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(loaded.placements[0].conflict_object, Some(hashed("rmte")));
 }
 
@@ -392,4 +394,100 @@ fn the_listing_names_every_conflicted_binding_and_nothing_else() {
     assert_eq!(card.base_object, Some(hashed("0rig")));
     assert_eq!(card.object, Some(hashed("ed17")));
     assert_eq!(card.conflict_object, Some(hashed("rmte")));
+}
+
+/// A remote answering a `Full` fetch of `card1.vcf` with the body filed
+/// under `srv` at revision `r2`, and nothing else.
+struct ServerEdit;
+
+impl PimdirRemote for ServerEdit {
+    type Error = &'static str;
+
+    fn enumerate(
+        &mut self,
+        _: &PimdirCollectionId,
+        _: PimdirEnumerate,
+    ) -> Result<PimdirEnumerated, &'static str> {
+        Err("no listing")
+    }
+
+    fn fetch(
+        &mut self,
+        _: &PimdirCollectionId,
+        handles: Vec<PimdirHandle>,
+        _: PimdirTier,
+    ) -> Result<Vec<PimdirFetchedItem>, &'static str> {
+        Ok(handles
+            .into_iter()
+            .map(|handle| PimdirFetchedItem {
+                handle,
+                link_id: PimdirLinkId("uid:a".into()),
+                summary: None,
+                sort_key: Default::default(),
+                body: Some(PimdirFetchedBody::Inline {
+                    hash: hashed("srv"),
+                    bytes: body_of("srv"),
+                }),
+                revision: Some("r2".into()),
+            })
+            .collect())
+    }
+
+    fn push(
+        &mut self,
+        _: &PimdirCollectionId,
+        _: Vec<PimdirChange>,
+    ) -> Result<Vec<PimdirPushResult>, &'static str> {
+        Err("no push")
+    }
+}
+
+/// The upgrade reading the server body a divergence was recorded without
+/// settles it by the source's `PreferRemote`: the body and the base adopt
+/// it, and the local edit it drops is kept as a retained item, reported
+/// `Overruled` (SYNC §6, §9).
+#[test]
+fn an_upgrade_under_prefer_remote_adopts_the_body_keeping_the_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seed(dir.path());
+    store
+        .write(card_batch("edit", PimdirStatus::Conflict, Some("r2"), None))
+        .unwrap();
+
+    let opts = PimdirUpgradeOptions {
+        conflict: PimdirConflictPolicy::PreferRemote,
+        push_content: true,
+    };
+    let report = store
+        .upgrade(
+            "contacts",
+            vec![PimdirHandle("card1.vcf".into())],
+            PimdirTier::Full,
+            opts,
+            &mut ServerEdit,
+        )
+        .unwrap();
+
+    let kept = PimdirLinkId("dup:uid:a#card1.vcf".into());
+    assert_eq!(
+        report.events,
+        [PimdirSyncEvent::Overruled {
+            handle: PimdirHandle("card1.vcf".into()),
+            link_id: kept,
+        }]
+    );
+    let placement = store
+        .load(&contacts(), &PimdirLoadSelection::All)
+        .unwrap()
+        .placements
+        .remove(0);
+    assert_eq!(placement.object, Some(hashed("srv")));
+    assert_eq!(placement.status, PimdirStatus::Clean);
+    let base = placement.base.expect("a base");
+    assert_eq!(
+        (base.revision.as_deref(), base.object),
+        (Some("r2"), Some(hashed("srv")))
+    );
+    let retained = store.list_retained("contacts", None, 10).unwrap();
+    assert_eq!(retained[0].object, Some(hashed("edit")), "the edit is kept");
 }

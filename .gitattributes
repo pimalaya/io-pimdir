@@ -3,3 +3,8 @@
 # normalises them under core.autocrlf and no body a clone holds matches its
 # name.
 tests/fixtures/** -text
+# The vendored vectors are pimdir's byte for byte (spec/REVISION): their
+# fixtures CRLF, the rest LF, and spec_drift compares them with the
+# specification's own bytes, so no checkout converts their line ends.
+spec/vectors/** -text
+spec/payloads/** -text

@@ -24,7 +24,7 @@ use crate::{
     placement::{PimdirLinkId, PimdirSortKey},
     summary::{
         calendar::{PimdirEventSummary, PimdirJournalSummary, PimdirTaskSummary},
-        contact::PimdirContactSummary,
+        contact::{PimdirContactSummary, PimdirContentLine},
         file::PimdirFileSummary,
         mail::PimdirMailSummary,
     },
@@ -299,6 +299,45 @@ pub(crate) fn without_body(
     Some(incoming)
 }
 
+/// Removes every property `X-PIMDIR-` names from a vCard or iCalendar
+/// resource, folds included, keeping every other line byte for byte
+/// (STORAGE §18): such a property instructs a performer (Annex B.1), so a
+/// producer strips it from a resource the user did not write as it
+/// stands before enqueueing it.
+pub fn strip_instructions(body: &[u8]) -> Vec<u8> {
+    logical_lines(body)
+        .into_iter()
+        .filter(|(_, line)| {
+            !PimdirContentLine::parse(line).is_some_and(|line| line.name.starts_with("X-PIMDIR-"))
+        })
+        .flat_map(|(raw, _)| raw.iter().copied())
+        .collect()
+}
+
+/// A vCard or iCalendar body's logical lines (RFC 5545 §3.1, RFC 6350
+/// §3.2), each as the bytes holding it, its folds and line ending
+/// included, and as [`unfold`] reads it.
+pub(crate) fn logical_lines(body: &[u8]) -> Vec<(&[u8], String)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    for physical in body.split_inclusive(|byte| *byte == b'\n') {
+        let end = at + physical.len();
+        match (physical.first(), ranges.last_mut()) {
+            (Some(b' ' | b'\t'), Some(last)) => last.1 = end,
+            _ => ranges.push((at, end)),
+        }
+        at = end;
+    }
+
+    ranges
+        .into_iter()
+        .map(|(start, end)| {
+            let raw = &body[start..end];
+            (raw, unfold(raw, false).concat())
+        })
+        .collect()
+}
+
 /// Unfolds a body into its logical lines: a line beginning with a space
 /// or a tab continues the one before it. Unfolding a header removes the
 /// CRLF alone and keeps the whitespace (RFC 5322 §2.2.3); unfolding a
@@ -335,6 +374,24 @@ pub(crate) fn same_message(held: Option<&PimdirSummary>, listed: Option<&PimdirS
         }
         _ => true,
     }
+}
+
+/// Whether a member's summary names the message a retained row's does
+/// (STORAGE §9): [`same_message`], and the same `size` where both state
+/// one, no source holding the retained message any more to tell them apart.
+pub(crate) fn same_retained_message(
+    held: Option<&PimdirSummary>,
+    listed: Option<&PimdirSummary>,
+) -> bool {
+    let sized = match (held, listed) {
+        (Some(PimdirSummary::Mail(held)), Some(PimdirSummary::Mail(listed))) => held
+            .size
+            .zip(listed.size)
+            .is_none_or(|(held, listed)| held == listed),
+        _ => true,
+    };
+
+    same_message(held, listed) && sized
 }
 
 /// A mail summary carrying only a subject, for the engine's own tests.
@@ -380,5 +437,24 @@ mod tests {
     fn an_unknown_kind_derives_nothing() {
         assert_eq!(derive("application/json", b"{}"), None);
         assert!(derive("text/vcard; charset=utf-8", b"BEGIN:VCARD\r\nEND:VCARD\r\n").is_some());
+    }
+
+    /// An instruction leaves with its folds and any group, and every
+    /// other line stays as it was, a value naming one included.
+    #[test]
+    fn an_instruction_is_stripped_whole_and_nothing_else() {
+        let body = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e\r\n\
+x-pimdir-online-meeting:TRUE\r\nX-PIMDIR-NEXT;A=\"b:c\":\r\n  folded\r\n\
+item1.X-PIMDIR-ONLINE-MEETING:TRUE\r\nDESCRIPTION:X-PIMDIR-ONLINE-MEETING:TRUE\r\n\
+X-PIMDIRECTOR:kept\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        assert_eq!(
+            strip_instructions(body),
+            b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e\r\n\
+DESCRIPTION:X-PIMDIR-ONLINE-MEETING:TRUE\r\nX-PIMDIRECTOR:kept\r\n\
+END:VEVENT\r\nEND:VCALENDAR"
+        );
+
+        let plain = b"BEGIN:VCARD\nFN:A\n B\nEND:VCARD\n";
+        assert_eq!(strip_instructions(plain), plain);
     }
 }

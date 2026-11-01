@@ -1,4 +1,4 @@
-//! Store rules of storage-draft-05 a write or a drain enforces (STORAGE
+//! Store rules a write or a drain enforces (STORAGE
 //! §7, §9, §14, §15): a collection holding queued actions is not deleted,
 //! a hint beginning like a derived key is escaped, an unknown payload
 //! version is skipped, an edit names the body it replaced, and a body is
@@ -113,9 +113,10 @@ fn an_unknown_payload_version_is_skipped_not_parked() {
 
 /// A body whose bytes no longer hash to its name is no body (STORAGE §7):
 /// a read answers none, the drain applies nothing over it, and the owner
-/// unlinks the file so the next write of that body writes it anew.
+/// moves the file into quarantine/, never unlinking it, so the next write
+/// of that body writes it anew.
 #[test]
-fn a_body_failing_its_name_is_no_body_and_the_owner_unlinks_it() {
+fn a_body_failing_its_name_is_no_body_and_the_owner_quarantines_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = opened(dir.path());
     let body = b"Message-ID: <flip@x>\r\nSubject: flip\r\n\r\nbody".as_slice();
@@ -136,7 +137,7 @@ fn a_body_failing_its_name_is_no_body_and_the_owner_unlinks_it() {
         .unwrap();
     drop(producer);
 
-    let path = store.blobs().path(&object.hash);
+    let path = store.blobs().path(&object.hash).unwrap();
     let mut flipped = std::fs::read(&path).unwrap();
     flipped[0] ^= 1;
     std::fs::write(&path, &flipped).unwrap();
@@ -145,7 +146,11 @@ fn a_body_failing_its_name_is_no_body_and_the_owner_unlinks_it() {
     let report = store.drain().unwrap();
     assert_eq!((report.applied, report.retried), (0, 1), "{report:?}");
     assert_eq!(store.count_items("INBOX").unwrap(), 0);
-    assert!(!path.exists(), "the owner unlinked the corrupt file");
+    assert!(!path.exists(), "the owner moved the corrupt file aside");
+    let quarantine = std::fs::read_dir(dir.path().join("quarantine")).unwrap();
+    let moved: Vec<_> = quarantine.map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(moved.len(), 1, "never unlinked");
+    assert_eq!(std::fs::read(&moved[0]).unwrap(), flipped);
 
     // the producer writes it anew, and the retried add applies
     let producer = PimdirProducer::open(dir.path(), "test").unwrap();
@@ -165,7 +170,7 @@ fn a_blob_write_never_takes_another_writers_temporary() {
     let store = opened(dir.path());
     let body = b"one body, two writers".as_slice();
     let hash = store.hash(body);
-    let path = store.blobs().path(&hash);
+    let path = store.blobs().path(&hash).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let theirs = path.parent().unwrap().join(format!(".{}.tmp", hash.0));
     std::fs::write(&theirs, b"one bo").unwrap();
@@ -284,7 +289,7 @@ fn a_streamed_body_failing_its_name_fails_at_its_end() {
     reader.read_to_end(&mut sound).unwrap();
     assert_eq!(sound, body);
 
-    let path = store.blobs().path(&object.hash);
+    let path = store.blobs().path(&object.hash).unwrap();
     let mut flipped = std::fs::read(&path).unwrap();
     flipped[0] ^= 1;
     std::fs::write(&path, &flipped).unwrap();
@@ -318,7 +323,7 @@ fn a_streamed_body_read_to_its_length_is_verified() {
     };
     assert_eq!(exactly(&object.hash).unwrap(), body);
 
-    let path = store.blobs().path(&object.hash);
+    let path = store.blobs().path(&object.hash).unwrap();
     let mut flipped = std::fs::read(&path).unwrap();
     flipped[0] ^= 1;
     std::fs::write(&path, &flipped).unwrap();

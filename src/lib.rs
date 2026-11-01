@@ -16,7 +16,9 @@
 //! [`codec`] the column encodings and the queue payload, [`hash`] names a
 //! body, and [`summary`] derives what a writer records about an item
 //! before its row reaches the store (Annex A): its key, its summary row
-//! with the people it names, and its sort key.
+//! with the people it names, and its sort key. [`security`] holds the text
+//! rules of STORAGE.md §18: a name made a path component, an error's
+//! credentials scrubbed.
 //!
 //! ## The model
 //!
@@ -120,6 +122,7 @@ pub mod reference;
 pub mod rekey;
 pub mod remote;
 pub mod search;
+pub mod security;
 pub mod sql;
 pub mod summary;
 pub mod sync;

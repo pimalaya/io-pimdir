@@ -44,7 +44,9 @@ fn placement(collection: &str, handle: &str, link: &str) -> PimdirPlacement {
         collection: PimdirCollectionId(collection.into()),
         handle: PimdirHandle(handle.into()),
         link_id: Some(PimdirLinkId(link.into())),
-        object: Some(PimdirHash("cafebabe".into())),
+        object: Some(PimdirHash(
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+        )),
         level: PimdirLevel::Full,
         summary: None,
         flags: PimdirFlags::default(),
@@ -54,7 +56,9 @@ fn placement(collection: &str, handle: &str, link: &str) -> PimdirPlacement {
         base: Some(PimdirBase {
             flags: PimdirFlags::default(),
             revision: None,
-            object: Some(PimdirHash("cafebabe".into())),
+            object: Some(PimdirHash(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+            )),
         }),
         origin: None,
     }
@@ -71,7 +75,7 @@ fn seeded(dir: &Path) -> PimdirSourceStore {
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: PimdirObject {
-                    hash: PimdirHash("cafebabe".into()),
+                    hash: PimdirHash("cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()),
                     size: 4,
                 },
                 body: Some(b"body".to_vec()),
@@ -226,68 +230,6 @@ fn a_reference_goes_with_the_last_row_of_an_end() {
     assert!(
         store.references_from(&n).unwrap().is_empty(),
         "a collection's delete takes the references of what it held last"
-    );
-}
-
-/// A store an earlier build of draft-04 wrote has no references and no
-/// invitation: a reader reads none, and its owner adds the table, its
-/// index, its trigger and the column on open (STORAGE §6).
-#[test]
-fn an_earlier_store_gains_the_references_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    drop(seeded(dir.path()));
-
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch(
-        "DROP TRIGGER items_drop_references;
-         DROP INDEX item_reference_to;
-         DROP TABLE item_reference;
-         DROP INDEX mail_summary_by_invitation;
-         ALTER TABLE mail_summary DROP COLUMN invitation;",
-    )
-    .unwrap();
-
-    let reader = PimdirReader::open(dir.path()).unwrap();
-    assert!(
-        reader
-            .references_from(&endpoint(MAIL, "m"))
-            .unwrap()
-            .is_empty()
-    );
-    drop(reader);
-
-    let store = PimdirStore::open(dir.path()).unwrap();
-    let declared: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name IN
-                 ('item_reference', 'item_reference_to', 'items_drop_references',
-                  'mail_summary_by_invitation')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        declared, 4,
-        "the table, its index, its trigger, the invitation's index"
-    );
-    let invitation: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM pragma_table_info('mail_summary') WHERE name = 'invitation'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(invitation, 1, "the invitation column");
-    assert!(
-        store
-            .add_reference(
-                &endpoint(MAIL, "m"),
-                &endpoint(CARD, "alice"),
-                &PimdirReferenceRole::Sender,
-                PimdirReferenceOrigin::Auto,
-            )
-            .unwrap()
-            .is_some()
     );
 }
 
@@ -539,90 +481,5 @@ fn a_task_refers_to_its_project_and_its_mail() {
             .unwrap()
             .is_empty(),
         "a project names no parent"
-    );
-}
-
-/// A store whose tasks predate their organisation gains the columns on
-/// open, re-derived from the held bodies, and the references they imply
-/// (STORAGE §6).
-#[test]
-fn an_earlier_store_derives_its_tasks_organisation_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = seeded(dir.path());
-    store.ensure_collection("Cal", "text/calendar").unwrap();
-    let body = b"BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:call\r\nSUMMARY:Call\r\n\
-PRIORITY:1\r\nCATEGORIES:@phone,Errands\\, small\r\nRELATED-TO:proj\r\n\
-ATTACH:mid:m\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
-    store
-        .write(vec![
-            PimdirWriteOp::StoreObject {
-                object: PimdirObject {
-                    hash: io_pimdir::hash::PimdirHashAlgo::default().hash(body),
-                    size: body.len() as _,
-                },
-                body: Some(body.to_vec()),
-            },
-            PimdirWriteOp::UpsertPlacement(PimdirPlacement {
-                object: Some(io_pimdir::hash::PimdirHashAlgo::default().hash(body)),
-                base: None,
-                summary: io_pimdir::summary::derive("text/calendar", body).and_then(|d| d.summary),
-                ..placement("Cal", "t", "call")
-            }),
-            PimdirWriteOp::UpsertPlacement(PimdirPlacement {
-                summary: Some(PimdirSummary::Task(PimdirTaskSummary {
-                    uid: Some("proj".into()),
-                    summary: "Project".into(),
-                    ..Default::default()
-                })),
-                ..placement("Cal", "p", "proj")
-            }),
-        ])
-        .unwrap();
-    drop(store);
-
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch(
-        "DELETE FROM item_reference;
-         DROP INDEX task_summary_by_parent;
-         DROP INDEX task_summary_by_mid;
-         ALTER TABLE task_summary DROP COLUMN priority;
-         DROP TABLE task_category;
-         ALTER TABLE task_summary DROP COLUMN parent;
-         ALTER TABLE task_summary DROP COLUMN mid;",
-    )
-    .unwrap();
-
-    let store = PimdirStore::open(dir.path()).unwrap();
-    let row: (Option<i64>, String, Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT priority, (SELECT group_concat(value, '|') FROM (SELECT value FROM task_category \
-             WHERE link_id = 'call' ORDER BY position)), parent, mid FROM task_summary WHERE link_id = 'call'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        row,
-        (
-            Some(1),
-            "@phone|Errands, small".into(),
-            Some("proj".into()),
-            Some("m".into())
-        ),
-        "the columns re-derived from the held body"
-    );
-    let read: Vec<(String, String)> = store
-        .references_from(&endpoint("text/calendar", "call"))
-        .unwrap()
-        .into_iter()
-        .map(|r| (r.to.link_id.0, r.role.as_str().to_string()))
-        .collect();
-    assert_eq!(
-        read,
-        [
-            ("m".into(), "source".into()),
-            ("proj".into(), "parent".into())
-        ],
-        "the references the columns imply, backfilled"
     );
 }

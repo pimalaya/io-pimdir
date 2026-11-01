@@ -82,7 +82,13 @@ fn an_entry_is_written_restated_and_deleted_with_its_pins() {
     let running = store.get_item(TIME_COLLECTION, seq).unwrap().unwrap();
     assert_eq!(running.level, PimdirLevel::Full);
     assert_eq!(running.object, Some(store.hash(&entry(None))));
-    assert!(store.blobs().path(&store.hash(&entry(None))).is_file());
+    assert!(
+        store
+            .blobs()
+            .path(&store.hash(&entry(None)))
+            .unwrap()
+            .is_file()
+    );
 
     let (_, restated) = store
         .put_item(TIME_COLLECTION, &entry(Some("20261028T103000Z")))

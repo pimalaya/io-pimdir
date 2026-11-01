@@ -50,6 +50,19 @@ An upgrade SHALL revisit a placement whose level claims a tier it does not hold:
 - WHEN it is upgraded to `Full`
 - THEN it is fetched rather than skipped
 
+### Requirement: A Full item whose body fails its name is fetched again
+A `Full` upgrade SHALL verify the bodies its requested placements hold at `Full`, unconflicted and as their source last agreed on them (no staged edit), by yielding `PimdirYield::WantsVerify` before anything else, and SHALL revisit every placement whose body the storage leaves out: such a body is missing (pimdir STORAGE §7), and is fetched again where the source holds it (SYNC §6). A dedup hit naming a body found missing SHALL be fetched instead of linked. A body of a local edit is not verified here, no source holding it to fetch.
+
+#### Scenario: A corrupt body is fetched again
+- GIVEN a message upgraded to `Full`, whose blob then has a byte flipped
+- WHEN it is upgraded to `Full` again
+- THEN the owner moves the file into quarantine/, the body is fetched again and reads sound; a sound body is not fetched again (tests/engine/quarantine.rs `a_full_item_whose_body_fails_its_name_is_fetched_again`)
+
+#### Scenario: No dedup onto a corrupt body
+- GIVEN a message held at `Full` in one collection whose blob then fails its name, and the same message at `Meta` in another
+- WHEN the second is upgraded to `Full`
+- THEN nothing is linked, the body is fetched and the failing file is in quarantine/ (tests/engine/quarantine.rs `a_dedup_never_links_onto_a_body_failing_its_name`)
+
 ### Requirement: A fetch never establishes a link the collection already holds
 Applying a fetched item SHALL NOT set a placement's `link_id` to one another placement of the same collection already carries, whether that other placement is in the same batch or only in the store. The engine identifies a placement by its collection and link id, and a source binds it with one handle, so a second placement resolving to the same identity cannot take the key: taking it would overwrite the first binding's handle, and the fact that the source holds two resources would be lost at that write, before any later rule could act on it.
 
@@ -101,6 +114,13 @@ Such a placement SHALL be fetched rather than linked from the object store, for 
 
 A fetched diverging body equal to the placement's own SHALL clear the conflict, the base adopting that body at the fetched revision: the push whose record was lost had landed, and there is nothing to decide (pimdir SYNC §5).
 
+Any other fetched body SHALL be settled by the source's policy (`PimdirUpgradeOptions`, from the options the source syncs under, `PimdirSourceStore::upgrade`'s `opts`), as a carried body would have been (pimdir SYNC §5, §6): under `Manual`, and under `PreferLocal` without content pushes, it lands as the binding's `conflict_object`; under `PreferLocal` it is kept as a retained item, reported `Overruled`, the base adopting it at its revision and the conflict cleared, so the next sync pushes the local body gated on that revision, the write recording the divergence then overruling it as the sync's keep does; under `PreferRemote` the placement adopts it as its body and base, the binding's conflict cleared first, so the write keeps the local edit it drops as a `PreferRemote` pull's (hub.md). The upgrade pushes nothing.
+
+#### Scenario: A prefer-local divergence waited for its body
+- GIVEN the store vector 15 left: a local edit `c2` over `c1`, the binding conflicted at `r2` with no `conflict_object`
+- WHEN a `Full` upgrade under `prefer-local` fetches `c3` at `r2`
+- THEN `c3` is a retained item reported `Overruled`, the base is `c3` at `r2`, the conflict is clear and nothing is pushed (vectors/sync/116); under `prefer-remote` the placement holds `c3` and `c2` is kept (tests/conflict.rs `an_upgrade_under_prefer_remote_adopts_the_body_keeping_the_edit`)
+
 #### Scenario: A conflicted placement without its diverging body
 - GIVEN a conflicted placement holding a local body and no conflict object
 - WHEN it is upgraded
@@ -123,7 +143,7 @@ A `Meta` fetch SHALL raise only a placement holding no summary (vectors/sync/07)
 ### Requirement: A pending create is landed by its arrival
 A page or a fetch resolving a member to a hint a pending create of the same source holds in the collection, a `Created` placement with no base under a provisional handle, SHALL land that create rather than mint a second copy (pimdir SYNC §6): the hint arrived by a relocation the source's remove made, by an accepted add whose record was lost, or by another client, and it is the create delivered. Only a hint a based binding holds is minted.
 
-Landing is a `Superseded` drop of the provisional handle, then the create upserted under the fetched handle in the same batch, with a base of the flags the source reported, the fetched revision, and the fetched body at `Full` or else, for an immutable kind, the create's own body. The flags, body, summary and sort key staged on the create stay, so an edit made on it still pushes: the status is `Clean` when they equal the base and `Dirty` otherwise, and the origin goes, there being nothing left to copy from. A create holding no body adopts a fetched one as its own. A mutable fetch carrying no body, or another body than the staged one, leaves the binding conflicted at the fetched revision, its base naming no body, the fetched body its `conflict_object` ("An unread arrival landing a create conflicts" in [sync](sync.md)).
+Landing is a `Superseded` drop of the provisional handle, then the create upserted under the fetched handle in the same batch, with a base of the flags the source reported, the fetched revision, and the fetched body at `Full` or else, for an immutable kind, the create's own body. The flags, body, summary and sort key staged on the create stay, so an edit made on it still pushes: the status is `Clean` when they equal the base and `Dirty` otherwise, and the origin goes, there being nothing left to copy from. A create holding no body adopts a fetched one as its own. A mutable fetch carrying no body leaves the binding conflicted at the fetched revision, its base naming no body ("An unread arrival landing a create conflicts" in [sync](sync.md)); one carrying another body than the staged one is settled by the source's policy as above ("An upgrade supplies a conflict's diverging body"), `Manual` recording it as the `conflict_object`.
 
 The `Links` load an upgrade makes for a fresh hint asks for the hint and its minted form, and a store answers with the placements the source binds (SYNC §10), a pending create being one, so the holder to land is in the batch whether or not the requested handles named it.
 
@@ -139,6 +159,8 @@ The `Links` load an upgrade makes for a fresh hint asks for the hint and its min
 
 ### Requirement: An item conflict's late body meets the policy
 An item conflict recorded for want of its incoming body SHALL be revisited by the `Full` upgrade of each binding whose base names a revision and no body, and only those: the fetched body lands as that binding's body and base, and the write settles it against the item's by the collection's policy as a carried body would have been, `Manual` recording it in `items.conflict_object`, `PreferIncoming` adopting it and `PreferExisting` keeping the shared body, the conflict cleared and the body not adopted kept and reported `Overruled` (pimdir SYNC §6, §9, vectors/sync/84, 90, 91). A binding whose base holds a body is not refetched for the item's conflict.
+
+An item holding no body when its conflict was recorded waits for the fill: the upgrade reading that binding's own body fills the item, and the write settles a `prefer-` conflict then, `prefer-incoming` adopting the diverging body and `prefer-existing` keeping the filled one, the conflict cleared and the body not adopted kept over the filling binding's handle and reported `Overruled`; `manual` leaves the conflict standing (pimdir SYNC §9, vectors/sync/112 to 115; hub.md).
 
 ### Requirement: A full fetch answering no body counts nothing
 A `Full` fetch whose answer carries no body SHALL count neither as `fetched` nor as `upgraded`: it raised nothing. The placement is still written with what the fetch refreshed, its level the one the row supports.

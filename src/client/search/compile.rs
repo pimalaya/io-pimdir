@@ -1,13 +1,14 @@
 //! # Compiler
 //!
-//! A [`PimdirQuery`] compiled to one SQL statement over index.db with the
-//! store attached (SEARCH §8): every text term an FTS5 `MATCH` built from
-//! escaped tokens, through the canonical `match_objects` and
-//! `match_summaries`; every structured term a set of placements, through
-//! the canonical statements where one exists. A hit is `(account, seq)`,
-//! so each term is lifted to the hits any live placement of which it
-//! holds for, and `not` is the hits none does: the union rule SEARCH §8.2
-//! states for tags, kept for every term.
+//! A [`PimdirQuery`] compiled to SQL over index.db with the store attached
+//! (SEARCH §8): every text term an FTS5 `MATCH` built from escaped tokens,
+//! read once through the canonical `match_objects` and `match_summaries`
+//! into `temp.term_match` before the query runs, so a query of many terms
+//! stays one shallow statement; every structured term a set of
+//! placements, through the canonical statements where one exists. A hit
+//! is `(account, seq)`, so each term is lifted to the hits any live
+//! placement of which it holds for, and `not` is the hits none does: the
+//! union rule SEARCH §8.2 states for tags, kept for every term.
 
 use alloc::{
     format,
@@ -41,12 +42,15 @@ pub(crate) type Ends = Vec<(PimdirQueryId, Vec<(String, String)>)>;
 /// to it, as stated.
 pub(crate) type Categories = Vec<(String, Vec<String>)>;
 
-/// A compiled query: its common table expressions, the condition a live
-/// hit meets, the parameters both bind, and what an answer reports
-/// beside its hits.
+/// A compiled query: the statements filling `temp.term_match` with its
+/// text terms' matches, the condition a live hit meets, the parameters it
+/// binds, and what an answer reports beside its hits.
 pub(crate) struct Compiled {
-    /// One `t<n>(akey, seq, src, rank)` per text term.
-    ctes: Vec<String>,
+    /// The statements reading each text term's matches into
+    /// `temp.term_match`, run before the query, in order.
+    pub(crate) matches: Vec<Matches>,
+    /// The text terms read so far, each numbered by its position.
+    terms: usize,
     /// The text terms no `not` negates, whose matches say what a hit
     /// matched on and rank it.
     positive: Vec<usize>,
@@ -54,6 +58,9 @@ pub(crate) struct Compiled {
     condition: String,
     /// The parameters, bound by position.
     pub(crate) params: Vec<Value>,
+    /// The positive text terms' expressions, each probed against a page's
+    /// hits to tell what they matched (`match_object`, `match_summary`).
+    pub(crate) probes: Vec<Probe>,
     /// The words a snippet looks for: the positive text terms'.
     pub(crate) words: Vec<String>,
     /// The items each `linked:` term names, as `(kind, link id)` pairs
@@ -81,8 +88,10 @@ impl Compiled {
             .collect();
 
         let mut compiled = Self {
-            ctes: Vec::new(),
+            matches: Vec::new(),
+            terms: 0,
             positive: Vec::new(),
+            probes: Vec::new(),
             condition: String::new(),
             params: Vec::new(),
             words: Vec::new(),
@@ -95,8 +104,8 @@ impl Compiled {
     }
 
     /// The hits in `sort` order (SEARCH §8.2), `limit` of them after
-    /// `offset`, every one with `None`: account, seq, what they matched
-    /// on, rank, sort key, whether undated, title. The `name` order folds
+    /// `offset`, every one with `None`: account, seq, rank, sort key,
+    /// whether undated, title. The `name` order folds
     /// titles as SQL cannot, so its caller sorts the whole set itself;
     /// another order leaves the title empty, read for no hit.
     pub(crate) fn select(
@@ -120,6 +129,12 @@ impl Compiled {
             AND i.deleted = 0 AND i.retained_at IS NULL";
         // NOTE: the title joins six summary tables per hit, before the order
         // and the page cut: only the `name` order reads it.
+        let rank = match sort {
+            PimdirSearchSort::Relevance => {
+                "(SELECT min(m.rank) FROM matched m WHERE m.akey = h.akey AND m.seq = h.seq)"
+            }
+            _ => "NULL",
+        };
         let title = match sort {
             PimdirSearchSort::Name => format!(
                 "(SELECT coalesce(ms.subject, cs.fn, es.summary, ts.summary, js.summary, fs.name, '') \
@@ -132,9 +147,7 @@ impl Compiled {
         format!(
             "{}
 SELECT h.account, h.seq,
-  (SELECT CASE WHEN max(m.src = 'body') = 1 THEN 'body' WHEN count(*) > 0 THEN 'summary' END
-   FROM matched m WHERE m.akey = h.akey AND m.seq = h.seq) AS matched,
-  (SELECT min(m.rank) FROM matched m WHERE m.akey = h.akey AND m.seq = h.seq) AS rank,
+  {rank} AS rank,
   (SELECT max(i.sort_key) {placements}) AS sort_key,
   (SELECT max(c.kind IN ('text/vcard', 'application/octet-stream')) {placements}) AS undated,
   {title} AS title
@@ -148,11 +161,11 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
         format!("{}\nSELECT count(*) FROM hits;", self.with())
     }
 
-    /// The common table expressions every statement starts with: the text
-    /// terms, the live hits, the hits meeting the condition, and the
-    /// matches of the positive text terms.
+    /// The common table expressions every statement starts with: the live
+    /// hits, the hits meeting the condition, and the matches of the
+    /// positive text terms.
     fn with(&self) -> String {
-        let mut ctes = self.ctes.clone();
+        let mut ctes = Vec::new();
         ctes.push(
             "live(akey, account, seq) AS (SELECT DISTINCT ifnull(c.account, ''), c.account, i.seq \
              FROM store.items i JOIN store.collections c ON c.id = i.collection \
@@ -164,15 +177,11 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             self.condition
         ));
 
-        let matched = match self.positive.is_empty() {
-            true => "SELECT NULL, NULL, NULL, NULL WHERE 0".to_string(),
-            false => self
-                .positive
-                .iter()
-                .map(|at| format!("SELECT akey, seq, src, rank FROM t{at}"))
-                .collect::<Vec<_>>()
-                .join(" UNION ALL "),
-        };
+        let positive: Vec<String> = self.positive.iter().map(ToString::to_string).collect();
+        let matched = format!(
+            "SELECT akey, seq, src, rank FROM temp.term_match WHERE term IN ({})",
+            positive.join(", ")
+        );
         ctes.push(format!("matched(akey, seq, src, rank) AS ({matched})"));
 
         format!("WITH {}", ctes.join(",\n"))
@@ -184,21 +193,36 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
         format!("?{}", self.params.len())
     }
 
-    /// Embeds a canonical statement as a subquery: its comments and final
-    /// semicolon stripped, each named parameter bound by position.
+    /// Embeds a canonical statement as a subquery of the query, each named
+    /// parameter bound by position.
     fn embed(&mut self, statement: &str, binds: Vec<(&str, Value)>) -> String {
-        let mut text: String = statement
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        text = text.trim().trim_end_matches(';').to_string();
+        embed(statement, binds, &mut self.params)
+    }
 
-        for (name, value) in binds {
-            let position = self.bind(value);
-            text = replace_param(&text, name, &position);
-        }
-        text
+    /// Reads a text term's matches into `temp.term_match` before the query
+    /// runs, through `statement` (`match_objects` or `match_summaries`),
+    /// what matched named `src`, those of collections of another kind than
+    /// `kind` left out.
+    fn matches(
+        &mut self,
+        term: usize,
+        statement: &str,
+        src: &str,
+        expression: String,
+        kind: Option<&str>,
+    ) {
+        let mut params = Vec::new();
+        let matched = embed(statement, vec![(":match", expression.into())], &mut params);
+        let kind = match kind {
+            Some(kind) => format!(" WHERE c.kind = '{kind}'"),
+            None => String::new(),
+        };
+        let sql = format!(
+            "INSERT INTO temp.term_match(term, collection, akey, seq, src, rank) \
+             SELECT {term}, m.collection, ifnull(c.account, ''), m.seq, '{src}', m.rank \
+             FROM ({matched}) m JOIN store.collections c ON c.id = m.collection{kind}"
+        );
+        self.matches.push(Matches { sql, params });
     }
 
     /// Compiles one node to a condition over `live`.
@@ -246,9 +270,20 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                         sql::LIST_DOMAIN_PLACEMENTS,
                         vec![(":domain", domain.to_string().into()), (":role", role)],
                     ),
+                    // NOTE: one page holding every placement, a `LIMIT` of
+                    // -1 being SQLite's unbounded one: the term is a set,
+                    // which the query's own order pages.
                     None => self.embed(
                         sql::LIST_ADDRESS_PLACEMENTS,
-                        vec![(":address", address.into()), (":role", role)],
+                        vec![
+                            (":address", address.into()),
+                            (":role", role),
+                            (":after_key", Value::Null),
+                            (":after_seq", Value::Null),
+                            (":after_collection", Value::Null),
+                            (":after_role", Value::Null),
+                            (":limit", Value::Integer(-1)),
+                        ],
                     ),
                 }
             }
@@ -467,42 +502,29 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
     /// The placements of `person:` (SEARCH §8): the contacts whose title
     /// matches, and every item naming one of their addresses in any role.
     fn person(&mut self, text: &PimdirQueryText) -> String {
-        let at = self.ctes.len();
-        let contacts = match fts(Some("title"), text) {
-            None => "SELECT NULL, NULL WHERE 0".to_string(),
-            Some(expression) => {
-                let objects = self.embed(
-                    search::MATCH_OBJECTS,
-                    vec![(":match", expression.clone().into())],
-                );
-                let summaries =
-                    self.embed(search::MATCH_SUMMARIES, vec![(":match", expression.into())]);
-                format!(
-                    "SELECT m.collection, m.seq FROM ({objects}) m \
-                     JOIN store.collections c ON c.id = m.collection WHERE c.kind = 'text/vcard' \
-                     UNION SELECT m.collection, m.seq FROM ({summaries}) m \
-                     JOIN store.collections c ON c.id = m.collection WHERE c.kind = 'text/vcard'"
-                )
-            }
-        };
-        self.ctes.push(format!(
-            "p{at}(collection, seq) AS MATERIALIZED ({contacts})"
-        ));
+        let at = self.terms;
+        self.terms += 1;
+        if let Some(expression) = fts(Some("title"), text) {
+            let card = Some("text/vcard");
+            self.matches(at, search::MATCH_OBJECTS, "body", expression.clone(), card);
+            self.matches(at, search::MATCH_SUMMARIES, "summary", expression, card);
+        }
+        let contacts = format!("SELECT collection, seq FROM temp.term_match WHERE term = {at}");
 
         format!(
-            "SELECT collection, seq FROM p{at} UNION \
+            "{contacts} UNION \
              SELECT i.collection, i.seq FROM store.item_address a \
              JOIN store.items i ON i.collection = a.collection AND i.link_id = a.link_id \
              WHERE i.deleted = 0 AND i.retained_at IS NULL AND a.address IN ( \
                SELECT e.address FROM store.item_address e \
                JOIN store.items ei ON ei.collection = e.collection AND ei.link_id = e.link_id \
-               WHERE e.role = 'email' AND (ei.collection, ei.seq) IN (SELECT collection, seq FROM p{at}))"
+               WHERE e.role = 'email' AND (ei.collection, ei.seq) IN ({contacts}))"
         )
     }
 
-    /// Compiles a text term to a `t<n>` expression of its matches over
-    /// bodies and, when the field exists there, over summaries, answering
-    /// the condition over `live`.
+    /// Compiles a text term to its matches over bodies and, when the field
+    /// exists there, over summaries, read into `temp.term_match` under the
+    /// term's number, answering the condition over `live`.
     fn text(
         &mut self,
         column: Option<&str>,
@@ -510,43 +532,65 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
         text: &PimdirQueryText,
         negated: bool,
     ) -> String {
-        let at = self.ctes.len();
-        let cte = match fts(column, text) {
-            None => "SELECT NULL, NULL, NULL, NULL WHERE 0".to_string(),
-            Some(expression) => {
-                let objects = self.embed(
-                    search::MATCH_OBJECTS,
-                    vec![(":match", expression.clone().into())],
-                );
-                let mut union = format!(
-                    "SELECT ifnull(c.account, ''), m.seq, 'body', m.rank FROM ({objects}) m \
-                     JOIN store.collections c ON c.id = m.collection"
-                );
-                if summary {
-                    let summaries =
-                        self.embed(search::MATCH_SUMMARIES, vec![(":match", expression.into())]);
-                    union += &format!(
-                        " UNION ALL SELECT ifnull(c.account, ''), m.seq, 'summary', m.rank \
-                         FROM ({summaries}) m JOIN store.collections c ON c.id = m.collection"
-                    );
-                }
-                union
+        let at = self.terms;
+        self.terms += 1;
+        if let Some(expression) = fts(column, text) {
+            self.matches(at, search::MATCH_OBJECTS, "body", expression.clone(), None);
+            if summary {
+                self.matches(at, search::MATCH_SUMMARIES, "summary", expression, None);
             }
-        };
-        // NOTE: materialised, so `bm25` runs in the full-text query that
-        // ranks; flattened into the statement reading `rank`, a lone
-        // `match_objects` would call it outside one, which FTS5 refuses.
-        self.ctes.push(format!(
-            "t{at}(akey, seq, src, rank) AS MATERIALIZED ({cte})"
-        ));
+        }
 
         if !negated {
             self.positive.push(at);
             self.words.push(text.text.clone());
+            if let Some(expression) = fts(column, text) {
+                self.probes.push(Probe {
+                    expression,
+                    summary,
+                });
+            }
         }
 
-        member(&format!("SELECT akey, seq FROM t{at}"))
+        member(&format!(
+            "SELECT akey, seq FROM temp.term_match WHERE term = {at}"
+        ))
     }
+}
+
+/// A positive text term, probed against one hit's body or summary.
+pub(crate) struct Probe {
+    /// Its FTS5 expression (SEARCH §8.5).
+    pub(crate) expression: String,
+    /// Whether its field exists in a summary, which it then matches too.
+    pub(crate) summary: bool,
+}
+
+/// A statement filling `temp.term_match`, run before the query.
+pub(crate) struct Matches {
+    /// The statement.
+    pub(crate) sql: String,
+    /// Its parameters, bound by position.
+    pub(crate) params: Vec<Value>,
+}
+
+/// Embeds a canonical statement as a subquery: its comments and final
+/// semicolon stripped, each named parameter bound by position after those
+/// `params` holds.
+fn embed(statement: &str, binds: Vec<(&str, Value)>, params: &mut Vec<Value>) -> String {
+    let mut text: String = statement
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    text = text.trim().trim_end_matches(';').to_string();
+
+    for (name, value) in binds {
+        params.push(value);
+        let position = format!("?{}", params.len());
+        text = replace_param(&text, name, &position);
+    }
+    text
 }
 
 /// The condition that a hit of `live` is among `hits`, a statement

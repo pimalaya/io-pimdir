@@ -18,6 +18,7 @@ use std::{collections::BTreeSet, fmt, path::PathBuf};
 
 use anyhow::Result;
 use clap::Args;
+use io_pimdir::client::blobs::PimdirBlobStrayKind;
 use pimalaya_cli::printer::Printer;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -31,8 +32,9 @@ const SHOWN: usize = 20;
 /// Check a store's internal consistency.
 ///
 /// Reports object rows whose body is missing, refcounts that disagree with the
-/// references justifying them, rows pointing at something absent, and blob
-/// files no row references (which `pimdir gc` reclaims). Reading only, unless
+/// references justifying them, rows pointing at something absent, blob files no
+/// row references (which `pimdir gc` reclaims), entries of objects/ that are no
+/// body (left in place) and the files quarantine/ holds. Reading only, unless
 /// `--fix` is passed.
 #[derive(Debug, Args)]
 pub struct CheckCommand {
@@ -51,7 +53,10 @@ impl CheckCommand {
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         let read = store.read()?;
         let indexed = read.indexed_hashes().map_err(report)?;
-        let on_disk = read.blobs().files()?;
+        let blobs = read.blobs();
+        let scan = blobs.scan()?;
+        let quarantined = blobs.quarantined()?;
+        let on_disk = scan.files;
 
         let mut orphans = Vec::new();
         let mut orphan_bytes = 0;
@@ -123,6 +128,15 @@ impl CheckCommand {
                 .collect(),
             orphan_bytes,
             missing,
+            strays: scan
+                .strays
+                .into_iter()
+                .map(|stray| StrayEntry {
+                    kind: stray_kind(stray.kind),
+                    path: stray.path,
+                })
+                .collect(),
+            quarantined,
             drift,
             dangling,
             minted,
@@ -140,6 +154,17 @@ pub struct OrphanBlob {
     pub hash: String,
     /// Its size on disk.
     pub size: u64,
+    /// Where it sits.
+    pub path: PathBuf,
+}
+
+/// One entry of objects/ that is no body, which the collector leaves in
+/// place (STORAGE §5).
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StrayEntry {
+    /// What it is: `temporary`, `link` or `foreign`.
+    pub kind: &'static str,
     /// Where it sits.
     pub path: PathBuf,
 }
@@ -186,6 +211,12 @@ pub struct CheckOutput {
     pub orphans: Vec<OrphanBlob>,
     /// What they weigh in total.
     pub orphan_bytes: u64,
+    /// Entries of objects/ that are no body: a writer's temporary, a link,
+    /// a name or a position that is not the store's.
+    pub strays: Vec<StrayEntry>,
+    /// Files that failed their name, moved into quarantine/ by an owner and
+    /// never read again; only the user empties it.
+    pub quarantined: Vec<PathBuf>,
     /// Object rows whose blob file is missing.
     pub missing: Vec<String>,
     /// Objects whose refcount disagrees with their references.
@@ -204,7 +235,12 @@ pub struct CheckOutput {
 impl CheckOutput {
     /// How many problems the check found.
     fn problems(&self) -> usize {
-        self.orphans.len() + self.missing.len() + self.drift.len() + self.dangling.len()
+        self.orphans.len()
+            + self.strays.len()
+            + self.quarantined.len()
+            + self.missing.len()
+            + self.drift.len()
+            + self.dangling.len()
     }
 }
 
@@ -229,6 +265,30 @@ impl fmt::Display for CheckOutput {
             }
             more(f, self.orphans.len())?;
             writeln!(f, "   Reclaim them with `pimdir gc`")?;
+        }
+
+        if !self.strays.is_empty() {
+            writeln!(
+                f,
+                "{} entry(ies) under objects/ that are no body, left in place:",
+                self.strays.len()
+            )?;
+            for stray in self.strays.iter().take(SHOWN) {
+                writeln!(f, " - {} ({})", stray.path.display(), stray.kind)?;
+            }
+            more(f, self.strays.len())?;
+        }
+
+        if !self.quarantined.is_empty() {
+            writeln!(
+                f,
+                "{} file(s) in quarantine/ that failed their name, kept for recovery:",
+                self.quarantined.len()
+            )?;
+            for path in self.quarantined.iter().take(SHOWN) {
+                writeln!(f, " - {}", path.display())?;
+            }
+            more(f, self.quarantined.len())?;
         }
 
         if !self.missing.is_empty() {
@@ -307,4 +367,13 @@ fn more(f: &mut fmt::Formatter<'_>, total: usize) -> fmt::Result {
         )?;
     }
     Ok(())
+}
+
+/// A stray entry's kind as the output names it.
+fn stray_kind(kind: PimdirBlobStrayKind) -> &'static str {
+    match kind {
+        PimdirBlobStrayKind::Temporary => "temporary",
+        PimdirBlobStrayKind::Link => "link",
+        PimdirBlobStrayKind::Foreign => "foreign",
+    }
 }

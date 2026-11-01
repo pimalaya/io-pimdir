@@ -9,24 +9,20 @@ jobs:
     name: fmt + clippy + deny + test
     runs-on: ubuntu-latest
     steps:
-      # NOTE: the spec is a sibling checkout, not a vendored copy, and the
-      # suites proving the crate against it (the schema and statement
-      # fidelity of tests/spec_drift.rs, the object-naming vectors of
-      # tests/objects.rs, the Annex A summaries of tests/summaries.rs, the
-      # sync vectors of tests/vectors_sync.rs and the search vectors of
-      # tests/search.rs) skip without it.
-      # Checking it out is what makes them run, and drift between the two
-      # repositories is exactly what nothing else notices.
+      # NOTE: the suites proving the crate against the spec read its vendored
+      # copy under spec/, so they run without a pimdir checkout. The one
+      # beside this one serves tests/spec_drift.rs alone, which compares
+      # spec/ with pimdir at the revision spec/REVISION names: drift between
+      # the two repositories is exactly what nothing else notices.
       - uses: actions/checkout@v4
         with:
           path: io-pimdir
-      # At the tag the crate claims, so a later spec edit cannot turn a
-      # released crate red: storage-draft-07, sync-draft-06 and
-      # search-draft-07 name one commit. Move it with spec/.
+      - id: pin
+        run: echo "revision=$(cat io-pimdir/spec/REVISION)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: pimalaya/pimdir
-          ref: storage-draft-07
+          ref: ${{ steps.pin.outputs.revision }}
           path: pimdir
       # The system link, the one Nix builds and consumers turning `vendored`
       # off take, needs the library before anything compiles.
@@ -55,16 +51,13 @@ jobs:
       # proven by its unit tests alone.
       - run: cargo test --no-default-features --lib
         working-directory: io-pimdir
-      # The spec suites skip silently when the spec is absent, so a green
-      # run proves nothing unless they actually ran.
-      - name: The spec suites ran rather than skipped
+      # spec_drift compares nothing when the checkout lacks the pinned
+      # revision, so a green run proves nothing unless it compared.
+      - name: The vendored copy was compared with pimdir
         working-directory: io-pimdir
         run: |
           set -eu
-          for suite in spec_drift summaries vectors_sync objects search; do
-            [ -f "tests/$suite.rs" ] || continue
-            if cargo test --all-features --test "$suite" -- --nocapture 2>&1 | grep -qE "skipped: no pimdir spec checkout beside this one|skipping: the pimdir spec checkout is not beside this crate"; then
-              echo "::error::$suite skipped: the pimdir checkout was not found"
-              exit 1
-            fi
-          done
+          if cargo test --all-features --test spec_drift -- --nocapture 2>&1 | grep -q "nothing compared"; then
+            echo "::error::spec_drift compared nothing: the pimdir checkout lacks spec/REVISION"
+            exit 1
+          fi

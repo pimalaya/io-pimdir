@@ -10,8 +10,10 @@
 //!
 //! A refresh collects the message ids its batch touched (a mail placement
 //! new, rebodied, rekeyed or dropped) and relinks them before the batch
-//! commits: their parents re-read, the edge closing a cycle ignored, and
-//! every thread they reach recomputed. No joining by subject.
+//! commits: the thread of one no placement holds any more pruned first
+//! through the canonical statements, then the parents of the others
+//! re-read, the edge closing a cycle ignored, and every thread they and
+//! the pruned rows reach recomputed. No joining by subject.
 //!
 //! The relink here reads nothing: it runs over the messages the refresh
 //! has read ([`PimdirIndexMessage`]), changes them in memory, and answers
@@ -67,7 +69,8 @@ pub(crate) fn parent(body: &[u8]) -> Option<Option<String>> {
 }
 
 /// Rereads the parents of the message ids a batch touched and recomputes
-/// every thread they reach (SEARCH §9), over the messages read so far:
+/// every thread they or `seeds`, the rows a prune left (SEARCH §9), reach,
+/// over the messages read so far:
 /// the ops writing the result, the thread rows first, then the message
 /// rows, then the thread rows no message points to any more, so a
 /// consumer enforcing `message.thread`'s reference never sees a message
@@ -77,6 +80,7 @@ pub(crate) fn relink(
     nodes: &BTreeMap<String, PimdirIndexMessage>,
     heads: &Heads,
     touched: &BTreeSet<String>,
+    seeds: &BTreeSet<String>,
 ) -> Result<Vec<PimdirIndexOp>, Need> {
     let mut graph = Graph {
         nodes,
@@ -85,24 +89,21 @@ pub(crate) fn relink(
         need: Need::default(),
     };
 
-    let mut seeds = BTreeSet::new();
+    let mut seeds = seeds.clone();
     for link_id in touched {
         let Some(node) = graph.node(link_id) else {
             continue;
         };
-        let held = node.row.clone();
-        let held = graph.current.get(link_id).cloned().unwrap_or(held);
-        let present = node.presence.is_some();
-        if held.is_none() && !present {
+        // NOTE: a message no placement holds any more left with its
+        // thread pruned first, the rows left among the seeds.
+        if node.presence.is_none() {
             continue;
         }
+        let held = node.row.clone();
+        let held = graph.current.get(link_id).cloned().unwrap_or(held);
 
-        let parent = match present {
-            true => match graph.parent(node) {
-                Some(parent) => parent,
-                None => continue,
-            },
-            false => None,
+        let Some(parent) = graph.parent(node) else {
+            continue;
         };
         // NOTE: the edge that would close a cycle is ignored, a message
         // naming itself included.
@@ -255,7 +256,7 @@ impl<'a> Graph<'a> {
     }
 
     /// Recomputes the thread of every component a seed is in: a component
-    /// no placement holds a member of dropped whole (a message row nobody
+    /// no placement holds a member of pruned whole (a message row nobody
     /// holds has no parent, so one nobody names is alone), else every
     /// member pointed to one thread row named after the present member
     /// with the lowest `(sort_key, link_id)`; last the thread rows no
@@ -263,6 +264,7 @@ impl<'a> Graph<'a> {
     fn rethread(mut self, seeds: &BTreeSet<String>) -> Result<Vec<PimdirIndexOp>, Need> {
         let mut done = BTreeSet::new();
         let mut stale = BTreeSet::new();
+        let mut pruned = BTreeSet::new();
         let mut ops = Vec::new();
 
         for seed in seeds {
@@ -302,9 +304,10 @@ impl<'a> Graph<'a> {
                 .iter()
                 .min_by(|(a, x), (b, y)| (&x.sort_key, a).cmp(&(&y.sort_key, b)))
             else {
-                trace!("thread of {seed} holds no message, dropping it");
-                for link_id in members.keys() {
-                    self.current.insert(link_id.clone(), None);
+                trace!("thread of {seed} holds no message, pruning it");
+                for (link_id, row) in members {
+                    pruned.insert(row.thread);
+                    self.current.insert(link_id, None);
                 }
                 continue;
             };
@@ -350,10 +353,10 @@ impl<'a> Graph<'a> {
                     thread: row.thread.clone(),
                     parent: row.parent.clone(),
                 }),
-                None if read.is_some() => ops.push(PimdirIndexOp::DropMessage(link_id.clone())),
                 _ => (),
             }
         }
+        ops.extend(pruned.into_iter().map(PimdirIndexOp::PruneThread));
         ops.extend(stale.into_iter().map(PimdirIndexOp::DropThread));
         Ok(ops)
     }
@@ -395,13 +398,13 @@ mod tests {
         ]);
         let touched = BTreeSet::from(["b".to_string(), "c".to_string()]);
 
-        let Err(need) = relink(&nodes, &Heads::new(), &touched) else {
+        let Err(need) = relink(&nodes, &Heads::new(), &touched, &BTreeSet::new()) else {
             panic!("the parent is not read yet");
         };
         assert_eq!(need.messages, BTreeSet::from(["a".to_string()]));
         nodes.insert("a".into(), PimdirIndexMessage::default());
 
-        let ops = relink(&nodes, &Heads::new(), &touched).unwrap();
+        let ops = relink(&nodes, &Heads::new(), &touched, &BTreeSet::new()).unwrap();
         assert_eq!(
             ops[0],
             PimdirIndexOp::PutThread {
@@ -435,7 +438,7 @@ mod tests {
     fn a_message_naming_itself_stands_alone() {
         let nodes = BTreeMap::from([("a".to_string(), present("2026-01", Some("a")))]);
         let touched = BTreeSet::from(["a".to_string()]);
-        let ops = relink(&nodes, &Heads::new(), &touched).unwrap();
+        let ops = relink(&nodes, &Heads::new(), &touched, &BTreeSet::new()).unwrap();
         assert!(ops.contains(&PimdirIndexOp::PutMessage {
             link_id: "a".into(),
             thread: "a".into(),

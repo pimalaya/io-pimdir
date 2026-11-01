@@ -108,8 +108,8 @@ Rebuilding a collection onto a new handle space SHALL carry each placement's key
 ### Requirement: The store bumps the generation on a rekeyed batch
 The engine emits no op for the epoch bump: a batch carrying a `Rekeyed` drop is a rebuild, and the store bumps the collection's generation in the transaction applying it (pimdir STORAGE §12, SYNC §8).
 
-### Requirement: A rekey missing most members parks
-A rekey whose listing leaves more than half of the source's based bindings in the collection with no member, those bindings numbering at least 20, SHALL write nothing (no drop, no upsert, the checkpoint and the generation unmoved) unless `PimdirRekey::accept_absences` is set (`PimdirSourceStore::rekey(collection, accept_absences, remote)`), and `PimdirRekeyReport::parked` carries the counts (pimdir SYNC §8, vectors/sync/89). The old checkpoint still names the old handle space, so the next run names the rekey again.
+### Requirement: A rekey missing most members, or listing none, parks
+A rekey whose listing leaves more than half of the source's based bindings in the collection with no member, those bindings numbering at least 20, SHALL write nothing (no drop, no upsert, the checkpoint and the generation unmoved) unless `PimdirRekey::accept_absences` is set (`PimdirSourceStore::rekey(collection, accept_absences, remote)`), and `PimdirRekeyReport::parked` carries the counts (pimdir SYNC §8, vectors/sync/89). A rekey whose listing names no member SHALL park the same way while any based binding of the source is absent, whatever their number (src/rekey.rs `an_empty_listing_parks_the_rekey`). The old checkpoint still names the old handle space, so the next run names the rekey again.
 
 ### Requirement: A re-staged edit takes a provisional handle
 A rebuild re-staging an edited row no member carries (SYNC §8) SHALL key it under the provisional handle its link id derives, its binding moved there by a `Superseded` drop of the old handle, which is void and may be one the new space gives another member.

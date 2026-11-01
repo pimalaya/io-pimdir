@@ -1,7 +1,8 @@
-//! An owner open that creates, migrates and reconciles nothing (STORAGE
-//! §6, §8): `PimdirStore::open_current` takes the owner lock on a store
-//! exactly as this crate writes it, and refuses any other, leaving it as it
-//! was, where `PimdirStore::open` would bring it to this crate's schema.
+//! An owner open that creates nothing (STORAGE §6, §8):
+//! `PimdirStore::open_current` takes the owner lock on a store exactly as
+//! this crate writes it, and refuses any other, leaving it as it was,
+//! where `PimdirStore::open` would create an absent one. Neither
+//! reconciles nor migrates: a store of another draft is refused by both.
 
 #![cfg(feature = "client")]
 
@@ -20,17 +21,6 @@ BEGIN:VEVENT\r\nUID:entry-1@example.org\r\nDTSTAMP:20261028T090000Z\r\n\
 DTSTART:20261028T090000Z\r\nDTEND:20261028T100000Z\r\nSUMMARY:Paint\r\n\
 TRANSP:TRANSPARENT\r\nRELATED-TO:todo-1@example.org\r\n\
 END:VEVENT\r\nEND:VCALENDAR\r\n";
-
-fn columns(dir: &std::path::Path, table: &str) -> Vec<String> {
-    let conn = rusqlite::Connection::open(dir.join("pimdir.db")).unwrap();
-    let mut stmt = conn
-        .prepare("SELECT name FROM pragma_table_info(?1)")
-        .unwrap();
-    stmt.query_map([table], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
-}
 
 #[test]
 fn a_store_this_crate_created_opens_and_takes_writes() {
@@ -67,96 +57,26 @@ fn an_absent_store_is_refused_and_not_created() {
     );
 }
 
+/// Tables at `user_version` 0 are another program's (§3), as the owner's
+/// open reads them; a `user_version` the stamps disagree on is a corrupt
+/// store. Neither is migrated.
 #[test]
 fn another_schema_version_is_refused_and_not_migrated() {
-    for version in [0, 2] {
+    for (version, code) in [(0, "store-foreign"), (2, "store-corrupt")] {
         let dir = tempfile::tempdir().unwrap();
         drop(PimdirStore::open(dir.path()).unwrap());
         let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
         drop(conn);
 
-        let refused = PimdirStore::open_current(dir.path()).err();
-        // NOTE: tables at version 0 are another program's (§3), as the
-        // owner's open reads them.
-        let expected = match version {
-            0 => matches!(refused, Some(PimdirError::Foreign)),
-            _ => matches!(
-                refused,
-                Some(PimdirError::NotCurrent(PimdirNotCurrent::Version { found })) if found == version
-            ),
-        };
-        assert!(expected, "{refused:?}");
-        let code = if version > 1 {
-            "store-newer"
-        } else {
-            "store-foreign"
-        };
-        assert_eq!(refused.unwrap().code(), code);
+        let refused = PimdirStore::open_current(dir.path()).err().unwrap();
+        assert_eq!(refused.code(), code, "{refused:?}");
         let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
         let after: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(after, version, "left as it was");
     }
-}
-
-/// A store an owner at io-pimdir 3b4bed8 reconciled to its own schema: its
-/// `task_summary` lacks the task organisation columns.
-#[test]
-fn a_store_needing_a_reconcile_is_refused_and_left_as_it_was() {
-    let dir = tempfile::tempdir().unwrap();
-    drop(PimdirStore::open(dir.path()).unwrap());
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch(
-        "DROP INDEX task_summary_by_parent;
-         DROP INDEX task_summary_by_mid;
-         ALTER TABLE task_summary DROP COLUMN mid;
-         ALTER TABLE task_summary DROP COLUMN parent;
-         ALTER TABLE task_summary DROP COLUMN priority;",
-    )
-    .unwrap();
-    drop(conn);
-    let before = columns(dir.path(), "task_summary");
-
-    let refused = PimdirStore::open_current(dir.path()).err();
-    assert!(
-        matches!(
-            &refused,
-            Some(PimdirError::NotCurrent(PimdirNotCurrent::Shape { object })) if object == "task_summary"
-        ),
-        "{refused:?}"
-    );
-    assert_eq!(columns(dir.path(), "task_summary"), before, "not rebuilt");
-    assert!(!before.iter().any(|column| column == "priority"));
-
-    // NOTE: the lock went with the refusal, and open reconciles.
-    drop(PimdirStore::open(dir.path()).unwrap());
-    assert!(
-        columns(dir.path(), "task_summary")
-            .iter()
-            .any(|column| column == "priority")
-    );
-    drop(PimdirStore::open_current(dir.path()).unwrap());
-}
-
-#[test]
-fn an_extra_index_is_a_difference_too() {
-    let dir = tempfile::tempdir().unwrap();
-    drop(PimdirStore::open(dir.path()).unwrap());
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch("CREATE INDEX zz_extra ON items(sort_key);")
-        .unwrap();
-    drop(conn);
-
-    let refused = PimdirStore::open_current(dir.path()).err();
-    assert!(
-        matches!(
-            &refused,
-            Some(PimdirError::NotCurrent(PimdirNotCurrent::Shape { object })) if object == "zz_extra"
-        ),
-        "{refused:?}"
-    );
 }
 
 /// Held the way another process would: through a file description this
@@ -183,10 +103,11 @@ fn a_store_another_process_owns_is_refused_at_once() {
 }
 
 /// A consumer cancelling one queue row owns the store for that write alone:
-/// a store another revision keeps is refused, never brought to this crate's
-/// schema (himalaya at 3b4bed8 dropped a newer store's tables this way).
+/// a store of another draft is refused and left as it was, its row still
+/// queued (himalaya at 3b4bed8 dropped a newer store's tables by
+/// reconciling it).
 #[test]
-fn a_cancel_leaves_a_store_needing_a_reconcile_as_it_was() {
+fn a_cancel_leaves_a_store_of_another_draft_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let store = PimdirStore::open(dir.path()).unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
@@ -196,23 +117,27 @@ fn a_cancel_leaves_a_store_needing_a_reconcile_as_it_was() {
         .enqueue("INBOX", &PimdirAction::Remove { seq: 1 }, None)
         .unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch("ALTER TABLE task_summary ADD COLUMN newer TEXT;")
-        .unwrap();
+    conn.execute_batch(
+        "UPDATE store_meta SET format_version = 'storage-draft-09';
+         ALTER TABLE task_summary ADD COLUMN newer TEXT;",
+    )
+    .unwrap();
     drop(conn);
-    let before = columns(dir.path(), "task_summary");
+    let before = fs::read(dir.path().join("pimdir.db")).unwrap();
 
     let refused = PimdirStore::cancel_action(dir.path(), id).err();
     assert!(
-        matches!(
-            &refused,
-            Some(PimdirError::NotCurrent(PimdirNotCurrent::Shape { object })) if object == "task_summary"
-        ),
+        matches!(&refused, Some(PimdirError::Version { found: Some(found) }) if found == "storage-draft-09"),
         "{refused:?}"
     );
-    assert_eq!(columns(dir.path(), "task_summary"), before, "not rebuilt");
-    let pending = PimdirReader::open(dir.path())
+    assert_eq!(
+        fs::read(dir.path().join("pimdir.db")).unwrap(),
+        before,
+        "not rebuilt"
+    );
+    let queued: i64 = rusqlite::Connection::open(dir.path().join("pimdir.db"))
         .unwrap()
-        .pending_actions("INBOX")
+        .query_row("SELECT count(*) FROM queue", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(pending.len(), 1, "the row stays queued");
+    assert_eq!(queued, 1, "the row stays queued");
 }

@@ -8,7 +8,7 @@ use log::{debug, trace};
 use crate::{
     collection::PimdirCollectionId,
     coroutine::*,
-    load::{PimdirLoadScope, PimdirLoaded},
+    load::{PimdirLoadSelection, PimdirLoaded},
 };
 
 /// I/O-free OPEN coroutine.
@@ -44,7 +44,7 @@ impl PimdirCoroutine for PimdirOpen {
                 self.state = State::Loading;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                     collection: self.collection.clone(),
-                    scope: PimdirLoadScope::All,
+                    selection: PimdirLoadSelection::All,
                 })
             }
             (State::Loading, Some(PimdirArg::Load(loaded))) => {

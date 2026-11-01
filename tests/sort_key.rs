@@ -13,7 +13,7 @@ use io_pimdir::client::{PimdirSourceStore, PimdirStore};
 use io_pimdir::{
     change::PimdirWriteOp,
     collection::PimdirCollectionId,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     placement::{
         PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey,
         PimdirStatus,
@@ -211,7 +211,7 @@ fn renaming_a_collection_carries_its_contents() {
     let loaded = store
         .load(
             &PimdirCollectionId("personal/INBOX".into()),
-            &PimdirLoadScope::All,
+            &PimdirLoadSelection::All,
         )
         .expect("load the renamed collection");
     assert_eq!(loaded.placements.len(), 1);
@@ -240,7 +240,10 @@ fn a_key_written_by_a_placement_survives_a_later_write() {
     // `load`, so the update rewrites what was there rather than blanking
     // it
     let loaded = store
-        .load(&PimdirCollectionId("INBOX".into()), &PimdirLoadScope::All)
+        .load(
+            &PimdirCollectionId("INBOX".into()),
+            &PimdirLoadSelection::All,
+        )
         .expect("load the collection");
     store
         .write(

@@ -40,7 +40,7 @@ use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     coroutine::*,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     object::PimdirHash,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -518,7 +518,7 @@ impl PimdirCoroutine for PimdirRekey {
                 self.state = State::Loading;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                     collection: self.collection.clone(),
-                    scope: PimdirLoadScope::All,
+                    selection: PimdirLoadSelection::All,
                 })
             }
 
@@ -583,12 +583,14 @@ impl PimdirCoroutine for PimdirRekey {
                             .filter(|p| p.base.is_some())
                             .map(|p| p.handle.clone())
                             .collect();
+                        let named = !self.items.is_empty();
                         let writes = self.rebuild();
 
                         // NOTE: a based binding the rebuild drops `Deleted`
                         // resolved to no member; a listing leaving most of
-                        // them is read as truncated until the caller
-                        // confirms it, and nothing is written (SYNC §8).
+                        // them, or naming no member at all, is read as
+                        // truncated until the caller confirms it, and
+                        // nothing is written (SYNC §8).
                         let absent = writes
                             .iter()
                             .filter(|op| {
@@ -603,7 +605,7 @@ impl PimdirCoroutine for PimdirRekey {
                             })
                             .count();
                         if let Some(parked) =
-                            PimdirParked::guard(absent, based.len(), self.accept_absences)
+                            PimdirParked::guard(absent, based.len(), named, self.accept_absences)
                         {
                             debug!(
                                 "{} of {} bound members absent, park the rekey",
@@ -1064,6 +1066,8 @@ mod tests {
             last: false,
             cursor: None,
             checkpoint: None,
+            narrowed: false,
+            enumerated: None,
         };
 
         match answer(page) {
@@ -1409,5 +1413,58 @@ mod tests {
                 ("8", PimdirDropReason::Deleted),
             ],
         );
+    }
+
+    /// A rekey whose listing names no member parks whatever the count, an
+    /// emptied collection and a failing connector answering alike, until
+    /// the caller confirms the absences (SYNC §8).
+    #[test]
+    fn an_empty_listing_parks_the_rekey() {
+        let old = || vec![synced("7", "m1", &[]), synced("8", "m2", &[])];
+        let empty = PimdirRemoteSnapshot::round(Vec::new(), Some(PimdirCheckpoint(b"v2".to_vec())));
+
+        let mut rekey = PimdirRekey::new("inbox");
+        let _ = rekey.resume(None);
+        let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: old(),
+            ..Default::default()
+        })));
+        match rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(
+            empty.clone(),
+        )))) {
+            PimdirCoroutineState::Complete(Ok(report)) => assert_eq!(
+                report.parked,
+                Some(PimdirParked {
+                    absent: 2,
+                    bound: 2
+                }),
+                "nothing written"
+            ),
+            state => panic!("expected a parked rekey, got {state:?}"),
+        }
+
+        let mut rekey = PimdirRekey::new("inbox").accept_absences(true);
+        let _ = rekey.resume(None);
+        let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: old(),
+            ..Default::default()
+        })));
+        match rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(empty)))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => assert_eq!(
+                writes
+                    .iter()
+                    .filter(|op| matches!(
+                        op,
+                        PimdirWriteOp::DropPlacement {
+                            reason: PimdirDropReason::Deleted,
+                            ..
+                        }
+                    ))
+                    .count(),
+                2,
+                "confirmed, the absences drop: {writes:?}"
+            ),
+            state => panic!("expected the rebuild's write, got {state:?}"),
+        }
     }
 }

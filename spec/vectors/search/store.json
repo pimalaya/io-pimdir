@@ -1,0 +1,51 @@
+{
+  "v": 1,
+  "note": "the fixture store every search case is asked against (SEARCH.md §11). seq is store-global: the message filed in both accounts' INBOX shares seq 1, which is what pins hits being keyed (account, seq). Item 8 is bodiless and indexed from its summary alone, as is item 10, the stand-in of its attachment (STORAGE §14.3). Item 11 replies to item 1, so the two are one thread; item 12 is encrypted, indexed by its headers alone; item 13 carries an attachment, so the store holds it as an owner recording attachments leaves it (STORAGE §14.3, sync vector 70): its stand-in, item 14, in the account's declared attachments collection, and the attachment reference, both written in the transaction storing item 13's body. An owner not recording attachments writes them as listed all the same, so every implementation builds one store. work/INBOX is synced by a source whose last round covered from 2026-08-01, and work/Archive by one that never closed a round (STORAGE §10), so the temporal coverage cases have a floor and a filling collection to report; every other collection no source syncs is complete. Item 15 holds a single RECURRENCE-ID override and no master, as an attendee invited to one instance stores it. Item 16 is an organised task with no date: a status, a priority, three categories, a parent and a mail it came from, neither held, so it takes no reference; its X-PIMALAYA-GTD property is the body's alone and decides no view. Items 17 to 21, in home/Tasks, are tasks by category: a capture stating no STATUS and its category cased Inbox, a waiting task beside a person's category, a someday one, a completed capture, and an in-process next action. Item 22 is a task due on a date, its one occurrence of zero length at midnight starting a day's range, and item 23 an event attaching a file by URI with its `FILENAME` (RFC 8607) and `FMTTYPE`. Item 24 is a file whose source states the id 4 (a server numbering its files, as Nextcloud's `oc:fileid` does), so its link id is digits that are also item 4's seq. Item 25 is a card holding an ADR, a BDAY and a PHOTO and no TEL, where item 5 holds a TEL alone, with categories one of which a task carries too, stated twice under two cases. Items 27 and 28 meet the bounds of SEARCH.md section 7: an hourly series from 1 February 2027 writes its 10,000 first occurrences and is cut at 2028-03-23T16:00:00Z, the start of its 10,001st, and a series stepping by the second whose BYxxx parts let one second a year through writes its DTSTART and is cut at 2026-08-12T13:46:40Z, the start of its millionth period. The references are given, not derived: an owner records them by rule or by hand (STORAGE §14.2)",
+  "collections": [
+    { "id": "home/INBOX", "account": "home", "kind": "message/rfc822" },
+    { "id": "home/Contacts", "account": "home", "kind": "text/vcard" },
+    { "id": "home/Calendar", "account": "home", "kind": "text/calendar" },
+    { "id": "home/Tasks", "account": "home", "kind": "text/calendar" },
+    { "id": "work/INBOX", "account": "work", "kind": "message/rfc822", "sources": [{ "source": "imap", "covered_since": "2026-08-01T00:00:00Z", "covered_until": null, "covered_at": "2026-08-15T00:00:00Z" }] },
+    { "id": "work/Archive", "account": "work", "kind": "message/rfc822", "sources": [{ "source": "imap", "covered_since": null, "covered_until": null, "covered_at": null }] },
+    { "id": "home/Files", "account": "home", "kind": "application/octet-stream" },
+    { "id": "home/\u0001attachments", "account": "home", "kind": "application/octet-stream", "role": "attachments" }
+  ],
+  "items": [
+    { "collection": "home/INBOX", "seq": 1, "link_id": "basic-1@example.org", "flags": ["\\Seen"], "fixture": "fixtures/mail-basic.eml" },
+    { "collection": "work/INBOX", "seq": 1, "link_id": "basic-1@example.org", "flags": ["\\Seen"], "fixture": "fixtures/mail-basic.eml" },
+    { "collection": "home/INBOX", "seq": 2, "link_id": "encoded-1@example.org", "flags": [], "fixture": "fixtures/mail-encoded.eml" },
+    { "collection": "home/INBOX", "seq": 3, "link_id": "multi-1@example.org", "flags": ["\\Seen", "\\Flagged"], "fixture": "fixtures/mail-multi-reply.eml" },
+    { "collection": "home/Contacts", "seq": 4, "link_id": "urn:uuid:4fbe8971-0bc3-4e1f-8a2d-1c9b7f6e5d40", "flags": [], "fixture": "fixtures/card-basic.vcf" },
+    { "collection": "home/Contacts", "seq": 5, "link_id": "urn:uuid:9e8d7c6b-5a49-4837-9261-0f1e2d3c4b5a", "flags": [], "fixture": "fixtures/card-escaped.vcf" },
+    { "collection": "home/Calendar", "seq": 6, "link_id": "event-series@example.org", "flags": [], "fixture": "fixtures/event-recurring.ics" },
+    { "collection": "home/Calendar", "seq": 7, "link_id": "todo-due@example.org", "flags": [], "fixture": "fixtures/todo-due-only.ics" },
+    { "collection": "home/INBOX", "seq": 8, "link_id": "budget-1@example.net", "flags": [], "summary": { "table": "mail_summary", "row": { "message_id": "budget-1@example.net", "in_reply_to": [], "subject": "Budget \u0391\u03b8\u03ae\u03bd\u03b1", "sender": "dan@example.net", "sender_name": "Dan", "date": "2026-08-10T08:00:00Z", "size": 4096, "attachment": null, "invitation": null }, "addresses": [{ "role": "from", "position": 0, "address": "dan@example.net", "name": "Dan" }, { "role": "to", "position": 0, "address": "bob@example.org", "name": null }], "sort_key": "2026-08-10T08:00:00Z" } },
+    { "collection": "home/INBOX", "seq": 9, "link_id": "invite-1@example.org", "flags": ["\\Seen"], "fixture": "fixtures/mail-invitation.eml" },
+    { "collection": "home/Files", "seq": 10, "link_id": "part:budget-1@example.net#2", "flags": [], "summary": { "table": "file_summary", "row": { "name": "forecast.xlsx", "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "size": 2048, "part": "2" }, "addresses": [], "sort_key": "forecast.xlsx" } },
+    { "collection": "home/INBOX", "seq": 11, "link_id": "reply-1@example.org", "flags": ["\\Seen"], "fixture": "fixtures/mail-reply.eml" },
+    { "collection": "home/INBOX", "seq": 12, "link_id": "sealed-1@example.org", "flags": ["\\Seen"], "fixture": "fixtures/mail-encrypted.eml" },
+    { "collection": "home/INBOX", "seq": 13, "link_id": "attach-1@example.org", "flags": ["\\Seen"], "fixture": "fixtures/mail-attachment.eml" },
+    { "collection": "home/\u0001attachments", "seq": 14, "link_id": "part:attach-1@example.org#2", "flags": [], "summary": { "table": "file_summary", "row": { "name": "invoice.pdf", "media_type": "application/pdf", "size": 9, "part": "2" }, "addresses": [], "sort_key": "invoice.pdf" } },
+    { "collection": "home/Calendar", "seq": 15, "link_id": "override-only@example.org", "flags": [], "fixture": "fixtures/event-override-only.ics" },
+    { "collection": "home/Calendar", "seq": 16, "link_id": "todo-gtd@example.org", "flags": [], "fixture": "fixtures/todo-gtd.ics" },
+    { "collection": "home/Tasks", "seq": 17, "link_id": "todo-inbox@example.org", "flags": [], "fixture": "fixtures/todo-inbox.ics" },
+    { "collection": "home/Tasks", "seq": 18, "link_id": "todo-waiting@example.org", "flags": [], "fixture": "fixtures/todo-waiting.ics" },
+    { "collection": "home/Tasks", "seq": 19, "link_id": "todo-someday@example.org", "flags": [], "fixture": "fixtures/todo-someday.ics" },
+    { "collection": "home/Tasks", "seq": 20, "link_id": "todo-inbox-done@example.org", "flags": [], "fixture": "fixtures/todo-inbox-done.ics" },
+    { "collection": "home/Tasks", "seq": 21, "link_id": "todo-next@example.org", "flags": [], "fixture": "fixtures/todo-next.ics" },
+    { "collection": "home/Tasks", "seq": 22, "link_id": "todo-due-date@example.org", "flags": [], "fixture": "fixtures/todo-due-date.ics" },
+    { "collection": "home/Calendar", "seq": 23, "link_id": "event-attach@example.org", "flags": [], "fixture": "fixtures/event-attach.ics" },
+    { "collection": "home/Files", "seq": 24, "link_id": "4", "flags": [], "summary": { "table": "file_summary", "row": { "name": "scan.png", "media_type": "image/png", "size": 512, "part": null }, "addresses": [], "sort_key": "scan.png" } },
+    { "collection": "home/Contacts", "seq": 25, "link_id": "urn:uuid:5d2c9a7e-3b1f-4e6a-9c8d-7f0e1a2b3c4d", "flags": [], "fixture": "fixtures/card-held.vcf" },
+    { "collection": "home/Calendar", "seq": 26, "link_id": "event-gap@example.org", "flags": [], "fixture": "fixtures/event-zoned-gap.ics" },
+    { "collection": "home/Calendar", "seq": 27, "link_id": "event-hourly@example.org", "flags": [], "fixture": "fixtures/event-hourly.ics" },
+    { "collection": "home/Calendar", "seq": 28, "link_id": "event-sparse@example.org", "flags": [], "fixture": "fixtures/event-sparse.ics" }
+  ],
+  "references": [
+    { "from_kind": "message/rfc822", "from_link_id": "invite-1@example.org", "to_kind": "text/calendar", "to_link_id": "event-series@example.org", "role": "invitation", "origin": "auto" },
+    { "from_kind": "message/rfc822", "from_link_id": "budget-1@example.net", "to_kind": "application/octet-stream", "to_link_id": "part:budget-1@example.net#2", "role": "attachment", "origin": "auto" },
+    { "from_kind": "message/rfc822", "from_link_id": "basic-1@example.org", "to_kind": "text/vcard", "to_link_id": "urn:uuid:4fbe8971-0bc3-4e1f-8a2d-1c9b7f6e5d40", "role": "related", "origin": "user" },
+    { "from_kind": "message/rfc822", "from_link_id": "attach-1@example.org", "to_kind": "application/octet-stream", "to_link_id": "part:attach-1@example.org#2", "role": "attachment", "origin": "auto" }
+  ]
+}

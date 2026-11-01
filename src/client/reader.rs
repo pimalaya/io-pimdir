@@ -11,7 +11,6 @@
 use core::cmp::Ordering;
 
 use alloc::{
-    borrow::Cow,
     string::{String, ToString},
     vec,
     vec::Vec,
@@ -29,21 +28,20 @@ use crate::{
     client::{
         PimdirError, bind_list,
         blobs::PimdirBlobs,
-        capability, prepare_connection,
+        capability, modes, prepare_connection,
         producer::{
             PimdirActionStatus, PimdirParkedAction, PimdirPendingAction, action_status,
             overlaid_actions, pending_actions,
         },
-        rows,
-        schema::{self, StoreShape},
+        rows, schema,
         write::{
             PimdirSummaryTable, attach_address, attach_list_value, binding_from_row, list_sql,
-            load_addresses, load_list, load_summaries_by, tables_of,
+            load_addresses, load_list, load_summaries, tables_of,
         },
     },
     codec::{self, PimdirAction},
     collection::{self, PimdirCoverage, PimdirScope},
-    hash::{PimdirHashAlgo, PimdirHasher},
+    hash::{self, PimdirHasher},
     hub::{PimdirBinding, PimdirSourceId},
     object::PimdirHash,
     placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId},
@@ -61,14 +59,8 @@ pub struct PimdirReader {
     pub(crate) conn: Connection,
     /// The store directory, which the collector locks and the blobs hang off.
     pub(crate) dir: PathBuf,
-    /// The hash this store names its objects by (§5).
-    pub(crate) hash: PimdirHashAlgo,
     /// Whether item reads fold the pending queue over the rows (§15.4).
     overlay: bool,
-    /// Whether the store held every canonical table and column when
-    /// opened, else every statement is read as its reconciliation would
-    /// leave it (§6).
-    shape: StoreShape,
 }
 
 /// A collection as a read reports it, kind-agnostic.
@@ -181,6 +173,35 @@ pub struct PimdirAddressPlacement {
     pub seq: i64,
     /// The item's sort key.
     pub sort_key: String,
+}
+
+impl PimdirAddressPlacement {
+    /// The cursor resuming the page after this entry.
+    pub fn cursor(&self) -> PimdirAddressCursor {
+        PimdirAddressCursor {
+            sort_key: self.sort_key.clone(),
+            seq: self.seq,
+            collection: self.collection.clone(),
+            role: self.role,
+        }
+    }
+}
+
+/// Where a page of an address's placements resumes: the last entry of the
+/// page before.
+///
+/// An item names an address under several roles, so the role breaks the
+/// last tie.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirAddressCursor {
+    /// The entry's sort key.
+    pub sort_key: String,
+    /// Its public id.
+    pub seq: i64,
+    /// Its collection.
+    pub collection: String,
+    /// The role it names the address in.
+    pub role: PimdirAddressRole,
 }
 
 /// One item two sources disagree on (STORAGE §10, §14.1): the shared
@@ -428,49 +449,86 @@ pub struct PimdirCollectionChange {
     pub changed: i64,
 }
 
-/// The change feed's cursor (§4.5): the last stamp drawn and the purge
-/// count, recorded beside what a consumer derives.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The change feed's cursor (§4.5): the last stamp drawn, the purge count
+/// and the store's identity, recorded beside what a consumer derives.
+///
+/// Another `store_id` or `incarnation` than the recorded ones, or a
+/// recorded `changed` above the store's, is a reset: what the consumer
+/// derived is unknown (§4.5, §8).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirChangeCursor {
     /// The last stamp drawn: the next look asks for every stamp above it.
     pub changed: i64,
-    /// How many rows left without a stamp: purged items and collected objects.
+    /// How many rows left without a stamp: purged items, collected
+    /// objects and renamed collections.
+    pub purges: i64,
+    /// The store's id, 32 lowercase hex digits drawn at its creation.
+    pub store_id: String,
+    /// The store's incarnation, raised when a copy of it is restored.
+    pub incarnation: i64,
+}
+
+/// The store's `store_meta` row (`load_store_meta`, §4.2, §4.3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirStoreMeta {
+    /// The STORAGE version whose schema the store holds,
+    /// [`FORMAT_VERSION`](sql::FORMAT_VERSION) for every store this crate
+    /// opens.
+    pub format_version: String,
+    /// The schema version, `PRAGMA user_version`'s mirror.
+    pub version: i64,
+    /// The lowest schema version a reader must implement to read it.
+    pub read_version: i64,
+    /// The lowest schema version a producer must implement to enqueue.
+    pub produce_version: i64,
+    /// The store's id, 32 lowercase hex digits drawn at its creation.
+    pub store_id: String,
+    /// The store's incarnation, raised when a copy of it is restored.
+    pub incarnation: i64,
+    /// The algorithm its objects are named by, `blake3`.
+    pub hash_algo: String,
+    /// When it was created, an RFC 3339 instant.
+    pub created_at: String,
+    /// The Annex A revision its summaries stand under.
+    pub derivation: i64,
+    /// The SYNC version whose engine wrote its sync state, `None` until
+    /// an engine wrote.
+    pub sync_version: Option<String>,
+    /// The next public id to hand out.
+    pub next_seq: i64,
+    /// The next change stamp to draw.
+    pub next_change: i64,
+    /// How many rows left without a stamp.
     pub purges: i64,
 }
 
 impl PimdirReader {
-    /// Opens an existing store rooted at `dir` to read, refusing one no
-    /// owner has created ([`PimdirError::Uncreated`]) and one at another
-    /// version. Takes no lock.
+    /// Opens an existing store rooted at `dir` to read, refusing, as every
+    /// profile does, one no owner has created ([`PimdirError::Uncreated`]),
+    /// one of another draft ([`PimdirError::Version`]) and every other
+    /// store the owner's open refuses (STORAGE §6, §18). Takes no lock.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         if !dir.join("pimdir.db").is_file() {
             return Err(PimdirError::Uncreated);
         }
+        modes::check(dir)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
         prepare_connection(&conn)?;
-        schema::check_version(&conn)?;
-        let hash = schema::hash_algo(&conn, None)?;
+        schema::check(&conn)?;
 
-        Self::over(conn, dir.to_path_buf(), hash)
+        Self::over(conn, dir.to_path_buf())
     }
 
     /// Wraps an already-opened connection, the owner's own reader.
-    pub(crate) fn over(
-        conn: Connection,
-        dir: PathBuf,
-        hash: PimdirHashAlgo,
-    ) -> Result<Self, PimdirError> {
-        let shape = StoreShape::read(&conn, "main")?;
+    pub(crate) fn over(conn: Connection, dir: PathBuf) -> Result<Self, PimdirError> {
         Ok(Self {
             conn,
             dir,
-            hash,
             overlay: false,
-            shape,
         })
     }
 
@@ -488,24 +546,19 @@ impl PimdirReader {
         self.overlay
     }
 
-    /// The hash this store names its objects by (§5).
-    pub fn hash_algo(&self) -> PimdirHashAlgo {
-        self.hash
-    }
-
     /// The blob directory, independent of the SQLite connection.
     pub fn blobs(&self) -> PimdirBlobs {
-        PimdirBlobs::open(&self.dir, self.hash)
+        PimdirBlobs::open(&self.dir)
     }
 
-    /// The content hash of a whole body, under this store's algorithm.
+    /// The content hash of a whole body (§5).
     pub fn hash(&self, bytes: &[u8]) -> PimdirHash {
-        self.hash.hash(bytes)
+        hash::hash(bytes)
     }
 
     /// An incremental hasher for a body streamed into the blob store.
     pub fn hasher(&self) -> PimdirHasher {
-        self.hash.hasher()
+        PimdirHasher::new()
     }
 }
 
@@ -521,7 +574,7 @@ impl PimdirReader {
         Ok(self
             .conn
             .query_row(
-                &self.reconciled_sql(sql::LOAD_ACCOUNT)?,
+                sql::LOAD_ACCOUNT,
                 named_params! { ":collection": collection },
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -538,7 +591,7 @@ impl PimdirReader {
         Ok(self
             .conn
             .query_row(
-                &self.reconciled_sql(sql::LOAD_KIND)?,
+                sql::LOAD_KIND,
                 named_params! { ":collection": collection },
                 |r| r.get::<_, String>(0),
             )
@@ -549,7 +602,7 @@ impl PimdirReader {
     pub fn list_collections(&self) -> Result<Vec<PimdirCollection>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_COLLECTIONS)?,
+            sql::LIST_COLLECTIONS,
             [],
             collection_from_row,
         )?)
@@ -562,29 +615,15 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirCollection>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_COLLECTIONS_BY_ACCOUNT)?,
+            sql::LIST_COLLECTIONS_BY_ACCOUNT,
             named_params! { ":account": account },
             collection_from_row,
         )?)
     }
 
-    /// A canonical statement as the store can answer it: one whose owner
-    /// has not reconciled the columns or tables a later draft added yet
-    /// (`collections.role`, the coverage columns, the task organisation
-    /// columns of an owner at io-pimdir 3b4bed8) reads them as its
-    /// reconciliation would leave them (§6).
-    fn reconciled_sql<'a>(&self, statement: &'a str) -> Result<Cow<'a, str>, PimdirError> {
-        self.shape.sql(&self.conn, statement)
-    }
-
     /// The accounts owning at least one collection; not a configured roster.
     pub fn list_accounts(&self) -> Result<Vec<String>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            &self.reconciled_sql(sql::LIST_ACCOUNTS)?,
-            [],
-            |r| r.get(0),
-        )?)
+        Ok(rows(&self.conn, sql::LIST_ACCOUNTS, [], |r| r.get(0))?)
     }
 
     /// A collection's handle-space epoch (§12), `None` for an unknown one.
@@ -593,7 +632,7 @@ impl PimdirReader {
         Ok(self
             .conn
             .query_row(
-                &self.reconciled_sql(sql::LOAD_GENERATION)?,
+                sql::LOAD_GENERATION,
                 named_params! { ":collection": collection },
                 |r| r.get(0),
             )
@@ -602,12 +641,7 @@ impl PimdirReader {
 
     /// The distinct source names the store has synced against.
     pub fn distinct_sources(&self) -> Result<Vec<String>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            &self.reconciled_sql(sql::LIST_SOURCES)?,
-            [],
-            |r| r.get(0),
-        )?)
+        Ok(rows(&self.conn, sql::LIST_SOURCES, [], |r| r.get(0))?)
     }
 
     /// The sources binding one collection, which is what tells a sync
@@ -618,7 +652,7 @@ impl PimdirReader {
     ) -> Result<Vec<String>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::COLLECTION_SOURCES)?,
+            sql::COLLECTION_SOURCES,
             named_params! { ":collection": collection.as_ref() },
             |r| r.get(0),
         )?)
@@ -643,7 +677,7 @@ impl PimdirReader {
             |limit| {
                 Ok(rows(
                     &self.conn,
-                    &self.reconciled_sql(sql::LIST_ITEMS_PAGE)?,
+                    sql::LIST_ITEMS_PAGE,
                     named_params! {
                         ":collection": collection,
                         ":after": after,
@@ -668,7 +702,7 @@ impl PimdirReader {
         let collection = collection.as_ref();
         let (key, seq) = after.unwrap_or(("", 0));
         self.sorted_page(
-            &self.reconciled_sql(sql::LIST_ITEMS_PAGE_ASC)?,
+            sql::LIST_ITEMS_PAGE_ASC,
             collection,
             Some((key, seq)),
             limit,
@@ -684,13 +718,7 @@ impl PimdirReader {
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
         let collection = collection.as_ref();
-        self.sorted_page(
-            &self.reconciled_sql(sql::LIST_ITEMS_PAGE_DESC)?,
-            collection,
-            after,
-            limit,
-            true,
-        )
+        self.sorted_page(sql::LIST_ITEMS_PAGE_DESC, collection, after, limit, true)
     }
 
     /// A page in the kind's natural direction with each item's summary
@@ -720,11 +748,6 @@ impl PimdirReader {
                 ],
                 _ => return self.list_items_page_asc(collection, after, limit),
             };
-        let mut reconciled = Vec::new();
-        for (statement, table) in statements {
-            reconciled.push((self.reconciled_sql(statement)?, table));
-        }
-        let statements = reconciled;
 
         let after = after.map(|(key, seq)| (key.to_string(), seq));
         let mut items = self.overlaid(
@@ -866,7 +889,7 @@ impl PimdirReader {
         Ok(self
             .conn
             .query_row(
-                &self.reconciled_sql(sql::SEQ_BY_LINK)?,
+                sql::SEQ_BY_LINK,
                 named_params! { ":collection": collection, ":link_id": link_id },
                 |row| row.get(0),
             )
@@ -882,7 +905,7 @@ impl PimdirReader {
         let collection = collection.as_ref();
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_ITEM_BINDINGS)?,
+            sql::LIST_ITEM_BINDINGS,
             named_params! { ":collection": collection, ":link_id": link_id },
             binding_from_row,
         )?
@@ -899,7 +922,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirConflict>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_CONFLICTED_BINDINGS)?,
+            sql::LIST_CONFLICTED_BINDINGS,
             named_params! { ":account": account },
             |r| {
                 Ok(PimdirConflict {
@@ -924,7 +947,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirItemConflict>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_CONFLICTED_ITEMS)?,
+            sql::LIST_CONFLICTED_ITEMS,
             named_params! { ":account": account },
             |r| {
                 Ok(PimdirItemConflict {
@@ -942,7 +965,7 @@ impl PimdirReader {
     pub fn count_items(&self, collection: impl AsRef<str>) -> Result<u64, PimdirError> {
         let collection = collection.as_ref();
         let count: i64 = self.conn.query_row(
-            &self.reconciled_sql(sql::COUNT_ITEMS)?,
+            sql::COUNT_ITEMS,
             named_params! { ":collection": collection },
             |r| r.get(0),
         )?;
@@ -967,7 +990,7 @@ impl PimdirReader {
     pub fn link_placements(&self, link_id: &str) -> Result<Vec<PimdirItemLocation>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_LINK_PLACEMENTS)?,
+            sql::LIST_LINK_PLACEMENTS,
             named_params! { ":link_id": link_id },
             |r| {
                 Ok(PimdirItemLocation {
@@ -987,7 +1010,7 @@ impl PimdirReader {
     pub fn object_placements(&self, hash: &str) -> Result<Vec<PimdirItemLocation>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_OBJECT_PLACEMENTS)?,
+            sql::LIST_OBJECT_PLACEMENTS,
             named_params! { ":hash": hash },
             |r| {
                 Ok(PimdirItemLocation {
@@ -1003,18 +1026,29 @@ impl PimdirReader {
         )?)
     }
 
-    /// Every live placement naming one address, store-wide, `role` `None`
-    /// for any role: the person axis (Annex A.6). A row under a role the
-    /// format lacks is left out.
+    /// A page of the live placements naming one address, store-wide, once
+    /// per role, `role` `None` for any role: the person axis (Annex A.6),
+    /// newest first, resuming after `after` (`list_address_placements`).
+    /// A row under a role the format lacks is left out.
     pub fn address_placements(
         &self,
         address: &str,
         role: Option<PimdirAddressRole>,
+        after: Option<&PimdirAddressCursor>,
+        limit: usize,
     ) -> Result<Vec<PimdirAddressPlacement>, PimdirError> {
         let placements = rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_ADDRESS_PLACEMENTS)?,
-            named_params! { ":address": address, ":role": role.map(|r| r.as_str()) },
+            sql::LIST_ADDRESS_PLACEMENTS,
+            named_params! {
+                ":address": address,
+                ":role": role.map(|r| r.as_str()),
+                ":after_key": after.map(|cursor| cursor.sort_key.as_str()),
+                ":after_seq": after.map(|cursor| cursor.seq),
+                ":after_collection": after.map(|cursor| cursor.collection.as_str()),
+                ":after_role": after.map(|cursor| cursor.role.as_str()),
+                ":limit": limit as i64,
+            },
             |r| {
                 let Some(role) = PimdirAddressRole::parse(&r.get::<_, String>(0)?) else {
                     return Ok(None);
@@ -1059,15 +1093,8 @@ impl PimdirReader {
             return Ok(Vec::new());
         }
 
-        // NOTE: a store whose owner has not reconciled `collections.role`
-        // yet reads it as NULL (§6), every mail then answering.
         bind_list(&self.conn, "ids", &ids)?;
-        Ok(rows(
-            &self.conn,
-            &self.reconciled_sql(sql::LIST_REPLIED)?,
-            [],
-            |r| r.get(0),
-        )?)
+        Ok(rows(&self.conn, sql::LIST_REPLIED, [], |r| r.get(0))?)
     }
 
     /// The same for one domain, by a scan.
@@ -1078,7 +1105,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirAddressPlacement>, PimdirError> {
         let placements = rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_DOMAIN_PLACEMENTS)?,
+            sql::LIST_DOMAIN_PLACEMENTS,
             named_params! { ":domain": domain, ":role": role.map(|r| r.as_str()) },
             |r| {
                 let Some(role) = PimdirAddressRole::parse(&r.get::<_, String>(1)?) else {
@@ -1114,7 +1141,7 @@ impl PimdirReader {
         let collection = collection.as_ref();
         let mut items = rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_RETAINED_PAGE)?,
+            sql::LIST_RETAINED_PAGE,
             named_params! {
                 ":collection": collection,
                 ":after": after.unwrap_or(0),
@@ -1129,7 +1156,7 @@ impl PimdirReader {
     /// A collection's trash count, every deleted row.
     pub fn count_retained(&self, collection: impl AsRef<str>) -> Result<i64, PimdirError> {
         Ok(self.conn.query_row(
-            &self.reconciled_sql(sql::COUNT_RETAINED)?,
+            sql::COUNT_RETAINED,
             named_params! { ":collection": collection.as_ref() },
             |r| r.get(0),
         )?)
@@ -1138,9 +1165,7 @@ impl PimdirReader {
     /// The bytes retention holds store-wide, each body counted once: an
     /// upper bound on what a purge would reclaim.
     pub fn retained_bytes(&self) -> Result<u64, PimdirError> {
-        let bytes: i64 =
-            self.conn
-                .query_row(&self.reconciled_sql(sql::RETAINED_BYTES)?, [], |r| r.get(0))?;
+        let bytes: i64 = self.conn.query_row(sql::RETAINED_BYTES, [], |r| r.get(0))?;
         Ok(bytes.max(0) as u64)
     }
 
@@ -1174,10 +1199,10 @@ impl PimdirReader {
     }
 
     /// Whether `collection` takes tasks (§15.6): `false` when a source
-    /// syncing it states `x-vtodo` `none` there or source-wide, `true`
-    /// otherwise, a source stating nothing refusing nothing. What a client
-    /// reads before offering a calendar as a task list or capturing into it;
-    /// the gate refuses the same add.
+    /// syncing it states `calendar.component.vtodo` `none` there or
+    /// source-wide, `true` otherwise, a source stating nothing refusing
+    /// nothing. What a client reads before offering a calendar as a task
+    /// list or capturing into it; the gate refuses the same add.
     pub fn accepts_vtodo(&self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
         let sources = capability::at_collection(&self.conn, collection.as_ref())?;
         Ok(crate::capability::check_vtodo(&sources).is_ok())
@@ -1208,23 +1233,18 @@ impl PimdirReader {
 
     /// Every parked action across the store, in append order.
     pub fn parked_actions(&self) -> Result<Vec<PimdirParkedAction>, PimdirError> {
-        Ok(rows(
-            &self.conn,
-            &self.reconciled_sql(sql::LOAD_PARKED_ACTIONS)?,
-            [],
-            |r| {
-                Ok(PimdirParkedAction {
-                    id: r.get(0)?,
-                    created_at: r.get(1)?,
-                    producer: r.get(2)?,
-                    collection: r.get(3)?,
-                    action: r.get(4)?,
-                    payload: r.get(5)?,
-                    attempts: r.get(7)?,
-                    error: r.get(8)?,
-                })
-            },
-        )?)
+        Ok(rows(&self.conn, sql::LOAD_PARKED_ACTIONS, [], |r| {
+            Ok(PimdirParkedAction {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                producer: r.get(2)?,
+                collection: r.get(3)?,
+                action: r.get(4)?,
+                payload: r.get(5)?,
+                attempts: r.get(7)?,
+                error: r.get(8)?,
+            })
+        })?)
     }
 
     /// The queued creates targeting a collection, reported apart since a
@@ -1247,16 +1267,39 @@ impl PimdirReader {
         Ok(self.pending_creates(collection)?.len())
     }
 
-    /// The change feed's cursor (§4.5), recorded beside what a consumer derives.
+    /// The change feed's cursor (§4.5), recorded beside what a consumer
+    /// derives (`load_change_cursor`).
     pub fn change_cursor(&self) -> Result<PimdirChangeCursor, PimdirError> {
-        Ok(self
-            .conn
-            .query_row(&self.reconciled_sql(sql::LOAD_CHANGE_CURSOR)?, [], |r| {
-                Ok(PimdirChangeCursor {
-                    changed: r.get(0)?,
-                    purges: r.get(1)?,
-                })
-            })?)
+        Ok(self.conn.query_row(sql::LOAD_CHANGE_CURSOR, [], |r| {
+            Ok(PimdirChangeCursor {
+                changed: r.get(0)?,
+                purges: r.get(1)?,
+                store_id: r.get(2)?,
+                incarnation: r.get(3)?,
+            })
+        })?)
+    }
+
+    /// The store's `store_meta` row (`load_store_meta`): its versions, its
+    /// identity and its counters.
+    pub fn store_meta(&self) -> Result<PimdirStoreMeta, PimdirError> {
+        Ok(self.conn.query_row(sql::LOAD_STORE_META, [], |r| {
+            Ok(PimdirStoreMeta {
+                version: r.get(1)?,
+                hash_algo: r.get(2)?,
+                created_at: r.get(3)?,
+                next_seq: r.get(4)?,
+                next_change: r.get(5)?,
+                purges: r.get(6)?,
+                derivation: r.get(7)?,
+                format_version: r.get(8)?,
+                read_version: r.get(9)?,
+                produce_version: r.get(10)?,
+                store_id: r.get(11)?,
+                incarnation: r.get(12)?,
+                sync_version: r.get(13)?,
+            })
+        })?)
     }
 
     /// Every item stamped above `since`, retained ones included, in stamp order.
@@ -1267,7 +1310,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirItemChange>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_ITEMS_CHANGED_SINCE)?,
+            sql::LIST_ITEMS_CHANGED_SINCE,
             named_params! { ":since": since, ":limit": limit as i64 },
             |r| {
                 Ok(PimdirItemChange {
@@ -1290,7 +1333,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirCollectionChange>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_COLLECTIONS_CHANGED_SINCE)?,
+            sql::LIST_COLLECTIONS_CHANGED_SINCE,
             named_params! { ":since": since, ":limit": limit as i64 },
             |r| {
                 Ok(PimdirCollectionChange {
@@ -1313,16 +1356,14 @@ impl PimdirReader {
 impl PimdirReader {
     /// One collection's coverage per source, with the round each has
     /// under way (`list_coverage`): what a reader says "mail since" from
-    /// per account, or shows a first sync filling in by. A store whose
-    /// owner has not reconciled the coverage columns yet lists each source
-    /// with none, never closed (§6).
+    /// per account, or shows a first sync filling in by.
     pub fn list_coverage(
         &self,
         collection: impl AsRef<str>,
     ) -> Result<Vec<PimdirSourceCoverage>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_COVERAGE)?,
+            sql::LIST_COVERAGE,
             named_params! { ":collection": collection.as_ref() },
             |r| {
                 let at: Option<String> = r.get(3)?;
@@ -1363,7 +1404,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirReference>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::REFERENCES_FROM)?,
+            sql::REFERENCES_FROM,
             named_params! { ":kind": endpoint.kind, ":link_id": endpoint.link_id.as_str() },
             reference_from_row,
         )?)
@@ -1381,7 +1422,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirAttachment>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_ATTACHMENTS)?,
+            sql::LIST_ATTACHMENTS,
             named_params! { ":account": account, ":link_id": message.as_str() },
             |row| {
                 let summary = match PimdirSummaryTable::File.read_row(row, 3)? {
@@ -1407,7 +1448,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirReference>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::REFERENCES_TO)?,
+            sql::REFERENCES_TO,
             named_params! { ":kind": endpoint.kind, ":link_id": endpoint.link_id.as_str() },
             reference_from_row,
         )?)
@@ -1429,7 +1470,7 @@ impl PimdirReader {
             collections.iter().map(|c| c.as_ref()),
         )?;
         let count: i64 = self.conn.query_row(
-            &self.reconciled_sql(sql::COUNT_MAIL)?,
+            sql::COUNT_MAIL,
             named_params! {
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
@@ -1442,14 +1483,15 @@ impl PimdirReader {
 
     /// [`count_mail`](Self::count_mail) per day of the `Date`
     /// (`count_mail_by_day`), newest day first and the undated last.
-    /// `shift` is a SQLite date modifier moving the UTC instant to the
-    /// reader's wall clock (`"+120 minutes"`), `None` reading UTC days.
+    /// `shift` is the reader's offset from UTC in whole minutes, east
+    /// positive (`120`, `-300`), added to the instant before its day is
+    /// read, `None` reading UTC days.
     pub fn count_mail_by_day(
         &self,
         collections: &[impl AsRef<str>],
         filter: PimdirMailFilter,
         since: Option<&str>,
-        shift: Option<&str>,
+        shift: Option<i64>,
     ) -> Result<Vec<PimdirDayCount>, PimdirError> {
         bind_list(
             &self.conn,
@@ -1458,7 +1500,7 @@ impl PimdirReader {
         )?;
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::COUNT_MAIL_BY_DAY)?,
+            sql::COUNT_MAIL_BY_DAY,
             named_params! {
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
@@ -1490,7 +1532,7 @@ impl PimdirReader {
         )?;
         let counted = rows(
             &self.conn,
-            &self.reconciled_sql(sql::COUNT_UNREAD)?,
+            sql::COUNT_UNREAD,
             named_params! {
                 ":attachment": attachment,
                 ":since": since,
@@ -1518,7 +1560,7 @@ impl PimdirReader {
             collections.iter().map(|c| c.as_ref()),
         )?;
         let (count, size, unknown): (i64, i64, i64) = self.conn.query_row(
-            &self.reconciled_sql(sql::SUM_MAIL)?,
+            sql::SUM_MAIL,
             named_params! {
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
@@ -1545,7 +1587,7 @@ impl PimdirReader {
     ) -> Result<Option<PimdirMailEntry>, PimdirError> {
         let mut entries = rows(
             &self.conn,
-            &self.reconciled_sql(sql::GET_MAIL_ROW)?,
+            sql::GET_MAIL_ROW,
             named_params! { ":collection": collection.as_ref(), ":link_id": link_id.as_str() },
             |row| entry_from_row(row, Some(PimdirSummaryTable::Mail)),
         )?;
@@ -1570,7 +1612,7 @@ impl PimdirReader {
         )?;
         let mut entries = rows(
             &self.conn,
-            &self.reconciled_sql(sql::SEARCH_CONTACTS)?,
+            sql::SEARCH_CONTACTS,
             named_params! {
                 ":pattern": pattern,
                 ":after_key": after.map(|after| after.sort_key.as_str()),
@@ -1601,7 +1643,7 @@ impl PimdirReader {
         )?;
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::SEARCH_FILES)?,
+            sql::SEARCH_FILES,
             named_params! {
                 ":pattern": pattern,
                 ":after_key": after.map(|after| after.sort_key.as_str()),
@@ -1631,7 +1673,7 @@ impl PimdirReader {
         )?;
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::SEARCH_CALENDAR)?,
+            sql::SEARCH_CALENDAR,
             named_params! {
                 ":pattern": pattern,
                 ":after_key": after.map(|after| after.sort_key.as_str()),
@@ -1659,7 +1701,7 @@ impl PimdirReader {
         Ok(self
             .conn
             .query_row(
-                &self.reconciled_sql(sql::DESCRIBE_ENDPOINT)?,
+                sql::DESCRIBE_ENDPOINT,
                 named_params! { ":kind": endpoint.kind, ":link_id": endpoint.link_id.as_str() },
                 |row| {
                     Ok(PimdirEndpointView {
@@ -1684,7 +1726,7 @@ impl PimdirReader {
     ) -> Result<Vec<PimdirAccountAttachment>, PimdirError> {
         Ok(rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_ATTACHMENTS_BY_ACCOUNT)?,
+            sql::LIST_ATTACHMENTS_BY_ACCOUNT,
             named_params! {
                 ":account": account,
                 ":after_key": after.map(|after| after.message_sort_key.as_str()),
@@ -1732,7 +1774,7 @@ impl PimdirReader {
         )?;
         let mut entries = rows(
             &self.conn,
-            &self.reconciled_sql(sql::LIST_MAIL_PAGE_FILTERED)?,
+            sql::LIST_MAIL_PAGE_FILTERED,
             named_params! {
                 ":seen": filter.seen,
                 ":attachment": filter.attachment,
@@ -1768,7 +1810,7 @@ impl PimdirReader {
         )?;
         let mut entries = rows(
             &self.conn,
-            &self.reconciled_sql(sql::SEARCH_MAIL)?,
+            sql::SEARCH_MAIL,
             named_params! {
                 ":pattern": pattern,
                 ":seen": filter.seen,
@@ -1796,34 +1838,44 @@ impl PimdirReader {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<PimdirSearchCoverage, PimdirError> {
-        let mut coverage = PimdirSearchCoverage::default();
+        let mut coverage = PimdirSearchCoverage {
+            temporal: self.search_temporal(collections, since, until)?,
+            ..Default::default()
+        };
 
         bind_list(
             &self.conn,
             "collections",
             collections.iter().map(|c| c.as_ref()),
         )?;
-        let bodiless = rows(
-            &self.conn,
-            &self.reconciled_sql(sql::COUNT_BODILESS)?,
-            [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )?;
+        let bodiless = rows(&self.conn, sql::COUNT_BODILESS, [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         for (kind, count) in bodiless {
             coverage.local.bodiless.insert(kind, count as u64);
         }
 
+        Ok(coverage)
+    }
+
+    /// Whether every collection's coverage (§10) holds the range `[since,
+    /// until)`, RFC 3339 instants with either side open: the temporal axis
+    /// of a search's coverage (SEARCH §8.2).
+    pub(crate) fn search_temporal(
+        &self,
+        collections: &[impl AsRef<str>],
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<PimdirSearchTemporal, PimdirError> {
+        let mut temporal = PimdirSearchTemporal::Full;
         for collection in collections {
             let sources = self.list_coverage(collection)?;
             let scopes = sources
                 .iter()
                 .map(|source| source.coverage.as_ref().map(|coverage| &coverage.scope));
-            coverage
-                .temporal
-                .merge(&PimdirSearchTemporal::over(scopes, since, until));
+            temporal.merge(&PimdirSearchTemporal::over(scopes, since, until));
         }
-
-        Ok(coverage)
+        Ok(temporal)
     }
 
     /// Joins the address rows onto a page spanning collections, read for
@@ -1945,17 +1997,12 @@ impl PimdirReader {
     ) -> Result<Option<PimdirItem>, PimdirError> {
         let kind = self.collection_kind(collection)?.unwrap_or_default();
         let tables = tables_of(&kind);
-        let mut statements = Vec::new();
-        for table in &tables {
-            statements.push(self.reconciled_sql(table.get_sql())?);
-        }
-
         let mut found: Option<PimdirItem> = None;
-        for (table, statement) in tables.iter().zip(&statements) {
+        for table in &tables {
             let item = self
                 .conn
                 .query_row(
-                    statement,
+                    table.get_sql(),
                     named_params! { ":collection": collection, ":seq": seq },
                     |row| {
                         let mut item = item_from_row(row)?;
@@ -1994,10 +2041,8 @@ impl PimdirReader {
             items.iter().map(|item| item.link_id.0.as_str()),
         )?;
         for table in &tables {
-            let statement = self.reconciled_sql(table.load_sql())?;
-            for (link, summary) in
-                load_summaries_by(&self.conn, &statement, *table, collection, true)?
-            {
+            let statement = table.load_sql(true);
+            for (link, summary) in load_summaries(&self.conn, statement, *table, collection)? {
                 if let Some(item) = items.iter_mut().find(|item| item.link_id == link) {
                     item.summary = Some(summary);
                 }
@@ -2022,12 +2067,9 @@ impl PimdirReader {
             "links",
             items.iter().map(|item| item.link_id.0.as_str()),
         )?;
-        for (link, role, address) in load_addresses(
-            &self.conn,
-            &self.reconciled_sql(sql::LOAD_ADDRESSES_BY_LINK)?,
-            collection,
-            true,
-        )? {
+        for (link, role, address) in
+            load_addresses(&self.conn, sql::LOAD_ADDRESSES_BY_LINK, collection)?
+        {
             if let Some(summary) = items
                 .iter_mut()
                 .find(|item| item.link_id == link)
@@ -2036,9 +2078,8 @@ impl PimdirReader {
                 attach_address(summary, role, address);
             }
         }
-        for statement in list_sql(tables) {
-            let statement = self.reconciled_sql(statement)?;
-            for (link, value) in load_list(&self.conn, &statement, collection, true)? {
+        for statement in list_sql(tables, true) {
+            for (link, value) in load_list(&self.conn, statement, collection)? {
                 if let Some(summary) = items
                     .iter_mut()
                     .find(|item| item.link_id == link)

@@ -1,8 +1,10 @@
 //! # Mail summaries
 //!
-//! The `message/rfc822` derivation (Annex A.1): the header block decoded
-//! (RFC 2047), the addresses canonical (A.6), the `Date` an instant, and
-//! the MIME tree walked for an attachment.
+//! The `message/rfc822` derivation (Annex A.1, revision 3): the header
+//! block read as the annex reads it (comments, quoted-strings, RFC 2047
+//! encoded words under WHATWG labels, the `Message-ID` and the `Date`
+//! forms), the addresses canonical (A.6), and the MIME tree walked for an
+//! attachment and an invitation within its bounds.
 //!
 //! The decoders are public so a connector building the summary from an
 //! IMAP ENVELOPE at the `Meta` tier lands on the same bytes the `Full`
@@ -31,6 +33,12 @@ use crate::{
 /// further would otherwise cost the walk a stack frame and a rescan of the
 /// body per level.
 pub const MIME_DEPTH_MAX: usize = 64;
+
+/// The most entities the walk of the parts reads, in document order, the
+/// message's own counted (Annex A.1): an entity after it, with every part
+/// under it, makes no mark, no invitation, no stand-in and no extracted
+/// text. Dovecot's default `max_total_mime_parts`.
+pub const MIME_ENTITIES_MAX: usize = 10_000;
 
 /// The `mail_summary` row of a message with the people it names.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -103,10 +111,10 @@ impl PimdirMailSummary {
 pub fn derive(body: &[u8]) -> PimdirDerivation {
     let (headers, rest) = split_headers(body);
     let headers = header_fields(headers);
-    let attachment = has_attachment(&headers, rest, 0);
+    let attachment = has_attachment(&headers, rest, 0, &mut 0);
 
     let mut summary = from_headers(&headers, Some(body.len() as u64), attachment);
-    summary.invitation = invitation(&headers, rest, 0);
+    summary.invitation = invitation(&headers, rest, 0, &mut 0);
     summary.derivation()
 }
 
@@ -154,7 +162,7 @@ fn from_headers(
     let first = from.first();
 
     PimdirMailSummary {
-        message_id: header("message-id").and_then(strip_angles),
+        message_id: header("message-id").and_then(message_id),
         in_reply_to: header("in-reply-to").map(message_ids).unwrap_or_default(),
         subject: header("subject").map(decode).unwrap_or_default(),
         sender: first.map(|address| address.address.clone()),
@@ -170,83 +178,207 @@ fn from_headers(
     }
 }
 
-/// Decodes a header value: unfolded, RFC 2047 encoded words decoded.
+/// Decodes an unstructured value, a `Subject` or a display name (Annex
+/// A.1): every RFC 2047 encoded word decoded wherever it stands.
 ///
-/// Adjacent encoded words are joined without the whitespace between them
-/// (RFC 2047 §6.2); an unknown charset reads its bytes as UTF-8, lossily.
+/// A malformed word, or one whose charset no WHATWG label names, stays as
+/// its literal text. The whitespace standing between two decoded words is
+/// removed (RFC 2047 §6.2) and no other, and the ends are trimmed of
+/// spaces and tabs, whitespace inside kept as it is.
 pub fn decode(raw: &str) -> String {
     let mut out = String::new();
-    let mut rest = raw;
-    let mut after_word = false;
+    let mut text = 0;
+    let mut at = 0;
+    // NOTE: where the literal text since the last decoded word starts in
+    // `out`, dropped when the next word decodes and it is whitespace.
+    let mut after_word: Option<usize> = None;
 
-    while let Some(start) = rest.find("=?") {
-        let (text, tail) = rest.split_at(start);
-        match encoded_word(tail) {
-            Some((decoded, len)) => {
-                if !(after_word && text.trim().is_empty()) {
-                    out.push_str(text);
-                }
-                out.push_str(&decoded);
-                rest = &tail[len..];
-                after_word = true;
+    while let Some(offset) = raw[at..].find("=?") {
+        let start = at + offset;
+        let Some((decoded, len)) = encoded_word(&raw[start..]) else {
+            at = start + 1;
+            continue;
+        };
+        at = start + len;
+
+        // NOTE: a malformed word stays in the literal text around it.
+        let Some(decoded) = decoded else {
+            continue;
+        };
+        out.push_str(&raw[text..start]);
+        if let Some(gap) = after_word
+            && out[gap..].chars().all(is_wsp)
+        {
+            out.truncate(gap);
+        }
+        out.push_str(&decoded);
+        after_word = Some(out.len());
+        text = at;
+    }
+    out.push_str(&raw[text..]);
+
+    trim_wsp(&out).to_string()
+}
+
+/// One RFC 2047 `encoded-word` at the head of `text`, its octets decoded
+/// (`None` when malformed or in a charset no WHATWG label names), and its
+/// length; `None` when `text` opens on none.
+///
+/// The charset is an RFC 2047 token, the encoding `B` or `Q` in either
+/// case and the encoded text one or more printable ASCII characters other
+/// than `?`, a space being none.
+fn encoded_word(text: &str) -> Option<(Option<String>, usize)> {
+    let especial = |char: char| "()<>@,;:\\\"/[]?.=".contains(char);
+    let token = |char: char| char > ' ' && char != '\x7f' && !especial(char);
+    let printable = |char: char| ('!'..='~').contains(&char) && char != '?';
+
+    let rest = text.strip_prefix("=?")?;
+    let charset = &rest[..rest.find(|char| !token(char)).unwrap_or(rest.len())];
+    let rest = rest[charset.len()..].strip_prefix('?')?;
+    let encoding = rest.chars().next()?;
+    let rest = rest.get(1..)?.strip_prefix('?')?;
+    let payload = &rest[..rest.find(|char| !printable(char)).unwrap_or(rest.len())];
+    if charset.is_empty() || payload.is_empty() || !rest[payload.len()..].starts_with("?=") {
+        return None;
+    }
+
+    let octets = match encoding {
+        'B' | 'b' => b_octets(payload),
+        'Q' | 'q' => q_octets(payload),
+        _ => return None,
+    };
+    let len = 2 + charset.len() + 3 + payload.len() + 2;
+
+    Some((
+        octets.and_then(|octets| charset_decode(charset, &octets)),
+        len,
+    ))
+}
+
+/// An encoded word's `B` text as octets (RFC 4648 §4), its trailing `=`
+/// optional; `None` for a character outside the alphabet, an `=` anywhere
+/// but in a trailing padding of at most two, or a length, padding aside,
+/// leaving one character beyond whole groups of four.
+fn b_octets(text: &str) -> Option<Vec<u8>> {
+    let bare = text.trim_end_matches('=');
+    if text.len() - bare.len() > 2 || bare.len() % 4 == 1 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(bare.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for byte in bare.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+
+    Some(out)
+}
+
+/// An encoded word's `Q` text as octets (RFC 2047 §4.2): `_` a space and
+/// `=` with two hexadecimal digits of either case one octet; `None` for an
+/// `=` not followed by two.
+fn q_octets(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+
+    while at < bytes.len() {
+        match bytes[at] {
+            b'_' => {
+                out.push(b' ');
+                at += 1;
             }
-            None => {
-                out.push_str(text);
-                out.push_str("=?");
-                rest = &tail[2..];
-                after_word = false;
+            b'=' => {
+                let pair = bytes.get(at + 1..at + 3)?;
+                out.push(hex_pair(pair[0], pair[1])?);
+                at += 3;
+            }
+            byte => {
+                out.push(byte);
+                at += 1;
             }
         }
     }
-    out.push_str(rest);
 
-    out.trim().to_string()
+    Some(out)
 }
 
-/// One RFC 2047 `encoded-word` at the head of `text`, and its length.
-fn encoded_word(text: &str) -> Option<(String, usize)> {
-    let inner = text.strip_prefix("=?")?;
-    let (charset, rest) = inner.split_once('?')?;
-    let (encoding, rest) = rest.split_once('?')?;
-    let end = rest.find("?=")?;
-    let payload = &rest[..end];
+/// The labels of the WHATWG Encoding Standard naming UTF-8.
+const UTF_8_LABELS: [&str; 6] = [
+    "unicode-1-1-utf-8",
+    "unicode11utf8",
+    "unicode20utf8",
+    "utf-8",
+    "utf8",
+    "x-unicode20utf8",
+];
 
-    let bytes = match encoding {
-        "B" | "b" => base64(payload.as_bytes())?,
-        "Q" | "q" => quoted_printable(payload.as_bytes(), true),
-        _ => return None,
-    };
+/// The labels of the WHATWG Encoding Standard naming windows-1252, the
+/// encoding it reads `iso-8859-1` and `us-ascii` as.
+const WINDOWS_1252_LABELS: [&str; 17] = [
+    "ansi_x3.4-1968",
+    "ascii",
+    "cp1252",
+    "cp819",
+    "csisolatin1",
+    "ibm819",
+    "iso-8859-1",
+    "iso-ir-100",
+    "iso8859-1",
+    "iso88591",
+    "iso_8859-1",
+    "iso_8859-1:1987",
+    "l1",
+    "latin1",
+    "us-ascii",
+    "windows-1252",
+    "x-cp1252",
+];
 
-    let len = 2 + charset.len() + 1 + encoding.len() + 1 + end + 2;
-    Some((charset_decode(charset, &bytes), len))
-}
+/// Octets under a MIME charset as text (Annex A.1), or `None` for a
+/// charset no label of the WHATWG Encoding Standard names, or one naming
+/// its replacement encoding: the label, an RFC 2231 language after `*`
+/// dropped, matched without regard to ASCII case, and the octets decoded
+/// by the encoding it names, no byte order mark sniffed.
+///
+/// The UTF-8 and windows-1252 labels decode in every build, ill-formed
+/// UTF-8 replaced (Annex A.0). The other encodings need the
+/// `charset-tables` feature (`encoding_rs`, which `client` enables): a
+/// build without it has no table for them and keeps such a label as one
+/// it does not know, a deviation from Annex A.1.
+pub fn charset_decode(charset: &str, octets: &[u8]) -> Option<String> {
+    let label = charset
+        .split('*')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
-/// Bytes under a MIME charset as text: `iso-8859-1` and `us-ascii` by
-/// the byte, `windows-1252` by its table, and every other charset as
-/// UTF-8, replacing what does not decode (Annex A.0). The default build
-/// carries no charset tables beyond these, so another 8-bit charset
-/// reads lossily; the `charset-tables` feature first consults the
-/// WHATWG label table (`encoding_rs`), whose labels name gbk, big5,
-/// euc-jp, iso-2022-jp, shift_jis, euc-kr, the windows-125x and
-/// iso-8859-x rows, utf-16 and their aliases. The label holds: the
-/// bytes are decoded by the encoding it names, a byte-order mark
-/// among them reading as the character it is. A label the table names
-/// with no encoding behind it (iso-2022-kr among them) and a label it
-/// does not name at all read as UTF-8, lossily, as they do by default.
-fn charset_decode(charset: &str, bytes: &[u8]) -> String {
-    let charset = charset.split('*').next().unwrap_or_default().to_lowercase();
-    match charset.as_str() {
-        "iso-8859-1" | "latin1" | "us-ascii" | "ascii" => {
-            bytes.iter().map(|byte| char::from(*byte)).collect()
+    match label.as_str() {
+        label if UTF_8_LABELS.contains(&label) => {
+            Some(String::from_utf8_lossy(octets).into_owned())
         }
-        "windows-1252" | "cp1252" => bytes.iter().map(|byte| cp1252(*byte)).collect(),
+        label if WINDOWS_1252_LABELS.contains(&label) => {
+            Some(octets.iter().map(|byte| cp1252(*byte)).collect())
+        }
         #[cfg(feature = "charset-tables")]
-        _ => match encoding_rs::Encoding::for_label_no_replacement(charset.as_bytes()) {
-            Some(encoding) => encoding.decode_without_bom_handling(bytes).0.into_owned(),
-            None => String::from_utf8_lossy(bytes).into_owned(),
-        },
+        label => encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
+            .map(|encoding| encoding.decode_without_bom_handling(octets).0.into_owned()),
         #[cfg(not(feature = "charset-tables"))]
-        _ => String::from_utf8_lossy(bytes).into_owned(),
+        _ => None,
     }
 }
 
@@ -267,11 +399,10 @@ fn cp1252(byte: u8) -> char {
     }
 }
 
-/// Decodes RFC 2045 quoted-printable, with the `_` of RFC 2047 §4.2 when
-/// `header` is set, octet by octet: an octet that is no UTF-8 passes
-/// through as itself, replaced only once the decoded text is read
-/// (Annex A.0).
-fn quoted_printable(bytes: &[u8], header: bool) -> Vec<u8> {
+/// Decodes RFC 2045 quoted-printable octet by octet: an octet that is no
+/// UTF-8 passes through as itself, replaced only once the decoded text is
+/// read (Annex A.0).
+fn quoted_printable(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
 
@@ -287,10 +418,6 @@ fn quoted_printable(bytes: &[u8], header: bool) -> Vec<u8> {
                     at += 1;
                 }
             },
-            b'_' if header => {
-                out.push(b' ');
-                at += 1;
-            }
             byte => {
                 out.push(byte);
                 at += 1;
@@ -333,238 +460,381 @@ fn base64(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The addresses of an address-list header, in document order.
+/// The addresses of an address-list header, in document order (Annex
+/// A.1): split at the commas outside a quoted-string, a comment and angle
+/// brackets, a group listing its own mailboxes.
 ///
-/// Groups are flattened, comments dropped, display names decoded and
-/// unquoted, and every addr-spec made canonical (Annex A.6).
+/// A mailbox's address is the text between its angle brackets, else its
+/// whole text with its comments removed, made canonical (Annex A.6); its
+/// name is its [`display_name`].
 pub fn addresses(raw: &str) -> Vec<PimdirAddress> {
     mailboxes(raw)
         .iter()
         .filter_map(|mailbox| {
-            let mailbox = mailbox.trim();
-            let (name, address) = match (mailbox.find('<'), mailbox.rfind('>')) {
-                (Some(open), Some(close)) if open < close => {
-                    (Some(&mailbox[..open]), &mailbox[open + 1..close])
-                }
-                _ => (None, mailbox),
+            let opened = lexemes(mailbox)
+                .find(|lexeme| lexeme.char == '<' && lexeme.depth == 0 && !lexeme.quoted)
+                .map(|lexeme| lexeme.at)
+                .and_then(|open| Some((open, open + 1 + mailbox[open + 1..].find('>')?)));
+            let (address, name) = match opened {
+                Some((open, close)) => (
+                    trim_wsp(&mailbox[open + 1..close]).to_string(),
+                    display_name(&mailbox[..open]),
+                ),
+                None => (trim_wsp(&uncommented(mailbox)).to_string(), None),
             };
-            let address = PimdirAddress::canonical(address);
-            if address.is_empty() {
-                return None;
-            }
 
-            let name = name
-                .map(|name| decode(&unquote(name.trim())))
-                .filter(|name| !name.is_empty());
-            Some(PimdirAddress { address, name })
+            let address = PimdirAddress::canonical(&address);
+            (!address.is_empty()).then_some(PimdirAddress { address, name })
         })
         .collect()
 }
 
-/// Splits an address-list into its mailboxes: at the commas outside
-/// quotes, comments and angle brackets, with a group's name and its
-/// closing semicolon removed.
+/// Splits an address-list into its mailboxes: at the commas outside a
+/// quoted-string, a comment and angle brackets, a group's name and colon
+/// dropped and its closing semicolon splitting.
 fn mailboxes(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
-    let mut quoted = false;
-    let mut comment = 0;
     let mut angled = false;
-    let mut escaped = false;
 
-    for char in raw.chars() {
-        if escaped {
-            current.push(char);
-            escaped = false;
-            continue;
+    for lexeme in lexemes(raw) {
+        if lexeme.depth == 0 && !lexeme.quoted && !lexeme.escaped {
+            match lexeme.char {
+                '<' | '>' => angled = lexeme.char == '<',
+                ':' if !angled && !current.contains('@') => {
+                    current.clear();
+                    continue;
+                }
+                ',' | ';' if !angled => {
+                    out.push(core::mem::take(&mut current));
+                    continue;
+                }
+                _ => {}
+            }
         }
-        match char {
-            '\\' if quoted => {
-                current.push(char);
-                escaped = true;
-            }
-            '"' if comment == 0 => {
-                quoted = !quoted;
-                current.push(char);
-            }
-            '(' if !quoted => comment += 1,
-            ')' if !quoted && comment > 0 => comment -= 1,
-            _ if comment > 0 => {}
-            '<' if !quoted => {
-                angled = true;
-                current.push(char);
-            }
-            '>' if !quoted => {
-                angled = false;
-                current.push(char);
-            }
-            ':' if !quoted && !angled && !current.contains('@') => current.clear(),
-            ',' | ';' if !quoted && !angled => {
-                out.push(core::mem::take(&mut current));
-            }
-            _ => current.push(char),
-        }
+        current.push(lexeme.char);
     }
     out.push(current);
 
-    out.into_iter()
-        .filter(|mailbox| !mailbox.trim().is_empty())
+    out
+}
+
+/// The display name of a mailbox, the text before its `<` (Annex A.1):
+/// its comments read as spaces, each quoted-string its content with its
+/// quoted pairs undone, then [`decode`]d; `None` when empty.
+pub fn display_name(phrase: &str) -> Option<String> {
+    let mut out = String::with_capacity(phrase.len());
+    for lexeme in lexemes(phrase) {
+        if lexeme.depth > 0 {
+            if lexeme.char == '(' && lexeme.depth == 1 && !lexeme.escaped {
+                out.push(' ');
+            }
+        } else if lexeme.escaped || !(lexeme.char == '"' || lexeme.char == '\\' && lexeme.quoted) {
+            out.push(lexeme.char);
+        }
+    }
+
+    Some(decode(&out)).filter(|name| !name.is_empty())
+}
+
+/// The bare id a `Message-ID` field names (Annex A.1), its first msg-id,
+/// or `None` when unparseable: comments skipped, the text from the first
+/// `<` outside one to the next `>`, trimmed and not empty; with no such
+/// `<`, the field read bracketless, its comments removed and trimmed,
+/// when it holds no whitespace, no `<`, `>` or `"` and exactly one `@`.
+pub fn message_id(raw: &str) -> Option<String> {
+    ids(raw, true).into_iter().next()
+}
+
+/// The bare ids of an `In-Reply-To` or `References` field (Annex A.1), in
+/// document order: each `<` outside a comment to the next `>`, trimmed,
+/// empty ones dropped; with no such `<`, each whitespace-separated word of
+/// the field, its comments removed, that [`message_id`] would take.
+pub fn message_ids(raw: &str) -> Vec<String> {
+    ids(raw, false)
+}
+
+/// The msg-ids of a field, the first alone when `first` (Annex A.1).
+fn ids(raw: &str, first: bool) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut opened: Option<usize> = None;
+
+    for lexeme in lexemes(raw) {
+        match opened {
+            Some(start) if lexeme.char == '>' => {
+                found.push(trim_wsp(&raw[start..lexeme.at]).to_string());
+                opened = None;
+                if first {
+                    break;
+                }
+            }
+            None if lexeme.char == '<' && lexeme.depth == 0 => opened = Some(lexeme.at + 1),
+            _ => {}
+        }
+    }
+    if !found.is_empty() || opened.is_some() {
+        found.retain(|id| !id.is_empty());
+        return found;
+    }
+
+    let bare = uncommented(raw);
+    let words: Vec<&str> = bare
+        .split([' ', '\t'])
+        .filter(|word| !word.is_empty())
+        .collect();
+    if first && words.len() != 1 {
+        return Vec::new();
+    }
+    words
+        .into_iter()
+        .filter(|word| word.matches('@').count() == 1 && !word.contains(['<', '>', '"']))
+        .map(String::from)
         .collect()
 }
 
-/// A display name with its surrounding quotes and their escapes removed.
-fn unquote(name: &str) -> String {
-    let Some(inner) = name
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    else {
-        return name.to_string();
+/// An RFC 5322 `date-time` as the RFC 3339 instant in UTC the summary
+/// stores (Annex A.1), or `None` when unparseable: a date is never
+/// invented.
+///
+/// RFC 5322 §3.3 with the obsolete forms of §4.3: comments removed, the
+/// day of the week before the first comma skipped and never checked, then
+/// five words, whitespace around a colon not counting: the day, the month,
+/// a year of two digits or more (two below 50 in the 2000s, two from 50 or
+/// three in the 1900s, then 1900 to 9999), `hh:mm[:ss]` and the zone. The
+/// day exists in its month, the hour is 00 to 23, a second of 60 reads as
+/// 59, and nothing is carried into the next day.
+pub fn instant(raw: &str) -> Option<String> {
+    let text = uncommented(raw);
+    let text = text.split_once(',').map_or(text.as_str(), |(_, rest)| rest);
+
+    // NOTE: the whitespace around a colon is no word separator.
+    let mut squeezed = String::with_capacity(text.len());
+    let mut colon = false;
+    for char in text.chars() {
+        match char {
+            ':' => {
+                squeezed.truncate(trim_wsp_end(&squeezed).len());
+                squeezed.push(char);
+                colon = true;
+            }
+            ' ' | '\t' if colon => {}
+            char => {
+                squeezed.push(char);
+                colon = false;
+            }
+        }
+    }
+
+    let words: Vec<&str> = squeezed
+        .split([' ', '\t'])
+        .filter(|word| !word.is_empty())
+        .collect();
+    let [day, month, year, clock, zone] = words.as_slice() else {
+        return None;
     };
 
-    let mut out = String::with_capacity(inner.len());
+    let day = (day.len() <= 2).then(|| digits(day)).flatten()?;
+    let month = self::month(month)?;
+    let year = self::year(year)?;
+    let (hour, minute, second) = match clock.as_bytes() {
+        [_, _, b':', _, _] => (
+            time::digits(clock.as_bytes(), 0, 2)?,
+            time::digits(clock.as_bytes(), 3, 2)?,
+            0,
+        ),
+        [_, _, b':', _, _, b':', _, _] => (
+            time::digits(clock.as_bytes(), 0, 2)?,
+            time::digits(clock.as_bytes(), 3, 2)?,
+            time::digits(clock.as_bytes(), 6, 2)?,
+        ),
+        _ => return None,
+    };
+    if !(1..=time::days_in_month(year, month)).contains(&(day as u32))
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    let offset = self::zone(zone)?;
+    let instant = time::unix(year, month, day as u32, hour, minute, second.min(59)) - offset;
+    (instant < time::unix(10_000, 1, 1, 0, 0, 0)).then(|| time::rfc3339(instant))
+}
+
+/// The month a `date-time`'s three-letter name stands for, in any case.
+fn month(name: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+
+    MONTHS
+        .iter()
+        .position(|month| month.eq_ignore_ascii_case(name))
+        .map(|index| index as u32 + 1)
+}
+
+/// A `date-time`'s year: two digits or more, the two- and three-digit
+/// forms of RFC 5322 §4.3 read in the 1900s and 2000s, then 1900 to 9999.
+fn year(raw: &str) -> Option<i32> {
+    let year = digits(raw)?;
+    let year = match raw.len() {
+        0 | 1 => return None,
+        2 if year < 50 => 2000 + year,
+        2 | 3 => 1900 + year,
+        _ => year,
+    };
+
+    (1900..=9999).contains(&year).then_some(year as i32)
+}
+
+/// A `date-time`'s zone as the seconds to subtract to reach UTC: `+hhmm`
+/// or `-hhmm` with `mm` at most 59, a named zone of RFC 5322 §4.3 in any
+/// case, or one military letter other than `J`, which §4.3 reads as
+/// `-0000` and so at `+0000`.
+fn zone(raw: &str) -> Option<i64> {
+    let bytes = raw.as_bytes();
+    if let [sign @ (b'+' | b'-'), ..] = bytes
+        && bytes.len() == 5
+    {
+        let hours = time::digits(bytes, 1, 2)? as i64;
+        let minutes = time::digits(bytes, 3, 2).filter(|minutes| *minutes <= 59)? as i64;
+        let offset = hours * 3_600 + minutes * 60;
+        return Some(if *sign == b'-' { -offset } else { offset });
+    }
+
+    match raw.to_ascii_uppercase().as_str() {
+        "UT" | "GMT" => Some(0),
+        "EDT" => Some(-4 * 3_600),
+        "EST" | "CDT" => Some(-5 * 3_600),
+        "CST" | "MDT" => Some(-6 * 3_600),
+        "MST" | "PDT" => Some(-7 * 3_600),
+        "PST" => Some(-8 * 3_600),
+        "J" => None,
+        letter if letter.len() == 1 && letter.as_bytes()[0].is_ascii_uppercase() => Some(0),
+        _ => None,
+    }
+}
+
+/// A run of ASCII digits as a number, saturating far past any year; `None`
+/// when empty or holding anything else.
+fn digits(raw: &str) -> Option<i64> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(raw.bytes().fold(0i64, |value, byte| {
+        value
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'))
+    }))
+}
+
+/// One character of a structured header value (RFC 5322 §3.2), with where
+/// it stands.
+#[derive(Clone, Copy)]
+struct Lexeme {
+    /// Its byte offset in the value.
+    at: usize,
+    char: char,
+    /// The comment nesting it stands in, an opening parenthesis counting
+    /// in the comment it opens and a closing one in the comment it closes.
+    depth: usize,
+    /// Whether it stands in a quoted-string, its quotes included.
+    quoted: bool,
+    /// Whether a backslash quotes it, in a comment or a quoted-string.
+    escaped: bool,
+}
+
+/// The characters of a structured value with where each stands: a comment
+/// is text in parentheses, nested, and a quoted-string text in double
+/// quotes holding no comment, a backslash in either quoting the next
+/// character (RFC 5322 §3.2).
+fn lexemes(text: &str) -> impl Iterator<Item = Lexeme> + '_ {
+    let mut depth = 0;
+    let mut quoted = false;
     let mut escaped = false;
-    for char in inner.chars() {
-        match (escaped, char) {
-            (false, '\\') => escaped = true,
-            _ => {
-                out.push(char);
-                escaped = false;
-            }
+
+    text.char_indices().map(move |(at, char)| {
+        let mut lexeme = Lexeme {
+            at,
+            char,
+            depth,
+            quoted,
+            escaped: false,
+        };
+        if escaped {
+            escaped = false;
+            lexeme.escaped = true;
+        } else if char == '\\' && (depth > 0 || quoted) {
+            escaped = true;
+        } else if char == '(' && !quoted {
+            depth += 1;
+            lexeme.depth = depth;
+        } else if char == ')' && !quoted && depth > 0 {
+            depth -= 1;
+        } else if char == '"' && depth == 0 {
+            quoted = !quoted;
+            lexeme.quoted = true;
+        }
+        lexeme
+    })
+}
+
+/// A structured value with each comment read as one space (Annex A.1).
+fn uncommented(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for lexeme in lexemes(text) {
+        if lexeme.depth == 0 {
+            out.push(lexeme.char);
+        } else if lexeme.char == '(' && lexeme.depth == 1 && !lexeme.escaped {
+            out.push(' ');
         }
     }
 
     out
 }
 
-/// The bare ids of an `In-Reply-To` or `References` value (RFC 5322
-/// §3.6.4, `1*msg-id`), read off their angle brackets when they carry
-/// any and off whitespace otherwise.
-pub fn message_ids(raw: &str) -> Vec<String> {
-    if raw.contains('<') {
-        return raw
-            .split('<')
-            .filter_map(|rest| rest.split_once('>'))
-            .filter_map(|(id, _)| strip_angles(id))
-            .collect();
-    }
-
-    raw.split_whitespace().filter_map(strip_angles).collect()
+/// Whether a character is whitespace as Annex A.1 reads a header: the
+/// space and the tab.
+fn is_wsp(char: char) -> bool {
+    char == ' ' || char == '\t'
 }
 
-/// Strips a `msg-id`'s angle brackets; an empty result is no id at all.
-fn strip_angles(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    let inner = trimmed
-        .strip_prefix('<')
-        .and_then(|rest| rest.strip_suffix('>'))
-        .unwrap_or(trimmed)
-        .trim();
-
-    (!inner.is_empty()).then(|| inner.to_string())
+/// A text trimmed of spaces and tabs at both ends.
+fn trim_wsp(text: &str) -> &str {
+    text.trim_matches(is_wsp)
 }
 
-/// An RFC 5322 `date-time` as the RFC 3339 instant in UTC the summary
-/// stores, or `None` when it does not parse: a date is never invented.
-///
-/// `[day-of-week ","] day month year hour ":" minute [":" second] zone`,
-/// with the obsolete alphabetic zones RFC 5322 §4.3 keeps.
-pub fn instant(raw: &str) -> Option<String> {
-    let raw = raw.split(&['(', ';'][..]).next().unwrap_or_default();
-    let rest = match raw.split_once(',') {
-        Some((_, rest)) => rest,
-        None => raw,
-    };
-
-    let mut fields = rest.split_whitespace();
-    let day: u32 = fields.next()?.parse().ok()?;
-    let month = month(fields.next()?)?;
-    let year = year(fields.next()?)?;
-
-    let mut clock = fields.next()?.split(':');
-    let hour: u32 = clock.next()?.parse().ok()?;
-    let minute: u32 = clock.next()?.parse().ok()?;
-    let second: u32 = clock.next().unwrap_or("0").parse().ok()?;
-    if day == 0 || day > 31 || hour > 24 || minute > 59 || second > 60 {
-        return None;
-    }
-
-    let offset = zone(fields.next().unwrap_or("-0000"))?;
-    Some(time::rfc3339(
-        time::unix(year, month, day, hour, minute, second) - offset,
-    ))
+/// A text trimmed of spaces and tabs at its end.
+fn trim_wsp_end(text: &str) -> &str {
+    text.trim_end_matches(is_wsp)
 }
 
-/// The month a `date-time`'s three-letter name stands for.
-fn month(name: &str) -> Option<u32> {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
-
-    let name = name.to_lowercase();
-    MONTHS
-        .iter()
-        .position(|month| *month == name)
-        .map(|index| index as u32 + 1)
-}
-
-/// A `date-time`'s year, with the two- and three-digit forms of RFC 5322 §4.3.
-fn year(raw: &str) -> Option<i32> {
-    let year: i32 = raw.parse().ok()?;
-    match raw.len() {
-        2 if year < 50 => Some(2000 + year),
-        2 => Some(1900 + year),
-        3 => Some(1900 + year),
-        _ => Some(year),
-    }
-}
-
-/// A `date-time`'s zone, as the seconds to subtract to reach UTC.
-///
-/// `-0000` states an unknown zone rather than UTC, and names the same
-/// instant, which is all a key needs; so does every other single letter.
-fn zone(raw: &str) -> Option<i64> {
-    let bytes = raw.as_bytes();
-    if matches!(bytes.first(), Some(b'+' | b'-')) && bytes.len() >= 5 {
-        let hours = time::digits(bytes, 1, 2)? as i64;
-        let minutes = time::digits(bytes, 3, 2)? as i64;
-        let offset = hours * 3_600 + minutes * 60;
-        return Some(if bytes[0] == b'-' { -offset } else { offset });
-    }
-
-    match raw.to_uppercase().as_str() {
-        "UT" | "GMT" | "Z" => Some(0),
-        "EDT" => Some(-4 * 3_600),
-        "EST" | "CDT" => Some(-5 * 3_600),
-        "CST" | "MDT" => Some(-6 * 3_600),
-        "MST" | "PDT" => Some(-7 * 3_600),
-        "PST" => Some(-8 * 3_600),
-        name if name.len() == 1 => Some(0),
-        _ => None,
-    }
-}
-
-/// Splits a MIME entity into its header block and its body.
+/// Splits a MIME entity into its header block and its body: the block
+/// ends at the first empty line, a line at CRLF or a bare LF (Annex A.1).
 fn split_headers(entity: &[u8]) -> (&[u8], &[u8]) {
-    for (at, window) in entity.windows(2).enumerate() {
-        if window == b"\n\n" {
-            return (&entity[..at + 1], &entity[at + 2..]);
+    let mut at = 0;
+    while let Some(offset) = entity[at..].iter().position(|byte| *byte == b'\n') {
+        let end = at + offset;
+        if matches!(&entity[at..end], [] | [b'\r']) {
+            return (&entity[..at], &entity[end + 1..]);
         }
-        if window == b"\r\n" && entity.get(at + 2..at + 4) == Some(b"\r\n") {
-            return (&entity[..at + 2], &entity[at + 4..]);
-        }
+        at = end + 1;
     }
 
     (entity, &[])
 }
 
-/// A header block, unfolded, as `(lowercased name, value)` pairs.
+/// A header block, unfolded, as `(lowercased name, value)` pairs, the
+/// value trimmed of spaces and tabs.
 fn header_fields(block: &[u8]) -> Vec<(String, String)> {
     unfold(block, true)
         .into_iter()
         .take_while(|line| !line.is_empty())
         .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_lowercase(), value.trim().to_string()))
+            Some((name.trim().to_lowercase(), trim_wsp(value).to_string()))
         })
         .collect()
 }
@@ -579,8 +849,16 @@ fn field<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// Whether the entity, nested `depth` multipart levels down, or a part under
 /// it, carries `Content-Disposition: attachment`, walking multipart bodies by
-/// their boundary down to [`MIME_DEPTH_MAX`].
-fn has_attachment(headers: &[(String, String)], body: &[u8], depth: usize) -> bool {
+/// their boundary down to [`MIME_DEPTH_MAX`] and through
+/// [`MIME_ENTITIES_MAX`] entities in document order, `read` counting them,
+/// this one included.
+fn has_attachment(
+    headers: &[(String, String)],
+    body: &[u8],
+    depth: usize,
+    read: &mut usize,
+) -> bool {
+    *read += 1;
     if field(headers, "content-disposition")
         .and_then(|value| value.split(';').next())
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"))
@@ -598,15 +876,22 @@ fn has_attachment(headers: &[(String, String)], body: &[u8], depth: usize) -> bo
 
     parts(body, &boundary).into_iter().any(|part| {
         let (headers, body) = split_headers(part);
-        has_attachment(&header_fields(headers), body, depth + 1)
+        *read < MIME_ENTITIES_MAX && has_attachment(&header_fields(headers), body, depth + 1, read)
     })
 }
 
 /// The first `UID` of the first `text/calendar` part in document order,
 /// its transfer encoding undone and its lines unfolded (Annex A.1), the
-/// entity nested `depth` multipart levels down and the walk stopping at
-/// [`MIME_DEPTH_MAX`].
-fn invitation(headers: &[(String, String)], body: &[u8], depth: usize) -> Option<String> {
+/// entity nested `depth` multipart levels down, the walk stopping at
+/// [`MIME_DEPTH_MAX`] and after [`MIME_ENTITIES_MAX`] entities, `read`
+/// counting them, this one included.
+fn invitation(
+    headers: &[(String, String)],
+    body: &[u8],
+    depth: usize,
+    read: &mut usize,
+) -> Option<String> {
+    *read += 1;
     let content_type = field(headers, "content-type").unwrap_or_default();
     let media = content_type
         .split(';')
@@ -620,7 +905,7 @@ fn invitation(headers: &[(String, String)], body: &[u8], depth: usize) -> Option
         let encoding = field(headers, "content-transfer-encoding").map(str::to_lowercase);
         let decoded = match encoding.as_deref().map(str::trim) {
             Some("base64") => base64(body).unwrap_or_default(),
-            Some("quoted-printable") => quoted_printable(body, false),
+            Some("quoted-printable") => quoted_printable(body),
             _ => body.to_vec(),
         };
         return unfold(&decoded, false).into_iter().find_map(|line| {
@@ -636,8 +921,11 @@ fn invitation(headers: &[(String, String)], body: &[u8], depth: usize) -> Option
 
     let boundary = boundary(content_type)?;
     parts(body, &boundary).into_iter().find_map(|part| {
+        if *read >= MIME_ENTITIES_MAX {
+            return None;
+        }
         let (headers, body) = split_headers(part);
-        invitation(&header_fields(headers), body, depth + 1)
+        invitation(&header_fields(headers), body, depth + 1, read)
     })
 }
 
@@ -670,11 +958,11 @@ fn parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
             .map_or(body.len(), |offset| at + offset);
         let line = &body[at..end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(rest) = line.strip_prefix(delimiter.as_bytes()) {
+        if let Some(close) = delimits(line, delimiter.as_bytes()) {
             if let Some(from) = start {
                 parts.push(&body[from..at]);
             }
-            if rest.starts_with(b"--") {
+            if close {
                 break;
             }
             start = Some(end + 1);
@@ -683,6 +971,23 @@ fn parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
     }
 
     parts
+}
+
+/// Whether a line, its line break excluded, is a delimiter of a multipart
+/// body, `delimiter` being `--` and its boundary, and whether it closes
+/// the body: the delimiter, `--` when it closes, then spaces and tabs
+/// alone (RFC 2046 §5.1.1), so a boundary another one begins with never
+/// delimits the other.
+fn delimits(line: &[u8], delimiter: &[u8]) -> Option<bool> {
+    let rest = line.strip_prefix(delimiter)?;
+    let (close, rest) = match rest.strip_prefix(b"--") {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+
+    rest.iter()
+        .all(|byte| matches!(byte, b' ' | b'\t'))
+        .then_some(close)
 }
 
 #[cfg(test)]
@@ -754,11 +1059,11 @@ mod tests {
     fn an_attachment_is_found_under_a_nested_multipart() {
         let body = b"Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain\r\n\r\nhi\r\n--inner--\r\n--outer\r\nContent-Disposition: attachment; filename=a.pdf\r\n\r\n%PDF\r\n--outer--\r\n";
         let (headers, rest) = split_headers(body);
-        assert!(has_attachment(&header_fields(headers), rest, 0));
+        assert!(has_attachment(&header_fields(headers), rest, 0, &mut 0));
 
         let plain = b"Content-Type: text/plain\r\n\r\nhi\r\n";
         let (headers, rest) = split_headers(plain);
-        assert!(!has_attachment(&header_fields(headers), rest, 0));
+        assert!(!has_attachment(&header_fields(headers), rest, 0, &mut 0));
     }
 
     #[test]
@@ -800,22 +1105,169 @@ mod tests {
         );
         assert_eq!(derivation.sort_key.as_str(), "2026-08-01T10:00:00Z");
     }
+    #[test]
+    fn a_date_outside_annex_a1s_forms_is_unparseable() {
+        let date = |raw: &str| instant(raw);
+        assert_eq!(date("Sat, 1 Aug 2026 24:00:00 +0000"), None, "24:00");
+        assert_eq!(date("Sat, 1 Aug 2026 10:00:00"), None, "no zone");
+        assert_eq!(
+            date("Sat, 1 Aug 2026 10:00:00 +0000 UTC"),
+            None,
+            "a word after"
+        );
+        assert_eq!(date("Sat, 1 Aug 2026 10:00:00 J"), None, "J");
+        assert_eq!(date("Sat, 1 Aug 2026 10:00:00 7"), None, "a digit");
+        assert_eq!(date("Sat, 1 Aug 2026 10:00:00 +0160"), None, "mm past 59");
+        assert_eq!(
+            date("Sat, 1 Aug 2026 10:00:00 +02000"),
+            None,
+            "six characters"
+        );
+        assert_eq!(
+            date("Sat, 1 Aug 2026 1:00:00 +0000"),
+            None,
+            "one-digit hour"
+        );
+        assert_eq!(date("Sat, 1 Aug 1899 10:00:00 +0000"), None, "before 1900");
+        assert_eq!(date("Sat, 1 Aug 0026 10:00:00 +0000"), None, "four digits");
+    }
+
+    #[test]
+    fn a_date_reads_comments_colons_and_leap_seconds_as_annex_a1_says() {
+        let date = |raw: &str| instant(raw);
+        assert_eq!(
+            date("Sat, 1 Aug 2026 (sent) 10:00:00 +0000").as_deref(),
+            Some("2026-08-01T10:00:00Z"),
+            "a comment before the time"
+        );
+        assert_eq!(
+            date("Sat, 1 Aug 2026 10 : 00 : 00 +0000").as_deref(),
+            Some("2026-08-01T10:00:00Z"),
+            "whitespace around a colon"
+        );
+        assert_eq!(
+            date("Wed, 31 Dec 2026 23:59:60 +0000").as_deref(),
+            Some("2026-12-31T23:59:59Z"),
+            "60 read as 59, not carried"
+        );
+        assert_eq!(
+            date("Sat, 1 Aug 02026 10:00:00 z").as_deref(),
+            Some("2026-08-01T10:00:00Z"),
+            "a long year and a lowercase military letter"
+        );
+    }
+
+    #[test]
+    fn a_bracketless_id_holds_one_at_and_no_quote() {
+        assert_eq!(message_id("a\"b@x"), None);
+        assert_eq!(message_id("a@b@x"), None);
+        assert_eq!(message_id("<>"), None, "an empty id");
+        assert_eq!(message_id("<a@x"), None, "no > after the <");
+        assert_eq!(
+            message_ids("a@x junk (c@x) b@y"),
+            ["a@x", "b@y"],
+            "In-Reply-To word by word, comments removed"
+        );
+    }
+
+    #[test]
+    fn an_encoded_word_is_read_as_annex_a1_states_it() {
+        assert_eq!(
+            decode("=?iso-8859-1?Q?=80?= =?us-ascii?Q?=93?="),
+            "\u{20ac}\u{201c}",
+            "iso-8859-1 and us-ascii read as windows-1252"
+        );
+        assert_eq!(
+            decode("=?UTF-8?B?b2s===?="),
+            "=?UTF-8?B?b2s===?=",
+            "three pads"
+        );
+        assert_eq!(
+            decode("=?UTF-8?B?b2sxx?="),
+            "=?UTF-8?B?b2sxx?=",
+            "a lone sextet"
+        );
+        assert_eq!(decode("=?UTF-8?B?b2s?="), "ok", "padding optional");
+        assert_eq!(
+            decode("=?UTF-8?Q?=C2=A0x=C2=A0?="),
+            "\u{a0}x\u{a0}",
+            "only spaces and tabs trimmed"
+        );
+        assert_eq!(
+            decode("=?UTF-8?Q?a?= \t=?UTF-8?Q?b?= c =?UTF-8?Q?d?="),
+            "ab c d",
+            "whitespace between two decoded words alone removed"
+        );
+    }
+
+    #[test]
+    fn a_display_name_reads_comments_as_spaces_and_quotes_anywhere() {
+        let name = |raw: &str| addresses(raw).remove(0).name;
+        assert_eq!(
+            name("Night(ops)Shift <x@y>").as_deref(),
+            Some("Night Shift")
+        );
+        assert_eq!(
+            name("Zoe \"the \\\"Z\\\"\" Doe <z@x>").as_deref(),
+            Some("Zoe the \"Z\" Doe")
+        );
+        assert_eq!(name("(only a comment) <z@x>"), None);
+        assert_eq!(
+            addresses("(a, b) x@y, \"c, d\" <z@w>")
+                .iter()
+                .map(|address| address.address.as_str())
+                .collect::<Vec<_>>(),
+            ["x@y", "z@w"],
+            "no split inside a comment or a quoted-string"
+        );
+    }
+
+    #[test]
+    fn the_walk_reads_no_entity_past_its_bound() {
+        let mut body = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n".to_vec();
+        for _ in 1..MIME_ENTITIES_MAX {
+            body.extend_from_slice(b"--b\r\n\r\nx\r\n");
+        }
+        body.extend_from_slice(b"--b\r\nContent-Disposition: attachment\r\n\r\nx\r\n");
+        body.extend_from_slice(b"--b\r\nContent-Type: text/calendar\r\n\r\nUID:late\r\n");
+        body.extend_from_slice(b"--b--\r\n");
+
+        let Some(PimdirSummary::Mail(mail)) = derive(&body).summary else {
+            unreachable!("a message derives a mail summary");
+        };
+        assert_eq!(mail.attachment, Some(false), "the 10,001st entity unread");
+        assert_eq!(mail.invitation, None);
+        assert!(attachments::attachments(&body).is_empty());
+    }
+
+    #[test]
+    fn a_boundary_another_begins_with_delimits_only_its_own_body() {
+        let body = b"Content-Type: multipart/mixed; boundary=d1\r\n\r\n\
+--d1\r\nContent-Type: multipart/mixed; boundary=d10\r\n\r\n\
+--d10\r\nContent-Disposition: attachment\r\n\r\nx\r\n--d10--\r\n--d1--\r\n";
+        let found = attachments::attachments(body);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].part.as_deref(), Some("1.1"));
+        assert_eq!(delimits(b"--d1 \t", b"--d1"), Some(false));
+        assert_eq!(delimits(b"--d1--", b"--d1"), Some(true));
+        assert_eq!(delimits(b"--d1x", b"--d1"), None);
+    }
 }
 
 #[cfg(test)]
 mod charset_table_tests {
     use super::decode;
 
-    /// A legacy GBK subject of the kind older CN mail servers still
-    /// emit by the thousand a week: the default build replaces their
-    /// octets, the feature reads them.
+    /// A legacy GBK subject of the kind older CN mail servers still emit by
+    /// the thousand a week: read with the tables, which `client` enables,
+    /// and kept as written by a build without them.
     #[test]
-    fn a_gbk_subject_is_lossy_by_default_and_read_with_the_tables() {
+    fn a_gbk_subject_is_read_with_the_tables_and_kept_without() {
         let out = decode("=?gbk?B?1PbBv8r9vt3NrLK9sai45i0yNjEwMjk?=");
         #[cfg(feature = "charset-tables")]
         assert_eq!(out, "增量数据同步报告-261029");
         #[cfg(not(feature = "charset-tables"))]
-        assert!(!out.contains('增'));
+        assert_eq!(out, "=?gbk?B?1PbBv8r9vt3NrLK9sai45i0yNjEwMjk?=");
     }
 
     #[test]
@@ -826,28 +1278,23 @@ mod charset_table_tests {
         assert_eq!(decode("=?shift_jis?B?k4yLng==?="), "東京");
     }
 
-    /// The table names iso-2022-kr with no encoding behind it: the octets
-    /// read as UTF-8, lossily, not as the single replacement character a
-    /// lookup through the WHATWG replacement would give.
+    /// A label naming the WHATWG replacement encoding, and one no label
+    /// table names, are unknown charsets: the word stays as written.
     #[test]
-    fn a_label_the_table_names_without_an_encoding_reads_lossily() {
-        let out = decode("=?iso-2022-kr?B?GyQpQw5HUTE5Pm4P?=");
-        assert!(out.contains("\u{1B}$)C"));
-    }
-
-    /// A label no table names at all falls back the same way, its lossy
-    /// read longer than one replacement character.
-    #[test]
-    fn a_label_no_table_names_reads_lossily() {
-        let out = decode("=?x-legacy-cjk?B?1PbBv8r9vt3NrLK9sai45i0yNjEwMjk?=");
-        assert!(!out.contains('增'));
-        assert!(out.chars().count() > 1);
+    fn a_label_naming_no_decoder_keeps_its_word() {
+        assert_eq!(
+            decode("=?iso-2022-kr?B?GyQpQw5HUTE5Pm4P?="),
+            "=?iso-2022-kr?B?GyQpQw5HUTE5Pm4P?="
+        );
+        assert_eq!(
+            decode("=?x-legacy-cjk?B?1PY=?= z"),
+            "=?x-legacy-cjk?B?1PY=?= z"
+        );
     }
 
     /// The label holds against a byte-order mark: utf-8 decodes its BOM
     /// as the character it is, never as a sniff that overrides the label.
     #[test]
-    #[cfg(feature = "charset-tables")]
     fn a_byte_order_mark_decodes_under_its_label() {
         assert_eq!(decode("=?utf-8?B?77u/5aSp5aSp?="), "\u{FEFF}天天");
     }

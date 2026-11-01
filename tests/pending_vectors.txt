@@ -1,0 +1,11 @@
+# The vector cases expected to fail until a later phase of
+# cairn/changes/the-crate-follows-storage-draft-08 lands (decision 3), read
+# by tests/pending/mod.rs. One case per line: the phase fixing it, a space,
+# the suite, a colon and a space, then the case as its runner names it.
+# A listed case that passes, an unlisted one that fails and a listed one
+# the suite does not hold each fail the suite. Release needs this list
+# empty.
+#
+# Suites: objects (vectors/objects.json), summaries (vectors/summaries.json),
+# payloads (vectors/payloads.json), sync (vectors/sync/, by file stem),
+# queries and chunks (vectors/search/).

@@ -20,7 +20,11 @@ use crate::cli::{
     collection::CollectionsOutput,
     export::ExportOutput,
     gc::GcOutput,
-    item::{ItemExportOutput, ItemPurgeOutput, ItemRestoreOutput, ItemShowOutput, ItemsOutput},
+    item::{
+        ItemEraseOutput, ItemExportOutput, ItemPurgeOutput, ItemRestoreOutput, ItemShowOutput,
+        ItemsOutput,
+    },
+    quarantine::QuarantineEmptyOutput,
     queue::{QueueCancelOutput, QueueOutput},
     search::{
         CountOutput, IndexOutput, QueryErrorOutput, SearchOutput, SearchThreadsOutput, ShowOutput,
@@ -51,11 +55,13 @@ pub fn registry() -> JsonSchemaRegistry {
     insert!("pimdir-item-export", ItemExportOutput);
     insert!("pimdir-item-restore", ItemRestoreOutput);
     insert!("pimdir-item-purge", ItemPurgeOutput);
+    insert!("pimdir-item-erase", ItemEraseOutput);
     insert!("pimdir-queue-list", QueueOutput);
     insert!("pimdir-queue-cancel", QueueCancelOutput);
     insert!("pimdir-store-info", StoreInfoOutput);
     insert!("pimdir-check", CheckOutput);
     insert!("pimdir-gc", GcOutput);
+    insert!("pimdir-quarantine-empty", QuarantineEmptyOutput);
     insert!("pimdir-export", ExportOutput);
     insert!("pimdir-index", IndexOutput);
     insert!("pimdir-search", SearchOutput);

@@ -48,7 +48,7 @@ The sync SHALL emit a `PimdirSyncEvent` for each per-item outcome it produces (a
 - THEN the report carries a `Created` event for the server-assigned handle
 
 ### Requirement: Headless conflict resolution
-`PimdirSyncOptions` SHALL carry a `PimdirConflictPolicy` (`Manual`, `PreferLocal`, `PreferRemote`; default `Manual`) applied when content diverges on both sides of a based placement. `Manual` marks the placement conflicted and waits for the consumer's edit, recording the observed remote revision as `conflict_revision` and the diverging remote body as `conflict_object` beside it. `PreferRemote` pulls the remote, the local edit it drops kept by the write as a retained item and reported `Overruled` (pimdir SYNC §5, §9, vectors/sync/14); a pull the write cannot let replace another source's body is recorded as the item's conflict instead and reported `Conflicted` in place of `ContentChanged` (vectors/sync/83). `PreferLocal` pushes the local body as an `Update` gated on the observed remote revision, and falls back to `Manual` when the source may not push content. Immutable-content backends report no revision and so never reach a content conflict.
+`PimdirSyncOptions` SHALL carry a `PimdirConflictPolicy` (`Manual`, `PreferLocal`, `PreferRemote`; default `Manual`) applied when content diverges on both sides of a based placement. `Manual` marks the placement conflicted and waits for the consumer's edit, recording the observed remote revision as `conflict_revision` and the diverging remote body as `conflict_object` beside it. `PreferRemote` pulls the remote, the local edit it drops kept by the write as a retained item and reported `Overruled` (pimdir SYNC §5, §9, vectors/sync/14); a pull the write cannot let replace another source's body is recorded as the item's conflict instead and reported `Conflicted` in place of `ContentChanged` (vectors/sync/83). `PreferLocal` keeps the member's body and pushes the local one over it ("PreferLocal keeps the body it pushes over" below), and falls back to `Manual` when the source may not push content. No policy settles against a body nobody read ("No policy settles against an unread body" below). Immutable-content backends report no revision and so never reach a content conflict.
 
 #### Scenario: PreferRemote discards the local edit
 - GIVEN a based placement edited locally and changed on the remote, `conflict = PreferRemote`
@@ -302,15 +302,15 @@ Every member a page lists SHALL be named in the page's write from its `PimdirRem
 `Join`, `Merge` and `Candidate`, the walk of both sides in handle order and the delta rule narrowing it, live in `sync/join.rs`; the unit tests of every verb live beside their module in a `tests.rs`. A module with code and submodules is `foo.rs` plus `foo/`.
 
 ### Requirement: A run chooses its listing from the coverage
-A sync SHALL read the source's checkpoint, coverage and round first, a `Handles` load naming none, and ask for one listing (`PimdirEnumerate`: a `PimdirListing` and a `PimdirScope`, pimdir SYNC §5): the open round resumed from its cursor when it lists the scope asked for and is a band round exactly when this run would list a band (`PimdirRound::band`); else a round, opened in the write of its first page, when no round ever closed (a store from an earlier draft included), a round is open over another scope or of the other kind, `full` is set, or the scope reaches outside the coverage, over the band alone when the connector's checkpoint is bound to no scope (`PimdirRemote::scope_bound`, `PimdirSync::scope_bound`) and the band adjoins the coverage; else a delta from the checkpoint, recording the narrower coverage (`SetCoverage`) when the scope lies strictly inside it. A connector answering a round to a delta request has one opened over the scope; one answering a delta to a round request is merged as a delta. A cursor the source rejects (`PimdirEnumerated::CursorRejected`) restarts the round under a new id; a rejected delta checkpoint opens a round.
+A sync SHALL read the source's checkpoint, coverage and round first, a `Handles` load naming none, and ask for one listing (`PimdirEnumerate`: a `PimdirListing` and a `PimdirScope`, pimdir SYNC §5): the open round resumed from its cursor when it lists the scope asked for and is a band round exactly when this run would list a band (`PimdirRound::band`); else a round, opened in the write of its first page, when no round ever closed a round is open over another scope or of the other kind, `full` is set, or the scope reaches outside the coverage, over the band alone when the connector's checkpoint is bound to no scope (`PimdirRemote::scope_bound`, `PimdirSync::scope_bound`) and the band adjoins the coverage; else a delta from the checkpoint, recording the narrower coverage (`SetCoverage`) when the scope lies strictly inside it. A connector answering a round to a delta request has one opened over the scope; one answering a delta to a round request is merged as a delta. A cursor the source rejects (`PimdirEnumerated::CursorRejected`) restarts the round under a new id; a rejected delta checkpoint opens a round.
 
 #### Scenario: A widening on IMAP
 - GIVEN a coverage since September and a connector bound to no scope
 - WHEN the scope widens to July
 - THEN the round lists July to September alone, hands no checkpoint, and closes with the coverage since July, the checkpoint kept
 
-#### Scenario: A band round open in a store an earlier build reconciled
-- GIVEN a round open over the band July to September that the store reads as no band round, its column added on open
+#### Scenario: A round open as no band round
+- GIVEN a round open over July to September that the store records as no band round
 - WHEN a sync bound to no scope widens to July
 - THEN it restarts the round as a band round rather than resuming it from its cursor
 
@@ -323,7 +323,7 @@ Every page SHALL land in one write: its members named and merged, the handles it
 - THEN it asks for the round from `p1`, and the last page closes it with the coverage of its scope
 
 ### Requirement: Absence means deleted in scope only
-The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope, or is unknown and the round is no band round (`NULL`, an empty `date` a connector hands being stored as `NULL`, so a round resumed in a later run and one opened and closed in the same run find the same members absent), read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A band round (`OpenRound { band: true }`, `sources.round_band`) SHALL infer no delete of an undated member: its date filter never returns undated mail, so the member is left to rounds over a whole scope and to deltas, and a vanished handle still applies to it; the in-memory rule (`RoundPlan::finds_absent`) and `list_unstamped_bindings` agree. A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
+The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope, or is unknown and the round is no band round (`NULL`, an empty `date` a connector hands being stored as `NULL`, so a round resumed in a later run and one opened and closed in the same run find the same members absent), read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A band round (`OpenRound { band: true }`, `sources.round_band`) SHALL infer no delete of an undated member: its date filter never returns undated mail, so the member is left to rounds over a whole scope and to deltas, and a vanished handle still applies to it; the in-memory rule (`RoundPlan::finds_absent`) and `list_unstamped_bindings` agree for a listing no date filter narrowed, the statement bound with `:narrowed` 0, `:enumerated` 0 and its `handles` slot empty; a narrowed listing is the store's to read ("A narrowed listing proves only what its filter could list" below). A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
 
 #### Scenario: A message older than the scope
 - GIVEN a bound member dated August and an undated one, both unlisted, under a scope since September
@@ -339,6 +339,14 @@ The deletes a round infers SHALL be the based bindings of its source no page of 
 - GIVEN a bound member whose summary carries an empty `date`, unlisted by a round that an earlier run opened
 - WHEN the resumed round's last page lands
 - THEN the member is dropped `Deleted`, as it is by a round opened and closed in one run
+
+### Requirement: A narrowed listing proves only what its filter could list
+A round whose last page states `narrowed` (`PimdirRemoteSnapshot::narrowed`, set by a connector on every page a date filter narrowed) SHALL find absent only a member whose `date` is known and earlier than the instant the round opened (`round_started_at`), and an undated or later-dated one only when the last page hands `enumerated` and that enumeration lacks its handle; any other member is left as it stands, neither dropped nor pushed (pimdir SYNC §4, §5; STORAGE §10). The last page loads `PimdirLoadSelection::LastPage { narrowed, enumerated }`, which the store answers through `list_unstamped_bindings` bound with `:narrowed`, `:enumerated` and the enumeration in the `handles` slot. A narrowed round that page would open, whose opening instant only the store stamps, is opened in a write of its own (`OpenRound`) before that load, so its absences are read as a round opened before. A head and a delta prove no absence, whatever they state.
+
+#### Scenario: Graph's narrowed round
+- GIVEN an undated draft received in May, a message dated 2035 by its sender's clock, and one dated 5 October, none listed by a round over `[2026-09-01, open)` narrowed by `receivedDateTime` with no enumeration
+- WHEN the round's last page lands
+- THEN the 5 October member is dropped `Deleted` and the other two stay as they were (vectors/sync/107; a narrowed enumeration lacking the undated member drops it, vectors/sync/47; a resumed round's enumeration, tests/scoped_sync.rs `a_resumed_narrowed_round_drops_only_what_its_enumeration_lacks`)
 
 ### Requirement: A scope bounds mail only
 `PimdirSyncOptions::scope` is unbounded by default. `PimdirSourceStore::sync` and `prepare_sync` SHALL refuse a bounded scope on a collection whose kind is not `message/rfc822`, naming the kind (`PimdirError::Scope`).
@@ -388,15 +396,20 @@ An `Add` answered `Accepted` with no assigned handle (an IMAP `APPEND` on a serv
 - THEN nothing is written for it and nothing is reported (src/sync.rs `an_add_accepted_without_a_handle_stays_pending`)
 
 ### Requirement: Another message under a held Message-ID is minted apart
-A member whose hint the collection holds under an item another source binds SHALL name that item only when its mail summary agrees with the item's on `subject`, `date` and `sender`, and SHALL otherwise be keyed by the identity minted over its handle (pimdir SYNC §6, §9, vectors/sync/93). The page's own naming applies it to an offered copy it would land; the write applies it to every upsert binding a new source to an item another source binds, since a page before the last and an upgrade name their members against this source's holders alone (pimdir SYNC §10).
+A message SHALL agree with any row holding its key, a pending create of this source, a live item other sources or none bind, a tombstone or a retained row, before it is landed, joined or revived: on `subject`, `date` and `sender`, byte for byte, `NULL` matching `NULL`, and with a retained row on `size` too where both state one (`summary::same_message`, `same_retained_message`). One disagreeing SHALL be keyed by the identity minted over its handle, minted again over a held key, never joined, landed nor revived (pimdir STORAGE §9, SYNC §6, vectors/sync/93, 109, 110, 111). An `Add` over a disagreeing tombstone or retained row is minted, over a live one still refused; a `Copy` or a `Move` is minted; a create staged under its key's provisional handle moves to the minted key's. The page's own naming applies it to a pending create it would land; the write applies it to every upsert naming a new handle of a mail collection whichever step named it, against the rows the batch's load reads and the retained row under the key, since a step names its members against this source's holders alone where its load shows no other (pimdir SYNC §10, STORAGE §14).
 
 #### Scenario: Another message reusing the identifier
 - GIVEN source a holding `basic-1@example.org`, the stand-up notes
 - WHEN source b writes a member under that key whose summary names another subject and sender
 - THEN b's member is keyed `dup:basic-1@example.org#77` and a's item is left as it was; the same message served by b joins a's item (tests/another_message.rs)
 
+#### Scenario: A retained message under its identifier
+- GIVEN `basic-1@example.org` retained with its body, 299 octets
+- WHEN a round lists a member under that key naming another subject, or the same one at 4096 octets, or an `Add` stages another message under it
+- THEN the member is keyed `dup:basic-1@example.org#<handle>`, the create `dup:basic-1@example.org#\u{1}basic-1@example.org` under its own provisional handle, and the retained row stays in the trash as it was (vectors/sync/109, 110; tests/another_message.rs `an_add_of_another_message_over_a_retained_one_is_minted_apart`)
+
 ### Requirement: A body is verified before it is pushed
-Before a chunk is pushed, the sync SHALL yield `PimdirYield::WantsVerify` with every body its changes upload (an `Add` holding no origin, an `Update`), answered by `PimdirArg::Verified`, the bodies whose blob reads whole and hashes to its name (`PimdirSourceStore::verify`, pimdir STORAGE §7). A change whose body is missing or corrupt SHALL be withheld, its placement left as the merge wrote it, and counted in `PimdirSyncReport::unreadable` (vectors/sync/94).
+Before a chunk is pushed, the sync SHALL yield `PimdirYield::WantsVerify` with every body its changes upload (an `Add` holding no origin, an `Update`), answered by `PimdirArg::Verified`, the bodies whose blob reads whole and hashes to its name (`PimdirSourceStore::verify`, pimdir STORAGE §7). A change whose body is missing or corrupt SHALL be withheld, its placement left as the merge wrote it, and counted in `PimdirSyncReport::unreadable` (vectors/sync/94); the owner answering the verification moves a body failing its name into quarantine/ (store.md).
 
 ### Requirement: An event follows its commit
 A sync SHALL report an event only once the write recording it has been answered, and every event of an answered write (pimdir SYNC §5): the events derived for a batch wait in the coroutine and move to the report when the write is answered, so a run whose write fails reports nothing of it.
@@ -433,6 +446,14 @@ A placement present on both sides with no base SHALL merge its flags as the unio
 ### Requirement: A mass absence parks the round
 A round's last page finding absent more than half of the based bindings of the source in the round's scope, counted as the deletes are, SHALL NOT close the round when those bindings number at least 20 (`PimdirParked::MASS_ABSENCE`), unless the run carries `PimdirSyncOptions::accept_absences` (pimdir SYNC §5, vectors/sync/77, 78). It drops nothing and writes no `CloseRound`: the page lands as a page before the last, its members named and stamped, its checkpoint recorded with no cursor, and `PimdirSyncReport::parked` carries the absent and the bound counts. A round that held a cursor is drawn anew in that write, so the next run lists it from its first page and decides again. `accept_absences` is per run and never stored.
 
+### Requirement: An empty listing parks
+A round that named no member, none of its pages nor heads listing one in this run nor an earlier run's page stamping a binding with its id, SHALL NOT close while it finds absent any based binding of its source, whatever their number, unless the run carries `accept_absences`: it parks as a mass absence does, reported in `PimdirSyncReport::parked` with the absent and the bound counts (pimdir SYNC §5, vectors/sync/106). A listing naming nothing is an emptied collection or a failing connector alike, and only the caller can tell them apart. Whether an earlier run's page named a member is read from the store: a based binding in the round's scope, whose absence its listing could prove, that the store does not answer unstamped. `PimdirParked::guard(absent, bound, named, accepted)` decides both parks.
+
+#### Scenario: Nineteen cards and an empty answer
+- GIVEN an address book of 19 based cards
+- WHEN a round's one page lists nothing
+- THEN nothing is dropped, the page lands with its checkpoint and no cursor, and the run reports 19 absent of 19 (vectors/sync/106; resumed across runs, tests/scoped_sync.rs `a_resumed_round_naming_no_member_parks` and `a_resumed_round_an_earlier_page_named_closes_on_an_empty_last_page`)
+
 ### Requirement: A delta page is the last
 A delta page (not `complete`) that is not `last` SHALL complete the sync with `PimdirArgError::UnresumablePage`, writing nothing of it: a delta is one page, always the last, and its checkpoint would claim the changes the pages it says follow list (pimdir SYNC §4; sync-audit S12).
 
@@ -459,3 +480,19 @@ A mutable member listed at a revision with no body that lands a pending create h
 #### Scenario: The vectors
 - vectors/sync 97 (the landing under `prefer-local`) and 98 (the upgrade fetching the staged body clears), tests/vectors_sync.rs
 - src/upgrade.rs `an_unread_fetch_landing_a_mutable_create_conflicts`, `a_fetched_body_other_than_the_create_conflicts`
+
+### Requirement: No policy settles against an unread body
+A divergence where either body is unread SHALL be recorded as `Manual` records one, whatever the policy (pimdir SYNC §5, §6, §9). On the content axis, `PreferLocal` meeting a member that carries no body marks the binding conflicted at the observed revision with no `conflict_object`, reports `Conflicted` and pushes nothing; the upgrade fetching that body settles it by the source's policy ([upgrade](upgrade.md)). Between sources, the write records an unread divergence on the item whatever the collection's `conflict`; the upgrade reading the incoming body settles it by that policy, and the fill reading the item's own settles a `prefer-` one ([hub](hub.md)). `PreferRemote`'s pull of an unread body is unchanged: it writes nothing to the remote and keeps the local edit.
+
+#### Scenario: A server edit nobody read
+- GIVEN a local edit `c2` over `c1` at `r1`, and a listing at `r2` carrying no body, under `prefer-local`
+- WHEN the collection is synced
+- THEN the binding is conflicted at `r2` with no `conflict_object`, `Conflicted` is reported and nothing is pushed (vectors/sync/15; src/sync.rs `prefer_local_over_an_unread_body_records_the_conflict`)
+
+### Requirement: PreferLocal keeps the body it pushes over
+Before `PreferLocal` pushes over a body a member carried, the engine SHALL keep that body as a retained item, reported `Overruled`, in a write committed before the push (pimdir SYNC §5, §9): the binding is recorded conflicted with the member's body as its `conflict_object`, an `Overrule` keeps it as an overruling edit keeps a diverging body, and the placement is upserted with its base on that body at the observed revision, the conflict cleared; the merge hands this write over before any push chunk, and the local body is then pushed as an `Update` gated on that revision. A push rejected, interrupted or replayed finds the body kept and the base moved, so the next run pushes again gated on the same revision and keeps nothing twice; one that landed unrecorded is read back as a carried body equal to the edit. The flag axis merges on the placement the keep wrote.
+
+#### Scenario: The member carries the server body
+- GIVEN a local edit `c2` over `c1` at `r1`, and a listing at `r2` carrying `c3`, under `prefer-local`
+- WHEN the collection is synced
+- THEN `c3` is a retained item under `dup:<link>#a.vcf`, reported `Overruled`, `c2` is pushed gated on `r2` and, accepted at `r3`, becomes the base (vectors/sync/117; src/sync.rs `prefer_local_keeps_the_body_it_overwrites`, `a_rejected_prefer_local_push_keeps_its_body_once`)

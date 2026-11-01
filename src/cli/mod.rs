@@ -1,12 +1,12 @@
 //! The `pimdir` command tree, one module per verb group.
 //!
 //! Each module owns one group of subcommands ([`collection`], [`item`],
-//! [`queue`], [`store`], [`check`], [`gc`], [`export`], [`search`]) and
-//! renders its own output as both text and JSON, with [`json_schema`]
-//! indexing every output type. This module holds what they share: the
-//! global store flags, the roles a verb may open the store with, the
-//! error mapping, the confirmation prompt guarding destructive verbs and
-//! the formatting helpers.
+//! [`queue`], [`store`], [`check`], [`gc`], [`quarantine`], [`export`],
+//! [`search`]) and renders its own output as both text and JSON, with
+//! [`json_schema`] indexing every output type. This module holds what they
+//! share: the global store flags, the roles a verb may open the store with,
+//! the error mapping, the confirmation prompt guarding destructive verbs
+//! and the formatting helpers.
 //!
 //! The modules hang off the binary crate root rather than the library's
 //! `lib.rs`: the command structs are the binary's business, so the
@@ -18,6 +18,7 @@ pub mod export;
 pub mod gc;
 pub mod item;
 pub mod json_schema;
+pub mod quarantine;
 pub mod queue;
 pub mod search;
 pub mod store;
@@ -97,8 +98,7 @@ impl StoreFlags {
     /// Fails when another process owns the store (spec §8): a verb that
     /// destroys or repairs has nothing useful to do without the role. Opened
     /// as the store stands (`open_current`): this tool is never the store's
-    /// sync engine, so it never migrates nor reconciles a store another
-    /// revision keeps, and refuses it instead.
+    /// sync engine, so it never creates one.
     pub fn owner(&self) -> Result<PimdirStore> {
         self.ensure_store()?;
         PimdirStore::open_current(&self.store).map_err(report)
@@ -106,9 +106,9 @@ impl StoreFlags {
 
     /// The owner role when it is free, `None` when another process holds it:
     /// what a verb that can leave its work queued reports instead of failing.
-    /// Opened as the store stands, as [`owner`](Self::owner): a store of
-    /// another revision is `None` too, its work left queued for the sync
-    /// engine that brings the store to its schema.
+    /// Opened as the store stands, as [`owner`](Self::owner): a store holding
+    /// no schema yet is `None` too, its work left queued for the sync engine
+    /// that creates it.
     pub fn owner_if_free(&self) -> Result<Option<PimdirStore>> {
         self.ensure_store()?;
         match PimdirStore::open_current(&self.store) {
@@ -173,11 +173,6 @@ pub fn report(err: PimdirError) -> anyhow::Error {
         PimdirError::Busy => {
             anyhow!(
                 "another writer holds the store lock (a sync is running?); retry once it releases"
-            )
-        }
-        PimdirError::Stale { missing } => {
-            anyhow!(
-                "this store was written by an earlier draft of the format and lacks {missing}: run or upgrade the store's sync engine"
             )
         }
         err => anyhow!(err),

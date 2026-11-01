@@ -4,9 +4,9 @@
 //!
 //! An object's name is its hash, so every process touching one store must
 //! compute the same value: a disagreement writes blobs no other reader
-//! finds, and it fails silently, as a dedup that never dedups. The store
-//! therefore records its algorithm in `store_meta.hash_algo` (spec §4.3)
-//! and hands the digest out, rather than leaving each consumer to pick.
+//! finds, and it fails silently, as a dedup that never dedups. The format
+//! names one algorithm, BLAKE3 at its default 32 bytes, which the store
+//! records in `store_meta.hash_algo` (§4.3).
 //!
 //! The encoding is part of the contract: lowercase base32 (RFC 4648, no
 //! padding), because the hash is also a path component and a
@@ -14,99 +14,49 @@
 //! everywhere. Hex would work on Linux and collide on a
 //! case-insensitive filesystem.
 
-use alloc::{boxed::Box, string::String, vec::Vec};
-
-use sha2::{Digest, Sha256};
+use alloc::{boxed::Box, string::String};
 
 use crate::object::PimdirHash;
 
-/// The hash a store names its objects by (STORAGE §5).
+/// The algorithm `store_meta.hash_algo` names (STORAGE §5): a store naming
+/// another is refused.
+pub const HASH_ALGO: &str = "blake3";
+
+/// The content hash of a whole body.
+pub fn hash(bytes: &[u8]) -> PimdirHash {
+    let mut hasher = PimdirHasher::new();
+    hasher.update(bytes);
+    hasher.finish()
+}
+
+/// An incremental BLAKE3 hasher over a body's bytes, for a body streamed
+/// into the blob store rather than held whole in memory (STORAGE §14's
+/// byteless `StoreObject`).
 ///
-/// Recorded in `store_meta.hash_algo` when the store is created.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PimdirHashAlgo {
-    /// BLAKE3, the whole 256-bit digest, which the spec recommends.
-    #[default]
-    Blake3,
-    /// SHA-256 truncated to its first 128 bits, for a consumer whose
-    /// platform ships SHA-256 and would otherwise bundle a BLAKE3
-    /// implementation (the Android app takes this one).
-    ///
-    /// Content addressing needs collision resistance, not signature
-    /// strength, and a 26-character name keeps the blob paths short.
-    Sha256_128,
-}
-
-impl PimdirHashAlgo {
-    /// The spelling `store_meta.hash_algo` carries.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Blake3 => "blake3",
-            Self::Sha256_128 => "sha256-128",
-        }
-    }
-
-    /// The algorithm a stored spelling names, or `None` for one this
-    /// crate does not implement, which a caller reports rather than
-    /// guessing around.
-    pub fn parse(algo: &str) -> Option<Self> {
-        match algo {
-            "blake3" => Some(Self::Blake3),
-            "sha256-128" => Some(Self::Sha256_128),
-            _ => None,
-        }
-    }
-
-    /// The content hash of a whole body.
-    pub fn hash(&self, bytes: &[u8]) -> PimdirHash {
-        let mut hasher = self.hasher();
-        hasher.update(bytes);
-        hasher.finish()
-    }
-
-    /// An incremental hasher, for a body streamed into the blob store
-    /// rather than held whole in memory (spec §14's byteless
-    /// `StoreObject`).
-    pub fn hasher(&self) -> PimdirHasher {
-        match self {
-            Self::Blake3 => PimdirHasher::Blake3(Box::new(blake3::Hasher::new())),
-            Self::Sha256_128 => PimdirHasher::Sha256_128(Sha256::new()),
-        }
-    }
-}
-
-/// An incremental hasher over a body's bytes.
-///
-/// Made by [`hasher`](PimdirHashAlgo::hasher), for a body streamed into
-/// the blob store.
-pub enum PimdirHasher {
-    /// A BLAKE3 digest in progress, boxed: its state is nearly two
-    /// kilobytes, which would otherwise size every hasher this enum
-    /// hands out.
-    Blake3(Box<blake3::Hasher>),
-    /// A SHA-256 digest in progress, truncated when it finishes.
-    Sha256_128(Sha256),
-}
+/// Its state is boxed: it is nearly two kilobytes, which would otherwise
+/// size every value holding a hasher.
+pub struct PimdirHasher(Box<blake3::Hasher>);
 
 impl PimdirHasher {
+    /// A hasher over no bytes yet.
+    pub fn new() -> Self {
+        Self(Box::new(blake3::Hasher::new()))
+    }
+
     /// Feeds the next bytes of the body.
     pub fn update(&mut self, bytes: &[u8]) {
-        match self {
-            Self::Blake3(hasher) => {
-                hasher.update(bytes);
-            }
-            Self::Sha256_128(hasher) => hasher.update(bytes),
-        }
+        self.0.update(bytes);
     }
 
     /// The finished hash, as the object store names it.
     pub fn finish(self) -> PimdirHash {
-        let digest: Vec<u8> = match self {
-            Self::Blake3(hasher) => hasher.finalize().as_bytes().to_vec(),
-            Self::Sha256_128(hasher) => hasher.finalize()[..16].to_vec(),
-        };
+        PimdirHash(base32(self.0.finalize().as_bytes()))
+    }
+}
 
-        PimdirHash(base32(&digest))
+impl Default for PimdirHasher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -140,19 +90,7 @@ fn base32(digest: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn sha256_128_matches_the_shape_every_implementation_must_agree_on() {
-        // NOTE: pinned against the Android app's PimdirHash, which
-        // computes the same name in Java. A disagreement here does not
-        // fail loudly, it writes blobs the other never finds.
-        let hash = PimdirHashAlgo::Sha256_128.hash(b"pimdir");
-        assert_eq!(hash.0.len(), 26);
-        assert!(hash.0.chars().all(|c| ALPHABET_CHARS.contains(c)));
-    }
-
-    const ALPHABET_CHARS: &str = "abcdefghijklmnopqrstuvwxyz234567";
+    use crate::hash::*;
 
     #[test]
     fn base32_encodes_rfc_4648_vectors_lowercased() {
@@ -167,23 +105,19 @@ mod tests {
 
     #[test]
     fn a_streamed_body_hashes_like_a_whole_one() {
-        for algo in [PimdirHashAlgo::Blake3, PimdirHashAlgo::Sha256_128] {
-            let mut hasher = algo.hasher();
-            hasher.update(b"BEGIN:VCARD\r\n");
-            hasher.update(b"UID:x\r\nEND:VCARD\r\n");
-            assert_eq!(
-                hasher.finish(),
-                algo.hash(b"BEGIN:VCARD\r\nUID:x\r\nEND:VCARD\r\n")
-            );
-        }
+        let mut hasher = PimdirHasher::new();
+        hasher.update(b"BEGIN:VCARD\r\n");
+        hasher.update(b"UID:x\r\nEND:VCARD\r\n");
+        assert_eq!(
+            hasher.finish(),
+            hash(b"BEGIN:VCARD\r\nUID:x\r\nEND:VCARD\r\n")
+        );
     }
 
     #[test]
-    fn the_algorithms_round_trip_through_their_stored_spelling() {
-        for algo in [PimdirHashAlgo::Blake3, PimdirHashAlgo::Sha256_128] {
-            assert_eq!(PimdirHashAlgo::parse(algo.as_str()), Some(algo));
-        }
-        assert_eq!(PimdirHashAlgo::parse("md5"), None);
-        assert_eq!(PimdirHashAlgo::default(), PimdirHashAlgo::Blake3);
+    fn a_name_is_52_characters_of_the_alphabet() {
+        let name = hash(b"pimdir").0;
+        assert_eq!(name.len(), 52);
+        assert!(name.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')));
     }
 }

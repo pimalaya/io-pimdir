@@ -3,9 +3,7 @@
 //! The canonical consumer of [`PimdirIndexRefresh`]: every yield answered
 //! and every op written through the canonical statements of SEARCH.md and
 //! STORAGE.md (with the crate's own beside them), on index.db with the
-//! store attached as `store`, inside the run's one transaction. What the
-//! store is read through goes through [`StoreShape`], so a store an older
-//! release wrote is read as its reconciliation would leave it.
+//! store attached as `store`, inside the run's one transaction.
 //!
 //! [`PimdirIndexRefresh`]: crate::search::refresh::PimdirIndexRefresh
 
@@ -15,18 +13,20 @@ use alloc::{
     vec::Vec,
 };
 
+use log::trace;
 use rusqlite::{Connection, OptionalExtension, Transaction, named_params};
 
 use crate::{
-    client::{PimdirError, blobs::PimdirBlobs, rows, schema::StoreShape, write::tables_of},
+    client::{PimdirError, bind_list, blobs::PimdirBlobs, rows, write::tables_of},
     codec,
     object::PimdirHash,
     placement::PimdirLinkId,
     search::refresh::{
-        PimdirIndexFeedRow, PimdirIndexGone, PimdirIndexHorizon, PimdirIndexKey,
-        PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexMeta, PimdirIndexObject,
-        PimdirIndexOp, PimdirIndexPlacement, PimdirIndexPresence, PimdirIndexRefreshArg,
-        PimdirIndexRefreshYield, PimdirIndexSummary, PimdirIndexText,
+        PimdirIndexFeedRow, PimdirIndexGone, PimdirIndexGonePlacement, PimdirIndexHorizon,
+        PimdirIndexKey, PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexMeta,
+        PimdirIndexObject, PimdirIndexOp, PimdirIndexPlacement, PimdirIndexPresence,
+        PimdirIndexRefreshArg, PimdirIndexRefreshYield, PimdirIndexSummary, PimdirIndexText,
+        PimdirIndexThreadRow,
     },
     sql::{self, search},
     summary::{PimdirAddress, PimdirAddressRole, PimdirSummary},
@@ -35,7 +35,6 @@ use crate::{
 /// The canonical statements over one refresh transaction.
 pub(crate) struct Statements<'a> {
     pub(crate) tx: &'a Transaction<'a>,
-    pub(crate) shape: StoreShape,
     pub(crate) blobs: &'a PimdirBlobs,
 }
 
@@ -56,15 +55,17 @@ impl Statements<'_> {
                 old,
                 new,
                 tzdb_version,
+                floating_zone,
             } => PimdirIndexRefreshArg::Reexpand(rows(
                 tx,
-                &self.shape.sql(tx, search::ITEMS_TO_REEXPAND)?,
+                search::ITEMS_TO_REEXPAND,
                 named_params! {
                     ":old_start": old.start,
                     ":old_end": old.end,
                     ":new_start": new.start,
                     ":new_end": new.end,
                     ":tzdb_version": tzdb_version,
+                    ":floating_zone": floating_zone,
                 },
                 |r| {
                     Ok(PimdirIndexKey {
@@ -79,11 +80,8 @@ impl Statements<'_> {
                     named_params! { ":since": since, ":limit": limit as i64 },
                 )?)
             }
-            PimdirIndexRefreshYield::WantsUnread { limit } => {
-                PimdirIndexRefreshArg::Feed(self.feed(
-                    search::LOAD_UNREAD_BODIES,
-                    named_params! { ":limit": limit as i64 },
-                )?)
+            PimdirIndexRefreshYield::WantsMissing => {
+                PimdirIndexRefreshArg::Feed(self.feed(search::LOAD_MISSING_ITEMS, &[])?)
             }
             PimdirIndexRefreshYield::WantsHeld {
                 placements,
@@ -120,7 +118,7 @@ impl Statements<'_> {
                     if !kinds.contains_key(&key.collection) {
                         let kind: Option<String> = tx
                             .query_row(
-                                &self.shape.sql(tx, sql::LOAD_KIND)?,
+                                sql::LOAD_KIND,
                                 named_params! { ":collection": key.collection },
                                 |r| r.get(0),
                             )
@@ -128,7 +126,7 @@ impl Statements<'_> {
                         kinds.insert(key.collection.clone(), kind.unwrap_or_default());
                     }
                     let kind = &kinds[&key.collection];
-                    let read = summary(tx, self.shape, &key.collection, key.seq, kind)?;
+                    let read = summary(tx, &key.collection, key.seq, kind)?;
                     found.insert(key, read);
                 }
                 PimdirIndexRefreshArg::Summaries(found)
@@ -141,17 +139,33 @@ impl Statements<'_> {
                 }
                 PimdirIndexRefreshArg::Messages(read)
             }
-            PimdirIndexRefreshYield::WantsGone => {
-                let keys = rows(tx, &self.shape.sql(tx, search::PLACEMENTS_GONE)?, [], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                })?;
-                let mut placements = Vec::new();
-                for (collection, seq) in keys {
-                    placements.extend(self.placement(&collection, seq)?);
+            PimdirIndexRefreshYield::WantsThreadRows { threads } => {
+                let mut read = Vec::new();
+                for thread in threads {
+                    read.extend(rows(
+                        tx,
+                        search::THREAD_ROWS,
+                        named_params! { ":thread": thread },
+                        |r| {
+                            Ok(PimdirIndexThreadRow {
+                                link_id: r.get(0)?,
+                                parent: r.get(1)?,
+                                sort_key: r.get(2)?,
+                            })
+                        },
+                    )?);
                 }
-                let objects = rows(tx, &self.shape.sql(tx, search::OBJECTS_GONE)?, [], |r| {
-                    Ok(PimdirHash(r.get(0)?))
+                PimdirIndexRefreshArg::ThreadRows(read)
+            }
+            PimdirIndexRefreshYield::WantsGone => {
+                let placements = rows(tx, search::PLACEMENTS_GONE, [], |r| {
+                    Ok(PimdirIndexGonePlacement {
+                        collection: r.get(0)?,
+                        seq: r.get(1)?,
+                        link_id: PimdirLinkId(r.get(2)?),
+                    })
                 })?;
+                let objects = rows(tx, search::OBJECTS_GONE, [], |r| Ok(PimdirHash(r.get(0)?)))?;
                 PimdirIndexRefreshArg::Gone(PimdirIndexGone {
                     placements,
                     objects,
@@ -167,8 +181,7 @@ impl Statements<'_> {
         Ok(arg)
     }
 
-    /// The index's `index_meta` with the store's change cursor and whether
-    /// a collection moved above the last completed pass.
+    /// The index's `index_meta` with the store's change cursor.
     fn meta(&self) -> Result<PimdirIndexMeta, PimdirError> {
         let tx = self.tx;
         let mut meta = tx.query_row(search::LOAD_INDEX_META, [], |r| {
@@ -177,22 +190,15 @@ impl Statements<'_> {
             Ok(PimdirIndexMeta {
                 store_change: r.get(2)?,
                 store_purges: r.get(3)?,
-                store_reconciled: r.get(7)?,
                 horizon: (!start.is_empty() && !end.is_empty())
                     .then_some(PimdirIndexHorizon { start, end }),
                 tzdb_version: r.get(6)?,
+                floating_zone: r.get(11)?,
                 ..Default::default()
             })
         })?;
         (meta.head, meta.purges) =
-            tx.query_row(&self.shape.sql(tx, sql::LOAD_CHANGE_CURSOR)?, [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?;
-        meta.moved = tx.query_row(
-            &self.shape.sql(tx, search::COLLECTIONS_MOVED)?,
-            named_params! { ":since": meta.store_reconciled },
-            |r| r.get(0),
-        )?;
+            tx.query_row(sql::LOAD_CHANGE_CURSOR, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(meta)
     }
 
@@ -204,7 +210,7 @@ impl Statements<'_> {
         params: &[(&str, &dyn rusqlite::ToSql)],
     ) -> Result<Vec<PimdirIndexFeedRow>, PimdirError> {
         let tx = self.tx;
-        let mut feed = rows(tx, &self.shape.sql(tx, statement)?, params, |r| {
+        let mut feed = rows(tx, statement, params, |r| {
             Ok(PimdirIndexFeedRow {
                 collection: r.get(0)?,
                 link_id: PimdirLinkId(r.get(1)?),
@@ -221,13 +227,7 @@ impl Statements<'_> {
         })?;
         for row in &mut feed {
             if row.needs_summary() {
-                row.summary = Some(summary(
-                    tx,
-                    self.shape,
-                    &row.collection,
-                    row.seq,
-                    &row.kind,
-                )?);
+                row.summary = Some(summary(tx, &row.collection, row.seq, &row.kind)?);
             }
         }
         Ok(feed)
@@ -294,7 +294,7 @@ impl Statements<'_> {
             .optional()?;
         let children = rows(tx, search::MESSAGE_CHILDREN, key, |r| r.get(0))?;
         let (count, sort_key, first, last): (i64, Option<String>, Option<String>, Option<String>) =
-            tx.query_row(&self.shape.sql(tx, search::MESSAGE_PRESENCE)?, key, |r| {
+            tx.query_row(search::MESSAGE_PRESENCE, key, |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
         let hash = tx
@@ -302,11 +302,7 @@ impl Statements<'_> {
             .optional()?
             .map(PimdirHash);
         let in_reply_to = tx
-            .query_row(
-                &self.shape.sql(tx, search::MESSAGE_IN_REPLY_TO)?,
-                key,
-                |r| r.get(0),
-            )
+            .query_row(search::MESSAGE_IN_REPLY_TO, key, |r| r.get(0))
             .optional()?;
 
         Ok(PimdirIndexMessage {
@@ -390,9 +386,14 @@ impl Statements<'_> {
                 collection,
                 seq,
                 occurrences,
+                cut,
             } => {
                 let key = named_params! { ":collection": collection, ":seq": seq };
                 tx.execute(search::REPLACE_OCCURRENCES, key)?;
+                tx.execute(
+                    search::SET_CUT,
+                    named_params! { ":cut": cut, ":collection": collection, ":seq": seq },
+                )?;
                 for occurrence in occurrences {
                     tx.execute(
                         search::INSERT_OCCURRENCE,
@@ -415,11 +416,23 @@ impl Statements<'_> {
                     named_params! { ":link_id": link_id, ":thread": thread, ":parent": parent },
                 )?;
             }
-            PimdirIndexOp::DropMessage(link_id) => {
+            PimdirIndexOp::PutMissing(key) => {
                 tx.execute(
-                    search::DELETE_MESSAGE,
-                    named_params! { ":link_id": link_id },
+                    search::INSERT_MISSING,
+                    named_params! { ":collection": key.collection, ":seq": key.seq },
                 )?;
+            }
+            PimdirIndexOp::DropMissing(key) => {
+                tx.execute(
+                    search::DELETE_MISSING,
+                    named_params! { ":collection": key.collection, ":seq": key.seq },
+                )?;
+            }
+            PimdirIndexOp::PruneThread(thread) => {
+                let key = named_params! { ":thread": thread };
+                tx.execute(search::UNPARENT_MESSAGES, key)?;
+                let pruned: Vec<String> = rows(tx, search::PRUNE_MESSAGES, key, |r| r.get(0))?;
+                trace!("pruned {} message row(s) of thread {thread}", pruned.len());
             }
             PimdirIndexOp::PutThread {
                 id,
@@ -438,19 +451,17 @@ impl Statements<'_> {
                 )?;
             }
             PimdirIndexOp::DropThread(id) => {
-                tx.execute(search::DELETE_THREAD_UNUSED, named_params! { ":id": id })?;
+                tx.execute(search::DELETE_THREAD, named_params! { ":id": id })?;
             }
             PimdirIndexOp::SetCursor {
                 store_change,
                 store_purges,
-                store_reconciled,
             } => {
                 tx.execute(
                     search::SET_INDEX_CURSOR,
                     named_params! {
                         ":store_change": store_change,
                         ":store_purges": store_purges,
-                        ":store_reconciled": store_reconciled,
                     },
                 )?;
             }
@@ -467,6 +478,12 @@ impl Statements<'_> {
                 tx.execute(
                     search::SET_TZDB_VERSION,
                     named_params! { ":tzdb_version": version },
+                )?;
+            }
+            PimdirIndexOp::SetFloatingZone(zone) => {
+                tx.execute(
+                    search::SET_FLOATING_ZONE,
+                    named_params! { ":floating_zone": zone },
                 )?;
             }
         }
@@ -555,12 +572,9 @@ impl Statements<'_> {
 }
 
 /// One live item's summary as the fold reads it (SEARCH §6): its summary
-/// row by key, a seek on each statement where the load statements
-/// filtered by the `links` slot scan the whole collection, its lists, and
-/// its address rows.
+/// row by key, a seek on each statement, its lists, and its address rows.
 pub(crate) fn summary(
     conn: &Connection,
-    shape: StoreShape,
     collection: &str,
     seq: i64,
     kind: &str,
@@ -570,7 +584,7 @@ pub(crate) fn summary(
     let mut found = None;
     for table in tables_of(kind) {
         let item = conn
-            .prepare(&shape.sql(conn, table.get_sql())?)?
+            .prepare(table.get_sql())?
             .query_row(key, |row| {
                 Ok((row.get::<_, String>(1)?, table.read_row(row, 6)?))
             })
@@ -589,28 +603,23 @@ pub(crate) fn summary(
     };
 
     let item = named_params! { ":collection": collection, ":link_id": link_id };
+    let collection = named_params! { ":collection": collection };
     match &mut found {
         Some(PimdirSummary::Mail(mail)) => {
-            mail.in_reply_to = rows(
-                conn,
-                &shape.sql(conn, search::LOAD_ITEM_IN_REPLY_TO)?,
-                item,
-                |r| r.get(0),
-            )?;
+            bind_list(conn, "links", [&link_id])?;
+            mail.in_reply_to = rows(conn, sql::LOAD_IN_REPLY_TO_BY_LINK, collection, |r| {
+                r.get(2)
+            })?;
         }
         Some(PimdirSummary::Task(task)) => {
-            task.categories = rows(
-                conn,
-                &shape.sql(conn, search::LOAD_ITEM_CATEGORIES)?,
-                item,
-                |r| r.get(0),
-            )?;
+            bind_list(conn, "links", [&link_id])?;
+            task.categories = rows(conn, sql::LOAD_CATEGORIES_BY_LINK, collection, |r| r.get(2))?;
         }
         _ => (),
     }
 
     let mut addresses = Vec::new();
-    let read = rows(conn, &shape.sql(conn, sql::LOAD_ADDRESSES)?, item, |r| {
+    let read = rows(conn, sql::LOAD_ADDRESSES, item, |r| {
         Ok((
             r.get::<_, String>(0)?,
             PimdirAddress {

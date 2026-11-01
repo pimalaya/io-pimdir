@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
+    fs::{self, File},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -250,14 +250,67 @@ impl Drop for PimdirLock {
     }
 }
 
-/// Opens (creating if absent) a lock file.
-fn open(path: &Path) -> Result<File, PimdirError> {
-    Ok(OpenOptions::new()
+/// Opens (creating if absent, `0600`) a lock file without following a
+/// link (STORAGE §18): `O_NOFOLLOW` refuses one, which is
+/// [`PimdirError::Exposed`] naming it, since a process able to read the
+/// store directory could otherwise point the lock at a file it holds.
+#[cfg(unix)]
+pub(crate) fn open(path: &Path) -> Result<File, PimdirError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR) {
+        Ok(fd) => Ok(File::from(fd)),
+        Err(_) if is_link(path) => Err(PimdirError::Exposed(path.to_path_buf())),
+        Err(err) => Err(std::io::Error::from(err).into()),
+    }
+}
+
+/// Opens (creating if absent) a lock file without following a link
+/// (STORAGE §18): `FILE_FLAG_OPEN_REPARSE_POINT` opens a link itself rather
+/// than its target, and one opened so is [`PimdirError::Exposed`] naming
+/// it.
+#[cfg(windows)]
+pub(crate) fn open(path: &Path) -> Result<File, PimdirError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` of winbase.h, which std does not name.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_type().is_symlink() {
+        return Err(PimdirError::Exposed(path.to_path_buf()));
+    }
+
+    Ok(file)
+}
+
+/// Opens (creating if absent) a lock file, refusing a link found there
+/// before the open (STORAGE §18) where no link-free open exists.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open(path: &Path) -> Result<File, PimdirError> {
+    if is_link(path) {
+        return Err(PimdirError::Exposed(path.to_path_buf()));
+    }
+
+    Ok(fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(path)?)
+}
+
+/// Whether a symbolic link sits at `path`.
+#[cfg(not(windows))]
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
 #[cfg(test)]

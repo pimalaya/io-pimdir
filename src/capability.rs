@@ -42,12 +42,12 @@ pub const MAIL_SUBMIT: &str = "mail.submit";
 pub const MAIL_SUBMIT_COPY: &str = "mail.submit.copy";
 
 /// Creating a collection on the source's server, the `collection-create`
-/// intent (Annex B.2): the one capability without a domain, declared for
-/// every kind.
+/// intent (Annex B.2): its domain, `collection`, holds for every kind, so
+/// it is declared whatever kinds the source syncs.
 pub const COLLECTION_CREATE: &str = "collection.create";
 
-/// Every Annex B capability of the mail domain, what a declaration of a
-/// mail source writes whole (§15.6).
+/// Every capability of Annex B's base set in the mail domain, what a
+/// declaration of a mail source writes whole (§15.6).
 pub const MAIL: &[&str] = &[
     MAIL_MESSAGE_ADD,
     MAIL_MESSAGE_COPY,
@@ -74,7 +74,7 @@ pub const CONTACTS_CARD_MOVE: &str = "contacts.card.move";
 /// Copying a card into another address book.
 pub const CONTACTS_CARD_COPY: &str = "contacts.card.copy";
 
-/// Every Annex B capability of the contacts domain.
+/// Every capability of Annex B's base set in the contacts domain.
 pub const CONTACTS: &[&str] = &[
     CONTACTS_CARD_ADD,
     CONTACTS_CARD_UPDATE,
@@ -100,10 +100,10 @@ pub const CALENDAR_OCCURRENCE_UPDATE: &str = "calendar.occurrence.update";
 pub const CALENDAR_SCHEDULING: &str = "calendar.scheduling";
 /// Creating an online meeting with the resource that asks for one.
 pub const CALENDAR_ONLINE_MEETING: &str = "calendar.online-meeting";
-/// Whether a calendar collection takes VTODO resources (STORAGE §15.6): an
-/// application capability the store reads only where a row states it, `none`
-/// meaning the collection refuses tasks and no row refusing nothing.
-pub const X_VTODO: &str = "x-vtodo";
+/// Whether a calendar collection takes VTODO resources (STORAGE §15.6):
+/// outside the base set, read only where a row states it, `none` meaning
+/// the collection refuses tasks and no row refusing nothing.
+pub const CALENDAR_COMPONENT_VTODO: &str = "calendar.component.vtodo";
 /// Replying to an invitation, the `calendar-reply` intent.
 pub const CALENDAR_REPLY: &str = "calendar.reply";
 /// Cancelling an event the account organises, the `calendar-cancel` intent.
@@ -113,7 +113,9 @@ pub const CALENDAR_REPLY_OCCURRENCE: &str = "calendar.reply.occurrence";
 /// Cancelling one occurrence, a `calendar-cancel` naming `recurrence_id`.
 pub const CALENDAR_CANCEL_OCCURRENCE: &str = "calendar.cancel.occurrence";
 
-/// Every Annex B capability of the calendar domain.
+/// Every capability of Annex B's base set in the calendar domain, what a
+/// declaration of a calendar source writes whole (§15.6):
+/// [`CALENDAR_COMPONENT_VTODO`] is written only where the owner knows it.
 pub const CALENDAR: &[&str] = &[
     CALENDAR_ITEM_ADD,
     CALENDAR_ITEM_UPDATE,
@@ -236,6 +238,23 @@ impl fmt::Display for PimdirRefusal {
 }
 
 impl core::error::Error for PimdirRefusal {}
+
+/// Whether `name` follows Annex B's grammar: lowercase words of letters,
+/// digits and hyphens joined by periods, the first beginning with a
+/// letter, as `set-performer`'s schema reads a capability (§15.3). An
+/// application's own begins with `x-`.
+pub fn is_name(name: &str) -> bool {
+    let mut words = name.split('.');
+    let first = words.next().unwrap_or_default();
+    let word = |word: &str| {
+        !word.is_empty()
+            && word
+                .bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+    };
+
+    first.starts_with(|char: char| char.is_ascii_lowercase()) && word(first) && words.all(word)
+}
 
 /// The capability an intent kind is bound to (Annex B.2), `None` for a
 /// kind outside the vocabulary.
@@ -373,23 +392,24 @@ pub fn check(
 }
 
 /// Whether a calendar resource is a VTODO one, the component its master is
-/// (Annex A.3), which `x-vtodo` gates.
+/// (Annex A.3), which [`CALENDAR_COMPONENT_VTODO`] gates.
 pub fn is_vtodo(body: &[u8]) -> bool {
     matches!(calendar::derive(body).summary, Some(PimdirSummary::Task(_)))
 }
 
 /// Checks that every source concerned takes a VTODO resource where it
-/// lands (STORAGE §15.6): one stating `x-vtodo` `none` there, or
-/// source-wide, refuses it; one stating nothing, declared or not, does not.
+/// lands (STORAGE §15.6): one stating [`CALENDAR_COMPONENT_VTODO`] `none`
+/// there, or source-wide, refuses it; one stating nothing, declared or
+/// not, does not.
 pub fn check_vtodo(sources: &[PimdirSourceCapabilities]) -> Result<(), PimdirRefusal> {
     for source in sources {
         if let Some((PimdirSupport::None, detail)) = source
             .declared
             .as_ref()
-            .and_then(|declared| declared.get(X_VTODO))
+            .and_then(|declared| declared.get(CALENDAR_COMPONENT_VTODO))
         {
             return Err(PimdirRefusal {
-                capability: X_VTODO.to_string(),
+                capability: CALENDAR_COMPONENT_VTODO.to_string(),
                 source: source.source.clone(),
                 detail: detail.clone(),
             });
@@ -553,5 +573,43 @@ mod tests {
         let partials = check(&needed, &[gmail]).unwrap();
         assert_eq!(partials.len(), 1);
         assert_eq!(partials[0].capability, MAIL_MESSAGE_REMOVE);
+    }
+
+    /// Annex B names 30 capabilities, each lowercase words joined by
+    /// periods, the first its domain, none an application's own.
+    #[test]
+    fn every_capability_follows_annex_bs_grammar_in_its_domain() {
+        let lists = [
+            ("mail", MAIL),
+            ("contacts", CONTACTS),
+            ("calendar", CALENDAR),
+            ("calendar", &[CALENDAR_COMPONENT_VTODO]),
+        ];
+
+        let mut names = BTreeSet::new();
+        for (domain, list) in lists {
+            for name in list {
+                let first = name.split('.').next().unwrap();
+                assert!(first == domain || first == "collection", "{name}");
+                assert!(is_name(name) && !name.starts_with("x-"), "{name}");
+                names.insert(*name);
+            }
+        }
+        assert_eq!(names.len(), 30);
+
+        for name in ["x-fax.send", "mail.submit.copy", "calendar.online-meeting"] {
+            assert!(is_name(name), "{name}");
+        }
+        for name in [
+            "Mail.Submit",
+            "mail..submit",
+            "mail.",
+            ".mail",
+            "1mail",
+            "",
+            "mail.sub mit",
+        ] {
+            assert!(!is_name(name), "{name:?}");
+        }
     }
 }

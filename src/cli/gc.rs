@@ -34,6 +34,7 @@ impl GcCommand {
             objects: collected.objects,
             blobs: collected.blobs,
             bytes: collected.bytes,
+            strays: collected.strays.len(),
         })
     }
 }
@@ -48,20 +49,32 @@ pub struct GcOutput {
     pub blobs: usize,
     /// Bytes they freed.
     pub bytes: u64,
+    /// Entries of objects/ that are no body, left in place: `pimdir check`
+    /// lists them.
+    pub strays: usize,
 }
 
 impl fmt::Display for GcOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.objects == 0 && self.blobs == 0 {
-            return writeln!(f, "Nothing to collect: every body is still referenced");
+            writeln!(f, "Nothing to collect: every body is still referenced")?;
+        } else {
+            writeln!(
+                f,
+                "Collected {} object(s) and {} blob file(s), freeing {}",
+                self.objects,
+                self.blobs,
+                bytes(self.bytes)
+            )?;
         }
 
-        writeln!(
-            f,
-            "Collected {} object(s) and {} blob file(s), freeing {}",
-            self.objects,
-            self.blobs,
-            bytes(self.bytes)
-        )
+        if self.strays > 0 {
+            writeln!(
+                f,
+                "Left {} entry(ies) under objects/ that are no body, see `pimdir check`",
+                self.strays
+            )?;
+        }
+        Ok(())
     }
 }

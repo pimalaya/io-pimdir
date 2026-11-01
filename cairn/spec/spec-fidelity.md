@@ -6,10 +6,18 @@ status: current
 
 # Spec fidelity
 
-The `sql` module is generated at build time from spec/, a byte-for-byte copy of the pimdir specification's migrations/storage/ and queries/storage/, so a consumer holding its own SQLite binding runs the format's own statements by name and nothing is transcribed. The spec lives in a separate repository, so nothing about the build notices when one moves and the other does not. This capability is what notices.
+The `sql` module is generated at build time from spec/, a byte-for-byte copy of the pimdir specification's migrations/ and queries/ at a pinned revision, so a consumer holding its own SQLite binding runs the format's own statements by name and nothing is transcribed. The suites proving the crate against the format read the vectors from the same copy. The spec lives in a separate repository, so nothing about the build notices when one moves and the other does not. This capability is what notices.
 
 ### Requirement: The vendored copy is the specification's, byte for byte
-spec/migrations/storage/ and spec/queries/storage/ SHALL be identical to the specification's directories of the same name, file by file and both ways, and tests/spec_drift.rs SHALL compare them whenever the spec checkout sits beside this one. Re-vendoring is a copy of the two directories; nothing under spec/ is edited here. The text copied is named by its draft number, `draft-04`, in README.md and CHANGELOG.md, and a re-vendoring from a later draft renames it there.
+spec/migrations/, spec/queries/, spec/vectors/ and spec/payloads/ SHALL be identical to the specification's directories of the same name at the revision spec/REVISION names (its full commit id, one line; pimdir d671bbd at storage-draft-08, sync-draft-07 and search-draft-08, branch audit-2026-10-31, untagged), file by file and both ways. tests/spec_drift.rs SHALL compare them with that revision read from the git history of a pimdir checkout beside this one, whatever branch its working tree is on, and SHALL check spec/vectors/ and spec/payloads/ against spec/vectors/manifest.json without any checkout: every listed file present under its SHA-256, none present and unlisted (but the manifest and the README), and each case file holding the number of cases the manifest counts, the sync cases included. Re-vendoring copies the four directories at one revision, deleting a file the revision lacks, and writes it to spec/REVISION; nothing under spec/ is edited here. The package leaves spec/vectors/ and spec/payloads/ out. The drafts the copy carries are named in README.md and CHANGELOG.md, and a re-vendoring from later drafts renames them there.
+
+#### Scenario: The sibling checkout is on another revision
+- GIVEN a pimdir checkout beside this one whose working tree is on a revision other than spec/REVISION
+- WHEN tests/spec_drift.rs runs
+- THEN it compares spec/ with the files at spec/REVISION, not with the working tree, and passes while the copy is exact
+
+#### Scenario: A vector edited by hand
+- tests/spec_drift.rs `the_vendored_vectors_are_the_manifests`, whatever sits beside this checkout
 
 ### Requirement: The constants are generated, never written
 build.rs SHALL emit one constant per statement file, named after the file in upper case, documented by the file's leading comment, plus one per migration, `MIGRATIONS` listing them in order and `VERSION` as their count, and `sql::CANONICAL` indexing the statements. `sql::OWN` indexes this crate's own statements, and `sql::all()` both. A canonical statement is therefore never substituted: the specification's text is the constant's.
@@ -26,10 +34,26 @@ build.rs SHALL emit one constant per statement file, named after the file in upp
 Every statement file under the specification's queries/storage/ profile directories (read/, queue/, owner/) SHALL have a constant reachable through `sql::all()`.
 
 ### Requirement: Every statement prepares against the schema
-Every constant `sql::all()` yields SHALL prepare against a database created from `sql::MIGRATION_0001`, and every statement the specification checkout carries SHALL prepare against its own migration. The specification repository holds no toolchain, so this is the only place its SQL is ever loaded.
+Every constant `sql::all()` yields SHALL prepare against a database created from `sql::MIGRATION_0001`, and every statement the vendored copy carries SHALL prepare against the vendored migration, a file holding several (`optimize_text`) statement by statement. The specification repository holds no toolchain, so this is the only place its SQL is ever loaded.
 
-### Requirement: The check degrades to a skip, never to a failure
-The comparisons against the specification checkout SHALL skip when it is absent (a consumer building from the registry has no reason to hold it) and SHALL run whenever the two sit side by side, which is where drift is created. Every skipping suite SHALL print exactly `skipped: no pimdir spec checkout beside this one`, the line CI greps for.
+### Requirement: The vectors are read from the vendored copy
+Every suite reading the specification's files (tests/spec_drift.rs, tests/objects.rs, tests/summaries.rs, tests/payloads.rs, tests/vectors_sync.rs, tests/search.rs) SHALL read them from spec/, and none SHALL skip: a vendored file missing fails the suite reading it. A runner SHALL check every case of its file, a failure being the case's own, and settle them against tests/pending_vectors.txt (tests/pending/mod.rs): a case listed there with the phase of the-crate-follows-storage-draft-08 fixing it may fail; a listed case passing, an unlisted one failing and a listed one its suite does not hold each fail the suite, so the list only shrinks, and a release needs it empty (decision 3). Only the comparison with the specification needs a pimdir checkout; without one holding the pinned revision beside this one (a consumer building from the registry has no reason to hold it) it compares nothing and prints one line saying so, never a failure.
+
+#### Scenario: No pimdir checkout
+- GIVEN no pimdir checkout beside this one
+- WHEN the suites run
+- THEN every vector suite runs against spec/vectors/, and tests/spec_drift.rs alone reports that it compared nothing
+
+#### Scenario: The pending list is empty
+- tests/pending_vectors.txt names no case since phase 6: every case of the six files passes, the 13 objects cases, the 53 summaries cases, the 34 payloads, the sync cases and the 168 queries among them
+
+#### Scenario: An unlisted failure
+- GIVEN a scratch copy of the tree whose objects runner fails one case
+- WHEN tests/objects.rs runs
+- THEN the case's panic is caught, the next cases run, and the settle fails the suite naming the case (proved at phase 7 of the-crate-follows-storage-draft-08)
+
+### Requirement: The crate states its conformance
+README.md SHALL state the crate's conformance as STORAGE §17, SYNC §12 and SEARCH §12 ask, each part's version and the profile met: `storage-draft-08 owner, sync-draft-07 engine, search-draft-08 indexer (canonical) and query client`. The owner holds the reader's and the producer's profiles, each a handle of its own; the crate is no connector, which a consumer writes. Its departures from a MUST are listed there with it (Annex A.1 without `charset-tables`; STORAGE §18's access list on Windows).
 
 ### Requirement: Object naming is checked against the format's vectors
-The crate SHALL check its object names against the specification's vectors/objects.json (STORAGE §16): every body, under both `hash_algo` values, fed whole and fed in pieces, together with the shard path each name derives. A store whose two writers name the same body differently reports nothing: it silently never deduplicates and never finds the blob the other side wrote. `PimdirBlobs::path` is public for the same reason, STORAGE §14 inviting a consumer to stream a body straight to it.
+The crate SHALL check its object names against the specification's vectors/objects.json as vendored (STORAGE §16): every body under BLAKE3, the one algorithm, fed whole and fed in pieces, together with the shard path each name derives, one shard level (`objects/<hash[0:2]>/<hash>`). A store whose two writers name the same body differently reports nothing: it silently never deduplicates and never finds the blob the other side wrote. `PimdirBlobs::path` is public for the same reason, STORAGE §14 inviting a consumer to stream a body straight to it; it checks the name first and answers `InvalidInput` for a malformed one.

@@ -22,7 +22,7 @@ use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     collection::PimdirCollectionId,
     coroutine::*,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
@@ -175,14 +175,14 @@ impl PimdirMutation {
     ///
     /// Named variant by variant: a mutation added later has to say what
     /// it reads, where a catch-all would hand it the whole collection.
-    fn scope(&self) -> PimdirLoadScope {
+    fn selection(&self) -> PimdirLoadSelection {
         match self {
-            Self::Add { link_id, .. } => PimdirLoadScope::Links(vec![link_id.clone()]),
+            Self::Add { link_id, .. } => PimdirLoadSelection::Links(vec![link_id.clone()]),
             Self::SetFlags { handle, .. }
             | Self::Remove(handle)
             | Self::Edit { handle, .. }
             | Self::Copy { handle, .. }
-            | Self::Move { handle, .. } => PimdirLoadScope::Handles(vec![handle.clone()]),
+            | Self::Move { handle, .. } => PimdirLoadSelection::Handles(vec![handle.clone()]),
         }
     }
 }
@@ -508,7 +508,7 @@ impl PimdirCoroutine for PimdirMutate {
                 self.state = State::Loading;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                     collection: self.collection.clone(),
-                    scope: self.mutation.scope(),
+                    selection: self.mutation.selection(),
                 })
             }
             (State::Loading, Some(PimdirArg::Load(loaded))) => {
@@ -564,7 +564,7 @@ impl PimdirCoroutine for PimdirMutate {
                         // NOTE: a second copy in the target mints over the
                         // provisional handle the bare key would take, so
                         // that key is read too (STORAGE §9).
-                        let scope = PimdirLoadScope::Links(vec![
+                        let selection = PimdirLoadSelection::Links(vec![
                             hint.clone(),
                             hint.minted(&hint.provisional()),
                         ]);
@@ -574,7 +574,7 @@ impl PimdirCoroutine for PimdirMutate {
                         self.state = State::LoadingTarget;
                         return PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                             collection,
-                            scope,
+                            selection,
                         });
                     }
 
@@ -1337,11 +1337,14 @@ mod tests {
         let _ = mutate.resume(None);
 
         match mutate.resume(Some(PimdirArg::Load(loaded("1")))) {
-            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { collection, scope }) => {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
+                collection,
+                selection,
+            }) => {
                 assert_eq!(collection.as_str(), "archive");
                 assert_eq!(
-                    scope,
-                    PimdirLoadScope::Links(vec![
+                    selection,
+                    PimdirLoadSelection::Links(vec![
                         PimdirLinkId::from("1"),
                         PimdirLinkId::from("dup:1#\u{1}1"),
                     ]),
@@ -1470,10 +1473,10 @@ mod tests {
     fn a_mutation_reads_only_what_it_edits() {
         let mut mutate = PimdirMutate::new("inbox", PimdirMutation::Remove("7".into()));
         match mutate.resume(None) {
-            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { scope, .. }) => {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { selection, .. }) => {
                 assert_eq!(
-                    scope,
-                    PimdirLoadScope::Handles(vec![PimdirHandle::from("7")])
+                    selection,
+                    PimdirLoadSelection::Handles(vec![PimdirHandle::from("7")])
                 );
             }
             state => panic!("expected WantsLoad, got {state:?}"),
@@ -1492,10 +1495,10 @@ mod tests {
         };
         let mut mutate = PimdirMutate::new("inbox", add);
         match mutate.resume(None) {
-            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { scope, .. }) => {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { selection, .. }) => {
                 assert_eq!(
-                    scope,
-                    PimdirLoadScope::Links(vec![PimdirLinkId::from("m1")]),
+                    selection,
+                    PimdirLoadSelection::Links(vec![PimdirLinkId::from("m1")]),
                 );
             }
             state => panic!("expected WantsLoad, got {state:?}"),

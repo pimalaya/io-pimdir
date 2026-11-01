@@ -91,16 +91,7 @@ pub(crate) struct PimdirContentLine {
 impl PimdirContentLine {
     /// Reads a line, or `None` for one carrying no colon outside quotes.
     pub fn parse(line: &str) -> Option<Self> {
-        let mut quoted = false;
-        let colon = line.char_indices().find_map(|(at, char)| match char {
-            '"' => {
-                quoted = !quoted;
-                None
-            }
-            ':' if !quoted => Some(at),
-            _ => None,
-        })?;
-        let (head, value) = (&line[..colon], &line[colon + 1..]);
+        let (head, value) = split_value(line)?;
 
         let mut parts = split_unquoted(head, ';').into_iter();
         let name = parts.next()?;
@@ -141,8 +132,25 @@ impl PimdirContentLine {
     }
 }
 
+/// Splits a content line on its first colon outside a quoted parameter
+/// value: the name and parameters, then the value; `None` for a line
+/// carrying no such colon.
+pub(crate) fn split_value(line: &str) -> Option<(&str, &str)> {
+    let mut quoted = false;
+    let colon = line.char_indices().find_map(|(at, char)| match char {
+        '"' => {
+            quoted = !quoted;
+            None
+        }
+        ':' if !quoted => Some(at),
+        _ => None,
+    })?;
+
+    Some((&line[..colon], &line[colon + 1..]))
+}
+
 /// Splits on a separator outside double quotes.
-fn split_unquoted(text: &str, separator: char) -> Vec<&str> {
+pub(crate) fn split_unquoted(text: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut quoted = false;
     let mut start = 0;

@@ -19,8 +19,8 @@ use io_pimdir::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
         PimdirStatus,
     },
+    summary,
 };
-use rusqlite::Connection;
 
 /// A one-message INBOX bound by source `graph`, plus an Archive.
 fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
@@ -34,7 +34,7 @@ fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: PimdirObject {
-                    hash: PimdirHash("cafebabe".into()),
+                    hash: PimdirHash("cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()),
                     size: 3,
                 },
                 body: Some(b"abc".to_vec()),
@@ -44,7 +44,9 @@ fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
                 collection: PimdirCollectionId("INBOX".into()),
                 handle: PimdirHandle("1".into()),
                 link_id: Some(PimdirLinkId("mid:a".into())),
-                object: Some(PimdirHash("cafebabe".into())),
+                object: Some(PimdirHash(
+                    "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+                )),
                 level: PimdirLevel::Full,
                 summary: None,
                 flags: flags.clone(),
@@ -54,7 +56,9 @@ fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
                 base: Some(PimdirBase {
                     flags,
                     revision: None,
-                    object: Some(PimdirHash("cafebabe".into())),
+                    object: Some(PimdirHash(
+                        "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+                    )),
                 }),
                 origin: None,
             }),
@@ -170,11 +174,16 @@ fn an_intent_needs_the_user_to_choose_among_several_performers() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let Err(PimdirError::Ambiguous { candidates, .. }) =
-        producer.enqueue("INBOX", &submit(None), None)
+        producer.performer("INBOX", capability::MAIL_SUBMIT, None)
     else {
         panic!("two senders should be ambiguous");
     };
     assert_eq!(candidates, ["graph", "smtp"]);
+    let Err(PimdirError::Action(PimdirActionError::MissingField("source"))) =
+        producer.enqueue("INBOX", &submit(None), None)
+    else {
+        panic!("an intent names its performer");
+    };
     producer
         .enqueue("INBOX", &submit(Some("graph")), None)
         .unwrap();
@@ -190,13 +199,13 @@ fn an_intent_needs_the_user_to_choose_among_several_performers() {
     producer.enqueue("INBOX", &choose, None).unwrap();
 
     // the choice holds while still queued, before the owner applies it
-    assert_eq!(
-        producer
-            .performer("INBOX", capability::MAIL_SUBMIT, None)
-            .unwrap(),
-        "smtp"
-    );
-    producer.enqueue("INBOX", &submit(None), None).unwrap();
+    let performer = producer
+        .performer("INBOX", capability::MAIL_SUBMIT, None)
+        .unwrap();
+    assert_eq!(performer, "smtp");
+    producer
+        .enqueue("INBOX", &submit(Some(&performer)), None)
+        .unwrap();
     drop(producer);
     assert_eq!(store.drain().unwrap().applied, 1);
 
@@ -209,27 +218,6 @@ fn an_intent_needs_the_user_to_choose_among_several_performers() {
     );
 }
 
-#[test]
-fn a_store_from_an_older_owner_gains_the_tables_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let (store, seq) = seeded(dir.path());
-    drop(store);
-    Connection::open(dir.path().join("pimdir.db"))
-        .unwrap()
-        .execute_batch("DROP TABLE capabilities; DROP TABLE performers;")
-        .unwrap();
-
-    // a producer reads the missing tables as nothing declared
-    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
-    producer.enqueue("INBOX", &archive(seq), None).unwrap();
-    drop(producer);
-
-    let mut store = PimdirStore::open(dir.path()).unwrap();
-    store
-        .declare("graph", &mail(&[capability::MAIL_MESSAGE_MOVE]))
-        .unwrap();
-}
-
 const MEETING: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:m1\r\nDTSTART:20261010T090000Z\r\nORGANIZER:mailto:a@b.org\r\nATTENDEE:mailto:c@d.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 /// One event in `collection`, bound by `source`, returning its seq.
@@ -239,7 +227,7 @@ fn seeded_event(dir: &Path, source: &str, collection: &str, uid: &str) -> i64 {
         .ensure_collection(collection, "text/calendar")
         .unwrap();
     let body = MEETING.replace("UID:m1", &format!("UID:{uid}"));
-    let hash = io_pimdir::hash::PimdirHashAlgo::default().hash(body.as_bytes());
+    let hash = io_pimdir::hash::hash(body.as_bytes());
     store
         .write(vec![
             PimdirWriteOp::StoreObject {
@@ -304,11 +292,16 @@ fn a_scheduled_event_needs_a_source_that_notifies() {
     };
     assert_eq!(refusal.capability, capability::CALENDAR_SCHEDULING);
 
-    // the user accepted that nobody is notified
-    let unscheduled = MEETING
-        .replace("ORGANIZER:", "ORGANIZER;SCHEDULE-AGENT=NONE:")
-        .replace("ATTENDEE:", "ATTENDEE;SCHEDULE-AGENT=NONE:");
-    let (action, object) = add(&producer, &unscheduled);
+    // the user accepted that nobody is notified, which the resource says
+    let unscheduled = summary::calendar::unschedule(MEETING.as_bytes());
+    assert_eq!(
+        unscheduled,
+        MEETING
+            .replace("ORGANIZER:", "ORGANIZER;SCHEDULE-AGENT=NONE:")
+            .replace("ATTENDEE:", "ATTENDEE;SCHEDULE-AGENT=NONE:")
+            .as_bytes()
+    );
+    let (action, object) = add(&producer, &String::from_utf8(unscheduled).unwrap());
     producer.enqueue("work", &action, Some(&object)).unwrap();
 
     let Err(PimdirError::Unsupported(_)) =
@@ -336,6 +329,91 @@ fn an_online_meeting_is_asked_in_the_resource() {
         panic!("an online meeting should be refused");
     };
     assert_eq!(refusal.capability, capability::CALENDAR_ONLINE_MEETING);
+}
+
+/// STORAGE §18: a resource the user did not write as it stands enters the
+/// queue without the instructions it carried, so an online meeting
+/// another party asked for is no request of the user's.
+#[test]
+fn a_foreign_resource_is_queued_without_its_instructions() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded_event(dir.path(), "dav", "work", "m0");
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store
+        .declare("dav", &calendar(&[capability::CALENDAR_ONLINE_MEETING]))
+        .unwrap();
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let invitation = MEETING.replace("UID:m1", "UID:m2");
+    let asking = invitation.replace("END:VEVENT", "X-PIMDIR-ONLINE-MEETING:TRUE\r\nEND:VEVENT");
+    let add = |hash| PimdirAction::Add {
+        link_id: None,
+        flags: PimdirFlags::default(),
+        object: Some(hash),
+        supersedes: None,
+    };
+    let Err(PimdirError::Unsupported(_)) =
+        producer.enqueue_with_body("work", asking.as_bytes(), add)
+    else {
+        panic!("the user's own online meeting should be refused");
+    };
+
+    producer
+        .enqueue_foreign_body("work", asking.as_bytes(), add)
+        .unwrap();
+    let pending = producer.pending_actions("work").unwrap();
+    let hash = pending[0].action.object_hash().unwrap();
+    let queued = producer.blobs().get(hash).unwrap().unwrap();
+    assert_eq!(queued, invitation.as_bytes(), "the instruction left");
+}
+
+/// STORAGE §15.6: the owner's backstop decides whatever the producer's
+/// gate let through. An intent naming a declared source that does not
+/// declare its capability, or the option it asks for, parks naming both;
+/// one naming a source that declares nothing is left to its performer.
+#[test]
+fn the_owner_parks_an_intent_its_source_does_not_declare() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = seeded(dir.path());
+
+    // NOTE: enqueued while the account declared nothing, then declared.
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let copied = PimdirAction::Unknown {
+        kind: "submit".into(),
+        payload: r#"{"v":1,"source":"graph","from":"a@b","rcpts":["c@d"],"copy":"INBOX"}"#.into(),
+        object_hash: None,
+    };
+    producer
+        .enqueue("INBOX", &submit(Some("smtp")), None)
+        .unwrap();
+    producer.enqueue("INBOX", &copied, None).unwrap();
+    producer
+        .enqueue("INBOX", &submit(Some("fax")), None)
+        .unwrap();
+    drop(producer);
+    store
+        .declare("smtp", &mail(&[capability::MAIL_SUBMIT]))
+        .unwrap();
+    store
+        .declare("graph", &mail(&[capability::MAIL_SUBMIT_COPY]))
+        .unwrap();
+
+    let report = store.drain().unwrap();
+    assert_eq!((report.parked, report.skipped), (2, 1), "{report:?}");
+    let parked: Vec<String> = store
+        .parked_actions()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.error)
+        .collect();
+    assert_eq!(
+        parked,
+        [
+            "Source smtp does not support mail.submit",
+            "Source graph does not support mail.submit.copy",
+        ]
+    );
 }
 
 #[test]
@@ -474,7 +552,7 @@ fn a_collection_is_created_by_a_source_that_declares_it_under_its_anchor() {
     assert_eq!(
         PimdirCollectionCreate::from_payload(payload).unwrap(),
         PimdirCollectionCreate {
-            source: Some("graph".into()),
+            source: "graph".into(),
             name: "Projects".into(),
             parent: None,
         }
@@ -550,7 +628,7 @@ fn an_occurrence_is_answered_only_by_a_performer_declaring_it() {
     let seq = seeded_event(dir.path(), "dav", "work", "m0");
     let invitation = |kind: &str, recurrence_id: Option<&str>| {
         PimdirInvitation {
-            source: Some("dav".into()),
+            source: "dav".into(),
             item: PimdirIntentItem::Seq(seq),
             partstat: (kind == intent::CALENDAR_REPLY).then_some(PimdirPartstat::Accepted),
             comment: None,
@@ -618,13 +696,14 @@ const TODO: &str = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t1\r\nDTSTAMP:20261028
 const EVENT: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e9\r\nDTSTART:20261010T090000Z\r\nSUMMARY:Lunch\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 /// Source caldav syncing Tasks, holding task t0, and Events, declared with
-/// every calendar capability and `x-vtodo` `none` on Events alone.
+/// every calendar capability and `calendar.component.vtodo` `none` on
+/// Events alone.
 fn events_only(dir: &Path) -> i64 {
     seeded_event(dir, "caldav", "Events", "e0");
     let mut store = PimdirStore::open(dir).unwrap().for_source("caldav");
     store.ensure_collection("Tasks", "text/calendar").unwrap();
     let body = TODO.replace("UID:t1", "UID:t0");
-    let hash = io_pimdir::hash::PimdirHashAlgo::default().hash(body.as_bytes());
+    let hash = io_pimdir::hash::hash(body.as_bytes());
     store
         .write(vec![
             PimdirWriteOp::StoreObject {
@@ -662,7 +741,7 @@ fn refuse_tasks(store: &mut PimdirStore) {
     let mut rows = calendar(&[]);
     rows.push(PimdirCapability {
         collection: Some("Events".into()),
-        name: capability::X_VTODO.into(),
+        name: capability::CALENDAR_COMPONENT_VTODO.into(),
         support: PimdirSupport::None,
         detail: Some("events only".into()),
     });
@@ -683,7 +762,7 @@ fn a_calendar_refusing_tasks_refuses_a_task_and_takes_an_event() {
     else {
         panic!("a task into an events-only calendar should be refused");
     };
-    assert_eq!(refusal.capability, capability::X_VTODO);
+    assert_eq!(refusal.capability, capability::CALENDAR_COMPONENT_VTODO);
     assert_eq!(refusal.source, "caldav");
     assert_eq!(refusal.detail.as_deref(), Some("events only"));
 
@@ -700,7 +779,7 @@ fn a_calendar_refusing_tasks_refuses_a_task_and_takes_an_event() {
     else {
         panic!("moving a task into an events-only calendar should be refused");
     };
-    assert_eq!(refusal.capability, capability::X_VTODO);
+    assert_eq!(refusal.capability, capability::CALENDAR_COMPONENT_VTODO);
 
     let reader = io_pimdir::client::reader::PimdirReader::open(dir.path()).unwrap();
     assert!(!reader.accepts_vtodo("Events").unwrap());
@@ -725,12 +804,12 @@ fn the_owner_parks_a_task_into_a_calendar_refusing_tasks() {
     assert!(
         store.parked_actions().unwrap()[0]
             .error
-            .contains(capability::X_VTODO)
+            .contains(capability::CALENDAR_COMPONENT_VTODO)
     );
 }
 
 #[test]
-fn a_source_stating_no_x_vtodo_row_refuses_no_task() {
+fn a_source_stating_no_vtodo_row_refuses_no_task() {
     let dir = tempfile::tempdir().unwrap();
     events_only(dir.path());
     let mut store = PimdirStore::open(dir.path()).unwrap();
@@ -793,7 +872,10 @@ fn a_refused_create_stages_nothing() {
     drop(store);
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
-    let path = producer.blobs().path(&producer.hash(TODO.as_bytes()));
+    let path = producer
+        .blobs()
+        .path(&producer.hash(TODO.as_bytes()))
+        .unwrap();
     let refused = producer
         .enqueue_with_body("Events", TODO.as_bytes(), |hash| PimdirAction::Add {
             link_id: None,

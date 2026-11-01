@@ -2,22 +2,26 @@
 //! (pimdir STORAGE.md §16): every fixture's key, summary row, address rows
 //! and sort key, compared as parsed structures.
 //!
-//! The spec is a sibling checkout, so the suite skips when it is absent.
+//! The vectors are the vendored copy under spec/vectors/, so the suite
+//! always runs; a case a later phase fixes is on tests/pending_vectors.txt.
 
-use std::{fs, path::PathBuf};
+mod pending;
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use io_pimdir::{
-    hash::PimdirHashAlgo,
+    hash,
     placement::PimdirHandle,
     summary::{self, PimdirSummary, mail},
 };
 use serde_json::{Map, Value, json};
 
-fn spec_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .join("pimdir");
-    dir.join("vectors/summaries.json").is_file().then_some(dir)
+/// The specification's vectors, vendored at the revision spec/REVISION names.
+fn spec_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("spec")
 }
 
 /// A summary as the columns of its table, the way a vector states it.
@@ -146,140 +150,143 @@ fn addresses(summary: &PimdirSummary) -> Vec<Value> {
 
 #[test]
 fn every_summary_vector_derives() {
-    let Some(spec) = spec_dir() else {
-        eprintln!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let spec = spec_dir();
 
     let vectors: Value =
         serde_json::from_str(&fs::read_to_string(spec.join("vectors/summaries.json")).unwrap())
             .unwrap();
+    assert_eq!(vectors["v"], 3, "summaries.json at another version");
     let cases = vectors["cases"].as_array().unwrap();
     assert!(!cases.is_empty(), "the vectors carry no case");
 
-    for case in cases {
-        let label = case["label"].as_str().unwrap_or("");
-        let body = fs::read(spec.join("vectors").join(case["fixture"].as_str().unwrap())).unwrap();
+    let outcomes = cases
+        .iter()
+        .map(|case| {
+            let label = case["label"].as_str().unwrap_or("").to_string();
+            (label, pending::check(|| derives(&spec, case)))
+        })
+        .collect();
+    pending::settle("summaries", outcomes);
+}
 
-        assert_eq!(
-            PimdirHashAlgo::Blake3.hash(&body).0,
-            case["body"]["blake3"].as_str().unwrap(),
-            "{label}: the fixture read differently from what the vector names"
-        );
-        assert_eq!(
-            PimdirHashAlgo::Sha256_128.hash(&body).0,
-            case["body"]["sha256-128"].as_str().unwrap(),
-            "{label}: the fixture read differently from what the vector names"
-        );
+/// One case's fixture derives the key, rows and sort key it states.
+fn derives(spec: &Path, case: &Value) {
+    let label = case["label"].as_str().unwrap_or("");
+    let body = fs::read(spec.join("vectors").join(case["fixture"].as_str().unwrap())).unwrap();
 
-        let derivation = summary::derive(case["kind"].as_str().unwrap(), &body)
-            .unwrap_or_else(|| panic!("{label}: no conventions for the kind"));
+    assert_eq!(
+        hash::hash(&body).0,
+        case["body"]["blake3"].as_str().unwrap(),
+        "{label}: the fixture read differently from what the vector names"
+    );
 
-        // NOTE: every case pins its key, the writer-derived hash: one
-        // included (STORAGE §16); a hint with a handle pins the minted one.
-        let expected = case["link_id"].as_str().unwrap();
-        match (case.get("hint"), case.get("handle")) {
-            (Some(hint), Some(handle)) => {
-                assert_eq!(
-                    derivation.link_id.as_str(),
-                    hint.as_str().unwrap(),
-                    "{label}: hint"
-                );
-                let minted = derivation
-                    .link_id
-                    .minted(&PimdirHandle::from(handle.as_str().unwrap()));
-                assert_eq!(minted.as_str(), expected, "{label}: minted key");
-            }
-            _ => assert_eq!(derivation.link_id.as_str(), expected, "{label}: link id"),
+    let derivation = summary::derive(case["kind"].as_str().unwrap(), &body)
+        .unwrap_or_else(|| panic!("{label}: no conventions for the kind"));
+
+    // NOTE: every case pins its key, the writer-derived hash: one
+    // included (STORAGE §16); a hint with a handle pins the minted one.
+    let expected = case["link_id"].as_str().unwrap();
+    match (case.get("hint"), case.get("handle")) {
+        (Some(hint), Some(handle)) => {
+            assert_eq!(
+                derivation.link_id.as_str(),
+                hint.as_str().unwrap(),
+                "{label}: hint"
+            );
+            let minted = derivation
+                .link_id
+                .minted(&PimdirHandle::from(handle.as_str().unwrap()));
+            assert_eq!(minted.as_str(), expected, "{label}: minted key");
         }
+        _ => assert_eq!(derivation.link_id.as_str(), expected, "{label}: link id"),
+    }
 
-        let summary = derivation
-            .summary
-            .as_ref()
-            .unwrap_or_else(|| panic!("{label}: no summary row"));
-        let (table, actual) = row(summary);
-        assert_eq!(table, case["table"].as_str().unwrap(), "{label}: table");
-        assert_eq!(actual, case["summary"], "{label}: summary row");
+    let summary = derivation
+        .summary
+        .as_ref()
+        .unwrap_or_else(|| panic!("{label}: no summary row"));
+    let (table, actual) = row(summary);
+    assert_eq!(table, case["table"].as_str().unwrap(), "{label}: table");
+    assert_eq!(actual, case["summary"], "{label}: summary row");
+    assert_eq!(
+        addresses(summary),
+        case["addresses"].as_array().cloned().unwrap_or_default(),
+        "{label}: address rows"
+    );
+    assert_eq!(
+        derivation.sort_key.as_str(),
+        case["sort_key"].as_str().unwrap_or(""),
+        "{label}: sort key"
+    );
+
+    // NOTE: the mark without the body (Annex A.1): the same row read
+    // off the header block alone agrees on every column but the mark,
+    // which the top-level Content-Type gives, and the invitation, which
+    // only the parts give.
+    if let Some(mark) = case.get("meta_attachment") {
+        let meta = mail::derive_meta(&body, Some(body.len() as u64), None);
+        let Some(PimdirSummary::Mail(read)) = &meta.summary else {
+            panic!("{label}: a message derives a mail summary");
+        };
         assert_eq!(
-            addresses(summary),
-            case["addresses"].as_array().cloned().unwrap_or_default(),
-            "{label}: address rows"
-        );
-        assert_eq!(
-            derivation.sort_key.as_str(),
-            case["sort_key"].as_str().unwrap_or(""),
-            "{label}: sort key"
+            read.attachment.map(i64::from),
+            mark.as_i64(),
+            "{label}: meta_attachment"
         );
 
-        // NOTE: the mark without the body (Annex A.1): the same row read
-        // off the header block alone agrees on every column but the mark,
-        // which the top-level Content-Type gives, and the invitation, which
-        // only the parts give.
-        if let Some(mark) = case.get("meta_attachment") {
-            let meta = mail::derive_meta(&body, Some(body.len() as u64), None);
-            let Some(PimdirSummary::Mail(read)) = &meta.summary else {
-                panic!("{label}: a message derives a mail summary");
-            };
-            assert_eq!(
-                read.attachment.map(i64::from),
-                mark.as_i64(),
-                "{label}: meta_attachment"
-            );
-
-            let mut walked = summary.clone();
-            if let PimdirSummary::Mail(walked) = &mut walked {
-                walked.attachment = read.attachment;
-                walked.invitation = None;
-            }
-            assert_eq!(
-                meta.summary.as_ref(),
-                Some(&walked),
-                "{label}: meta summary"
-            );
-            assert_eq!(meta.link_id, derivation.link_id, "{label}: meta link id");
-            assert_eq!(meta.sort_key, derivation.sort_key, "{label}: meta sort key");
+        let mut walked = summary.clone();
+        if let PimdirSummary::Mail(walked) = &mut walked {
+            walked.attachment = read.attachment;
+            walked.invitation = None;
         }
+        assert_eq!(
+            meta.summary.as_ref(),
+            Some(&walked),
+            "{label}: meta summary"
+        );
+        assert_eq!(meta.link_id, derivation.link_id, "{label}: meta link id");
+        assert_eq!(meta.sort_key, derivation.sort_key, "{label}: meta sort key");
+    }
 
-        // NOTE: the stand-ins' parts (STORAGE §14.3, Annex A.7), the walk fed
-        // whole and a few octets at a time alike.
-        if let Some(expected) = case.get("attachments") {
-            let whole = mail::attachments::attachments(&body);
-            let mut walk = mail::attachments::PimdirAttachmentWalk::new();
-            for chunk in body.chunks(7) {
-                walk.feed(chunk);
-            }
-            let parts = walk.finish_parts();
-            assert_eq!(
-                parts.attachments, whole,
-                "{label}: attachments fed in chunks"
-            );
+    // NOTE: the stand-ins' parts (STORAGE §14.3, Annex A.7), the walk fed
+    // whole and a few octets at a time alike.
+    if let Some(expected) = case.get("attachments") {
+        let whole = mail::attachments::attachments(&body);
+        let mut walk = mail::attachments::PimdirAttachmentWalk::new();
+        for chunk in body.chunks(7) {
+            walk.feed(chunk);
+        }
+        let parts = walk.finish_parts();
+        assert_eq!(
+            parts.attachments, whole,
+            "{label}: attachments fed in chunks"
+        );
 
-            // NOTE: the streamed walk's mark and invitation are the row's,
-            // so a writer never holding the body whole derives alike.
-            let PimdirSummary::Mail(mail) = summary else {
-                panic!("{label}: a message derives a mail summary");
-            };
-            assert_eq!(
-                Some(parts.attachment),
-                mail.attachment,
-                "{label}: walked mark"
-            );
-            assert_eq!(
-                parts.invitation, mail.invitation,
-                "{label}: walked invitation"
-            );
-            let actual: Vec<Value> = whole
-                .iter()
-                .map(|file| {
-                    json!({
-                        "part": file.part,
-                        "name": file.name,
-                        "media_type": file.media_type,
-                        "size": file.size,
-                    })
+        // NOTE: the streamed walk's mark and invitation are the row's,
+        // so a writer never holding the body whole derives alike.
+        let PimdirSummary::Mail(mail) = summary else {
+            panic!("{label}: a message derives a mail summary");
+        };
+        assert_eq!(
+            Some(parts.attachment),
+            mail.attachment,
+            "{label}: walked mark"
+        );
+        assert_eq!(
+            parts.invitation, mail.invitation,
+            "{label}: walked invitation"
+        );
+        let actual: Vec<Value> = whole
+            .iter()
+            .map(|file| {
+                json!({
+                    "part": file.part,
+                    "name": file.name,
+                    "media_type": file.media_type,
+                    "size": file.size,
                 })
-                .collect();
-            assert_eq!(&Value::from(actual), expected, "{label}: attachments");
-        }
+            })
+            .collect();
+        assert_eq!(&Value::from(actual), expected, "{label}: attachments");
     }
 }

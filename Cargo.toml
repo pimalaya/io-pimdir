@@ -22,6 +22,8 @@ exclude = [
   "flake.nix",
   "package.nix",
   "shell.nix",
+  "spec/payloads/",
+  "spec/vectors/",
   "tests/proptest-regressions/",
 ]
 
@@ -31,7 +33,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["client", "vendored"]
-client = ["dep:fs4", "dep:rusqlite"]
+client = ["charset-tables", "dep:fs4", "dep:rusqlite", "dep:rustix"]
 search = ["dep:ical-rs", "dep:mail-parser", "dep:unicode-normalization", "dep:vcard-rs"]
 cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars"]
 charset-tables = ["dep:encoding_rs"]
@@ -53,6 +55,7 @@ pimalaya-cli = { version = "0.2", default-features = false, features = ["build"]
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+sha2 = { version = "0.11", default-features = false }
 tempfile = { version = "3", default-features = false }
 
 [dependencies]
@@ -62,6 +65,7 @@ clap = { version = "4.4", default-features = false, features = ["derive", "std",
 encoding_rs = { version = "0.8", default-features = false, features = ["alloc"], optional = true }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 humantime = { version = "2.2", default-features = false, optional = true }
+jiff = { version = "0.2.33", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
 ical-rs = { version = "0.6", default-features = false, features = ["parser", "tzdb"], optional = true }
 log = { version = "0.4", default-features = false }
 mail-parser = { version = "0.11", default-features = false, features = ["full_encoding"], optional = true }
@@ -70,9 +74,11 @@ rusqlite = { version = "0.41", default-features = false, optional = true }
 schemars = { version = "1", default-features = false, features = ["derive", "std"], optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
-sha2 = { version = "0.11", default-features = false }
 unicode-normalization = { version = "0.1", default-features = false, optional = true }
 vcard-rs = { version = "0.5", default-features = false, features = ["parser"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"], optional = true }
 
 [patch.crates-io]
 ical-rs = { git = "https://github.com/pimalaya/ical", rev = "99b92736a6a076c72936fac29c9b85a5168e4c2f" }

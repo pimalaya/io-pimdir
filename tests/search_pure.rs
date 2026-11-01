@@ -21,6 +21,7 @@ use io_pimdir::{
             PimdirIndexRefresh, PimdirIndexRefreshArg, PimdirIndexRefreshYield,
         },
     },
+    summary::mail::{MIME_DEPTH_MAX, MIME_ENTITIES_MAX},
 };
 
 const MESSAGE: &[u8] = b"Message-ID: <a@x>\r\n\
@@ -55,6 +56,37 @@ fn a_query_parses_and_a_message_extracts() {
         extract.from
     );
     assert!(extract.body.contains("quarterly figures"));
+}
+
+/// The extraction reads the parts the walk of Annex A.1 reads: a text part at
+/// depth 64, not one deeper, and none after the 10,000th entity.
+#[test]
+fn the_extraction_reads_the_parts_the_walk_reads() {
+    let nested = |depth: usize| {
+        let mut body = String::from("Message-ID: <deep@x>\r\n");
+        for level in 0..depth {
+            body.push_str(&format!(
+                "Content-Type: multipart/mixed; boundary=b{level}x\r\n\r\n--b{level}x\r\n"
+            ));
+        }
+        body.push_str("Content-Type: text/plain\r\n\r\nbottom\r\n");
+        for level in (0..depth).rev() {
+            body.push_str(&format!("--b{level}x--\r\n"));
+        }
+        PimdirExtract::mail(body.as_bytes()).body
+    };
+    assert!(nested(MIME_DEPTH_MAX).contains("bottom"));
+    assert!(!nested(MIME_DEPTH_MAX + 1).contains("bottom"));
+
+    let mut body = String::from("Content-Type: multipart/mixed; boundary=b\r\n\r\n");
+    for _ in 2..MIME_ENTITIES_MAX {
+        body.push_str("--b\r\nContent-Type: image/png\r\n\r\nx\r\n");
+    }
+    body.push_str("--b\r\nContent-Type: text/plain\r\n\r\nlast read\r\n");
+    body.push_str("--b\r\nContent-Type: text/plain\r\n\r\nunread\r\n--b--\r\n");
+    let extract = PimdirExtract::mail(body.as_bytes());
+    assert!(extract.body.contains("last read"));
+    assert!(!extract.body.contains("unread"));
 }
 
 /// One run over a one-message feed, answered by hand: the body indexed
@@ -95,7 +127,7 @@ fn a_refresh_runs_without_a_database() {
             PimdirIndexRefreshYield::WantsFeed { since: 0, .. } => {
                 PimdirIndexRefreshArg::Feed(vec![row.clone()])
             }
-            PimdirIndexRefreshYield::WantsUnread { .. } => PimdirIndexRefreshArg::Feed(Vec::new()),
+            PimdirIndexRefreshYield::WantsMissing => PimdirIndexRefreshArg::Feed(Vec::new()),
             PimdirIndexRefreshYield::WantsHeld { .. } => PimdirIndexRefreshArg::Held {
                 placements: Vec::new(),
                 objects: BTreeSet::new(),
@@ -149,7 +181,6 @@ fn a_refresh_runs_without_a_database() {
         Some(&PimdirIndexOp::SetCursor {
             store_change: 1,
             store_purges: 0,
-            store_reconciled: 1,
         })
     );
 }

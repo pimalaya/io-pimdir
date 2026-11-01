@@ -1,4 +1,4 @@
-//! The `item` verb group: list, show, export, restore and purge.
+//! The `item` verb group: list, show, export, restore, purge and erase.
 //!
 //! None of it interprets content. An item prints as its public `seq`,
 //! its cross-source link id, its flags, its detail level, its body hash
@@ -15,7 +15,10 @@ use std::{
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
 use io_pimdir::{
-    client::reader::{PimdirItem, PimdirReader},
+    client::{
+        reader::{PimdirItem, PimdirReader},
+        search::PimdirIndex,
+    },
     codec::PimdirAction,
     hub::{PimdirBinding, PimdirSourceId},
     object::PimdirHash,
@@ -52,6 +55,8 @@ pub enum ItemCommand {
     Restore(ItemRestoreCommand),
     /// Destroy retained items for good.
     Purge(ItemPurgeCommand),
+    /// Erase one item's bytes from the store's files.
+    Erase(ItemEraseCommand),
 }
 
 impl ItemCommand {
@@ -63,6 +68,7 @@ impl ItemCommand {
             Self::Export(cmd) => cmd.execute(printer, store),
             Self::Restore(cmd) => cmd.execute(printer, store),
             Self::Purge(cmd) => cmd.execute(printer, store),
+            Self::Erase(cmd) => cmd.execute(printer, store),
         }
     }
 }
@@ -250,10 +256,12 @@ impl ItemExportCommand {
             );
         };
 
+        // NOTE: read whole and checked before a byte is served (STORAGE
+        // §7): a body failing its name is missing.
         let blobs = read.blobs();
-        let Some(mut reader) = blobs.reader(&PimdirHash(hash.clone()))? else {
+        let Some(mut reader) = blobs.verified(&PimdirHash(hash.clone()))? else {
             bail!(
-                "the body of seq {} is missing from the blob store (hash {hash}); run `pimdir check`",
+                "the body of seq {} is missing from the blob store or fails its name (hash {hash}); run `pimdir check`",
                 self.seq
             );
         };
@@ -324,9 +332,14 @@ impl ItemRestoreCommand {
         let source = store.write_source(&read)?;
         drop(read);
 
+        // NOTE: a payload carries a known set (STORAGE §15.3), and an add
+        // starts from an empty one, which a set never read restores as.
         let action = PimdirAction::Add {
             link_id: Some(item.link_id.clone()),
-            flags: item.flags.clone(),
+            flags: match item.flags.is_unknown() {
+                true => PimdirFlags::default(),
+                false => item.flags.clone(),
+            },
             object: item.object.clone(),
             supersedes: None,
         };
@@ -477,6 +490,93 @@ impl ItemPurgeCommand {
         printer.out(ItemPurgeOutput {
             cutoff: None,
             items: 1,
+        })
+    }
+}
+
+/// Erase one item's bytes from the store's files.
+///
+/// A purge removes a row, and SQLite keeps what it freed in the database
+/// files until it reuses the space. An erase runs the whole procedure: the
+/// purge of the retained item, or the delete of a live one no source binds,
+/// the collector, the search index's refresh and the merge of its full-text
+/// segments when the store keeps one, then a checkpoint truncating both
+/// write-ahead logs. The item's bytes are then in neither database nor in
+/// objects/, unless another item holds the same body; a backup, quarantine/
+/// and the filesystem's own copies stay. A live item a source syncs is
+/// removed through that source first. Takes the owner role and asks first
+/// unless `--yes` is passed.
+#[derive(Debug, Args)]
+pub struct ItemEraseCommand {
+    /// Public id of the item to erase (`seq`).
+    #[arg(value_name = "SEQ")]
+    pub seq: i64,
+
+    /// Restrict the lookup to this collection.
+    #[arg(long, short = 'c', value_name = "COLLECTION")]
+    pub collection: Option<String>,
+
+    /// Do not ask for confirmation.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+impl ItemEraseCommand {
+    /// Erases the item, then the index's copy of it when one is kept.
+    pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
+        let read = store.read()?;
+        let found = one(
+            locate(&read, self.seq, self.collection.as_deref())?,
+            self.seq,
+        )?;
+        if found.item.retention.is_none() {
+            let bound = read
+                .item_bindings(&found.collection, found.item.link_id.as_str())
+                .map_err(report)?;
+            if !bound.is_empty() {
+                bail!(
+                    "seq {} is live in {} and a source syncs it: remove it first, then erase it once retained",
+                    self.seq,
+                    found.collection
+                );
+            }
+        }
+        drop(read);
+
+        confirm(
+            printer,
+            self.yes,
+            &format!(
+                "Erase item {} in {} from the store's files for good?",
+                self.seq, found.collection
+            ),
+        )?;
+
+        let erased = store
+            .owner()?
+            .erase(&found.collection, self.seq)
+            .map_err(report)?;
+        if !erased.erased {
+            bail!(
+                "seq {} was not erased: it is no longer retained nor unbound in {}",
+                self.seq,
+                found.collection
+            );
+        }
+
+        let index = store.dir().join("index.db").is_file();
+        if index {
+            PimdirIndex::open(store.dir())
+                .and_then(|mut index| index.erase())
+                .map_err(report)?;
+        }
+
+        printer.out(ItemEraseOutput {
+            seq: self.seq,
+            collection: found.collection,
+            blobs: erased.collected.blobs,
+            bytes: erased.collected.bytes,
+            index,
         })
     }
 }
@@ -988,6 +1088,39 @@ impl fmt::Display for ItemPurgeOutput {
         writeln!(f, "Purged {} item(s)", self.items)?;
         if self.items > 0 {
             writeln!(f, "Run `pimdir gc` to reclaim the bodies they released")?;
+        }
+        Ok(())
+    }
+}
+
+/// The `item erase` output.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemEraseOutput {
+    /// The public id erased.
+    pub seq: i64,
+    /// The collection it was in.
+    pub collection: String,
+    /// Blob files the collector unlinked.
+    pub blobs: usize,
+    /// Bytes they freed.
+    pub bytes: u64,
+    /// Whether the store's search index was erased too.
+    pub index: bool,
+}
+
+impl fmt::Display for ItemEraseOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Erased item {} from {}, unlinking {} blob file(s) ({})",
+            self.seq,
+            self.collection,
+            self.blobs,
+            bytes(self.bytes)
+        )?;
+        if self.index {
+            writeln!(f, "Erased it from the search index too")?;
         }
         Ok(())
     }

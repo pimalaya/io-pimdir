@@ -14,7 +14,7 @@ use io_pimdir::{
     client::{PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer},
     codec::PimdirAction,
     collection::PimdirCollectionId,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -32,7 +32,9 @@ fn placement(flags: PimdirFlags) -> PimdirPlacement {
         collection: inbox(),
         handle: PimdirHandle("1".into()),
         link_id: Some(PimdirLinkId("a@example.org".into())),
-        object: Some(PimdirHash("cafebabe".into())),
+        object: Some(PimdirHash(
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+        )),
         level: PimdirLevel::Full,
         summary: None,
         flags: flags.clone(),
@@ -42,7 +44,9 @@ fn placement(flags: PimdirFlags) -> PimdirPlacement {
         base: Some(PimdirBase {
             flags,
             revision: None,
-            object: Some(PimdirHash("cafebabe".into())),
+            object: Some(PimdirHash(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+            )),
         }),
         origin: None,
     }
@@ -53,7 +57,7 @@ fn write(store: &mut PimdirSourceStore, flags: PimdirFlags) -> Result<(), Pimdir
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: PimdirObject {
-                    hash: PimdirHash("cafebabe".into()),
+                    hash: PimdirHash("cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()),
                     size: 3,
                 },
                 body: Some(b"abc".to_vec()),
@@ -82,7 +86,7 @@ fn a_set_reads_back_whole_and_a_restatement_stamps_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = seeded(dir.path());
 
-    let loaded = store.load(&inbox(), &PimdirLoadScope::All).unwrap();
+    let loaded = store.load(&inbox(), &PimdirLoadSelection::All).unwrap();
     let flags = PimdirFlags::from_iter(["$label", "\\Seen"]);
     assert_eq!(loaded.placements[0].flags, flags);
     assert_eq!(loaded.placements[0].base.as_ref().unwrap().flags, flags);
@@ -110,7 +114,7 @@ fn a_flag_the_store_cannot_hold_is_refused_at_the_write() {
         assert_eq!(refused.code(), "flag-invalid");
     }
 
-    let loaded = store.load(&inbox(), &PimdirLoadScope::All).unwrap();
+    let loaded = store.load(&inbox(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(
         loaded.placements[0].flags,
         PimdirFlags::from_iter(["\\Seen", "$label"]),
@@ -148,5 +152,5 @@ fn a_flag_the_store_cannot_hold_is_refused_at_the_enqueue_and_parked_by_the_drai
     let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (0, 1), "{report:?}");
     let parked = store.parked_actions().unwrap();
-    assert!(parked[0].error.contains("two words"), "{parked:?}");
+    assert!(parked[0].error.contains("field flags"), "{parked:?}");
 }

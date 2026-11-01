@@ -46,7 +46,9 @@ fn card(handle: &str, status: PimdirStatus) -> PimdirPlacement {
         base: Some(PimdirBase {
             flags: PimdirFlags::default(),
             revision: Some("etag-1".into()),
-            object: Some(PimdirHash("body".into())),
+            object: Some(PimdirHash(
+                "bodybodybodybodybodybodybodybodybodybodybodybodybody".into(),
+            )),
         }),
         origin: None,
     }
@@ -66,7 +68,7 @@ fn a_binding_names_the_handle_and_the_base_its_source_agreed_on() {
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: io_pimdir::object::PimdirObject {
-                    hash: PimdirHash("body".into()),
+                    hash: PimdirHash("bodybodybodybodybodybodybodybodybodybodybodybodybody".into()),
                     size: 3,
                 },
                 body: Some(b"vcf".to_vec()),
@@ -86,7 +88,12 @@ fn a_binding_names_the_handle_and_the_base_its_source_agreed_on() {
 
     let base = binding.base.as_ref().expect("a synced binding has a base");
     assert_eq!(base.revision.as_deref(), Some("etag-1"));
-    assert_eq!(base.object, Some(PimdirHash("body".into())));
+    assert_eq!(
+        base.object,
+        Some(PimdirHash(
+            "bodybodybodybodybodybodybodybodybodybodybodybodybody".into()
+        ))
+    );
 
     assert!(!binding.conflicted);
 }
@@ -105,7 +112,7 @@ fn a_minted_copy_names_the_resource_it_came_from() {
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: io_pimdir::object::PimdirObject {
-                    hash: PimdirHash("body".into()),
+                    hash: PimdirHash("bodybodybodybodybodybodybodybodybodybodybodybodybody".into()),
                     size: 3,
                 },
                 body: Some(b"ics".to_vec()),
@@ -144,7 +151,7 @@ fn every_source_holding_an_item_reports_its_own_binding() {
     left.write(vec![
         PimdirWriteOp::StoreObject {
             object: io_pimdir::object::PimdirObject {
-                hash: PimdirHash("body".into()),
+                hash: PimdirHash("bodybodybodybodybodybodybodybodybodybodybodybodybody".into()),
                 size: 3,
             },
             body: Some(b"vcf".to_vec()),

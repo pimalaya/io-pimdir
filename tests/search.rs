@@ -6,9 +6,12 @@
 //! Every case is answered: none is skipped. A case stating `threads` is
 //! asked as a threaded listing (SEARCH §9).
 //!
-//! The spec is a sibling checkout, so the suite skips when it is absent.
+//! The vectors are the vendored copy under spec/vectors/, so the suite
+//! always runs; a case a later phase fixes is on tests/pending_vectors.txt.
 
 #![cfg(all(feature = "client", feature = "search"))]
+
+mod pending;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -46,13 +49,9 @@ use io_pimdir::{
 };
 use serde_json::Value;
 
-fn spec_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .join("pimdir");
-    dir.join("vectors/search/queries.json")
-        .is_file()
-        .then_some(dir)
+/// The specification's vectors, vendored at the revision spec/REVISION names.
+fn spec_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("spec")
 }
 
 fn json(path: &Path) -> Value {
@@ -289,13 +288,11 @@ fn pairs(hits: &Value) -> Vec<(String, i64)> {
 
 #[test]
 fn every_search_vector_answers() {
-    let Some(spec) = spec_dir() else {
-        eprintln!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let spec = spec_dir();
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
     let vectors = json(&spec.join("vectors/search/queries.json"));
+    assert_eq!(vectors["v"], 2, "queries.json at another version");
 
     // NOTE: the horizon is drawn around the vectors' now (SEARCH §11).
     let now = unix(vectors["now"].as_str().unwrap());
@@ -327,167 +324,205 @@ fn every_search_vector_answers() {
         !windows.is_empty(),
         "the vectors carry no occurrence window"
     );
-    for window in windows {
-        let start = window["start"].as_str().unwrap();
-        let end = window["end"].as_str().unwrap();
-        let found: Vec<(String, i64, String, String)> = index
-            .occurrences_between(start, end)
-            .unwrap()
-            .into_iter()
-            .map(|occurrence| {
-                (
-                    occurrence.collection,
-                    occurrence.seq,
-                    occurrence.start,
-                    occurrence.end,
-                )
-            })
-            .collect();
-        let expected: Vec<(String, i64, String, String)> = window["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| {
-                (
-                    row[0].as_str().unwrap().into(),
-                    row[1].as_i64().unwrap(),
-                    row[2].as_str().unwrap().into(),
-                    row[3].as_str().unwrap().into(),
-                )
-            })
-            .collect();
-        assert_eq!(found, expected, "occurrences {start}..{end}");
-    }
+    let mut outcomes: Vec<(String, pending::Outcome)> = windows
+        .iter()
+        .map(|window| {
+            let case = format!(
+                "occurrences {}..{}",
+                window["start"].as_str().unwrap(),
+                window["end"].as_str().unwrap()
+            );
+            (case, pending::check(|| occurs(&index, window)))
+        })
+        .collect();
 
     let cases = vectors["cases"].as_array().unwrap();
     assert!(!cases.is_empty(), "the vectors carry no case");
 
     for case in cases {
         let query = case["query"].as_str().unwrap();
+        let outcome = pending::check(|| answers(&index, &store, clock, case));
+        outcomes.push((case_name(query), outcome));
+    }
+    pending::settle("queries", outcomes);
+}
 
-        if let Some(error) = case.get("error") {
-            let refused = PimdirQuery::parse(query).expect_err(query);
-            assert_eq!(
-                (refused.code.as_str(), refused.start, refused.end),
-                (
-                    error["code"].as_str().unwrap(),
-                    error["start"].as_u64().unwrap() as usize,
-                    error["end"].as_u64().unwrap() as usize,
-                ),
-                "{query:?}: refusal"
-            );
-            if refused.code.as_str() == "unknown-field" {
-                assert!(!refused.fields.is_empty(), "{query:?}: the known fields");
-            }
-            continue;
+/// A case's name on the pending list: its query quoted, a long one cut to
+/// its first 40 characters and the count of the rest.
+fn case_name(query: &str) -> String {
+    let length = query.chars().count();
+    match length > 60 {
+        true => {
+            let head: String = query.chars().take(40).collect();
+            format!("{head:?} and {} more characters", length - 40)
         }
+        false => format!("{query:?}"),
+    }
+}
 
-        let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{query:?}: {err}"));
+/// One window of an agenda answers the occurrences it states.
+fn occurs(index: &PimdirIndex, window: &Value) {
+    let start = window["start"].as_str().unwrap();
+    let end = window["end"].as_str().unwrap();
+    let found: Vec<(String, i64, String, String)> = index
+        .occurrences_between(start, end)
+        .unwrap()
+        .into_iter()
+        .map(|occurrence| {
+            (
+                occurrence.collection,
+                occurrence.seq,
+                occurrence.start,
+                occurrence.end,
+            )
+        })
+        .collect();
+    let expected: Vec<(String, i64, String, String)> = window["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap().into(),
+                row[1].as_i64().unwrap(),
+                row[2].as_str().unwrap().into(),
+                row[3].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(found, expected, "occurrences {start}..{end}");
+}
 
-        let options = PimdirSearchOptions {
-            sort: match case["sort"].as_str() {
-                Some("name") => PimdirSearchSort::Name,
-                Some("relevance") => PimdirSearchSort::Relevance,
-                _ => PimdirSearchSort::Date,
-            },
-            limit: 100,
-            offset: 0,
-            clock,
-        };
-        if let Some(want) = case.get("threads") {
-            let answer = index
-                .threads(&parsed, &options)
-                .unwrap_or_else(|err| panic!("{query:?}: {err}"));
-            let got: BTreeSet<_> = answer
-                .threads
-                .iter()
-                .map(|thread| {
-                    let hits: BTreeSet<(String, i64)> = thread
-                        .hits
-                        .iter()
-                        .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
-                        .collect();
-                    (
-                        thread.thread.clone(),
-                        thread.count,
-                        thread.first.clone(),
-                        thread.last.clone(),
-                        hits,
-                    )
-                })
-                .collect();
-            let want: BTreeSet<_> = want
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|thread| {
-                    (
-                        thread["thread"].as_str().map(String::from),
-                        thread["count"].as_u64().unwrap(),
-                        thread["first"].as_str().map(String::from),
-                        thread["last"].as_str().map(String::from),
-                        pairs(&thread["hits"]).into_iter().collect::<BTreeSet<_>>(),
-                    )
-                })
-                .collect();
-            assert_eq!(got, want, "{query:?}: threads");
-            continue;
-        }
-        let answer = index
-            .search(&parsed, &options)
-            .unwrap_or_else(|err| panic!("{query:?}: {err}"));
-        let got: Vec<(String, i64)> = answer
-            .hits
-            .iter()
-            .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
-            .collect();
-        let want = pairs(&case["hits"]);
+/// One case answers the hits, the coverage and the refusal it states.
+fn answers(index: &PimdirIndex, store: &Value, clock: PimdirSearchClock, case: &Value) {
+    let query = case["query"].as_str().unwrap();
 
-        if case["ordered"].as_bool() == Some(true) {
-            assert_eq!(got, want, "{query:?}: ordered hits");
-        } else {
-            assert_eq!(
-                got.iter().collect::<BTreeSet<_>>(),
-                want.iter().collect::<BTreeSet<_>>(),
-                "{query:?}: hits"
-            );
-        }
-
-        let count = index.count(&parsed, &clock).unwrap();
-        assert_eq!(count.count as usize, want.len(), "{query:?}: count");
-
-        let expected = bodiless(&store, &parsed);
+    if let Some(error) = case.get("error") {
+        let refused = PimdirQuery::parse(query).expect_err(query);
         assert_eq!(
-            answer.coverage.local.bodiless, expected,
-            "{query:?}: coverage"
+            (refused.code.as_str(), refused.start, refused.end),
+            (
+                error["code"].as_str().unwrap(),
+                error["start"].as_u64().unwrap() as usize,
+                error["end"].as_u64().unwrap() as usize,
+            ),
+            "{query:?}: refusal"
         );
-        assert_eq!(answer.coverage.local.unindexed, 0, "{query:?}: unindexed");
-        if let Some(temporal) = case.get("temporal") {
-            let expected = match temporal.as_str() {
-                Some("full") => PimdirSearchTemporal::Full,
-                _ => PimdirSearchTemporal::Bounded {
-                    since: temporal["since"].as_str().map(Into::into),
-                    until: temporal["until"].as_str().map(Into::into),
-                    filling: temporal["filling"].as_bool().unwrap(),
-                },
-            };
-            assert_eq!(answer.coverage.temporal, expected, "{query:?}: temporal");
+        if refused.code.as_str() == "unknown-field" {
+            assert!(!refused.fields.is_empty(), "{query:?}: the known fields");
         }
+        return;
+    }
 
+    let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{query:?}: {err}"));
+
+    let options = PimdirSearchOptions {
+        sort: match case["sort"].as_str() {
+            Some("name") => PimdirSearchSort::Name,
+            Some("relevance") => PimdirSearchSort::Relevance,
+            _ => PimdirSearchSort::Date,
+        },
+        limit: 100,
+        offset: 0,
+        clock,
+    };
+    if let Some(want) = case.get("threads") {
+        let answer = index
+            .threads(&parsed, &options)
+            .unwrap_or_else(|err| panic!("{query:?}: {err}"));
+        let got: BTreeSet<_> = answer
+            .threads
+            .iter()
+            .map(|thread| {
+                let hits: BTreeSet<(String, i64)> = thread
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+                    .collect();
+                (
+                    thread.thread.clone(),
+                    thread.count,
+                    thread.first.clone(),
+                    thread.last.clone(),
+                    hits,
+                )
+            })
+            .collect();
+        let want: BTreeSet<_> = want
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|thread| {
+                (
+                    thread["thread"].as_str().map(String::from),
+                    thread["count"].as_u64().unwrap(),
+                    thread["first"].as_str().map(String::from),
+                    thread["last"].as_str().map(String::from),
+                    pairs(&thread["hits"]).into_iter().collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "{query:?}: threads");
+        return;
+    }
+    let answer = index
+        .search(&parsed, &options)
+        .unwrap_or_else(|err| panic!("{query:?}: {err}"));
+    let got: Vec<(String, i64)> = answer
+        .hits
+        .iter()
+        .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+        .collect();
+    let want = pairs(&case["hits"]);
+
+    if case["ordered"].as_bool() == Some(true) {
+        assert_eq!(got, want, "{query:?}: ordered hits");
+    } else {
         assert_eq!(
-            answer.coverage.horizon_left,
-            case["horizon_left"].as_bool().unwrap_or(false),
-            "{query:?}: horizon_left"
+            got.iter().collect::<BTreeSet<_>>(),
+            want.iter().collect::<BTreeSet<_>>(),
+            "{query:?}: hits"
+        );
+    }
+
+    let count = index.count(&parsed, &clock).unwrap();
+    assert_eq!(count.count as usize, want.len(), "{query:?}: count");
+
+    let expected = bodiless(store, &parsed);
+    assert_eq!(
+        answer.coverage.local.bodiless, expected,
+        "{query:?}: coverage"
+    );
+    assert_eq!(answer.coverage.local.unindexed, 0, "{query:?}: unindexed");
+    if let Some(temporal) = case.get("temporal") {
+        let expected = match temporal.as_str() {
+            Some("full") => PimdirSearchTemporal::Full,
+            _ => PimdirSearchTemporal::Bounded {
+                since: temporal["since"].as_str().map(Into::into),
+                until: temporal["until"].as_str().map(Into::into),
+                filling: temporal["filling"].as_bool().unwrap(),
+            },
+        };
+        assert_eq!(answer.coverage.temporal, expected, "{query:?}: temporal");
+    }
+
+    assert_eq!(
+        answer.coverage.horizon_left,
+        case["horizon_left"].as_bool().unwrap_or(false),
+        "{query:?}: horizon_left"
+    );
+    if let Some(cut) = case.get("cut") {
+        assert_eq!(
+            Some(answer.coverage.cut),
+            cut.as_u64(),
+            "{query:?}: the series cut before the range's end"
         );
     }
 }
 
 #[test]
 fn a_hit_says_what_it_matched_and_carries_a_snippet() {
-    let Some(spec) = spec_dir() else {
-        eprintln!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let spec = spec_dir();
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
     let mut index = PimdirIndex::open(dir.path()).unwrap();
@@ -546,42 +581,51 @@ fn a_hit_says_what_it_matched_and_carries_a_snippet() {
 
 #[test]
 fn every_chunk_vector_derives() {
-    let Some(spec) = spec_dir() else {
-        eprintln!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/chunks.json"));
 
-    for case in vectors["cases"].as_array().unwrap() {
-        let label = case["label"].as_str().unwrap();
-        let mut got = Vec::new();
-        for field in ["body", "note"] {
-            let Some(parts) = case["fields"].get(field) else {
-                continue;
-            };
-            let text: String = parts
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|part| match part.as_str() {
-                    Some(text) => text.to_string(),
-                    None => part["repeat"]
-                        .as_str()
-                        .unwrap()
-                        .repeat(part["times"].as_u64().unwrap() as usize),
-                })
-                .collect();
-            for range in chunk::chunks(&text) {
-                got.push(serde_json::json!({
-                    "ord": got.len(),
-                    "field": field,
-                    "start": range.start,
-                    "end": range.end,
-                }));
-            }
+    let outcomes = vectors["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|case| {
+            let label = case["label"].as_str().unwrap().to_string();
+            (label, pending::check(|| chunks(case)))
+        })
+        .collect();
+    pending::settle("chunks", outcomes);
+}
+
+/// One case's fields chunk at the boundaries it states.
+fn chunks(case: &Value) {
+    let label = case["label"].as_str().unwrap();
+    let mut got = Vec::new();
+    for field in ["body", "note"] {
+        let Some(parts) = case["fields"].get(field) else {
+            continue;
+        };
+        let text: String = parts
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| match part.as_str() {
+                Some(text) => text.to_string(),
+                None => part["repeat"]
+                    .as_str()
+                    .unwrap()
+                    .repeat(part["times"].as_u64().unwrap() as usize),
+            })
+            .collect();
+        for range in chunk::chunks(&text) {
+            got.push(serde_json::json!({
+                "ord": got.len(),
+                "field": field,
+                "start": range.start,
+                "end": range.end,
+            }));
         }
-        assert_eq!(Value::from(got), case["chunks"], "{label}");
     }
+    assert_eq!(Value::from(got), case["chunks"], "{label}");
 }
 
 /// A message with one subject and one body line.
@@ -656,7 +700,7 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
     let past = PimdirIndexRefreshOptions {
         batch: 1,
         deadline: Some(std::time::Instant::now()),
-        now: None,
+        ..Default::default()
     };
     let report = index.refresh(&past).unwrap();
     assert_eq!(
@@ -837,10 +881,7 @@ fn unix(instant: &str) -> i64 {
 /// alone once ranked outside its full-text query, which FTS5 refuses.
 #[test]
 fn every_field_alone_answers_in_every_order() {
-    let Some(spec) = spec_dir() else {
-        eprintln!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let spec = spec_dir();
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
     let mut index = PimdirIndex::open(dir.path()).unwrap();
@@ -1482,7 +1523,7 @@ fn a_query_open_neither_builds_rebuilds_nor_refreshes() {
 /// by the indexer and refused by a query client, while a table of another
 /// implementation's beside them, and FTS5's own, change nothing.
 #[test]
-fn an_index_of_another_shape_is_rebuilt_never_queried() {
+fn an_index_of_another_schema_text_is_rebuilt_never_queried() {
     let dir = tempfile::tempdir().unwrap();
     file_message(
         dir.path(),
@@ -1523,6 +1564,430 @@ fn an_index_of_another_shape_is_rebuilt_never_queried() {
 }
 
 /// A collection's name is a label, never an address (STORAGE §14):
+/// An index.db built and refreshed over one message, its handle closed.
+fn indexed(dir: &Path) {
+    file_message(dir, "INBOX", message("a@x", "Alpha", "first body"), &[]);
+    let mut index = PimdirIndex::open(dir).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+}
+
+/// Runs `sql` on index.db as another program would.
+fn alter_index(dir: &Path, sql: &str) {
+    rusqlite::Connection::open(dir.join("index.db"))
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+}
+
+/// One `index_meta` column of index.db.
+fn index_meta(dir: &Path, column: &str) -> rusqlite::types::Value {
+    rusqlite::Connection::open(dir.join("index.db"))
+        .unwrap()
+        .query_row(&format!("SELECT {column} FROM index_meta"), [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+/// An index of another shape, of a later version or holding no
+/// `index_meta` is refused by the indexer and by a query client, naming
+/// what it holds, and left byte for byte as it was (SEARCH §2): a person
+/// deleting index.db hands the store to this indexer.
+#[test]
+fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
+    for (altered, version, shape) in [
+        (
+            "UPDATE index_meta SET shape = 'fts4'",
+            Some("search-draft-08"),
+            Some("fts4"),
+        ),
+        (
+            "UPDATE index_meta SET format_version = 'search-draft-09'",
+            Some("search-draft-09"),
+            Some("canonical"),
+        ),
+        (
+            "UPDATE index_meta SET format_version = 'search-v1'",
+            Some("search-v1"),
+            Some("canonical"),
+        ),
+        ("DROP TABLE index_meta", None, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        indexed(dir.path());
+        alter_index(dir.path(), altered);
+        let bytes = fs::read(dir.path().join("index.db")).unwrap();
+
+        for refused in [
+            PimdirIndex::open(dir.path()).err(),
+            PimdirIndex::open_query(dir.path()).err(),
+        ] {
+            let Some(PimdirError::IndexVersion {
+                version: found,
+                shape: named,
+                ..
+            }) = refused
+            else {
+                panic!("{altered}: refused as index-version, got {refused:?}");
+            };
+            assert_eq!(
+                (found.as_deref(), named.as_deref()),
+                (version, shape),
+                "{altered}"
+            );
+        }
+        assert_eq!(
+            fs::read(dir.path().join("index.db")).unwrap(),
+            bytes,
+            "{altered}: nothing rebuilt, written nor deleted"
+        );
+        let wal = fs::metadata(dir.path().join("index.db-wal")).map_or(0, |wal| wal.len());
+        assert_eq!(wal, 0, "{altered}: no frame written");
+    }
+}
+
+/// An index of this shape at an earlier version, or naming none, is
+/// rebuilt by the indexer and refused by a query client (SEARCH §2).
+#[test]
+fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
+    for altered in [
+        "UPDATE index_meta SET format_version = 'search-draft-07'",
+        "ALTER TABLE index_meta DROP COLUMN format_version",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        indexed(dir.path());
+        alter_index(dir.path(), altered);
+
+        let Err(err) = PimdirIndex::open_query(dir.path()) else {
+            panic!("{altered}: an earlier index opens for queries");
+        };
+        assert_eq!(err.code(), "index-version", "{altered}");
+
+        let index = PimdirIndex::open(dir.path()).unwrap();
+        assert_eq!(index.cursor().unwrap(), 0, "{altered}: rebuilt");
+        drop(index);
+        assert_eq!(
+            index_meta(dir.path(), "format_version"),
+            rusqlite::types::Value::Text("search-draft-08".into()),
+            "{altered}"
+        );
+    }
+}
+
+/// An index built from another store, another copy of it, or holding a
+/// cursor above the store's last stamp is rebuilt by the indexer, when it
+/// opens it and when a refresh finds the store restored under it, and
+/// refused by a query client (SEARCH §2, §4).
+#[test]
+fn an_index_built_from_another_store_or_copy_is_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    indexed(dir.path());
+    let store_id = index_meta(dir.path(), "store_id");
+
+    for altered in [
+        "UPDATE index_meta SET store_id = 'another'",
+        "UPDATE index_meta SET store_incarnation = store_incarnation + 1",
+        "UPDATE index_meta SET store_change = store_change + 1",
+    ] {
+        alter_index(dir.path(), altered);
+        let Err(err) = PimdirIndex::open_query(dir.path()) else {
+            panic!("{altered}: opens for queries");
+        };
+        assert_eq!(err.code(), "index-outdated", "{altered}");
+
+        let mut index = PimdirIndex::open(dir.path()).unwrap();
+        assert_eq!(index.cursor().unwrap(), 0, "{altered}: rebuilt");
+        assert!(
+            index
+                .refresh(&PimdirIndexRefreshOptions::default())
+                .unwrap()
+                .is_current()
+        );
+        assert_eq!(index_meta(dir.path(), "store_id"), store_id, "{altered}");
+    }
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let incarnation = PimdirStore::open(dir.path())
+        .unwrap()
+        .raise_incarnation(None)
+        .unwrap();
+    let report = index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(report.folded, 1, "the restored store folded again whole");
+    assert_eq!(
+        index_meta(dir.path(), "store_incarnation"),
+        rusqlite::types::Value::Integer(incarnation)
+    );
+    assert_eq!(hits(&index, "alpha").len(), 1);
+}
+
+/// Floating times are read in the zone the indexer states, `UTC` unless
+/// it states another, which re-expands every live calendar item once and
+/// is recorded (SEARCH §7); a zone the IANA database does not name is
+/// refused before anything is read.
+#[test]
+fn another_floating_zone_re_expands_every_calendar_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let event = |uid: &str, start: &str| {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//x//EN\r\nBEGIN:VEVENT\r\n\
+             UID:{uid}\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:{start}\r\nDURATION:PT1H\r\n\
+             SUMMARY:{uid}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        .into_bytes()
+    };
+    let calendar = "text/calendar";
+    file_as(
+        dir.path(),
+        "local",
+        "Calendar",
+        calendar,
+        event("floating", "20260801T090000"),
+    );
+    file_as(
+        dir.path(),
+        "local",
+        "Calendar",
+        calendar,
+        event("utc", "20260801T120000Z"),
+    );
+
+    let now = unix("2026-08-20T00:00:00Z");
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let mut refresh = |zone: &str| {
+        index.refresh(&PimdirIndexRefreshOptions {
+            now: Some(now),
+            floating_zone: zone.into(),
+            ..Default::default()
+        })
+    };
+    let starts = |dir: &Path| -> Vec<String> {
+        PimdirIndex::open_query(dir)
+            .unwrap()
+            .occurrences_between("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .map(|occurrence| occurrence.start)
+            .collect()
+    };
+
+    assert_eq!(refresh("UTC").unwrap().expanded, 2);
+    assert_eq!(
+        starts(dir.path()),
+        ["2026-08-01T09:00:00Z", "2026-08-01T12:00:00Z"]
+    );
+    assert_eq!(refresh("UTC").unwrap().expanded, 0, "nothing moved");
+
+    assert_eq!(refresh("Europe/Paris").unwrap().expanded, 2);
+    assert_eq!(
+        starts(dir.path()),
+        ["2026-08-01T07:00:00Z", "2026-08-01T12:00:00Z"]
+    );
+    assert_eq!(
+        index_meta(dir.path(), "floating_zone"),
+        rusqlite::types::Value::Text("Europe/Paris".into())
+    );
+    assert_eq!(
+        refresh("Europe/Paris").unwrap().expanded,
+        0,
+        "recorded once"
+    );
+
+    let Err(err) = refresh("Mars/Olympus") else {
+        panic!("an unknown zone refreshed");
+    };
+    assert_eq!(err.code(), "index-zone-unknown");
+    assert_eq!(
+        refresh("UTC").unwrap().expanded,
+        2,
+        "UTC is another zone again"
+    );
+    assert_eq!(
+        starts(dir.path()),
+        ["2026-08-01T09:00:00Z", "2026-08-01T12:00:00Z"]
+    );
+}
+
+/// A body the blob directory does not hold when the index folds its row is
+/// indexed bodiless and recorded; the next pass folds it again though the
+/// store stamped nothing, so a body put back under its name is indexed and
+/// leaves the record (SEARCH §4).
+#[test]
+fn a_body_that_could_not_be_read_is_folded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = message("a@x", "Alpha", "zanzibar body");
+    let hash = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .hash(&body);
+    file_message(dir.path(), "INBOX", body.clone(), &[]);
+    let blob = io_pimdir::client::reader::PimdirReader::open(dir.path())
+        .unwrap()
+        .blobs()
+        .path(&hash)
+        .unwrap();
+    fs::remove_file(&blob).unwrap();
+
+    let missing = |dir: &Path| -> i64 {
+        rusqlite::Connection::open(dir.join("index.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM missing", [], |r| r.get(0))
+            .unwrap()
+    };
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(missing(dir.path()), 1);
+    assert!(hits(&index, "zanzibar").is_empty());
+    assert_eq!(hits(&index, "alpha").len(), 1, "searched by its summary");
+
+    fs::write(&blob, &body).unwrap();
+    let report = index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(
+        (report.folded, report.indexed),
+        (0, 1),
+        "the store stamped nothing"
+    );
+    assert_eq!(missing(dir.path()), 0);
+    let answer = index
+        .search(
+            &PimdirQuery::parse("zanzibar").unwrap(),
+            &PimdirSearchOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(answer.hits.len(), 1);
+    assert_eq!(answer.hits[0].matched, Some(PimdirSearchMatched::Body));
+}
+
+/// The `message` rows, then the `thread` rows, of an index, as text.
+type ThreadRows = (Vec<Vec<String>>, Vec<Vec<String>>);
+
+/// The `message` and `thread` rows index.db holds, then those an index
+/// rebuilt from the store as it stands holds, the rebuild left in place.
+fn thread_rows_and_rebuilt(dir: &Path) -> [ThreadRows; 2] {
+    let read = |dir: &Path| {
+        let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+        let rows = |sql: &str| -> Vec<Vec<String>> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let width = stmt.column_count();
+            stmt.query_map([], |r| {
+                (0..width)
+                    .map(|at| {
+                        Ok(match r.get::<_, rusqlite::types::Value>(at)? {
+                            rusqlite::types::Value::Text(text) => text,
+                            rusqlite::types::Value::Integer(int) => int.to_string(),
+                            _ => String::from("NULL"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        (
+            rows("SELECT link_id, thread, parent FROM message ORDER BY link_id"),
+            rows("SELECT id, first, last, count FROM thread ORDER BY id"),
+        )
+    };
+
+    let refreshed = read(dir);
+    for name in ["index.db", "index.db-wal", "index.db-shm"] {
+        let _ = fs::remove_file(dir.join(name));
+    }
+    let mut index = PimdirIndex::open(dir).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    drop(index);
+    [refreshed, read(dir)]
+}
+
+/// A message whose last placement goes prunes its thread (SEARCH §9): the
+/// rows no member holds name no parent, those no row names go, a phantom
+/// parent with them, and each set left is re-keyed, so the rows are those
+/// a rebuild from the store as it stands writes.
+#[test]
+fn a_message_that_leaves_prunes_its_thread_as_a_rebuild_would() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        mail("a@x", 8, "In-Reply-To: <p@x>\r\n"),
+        &[],
+    );
+    file_message(
+        dir.path(),
+        "INBOX",
+        mail("b@x", 9, "In-Reply-To: <a@x>\r\n"),
+        &[],
+    );
+    file_message(
+        dir.path(),
+        "INBOX",
+        mail("c@x", 10, "In-Reply-To: <b@x>\r\n"),
+        &[],
+    );
+    file_message(
+        dir.path(),
+        "INBOX",
+        mail("d@x", 11, "In-Reply-To: <a@x>\r\n"),
+        &[],
+    );
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    drop(index);
+
+    for (gone, messages) in [("b@x", 5), ("a@x", 4)] {
+        delete_message(dir.path(), gone);
+        let mut index = PimdirIndex::open(dir.path()).unwrap();
+        index
+            .refresh(&PimdirIndexRefreshOptions::default())
+            .unwrap();
+        drop(index);
+
+        let [refreshed, rebuilt] = thread_rows_and_rebuilt(dir.path());
+        assert_eq!(refreshed, rebuilt, "{gone} left: the rows a rebuild writes");
+        assert_eq!(
+            refreshed.0.len(),
+            messages,
+            "{gone} left: {:?}",
+            refreshed.0
+        );
+    }
+}
+
+/// A message alone in its thread that leaves takes the thread row with
+/// its own (SEARCH §9): no row is left that a rebuild would not write.
+#[test]
+fn a_lone_message_that_leaves_drops_its_thread_row() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(dir.path(), "INBOX", mail("kept@x", 8, ""), &[]);
+    file_message(dir.path(), "INBOX", mail("alone@x", 9, ""), &[]);
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+
+    delete_message(dir.path(), "alone@x");
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    drop(index);
+
+    let [refreshed, rebuilt] = thread_rows_and_rebuilt(dir.path());
+    assert_eq!(refreshed, rebuilt, "the rows a rebuild writes");
+    assert_eq!(refreshed.1.len(), 1, "{:?}", refreshed.1);
+}
+
 /// `collection:` and `folder:` name an id alone.
 #[test]
 fn a_collection_term_names_an_id_never_a_display_name() {
@@ -1548,8 +2013,9 @@ fn a_collection_term_names_an_id_never_a_display_name() {
 }
 
 /// A rename a deadline-cut pass folded past is still reconciled by the
-/// next pass completing (SEARCH §4): the cut pass advanced the cursor past
-/// the collection's stamp, which no longer says anything moved.
+/// next pass completing (SEARCH §4): the rename counts in the store's
+/// purges, which a batch never records, so the purge count alone says the
+/// keys moved.
 #[test]
 fn a_rename_a_cut_pass_went_past_is_reconciled_by_the_next_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -1637,27 +2103,31 @@ fn an_id_of_digits_names_the_seq_and_the_link_id() {
 mod memory {
     use std::{
         collections::{BTreeMap, BTreeSet},
+        fs,
         path::Path,
     };
 
     use io_pimdir::{
+        change::{PimdirDropReason, PimdirWriteOp},
         client::{PimdirStore, reader::PimdirReader, search::PimdirIndex},
         codec,
+        collection::PimdirCollectionId,
         coroutine::PimdirCoroutineState,
         object::PimdirHash,
-        placement::PimdirLinkId,
+        placement::{PimdirHandle, PimdirLinkId},
         search::refresh::{
-            PimdirIndexFeedRow, PimdirIndexGone, PimdirIndexHorizon, PimdirIndexKey,
-            PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexMeta, PimdirIndexObject,
-            PimdirIndexOp, PimdirIndexPlacement, PimdirIndexPresence, PimdirIndexRefresh,
-            PimdirIndexRefreshArg, PimdirIndexRefreshYield, PimdirIndexSummary, PimdirIndexText,
+            PimdirIndexFeedRow, PimdirIndexGone, PimdirIndexGonePlacement, PimdirIndexHorizon,
+            PimdirIndexKey, PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexMeta,
+            PimdirIndexObject, PimdirIndexOp, PimdirIndexPlacement, PimdirIndexPresence,
+            PimdirIndexRefresh, PimdirIndexRefreshArg, PimdirIndexRefreshYield, PimdirIndexSummary,
+            PimdirIndexText, PimdirIndexThreadRow,
         },
         sql,
         summary::{PimdirAddress, PimdirAddressRole},
     };
     use rusqlite::{Connection, OptionalExtension, params};
 
-    use crate::{PimdirIndexRefreshOptions, build, json, spec_dir, unix};
+    use crate::{PimdirIndexRefreshOptions, build, file_as, json, message, spec_dir, unix};
 
     type Key = (String, i64);
 
@@ -1671,6 +2141,8 @@ mod memory {
         summary_text: BTreeMap<Key, PimdirIndexText>,
         flags: BTreeMap<Key, BTreeSet<String>>,
         occurrences: BTreeMap<Key, Vec<(String, String)>>,
+        cuts: BTreeMap<Key, String>,
+        missing: BTreeSet<Key>,
         messages: BTreeMap<String, (String, Option<String>)>,
         threads: BTreeMap<String, (String, String, i64)>,
     }
@@ -1687,21 +2159,31 @@ mod memory {
             Self {
                 store,
                 reader: PimdirReader::open(dir).unwrap(),
-                meta: PimdirIndexMeta::default(),
+                meta: PimdirIndexMeta {
+                    floating_zone: "UTC".into(),
+                    ..Default::default()
+                },
                 placements: BTreeMap::new(),
                 objects: BTreeMap::new(),
                 summary_text: BTreeMap::new(),
                 flags: BTreeMap::new(),
                 occurrences: BTreeMap::new(),
+                cuts: BTreeMap::new(),
+                missing: BTreeSet::new(),
                 messages: BTreeMap::new(),
                 threads: BTreeMap::new(),
             }
         }
 
-        /// Folds the whole feed, one run per batch.
-        fn refresh(&mut self, now: i64, batch: usize) {
+        /// Folds the whole feed, one run per batch, the placements
+        /// recorded missing first, floating times read in `zone`.
+        fn refresh(&mut self, now: i64, batch: usize, zone: &str) {
+            let mut first = true;
             loop {
                 let mut run = PimdirIndexRefresh::new(now, batch);
+                run.floating_zone = zone.into();
+                run.missing = first;
+                first = false;
                 let mut arg = None;
                 let output = loop {
                     match run.resume(arg.take()) {
@@ -1877,22 +2359,16 @@ mod memory {
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
                         .unwrap();
-                    meta.moved = self
-                        .store
-                        .query_row(
-                            "SELECT EXISTS (SELECT 1 FROM store.collections WHERE changed > ?1)",
-                            [meta.store_reconciled],
-                            |r| r.get(0),
-                        )
-                        .unwrap();
                     PimdirIndexRefreshArg::IndexState(meta)
                 }
                 PimdirIndexRefreshYield::WantsReexpand {
                     old,
                     new,
                     tzdb_version,
+                    floating_zone,
                 } => {
-                    let every = tzdb_version != self.meta.tzdb_version;
+                    let every = tzdb_version != self.meta.tzdb_version
+                        || floating_zone != self.meta.floating_zone;
                     let mut stmt = self
                         .store
                         .prepare(
@@ -1942,11 +2418,9 @@ mod memory {
                         rusqlite::named_params! { ":since": since, ":limit": limit as i64 },
                     ))
                 }
-                PimdirIndexRefreshYield::WantsUnread { limit } => {
+                PimdirIndexRefreshYield::WantsMissing => {
                     let mut rows = Vec::new();
-                    for ((collection, seq), _) in
-                        self.placements.iter().filter(|(_, p)| p.1.is_none())
-                    {
+                    for (collection, seq) in &self.missing {
                         rows.extend(self.feed(
                             "SELECT i.collection, i.link_id, i.seq, i.object_hash, \
                                CASE WHEN i.flags_known = 1 THEN coalesce((SELECT group_concat(f.flag, ' ') \
@@ -1954,12 +2428,11 @@ mod memory {
                                  AND f.link_id = i.link_id), '') END, \
                                i.deleted, i.retained_at, c.kind, c.account, i.changed \
                              FROM store.items i JOIN store.collections c ON c.id = i.collection \
-                             WHERE i.collection = ?1 AND i.seq = ?2 AND i.object_hash IS NOT NULL \
-                               AND i.deleted = 0 AND c.kind != 'application/octet-stream'",
+                             WHERE i.collection = ?1 AND i.seq = ?2",
                             params![collection, seq],
                         ));
                     }
-                    rows.truncate(limit);
+                    rows.sort_by_key(|row| row.changed);
                     PimdirIndexRefreshArg::Feed(rows)
                 }
                 PimdirIndexRefreshYield::WantsHeld {
@@ -2006,6 +2479,28 @@ mod memory {
                             .collect(),
                     )
                 }
+                PimdirIndexRefreshYield::WantsThreadRows { threads } => {
+                    let mut rows = Vec::new();
+                    for (link_id, (thread, parent)) in &self.messages {
+                        if !threads.contains(thread) {
+                            continue;
+                        }
+                        let sort_key = self
+                            .placements
+                            .iter()
+                            .filter(|(key, (link, _))| {
+                                link == link_id && self.kind(&key.0) == "message/rfc822"
+                            })
+                            .filter_map(|(key, _)| self.sort_key(key))
+                            .min();
+                        rows.push(PimdirIndexThreadRow {
+                            link_id: link_id.clone(),
+                            parent: parent.clone(),
+                            sort_key,
+                        });
+                    }
+                    PimdirIndexRefreshArg::ThreadRows(rows)
+                }
                 PimdirIndexRefreshYield::WantsGone => {
                     let placements = self
                         .placements
@@ -2021,7 +2516,11 @@ mod memory {
                                 .unwrap()
                                 .is_none()
                         })
-                        .filter_map(|key| self.held(key))
+                        .map(|key| PimdirIndexGonePlacement {
+                            collection: key.0.clone(),
+                            seq: key.1,
+                            link_id: PimdirLinkId(self.placements[key].0.clone()),
+                        })
                         .collect();
                     let objects = self
                         .objects
@@ -2073,6 +2572,8 @@ mod memory {
                     self.summary_text.remove(&key);
                     self.flags.remove(&key);
                     self.occurrences.remove(&key);
+                    self.cuts.remove(&key);
+                    self.missing.remove(&key);
                 }
                 PimdirIndexOp::PutSummaryText {
                     collection,
@@ -2102,8 +2603,13 @@ mod memory {
                     collection,
                     seq,
                     occurrences,
+                    cut,
                 } => {
                     let key = (collection, seq);
+                    self.cuts.remove(&key);
+                    if let Some(cut) = cut {
+                        self.cuts.insert(key.clone(), cut);
+                    }
                     self.occurrences.remove(&key);
                     if !occurrences.is_empty() {
                         let rows = occurrences.into_iter().map(|o| (o.start, o.end)).collect();
@@ -2121,8 +2627,37 @@ mod memory {
                     );
                     self.messages.insert(link_id, (thread, parent));
                 }
-                PimdirIndexOp::DropMessage(link_id) => {
-                    self.messages.remove(&link_id);
+                PimdirIndexOp::PutMissing(key) => {
+                    self.missing.insert((key.collection, key.seq));
+                }
+                PimdirIndexOp::DropMissing(key) => {
+                    self.missing.remove(&(key.collection, key.seq));
+                }
+                PimdirIndexOp::PruneThread(thread) => {
+                    let held = |memory: &Self, link_id: &str| {
+                        memory.placements.iter().any(|(key, (link, _))| {
+                            link == link_id && memory.kind(&key.0) == "message/rfc822"
+                        })
+                    };
+                    let rows: Vec<String> = self
+                        .messages
+                        .iter()
+                        .filter(|(link_id, (of, _))| *of == thread && !held(self, link_id))
+                        .map(|(link_id, _)| link_id.clone())
+                        .collect();
+                    for link_id in &rows {
+                        self.messages.get_mut(link_id).unwrap().1 = None;
+                    }
+                    let named: BTreeSet<String> = self
+                        .messages
+                        .values()
+                        .filter_map(|(_, parent)| parent.clone())
+                        .collect();
+                    for link_id in rows {
+                        if !named.contains(&link_id) {
+                            self.messages.remove(&link_id);
+                        }
+                    }
                 }
                 PimdirIndexOp::PutThread {
                     id,
@@ -2140,14 +2675,13 @@ mod memory {
                 PimdirIndexOp::SetCursor {
                     store_change,
                     store_purges,
-                    store_reconciled,
                 } => {
                     self.meta.store_change = store_change;
                     self.meta.store_purges = store_purges;
-                    self.meta.store_reconciled = store_reconciled;
                 }
                 PimdirIndexOp::SetHorizon(horizon) => self.meta.horizon = Some(horizon),
                 PimdirIndexOp::SetTzdbVersion(version) => self.meta.tzdb_version = version,
+                PimdirIndexOp::SetFloatingZone(zone) => self.meta.floating_zone = zone,
             }
         }
     }
@@ -2288,6 +2822,17 @@ mod memory {
         let mut held = memory.occurrences.clone();
         held.values_mut().for_each(|rows| rows.sort());
         assert_eq!(occurrences, held, "occurrences");
+        let cuts: BTreeMap<Key, String> =
+            rows("SELECT collection, seq, cut FROM placement WHERE cut IS NOT NULL")
+                .iter()
+                .map(|r| ((text(&r[0]), int(&r[1])), text(&r[2])))
+                .collect();
+        assert_eq!(cuts, memory.cuts, "cuts");
+        let missing: BTreeSet<Key> = rows("SELECT collection, seq FROM missing")
+            .iter()
+            .map(|r| (text(&r[0]), int(&r[1])))
+            .collect();
+        assert_eq!(missing, memory.missing, "missing");
 
         let messages: BTreeMap<String, (String, Option<String>)> =
             rows("SELECT link_id, thread, parent FROM message")
@@ -2303,36 +2848,36 @@ mod memory {
         assert_eq!(threads, memory.threads, "threads");
 
         let meta = &rows(
-            "SELECT store_change, store_purges, store_reconciled, horizon_start, horizon_end, \
-             tzdb_version FROM index_meta",
+            "SELECT store_change, store_purges, horizon_start, horizon_end, \
+             tzdb_version, floating_zone FROM index_meta",
         )[0];
         let held = &memory.meta;
         assert_eq!(
-            (int(&meta[0]), int(&meta[1]), int(&meta[2])),
-            (held.store_change, held.store_purges, held.store_reconciled),
+            (int(&meta[0]), int(&meta[1])),
+            (held.store_change, held.store_purges),
             "the cursor"
         );
         assert_eq!(
             Some(PimdirIndexHorizon {
-                start: text(&meta[3]),
-                end: text(&meta[4]),
+                start: text(&meta[2]),
+                end: text(&meta[3]),
             }),
             held.horizon,
             "the horizon"
         );
-        assert_eq!(text(&meta[5]), held.tzdb_version, "the tzdb version");
+        assert_eq!(text(&meta[4]), held.tzdb_version, "the tzdb version");
+        assert_eq!(text(&meta[5]), held.floating_zone, "the floating zone");
     }
 
     /// The vectors' fixture store, indexed by `PimdirIndex` and by
     /// a consumer holding its index in maps, agrees row for row: once
     /// whole in small batches, then after a rename, which the key
-    /// reconciliation follows, and a horizon rolled a week later.
+    /// reconciliation follows, and a horizon rolled a week later, after a
+    /// reply left, its thread pruned, under another floating zone, and
+    /// over a body missing, then put back.
     #[test]
     fn a_consumer_of_its_own_shape_folds_the_canonical_index() {
-        let Some(spec) = spec_dir() else {
-            eprintln!("skipped: no pimdir spec checkout beside this one");
-            return;
-        };
+        let spec = spec_dir();
         let dir = tempfile::tempdir().unwrap();
         build(&spec, dir.path());
         let vectors = json(&spec.join("vectors/search/queries.json"));
@@ -2346,7 +2891,7 @@ mod memory {
         };
         assert!(index.refresh(&options).unwrap().is_current());
         let mut memory = Memory::new(dir.path());
-        memory.refresh(now, 4);
+        memory.refresh(now, 4, "UTC");
         assert!(!memory.placements.is_empty() && !memory.messages.is_empty());
         assert!(!memory.occurrences.is_empty());
         agree(dir.path(), &memory);
@@ -2356,14 +2901,56 @@ mod memory {
             .rename_collection("work/INBOX", "work/Mail")
             .unwrap();
         let later = now + 7 * 86_400;
-        let report = index
-            .refresh(&PimdirIndexRefreshOptions {
-                now: Some(later),
-                ..options
-            })
-            .unwrap();
+        let options = PimdirIndexRefreshOptions {
+            now: Some(later),
+            ..options
+        };
+        let report = index.refresh(&options).unwrap();
         assert!(report.reconciled && report.removed > 0, "{report:?}");
-        memory.refresh(later, 4);
+        memory.refresh(later, 4, "UTC");
+        agree(dir.path(), &memory);
+
+        PimdirStore::open(dir.path())
+            .unwrap()
+            .for_source("vectors")
+            .write(vec![PimdirWriteOp::DropPlacement {
+                collection: PimdirCollectionId("home/INBOX".into()),
+                handle: PimdirHandle("11".into()),
+                reason: PimdirDropReason::Deleted,
+            }])
+            .unwrap();
+        let paris = PimdirIndexRefreshOptions {
+            floating_zone: "Europe/Paris".into(),
+            ..options.clone()
+        };
+        assert!(index.refresh(&paris).unwrap().expanded > 0);
+        memory.refresh(later, 4, "Europe/Paris");
+        assert!(!memory.messages.contains_key("reply-1@example.org"));
+        agree(dir.path(), &memory);
+
+        let body = message("late@x", "Late", "late body");
+        let hash = PimdirStore::open(dir.path())
+            .unwrap()
+            .for_source("vectors")
+            .hash(&body);
+        file_as(
+            dir.path(),
+            "vectors",
+            "home/INBOX",
+            "message/rfc822",
+            body.clone(),
+        );
+        let blob = memory.reader.blobs().path(&hash).unwrap();
+        fs::remove_file(&blob).unwrap();
+        index.refresh(&options).unwrap();
+        memory.refresh(later, 4, "UTC");
+        assert_eq!(memory.missing.len(), 1);
+        agree(dir.path(), &memory);
+
+        fs::write(&blob, &body).unwrap();
+        index.refresh(&options).unwrap();
+        memory.refresh(later, 4, "UTC");
+        assert!(memory.missing.is_empty());
         agree(dir.path(), &memory);
     }
 }

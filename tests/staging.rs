@@ -101,7 +101,10 @@ fn a_create_naming_a_live_or_pending_link_id_is_refused() {
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
 
     let add = |producer: &mut PimdirProducer, id: &str| {
-        producer.enqueue_add("INBOX", &link(id), PimdirFlags::default(), None, None)
+        let body = format!("Message-ID: <{id}>\r\n\r\nx\r\n");
+        let object = producer.stage_body(body.as_bytes())?;
+        let flags = PimdirFlags::default();
+        producer.enqueue_add("INBOX", &link(id), flags, Some(&object), None)
     };
 
     add(&mut producer, "mid:a").unwrap();

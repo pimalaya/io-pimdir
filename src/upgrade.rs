@@ -7,6 +7,8 @@
 //! store first, so a body already stored under another collection is
 //! linked with no network round-trip: one body backs an item appearing
 //! in several collections, which is what the unified view relies on.
+//! The bodies the requested placements already hold are verified first,
+//! and one missing or failing its name is fetched again (STORAGE §7).
 //!
 //! A fetch is also what reads an identity, so this is where it settles.
 //! A collection holds one link id once, so a second copy of an identity
@@ -17,7 +19,11 @@
 
 use core::mem;
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec::Vec,
+};
 
 use log::{debug, trace};
 
@@ -25,14 +31,14 @@ use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     collection::PimdirCollectionId,
     coroutine::*,
-    load::PimdirLoadScope,
-    object::PimdirObject,
+    load::PimdirLoadSelection,
+    object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirStatus,
     },
     remote::{PimdirFetchedBody, PimdirFetchedItem, PimdirTier},
     summary::{self, PimdirSummary},
-    sync::PimdirSyncEvent,
+    sync::{PimdirConflictPolicy, PimdirSyncEvent, PimdirSyncOptions},
 };
 
 /// What an upgrade did.
@@ -50,12 +56,48 @@ pub struct PimdirUpgradeReport {
     pub events: Vec<PimdirSyncEvent>,
 }
 
+/// How an upgrade settles a divergence whose body it fetches (SYNC §6):
+/// by the source's policy, as its sync runs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PimdirUpgradeOptions {
+    /// The source's conflict policy (SYNC §5), `Manual` by default: a
+    /// divergence recorded before its server body was read is settled by
+    /// it once the upgrade reads that body.
+    pub conflict: PimdirConflictPolicy,
+    /// Whether the source may push content, its sync's `push` and
+    /// `rights.content`: `PreferLocal` settles nothing without, the
+    /// divergence staying as `Manual` records it.
+    pub push_content: bool,
+}
+
+impl Default for PimdirUpgradeOptions {
+    fn default() -> Self {
+        Self {
+            conflict: PimdirConflictPolicy::Manual,
+            push_content: true,
+        }
+    }
+}
+
+impl From<&PimdirSyncOptions> for PimdirUpgradeOptions {
+    fn from(opts: &PimdirSyncOptions) -> Self {
+        Self {
+            conflict: opts.conflict,
+            push_content: opts.push && opts.rights.content,
+        }
+    }
+}
+
 /// I/O-free UPGRADE coroutine.
 pub struct PimdirUpgrade {
     collection: PimdirCollectionId,
     handles: Vec<PimdirHandle>,
     tier: PimdirTier,
+    opts: PimdirUpgradeOptions,
     placements: BTreeMap<PimdirHandle, PimdirPlacement>,
+    /// The bodies requested placements hold that the storage found
+    /// missing or failing their name (STORAGE §7): fetched again.
+    missing: BTreeSet<PimdirHash>,
     /// Fetched items held between the fetch and the identity check.
     fetched: Vec<PimdirFetchedItem>,
     ops: Vec<PimdirWriteOp>,
@@ -81,12 +123,21 @@ impl PimdirUpgrade {
             collection,
             handles,
             tier,
+            opts: PimdirUpgradeOptions::default(),
             placements: BTreeMap::new(),
+            missing: BTreeSet::new(),
             fetched: Vec::new(),
             ops: Vec::new(),
             report: PimdirUpgradeReport::default(),
             state: State::Start,
         }
+    }
+
+    /// Tells the coroutine the source's policy (SYNC §6), which settles a
+    /// divergence whose body it fetches; `Manual` by default.
+    pub fn options(mut self, opts: PimdirUpgradeOptions) -> Self {
+        self.opts = opts;
+        self
     }
 
     /// Requested handles that still need work for the target tier.
@@ -107,9 +158,15 @@ impl PimdirUpgrade {
                         .base
                         .as_ref()
                         .is_some_and(|base| base.revision.is_some() && base.object.is_none()),
-                    PimdirTier::Full => match is_conflicted(p) {
-                        true => p.conflict_object.is_none(),
-                        false => p.level < PimdirLevel::Full || p.object.is_none(),
+                    // NOTE: a body held but missing or failing its name is no
+                    // body (STORAGE §7): fetched again where the source holds
+                    // it.
+                    PimdirTier::Full => match (is_conflicted(p), &p.object) {
+                        (true, _) => p.conflict_object.is_none(),
+                        (false, Some(object)) => {
+                            p.level < PimdirLevel::Full || self.missing.contains(object)
+                        }
+                        (false, None) => true,
                     },
                 },
                 None => false,
@@ -200,10 +257,11 @@ impl PimdirUpgrade {
                         revision: item.revision.clone(),
                         object: Some(hash),
                     });
+                    self.ops.push(PimdirWriteOp::UpsertPlacement(patched));
                 } else {
-                    patched.conflict_object = Some(hash);
+                    let revision = item.revision.clone().or(patched.conflict_revision.clone());
+                    self.settle(patched, hash, revision);
                 }
-                self.ops.push(PimdirWriteOp::UpsertPlacement(patched));
                 self.report.fetched += 1;
                 self.report.upgraded += 1;
                 continue;
@@ -322,6 +380,146 @@ impl PimdirUpgrade {
         PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops))
     }
 
+    /// Raises the pending handles: a fetch at `Meta`, a lookup of the
+    /// link ids in the object store first at `Full`, nothing left done.
+    fn raise(&mut self) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
+        let pending = self.pending_handles();
+        if pending.is_empty() {
+            debug!("nothing to upgrade");
+            self.state = State::Done;
+            return PimdirCoroutineState::Complete(Ok(mem::take(&mut self.report)));
+        }
+
+        match self.tier {
+            PimdirTier::Meta => {
+                debug!("fetch {} items at meta tier", pending.len());
+                self.state = State::Fetching;
+                PimdirCoroutineState::Yielded(PimdirYield::WantsFetch {
+                    collection: self.collection.clone(),
+                    handles: pending,
+                    tier: PimdirTier::Meta,
+                })
+            }
+            PimdirTier::Full => {
+                let links: Vec<_> = pending
+                    .iter()
+                    .filter_map(|h| self.placements.get(h))
+                    .filter(|p| !is_mutable(p) && !is_conflicted(p))
+                    .filter_map(|p| p.link_id.clone())
+                    .collect();
+
+                if links.is_empty() {
+                    debug!("fetch {} items at full tier", pending.len());
+                    self.state = State::Fetching;
+                    return PimdirCoroutineState::Yielded(PimdirYield::WantsFetch {
+                        collection: self.collection.clone(),
+                        handles: pending,
+                        tier: PimdirTier::Full,
+                    });
+                }
+
+                debug!("look up {} link ids in object store", links.len());
+                trace!("link ids: {links:?}");
+                self.state = State::LookingUp;
+                PimdirCoroutineState::Yielded(PimdirYield::WantsLookupObject(links))
+            }
+        }
+    }
+
+    /// The bodies the requested placements hold at `Full` as the source
+    /// last agreed on them, which a full upgrade would otherwise trust
+    /// unread: what it verifies first (STORAGE §7). None at `Meta`, and
+    /// none a local edit staged, which no source holds to fetch again.
+    fn held_bodies(&self) -> BTreeSet<PimdirHash> {
+        if self.tier != PimdirTier::Full {
+            return BTreeSet::new();
+        }
+
+        self.handles
+            .iter()
+            .filter_map(|handle| self.placements.get(handle))
+            .filter(|p| p.level == PimdirLevel::Full && !is_conflicted(p))
+            .filter(|p| p.staged_edit().is_none())
+            .filter_map(|p| p.object.clone())
+            .collect()
+    }
+
+    /// Settles a binding's divergence by the source's policy once its
+    /// server body, `fetched` at `revision`, is read (SYNC §5, §6).
+    ///
+    /// `Manual`, and `PreferLocal` without content pushes, record it as
+    /// the binding's diverging body. `PreferLocal` keeps it as a retained
+    /// item, an overruling write setting it aside, and moves the base onto
+    /// it, so the next sync pushes the local body gated on its revision.
+    /// `PreferRemote` adopts it as the body and the base, the write keeping
+    /// the local edit it drops (SYNC §9).
+    fn settle(
+        &mut self,
+        mut patched: PimdirPlacement,
+        fetched: PimdirHash,
+        revision: Option<String>,
+    ) {
+        let base_flags = patched
+            .base
+            .as_ref()
+            .map(|base| base.flags.clone())
+            .unwrap_or_else(|| patched.flags.clone());
+        let mut diverged = patched.clone();
+        diverged.status = PimdirStatus::Conflict;
+        diverged.conflict_revision = revision.clone();
+        diverged.conflict_object = Some(fetched.clone());
+
+        let policy = match (self.opts.conflict, self.opts.push_content) {
+            (PimdirConflictPolicy::PreferLocal, false) => PimdirConflictPolicy::Manual,
+            (policy, _) => policy,
+        };
+        match policy {
+            PimdirConflictPolicy::Manual => {
+                self.ops.push(PimdirWriteOp::UpsertPlacement(diverged));
+                return;
+            }
+            PimdirConflictPolicy::PreferLocal => {
+                debug!("keep the body {} pushes over", patched.handle.as_str());
+                self.ops.push(PimdirWriteOp::UpsertPlacement(diverged));
+                self.ops.push(PimdirWriteOp::Overrule {
+                    collection: self.collection.clone(),
+                    handle: patched.handle.clone(),
+                });
+            }
+            PimdirConflictPolicy::PreferRemote => {
+                debug!("adopt the body {} fetched", patched.handle.as_str());
+                // NOTE: the binding's conflict clears first, so the write
+                // reads the pull as one dropping a local edit, which it
+                // keeps (SYNC §9).
+                if patched.conflict_revision.is_some() {
+                    let mut cleared = patched.clone();
+                    cleared.status = PimdirStatus::Dirty;
+                    cleared.conflict_revision = None;
+                    cleared.conflict_object = None;
+                    self.ops.push(PimdirWriteOp::UpsertPlacement(cleared));
+                }
+                patched.object = Some(fetched.clone());
+                patched.level = PimdirLevel::Full;
+            }
+        }
+
+        patched.conflict_revision = None;
+        patched.conflict_object = None;
+        patched.status = match (
+            patched.object == Some(fetched.clone()),
+            base_flags == patched.flags,
+        ) {
+            (true, true) => PimdirStatus::Clean,
+            _ => PimdirStatus::Dirty,
+        };
+        patched.base = Some(PimdirBase {
+            flags: base_flags,
+            revision,
+            object: Some(fetched),
+        });
+        self.ops.push(PimdirWriteOp::UpsertPlacement(patched));
+    }
+
     /// Takes the pending create of this source holding `hint`, if any.
     ///
     /// A `Created` placement with no base under a provisional handle is
@@ -355,9 +553,9 @@ impl PimdirUpgrade {
     /// create stay, so an edit made on it still pushes (SYNC §6). A
     /// mutable fetch carrying no body, or another body than the staged
     /// one, is the both-changed case: the binding is conflicted at the
-    /// fetched revision, its base naming no body, the fetched body its
-    /// `conflict_object`, since nothing read what the server held or no
-    /// policy is known here to choose between the two.
+    /// fetched revision, its base naming no body, when nothing read what
+    /// the server holds; a fetched body is settled by the source's policy
+    /// ([`settle`](Self::settle)).
     fn land(&mut self, create: PimdirPlacement, named: &PimdirPlacement, item: PimdirFetchedItem) {
         debug!(
             "land the pending create {} under {}",
@@ -375,6 +573,7 @@ impl PimdirUpgrade {
         let mut base_object = landed.object.clone();
         let mutable = item.revision.is_some() && landed.object.is_some();
         let mut diverged = mutable;
+        let mut fetched = None;
 
         if let (PimdirTier::Full, Some(body)) = (self.tier, item.body) {
             let (object, bytes) = stored_body(body);
@@ -385,7 +584,7 @@ impl PimdirUpgrade {
             });
             diverged = mutable && landed.object.as_ref() != Some(&hash);
             match diverged {
-                true => landed.conflict_object = Some(hash),
+                true => fetched = Some(hash),
                 false => {
                     base_object = Some(hash.clone());
                     landed.object.get_or_insert(hash);
@@ -414,18 +613,26 @@ impl PimdirUpgrade {
             }
             _ => PimdirStatus::Dirty,
         };
-        if diverged {
-            if let Some(base) = &mut landed.base {
-                base.object = None;
-            }
-            landed.status = PimdirStatus::Conflict;
-            landed.conflict_revision = landed.base.as_ref().and_then(|b| b.revision.clone());
-        }
         landed.origin = None;
-
-        self.ops.push(PimdirWriteOp::UpsertPlacement(landed));
+        if diverged && let Some(base) = &mut landed.base {
+            base.object = None;
+        }
         self.report.fetched += 1;
         self.report.upgraded += 1;
+
+        // NOTE: a fetched body settles the divergence by the policy as a
+        // carried one would have; none read leaves it as `Manual` records
+        // it, for a full upgrade to read (SYNC §6).
+        let revision = landed.base.as_ref().and_then(|b| b.revision.clone());
+        match (diverged, fetched) {
+            (true, Some(fetched)) => self.settle(landed, fetched, revision),
+            (true, None) => {
+                landed.status = PimdirStatus::Conflict;
+                landed.conflict_revision = revision;
+                self.ops.push(PimdirWriteOp::UpsertPlacement(landed));
+            }
+            (false, _) => self.ops.push(PimdirWriteOp::UpsertPlacement(landed)),
+        }
     }
 }
 
@@ -443,7 +650,7 @@ impl PimdirCoroutine for PimdirUpgrade {
                 self.state = State::Loading;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                     collection: self.collection.clone(),
-                    scope: PimdirLoadScope::Handles(self.handles.clone()),
+                    selection: PimdirLoadSelection::Handles(self.handles.clone()),
                 })
             }
 
@@ -454,47 +661,27 @@ impl PimdirCoroutine for PimdirUpgrade {
                     .map(|p| (p.handle.clone(), p))
                     .collect();
 
-                let pending = self.pending_handles();
-                if pending.is_empty() {
-                    debug!("nothing to upgrade");
-                    self.state = State::Done;
-                    return PimdirCoroutineState::Complete(Ok(mem::take(&mut self.report)));
+                // NOTE: a body a placement holds is only a name until read
+                // (STORAGE §7): the ones a full upgrade would trust are
+                // verified first, and those missing or failing their name
+                // are fetched again.
+                self.missing = self.held_bodies();
+                if !self.missing.is_empty() {
+                    debug!("verify {} held bodies", self.missing.len());
+                    self.state = State::Verifying;
+                    let hashes = self.missing.iter().cloned().collect();
+                    return PimdirCoroutineState::Yielded(PimdirYield::WantsVerify(hashes));
                 }
+                self.raise()
+            }
 
-                match self.tier {
-                    PimdirTier::Meta => {
-                        debug!("fetch {} items at meta tier", pending.len());
-                        self.state = State::Fetching;
-                        PimdirCoroutineState::Yielded(PimdirYield::WantsFetch {
-                            collection: self.collection.clone(),
-                            handles: pending,
-                            tier: PimdirTier::Meta,
-                        })
-                    }
-                    PimdirTier::Full => {
-                        let links: Vec<_> = pending
-                            .iter()
-                            .filter_map(|h| self.placements.get(h))
-                            .filter(|p| !is_mutable(p) && !is_conflicted(p))
-                            .filter_map(|p| p.link_id.clone())
-                            .collect();
-
-                        if links.is_empty() {
-                            debug!("fetch {} items at full tier", pending.len());
-                            self.state = State::Fetching;
-                            return PimdirCoroutineState::Yielded(PimdirYield::WantsFetch {
-                                collection: self.collection.clone(),
-                                handles: pending,
-                                tier: PimdirTier::Full,
-                            });
-                        }
-
-                        debug!("look up {} link ids in object store", links.len());
-                        trace!("link ids: {links:?}");
-                        self.state = State::LookingUp;
-                        PimdirCoroutineState::Yielded(PimdirYield::WantsLookupObject(links))
-                    }
+            (State::Verifying, Some(PimdirArg::Verified(sound))) => {
+                self.missing.retain(|hash| !sound.contains(hash));
+                if !self.missing.is_empty() {
+                    debug!("fetch {} held bodies again", self.missing.len());
+                    trace!("missing bodies: {:?}", self.missing);
                 }
+                self.raise()
             }
 
             (State::LookingUp, Some(PimdirArg::LookupObject(known))) => {
@@ -514,6 +701,8 @@ impl PimdirCoroutine for PimdirUpgrade {
                         .filter(|_| !is_mutable(placement) && !is_conflicted(placement))
                         .and_then(|link| known.get(link))
                         .filter(|object| size_agrees(placement, object.size))
+                        // NOTE: a body found missing is no body to link.
+                        .filter(|object| !self.missing.contains(&object.hash))
                         .map(|object| object.hash.clone());
 
                     match hit {
@@ -583,7 +772,7 @@ impl PimdirCoroutine for PimdirUpgrade {
                 self.state = State::CheckingLinks;
                 PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
                     collection: self.collection.clone(),
-                    scope: PimdirLoadScope::Links(fresh),
+                    selection: PimdirLoadSelection::Links(fresh),
                 })
             }
 
@@ -677,6 +866,7 @@ fn size_agrees(placement: &PimdirPlacement, size: usize) -> bool {
 enum State {
     Start,
     Loading,
+    Verifying,
     LookingUp,
     Fetching,
     CheckingLinks,
@@ -935,7 +1125,7 @@ mod tests {
         }];
         match up.resume(Some(PimdirArg::Fetch(items))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
-                scope: PimdirLoadScope::Links(links),
+                selection: PimdirLoadSelection::Links(links),
                 ..
             }) => assert_eq!(
                 links,
@@ -1010,7 +1200,7 @@ mod tests {
         let ops = match up.resume(Some(PimdirArg::Fetch(items))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => Some(ops),
             PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
-                scope: PimdirLoadScope::Links(_),
+                selection: PimdirLoadSelection::Links(_),
                 ..
             }) => None,
             state => panic!("expected WantsWrite or a link check, got {state:?}"),
@@ -1188,7 +1378,7 @@ mod tests {
         };
         match up.resume(Some(PimdirArg::Fetch(vec![item]))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
-                scope: PimdirLoadScope::Links(_),
+                selection: PimdirLoadSelection::Links(_),
                 ..
             }) => (),
             state => panic!("expected a link check, got {state:?}"),

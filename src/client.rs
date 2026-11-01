@@ -19,32 +19,35 @@ use std::{
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
+use log::{debug, trace, warn};
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Params, Row, ToSql, TransactionBehavior,
-    named_params,
+    config::DbConfig, named_params,
 };
 
 use crate::{
     capability::{PimdirCapability, PimdirRefusal},
     client::{
-        blobs::{PimdirBlobStage, PimdirBlobs},
+        blobs::{PimdirBlobCheck, PimdirBlobStage, PimdirBlobStray, PimdirBlobs},
         lock::PimdirLock,
         reader::{PimdirReader, reference_from_row},
         write::kind_of,
     },
     codec::{self, PimdirAction, PimdirActionError},
-    hash::PimdirHashAlgo,
+    hash,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
-    object::PimdirObject,
+    object::{PimdirHash, PimdirObject},
     placement::PimdirLinkId,
     reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
-    sql,
+    security, sql,
     summary::{
         self,
         file::{self, PimdirFileSummary},
     },
+    sync::SYNC_VERSION,
 };
 
 /// The local time collection's id (§14.3): `U+0001` and `time`, under no
@@ -55,6 +58,7 @@ pub const TIME_COLLECTION: &str = "\u{1}time";
 pub mod blobs;
 mod capability;
 pub mod diagnostics;
+pub mod modes;
 pub mod producer;
 pub mod reader;
 #[cfg(feature = "search")]
@@ -141,7 +145,7 @@ pub struct PimdirReleaseReport {
 }
 
 /// What a collection reclaimed.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirGcReport {
     /// Object rows dropped: bodies nothing references any more.
     pub objects: usize,
@@ -149,6 +153,31 @@ pub struct PimdirGcReport {
     pub blobs: usize,
     /// The bytes those files freed.
     pub bytes: u64,
+    /// The entries of objects/ that are no body, left in place (§5): a
+    /// link, a writer's temporary, any other name or position.
+    pub strays: Vec<PimdirBlobStray>,
+}
+
+/// What an erase removed (§11.5).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirEraseReport {
+    /// Whether a retained item, or a live one no source binds, held the
+    /// public id and was purged.
+    pub erased: bool,
+    /// What the collector reclaimed after the purge.
+    pub collected: PimdirGcReport,
+}
+
+/// What emptying quarantine/ removed (§7).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirQuarantineReport {
+    /// Files and links unlinked.
+    pub files: usize,
+    /// The bytes those files held.
+    pub bytes: u64,
+    /// The entries left in place: anything no file nor link, which no
+    /// owner moves there.
+    pub left: Vec<PathBuf>,
 }
 
 impl PimdirStore {
@@ -157,33 +186,60 @@ impl PimdirStore {
     /// Takes the store's exclusive advisory lock (§8) and holds it until
     /// the handle drops; a store another process owns is
     /// [`PimdirError::Owned`] at once, never a wait. A fresh database is
-    /// created by running the migrations (§6). An existing store is opened
-    /// in §6's order, refused before anything is written when it is above
-    /// this crate's version ([`PimdirError::Version`]), not a pimdir store
-    /// ([`PimdirError::Foreign`]), of another shape ([`PimdirError::Shape`]),
-    /// missing a core table ([`PimdirError::Stale`]) or naming its objects
-    /// by another algorithm; a version 1 store an earlier draft wrote is
-    /// then reconciled to 0001_init.sql, and every migration above its
-    /// version run.
+    /// created by 0001_init.sql (§6). An existing store is refused before
+    /// anything is written when this crate does not open it: not a pimdir
+    /// store ([`PimdirError::Foreign`]), a store of another draft or one
+    /// lacking `format_version` ([`PimdirError::Version`]), disagreeing
+    /// stamps ([`PimdirError::VersionMismatch`]), another algorithm
+    /// ([`PimdirError::HashAlgo`]) or a damaged schema
+    /// ([`PimdirError::Damaged`]). Nothing is reconciled nor migrated.
+    ///
+    /// A store is its user's alone (§18): created with its directories
+    /// `0700` and its files `0600`, the directory it is created in
+    /// restricted so too, and an existing one whose directory or pimdir.db
+    /// another user can read or write refused as [`PimdirError::Exposed`].
+    ///
+    /// A store whose rows stand under an earlier Annex A revision than this
+    /// crate's is re-derived before the handle is answered (§6).
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
-        Self::open_with_hash(dir, None)
+        let dir = dir.as_ref();
+        let db = dir.join("pimdir.db");
+        if !db.exists() {
+            modes::create_dir_all(dir)?;
+            modes::restrict(dir)?;
+        }
+        modes::check(dir)?;
+        modes::create_dir_all(&dir.join("objects"))?;
+
+        let lock = PimdirLock::own(dir)?;
+
+        modes::create_database(&db)?;
+        let mut conn = Connection::open(&db)?;
+        // NOTE: the journal mode is set by the schema runner once it knows
+        // the database is a fresh one (§6).
+        prepare_connection(&conn)?;
+        schema::init(&mut conn)?;
+
+        let mut store = Self {
+            reader: PimdirReader::over(conn, dir.to_path_buf())?,
+            lock,
+            account: None,
+        };
+        store.rederive()?;
+        Ok(store)
     }
 
-    /// Opens the existing store rooted at `dir` as its owner only as it
-    /// stands: unlike [`open`](Self::open), it creates, migrates and
-    /// reconciles nothing (§6), so a caller that owns the store for a
-    /// moment (one local write) never rebuilds a store another owner of
-    /// another revision keeps.
+    /// Opens the existing store rooted at `dir` as its owner: unlike
+    /// [`open`](Self::open), it creates nothing, so a caller that owns the
+    /// store for a moment (one local write) never makes a store its sync
+    /// engine has not.
     ///
-    /// Refused, writing nothing, as [`PimdirError::NotCurrent`]: no
-    /// database under `dir` ([`PimdirNotCurrent::Absent`]), a
-    /// `user_version` other than this crate's
-    /// ([`PimdirNotCurrent::Version`]), or a schema whose text differs
-    /// from the canonical one, which `open` would reconcile
-    /// ([`PimdirNotCurrent::Shape`]). Otherwise as `open`: the same lock,
-    /// [`PimdirError::Owned`] at once when another process holds it, and
-    /// the refusals of a damaged store ([`PimdirError::Stale`],
-    /// [`PimdirError::VersionMismatch`], [`PimdirError::HashAlgo`]).
+    /// Refused, writing nothing, as [`PimdirError::NotCurrent`] when no
+    /// database is under `dir` ([`PimdirNotCurrent::Absent`]) or the one
+    /// there holds no schema ([`PimdirNotCurrent::Version`]). Otherwise as
+    /// `open`: the same lock, [`PimdirError::Owned`] at once when another
+    /// process holds it, the same refusals, [`PimdirError::Exposed`]
+    /// included, and the same re-derivation.
     pub fn open_current(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         let db = dir.join("pimdir.db");
@@ -191,6 +247,7 @@ impl PimdirStore {
             return Err(PimdirError::NotCurrent(PimdirNotCurrent::Absent));
         }
 
+        modes::check(dir)?;
         let lock = PimdirLock::own(dir)?;
 
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -198,40 +255,113 @@ impl PimdirStore {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&db, flags)?;
         prepare_connection(&conn)?;
-        schema::current(&conn)?;
-        let hash = schema::hash_algo(&conn, None)?;
+        match schema::check(&conn) {
+            Err(PimdirError::Uncreated) => {
+                return Err(PimdirError::NotCurrent(PimdirNotCurrent::Version {
+                    found: 0,
+                }));
+            }
+            checked => checked?,
+        }
 
-        Ok(Self {
-            reader: PimdirReader::over(conn, dir.to_path_buf(), hash)?,
+        let mut store = Self {
+            reader: PimdirReader::over(conn, dir.to_path_buf())?,
             lock,
             account: None,
-        })
+        };
+        store.rederive()?;
+        Ok(store)
     }
 
-    /// Opens the store rooted at `dir`, declaring the hash its objects
-    /// are named by (§5) when it creates one; an existing store whose
-    /// algorithm differs is [`PimdirError::HashAlgo`].
-    pub fn open_with_hash(
-        dir: impl AsRef<Path>,
-        hash: Option<PimdirHashAlgo>,
-    ) -> Result<Self, PimdirError> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        fs::create_dir_all(dir.join("objects"))?;
+    /// Re-derives the held mail and tasks of a store whose rows stand under
+    /// an earlier Annex A revision than [`schema::DERIVATION`] (STORAGE §6):
+    /// every message and task holding a body, a keyset page of
+    /// `list_held_mail`, then of `list_held_tasks`, at a time, each page
+    /// written in its own transaction and the revision recorded with
+    /// `set_derivation` in the last one. An open interrupted before then
+    /// owes it again, and the next open resumes it from the first page.
+    ///
+    /// A body that is absent or fails its name derives nothing, the one
+    /// failing it moved into quarantine/; its rows stay as written.
+    fn rederive(&mut self) -> Result<(), PimdirError> {
+        const PAGE: i64 = 256;
 
-        let lock = PimdirLock::own(dir)?;
+        let stored = self.store_meta()?.derivation;
+        if stored >= schema::DERIVATION {
+            return Ok(());
+        }
+        debug!("re-derive the store from revision {stored}");
 
-        let mut conn = Connection::open(dir.join("pimdir.db"))?;
-        // NOTE: the journal mode is set by the schema runner once it knows
-        // the database is a store it may write (§6).
-        prepare_connection(&conn)?;
-        let hash = schema::init(&mut conn, hash, dir)?;
+        let lists = [
+            (sql::LIST_HELD_MAIL, "message/rfc822"),
+            (sql::LIST_HELD_TASKS, "text/calendar"),
+        ];
+        let mut moved = 0;
+        for (at, (statement, kind)) in lists.into_iter().enumerate() {
+            let mut after: Option<(String, String)> = None;
+            loop {
+                let page: Vec<(String, String, String)> = rows(
+                    &self.conn,
+                    statement,
+                    named_params! {
+                        ":after_collection": after.as_ref().map(|(collection, _)| collection),
+                        ":after_link_id": after.as_ref().map(|(_, link)| link),
+                        ":limit": PAGE,
+                    },
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(3)?)),
+                )?;
 
-        Ok(Self {
-            reader: PimdirReader::over(conn, dir.to_path_buf(), hash)?,
-            lock,
-            account: None,
-        })
+                let mut derived = Vec::with_capacity(page.len());
+                for (collection, link, hash) in &page {
+                    let hash = PimdirHash(hash.clone());
+                    match self.blobs().get(&hash)? {
+                        Some(body) => derived.extend(
+                            summary::derive(kind, &body)
+                                .map(|derivation| (collection, link, derivation)),
+                        ),
+                        None => {
+                            self.quarantine(&hash)?;
+                        }
+                    }
+                }
+
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(busy_or_sql)?;
+                for (collection, link, derivation) in &derived {
+                    let link = PimdirLinkId((*link).clone());
+                    let hub =
+                        write::read_hub(&tx, collection, Some(core::slice::from_ref(&link.0)))?;
+                    if let Some(held) = hub.items.get(&link)
+                        && write::rederive_item(&tx, collection, &link, held, derivation)?
+                    {
+                        moved += 1;
+                    }
+                }
+                let last = page.len() < PAGE as usize;
+                if last && at + 1 == lists.len() {
+                    tx.execute(
+                        sql::SET_DERIVATION,
+                        named_params! { ":derivation": schema::DERIVATION },
+                    )?;
+                }
+                tx.commit().map_err(busy_or_sql)?;
+
+                if last {
+                    break;
+                }
+                after = page
+                    .last()
+                    .map(|(collection, link, _)| (collection.clone(), link.clone()));
+            }
+        }
+
+        debug!(
+            "re-derived {moved} items to revision {}",
+            schema::DERIVATION
+        );
+        Ok(())
     }
 
     /// Binds this handle to an account, so every collection it creates
@@ -485,10 +615,10 @@ impl PimdirStore {
             });
         };
         let object = PimdirObject {
-            hash: self.hash.hash(body),
+            hash: hash::hash(body),
             size: body.len(),
         };
-        let blobs = PimdirBlobs::open(&self.dir, self.hash);
+        let blobs = PimdirBlobs::open(&self.dir);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -746,6 +876,45 @@ impl PimdirStore {
         Ok(PimdirPurgeReport { items })
     }
 
+    /// Erases the item `seq` of `collection` from the store's files, at the
+    /// user's request (§11.5): its purge when it is retained, or
+    /// `delete_unbound_item` when it is live and no source binds it, its
+    /// pins released; then the collector, which unlinks every body no row
+    /// names any more; then a `TRUNCATE` checkpoint of pimdir.db, again
+    /// until every frame is checkpointed. With `secure_delete` on every
+    /// connection, the item's rows then stand in neither the file nor its
+    /// WAL. A live item a source binds is that source's to remove first:
+    /// nothing is purged, [`erased`](PimdirEraseReport::erased) false.
+    ///
+    /// The other steps run whether or not an item was purged, so an erase
+    /// a busy reader stopped ([`PimdirError::Busy`] past three waits on
+    /// the WAL) finishes when it is run again. Where an index is kept,
+    /// `PimdirIndex::erase` (feature `search`) runs the rest of §11.5 on
+    /// index.db after it: a body another item names, a backup, quarantine/
+    /// and the filesystem's own copies stay.
+    pub fn erase(
+        &mut self,
+        collection: impl AsRef<str>,
+        seq: i64,
+    ) -> Result<PimdirEraseReport, PimdirError> {
+        let collection = collection.as_ref();
+        let live = self.get_item(collection, seq)?;
+
+        let erased = match self.purge(collection, seq)? {
+            true => true,
+            false => match &live {
+                Some(item) => self.delete_unbound(collection, &item.link_id)?,
+                None => false,
+            },
+        };
+        debug!("erase {collection}/{seq}: purged {erased}");
+
+        let collected = self.collect_garbage()?;
+        checkpoint(&self.conn)?;
+
+        Ok(PimdirEraseReport { erased, collected })
+    }
+
     /// The owner's manual collection of one mail collection below a date
     /// (§11.3): every live item whose `date` is older than `before` (RFC
     /// 3339, `Z`) and that owes nothing, removed with its bindings,
@@ -857,8 +1026,12 @@ impl PimdirStore {
             objects,
             ..Default::default()
         };
+        // NOTE: the scan reads entries by lstat, so a body is a regular
+        // file named well in its own shard, and anything else is a stray
+        // left in place (§5).
+        let scan = self.blobs().scan()?;
         let mut exists = self.conn.prepare(sql::OBJECT_EXISTS)?;
-        for blob in self.blobs().files()? {
+        for blob in scan.files {
             if exists.exists(named_params! { ":hash": blob.hash })? {
                 continue;
             }
@@ -867,8 +1040,82 @@ impl PimdirStore {
             report.bytes += blob.size;
         }
         drop(exists);
+        for stray in &scan.strays {
+            debug!("leave {:?} {}", stray.kind, stray.path.display());
+        }
+        report.strays = scan.strays;
 
         Ok(report)
+    }
+
+    /// Moves the body under `hash` into quarantine/ when it fails its name
+    /// (§7): bytes hashing to another name, or a link where its shard or
+    /// itself belongs. Checked again under the staging lock taken
+    /// exclusively and the process's own writer lock, as the collector
+    /// holds them, and never unlinked; the row stays, so the next write of
+    /// that body lands. Answers where it went, `None` when the body is
+    /// sound or absent, or when a producer holds the staging lock: the
+    /// move is then made by the next read finding the mismatch.
+    pub fn quarantine(&self, hash: &PimdirHash) -> Result<Option<PathBuf>, PimdirError> {
+        let Ok(_staging) = PimdirLock::collect(&self.dir) else {
+            return Ok(None);
+        };
+        let lock = Arc::clone(&self.lock);
+        let _collecting = lock.collecting();
+
+        let moved = self.blobs().quarantine(hash)?;
+        if let Some(target) = &moved {
+            warn!(
+                "body {} fails its name, moved to {}",
+                hash.0,
+                target.display()
+            );
+        }
+
+        Ok(moved)
+    }
+
+    /// Empties quarantine/ (§7), at the user's request: every file and
+    /// link in it unlinked, under the staging lock taken exclusively and
+    /// the process's own writer lock, as a move into it holds them. What
+    /// it held may have been the only copy of a body.
+    ///
+    /// A producer holding the staging lock is [`PimdirError::Staging`],
+    /// reported at once.
+    pub fn empty_quarantine(&self) -> Result<PimdirQuarantineReport, PimdirError> {
+        let _staging = PimdirLock::collect(&self.dir)?;
+        let lock = Arc::clone(&self.lock);
+        let _collecting = lock.collecting();
+
+        let mut report = PimdirQuarantineReport::default();
+        for path in self.blobs().quarantined()? {
+            let meta = fs::symlink_metadata(&path)?;
+            if !meta.is_file() && !meta.file_type().is_symlink() {
+                report.left.push(path);
+                continue;
+            }
+
+            fs::remove_file(&path)?;
+            report.files += 1;
+            if meta.is_file() {
+                report.bytes += meta.len();
+            }
+        }
+        debug!("emptied quarantine: {} files", report.files);
+
+        Ok(report)
+    }
+
+    /// Checks the body under `hash` against its name, streamed (§7), and
+    /// moves one failing it into quarantine/: what the owner's reads of a
+    /// body it is about to use go through.
+    pub(crate) fn check_body(&self, hash: &PimdirHash) -> Result<PimdirBlobCheck, PimdirError> {
+        let check = self.blobs().check(hash)?;
+        if check == PimdirBlobCheck::Failing {
+            self.quarantine(hash)?;
+        }
+
+        Ok(check)
     }
 
     /// Recomputes every refcount from the five pointer columns (§7),
@@ -885,6 +1132,22 @@ impl PimdirStore {
         self.conn
             .execute(sql::DELETE_DANGLING_BINDINGS, [])
             .map_err(busy_or_sql)
+    }
+
+    /// Raises the store's incarnation (`raise_incarnation`, STORAGE §4.5,
+    /// §8), answering the new one: what a restore runs on the copy before
+    /// anything else opens it, so no consumer takes the copy for the store
+    /// it followed. `replaced` is the incarnation of the store the copy
+    /// replaces when that one could still be read, the new one rising
+    /// above both.
+    pub fn raise_incarnation(&self, replaced: Option<i64>) -> Result<i64, PimdirError> {
+        self.conn
+            .execute(
+                sql::RAISE_INCARNATION,
+                named_params! { ":replaced": replaced },
+            )
+            .map_err(busy_or_sql)?;
+        Ok(self.change_cursor()?.incarnation)
     }
 }
 
@@ -912,9 +1175,8 @@ impl PimdirStore {
     /// the length of the call (§15.5); the store must exist already.
     ///
     /// Opened through [`open_current`](Self::open_current): a consumer
-    /// owning the store for one write never migrates nor reconciles it, so
-    /// a store of another revision is refused as
-    /// [`PimdirError::NotCurrent`] and left as it was.
+    /// owning the store for one write never creates it, and a store this
+    /// crate does not open is refused and left as it was.
     pub fn cancel_action(dir: impl AsRef<Path>, id: i64) -> Result<bool, PimdirError> {
         let dir = dir.as_ref();
         if !dir.join("pimdir.db").is_file() {
@@ -978,7 +1240,8 @@ impl PimdirStore {
     /// `seq`, in one transaction, so the change exists only once the
     /// intent is performed and a producer reads the intent `Applied`
     /// (§15.4). Reports whether the intent was still queued; when it was
-    /// not, nothing is enqueued.
+    /// not, nothing is enqueued. A change whose payload its schema refuses
+    /// is [`PimdirError::Action`], the intent left queued (§15.3).
     pub fn replace_action(
         &mut self,
         id: i64,
@@ -994,6 +1257,11 @@ impl PimdirStore {
         let Some(queued) = queued_collection(&tx, id)? else {
             return Ok(false);
         };
+        let payload = codec::action_to_payload(action);
+        match codec::action_from_payload(action.kind(), &payload) {
+            Ok(_) | Err(PimdirActionError::UnknownVersion(Some(_))) => {}
+            Err(err) => return Err(err.into()),
+        }
         let hash = action.object_hash().cloned();
         if let Some(hash) = &hash {
             tx.execute(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
@@ -1004,7 +1272,7 @@ impl PimdirStore {
                 ":producer": producer,
                 ":collection": collection,
                 ":action": action.kind(),
-                ":payload": codec::action_to_payload(action),
+                ":payload": payload,
                 ":target_collection": action.target_collection().map(|to| to.0.as_str()),
                 ":object_hash": hash.as_ref().map(|h| h.0.as_str()),
             },
@@ -1022,7 +1290,9 @@ impl PimdirStore {
     }
 
     /// Records a failed apply (§15.2): `None` bumps the attempts and
-    /// leaves the row pending, `Some(error)` parks it, the attempt counted.
+    /// leaves the row pending, `Some(error)` parks it, the attempt counted,
+    /// its text recorded once [scrubbed](security::scrub) of the
+    /// credentials a connector's error may carry (§18).
     pub fn fail_action(&self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
         let Some(error) = error else {
             self.conn
@@ -1031,6 +1301,7 @@ impl PimdirStore {
             return Ok(());
         };
 
+        let error = security::scrub(error);
         self.conn
             .execute(
                 sql::PARK_ACTION,
@@ -1085,12 +1356,71 @@ pub(crate) fn bind_list<V: ToSql>(
     Ok(())
 }
 
-/// Sets up a connection to a store as every role does (STORAGE §4.1,
-/// §4.4): foreign keys on, a busy timeout, and the list parameters'
-/// temporary table, which a read-only connection creates too.
+/// How long a connection waits on another's write transaction before a
+/// statement fails busy (STORAGE §4.1): long enough for a large write
+/// batch of the owner, or of a same-source worker, to commit.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The durability every connection sets (STORAGE §4.1): a commit synced
+/// before it reports, and a deleted row's bytes overwritten (§11.5).
+#[cfg(not(target_vendor = "apple"))]
+const DURABILITY: &str = "PRAGMA synchronous = FULL; PRAGMA secure_delete = ON;";
+
+/// The durability every connection sets (STORAGE §4.1): a commit synced
+/// before it reports, through `F_FULLFSYNC` since a plain `fsync` leaves
+/// the drive's cache unflushed here, and a deleted row's bytes
+/// overwritten (§11.5).
+#[cfg(target_vendor = "apple")]
+const DURABILITY: &str =
+    "PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA secure_delete = ON;";
+
+/// The SQLite version `SQLITE_DBCONFIG_DEFENSIVE` arrived in, as
+/// `sqlite3_libversion_number` spells it: an older one has no such flag.
+const DEFENSIVE_MIN: i32 = 3_026_000;
+
+/// Sets up a connection to a store or an index as every role does
+/// (STORAGE §4.1, §4.4): foreign keys on, the durability pragmas, a busy
+/// timeout, and the list parameters' temporary table, which a read-only
+/// connection creates too.
+///
+/// Every store is opened as one from elsewhere (§18), whoever created it:
+/// `trusted_schema` off and the defensive flag on, under which the
+/// canonical schemas and statements run, so a crafted trigger or view
+/// calls no function with side effects and no write reaches the file
+/// behind SQLite's back.
 pub(crate) fn prepare_connection(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;")?;
+    conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON;")?;
+    if rusqlite::version_number() >= DEFENSIVE_MIN {
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    }
+    conn.execute_batch(DURABILITY)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch(sql::CREATE_PARAM)
+}
+
+/// How many `TRUNCATE` checkpoints an erase tries, each waiting out the
+/// busy timeout, before it reports the store busy (§11.5).
+const CHECKPOINT_TRIES: usize = 3;
+
+/// Checkpoints the WAL of `conn`'s main database into it and truncates it
+/// (§11.5), again until it reports every frame checkpointed, so no byte a
+/// delete overwrote stays in the WAL. A database in another journal mode
+/// has nothing to checkpoint; a reader holding the WAL past
+/// [`CHECKPOINT_TRIES`] tries is [`PimdirError::Busy`].
+pub(crate) fn checkpoint(conn: &Connection) -> Result<(), PimdirError> {
+    for _ in 0..CHECKPOINT_TRIES {
+        let (busy, log, done): (i64, i64, i64) = conn
+            .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(busy_or_sql)?;
+        trace!("checkpoint: busy {busy}, {log} frames, {done} checkpointed");
+        if busy == 0 && log == done {
+            return Ok(());
+        }
+    }
+
+    Err(PimdirError::Busy)
 }
 
 /// Deletes one queue row by id (`cancel_action`, §15.5), answering the
@@ -1156,23 +1486,15 @@ pub(crate) fn busy_or_sql(err: rusqlite::Error) -> PimdirError {
 }
 
 /// Why [`PimdirStore::open_current`] refused a store: what
-/// [`PimdirStore::open`] would have created, migrated or reconciled (§6).
+/// [`PimdirStore::open`] would have created (§6).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirNotCurrent {
     /// No database under the directory.
     Absent,
-    /// The database's `user_version` is not this crate's: `0` for one no
-    /// migration ran on, above it for a later crate's.
+    /// The database holds no schema: no migration ran on it.
     Version {
-        /// The store's `PRAGMA user_version`.
+        /// The store's `PRAGMA user_version`, `0`.
         found: i64,
-    },
-    /// A table, index or trigger whose stored text is not the canonical
-    /// one, or that only one side declares: a store an owner of another
-    /// revision wrote or reconciled.
-    Shape {
-        /// The first such object, by name.
-        object: String,
     },
 }
 
@@ -1338,11 +1660,15 @@ pub enum PimdirError {
         /// What holds it.
         existing: PimdirDuplicate,
     },
-    /// The store's schema version is not one this crate services: above
-    /// it, a later program wrote the store.
+    /// The store is of another version of the format than this crate's
+    /// [`FORMAT_VERSION`](crate::sql::FORMAT_VERSION) (STORAGE §4.2, §6):
+    /// another draft's, a release's, or one lacking `format_version`,
+    /// which every draft before storage-draft-08 wrote. Nothing in it is
+    /// read, reconciled, migrated or written.
     Version {
-        /// The store's `user_version`.
-        found: i64,
+        /// The store's `store_meta.format_version`, `None` when it lacks
+        /// the column.
+        found: Option<String>,
     },
     /// The store has no schema yet; only the owner's open creates one.
     Uncreated,
@@ -1358,22 +1684,28 @@ pub enum PimdirError {
         store_meta: i64,
     },
     /// The store is not one [`PimdirStore::open_current`] owns as it
-    /// stands: only [`PimdirStore::open`] creates, migrates or reconciles
-    /// a store (§6).
+    /// stands: only [`PimdirStore::open`] creates a store (§6).
     NotCurrent(PimdirNotCurrent),
-    /// The store was written by an earlier draft and lacks a table or a
-    /// trigger the current schema declares (§6).
-    Stale {
-        /// The first table or trigger found missing.
-        missing: &'static str,
+    /// The store names this crate's format version but its schema is not
+    /// the canonical one (§4.1, §6): a table, an index or a trigger
+    /// missing, added or declared otherwise, or a `user_version` other
+    /// than the draft's. Nothing in it is read or written.
+    Damaged {
+        /// The first object found differing, by name, or `user_version`.
+        object: String,
     },
-    /// The store's `hash_algo` is not one this crate computes, or not the
-    /// one the caller declared (§5).
+    /// The store's `hash_algo` is not `blake3`, the one algorithm this
+    /// crate computes (§5, §6).
     HashAlgo {
         /// The algorithm the store records.
         found: String,
-        /// The algorithm the caller declared, when it declared one.
-        declared: Option<&'static str>,
+    },
+    /// The store's sync state was written by an engine of another version
+    /// than this crate's [`SYNC_VERSION`]
+    /// (STORAGE §4.3, SYNC §10): no verb runs on it.
+    SyncVersion {
+        /// The store's `store_meta.sync_version`.
+        found: String,
     },
     /// Another writer holds the write lock (§8); retry once it releases.
     Busy,
@@ -1386,6 +1718,10 @@ pub enum PimdirError {
     /// A verb of this process is between two of its chunks (§5), so a
     /// collector cannot run; retry once it has returned.
     InFlight(PathBuf),
+    /// A path of the store is not its user's alone (§18): its directory or
+    /// pimdir.db another user can read or write, or a link where a lock
+    /// file belongs. Nothing in it is opened.
+    Exposed(PathBuf),
     /// A declared source does not support a capability the action needs
     /// (§15.6), so it is not enqueued, or the owner parks it.
     Unsupported(PimdirRefusal),
@@ -1406,10 +1742,6 @@ pub enum PimdirError {
     /// holding a space, a control or a non-ASCII character. Refused before
     /// anything is written or queued.
     Flag(String),
-    /// The store is written in a shape this crate does not implement
-    /// (STORAGE §4.1): its `store_meta.shape` names another than the
-    /// canonical `pimdir`. Nothing in it is read, reconciled or written.
-    Shape(String),
     /// A purge cutoff is not an instant written as the store's stamps are,
     /// UTC with milliseconds (§11.2), which a textual comparison needs.
     Cutoff(String),
@@ -1441,11 +1773,29 @@ pub enum PimdirError {
     /// builds one, the store's indexer does.
     #[cfg(feature = "search")]
     IndexMissing(PathBuf),
-    /// The search index is at another schema version, tokenizer or build
-    /// than this crate's (SEARCH §2): a query client never rebuilds it,
-    /// the store's indexer does.
+    /// The search index of this crate's shape and version was built under
+    /// another tokenizer or schema text, or from another store or copy of
+    /// it (SEARCH §2): a query client never rebuilds it, the store's
+    /// indexer does.
     #[cfg(feature = "search")]
     IndexOutdated(PathBuf),
+    /// The search index holds no `index_meta`, or names another shape or
+    /// version than this crate's (SEARCH §2): an indexer never rebuilds,
+    /// writes nor deletes one of another shape or a later version, and a
+    /// query client answers from its own shape and version alone.
+    #[cfg(feature = "search")]
+    IndexVersion {
+        /// The index file.
+        path: PathBuf,
+        /// Its `index_meta.format_version`, `None` without one.
+        version: Option<String>,
+        /// Its `index_meta.shape`, `None` without one.
+        shape: Option<String>,
+    },
+    /// The zone an indexer states for floating times (SEARCH §7) names no
+    /// zone of the IANA time zone database.
+    #[cfg(feature = "search")]
+    IndexZone(String),
     /// A refresh was asked of an index opened for queries alone (SEARCH
     /// §3).
     #[cfg(feature = "search")]
@@ -1478,23 +1828,23 @@ impl PimdirError {
     /// | `collection-role` | [`Role`](Self::Role) |
     /// | `collection-queued` | [`Queued`](Self::Queued) |
     /// | `item-duplicate` | [`Duplicate`](Self::Duplicate) |
-    /// | `store-newer` | [`Version`](Self::Version), or `NotCurrent` above this crate's |
+    /// | `store-version` | [`Version`](Self::Version) |
     /// | `store-uncreated` | `Uncreated`, or an absent `NotCurrent` |
     /// | `store-foreign` | [`Foreign`](Self::Foreign) |
-    /// | `store-corrupt` | [`VersionMismatch`](Self::VersionMismatch) |
+    /// | `store-corrupt` | [`VersionMismatch`](Self::VersionMismatch), [`Damaged`](Self::Damaged) |
     /// | `store-not-current` | [`NotCurrent`](Self::NotCurrent) otherwise |
-    /// | `store-stale` | [`Stale`](Self::Stale) |
     /// | `store-hash-algo` | [`HashAlgo`](Self::HashAlgo) |
+    /// | `sync-version` | [`SyncVersion`](Self::SyncVersion) |
     /// | `store-busy` | [`Busy`](Self::Busy) |
     /// | `store-owned` | [`Owned`](Self::Owned) |
     /// | `store-staging` | [`Staging`](Self::Staging) |
     /// | `store-in-flight` | [`InFlight`](Self::InFlight) |
+    /// | `store-exposed` | [`Exposed`](Self::Exposed) |
     /// | `unsupported` | [`Unsupported`](Self::Unsupported) |
     /// | `no-performer` | [`NoPerformer`](Self::NoPerformer) |
     /// | `ambiguous-performer` | [`Ambiguous`](Self::Ambiguous) |
     /// | `cutoff-invalid` | [`Cutoff`](Self::Cutoff) |
     /// | `flag-invalid` | [`Flag`](Self::Flag) |
-    /// | `store-shape` | [`Shape`](Self::Shape) |
     /// | `query-refused` | `Query` (feature `search`) |
     /// | `tag-refused` | `Tag` (feature `search`) |
     /// | `index-fts5-missing` | `Fts5` (feature `search`) |
@@ -1502,6 +1852,8 @@ impl PimdirError {
     /// | `index-busy` | `Indexing` (feature `search`) |
     /// | `index-missing` | `IndexMissing` (feature `search`) |
     /// | `index-outdated` | `IndexOutdated` (feature `search`) |
+    /// | `index-version` | `IndexVersion` (feature `search`) |
+    /// | `index-zone-unknown` | `IndexZone` (feature `search`) |
     /// | `index-query-only` | `IndexQueryOnly` (feature `search`) |
     /// | `index-refresh-broken` | `Refresh` (feature `search`) |
     pub fn code(&self) -> &'static str {
@@ -1520,27 +1872,24 @@ impl PimdirError {
             Self::Role { .. } => "collection-role",
             Self::Queued { .. } => "collection-queued",
             Self::Duplicate { .. } => "item-duplicate",
-            Self::Version { .. } => "store-newer",
+            Self::Version { .. } => "store-version",
             Self::Uncreated => "store-uncreated",
             Self::Foreign => "store-foreign",
-            Self::VersionMismatch { .. } => "store-corrupt",
+            Self::VersionMismatch { .. } | Self::Damaged { .. } => "store-corrupt",
             Self::NotCurrent(PimdirNotCurrent::Absent) => "store-uncreated",
-            Self::NotCurrent(PimdirNotCurrent::Version { found }) if *found > sql::VERSION => {
-                "store-newer"
-            }
             Self::NotCurrent(_) => "store-not-current",
-            Self::Stale { .. } => "store-stale",
             Self::HashAlgo { .. } => "store-hash-algo",
+            Self::SyncVersion { .. } => "sync-version",
             Self::Busy => "store-busy",
             Self::Owned(_) => "store-owned",
             Self::Staging(_) => "store-staging",
             Self::InFlight(_) => "store-in-flight",
+            Self::Exposed(_) => "store-exposed",
             Self::Unsupported(_) => "unsupported",
             Self::NoPerformer { .. } => "no-performer",
             Self::Ambiguous { .. } => "ambiguous-performer",
             Self::Cutoff(_) => "cutoff-invalid",
             Self::Flag(_) => "flag-invalid",
-            Self::Shape(_) => "store-shape",
             #[cfg(feature = "search")]
             Self::Query(_) => "query-refused",
             #[cfg(feature = "search")]
@@ -1555,6 +1904,10 @@ impl PimdirError {
             Self::IndexMissing(_) => "index-missing",
             #[cfg(feature = "search")]
             Self::IndexOutdated(_) => "index-outdated",
+            #[cfg(feature = "search")]
+            Self::IndexVersion { .. } => "index-version",
+            #[cfg(feature = "search")]
+            Self::IndexZone(_) => "index-zone-unknown",
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(_) => "index-query-only",
             #[cfg(feature = "search")]
@@ -1628,10 +1981,15 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir create refused: collection {collection} already has {link_id} queued as action {id}"
             ),
-            Self::Version { found } => write!(
+            Self::Version { found: Some(found) } => write!(
                 f,
-                "Pimdir store schema version {found} is newer than this program's {}: upgrade this program",
-                sql::VERSION
+                "Pimdir store is {found}, not this program's {}: a store opens under its own version alone, so move it aside and sync a new one",
+                sql::FORMAT_VERSION
+            ),
+            Self::Version { found: None } => write!(
+                f,
+                "Pimdir store names no format version, as a draft before {0} wrote it, and this program is {0}: a store opens under its own version alone, so move it aside and sync a new one",
+                sql::FORMAT_VERSION
             ),
             Self::Uncreated => write!(
                 f,
@@ -1652,36 +2010,23 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir store does not exist yet: its sync engine has to create it first"
             ),
-            Self::NotCurrent(PimdirNotCurrent::Version { found }) if *found > sql::VERSION => {
-                write!(
-                    f,
-                    "Pimdir store schema version {found} is newer than this program's {}: upgrade this program",
-                    sql::VERSION
-                )
-            }
             Self::NotCurrent(PimdirNotCurrent::Version { found }) => write!(
                 f,
-                "Pimdir store schema version {found} is not this program's {}: run or upgrade the store's sync engine, which migrates it",
-                sql::VERSION
+                "Pimdir store holds no schema (version {found}): its sync engine has to create it first"
             ),
-            Self::NotCurrent(PimdirNotCurrent::Shape { object }) => write!(
+            Self::Damaged { object } => write!(
                 f,
-                "Pimdir store schema differs from this program's at {object}: run or upgrade the store's sync engine, which reconciles it"
+                "Pimdir store is damaged: its schema differs from {} at {object}",
+                sql::FORMAT_VERSION
             ),
-            Self::Stale { missing } => write!(
+            Self::HashAlgo { found } => write!(
                 f,
-                "Pimdir store was written by an earlier draft and lacks {missing}: run or upgrade the store's sync engine"
+                "Pimdir store names its objects with {found}, which this program does not compute"
             ),
-            Self::HashAlgo {
-                found,
-                declared: Some(declared),
-            } => write!(
+            Self::SyncVersion { found } => write!(
                 f,
-                "Pimdir store names its objects with {found}, not the {declared} this handle declared"
-            ),
-            Self::HashAlgo { found, .. } => write!(
-                f,
-                "Pimdir store names its objects with {found}, which this crate does not compute"
+                "Pimdir store's sync state was written by {found}, not this program's {}: a store syncs under one engine version, so move it aside and sync a new one",
+                SYNC_VERSION
             ),
             Self::Busy => write!(
                 f,
@@ -1702,6 +2047,11 @@ impl fmt::Display for PimdirError {
                 "Pimdir store at {} has a verb between two of its chunks",
                 store.display()
             ),
+            Self::Exposed(path) => write!(
+                f,
+                "Pimdir store path {} is a link or another user can read or write it: a store is its user's alone, so remove the link or restrict it (chmod 700 a directory, 600 a file)",
+                path.display()
+            ),
             Self::Unsupported(refusal) => write!(f, "{refusal}"),
             Self::NoPerformer { capability } => {
                 write!(f, "No source of this account supports {capability}")
@@ -1721,10 +2071,6 @@ impl fmt::Display for PimdirError {
             Self::Flag(flag) => write!(
                 f,
                 "Pimdir flag {flag:?} refused: a flag is printable ASCII without a space"
-            ),
-            Self::Shape(shape) => write!(
-                f,
-                "Pimdir store is written in shape {shape:?}, which this program does not implement"
             ),
             #[cfg(feature = "search")]
             Self::Query(err) => write!(f, "Pimdir search query refused: {err}"),
@@ -1755,8 +2101,27 @@ impl fmt::Display for PimdirError {
             #[cfg(feature = "search")]
             Self::IndexOutdated(index) => write!(
                 f,
-                "Pimdir search index {} was built by another version: run the store's sync engine, which rebuilds it",
+                "Pimdir search index {} was built otherwise or from another store: run the store's sync engine, which rebuilds it",
                 index.display()
+            ),
+            #[cfg(feature = "search")]
+            Self::IndexVersion {
+                path,
+                version,
+                shape,
+            } => write!(
+                f,
+                "Pimdir search index {} is of shape {} at {}, and this build implements {} at {}: an index of its shape at an earlier version is rebuilt by the store's sync engine, any other is left as it is",
+                path.display(),
+                shape.as_deref().unwrap_or("none"),
+                version.as_deref().unwrap_or("no version"),
+                crate::sql::search::SHAPE,
+                crate::sql::search::FORMAT_VERSION,
+            ),
+            #[cfg(feature = "search")]
+            Self::IndexZone(zone) => write!(
+                f,
+                "Pimdir search cannot read floating times in {zone}: name a zone of the IANA time zone database"
             ),
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(index) => write!(
@@ -1845,4 +2210,44 @@ pub(crate) fn is_stamp(value: &str) -> bool {
             23 => *byte == b'Z',
             _ => byte.is_ascii_digit(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, config::DbConfig};
+
+    use crate::client::prepare_connection;
+
+    /// Every connection syncs a commit fully, deletes securely and waits
+    /// out a writer (STORAGE §4.1).
+    #[test]
+    fn a_connection_syncs_fully_deletes_securely_and_waits() {
+        let conn = Connection::open_in_memory().unwrap();
+        prepare_connection(&conn).unwrap();
+        let pragma =
+            |name: &str| -> i64 { conn.pragma_query_value(None, name, |r| r.get(0)).unwrap() };
+        assert_eq!(pragma("foreign_keys"), 1);
+        assert_eq!(pragma("synchronous"), 2, "FULL");
+        assert_eq!(pragma("secure_delete"), 1);
+        assert_eq!(pragma("busy_timeout"), 30_000);
+    }
+
+    /// Every connection opens its store as one from elsewhere (STORAGE
+    /// §18): no function a schema names runs unless innocuous, and no
+    /// write reaches the file behind SQLite's back.
+    #[test]
+    fn a_connection_trusts_no_schema_and_defends_its_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        prepare_connection(&conn).unwrap();
+        let trusted: i64 = conn
+            .pragma_query_value(None, "trusted_schema", |r| r.get(0))
+            .unwrap();
+        assert_eq!(trusted, 0);
+        assert!(conn.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap());
+
+        conn.execute_batch("CREATE TABLE t (x); PRAGMA writable_schema = ON;")
+            .unwrap();
+        let edited = conn.execute("UPDATE sqlite_schema SET sql = '' WHERE name = 't'", []);
+        assert!(edited.is_err(), "the schema table is not writable");
+    }
 }

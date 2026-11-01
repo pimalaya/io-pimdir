@@ -20,6 +20,11 @@ pub mod search;
 
 include!(concat!(env!("OUT_DIR"), "/canonical.rs"));
 
+/// The STORAGE version whose schema the canonical migrations hold (§4.2),
+/// which `init_store_meta` writes as `store_meta.format_version`: a store
+/// naming another is refused by every profile.
+pub const FORMAT_VERSION: &str = "storage-draft-08";
+
 /// Declares the crate's own statements and the [`OWN`] index in one
 /// expansion, so a statement is added in one place.
 macro_rules! statements {

@@ -187,43 +187,14 @@ fn an_old_receipt_is_pruned() {
     );
 }
 
-#[test]
-fn a_store_from_an_older_owner_gains_the_receipts_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    store(dir.path());
-    Connection::open(dir.path().join("pimdir.db"))
-        .unwrap()
-        .execute_batch("DROP TABLE receipts;")
-        .unwrap();
-
-    // a producer reads the missing table as no receipt kept
-    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
-    let (action, object) = add(&producer, DRAFT);
-    let id = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
-    Connection::open(dir.path().join("pimdir.db"))
-        .unwrap()
-        .execute("DELETE FROM queue WHERE id = ?1", [id])
-        .unwrap();
-    assert_eq!(
-        producer.action_status(id).unwrap(),
-        PimdirActionStatus::Unknown
-    );
-
-    // the owner reconciles it on open, and the next add is followed
-    let id = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
-    drain(dir.path());
-    let PimdirActionStatus::Applied { seq: Some(_), .. } = producer.action_status(id).unwrap()
-    else {
-        panic!("the reconciled store keeps receipts");
-    };
-}
-
 /// A `submit` intent of `body`, which the drain leaves to its performer.
 fn submit(producer: &PimdirProducer, body: &str) -> (PimdirAction, PimdirObject) {
     let (_, object) = add(producer, body);
     let action = PimdirAction::Unknown {
         kind: "submit".into(),
-        payload: "{\"v\":1,\"from\":\"a@example.org\",\"rcpts\":[\"b@example.org\"]}".into(),
+        payload:
+            "{\"v\":1,\"source\":\"smtp\",\"from\":\"a@example.org\",\"rcpts\":[\"b@example.org\"]}"
+                .into(),
         object_hash: Some(object.hash.clone()),
     };
     (action, object)

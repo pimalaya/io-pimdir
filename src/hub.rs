@@ -172,6 +172,10 @@ pub struct PimdirHub {
     /// The handles whose next upsert is an overruling edit (SYNC §7),
     /// within the batch being absorbed.
     overruling: BTreeSet<PimdirHandle>,
+    /// The items a settle left holding a body whose summary the hub does
+    /// not hold, the diverging body a fill's `prefer-incoming` adopted,
+    /// for the storage to derive from its bytes (SYNC §9).
+    pub(crate) unsummarized: Vec<PimdirLinkId>,
 }
 
 /// A body a policy did not adopt (SYNC §9): the shared body
@@ -468,12 +472,15 @@ impl PimdirHub {
         item.level = item.stored_level();
 
         if let Some(lost) = verdict.lost {
-            let (summary, sort_key) = match lost.shared {
-                true => (held_summary, held_sort_key),
-                false => (
+            // NOTE: a diverging body nobody summarized is derived by the
+            // storage from its bytes as it keeps it.
+            let (summary, sort_key) = match lost.side {
+                PimdirLoserSide::Shared => (held_summary, held_sort_key),
+                PimdirLoserSide::Incoming => (
                     placement.summary.clone().map(PimdirSummary::stored),
                     placement.sort_key.clone(),
                 ),
+                PimdirLoserSide::Diverging => (None, held_sort_key),
             };
             self.overruled.push(PimdirOverruled {
                 source: source.clone(),
@@ -487,6 +494,9 @@ impl PimdirHub {
         }
         if verdict.diverged {
             self.diverged.push(placement.handle.clone());
+        }
+        if verdict.unsummarized {
+            self.unsummarized.push(link.clone());
         }
 
         // NOTE: the agreement point moves only with a body the item settled
@@ -588,9 +598,32 @@ impl PimdirHub {
         }
 
         // NOTE: the pull that emptied the item is the one this body was
-        // read for, and an item conflict standing stays as it is.
+        // read for. An item conflict standing was recorded without it, so
+        // with both bodies read at last a `prefer-` policy settles it, the
+        // body it does not adopt kept over this binding's handle; `manual`
+        // leaves it standing.
         if incoming.is_some() && shared.is_none() && prev.is_none() {
-            item.object = incoming;
+            item.object = incoming.clone();
+            let diverging = item.conflict_object.clone().filter(|_| item.conflicted);
+            let settled = match (diverging, policy) {
+                (None, _) | (Some(_), PimdirHubConflict::Manual) => return verdict,
+                (Some(diverging), PimdirHubConflict::PreferIncoming) => {
+                    item.object = Some(diverging);
+                    verdict.kept_shared = true;
+                    verdict.unsummarized = true;
+                    incoming.map(|object| PimdirLoser {
+                        object,
+                        side: PimdirLoserSide::Incoming,
+                    })
+                }
+                (Some(diverging), PimdirHubConflict::PreferExisting) => Some(PimdirLoser {
+                    object: diverging,
+                    side: PimdirLoserSide::Diverging,
+                }),
+            };
+            verdict.lost = settled;
+            item.conflicted = false;
+            item.conflict_object = None;
             return verdict;
         }
 
@@ -606,7 +639,7 @@ impl PimdirHub {
                 (false, PimdirHubConflict::PreferIncoming) => {
                     verdict.lost = shared.map(|object| PimdirLoser {
                         object,
-                        shared: true,
+                        side: PimdirLoserSide::Shared,
                     });
                     item.object = incoming;
                     item.conflicted = false;
@@ -615,7 +648,7 @@ impl PimdirHub {
                 (false, PimdirHubConflict::PreferExisting) => {
                     verdict.lost = incoming.map(|object| PimdirLoser {
                         object,
-                        shared: false,
+                        side: PimdirLoserSide::Incoming,
                     });
                     verdict.kept_shared = true;
                     item.conflicted = false;
@@ -635,7 +668,7 @@ impl PimdirHub {
             if pulled && !resolving && shared != prev {
                 verdict.lost = shared.map(|object| PimdirLoser {
                     object,
-                    shared: true,
+                    side: PimdirLoserSide::Shared,
                 });
             }
             item.object = incoming;
@@ -725,14 +758,26 @@ struct PimdirVerdict {
     kept_shared: bool,
     /// The body a policy did not adopt.
     lost: Option<PimdirLoser>,
+    /// The item adopted a body whose summary it does not hold.
+    unsummarized: bool,
 }
 
-/// A body a policy did not adopt, and whether it was the item's own.
+/// A body a policy did not adopt, and which one it was.
 #[derive(Debug)]
 struct PimdirLoser {
     object: PimdirHash,
-    /// Whether it was the shared body, else the incoming one.
-    shared: bool,
+    side: PimdirLoserSide,
+}
+
+/// Which body a policy did not adopt (SYNC §9).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PimdirLoserSide {
+    /// The item's own body.
+    Shared,
+    /// The body the upsert carried.
+    Incoming,
+    /// The diverging body an item conflict recorded, which a fill settles.
+    Diverging,
 }
 
 #[cfg(test)]
@@ -1339,6 +1384,56 @@ mod tests {
             .unwrap()
             .object
             .clone()
+    }
+
+    /// Fills the item vector 112's divergence left: it holds no body, is
+    /// flagged with right's `o2` as its diverging body, and left's base
+    /// names `r1` and no body; left's upgrade then reads `o1` at `r1`.
+    fn fill(policy: PimdirHubConflict) -> PimdirHub {
+        let mut hub = content_hub(policy);
+        let item = hub.items.get_mut(&PimdirLinkId::from("m1")).unwrap();
+        item.object = None;
+        item.level = PimdirLevel::Meta;
+        item.conflicted = true;
+        item.conflict_object = Some(PimdirHash::from("o2"));
+        let left = item.sources.get_mut(&PimdirSourceId::from("left")).unwrap();
+        left.base = Some(PimdirBase {
+            flags: PimdirFlags::default(),
+            revision: Some("r1".into()),
+            object: None,
+        });
+
+        hub.absorb(&"left".into(), &[content_upsert("l1", "o1")]);
+        hub
+    }
+
+    /// With both bodies read, the fill settles a `prefer-` divergence the
+    /// item recorded without its own (SYNC §9): `prefer-incoming` adopts
+    /// the diverging body, keeping the one the fill read and asking the
+    /// storage for the adopted body's summary; `prefer-existing` keeps
+    /// the fill's, keeping the diverging one; `manual` leaves it standing.
+    #[test]
+    fn a_fill_settles_a_prefer_divergence_by_its_policy() {
+        let hub = fill(PimdirHubConflict::PreferIncoming);
+        let item = &hub.items[&PimdirLinkId::from("m1")];
+        assert_eq!(item.object, Some(PimdirHash::from("o2")));
+        assert!(!item.conflicted && item.conflict_object.is_none());
+        assert_eq!(hub.overruled[0].object, PimdirHash::from("o1"));
+        assert_eq!(hub.overruled[0].handle, PimdirHandle::from("l1"));
+        assert_eq!(hub.unsummarized, [PimdirLinkId::from("m1")]);
+
+        let hub = fill(PimdirHubConflict::PreferExisting);
+        let item = &hub.items[&PimdirLinkId::from("m1")];
+        assert_eq!(item.object, Some(PimdirHash::from("o1")));
+        assert!(!item.conflicted && item.conflict_object.is_none());
+        assert_eq!(hub.overruled[0].object, PimdirHash::from("o2"));
+        assert!(hub.unsummarized.is_empty());
+
+        let hub = fill(PimdirHubConflict::Manual);
+        let item = &hub.items[&PimdirLinkId::from("m1")];
+        assert_eq!(item.object, Some(PimdirHash::from("o1")));
+        assert_eq!(item.conflict_object, Some(PimdirHash::from("o2")));
+        assert!(hub.overruled.is_empty());
     }
 
     /// Only left edited since both agreed, so the body is adopted.

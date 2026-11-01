@@ -5,8 +5,9 @@
 //! invitation reply and cancel with their optional occurrence. An intent
 //! travels as [`PimdirAction::Unknown`], so the store keeps its payload
 //! verbatim and skips it; these types build that action for a producer
-//! and read it back for a performer, refusing a malformed payload with
-//! the error the owner parks the row with. I/O-free.
+//! and read it back for a performer, strictly as payloads/ types it
+//! (STORAGE §15.3), refusing a malformed payload with the error the owner
+//! parks the row with. I/O-free.
 
 use alloc::{
     string::{String, ToString},
@@ -16,7 +17,7 @@ use alloc::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    codec::{PimdirAction, PimdirActionError},
+    codec::{self, PimdirAction, PimdirActionError},
     collection::PimdirCollectionId,
     object::PimdirHash,
     placement::PimdirLinkId,
@@ -40,9 +41,8 @@ pub const COLLECTION_CREATE: &str = "collection-create";
 /// labelled `name`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirCollectionCreate {
-    /// The source performing it, `None` only from a producer predating
-    /// §15.6.
-    pub source: Option<String>,
+    /// The source performing it (§15.6).
+    pub source: String,
     /// One level of the hierarchy: a non-empty label, mapped by the
     /// performer onto its server.
     pub name: String,
@@ -61,9 +61,11 @@ impl PimdirCollectionCreate {
         }
     }
 
-    /// Checks the payload's own rules: a `name` neither blank nor holding
-    /// a control character.
+    /// Checks the payload's own rules: a named `source`, a `name` neither
+    /// blank nor holding a control character, a `parent` naming a
+    /// collection.
     pub fn validate(&self) -> Result<(), PimdirActionError> {
+        validate_source(&self.source)?;
         if self.name.trim().is_empty() {
             return Err(PimdirActionError::Invalid {
                 field: "name",
@@ -89,9 +91,7 @@ impl PimdirCollectionCreate {
     pub fn to_action(&self) -> Result<PimdirAction, PimdirActionError> {
         self.validate()?;
         let mut map = versioned();
-        if let Some(source) = &self.source {
-            map.insert("source".into(), json!(source));
-        }
+        map.insert("source".into(), json!(self.source));
         map.insert("name".into(), json!(self.name));
         if let Some(parent) = &self.parent {
             map.insert("parent".into(), json!(parent.0));
@@ -101,11 +101,11 @@ impl PimdirCollectionCreate {
 
     /// Reads a `collection-create` payload strictly.
     pub fn from_payload(payload: &str) -> Result<Self, PimdirActionError> {
-        let map = object(payload)?;
+        let map = codec::members(payload, &["source", "name", "parent"])?;
         let create = Self {
-            source: string(&map, "source")?,
-            name: string(&map, "name")?.ok_or(PimdirActionError::MissingField("name"))?,
-            parent: string(&map, "parent")?.map(PimdirCollectionId),
+            source: codec::required(codec::label(map.get("source"), "source")?, "source")?,
+            name: codec::required(codec::label(map.get("name"), "name")?, "name")?,
+            parent: codec::label(map.get("parent"), "parent")?.map(PimdirCollectionId),
         };
         create.validate()?;
         Ok(create)
@@ -114,17 +114,15 @@ impl PimdirCollectionCreate {
 
 /// A message to send (Annex B.2, `submit`, capability `mail.submit`).
 ///
-/// The message is the action's body, pinned by `object`; the payload
-/// carries the envelope it is sent with, its `Bcc` field removed before
-/// transmission. Anchored on the collection the sent copy belongs to.
+/// The message is the action's body, the row's `queue.object_hash`, never
+/// a member of the payload, which carries the envelope it is sent with,
+/// its `Bcc` field removed before transmission. Anchored on the
+/// collection the sent copy belongs to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirSubmit {
-    /// The source performing it, `None` only from a producer predating
-    /// §15.6.
-    pub source: Option<String>,
-    /// The message, the body the row pins.
-    pub object: PimdirHash,
-    /// The envelope sender (`MAIL FROM`), empty for the null path.
+    /// The source performing it (§15.6).
+    pub source: String,
+    /// The envelope sender (`MAIL FROM`).
     pub from: String,
     /// The envelope recipients (`RCPT TO`), at least one.
     pub rcpts: Vec<String>,
@@ -136,9 +134,16 @@ pub struct PimdirSubmit {
 }
 
 impl PimdirSubmit {
-    /// Checks the payload's own rules: at least one recipient, none
-    /// blank, and a `copy` naming a collection.
+    /// Checks the payload's own rules: a named `source` and `from`, at
+    /// least one recipient, none blank, and a `copy` naming a collection.
     pub fn validate(&self) -> Result<(), PimdirActionError> {
+        validate_source(&self.source)?;
+        if self.from.is_empty() {
+            return Err(PimdirActionError::Invalid {
+                field: "from",
+                reason: "a submit names its envelope sender",
+            });
+        }
         if self.rcpts.is_empty() {
             return Err(PimdirActionError::Invalid {
                 field: "rcpts",
@@ -160,15 +165,12 @@ impl PimdirSubmit {
         Ok(())
     }
 
-    /// The queue action carrying it, validated first, its `object_hash`
-    /// the message.
-    pub fn to_action(&self) -> Result<PimdirAction, PimdirActionError> {
+    /// The queue action sending `message`, validated first: the message
+    /// is the action's body, its `object_hash`, which the enqueue pins.
+    pub fn to_action(&self, message: PimdirHash) -> Result<PimdirAction, PimdirActionError> {
         self.validate()?;
         let mut map = versioned();
-        if let Some(source) = &self.source {
-            map.insert("source".into(), json!(source));
-        }
-        map.insert("object".into(), json!(self.object.0));
+        map.insert("source".into(), json!(self.source));
         map.insert("from".into(), json!(self.from));
         map.insert("rcpts".into(), json!(self.rcpts));
         if let Some(subject) = &self.subject {
@@ -180,30 +182,32 @@ impl PimdirSubmit {
         Ok(PimdirAction::Unknown {
             kind: SUBMIT.to_string(),
             payload: Value::Object(map).to_string(),
-            object_hash: Some(self.object.clone()),
+            object_hash: Some(message),
         })
     }
 
     /// Reads a `submit` payload strictly.
     pub fn from_payload(payload: &str) -> Result<Self, PimdirActionError> {
-        let map = object(payload)?;
+        let map = codec::members(payload, &["source", "from", "rcpts", "subject", "copy"])?;
         let rcpts = match map.get("rcpts") {
             Some(Value::Array(rcpts)) => rcpts
                 .iter()
-                .map(|rcpt| rcpt.as_str().map(ToString::to_string))
-                .collect::<Option<Vec<_>>>()
-                .ok_or(PimdirActionError::MissingField("rcpts"))?,
-            _ => return Err(PimdirActionError::MissingField("rcpts")),
+                .map(|rcpt| codec::required(codec::label(Some(rcpt), "rcpts")?, "rcpts"))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(PimdirActionError::Invalid {
+                    field: "rcpts",
+                    reason: "an array of addresses is expected",
+                });
+            }
+            None => return Err(PimdirActionError::MissingField("rcpts")),
         };
         let submit = Self {
-            source: string(&map, "source")?,
-            object: string(&map, "object")?
-                .map(PimdirHash)
-                .ok_or(PimdirActionError::MissingField("object"))?,
-            from: string(&map, "from")?.ok_or(PimdirActionError::MissingField("from"))?,
+            source: codec::required(codec::label(map.get("source"), "source")?, "source")?,
+            from: codec::required(codec::label(map.get("from"), "from")?, "from")?,
             rcpts,
-            subject: string(&map, "subject")?,
-            copy: string(&map, "copy")?.map(PimdirCollectionId),
+            subject: codec::text(map.get("subject"), "subject")?,
+            copy: codec::label(map.get("copy"), "copy")?.map(PimdirCollectionId),
         };
         submit.validate()?;
         Ok(submit)
@@ -256,9 +260,8 @@ impl PimdirPartstat {
 /// `calendar-cancel`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirInvitation {
-    /// The source performing it, `None` only from a producer predating
-    /// §15.6.
-    pub source: Option<String>,
+    /// The source performing it (§15.6).
+    pub source: String,
     /// The item it addresses.
     pub item: PimdirIntentItem,
     /// The reply's participation, `None` for a cancel.
@@ -279,15 +282,37 @@ impl PimdirInvitation {
         }
     }
 
-    /// The queue action carrying it, validated first.
-    pub fn to_action(&self) -> Result<PimdirAction, PimdirActionError> {
+    /// Checks the payload's own rules: a named `source`, an item named by
+    /// a `seq` from 1 or a non-empty `link_id`, and a well-formed
+    /// `recurrence_id`.
+    pub fn validate(&self) -> Result<(), PimdirActionError> {
+        validate_source(&self.source)?;
+        match &self.item {
+            PimdirIntentItem::Seq(seq) if *seq < 1 => {
+                return Err(PimdirActionError::Invalid {
+                    field: "seq",
+                    reason: "an integer from 1 is expected",
+                });
+            }
+            PimdirIntentItem::Link(link) if link.0.is_empty() => {
+                return Err(PimdirActionError::Invalid {
+                    field: "link_id",
+                    reason: "a non-empty string is expected",
+                });
+            }
+            _ => {}
+        }
         if let Some(recurrence_id) = &self.recurrence_id {
             validate_recurrence_id(recurrence_id)?;
         }
+        Ok(())
+    }
+
+    /// The queue action carrying it, validated first.
+    pub fn to_action(&self) -> Result<PimdirAction, PimdirActionError> {
+        self.validate()?;
         let mut map = versioned();
-        if let Some(source) = &self.source {
-            map.insert("source".into(), json!(source));
-        }
+        map.insert("source".into(), json!(self.source));
         match &self.item {
             PimdirIntentItem::Seq(seq) => map.insert("seq".into(), json!(seq)),
             PimdirIntentItem::Link(link) => map.insert("link_id".into(), json!(link.0)),
@@ -304,16 +329,19 @@ impl PimdirInvitation {
         Ok(intent(self.kind(), map))
     }
 
-    /// Reads a `calendar-reply` or `calendar-cancel` payload strictly.
+    /// Reads a `calendar-reply` payload strictly when `kind` names it,
+    /// else a `calendar-cancel` one, which states no `partstat`.
     pub fn from_payload(kind: &str, payload: &str) -> Result<Self, PimdirActionError> {
-        let map = object(payload)?;
-        let item = match (map.get("seq"), string(&map, "link_id")?) {
-            (Some(seq), None) => {
-                PimdirIntentItem::Seq(seq.as_i64().ok_or(PimdirActionError::MissingField("seq"))?)
-            }
+        let map = match kind {
+            CALENDAR_REPLY => codec::members(payload, &INVITATION)?,
+            _ => codec::members(payload, &INVITATION[..INVITATION.len() - 1])?,
+        };
+        let seq = codec::seq(map.get("seq"), "seq")?;
+        let link = codec::label(map.get("link_id"), "link_id")?;
+        let item = match (seq, link) {
+            (Some(seq), None) => PimdirIntentItem::Seq(seq),
             (None, Some(link)) => PimdirIntentItem::Link(PimdirLinkId(link)),
-            (None, None) => return Err(PimdirActionError::MissingField("seq")),
-            (Some(_), Some(_)) => {
+            _ => {
                 return Err(PimdirActionError::Invalid {
                     field: "seq",
                     reason: "an intent names its item by exactly one of seq and link_id",
@@ -321,34 +349,47 @@ impl PimdirInvitation {
             }
         };
         let partstat = match kind {
-            CALENDAR_REPLY => Some(
-                string(&map, "partstat")?
-                    .as_deref()
-                    .and_then(PimdirPartstat::parse)
-                    .ok_or(PimdirActionError::MissingField("partstat"))?,
-            ),
+            CALENDAR_REPLY => {
+                let partstat =
+                    codec::required(codec::text(map.get("partstat"), "partstat")?, "partstat")?;
+                let partstat =
+                    PimdirPartstat::parse(&partstat).ok_or(PimdirActionError::Invalid {
+                        field: "partstat",
+                        reason: "ACCEPTED, TENTATIVE or DECLINED is expected",
+                    })?;
+                Some(partstat)
+            }
             _ => None,
         };
-        let recurrence_id = string(&map, "recurrence_id")?;
-        if let Some(recurrence_id) = &recurrence_id {
-            validate_recurrence_id(recurrence_id)?;
-        }
-        Ok(Self {
-            source: string(&map, "source")?,
+        let invitation = Self {
+            source: codec::required(codec::label(map.get("source"), "source")?, "source")?,
             item,
             partstat,
-            comment: string(&map, "comment")?,
-            recurrence_id,
-        })
+            comment: codec::text(map.get("comment"), "comment")?,
+            recurrence_id: codec::text(map.get("recurrence_id"), "recurrence_id")?,
+        };
+        invitation.validate()?;
+        Ok(invitation)
     }
 }
+
+/// The members an invitation payload defines at `v: 1`, a reply's
+/// `partstat` last.
+const INVITATION: [&str; 6] = [
+    "source",
+    "seq",
+    "link_id",
+    "comment",
+    "recurrence_id",
+    "partstat",
+];
 
 /// The occurrence an invitation payload names, `Ok(None)` when it names
 /// none, or the error when the field is there and malformed: what the
 /// gate reads without decoding the rest of the payload.
 pub fn recurrence_id(payload: &str) -> Result<Option<String>, PimdirActionError> {
-    let map = object(payload)?;
-    let recurrence_id = string(&map, "recurrence_id")?;
+    let map = codec::members(payload, &INVITATION)?;
+    let recurrence_id = codec::text(map.get("recurrence_id"), "recurrence_id")?;
     if let Some(recurrence_id) = &recurrence_id {
         validate_recurrence_id(recurrence_id)?;
     }
@@ -380,6 +421,17 @@ pub fn validate_recurrence_id(value: &str) -> Result<(), PimdirActionError> {
     }
 }
 
+/// Checks an intent names the source performing it (§15.6).
+fn validate_source(source: &str) -> Result<(), PimdirActionError> {
+    match source.is_empty() {
+        true => Err(PimdirActionError::Invalid {
+            field: "source",
+            reason: "an intent names the source performing it",
+        }),
+        false => Ok(()),
+    }
+}
+
 fn versioned() -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("v".into(), json!(1));
@@ -394,30 +446,6 @@ fn intent(kind: &str, map: Map<String, Value>) -> PimdirAction {
     }
 }
 
-/// The payload's object at `v: 1`.
-fn object(payload: &str) -> Result<Map<String, Value>, PimdirActionError> {
-    let value: Value = serde_json::from_str(payload).map_err(|_| PimdirActionError::Json)?;
-    let Value::Object(map) = value else {
-        return Err(PimdirActionError::Json);
-    };
-    let version = map.get("v").and_then(Value::as_i64);
-    if version != Some(1) {
-        return Err(PimdirActionError::UnknownVersion(version));
-    }
-    Ok(map)
-}
-
-fn string(
-    map: &Map<String, Value>,
-    field: &'static str,
-) -> Result<Option<String>, PimdirActionError> {
-    match map.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text.clone())),
-        Some(_) => Err(PimdirActionError::MissingField(field)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -425,71 +453,93 @@ mod tests {
     use super::*;
     use crate::codec;
 
+    /// The object name of the empty body (objects.json).
+    const EMPTY: &str = "v4jutopv7gq2nicajxvdnxgjjgn4wjojvxarfn6mtkj4vza7gjra";
+
     #[test]
     fn a_submit_round_trips_through_the_queue_codec() {
         let submit = PimdirSubmit {
-            source: Some("smtp".into()),
-            object: PimdirHash("cafebabe".into()),
+            source: "smtp".into(),
             from: "a@x.org".into(),
             rcpts: vec!["b@y.org".into(), "c@y.org".into()],
             subject: Some("hi".into()),
             copy: Some(PimdirCollectionId::from("Sent")),
         };
-        let action = submit.to_action().unwrap();
+        let message = PimdirHash(EMPTY.into());
+        let action = submit.to_action(message.clone()).unwrap();
         assert_eq!(action.kind(), SUBMIT);
-        assert_eq!(action.object_hash(), Some(&submit.object));
+        assert_eq!(action.object_hash(), Some(&message));
 
         let payload = codec::action_to_payload(&action);
+        assert!(!payload.contains("object"), "the body is the row's");
         let decoded = codec::action_from_payload(SUBMIT, &payload).unwrap();
-        assert_eq!(decoded, action);
+        assert_eq!(decoded.kind(), SUBMIT);
+        assert_eq!(codec::action_to_payload(&decoded), payload);
         assert_eq!(PimdirSubmit::from_payload(&payload).unwrap(), submit);
     }
 
-    /// The payload a frontend hand-rolled before the type: no source, no
-    /// copy, `null` read as absent.
+    /// The payload a frontend hand-rolled before the schemas: its body
+    /// named in the payload, no source, a `null` subject.
     #[test]
-    fn a_submit_reads_the_payload_frontends_wrote() {
-        let payload = r#"{"v":1,"object":"cafebabe","from":"","rcpts":["b@y.org"],"subject":null}"#;
-        let submit = PimdirSubmit::from_payload(payload).unwrap();
-        assert_eq!(submit.object, PimdirHash("cafebabe".into()));
-        assert_eq!(submit.from, "", "the null path");
-        assert_eq!(submit.rcpts, ["b@y.org"]);
+    fn a_submit_refuses_the_payload_frontends_wrote() {
+        let payload =
+            alloc::format!(r#"{{"v":1,"object":"{EMPTY}","from":"a@x.org","rcpts":["b@y.org"]}}"#);
         assert_eq!(
-            (submit.source, submit.subject, submit.copy),
-            (None, None, None)
+            PimdirSubmit::from_payload(&payload),
+            Err(PimdirActionError::UnknownField("object".into()))
         );
+        let payload = r#"{"v":1,"from":"a@x.org","rcpts":["b@y.org"]}"#;
+        assert_eq!(
+            PimdirSubmit::from_payload(payload),
+            Err(PimdirActionError::MissingField("source"))
+        );
+        let payload =
+            r#"{"v":1,"source":"smtp","from":"a@x.org","rcpts":["b@y.org"],"subject":null}"#;
+        assert!(matches!(
+            PimdirSubmit::from_payload(payload),
+            Err(PimdirActionError::Invalid {
+                field: "subject",
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn a_submit_needs_its_message_and_a_recipient() {
-        let refused = |payload: &str| PimdirSubmit::from_payload(payload).unwrap_err();
+    fn a_submit_needs_a_sender_and_a_recipient() {
+        let refused = |envelope: &str| {
+            let payload = alloc::format!(r#"{{"v":1,"source":"smtp",{envelope}}}"#);
+            PimdirSubmit::from_payload(&payload).unwrap_err()
+        };
 
         assert_eq!(
-            refused(r#"{"v":1,"from":"a@x.org","rcpts":["b@y.org"]}"#),
-            PimdirActionError::MissingField("object")
-        );
-        assert_eq!(
-            refused(r#"{"v":1,"object":"cafebabe","from":"a@x.org"}"#),
-            PimdirActionError::MissingField("rcpts")
-        );
-        assert_eq!(
-            refused(r#"{"v":1,"object":"cafebabe","from":"a@x.org","rcpts":[1]}"#),
-            PimdirActionError::MissingField("rcpts")
+            refused(r#""rcpts":["b@y.org"]"#),
+            PimdirActionError::MissingField("from")
         );
         assert!(matches!(
-            refused(r#"{"v":1,"object":"cafebabe","from":"a@x.org","rcpts":[]}"#),
-            PimdirActionError::Invalid { field: "rcpts", .. }
+            refused(r#""from":"","rcpts":["b@y.org"]"#),
+            PimdirActionError::Invalid { field: "from", .. }
         ));
         assert_eq!(
-            refused(r#"{"v":2,"object":"cafebabe","from":"a@x.org","rcpts":["b@y.org"]}"#),
-            PimdirActionError::UnknownVersion(Some(2))
+            refused(r#""from":"a@x.org""#),
+            PimdirActionError::MissingField("rcpts")
+        );
+        for rcpts in ["[1]", "\"b@y.org\"", "[]", "[\" \"]"] {
+            let err = refused(&alloc::format!(r#""from":"a@x.org","rcpts":{rcpts}"#));
+            assert!(
+                matches!(err, PimdirActionError::Invalid { field: "rcpts", .. }),
+                "{rcpts}: {err:?}"
+            );
+        }
+        assert_eq!(
+            PimdirSubmit::from_payload(r#"{"v":2,"source":"smtp"}"#),
+            Err(PimdirActionError::UnknownVersion(Some(2)))
         );
     }
 
     #[test]
     fn a_collection_create_round_trips_through_the_queue_codec() {
         let create = PimdirCollectionCreate {
-            source: Some("imap".into()),
+            source: "imap".into(),
             name: "Archives".into(),
             parent: Some(PimdirCollectionId::from("INBOX")),
         };
@@ -519,42 +569,50 @@ mod tests {
     }
 
     #[test]
-    fn a_collection_create_needs_a_name() {
+    fn a_collection_create_needs_a_source_and_a_name() {
         let refused = |payload: &str| PimdirCollectionCreate::from_payload(payload).unwrap_err();
 
         assert_eq!(
             refused(r#"{"v":1,"source":"imap"}"#),
             PimdirActionError::MissingField("name")
         );
-        assert!(matches!(
-            refused(r#"{"v":1,"name":"  "}"#),
-            PimdirActionError::Invalid { field: "name", .. }
-        ));
-        assert!(matches!(
-            refused("{\"v\":1,\"name\":\"a\\nb\"}"),
-            PimdirActionError::Invalid { field: "name", .. }
-        ));
         assert_eq!(
-            refused(r#"{"v":1,"name":3}"#),
-            PimdirActionError::MissingField("name")
+            refused(r#"{"v":1,"name":"a"}"#),
+            PimdirActionError::MissingField("source")
         );
+        assert!(matches!(
+            refused(r#"{"v":1,"source":"imap","name":"  "}"#),
+            PimdirActionError::Invalid { field: "name", .. }
+        ));
+        assert!(matches!(
+            refused("{\"v\":1,\"source\":\"imap\",\"name\":\"a\\nb\"}"),
+            PimdirActionError::Invalid { field: "name", .. }
+        ));
+        assert!(matches!(
+            refused(r#"{"v":1,"source":"imap","name":3}"#),
+            PimdirActionError::Invalid { field: "name", .. }
+        ));
         assert_eq!(
             refused(r#"{"v":2,"name":"a"}"#),
             PimdirActionError::UnknownVersion(Some(2))
         );
         assert!(matches!(
-            refused(r#"{"v":1,"name":"a","parent":""}"#),
+            refused(r#"{"v":1,"source":"imap","name":"a","parent":""}"#),
             PimdirActionError::Invalid {
                 field: "parent",
                 ..
             }
         ));
+        assert_eq!(
+            refused(r#"{"v":1,"source":"imap","name":"a","seq":1}"#),
+            PimdirActionError::UnknownField("seq".into())
+        );
     }
 
     #[test]
     fn an_invitation_names_its_occurrence_or_the_whole_series() {
         let reply = PimdirInvitation {
-            source: Some("dav".into()),
+            source: "dav".into(),
             item: PimdirIntentItem::Seq(4),
             partstat: Some(PimdirPartstat::Declined),
             comment: None,
@@ -574,7 +632,6 @@ mod tests {
             Some("20261006T070000Z")
         );
 
-        // NOTE: a payload from before the field addresses the series.
         let series = r#"{"v":1,"source":"dav","seq":4,"comment":"sorry"}"#;
         let cancel = PimdirInvitation::from_payload(CALENDAR_CANCEL, series).unwrap();
         assert_eq!(cancel.recurrence_id, None);
@@ -586,7 +643,8 @@ mod tests {
     #[test]
     fn an_invitation_refuses_a_malformed_occurrence_or_item() {
         for value in ["2026-10-06", "20261006T0700", "20261006T070000+0200", ""] {
-            let payload = alloc::format!(r#"{{"v":1,"seq":1,"recurrence_id":"{value}"}}"#);
+            let payload =
+                alloc::format!(r#"{{"v":1,"source":"dav","seq":1,"recurrence_id":"{value}"}}"#);
             assert!(
                 matches!(
                     recurrence_id(&payload),
@@ -602,17 +660,44 @@ mod tests {
             assert_eq!(validate_recurrence_id(value), Ok(()), "{value} accepted");
         }
 
-        let both = r#"{"v":1,"seq":1,"link_id":"uid:a","partstat":"ACCEPTED"}"#;
+        let refused =
+            |kind: &str, payload: &str| PimdirInvitation::from_payload(kind, payload).unwrap_err();
+        for payload in [
+            r#"{"v":1,"source":"dav","seq":1,"link_id":"uid:a","partstat":"ACCEPTED"}"#,
+            r#"{"v":1,"source":"dav","partstat":"ACCEPTED"}"#,
+        ] {
+            assert!(matches!(
+                refused(CALENDAR_REPLY, payload),
+                PimdirActionError::Invalid { field: "seq", .. }
+            ));
+        }
         assert!(matches!(
-            PimdirInvitation::from_payload(CALENDAR_REPLY, both),
-            Err(PimdirActionError::Invalid { field: "seq", .. })
+            refused(
+                CALENDAR_REPLY,
+                r#"{"v":1,"source":"dav","link_id":"uid:a","partstat":"MAYBE"}"#
+            ),
+            PimdirActionError::Invalid {
+                field: "partstat",
+                ..
+            }
         ));
-        let pending = r#"{"v":1,"link_id":"uid:a","partstat":"MAYBE"}"#;
         assert_eq!(
-            PimdirInvitation::from_payload(CALENDAR_REPLY, pending),
-            Err(PimdirActionError::MissingField("partstat"))
+            refused(CALENDAR_REPLY, r#"{"v":1,"source":"dav","seq":1}"#),
+            PimdirActionError::MissingField("partstat")
         );
-        let pending = r#"{"v":1,"link_id":"uid:a"}"#;
+        assert_eq!(
+            refused(
+                CALENDAR_CANCEL,
+                r#"{"v":1,"source":"dav","seq":1,"partstat":"ACCEPTED"}"#
+            ),
+            PimdirActionError::UnknownField("partstat".into())
+        );
+        assert_eq!(
+            refused(CALENDAR_CANCEL, r#"{"v":1,"seq":1}"#),
+            PimdirActionError::MissingField("source")
+        );
+
+        let pending = r#"{"v":1,"source":"dav","link_id":"uid:a"}"#;
         assert_eq!(
             PimdirInvitation::from_payload(CALENDAR_CANCEL, pending)
                 .unwrap()

@@ -6,17 +6,19 @@
 //! (`client::search`) and an owner holding its own SQLite in another
 //! language run one fold.
 //!
-//! A run asks the index's state ([`WantsIndexState`]), rolls the horizon
-//! when it moved ([`WantsReexpand`]), reads one page of the feed
-//! ([`WantsFeed`]) with what the index holds of it ([`WantsHeld`]), the
-//! bodies it extracts and expands ([`WantsBodies`]) and the summaries a
-//! bodiless or unreadable item is indexed from ([`WantsSummaries`]), then
-//! relinks the threads the page touched ([`WantsMessages`]). The run that
-//! exhausts the feed also reconciles what the store no longer holds
-//! ([`WantsGone`]) and meets again the bodies an earlier pass could not
-//! read ([`WantsUnread`]). Every write is a [`PimdirIndexOp`] naming the
-//! index's rows, its text already folded (SEARCH §5), which a consumer
-//! maps to its own shape's statements.
+//! A run asks the index's state ([`WantsIndexState`]), re-expands the
+//! calendar items when the horizon rolled, the time zone database moved or
+//! the floating zone is another ([`WantsReexpand`]), folds again the
+//! placements whose body an earlier pass could not read ([`WantsMissing`])
+//! when it begins a pass, reads one page of the feed ([`WantsFeed`]) with
+//! what the index holds of it ([`WantsHeld`]), the bodies it extracts and
+//! expands ([`WantsBodies`]) and the summaries a bodiless or unreadable
+//! item is indexed from ([`WantsSummaries`]), then relinks the threads the
+//! page touched ([`WantsMessages`]), pruning first the thread of a message
+//! that left ([`WantsThreadRows`]). The run that exhausts the feed also
+//! reconciles what the store no longer holds ([`WantsGone`]). Every write
+//! is a [`PimdirIndexOp`] naming the index's rows, its text already folded
+//! (SEARCH §5), which a consumer maps to its own shape's statements.
 //!
 //! One run is one transaction: a consumer answers every yield of a run
 //! inside one write transaction on the index, the store read in it as one
@@ -34,7 +36,8 @@
 //! [`WantsSummaries`]: PimdirIndexRefreshYield::WantsSummaries
 //! [`WantsMessages`]: PimdirIndexRefreshYield::WantsMessages
 //! [`WantsGone`]: PimdirIndexRefreshYield::WantsGone
-//! [`WantsUnread`]: PimdirIndexRefreshYield::WantsUnread
+//! [`WantsMissing`]: PimdirIndexRefreshYield::WantsMissing
+//! [`WantsThreadRows`]: PimdirIndexRefreshYield::WantsThreadRows
 //! [`Writes`]: PimdirIndexRefreshYield::Writes
 
 use core::mem;
@@ -55,7 +58,7 @@ use crate::{
     search::{
         extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
         fold,
-        occurrence::{self, Horizon},
+        occurrence::{self, Expansion, Horizon},
         thread::{self, Heads},
     },
     summary::{PimdirAddress, PimdirAddressRole, PimdirSummary, file, time},
@@ -68,6 +71,15 @@ pub const BODIES_MAX: usize = 16;
 /// I/O-free coroutine folding one batch of a store's change feed into its
 /// index (SEARCH §4).
 pub struct PimdirIndexRefresh {
+    /// The IANA zone floating times and dates are read in (SEARCH §7),
+    /// [`FLOATING_ZONE`](occurrence::FLOATING_ZONE) unless the indexer
+    /// states another: one other than the index records re-expands every
+    /// live calendar item and records it.
+    pub floating_zone: String,
+    /// Whether the run first folds again the placements whose body could
+    /// not be read (`load_missing_items`, SEARCH §4), as the first run of a
+    /// pass does; true unless set otherwise.
+    pub missing: bool,
     now: i64,
     batch: usize,
     state: State,
@@ -91,6 +103,8 @@ impl PimdirIndexRefresh {
     /// around `now` (Unix seconds, SEARCH §7).
     pub fn new(now: i64, batch: usize) -> Self {
         Self {
+            floating_zone: occurrence::FLOATING_ZONE.into(),
+            missing: true,
             now,
             batch: batch.max(1),
             state: State::Start,
@@ -129,7 +143,7 @@ impl PimdirIndexRefresh {
                 debug!("re-expand {} calendar item(s)", keys.len());
                 if keys.is_empty() {
                     self.record(new);
-                    return self.feed();
+                    return self.refold();
                 }
                 let want = PimdirIndexRefreshYield::WantsHeld {
                     placements: keys.clone(),
@@ -166,11 +180,15 @@ impl PimdirIndexRefresh {
             (State::Expanding(mut reexpand), Some(PimdirIndexRefreshArg::Bodies(bodies))) => {
                 for hash in mem::take(&mut reexpand.asked) {
                     if let Some(body) = bodies.get(&hash) {
-                        let derived = reexpand.new.occurrences(body);
+                        let derived = reexpand.new.occurrences(body, &self.floating_zone);
                         reexpand.derived.insert(hash, derived);
                     }
                 }
                 self.reexpand(reexpand)
+            }
+            (State::ReadingMissing, Some(PimdirIndexRefreshArg::Feed(rows))) => {
+                debug!("fold {} row(s) whose body was not read", rows.len());
+                self.fold(rows, After::Missing)
             }
             (State::ReadingFeed, Some(PimdirIndexRefreshArg::Feed(rows))) => {
                 debug!("fold {} feed row(s)", rows.len());
@@ -178,10 +196,6 @@ impl PimdirIndexRefresh {
                 self.end = rows.last().map(|row| row.changed);
                 self.output.folded += rows.len() as u64;
                 self.fold(rows, After::Feed)
-            }
-            (State::ReadingUnread, Some(PimdirIndexRefreshArg::Feed(rows))) => {
-                debug!("fold {} row(s) whose body was not read", rows.len());
-                self.fold(rows, After::Unread)
             }
             (
                 State::ReadingHeld(mut fold),
@@ -199,7 +213,7 @@ impl PimdirIndexRefresh {
                 self.bodies(fold)
             }
             (State::ReadingBodies(mut fold), Some(PimdirIndexRefreshArg::Bodies(bodies))) => {
-                fold.read(&bodies, &self.horizon);
+                fold.read(&bodies, &self.horizon, &self.floating_zone);
                 self.bodies(fold)
             }
             (State::ReadingSummaries(mut fold), Some(PimdirIndexRefreshArg::Summaries(found))) => {
@@ -223,7 +237,7 @@ impl PimdirIndexRefresh {
                 }
                 self.ops
                     .extend(gone.objects.into_iter().map(PimdirIndexOp::DropObject));
-                self.unread()
+                self.relink_touched()
             }
             (State::Relinking(mut relink), Some(PimdirIndexRefreshArg::Messages(mut read))) => {
                 for link_id in mem::take(&mut relink.messages) {
@@ -231,6 +245,19 @@ impl PimdirIndexRefresh {
                     relink.nodes.insert(link_id, message);
                 }
                 self.relink(relink)
+            }
+            (State::Relinking(mut relink), Some(PimdirIndexRefreshArg::ThreadRows(rows))) => {
+                trace!("{} message row(s) left in the pruned threads", rows.len());
+                relink.seeds = rows.into_iter().map(|row| row.link_id).collect();
+                // NOTE: the prune changed the rows read so far.
+                relink.nodes.clear();
+                let messages: BTreeSet<&String> =
+                    self.touched.iter().chain(&relink.seeds).collect();
+                relink.messages = messages.into_iter().cloned().collect();
+                let want = PimdirIndexRefreshYield::WantsMessages {
+                    link_ids: relink.messages.clone(),
+                };
+                self.ask(want, State::Relinking(relink))
             }
             (State::Relinking(mut relink), Some(PimdirIndexRefreshArg::Bodies(bodies))) => {
                 for hash in mem::take(&mut relink.bodies) {
@@ -273,9 +300,9 @@ impl PimdirIndexRefresh {
     }
 
     /// Rolls the horizon to the one around `now` when it moved by a day or
-    /// more, re-expanding what `items_to_reexpand` names when it rolled or
+    /// more, re-expanding what `items_to_reexpand` names when it rolled,
     /// the time zone database names another version than the one recorded
-    /// (SEARCH §7), then reads the feed.
+    /// or the floating zone is another (SEARCH §7), then folds.
     fn roll(&mut self, meta: PimdirIndexMeta) -> Step {
         let around = Horizon::around(self.now);
         let version = occurrence::tzdb_version();
@@ -285,35 +312,38 @@ impl PimdirIndexRefresh {
                 end: occurrence::instant(&horizon.end)?,
             })
         });
-        let recorded = meta.tzdb_version.clone();
+        let moved = meta.tzdb_version != version || meta.floating_zone != self.floating_zone;
         self.meta = meta;
 
         let Some(old) = old else {
             self.record(around);
-            return self.feed();
+            return self.refold();
         };
         let rolled = (around.start - old.start).abs() >= occurrence::ROLL;
-        if !rolled && recorded == version {
+        if !rolled && !moved {
             self.horizon = old;
-            return self.feed();
+            return self.refold();
         }
 
         let new = if rolled { around } else { old };
         debug!(
-            "re-expand calendar items for the horizon {}..{} under tzdb {version:?}",
+            "re-expand calendar items for the horizon {}..{} under tzdb {version:?} in {}",
             time::rfc3339(new.start),
-            time::rfc3339(new.end)
+            time::rfc3339(new.end),
+            self.floating_zone
         );
         self.horizon = new;
         let want = PimdirIndexRefreshYield::WantsReexpand {
             old: PimdirIndexHorizon::from(old),
             new: PimdirIndexHorizon::from(new),
             tzdb_version: version.into(),
+            floating_zone: self.floating_zone.clone(),
         };
         self.ask(want, State::ListingReexpand { new })
     }
 
-    /// Records the horizon and the time zone database version in force.
+    /// Records the horizon, the time zone database version and the
+    /// floating zone in force.
     fn record(&mut self, horizon: Horizon) {
         self.horizon = horizon;
         self.ops
@@ -321,6 +351,8 @@ impl PimdirIndexRefresh {
         self.ops.push(PimdirIndexOp::SetTzdbVersion(
             occurrence::tzdb_version().into(),
         ));
+        self.ops
+            .push(PimdirIndexOp::SetFloatingZone(self.floating_zone.clone()));
     }
 
     /// Asks the next bodies a re-expansion needs, else replaces the
@@ -347,20 +379,17 @@ impl PimdirIndexRefresh {
             self.ops.push(op);
         }
         self.record(new);
-        self.feed()
+        self.refold()
     }
 
-    /// The op replacing one placement's occurrences with those `derived`
-    /// holds, none without; counted when expanded.
-    fn occurrences(
-        &mut self,
-        key: &PimdirIndexKey,
-        derived: Option<&Occurrences>,
-    ) -> PimdirIndexOp {
+    /// The op replacing one placement's occurrences and cut with those
+    /// `derived` holds, none without; counted when expanded.
+    fn occurrences(&mut self, key: &PimdirIndexKey, derived: Option<&Expansion>) -> PimdirIndexOp {
         let mut occurrences = Vec::new();
-        if let Some((instants, cut)) = derived {
+        let mut cut = None;
+        if let Some((instants, at)) = derived {
             trace!(
-                "{} occurrence(s) of {}/{}",
+                "{} occurrence(s) of {}/{}, cut at {at:?}",
                 instants.len(),
                 key.collection,
                 key.seq
@@ -372,8 +401,9 @@ impl PimdirIndexRefresh {
                     end: time::rfc3339(*end),
                 })
                 .collect();
+            cut = at.map(time::rfc3339);
             self.output.expanded += 1;
-            if *cut {
+            if cut.is_some() {
                 self.output.bounded += 1;
             }
         }
@@ -381,6 +411,16 @@ impl PimdirIndexRefresh {
             collection: key.collection.clone(),
             seq: key.seq,
             occurrences,
+            cut,
+        }
+    }
+
+    /// Folds again the placements whose body could not be read when the
+    /// run begins a pass (SEARCH §4), else reads the feed.
+    fn refold(&mut self) -> Step {
+        match self.missing {
+            true => self.ask(PimdirIndexRefreshYield::WantsMissing, State::ReadingMissing),
+            false => self.feed(),
         }
     }
 
@@ -515,6 +555,16 @@ impl PimdirIndexRefresh {
                     link_id: row.link_id.clone(),
                     hash: hash.clone(),
                 }));
+            match row.indexable().is_some() && hash.is_none() {
+                true => {
+                    debug!(
+                        "body of {}/{} is missing, recording it",
+                        row.collection, row.seq
+                    );
+                    self.ops.push(PimdirIndexOp::PutMissing(key.clone()));
+                }
+                false => self.ops.push(PimdirIndexOp::DropMissing(key.clone())),
+            }
             match &hash {
                 None => {
                     let extract = summary_extract(fold.summaries.get(&key));
@@ -547,27 +597,20 @@ impl PimdirIndexRefresh {
         self.after(fold.after)
     }
 
-    /// What follows a folded page: a full one relinks and records its
-    /// cursor; the last one first reconciles keys when the store's purge
-    /// count or a collection's stamp moved (SEARCH §4) and meets again the
-    /// bodies not read; those relink and record.
+    /// What follows a folded page: the placements folded again read the
+    /// feed; a full page relinks and records its cursor; the last one first
+    /// reconciles keys when the store's purge count moved, a rename
+    /// counting there (SEARCH §4), then relinks and records.
     fn after(&mut self, after: After) -> Step {
         match after {
+            After::Missing => self.feed(),
             After::Feed if self.full => self.relink_touched(),
-            After::Feed if self.meta.purges != self.meta.store_purges || self.meta.moved => {
+            After::Feed if self.meta.purges != self.meta.store_purges => {
                 debug!("reconcile index keys");
                 self.ask(PimdirIndexRefreshYield::WantsGone, State::ReadingGone)
             }
-            After::Feed => self.unread(),
-            After::Unread => self.relink_touched(),
+            After::Feed => self.relink_touched(),
         }
-    }
-
-    /// Reads the live placements the index holds without the body the
-    /// store holds (SEARCH §4).
-    fn unread(&mut self) -> Step {
-        let want = PimdirIndexRefreshYield::WantsUnread { limit: self.batch };
-        self.ask(want, State::ReadingUnread)
     }
 
     /// Reads the messages the run touched, so they are relinked; records
@@ -582,6 +625,9 @@ impl PimdirIndexRefresh {
             heads: BTreeMap::new(),
             messages: self.touched.iter().cloned().collect(),
             bodies: Vec::new(),
+            pruned: false,
+            threads: BTreeSet::new(),
+            seeds: BTreeSet::new(),
         };
         let want = PimdirIndexRefreshYield::WantsMessages {
             link_ids: relink.messages.clone(),
@@ -589,11 +635,42 @@ impl PimdirIndexRefresh {
         self.ask(want, State::Relinking(Box::new(relink)))
     }
 
-    /// Relinks over the messages read so far, asking what it still needs.
+    /// Relinks over the messages read so far, asking what it still needs,
+    /// once the thread of every touched message no placement holds any
+    /// more is pruned (SEARCH §9): its rows no member holds name no parent
+    /// and those no row names go, what is left read again to be re-keyed.
     fn relink(&mut self, mut relink: Box<Relink>) -> Step {
-        match thread::relink(&relink.nodes, &relink.heads, &self.touched) {
+        if !relink.pruned {
+            relink.pruned = true;
+            let threads: BTreeSet<String> = self
+                .touched
+                .iter()
+                .filter_map(|link_id| relink.nodes.get(link_id))
+                .filter(|node| node.presence.is_none())
+                .filter_map(|node| Some(node.row.as_ref()?.thread.clone()))
+                .collect();
+            if !threads.is_empty() {
+                debug!("prune {} thread(s) a message left", threads.len());
+                self.ops
+                    .extend(threads.iter().cloned().map(PimdirIndexOp::PruneThread));
+                let want = PimdirIndexRefreshYield::WantsThreadRows {
+                    threads: threads.iter().cloned().collect(),
+                };
+                relink.threads = threads;
+                return self.ask(want, State::Relinking(relink));
+            }
+        }
+
+        match thread::relink(&relink.nodes, &relink.heads, &self.touched, &relink.seeds) {
             Ok(ops) => {
                 self.ops.extend(ops);
+                // NOTE: a pruned thread left with no row is no seed's, so
+                // the rethread never meets it.
+                self.ops.extend(
+                    mem::take(&mut relink.threads)
+                        .into_iter()
+                        .map(PimdirIndexOp::DropThread),
+                );
                 self.finish()
             }
             Err(need) if !need.messages.is_empty() => {
@@ -614,9 +691,10 @@ impl PimdirIndexRefresh {
         }
     }
 
-    /// Records the cursor the run reached, with what the last completed
-    /// pass recorded for a full page and what the store held before the
-    /// run for the last one (SEARCH §4), and writes what is pending.
+    /// Records the cursor the run reached, with the purge count the last
+    /// completed pass recorded for a full page, a batch never moving it,
+    /// and the one the store held before the run for the last one (SEARCH
+    /// §4), and writes what is pending.
     fn finish(&mut self) -> Step {
         let op = match self.full {
             true => {
@@ -624,7 +702,6 @@ impl PimdirIndexRefresh {
                 PimdirIndexOp::SetCursor {
                     store_change: self.output.cursor,
                     store_purges: self.meta.store_purges,
-                    store_reconciled: self.meta.store_reconciled,
                 }
             }
             false => {
@@ -636,7 +713,6 @@ impl PimdirIndexRefresh {
                 PimdirIndexOp::SetCursor {
                     store_change: self.output.cursor,
                     store_purges: self.meta.purges,
-                    store_reconciled: self.meta.head,
                 }
             }
         };
@@ -653,34 +729,33 @@ impl PimdirIndexRefresh {
 /// [`PimdirIndexRefreshArg`] it names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirIndexRefreshYield {
-    /// The index's `index_meta` with the store's change cursor and whether
-    /// a collection moved, answered by
-    /// [`IndexState`](PimdirIndexRefreshArg::IndexState).
+    /// The index's `index_meta` with the store's change cursor, answered
+    /// by [`IndexState`](PimdirIndexRefreshArg::IndexState).
     WantsIndexState,
-    /// The calendar items a horizon roll or a new time zone database
-    /// re-expands (`items_to_reexpand`, SEARCH §7), answered by
-    /// [`Reexpand`](PimdirIndexRefreshArg::Reexpand).
+    /// The calendar items a horizon roll, a new time zone database or
+    /// another floating zone re-expands (`items_to_reexpand`, SEARCH §7),
+    /// answered by [`Reexpand`](PimdirIndexRefreshArg::Reexpand).
     WantsReexpand {
         /// The horizon in force.
         old: PimdirIndexHorizon,
-        /// The horizon the run records, the old one when only the database
+        /// The horizon the run records, the old one when only a zone
         /// moved.
         new: PimdirIndexHorizon,
         /// The version of the time zone database in use.
         tzdb_version: String,
+        /// The zone floating times and dates are read in.
+        floating_zone: String,
     },
+    /// The placements whose body the index could not read (`missing`,
+    /// `load_missing_items`, SEARCH §4), as the feed answers a row,
+    /// answered by [`Feed`](PimdirIndexRefreshArg::Feed): each is folded
+    /// again, whether or not the store stamped it again.
+    WantsMissing,
     /// The store's feed above a stamp in stamp order (`load_changed_items`,
     /// STORAGE §4.5), answered by [`Feed`](PimdirIndexRefreshArg::Feed).
     WantsFeed {
         /// The stamp the rows lie above.
         since: i64,
-        /// The most rows answered.
-        limit: usize,
-    },
-    /// The live placements the index holds without the body the store
-    /// holds, files never (SEARCH §4), answered by
-    /// [`Feed`](PimdirIndexRefreshArg::Feed).
-    WantsUnread {
         /// The most rows answered.
         limit: usize,
     },
@@ -711,6 +786,14 @@ pub enum PimdirIndexRefreshYield {
         /// The message ids.
         link_ids: Vec<String>,
     },
+    /// The message rows left in these threads once pruned (`thread_rows`,
+    /// SEARCH §9), answered by
+    /// [`ThreadRows`](PimdirIndexRefreshArg::ThreadRows): what the
+    /// re-keying reads.
+    WantsThreadRows {
+        /// The thread ids.
+        threads: Vec<String>,
+    },
     /// What the index holds and the store no longer does
     /// (`placements_gone`, `objects_gone`), answered by
     /// [`Gone`](PimdirIndexRefreshArg::Gone).
@@ -720,8 +803,8 @@ pub enum PimdirIndexRefreshYield {
     /// a purged item, a collected object or a renamed collection's old id
     /// leaves no row to page and draws no stamp (STORAGE §4.5), so what is
     /// gone is a comparison of the index with the store, asked once by the
-    /// run exhausting the feed when the purge count or a collection's stamp
-    /// moved.
+    /// run exhausting the feed when the purge count, which a rename moves
+    /// too, moved.
     WantsGone,
     /// Apply these ops in order, inside the run's transaction, answered by
     /// [`Written`](PimdirIndexRefreshArg::Written).
@@ -737,8 +820,8 @@ pub enum PimdirIndexRefreshArg {
     /// the items, by placement key.
     Reexpand(Vec<PimdirIndexKey>),
     /// Answers [`WantsFeed`](PimdirIndexRefreshYield::WantsFeed) and
-    /// [`WantsUnread`](PimdirIndexRefreshYield::WantsUnread), in stamp
-    /// order for the feed.
+    /// [`WantsMissing`](PimdirIndexRefreshYield::WantsMissing), in stamp
+    /// order.
     Feed(Vec<PimdirIndexFeedRow>),
     /// Answers [`WantsHeld`](PimdirIndexRefreshYield::WantsHeld).
     Held {
@@ -756,6 +839,9 @@ pub enum PimdirIndexRefreshArg {
     /// Answers [`WantsMessages`](PimdirIndexRefreshYield::WantsMessages),
     /// by message id; one the index knows nothing of may be left out.
     Messages(BTreeMap<String, PimdirIndexMessage>),
+    /// Answers [`WantsThreadRows`](PimdirIndexRefreshYield::WantsThreadRows):
+    /// every message row of the threads asked.
+    ThreadRows(Vec<PimdirIndexThreadRow>),
     /// Answers [`WantsGone`](PimdirIndexRefreshYield::WantsGone).
     Gone(PimdirIndexGone),
     /// Answers [`Writes`](PimdirIndexRefreshYield::Writes) once applied.
@@ -776,7 +862,9 @@ pub struct PimdirIndexRefreshOutput {
     pub indexed: u64,
     /// Calendar items whose occurrences were expanded (SEARCH §7).
     pub expanded: u64,
-    /// Calendar items cut at [`OCCURRENCES_MAX`](occurrence::OCCURRENCES_MAX).
+    /// Calendar items a bound of SEARCH §7 cut:
+    /// [`OCCURRENCES_MAX`](occurrence::OCCURRENCES_MAX) occurrences or
+    /// [`PERIODS_MAX`](occurrence::PERIODS_MAX) periods.
     pub bounded: u64,
     /// Placements dropped: deleted, retained, purged or renamed away.
     pub removed: u64,
@@ -834,8 +922,8 @@ pub enum PimdirIndexOp {
         /// The flags.
         flags: BTreeSet<String>,
     },
-    /// Replaces a placement's occurrences (`replace_occurrences`, then
-    /// `insert_occurrence`).
+    /// Replaces a placement's occurrences and records its cut
+    /// (`replace_occurrences`, then `insert_occurrence`, then `set_cut`).
     ReplaceOccurrences {
         /// The collection.
         collection: String,
@@ -843,7 +931,16 @@ pub enum PimdirIndexOp {
         seq: i64,
         /// The occurrences within the horizon, possibly none.
         occurrences: Vec<PimdirIndexOccurrence>,
+        /// The instant from which they are not all written, RFC 3339 in
+        /// UTC, `None` when no bound of SEARCH §7 stopped them.
+        cut: Option<String>,
     },
+    /// Records a placement whose body could not be read (`insert_missing`,
+    /// SEARCH §4), indexed bodiless meanwhile.
+    PutMissing(PimdirIndexKey),
+    /// Forgets a placement whose body is indexed or that holds none
+    /// (`delete_missing`), if recorded.
+    DropMissing(PimdirIndexKey),
     /// Puts a message row (`upsert_message`), its thread row written
     /// before it.
     PutMessage {
@@ -854,8 +951,10 @@ pub enum PimdirIndexOp {
         /// The message id it replies to.
         parent: Option<String>,
     },
-    /// Drops a message row (`delete_message`).
-    DropMessage(String),
+    /// Prunes a thread a message left (SEARCH §9): its rows no live mail
+    /// placement holds name no parent (`unparent_messages`), then those no
+    /// row names go (`prune_messages`).
+    PruneThread(String),
     /// Puts a thread row (`upsert_thread`).
     PutThread {
         /// The link id of its present member with the lowest
@@ -870,7 +969,7 @@ pub enum PimdirIndexOp {
         count: u64,
     },
     /// Drops a thread row when no message row points to it any more,
-    /// keeping it otherwise (`delete_thread_unused`).
+    /// keeping it otherwise (`delete_thread`).
     DropThread(String),
     /// Records the store's cursor folded in (`set_index_cursor`).
     SetCursor {
@@ -878,8 +977,6 @@ pub enum PimdirIndexOp {
         store_change: i64,
         /// The purge count reconciled.
         store_purges: i64,
-        /// The cursor of the last completed pass.
-        store_reconciled: i64,
     },
     /// Records the horizon occurrences are expanded within
     /// (`set_horizon`).
@@ -887,31 +984,31 @@ pub enum PimdirIndexOp {
     /// Records the time zone database version occurrences are expanded
     /// under (`set_tzdb_version`).
     SetTzdbVersion(String),
+    /// Records the zone floating times and dates are read in
+    /// (`set_floating_zone`).
+    SetFloatingZone(String),
 }
 
 /// What [`WantsIndexState`](PimdirIndexRefreshYield::WantsIndexState)
-/// reads: the index's `index_meta`, and the store's change cursor and
-/// collection stamps read in the same transaction.
+/// reads: the index's `index_meta`, and the store's change cursor read in
+/// the same transaction.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirIndexMeta {
     /// The last stamp the index folded (`index_meta.store_change`).
     pub store_change: i64,
     /// The purge count it reconciled (`index_meta.store_purges`).
     pub store_purges: i64,
-    /// The cursor of the last completed pass
-    /// (`index_meta.store_reconciled`).
-    pub store_reconciled: i64,
     /// The horizon recorded, `None` before one was.
     pub horizon: Option<PimdirIndexHorizon>,
     /// The time zone database version recorded, empty with none.
     pub tzdb_version: String,
+    /// The zone floating times and dates were read in
+    /// (`index_meta.floating_zone`).
+    pub floating_zone: String,
     /// The store's last stamp drawn (`load_change_cursor`).
     pub head: i64,
-    /// The store's purge count (`load_change_cursor`).
+    /// The store's purge count (`load_change_cursor`), a rename counted.
     pub purges: i64,
-    /// Whether a collection's stamp lies above `store_reconciled`, which a
-    /// rename leaves (SEARCH §4).
-    pub moved: bool,
 }
 
 /// The window occurrences are expanded within, RFC 3339 instants in UTC
@@ -1196,14 +1293,38 @@ pub struct PimdirIndexPresence {
     pub last: Option<String>,
 }
 
+/// A message row of a pruned thread (`thread_rows`, SEARCH §9).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirIndexThreadRow {
+    /// The message id.
+    pub link_id: String,
+    /// The message id it replies to.
+    pub parent: Option<String>,
+    /// The lowest sort key of its live mail placements, `None` for a
+    /// message none holds.
+    pub sort_key: Option<String>,
+}
+
 /// What the index holds and the store no longer does (SEARCH §4).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirIndexGone {
     /// The placements the store no longer holds (`placements_gone`): purged
-    /// rows, a renamed collection's old id; as the index holds them.
-    pub placements: Vec<PimdirIndexPlacement>,
+    /// rows, a renamed collection's old id.
+    pub placements: Vec<PimdirIndexGonePlacement>,
     /// The bodies the collector took (`objects_gone`).
     pub objects: Vec<PimdirHash>,
+}
+
+/// A placement the store no longer holds, as `placements_gone` names it:
+/// its key and the link id whose thread its leaving may prune (SEARCH §9).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirIndexGonePlacement {
+    /// The collection.
+    pub collection: String,
+    /// The placement's `seq` there.
+    pub seq: i64,
+    /// The item's key.
+    pub link_id: PimdirLinkId,
 }
 
 /// What a step of the run answers.
@@ -1228,8 +1349,8 @@ enum State {
         keys: Vec<PimdirIndexKey>,
     },
     Expanding(Box<Reexpand>),
+    ReadingMissing,
     ReadingFeed,
-    ReadingUnread,
     ReadingHeld(Box<Fold>),
     ReadingBodies(Box<Fold>),
     ReadingSummaries(Box<Fold>),
@@ -1243,10 +1364,10 @@ enum State {
 /// What follows a folded page.
 #[derive(Clone, Copy, Debug)]
 enum After {
+    /// The rows whose body an earlier pass could not read.
+    Missing,
     /// A page of the feed.
     Feed,
-    /// The rows whose body was not read.
-    Unread,
 }
 
 /// A re-expansion under way: the items and the body each holds, and the
@@ -1256,7 +1377,7 @@ struct Reexpand {
     items: Vec<(PimdirIndexKey, Option<PimdirHash>)>,
     queue: Vec<PimdirHash>,
     asked: Vec<PimdirHash>,
-    derived: BTreeMap<PimdirHash, Occurrences>,
+    derived: BTreeMap<PimdirHash, Expansion>,
 }
 
 /// A page being folded and what was read for it.
@@ -1274,13 +1395,9 @@ struct Fold {
     asked: Vec<PimdirHash>,
     extracted: BTreeMap<PimdirHash, Extracted>,
     /// The occurrences by hash, `None` for a body not read.
-    derived: BTreeMap<PimdirHash, Option<Occurrences>>,
+    derived: BTreeMap<PimdirHash, Option<Expansion>>,
     summaries: BTreeMap<PimdirIndexKey, PimdirIndexSummary>,
 }
-
-/// A calendar resource's occurrences within the horizon, Unix seconds,
-/// and whether it held more than the bound.
-type Occurrences = (Vec<(i64, i64)>, bool);
 
 /// A body extracted.
 enum Extracted {
@@ -1318,7 +1435,7 @@ impl Fold {
 
     /// Extracts and expands the bodies asked, a missing one recorded as
     /// such.
-    fn read(&mut self, bodies: &BTreeMap<PimdirHash, Vec<u8>>, horizon: &Horizon) {
+    fn read(&mut self, bodies: &BTreeMap<PimdirHash, Vec<u8>>, horizon: &Horizon, zone: &str) {
         for hash in mem::take(&mut self.asked) {
             let body = bodies.get(&hash);
             if let Some((kind, key)) = self.extract.get(&hash) {
@@ -1336,11 +1453,11 @@ impl Fold {
                         };
                         self.extracted.insert(hash.clone(), extracted);
                     }
-                    None => debug!("blob {} is missing, indexing it later", hash.as_str()),
+                    None => debug!("blob {} is missing, recording it", hash.as_str()),
                 }
             }
             if self.expand.contains(&hash) {
-                let derived = body.map(|body| horizon.occurrences(body));
+                let derived = body.map(|body| horizon.occurrences(body, zone));
                 self.derived.insert(hash, derived);
             }
         }
@@ -1398,12 +1515,20 @@ impl Fold {
 }
 
 /// A relink under way: the messages and the body heads read so far, and
-/// what was asked last.
+/// what was asked last, the prune done first.
 struct Relink {
     nodes: BTreeMap<String, PimdirIndexMessage>,
     heads: Heads,
     messages: Vec<String>,
     bodies: Vec<PimdirHash>,
+    /// Whether the threads touched messages left are pruned.
+    pruned: bool,
+    /// The threads pruned, each dropped once the relink is written and
+    /// no row points to it any more (SEARCH §9).
+    threads: BTreeSet<String>,
+    /// The message ids left in the pruned threads, re-keyed with the
+    /// touched ones.
+    seeds: BTreeSet<String>,
 }
 
 /// An item's text read from its summary and address rows (SEARCH §6).
@@ -1423,8 +1548,9 @@ mod tests {
         search::refresh::*,
     };
 
-    /// A first run over an empty store: the horizon recorded before the
-    /// feed is read, the cursor at the store's head once it is exhausted.
+    /// A first run over an empty store: the horizon and the zones recorded,
+    /// the placements recorded missing folded before the feed is read, the
+    /// cursor at the store's head once it is exhausted.
     #[test]
     fn an_empty_feed_records_the_horizon_then_the_cursor() {
         crate::testlog::init();
@@ -1462,17 +1588,17 @@ mod tests {
             panic!("the horizon is written first: {:?}", wants[1]);
         };
         assert!(matches!(recorded[0], PimdirIndexOp::SetHorizon(_)));
+        assert!(matches!(recorded[2], PimdirIndexOp::SetFloatingZone(ref zone) if zone == "UTC"));
+        assert_eq!(wants[2], PimdirIndexRefreshYield::WantsMissing);
         assert_eq!(
-            wants[2],
+            wants[3],
             PimdirIndexRefreshYield::WantsFeed { since: 0, limit: 8 }
         );
-        assert_eq!(wants[3], PimdirIndexRefreshYield::WantsUnread { limit: 8 });
         assert_eq!(
             ops,
             [PimdirIndexOp::SetCursor {
                 store_change: 3,
                 store_purges: 0,
-                store_reconciled: 3,
             }]
         );
 

@@ -24,12 +24,15 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use std::{collections::BTreeMap, io::Read};
+use std::{
+    collections::BTreeMap,
+    io::{self, ErrorKind, Read},
+};
 
 use rusqlite::{Connection, OptionalExtension, named_params};
 
 use crate::{
-    client::{PimdirError, bind_list, blobs::PimdirBlobs, write::kind_of},
+    client::{PimdirError, bind_list, blobs::PimdirBlobs, schema, write::kind_of},
     hub::PimdirHub,
     object::PimdirHash,
     placement::PimdirLinkId,
@@ -313,15 +316,21 @@ fn walk(blobs: &PimdirBlobs, hash: &PimdirHash) -> Result<Option<PimdirParts>, P
         let read = match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             // NOTE: read to its end, the body failed its name: no body,
             // never parsed (§7).
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
+            Err(err) if err.kind() == ErrorKind::InvalidData => return Ok(None),
             Err(err) => return Err(err.into()),
         };
         walk.feed(&buffer[..read]);
     }
-    Ok(Some(walk.finish_parts()))
+    // NOTE: the walk stops where it has read enough; the rest is read for
+    // the check at the stream's end, before anything walked is recorded.
+    match io::copy(&mut file, &mut io::sink()) {
+        Ok(_) => Ok(Some(walk.finish_parts())),
+        Err(err) if err.kind() == ErrorKind::InvalidData => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// The account's attachments collection: the file collection holding the
@@ -383,7 +392,7 @@ pub(crate) fn insert_file(
     let shared: Option<i64> = conn
         .query_row(
             sql::SEQ_FOR_LINK_ANY,
-            named_params! { ":link_id": link.as_str() },
+            named_params! { ":collection": collection, ":link_id": link.as_str() },
             |row| row.get(0),
         )
         .optional()?;
@@ -417,6 +426,7 @@ pub(crate) fn upsert_file_summary(
     link: &PimdirLinkId,
     summary: &PimdirFileSummary,
 ) -> rusqlite::Result<()> {
+    schema::record_derivation(conn)?;
     conn.execute(
         sql::UPSERT_FILE_SUMMARY,
         named_params! {

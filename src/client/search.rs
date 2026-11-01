@@ -28,8 +28,9 @@ mod compile;
 mod refresh;
 mod tag;
 
+use core::mem;
+
 use alloc::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
@@ -38,13 +39,14 @@ use alloc::{
 };
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fs4::FileExt;
+use jiff::tz::TimeZone;
 use log::{debug, trace};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params, params_from_iter,
@@ -52,12 +54,11 @@ use rusqlite::{
 
 use crate::{
     client::{
-        PimdirError, bind_list, busy_or_sql, prepare_connection,
+        PimdirError, bind_list, busy_or_sql, checkpoint, lock, modes, prepare_connection,
         reader::PimdirReader,
         rows, schema,
-        schema::StoreShape,
         search::{
-            compile::{Categories, Compiled, Ends},
+            compile::{Categories, Compiled, Ends, Probe},
             refresh::Statements,
         },
     },
@@ -68,11 +69,11 @@ use crate::{
     search::{
         coverage::PimdirSearchCoverage,
         extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
-        fold,
+        fold, occurrence,
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
         refresh::PimdirIndexRefresh,
     },
-    sql::search,
+    sql::{self, search},
 };
 
 /// The file a refresh locks exclusively (SEARCH §3).
@@ -93,14 +94,10 @@ pub struct PimdirIndex {
     /// Opened by [`open_query`](PimdirIndex::open_query): index.db read
     /// only, never refreshed.
     query_only: bool,
-    /// Whether the attached store held every canonical table and column
-    /// when opened, else every statement reading it is read as its
-    /// reconciliation would leave it (STORAGE §6).
-    shape: StoreShape,
 }
 
 /// How far one refresh goes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PimdirIndexRefreshOptions {
     /// The most feed rows one transaction folds, so the store's WAL still
     /// checkpoints between them (SEARCH §4).
@@ -112,6 +109,10 @@ pub struct PimdirIndexRefreshOptions {
     /// The instant the horizon is drawn around (SEARCH §7), Unix seconds;
     /// `None` for the clock's.
     pub now: Option<i64>,
+    /// The IANA zone floating times and dates are read in (SEARCH §7),
+    /// `UTC` by default: one other than the index records re-expands
+    /// every live calendar item.
+    pub floating_zone: String,
 }
 
 impl Default for PimdirIndexRefreshOptions {
@@ -120,6 +121,7 @@ impl Default for PimdirIndexRefreshOptions {
             batch: 256,
             deadline: None,
             now: None,
+            floating_zone: occurrence::FLOATING_ZONE.into(),
         }
     }
 }
@@ -363,9 +365,6 @@ pub struct PimdirSearchItem {
 struct Found {
     account: Option<String>,
     seq: i64,
-    /// What it matched: `body`, `summary`, or `None` when only
-    /// structured terms did.
-    matched: Option<String>,
 }
 
 impl PimdirIndex {
@@ -389,31 +388,22 @@ impl PimdirIndex {
         }
 
         let mut conn = connect(dir, false)?;
-        if !is_current(&conn)? {
+        if held(&conn, dir)? != PimdirIndexHeld::Current {
             let Some(_lock) = lock(dir)? else {
                 return Err(PimdirError::Indexing(dir.to_path_buf()));
             };
             // NOTE: another indexer may have built it between the check
             // and the lock.
-            if !is_current(&conn)? {
-                debug!("building search index at {}", dir.display());
+            if held(&conn, dir)? != PimdirIndexHeld::Current {
                 drop(conn);
-                for name in ["index.db", "index.db-wal", "index.db-shm"] {
-                    match fs::remove_file(dir.join(name)) {
-                        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
-                        _ => (),
-                    }
-                }
-                conn = connect(dir, false)?;
-                init(&mut conn)?;
+                conn = build(dir)?;
             }
         }
+        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
 
-        let shape = StoreShape::read(&conn, "store")?;
         Ok(Self {
             conn,
             reader,
-            shape,
             dir: dir.to_path_buf(),
             query_only: false,
         })
@@ -449,29 +439,25 @@ impl PimdirIndex {
             return Err(PimdirError::IndexMissing(path));
         }
         let conn = connect(dir, true)?;
-        let version: i64 = conn.pragma_query_value(Some("main"), "user_version", |r| r.get(0))?;
-        if version == 0 {
-            return Err(PimdirError::IndexMissing(path));
-        }
-        if !is_current(&conn)? {
-            return Err(PimdirError::IndexOutdated(path));
+        match held(&conn, dir)? {
+            PimdirIndexHeld::Current => (),
+            PimdirIndexHeld::Empty => return Err(PimdirError::IndexMissing(path)),
+            PimdirIndexHeld::Earlier { version, shape } => {
+                return Err(PimdirError::IndexVersion {
+                    path,
+                    version,
+                    shape,
+                });
+            }
+            PimdirIndexHeld::Stale => return Err(PimdirError::IndexOutdated(path)),
         }
 
-        let shape = StoreShape::read(&conn, "store")?;
         Ok(Self {
             conn,
             reader,
-            shape,
             dir: dir.to_path_buf(),
             query_only: true,
         })
-    }
-
-    /// A statement reading the attached store as the store answers it
-    /// (STORAGE §6): a table or column it lacks read as its reconciliation
-    /// would leave it, the statement itself on a store holding them all.
-    fn store_sql<'a>(&self, statement: &'a str) -> Result<Cow<'a, str>, PimdirError> {
-        self.shape.sql(&self.conn, statement)
     }
 
     /// The store's reader this index reads summaries, coverage and bodies
@@ -496,7 +482,7 @@ impl PimdirIndex {
     /// this index and one an owner keeps on its own SQLite fold alike. Each
     /// writes the cursor it reached, so a pass cut short resumes there; the
     /// one exhausting the feed also reconciles keys when the store's purge
-    /// count or a collection stamp moved, meets again the bodies an earlier
+    /// count moved, a rename counting there, meets again the bodies an earlier
     /// pass could not read, and writes the cursor read before it, so a
     /// crash replays and skips nothing. Another indexer holding index.lock
     /// makes this one return at once, [`busy`](PimdirIndexReport::busy). A
@@ -514,6 +500,10 @@ impl PimdirIndex {
         if self.query_only {
             return Err(PimdirError::IndexQueryOnly(self.dir.join("index.db")));
         }
+        let zone = options.floating_zone.as_str();
+        if zone != occurrence::FLOATING_ZONE && TimeZone::get(zone).is_err() {
+            return Err(PimdirError::IndexZone(zone.into()));
+        }
         let mut report = PimdirIndexReport {
             cursor: self.cursor()?,
             ..Default::default()
@@ -525,6 +515,14 @@ impl PimdirIndex {
             report.busy = true;
             return Ok(report);
         };
+        // NOTE: the store may have been restored, or another store put in
+        // its place, since this handle opened the index (SEARCH §4).
+        if held(&self.conn, &self.dir)? != PimdirIndexHeld::Current {
+            let held = mem::replace(&mut self.conn, Connection::open_in_memory()?);
+            drop(held);
+            self.conn = build(&self.dir)?;
+            report.cursor = 0;
+        }
         debug!(
             "refreshing search index from stamp {} to {}",
             report.cursor, report.head
@@ -533,6 +531,7 @@ impl PimdirIndex {
         let batch = options.batch.max(1);
         let blobs = self.reader.blobs();
         let now = options.now.unwrap_or_else(unix_now);
+        let mut first = true;
         loop {
             if options
                 .deadline
@@ -548,10 +547,11 @@ impl PimdirIndex {
                 .map_err(busy_or_sql)?;
             let statements = Statements {
                 tx: &tx,
-                shape: self.shape,
                 blobs: &blobs,
             };
             let mut run = PimdirIndexRefresh::new(now, batch);
+            run.floating_zone.clone_from(&options.floating_zone);
+            run.missing = mem::take(&mut first);
             let mut arg = None;
             let output = loop {
                 match run.resume(arg.take()) {
@@ -582,6 +582,39 @@ impl PimdirIndex {
         Ok(report)
     }
 
+    /// Runs the index's part of an erase (STORAGE §11.5, SEARCH §4), after
+    /// `PimdirStore::erase` purged the item: a refresh folding the whole
+    /// feed in the zone the index records, which deletes the item's
+    /// placement, its bodies and the thread rows it gave, then
+    /// `optimize_text` under index.lock, merging every full-text segment
+    /// so no deleted token stays in one, then a `TRUNCATE` checkpoint of
+    /// index.db until every frame is checkpointed.
+    ///
+    /// Another indexer holding index.lock is [`PimdirError::Indexing`]; a
+    /// handle opened by [`open_query`](Self::open_query) is
+    /// [`PimdirError::IndexQueryOnly`].
+    pub fn erase(&mut self) -> Result<PimdirIndexReport, PimdirError> {
+        let zone: Option<String> = self
+            .conn
+            .query_row(search::LOAD_INDEX_META, [], |row| row.get(11))?;
+        let options = PimdirIndexRefreshOptions {
+            floating_zone: zone.unwrap_or_else(|| occurrence::FLOATING_ZONE.into()),
+            ..Default::default()
+        };
+        let report = self.refresh(&options)?;
+
+        let Some(_lock) = lock(&self.dir)?.filter(|_| !report.busy) else {
+            return Err(PimdirError::Indexing(self.dir.clone()));
+        };
+        debug!("optimize the full-text tables");
+        self.conn
+            .execute_batch(search::OPTIMIZE_TEXT)
+            .map_err(busy_or_sql)?;
+        checkpoint(&self.conn)?;
+
+        Ok(report)
+    }
+
     /// One page of the hits of a query (SEARCH §8.2), with what it could
     /// not see. Answers from the index as it stands: refresh first.
     pub fn search(
@@ -600,7 +633,7 @@ impl PimdirIndex {
 
         let mut hits = Vec::new();
         for hit in found {
-            hits.push(self.hit(hit, &compiled.words)?);
+            hits.push(self.hit(hit, &compiled.probes, &compiled.words)?);
         }
 
         Ok(PimdirSearchOutput {
@@ -630,7 +663,7 @@ impl PimdirIndex {
             let thread: Option<String> = self
                 .conn
                 .query_row(
-                    &self.store_sql(search::HIT_THREAD)?,
+                    search::HIT_THREAD,
                     named_params! { ":seq": hit.seq, ":account": hit.account },
                     |row| row.get(0),
                 )
@@ -655,7 +688,7 @@ impl PimdirIndex {
             let account = found[0].account.clone();
             let (count, first, last) = match &thread {
                 Some(thread) => self.conn.query_row(
-                    &self.store_sql(search::THREAD_SPAN)?,
+                    search::THREAD_SPAN,
                     named_params! { ":thread": thread, ":account": account },
                     |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
                 )?,
@@ -663,7 +696,7 @@ impl PimdirIndex {
             };
             let mut hits = Vec::new();
             for hit in found {
-                hits.push(self.hit(hit, &compiled.words)?);
+                hits.push(self.hit(hit, &compiled.probes, &compiled.words)?);
             }
             threads.push(PimdirSearchThread {
                 account,
@@ -719,7 +752,6 @@ impl PimdirIndex {
             let found = Found {
                 account: account.clone(),
                 seq,
-                matched: None,
             };
             return Ok(Some(PimdirSearchThread {
                 account,
@@ -727,13 +759,13 @@ impl PimdirIndex {
                 count: 1,
                 first: None,
                 last: None,
-                hits: vec![self.hit(found, &[])?],
+                hits: vec![self.hit(found, &[], &[])?],
             }));
         };
 
         let members: BTreeSet<i64> = rows(
             &self.conn,
-            &self.store_sql(search::THREAD_MEMBERS)?,
+            search::THREAD_MEMBERS,
             named_params! { ":thread": thread, ":account": account },
             |row| row.get::<_, i64>(1),
         )?
@@ -744,9 +776,8 @@ impl PimdirIndex {
             let found = Found {
                 account: account.clone(),
                 seq,
-                matched: None,
             };
-            let hit = self.hit(found, &[])?;
+            let hit = self.hit(found, &[], &[])?;
             // NOTE: a member whose placements went since the last refresh
             // is not live any more.
             if !hit.placements.is_empty() {
@@ -755,7 +786,7 @@ impl PimdirIndex {
         }
         hits.sort_by(|a, b| (&a.sort_key, a.seq).cmp(&(&b.sort_key, b.seq)));
         let (count, first, last) = self.conn.query_row(
-            &self.store_sql(search::THREAD_SPAN)?,
+            search::THREAD_SPAN,
             named_params! { ":thread": thread, ":account": account },
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
         )?;
@@ -809,7 +840,7 @@ impl PimdirIndex {
         let count: i64 = self
             .conn
             .query_row(
-                &self.store_sql(&compiled.count())?,
+                &compiled.count(),
                 params_from_iter(compiled.params.iter()),
                 |row| row.get(0),
             )
@@ -850,25 +881,11 @@ impl PimdirIndex {
         let (source, extract) = match blob {
             Some(blob) => (
                 PimdirSearchMatched::Body,
-                extract(
-                    &self.conn,
-                    self.shape,
-                    &first.collection,
-                    seq,
-                    &media_type,
-                    Some(&blob),
-                )?,
+                extract(&self.conn, &first.collection, seq, &media_type, Some(&blob))?,
             ),
             None => (
                 PimdirSearchMatched::Summary,
-                extract(
-                    &self.conn,
-                    self.shape,
-                    &first.collection,
-                    seq,
-                    &media_type,
-                    None,
-                )?,
+                extract(&self.conn, &first.collection, seq, &media_type, None)?,
             ),
         };
 
@@ -893,7 +910,6 @@ impl PimdirIndex {
         page: Option<(usize, usize)>,
     ) -> Result<Vec<Found>, PimdirError> {
         let sql = compiled.select(sort, page.filter(|_| sort != PimdirSearchSort::Name));
-        let sql = self.store_sql(&sql)?;
         trace!("search statement: {sql}");
 
         let mut found = rows(
@@ -904,8 +920,7 @@ impl PimdirIndex {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
@@ -913,7 +928,7 @@ impl PimdirIndex {
         if sort == PimdirSearchSort::Name {
             // NOTE: the title folded as STORAGE Annex A.2 folds `fn`,
             // ties to the seq then the account, as the SQL order gave.
-            found.sort_by_cached_key(|(_, _, _, title)| fold::value(title));
+            found.sort_by_cached_key(|(_, _, title)| fold::value(title));
             if let Some((limit, offset)) = page {
                 found = found.into_iter().skip(offset).take(limit).collect();
             }
@@ -921,23 +936,21 @@ impl PimdirIndex {
 
         Ok(found
             .into_iter()
-            .map(|(account, seq, matched, _)| Found {
-                account,
-                seq,
-                matched,
-            })
+            .map(|(account, seq, _)| Found { account, seq })
             .collect())
     }
 
     /// One hit, `(account, seq)`, as an answer carries it: its kind, title
-    /// and placements, what it matched and a snippet naming `words`.
-    fn hit(&self, found: Found, words: &[String]) -> Result<PimdirSearchHit, PimdirError> {
-        let Found {
-            account,
-            seq,
-            matched,
-        } = found;
+    /// and placements, what `probes` matched and a snippet naming `words`.
+    fn hit(
+        &self,
+        found: Found,
+        probes: &[Probe],
+        words: &[String],
+    ) -> Result<PimdirSearchHit, PimdirError> {
+        let Found { account, seq } = found;
         let (kind, title, placements) = self.placements(account.as_deref(), seq)?;
+        let matched = self.matched(seq, &placements, probes)?;
         let snippet = self.snippet(&kind, &placements, words)?;
 
         Ok(PimdirSearchHit {
@@ -951,22 +964,76 @@ impl PimdirIndex {
                 .max()
                 .unwrap_or_default(),
             placements,
-            matched: match matched.as_deref() {
-                Some("body") => Some(PimdirSearchMatched::Body),
-                Some("summary") => Some(PimdirSearchMatched::Summary),
-                _ => None,
-            },
+            matched,
             snippet,
         })
     }
 
+    /// What a hit's text terms matched (SEARCH §8.2): a body one of its
+    /// placements holds, probed by `match_object`, else the summary of one
+    /// indexed bodiless, by `match_summary`; `None` when only structured
+    /// terms did. A page's hits alone are probed, never every hit.
+    fn matched(
+        &self,
+        seq: i64,
+        placements: &[PimdirSearchPlacement],
+        probes: &[Probe],
+    ) -> Result<Option<PimdirSearchMatched>, PimdirError> {
+        let mut matched = None;
+        for probe in probes {
+            for placement in placements {
+                if let Some(hash) = &placement.object {
+                    let body = self
+                        .conn
+                        .query_row(
+                            search::MATCH_OBJECT,
+                            named_params! { ":match": probe.expression, ":hash": hash.0 },
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(unanswerable)?;
+                    if body.is_some() {
+                        return Ok(Some(PimdirSearchMatched::Body));
+                    }
+                }
+                if probe.summary && matched.is_none() {
+                    let summary = self
+                        .conn
+                        .query_row(
+                            search::MATCH_SUMMARY,
+                            named_params! {
+                                ":match": probe.expression,
+                                ":collection": placement.collection,
+                                ":seq": seq,
+                            },
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(unanswerable)?;
+                    if summary.is_some() {
+                        matched = Some(PimdirSearchMatched::Summary);
+                    }
+                }
+            }
+        }
+        Ok(matched)
+    }
+
     /// A query compiled with its `linked:` ends and its `category:` values
-    /// resolved; what it reads of the store is read as the store answers it
-    /// when it runs ([`store_sql`](Self::store_sql)).
+    /// resolved, its text terms' matches read into `temp.term_match`.
     fn compile(&self, query: &PimdirQuery, now: i64) -> Result<Compiled, PimdirError> {
         let ends = self.ends(query)?;
         let categories = self.categories(query)?;
-        Ok(Compiled::new(query, ends, categories, now))
+        let compiled = Compiled::new(query, ends, categories, now);
+
+        self.conn.execute(search::CLEAR_TERM_MATCH, [])?;
+        for matches in &compiled.matches {
+            trace!("text term statement: {}", matches.sql);
+            self.conn
+                .execute(&matches.sql, params_from_iter(matches.params.iter()))
+                .map_err(unanswerable)?;
+        }
+        Ok(compiled)
     }
 
     /// The task categories each `category:` term of a query names (SEARCH
@@ -984,12 +1051,10 @@ impl PimdirIndex {
             let stored = match &mut stored {
                 Some(stored) => stored,
                 None => {
-                    let values: Vec<String> = rows(
-                        &self.conn,
-                        &self.store_sql(search::TASK_CATEGORY_VALUES)?,
-                        [],
-                        |row| row.get(0),
-                    )?;
+                    let values: Vec<String> =
+                        rows(&self.conn, search::TASK_CATEGORY_VALUES, [], |row| {
+                            row.get(0)
+                        })?;
                     let folded = values
                         .into_iter()
                         .map(|value| (fold::value(&value), value))
@@ -1018,7 +1083,7 @@ impl PimdirIndex {
             };
             let named = rows(
                 &self.conn,
-                &self.store_sql(search::LOAD_ENDS)?,
+                search::LOAD_ENDS,
                 named_params! { ":seq": id.seq(), ":link_id": id.as_str() },
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -1036,7 +1101,7 @@ impl PimdirIndex {
         let mut described = (String::new(), String::new());
         let placements = rows(
             &self.conn,
-            &self.store_sql(search::LOAD_HIT_PLACEMENTS)?,
+            search::LOAD_HIT_PLACEMENTS,
             named_params! { ":seq": seq, ":account": account },
             |row| {
                 let kind: Option<String> = row.get(7)?;
@@ -1131,8 +1196,10 @@ impl PimdirIndex {
 
     /// What an answer to a query could not see: the coverage of the
     /// collections its top-level conjunction narrows to, over the date
-    /// range it narrows to, and the live items there the index has not
-    /// folded in yet.
+    /// range it narrows to: the live items there holding no body
+    /// (`coverage`) and those the index has not folded in yet, and for a
+    /// query bounded by date the calendar items cut before its end
+    /// (`cut_before`, SEARCH §8.2).
     fn coverage(&self, query: &PimdirQuery, now: i64) -> Result<PimdirSearchCoverage, PimdirError> {
         let conjuncts = match query {
             PimdirQuery::And(operands) => operands.iter().collect(),
@@ -1170,20 +1237,27 @@ impl PimdirIndex {
         }
 
         let ids: Vec<&str> = collections.iter().map(|c| c.id.as_str()).collect();
-        let mut coverage = self
-            .reader
-            .search_coverage(&ids, since.as_deref(), until.as_deref())?;
+        let mut coverage = PimdirSearchCoverage {
+            temporal: self
+                .reader
+                .search_temporal(&ids, since.as_deref(), until.as_deref())?,
+            ..Default::default()
+        };
 
         bind_list(&self.conn, "collections", &ids)?;
+        let bodiless = rows(&self.conn, search::COVERAGE, [], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for (kind, count) in bodiless {
+            coverage.local.bodiless.insert(kind, count as u64);
+        }
         let unindexed: i64 = self.conn.query_row(
-            &self.store_sql(search::COUNT_UNINDEXED)?,
+            search::COUNT_UNINDEXED,
             named_params! { ":since": self.cursor()? },
             |r| r.get(0),
         )?;
         coverage.local.unindexed = unindexed as u64;
-        let behind: i64 = self
-            .conn
-            .query_row(&self.store_sql(search::BEHIND)?, [], |r| r.get(0))?;
+        let behind: i64 = self.conn.query_row(search::BEHIND, [], |r| r.get(0))?;
         coverage.local.behind = behind.max(0) as u64;
 
         // NOTE: a range leaves the horizon when it starts before it or ends
@@ -1194,6 +1268,14 @@ impl PimdirIndex {
             .into_iter()
             .any(|(term, _)| matches!(term.predicate, PimdirQueryPredicate::Date(_)));
         let calendar = collections.iter().any(|c| c.kind == "text/calendar");
+        if dated && calendar {
+            let cut: i64 =
+                self.conn
+                    .query_row(search::CUT_BEFORE, named_params! { ":end": until }, |r| {
+                        r.get(0)
+                    })?;
+            coverage.cut = cut as u64;
+        }
         let (start, end): (String, String) =
             self.conn
                 .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(4)?, r.get(5)?)))?;
@@ -1211,19 +1293,23 @@ impl PimdirIndex {
 
 /// Opens index.db as the main database, the store attached read-only as
 /// `store` through a URI (SEARCH §3): read-write and created when absent
-/// for the indexer, read-only for a query client, which writes nothing,
-/// the journal mode included.
+/// for the indexer, read-only for a query client. Neither writes: the
+/// indexer sets the journal mode once it found the index its own or built
+/// it ([`held`]), so an index it refuses stays as it is. The indexer
+/// creates an absent index.db `0600` first, its `-wal` and `-shm` taking
+/// that mode (STORAGE §18).
 fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     let access = match query_only {
         true => OpenFlags::SQLITE_OPEN_READ_ONLY,
-        false => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        false => {
+            modes::create_database(&dir.join("index.db"))?;
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+        }
     };
     let flags = access | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(dir.join("index.db"), flags)?;
     prepare_connection(&conn)?;
-    if !query_only {
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
-    }
+    conn.execute_batch(search::CREATE_TERM_MATCH)?;
 
     let store = dir.join("pimdir.db").canonicalize()?;
     conn.execute(
@@ -1233,30 +1319,107 @@ fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     Ok(conn)
 }
 
-/// Whether index.db holds this build's schema under this build's
-/// tokenizer (SEARCH §2): its version, its `index_meta`, and its shape,
+/// What an index.db holds, read before an indexer folds into it or a
+/// query client answers from it (SEARCH §2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PimdirIndexHeld {
+    /// No schema at all: the indexer builds it.
+    Empty,
+    /// The canonical shape at an earlier version, or an `index_meta`
+    /// naming no version: the indexer rebuilds it.
+    Earlier {
+        /// Its `format_version`, `None` without one.
+        version: Option<String>,
+        /// Its `shape`, `None` without one.
+        shape: Option<String>,
+    },
+    /// This crate's shape and version built under another schema version,
+    /// tokenizer or schema text, from another store or another copy of it,
+    /// or holding a cursor above the store's last stamp: the indexer
+    /// rebuilds it.
+    Stale,
+    /// What this crate builds, from this store.
+    Current,
+}
+
+/// What index.db holds (SEARCH §2): refused as [`PimdirError::IndexVersion`]
+/// when it holds a schema and no `index_meta`, another shape, or a later or
+/// unknown version, which an indexer never rebuilds, writes nor deletes;
+/// else its version, then its schema version, tokenizer and schema text,
 /// every table, index and trigger the schema creates compared by its
-/// `sqlite_schema` text, comments removed and whitespace collapsed. The
-/// shadow tables FTS5 creates, and any other table, are not compared.
-fn is_current(conn: &Connection) -> Result<bool, PimdirError> {
-    let version: i64 = conn.pragma_query_value(Some("main"), "user_version", |r| r.get(0))?;
-    if version != search::VERSION {
-        return Ok(false);
+/// `sqlite_schema` text, comments removed and whitespace collapsed (the
+/// shadow tables FTS5 creates, and any other table, left out), then the
+/// store it was built from and the cursor it folded, against the store's
+/// own (STORAGE §4.5).
+fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
+    let objects: i64 =
+        conn.query_row("SELECT count(*) FROM main.sqlite_schema", [], |r| r.get(0))?;
+    if objects == 0 {
+        return Ok(PimdirIndexHeld::Empty);
     }
 
-    let meta: Option<(i64, String)> = conn
-        .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()
-        // NOTE: an index_meta of another shape fails the canonical read,
-        // which is an index to rebuild rather than an error.
-        .or_else(|err| match err {
-            rusqlite::Error::SqliteFailure(..) => Ok(None),
-            err => Err(err),
+    let columns: Vec<String> = rows(
+        conn,
+        "SELECT name FROM pragma_table_info('index_meta', 'main')",
+        [],
+        |r| r.get(0),
+    )?;
+    let column = |name: &'static str| match columns.iter().any(|column| column == name) {
+        true => name,
+        false => "NULL",
+    };
+    let named: Option<(Option<String>, Option<String>)> = match columns.is_empty() {
+        true => None,
+        false => conn
+            .query_row(
+                &format!(
+                    "SELECT {}, {} FROM main.index_meta WHERE id = 1",
+                    column("format_version"),
+                    column("shape")
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?,
+    };
+    let refused = |version: Option<String>, shape: Option<String>| PimdirError::IndexVersion {
+        path: dir.join("index.db"),
+        version,
+        shape,
+    };
+    let Some((version, named)) = named else {
+        return Err(refused(None, None));
+    };
+    let Some(found) = version.clone() else {
+        return Ok(PimdirIndexHeld::Earlier {
+            version,
+            shape: named,
+        });
+    };
+    if named.as_deref() != Some(search::SHAPE) {
+        return Err(refused(version, named));
+    }
+    match draft(&found) {
+        Some(number) if number < search::FORMAT_DRAFT => {
+            return Ok(PimdirIndexHeld::Earlier {
+                version,
+                shape: named,
+            });
+        }
+        Some(number) if number == search::FORMAT_DRAFT => (),
+        _ => return Err(refused(version, named)),
+    }
+
+    let version: i64 = conn.pragma_query_value(Some("main"), "user_version", |r| r.get(0))?;
+    if version != search::VERSION {
+        return Ok(PimdirIndexHeld::Stale);
+    }
+    let (version, tokenizer, change, id, incarnation): (i64, String, i64, String, i64) = conn
+        .query_row(search::LOAD_INDEX_META, [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(7)?, r.get(8)?))
         })?;
-    if !meta.is_some_and(|(version, tokenizer)| {
-        version == search::VERSION && tokenizer == search::TOKENIZER
-    }) {
-        return Ok(false);
+    if version != search::VERSION || tokenizer != search::TOKENIZER {
+        return Ok(PimdirIndexHeld::Stale);
     }
 
     let canonical = Connection::open_in_memory()?;
@@ -1264,10 +1427,51 @@ fn is_current(conn: &Connection) -> Result<bool, PimdirError> {
         canonical.execute_batch(migration)?;
     }
     let wanted = shape(&canonical, "main")?;
-    let held: BTreeMap<String, String> = shape(conn, "main")?.into_iter().collect();
-    Ok(wanted
+    let declared: BTreeMap<String, String> = shape(conn, "main")?.into_iter().collect();
+    let same = wanted
         .into_iter()
-        .all(|(name, sql)| held.get(&name).is_some_and(|held| *held == sql)))
+        .all(|(name, sql)| declared.get(&name).is_some_and(|held| *held == sql));
+    if !same {
+        return Ok(PimdirIndexHeld::Stale);
+    }
+
+    let (head, store_id, store_incarnation): (i64, String, i64) =
+        conn.query_row(sql::LOAD_CHANGE_CURSOR, [], |r| {
+            Ok((r.get(0)?, r.get(2)?, r.get(3)?))
+        })?;
+    if id != store_id || incarnation != store_incarnation || change > head {
+        debug!("search index was built from another store or copy of it");
+        return Ok(PimdirIndexHeld::Stale);
+    }
+
+    Ok(PimdirIndexHeld::Current)
+}
+
+/// The number of a draft version of SEARCH.md, `search-draft-N`, versions
+/// being ordered by it below every release (SEARCH §2); `None` for a
+/// release or a name of no known form, which no draft implements.
+fn draft(version: &str) -> Option<u32> {
+    let number = version.strip_prefix("search-draft-")?;
+    match number.bytes().all(|b| b.is_ascii_digit()) {
+        true => number.parse().ok(),
+        false => None,
+    }
+}
+
+/// Builds index.db afresh: the files of the one there removed, the schema
+/// applied and `index_meta` written (SEARCH §2).
+fn build(dir: &Path) -> Result<Connection, PimdirError> {
+    debug!("building search index at {}", dir.display());
+    for name in ["index.db", "index.db-wal", "index.db-shm"] {
+        match fs::remove_file(dir.join(name)) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+            _ => (),
+        }
+    }
+    let mut conn = connect(dir, false)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    init(&mut conn)?;
+    Ok(conn)
 }
 
 /// The tables, indexes and triggers database `schema` declares, by name,
@@ -1323,13 +1527,10 @@ fn init(conn: &mut Connection) -> Result<(), PimdirError> {
     Ok(())
 }
 
-/// Takes index.lock exclusively, `None` when another indexer holds it.
+/// Takes index.lock exclusively, `None` when another indexer holds it,
+/// opened `0600` without following a link (STORAGE §18).
 fn lock(dir: &Path) -> Result<Option<File>, PimdirError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(LOCK))?;
+    let file = lock::open(&dir.join(LOCK))?;
     // NOTE: named through the trait, as the owner lock does: std's own
     // inherent method from 1.89 would shadow it.
     match FileExt::try_lock(&file) {
@@ -1366,7 +1567,6 @@ fn uri_path(path: &Path) -> String {
 /// addresses.
 fn extract(
     conn: &Connection,
-    shape: StoreShape,
     collection: &str,
     seq: i64,
     kind: &str,
@@ -1379,7 +1579,7 @@ fn extract(
         return Ok(parsed.unwrap_or_default());
     }
 
-    let found = refresh::summary(conn, shape, collection, seq, kind)?;
+    let found = refresh::summary(conn, collection, seq, kind)?;
     let mut extract = PimdirExtract::summary(found.summary.as_ref(), &found.addresses);
     if parsed.is_some() {
         extract.status = PimdirExtractStatus::Unparseable;

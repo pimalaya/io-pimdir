@@ -254,7 +254,17 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
 
     for _ in 0..3 {
         for collection in COLLECTIONS {
-            client.sync(collection, opts.clone()).unwrap();
+            // NOTE: a round listing nothing parks until the caller confirms
+            // the absences (SYNC §5); the model, which is the server,
+            // confirms them.
+            let report = client.sync(collection, opts.clone()).unwrap();
+            if report.parked.is_some() {
+                let confirmed = PimdirSyncOptions {
+                    accept_absences: true,
+                    ..opts.clone()
+                };
+                client.sync(collection, confirmed).unwrap();
+            }
             let handles = every(&client, collection);
             let _ = client.upgrade(collection, handles, PimdirTier::Full);
         }

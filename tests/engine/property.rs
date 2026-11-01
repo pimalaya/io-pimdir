@@ -1320,7 +1320,17 @@ proptest! {
         }
 
         for _ in 0..3 {
-            a.sync("inbox", full_opts.clone()).unwrap();
+            // NOTE: a round listing nothing parks until the caller confirms
+            // the absences (SYNC §5); the model, which is the server,
+            // confirms them.
+            let report = a.sync("inbox", full_opts.clone()).unwrap();
+            if report.parked.is_some() {
+                let confirmed = PimdirSyncOptions {
+                    accept_absences: true,
+                    ..full_opts.clone()
+                };
+                a.sync("inbox", confirmed).unwrap();
+            }
             hydrate(&mut a, "inbox");
             b.sync("inbox", delta_opts.clone()).unwrap();
             hydrate(&mut b, "inbox");

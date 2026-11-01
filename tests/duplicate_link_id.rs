@@ -12,7 +12,7 @@
 use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
     collection::PimdirCollectionId,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -77,7 +77,7 @@ fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
 
 fn projected(store: &PimdirSourceStore) -> Vec<PimdirPlacement> {
     let mut placements = store
-        .load(&inbox(), &PimdirLoadScope::All)
+        .load(&inbox(), &PimdirLoadSelection::All)
         .unwrap()
         .placements;
     placements.sort_by(|a, b| a.link_id.cmp(&b.link_id));
@@ -142,10 +142,24 @@ fn two_resources_under_one_hint_are_two_items() {
 
     store
         .write(vec![
-            store_object("cafebabe", b"first"),
-            store_object("deadbeef", b"second"),
-            PimdirWriteOp::UpsertPlacement(hydrated("u1", "msg-a", "cafebabe")),
-            PimdirWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "deadbeef")),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"first",
+            ),
+            store_object(
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead",
+                b"second",
+            ),
+            PimdirWriteOp::UpsertPlacement(hydrated(
+                "u1",
+                "msg-a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            )),
+            PimdirWriteOp::UpsertPlacement(hydrated(
+                "u2",
+                "dup:msg-a#u2",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead",
+            )),
         ])
         .unwrap();
 
@@ -156,9 +170,19 @@ fn two_resources_under_one_hint_are_two_items() {
         Some(PimdirLinkId("dup:msg-a#u2".into()))
     );
     assert_eq!(placements[0].handle, PimdirHandle("u2".into()));
-    assert_eq!(placements[0].object, Some(PimdirHash("deadbeef".into())));
+    assert_eq!(
+        placements[0].object,
+        Some(PimdirHash(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead".into()
+        ))
+    );
     assert_eq!(placements[1].link_id, Some(PimdirLinkId("msg-a".into())));
-    assert_eq!(placements[1].object, Some(PimdirHash("cafebabe".into())));
+    assert_eq!(
+        placements[1].object,
+        Some(PimdirHash(
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()
+        ))
+    );
 
     let read = PimdirReader::open(dir.path()).unwrap();
     let bare = read.seq_for_link("INBOX", "msg-a").unwrap().unwrap();
@@ -183,16 +207,29 @@ fn a_byte_identical_pair_shares_one_object() {
 
     store
         .write(vec![
-            store_object("cafebabe", b"same"),
-            PimdirWriteOp::UpsertPlacement(hydrated("u1", "msg-a", "cafebabe")),
-            PimdirWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "cafebabe")),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"same",
+            ),
+            PimdirWriteOp::UpsertPlacement(hydrated(
+                "u1",
+                "msg-a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            )),
+            PimdirWriteOp::UpsertPlacement(hydrated(
+                "u2",
+                "dup:msg-a#u2",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            )),
         ])
         .unwrap();
 
     let read = PimdirReader::open(dir.path()).unwrap();
     assert_eq!(read.object_stats().unwrap().count, 1);
     assert_eq!(
-        read.object_placements("cafebabe").unwrap().len(),
+        read.object_placements("cafebabecafebabecafebabecafebabecafebabecafebabecafe")
+            .unwrap()
+            .len(),
         2,
         "one body, two placements: the report the store owes (spec §14.1)",
     );
@@ -210,8 +247,15 @@ fn a_minted_key_round_trips_through_retention_and_revival() {
 
     store
         .write(vec![
-            store_object("cafebabe", b"body"),
-            PimdirWriteOp::UpsertPlacement(hydrated("u2", "dup:msg-a#u2", "cafebabe")),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"body",
+            ),
+            PimdirWriteOp::UpsertPlacement(hydrated(
+                "u2",
+                "dup:msg-a#u2",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            )),
         ])
         .unwrap();
 
@@ -239,7 +283,7 @@ fn a_minted_key_round_trips_through_retention_and_revival() {
         .write(vec![PimdirWriteOp::UpsertPlacement(hydrated(
             "u2",
             "dup:msg-a#u2",
-            "cafebabe",
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
         ))])
         .unwrap();
     let revived = store.list_items("INBOX", None, 10).unwrap();

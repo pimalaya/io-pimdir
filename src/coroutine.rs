@@ -19,7 +19,7 @@ use alloc::{
 use crate::{
     change::{PimdirChange, PimdirWriteOp},
     collection::PimdirCollectionId,
-    load::{PimdirLoadScope, PimdirLoaded},
+    load::{PimdirLoadSelection, PimdirLoaded},
     object::{PimdirHash, PimdirObject},
     placement::{PimdirHandle, PimdirLinkId},
     remote::{PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirTier},
@@ -134,7 +134,7 @@ pub enum PimdirYield {
         /// The collection to read.
         collection: PimdirCollectionId,
         /// Which of its placements are needed.
-        scope: PimdirLoadScope,
+        selection: PimdirLoadSelection,
     },
     /// Resolve stored objects by link id, see [`PimdirArg::LookupObject`].
     ///
@@ -149,7 +149,8 @@ pub enum PimdirYield {
     /// answered by [`PimdirArg::Verified`].
     ///
     /// A sync asks it for every body a push chunk uploads, so a body that
-    /// fails is never pushed (SYNC §5).
+    /// fails is never pushed (SYNC §5), and a `Full` upgrade for the bodies
+    /// its placements hold, so one that fails is fetched again (SYNC §6).
     WantsVerify(Vec<PimdirHash>),
 }
 

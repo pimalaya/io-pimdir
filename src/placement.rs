@@ -218,10 +218,7 @@ impl<S: ToString> FromIterator<S> for PimdirFlags {
 
 /// The detail level of a placement, a ladder each rung including the last.
 ///
-/// Every member a listing names is at `Meta` at least (SYNC §4). A level
-/// of `0` an earlier draft wrote for a probed or pulled row reads as
-/// `Meta`, a claim the row may not hold, which the next upgrade revisits
-/// (SYNC §3, §6).
+/// Every member a listing names is at `Meta` at least (SYNC §4).
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PimdirLevel {
     /// Identity and summary cached.

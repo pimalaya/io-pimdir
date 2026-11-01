@@ -20,7 +20,7 @@ use io_pimdir::{
     change::PimdirWriteOp,
     collection::PimdirCollectionId,
     hub::PimdirSourceId,
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -112,7 +112,12 @@ fn the_agreement_point_survives_a_reopen() {
     let mut store = seed(dir.path());
 
     store
-        .write(batch("bod0", "bod1", PimdirStatus::Dirty, None))
+        .write(batch(
+            "bodabodabodabodabodabodabodabodabodabodabodabodaboda",
+            "bodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodb",
+            PimdirStatus::Dirty,
+            None,
+        ))
         .unwrap();
     drop(store);
 
@@ -123,13 +128,17 @@ fn the_agreement_point_survives_a_reopen() {
     assert!(!binding.conflicted, "an ordinary binding, nothing special");
     assert_eq!(
         binding.base.as_ref().and_then(|base| base.object.clone()),
-        Some(PimdirHash("bod0".into())),
+        Some(PimdirHash(
+            "bodabodabodabodabodabodabodabodabodabodabodabodaboda".into()
+        )),
         "the sync base is what the source last agreed with its own remote, and \
          the pending push is derived from it staying behind",
     );
     assert_eq!(
         binding.shared_object,
-        Some(PimdirHash("bod1".into())),
+        Some(PimdirHash(
+            "bodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodb".into()
+        )),
         "and the agreement point is the shared body the reconcile settled on",
     );
 }
@@ -144,8 +153,8 @@ fn a_conflicted_binding_carries_one_too() {
 
     store
         .write(batch(
-            "bod0",
-            "bod1",
+            "bodabodabodabodabodabodabodabodabodabodabodabodaboda",
+            "bodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodb",
             PimdirStatus::Conflict,
             Some("r-remote"),
         ))
@@ -160,7 +169,9 @@ fn a_conflicted_binding_carries_one_too() {
     assert_eq!(binding.conflict_revision.as_deref(), Some("r-remote"));
     assert_eq!(
         binding.shared_object,
-        Some(PimdirHash("bod1".into())),
+        Some(PimdirHash(
+            "bodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodb".into()
+        )),
         "the agreement point is not an exception and is not gated on the flag",
     );
 }
@@ -173,7 +184,12 @@ fn a_second_offline_edit_across_a_restart_is_not_a_conflict() {
     let mut store = seed(dir.path());
 
     store
-        .write(batch("bod0", "bod1", PimdirStatus::Dirty, None))
+        .write(batch(
+            "bodabodabodabodabodabodabodabodabodabodabodabodaboda",
+            "bodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodbbodb",
+            PimdirStatus::Dirty,
+            None,
+        ))
         .unwrap();
     drop(store);
 
@@ -181,13 +197,20 @@ fn a_second_offline_edit_across_a_restart_is_not_a_conflict() {
     // first edit left it.
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("carddav");
     store
-        .write(batch("bod0", "bod2", PimdirStatus::Dirty, None))
+        .write(batch(
+            "bodabodabodabodabodabodabodabodabodabodabodabodaboda",
+            "bodcbodcbodcbodcbodcbodcbodcbodcbodcbodcbodcbodcbodc",
+            PimdirStatus::Dirty,
+            None,
+        ))
         .unwrap();
 
-    let loaded = store.load(&contacts(), &PimdirLoadScope::All).unwrap();
+    let loaded = store.load(&contacts(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(
         loaded.placements[0].object,
-        Some(PimdirHash("bod2".into())),
+        Some(PimdirHash(
+            "bodcbodcbodcbodcbodcbodcbodcbodcbodcbodcbodcbodcbodc".into()
+        )),
         "the second edit is the item's body: measured from the sync base it \
          would read as another source having moved the shared one, and be \
          kept as the diverging body of a conflict nobody can resolve",

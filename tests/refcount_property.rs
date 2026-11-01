@@ -588,13 +588,15 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 // enqueue took exactly where it was.
                 (6, _) => Some(PimdirAction::Unknown {
                     kind: "submit".into(),
-                    payload: r#"{"v":1}"#.into(),
+                    payload: r#"{"v":1,"source":"smtp","from":"a@b","rcpts":["c@d"]}"#.into(),
                     object_hash: hash.clone(),
                 }),
-                _ => Some(PimdirAction::Add {
+                // NOTE: an add names its body (§15.3), so none is
+                // queued without one.
+                _ => hash.clone().map(|object| PimdirAction::Add {
                     link_id: Some(PimdirLinkId(LINKS[link].into())),
                     flags: PimdirFlags::default(),
-                    object: hash.clone(),
+                    object: Some(object),
                     supersedes: None,
                 }),
             };
@@ -774,10 +776,7 @@ fn retained_rows(dir: &Path) -> usize {
 }
 
 fn blob_path(dir: &Path, hash: &str) -> PathBuf {
-    dir.join("objects")
-        .join(&hash[0..2])
-        .join(&hash[2..4])
-        .join(hash)
+    dir.join("objects").join(&hash[0..2]).join(hash)
 }
 
 /// Every body the blob tree holds, by name.

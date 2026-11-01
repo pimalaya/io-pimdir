@@ -61,8 +61,13 @@ fn seed(dir: &std::path::Path) {
         .for_source("server");
     work.ensure_collection("work/INBOX", "message/rfc822")
         .unwrap();
-    work.write(batch("work/INBOX", "1", "<news@x>", "beef"))
-        .unwrap();
+    work.write(batch(
+        "work/INBOX",
+        "1",
+        "<news@x>",
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+    ))
+    .unwrap();
     drop(work);
 
     let mut home = PimdirStore::open(dir)
@@ -71,8 +76,13 @@ fn seed(dir: &std::path::Path) {
         .for_source("server");
     home.ensure_collection("home/INBOX", "message/rfc822")
         .unwrap();
-    home.write(batch("home/INBOX", "9", "<news@x>", "beef"))
-        .unwrap();
+    home.write(batch(
+        "home/INBOX",
+        "9",
+        "<news@x>",
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+    ))
+    .unwrap();
 }
 
 #[test]
@@ -97,7 +107,14 @@ fn an_ungrouped_store_is_the_null_bucket() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("server");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
-    store.write(batch("INBOX", "1", "<a@x>", "beef")).unwrap();
+    store
+        .write(batch(
+            "INBOX",
+            "1",
+            "<a@x>",
+            "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+        ))
+        .unwrap();
 
     // the point of matching with `IS`: a NULL account matches itself,
     // where `=` would match nothing
@@ -146,7 +163,9 @@ fn multiplicity_is_reported_on_both_axes() {
 
     // the dedup axis: the same two found by body, which is what pairs
     // placements two servers gave different link ids
-    let by_object = store.object_placements("beef").unwrap();
+    let by_object = store
+        .object_placements("beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef")
+        .unwrap();
     let seen: Vec<_> = by_object
         .iter()
         .map(|p| (p.account.as_deref(), p.collection.as_str()))
@@ -232,8 +251,15 @@ fn a_body_lookup_never_crosses_an_account() {
         .for_account("work")
         .for_source("server");
     work.ensure_collection("work/AB", "text/vcard").unwrap();
-    work.write(batch("work/AB", "1", "uid-collide", "aaaabbbb"))
-        .unwrap();
+    work.write(batch(
+        "work/AB",
+        "1",
+        "uid-collide",
+        // NOTE: the name of the bytes the batch writes, which a lookup
+        // reads and checks before answering it (STORAGE §7).
+        &io_pimdir::hash::hash(b"body").0,
+    ))
+    .unwrap();
 
     // home holds the same identity, with a different body and none cached
     let home = PimdirStore::open(dir.path())
@@ -272,7 +298,12 @@ fn a_body_lookup_still_dedups_across_collections() {
         .ensure_collection("work/Archive", "message/rfc822")
         .unwrap();
     store
-        .write(batch("work/INBOX", "1", "<msg@x>", "beef"))
+        .write(batch(
+            "work/INBOX",
+            "1",
+            "<msg@x>",
+            &io_pimdir::hash::hash(b"body").0,
+        ))
         .unwrap();
 
     let found = store

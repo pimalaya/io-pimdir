@@ -25,7 +25,7 @@ use io_pimdir::{
         calendar::{PimdirEventSummary, PimdirTaskSummary},
         contact::PimdirContactSummary,
         file::{self, PimdirFileSummary},
-        mail::{self, PimdirMailSummary},
+        mail::PimdirMailSummary,
     },
 };
 
@@ -99,7 +99,7 @@ fn seeded(dir: &Path) -> PimdirSourceStore {
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: PimdirObject {
-                    hash: PimdirHash("cafebabe".into()),
+                    hash: PimdirHash("cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()),
                     size: 4,
                 },
                 body: Some(b"body".to_vec()),
@@ -109,7 +109,7 @@ fn seeded(dir: &Path) -> PimdirSourceStore {
                 "Archive",
                 "1",
                 "m",
-                Some("cafebabe"),
+                Some("cafebabecafebabecafebabecafebabecafebabecafebabecafe"),
                 mail_summary("Plan", 10),
             ),
             placement("INBOX", "2", "n", None, mail_summary("Lunch", 5)),
@@ -269,54 +269,5 @@ fn a_derived_key_takes_no_reference() {
             )
             .unwrap(),
         None
-    );
-}
-
-/// A store an earlier build wrote has no invitation column: its owner adds
-/// it on open, backfills it from the held bodies and records the
-/// invitations they imply (STORAGE §6).
-#[test]
-fn an_earlier_store_backfills_the_invitation_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let body = b"Message-ID: <invite@x>\r\nSubject: Sync\r\nFrom: a@x\r\n\
-        Date: Fri, 07 Aug 2026 08:00:00 +0000\r\n\
-        Content-Type: text/calendar; method=REQUEST\r\n\r\n\
-        BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-    {
-        let mut store = seeded(dir.path());
-        let hash = store.blobs().hash(body);
-        let summary = mail::derive(body).summary.unwrap();
-        store
-            .write(vec![
-                PimdirWriteOp::StoreObject {
-                    object: PimdirObject {
-                        hash: hash.clone(),
-                        size: body.len(),
-                    },
-                    body: Some(body.to_vec()),
-                },
-                placement("INBOX", "3", "invite", Some(hash.as_str()), summary),
-            ])
-            .unwrap();
-    }
-
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch(
-        "DELETE FROM item_reference;
-         DROP INDEX mail_summary_by_invitation;
-         ALTER TABLE mail_summary DROP COLUMN invitation;",
-    )
-    .unwrap();
-    drop(conn);
-
-    let store = PimdirStore::open(dir.path()).unwrap();
-    let references = store.references_from(&endpoint(MAIL, "invite")).unwrap();
-    assert_eq!(
-        references
-            .iter()
-            .map(|r| (r.to.link_id.as_str(), r.role.as_str()))
-            .collect::<Vec<_>>(),
-        [("ev", "invitation")],
-        "backfilled from the held body, then linked"
     );
 }

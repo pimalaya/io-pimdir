@@ -6,11 +6,11 @@
 //!
 //! Mail goes through mail-parser: the MIME walk, transfer encodings,
 //! charsets, RFC 2047 and RFC 2231, `text/plain` preferred within an
-//! alternative and `text/html` reduced to text, under the depth bound the
-//! summaries keep ([`MIME_DEPTH_MAX`]). A vCard goes through vcard-rs and
-//! an iCalendar resource through ical-rs. A file, a placement holding no
-//! body and a body no parser accepts are read from their summary and
-//! address rows.
+//! alternative and `text/html` reduced to text, under the bounds the
+//! summaries keep ([`MIME_DEPTH_MAX`], [`MIME_ENTITIES_MAX`]). A vCard goes
+//! through vcard-rs and an iCalendar resource through ical-rs. A file, a
+//! placement holding no body and a body no parser accepts are read from
+//! their summary and address rows.
 
 use alloc::{
     borrow::Cow,
@@ -31,7 +31,7 @@ use crate::{
     search::{chunk, fold},
     summary::{
         PimdirAddress, PimdirAddressRole, PimdirSummary,
-        mail::{MIME_DEPTH_MAX, attachments},
+        mail::{MIME_DEPTH_MAX, MIME_ENTITIES_MAX, attachments},
     },
 };
 
@@ -153,8 +153,8 @@ impl PimdirExtract {
             return extract;
         }
 
-        let mut walk = Walk::default();
-        walk.part(&message, 0, 0);
+        let mut walk = Walk::over(&message);
+        walk.part(&message, 0);
         extract.body = walk.body.join("\n\n");
 
         // NOTE: the attachments are the stand-ins' (STORAGE §14.3), so an
@@ -397,15 +397,53 @@ impl PimdirExtract {
 }
 
 /// The text parts the MIME walk gathers.
-#[derive(Default)]
 struct Walk {
+    /// Whether the walk of the parts reads each part, by id (STORAGE Annex
+    /// A.1): an unread one and every part under it give no text.
+    read: Vec<bool>,
     body: Vec<String>,
 }
 
 impl Walk {
-    /// Walks the part `id` at `depth`, no deeper than [`MIME_DEPTH_MAX`].
-    fn part(&mut self, message: &Message, id: usize, depth: usize) {
-        if depth >= MIME_DEPTH_MAX {
+    /// The walk of `message`'s parts as Annex A.1 bounds it: in document
+    /// order, a multipart before its children, none deeper than
+    /// [`MIME_DEPTH_MAX`] and none after the [`MIME_ENTITIES_MAX`]th, the
+    /// message's own counted; a `message/rfc822` part is one, not opened.
+    fn over(message: &Message) -> Self {
+        let mut read = vec![false; message.parts.len()];
+        let mut count = 0;
+        let mut pending = vec![(0usize, 0usize)];
+
+        while let Some((id, depth)) = pending.pop() {
+            if depth > MIME_DEPTH_MAX || count >= MIME_ENTITIES_MAX {
+                continue;
+            }
+            let Some(part) = message.parts.get(id).filter(|_| !read[id]) else {
+                continue;
+            };
+            read[id] = true;
+            count += 1;
+            if let PartType::Multipart(children) = &part.body {
+                for child in children.iter().rev() {
+                    pending.push((*child as usize, depth + 1));
+                }
+            }
+        }
+
+        Self {
+            read,
+            body: Vec::new(),
+        }
+    }
+
+    /// Whether the walk reads the part `id`.
+    fn reads(&self, id: usize) -> bool {
+        self.read.get(id).copied().unwrap_or(false)
+    }
+
+    /// Gathers the text of the part `id` when the walk reads it.
+    fn part(&mut self, message: &Message, id: usize) {
+        if !self.reads(id) {
             return;
         }
         let Some(part) = message.parts.get(id) else {
@@ -421,16 +459,16 @@ impl Walk {
             PartType::Multipart(children) if subtype == "alternative" => {
                 let chosen = children
                     .iter()
-                    .find(|child| has_plain(message, **child as usize, depth + 1))
+                    .find(|child| self.has_plain(message, **child as usize))
                     .or(children.last());
                 if let Some(child) = chosen {
-                    self.part(message, *child as usize, depth + 1);
+                    self.part(message, *child as usize);
                 }
             }
             PartType::Multipart(_) if is_encrypted(part) => (),
             PartType::Multipart(children) => {
                 for child in children {
-                    self.part(message, *child as usize, depth + 1);
+                    self.part(message, *child as usize);
                 }
             }
             PartType::Text(text) if !attached && ctype == "text" && subtype == "plain" => {
@@ -440,24 +478,24 @@ impl Walk {
             _ => (),
         }
     }
-}
 
-/// Whether the part `id` is, or holds within the depth bound, a
-/// `text/plain` part an alternative prefers.
-fn has_plain(message: &Message, id: usize, depth: usize) -> bool {
-    if depth >= MIME_DEPTH_MAX {
-        return false;
-    }
-    let Some(part) = message.parts.get(id) else {
-        return false;
-    };
+    /// Whether the part `id` is, or holds among the parts the walk reads,
+    /// a `text/plain` part an alternative prefers.
+    fn has_plain(&self, message: &Message, id: usize) -> bool {
+        if !self.reads(id) {
+            return false;
+        }
+        let Some(part) = message.parts.get(id) else {
+            return false;
+        };
 
-    match &part.body {
-        PartType::Text(_) => media_type(part) == ("text".into(), "plain".into()),
-        PartType::Multipart(children) => children
-            .iter()
-            .any(|child| has_plain(message, *child as usize, depth + 1)),
-        _ => false,
+        match &part.body {
+            PartType::Text(_) => media_type(part) == ("text".into(), "plain".into()),
+            PartType::Multipart(children) => children
+                .iter()
+                .any(|child| self.has_plain(message, *child as usize)),
+            _ => false,
+        }
     }
 }
 

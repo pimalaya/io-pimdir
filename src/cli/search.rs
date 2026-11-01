@@ -47,7 +47,15 @@ const DEFAULT_LIMIT: usize = 50;
 /// store as a reader, so it runs beside a sync; another indexer running
 /// makes it report so and do nothing.
 #[derive(Debug, Args)]
-pub struct IndexCommand;
+pub struct IndexCommand {
+    /// The IANA zone floating times and dates are read in (`UTC`,
+    /// `Europe/Paris`).
+    ///
+    /// The index records it: another zone re-expands every calendar item,
+    /// so pass the same one to every command refreshing the index.
+    #[arg(long, value_name = "ZONE", default_value = "UTC")]
+    pub floating_zone: String,
+}
 
 impl IndexCommand {
     /// Runs a full refresh.
@@ -55,7 +63,10 @@ impl IndexCommand {
         store.ensure_store()?;
         let mut index = PimdirIndex::open(store.dir()).map_err(report)?;
         let report = index
-            .refresh(&PimdirIndexRefreshOptions::default())
+            .refresh(&PimdirIndexRefreshOptions {
+                floating_zone: self.floating_zone,
+                ..Default::default()
+            })
             .map_err(report)?;
 
         printer.out(IndexOutput {
@@ -479,6 +490,13 @@ pub struct RefreshFlags {
     /// `index` to fold everything.
     #[arg(long, value_name = "DURATION", default_value = "2s")]
     pub refresh_timeout: humantime::Duration,
+
+    /// The IANA zone floating times and dates are read in (`UTC`,
+    /// `Europe/Paris`), as `index --floating-zone` states it.
+    ///
+    /// The index records it: another zone re-expands every calendar item.
+    #[arg(long, value_name = "ZONE", default_value = "UTC")]
+    pub floating_zone: String,
 }
 
 impl RefreshFlags {
@@ -491,6 +509,7 @@ impl RefreshFlags {
             index
                 .refresh(&PimdirIndexRefreshOptions {
                     deadline: Some(Instant::now() + timeout),
+                    floating_zone: self.floating_zone.clone(),
                     ..Default::default()
                 })
                 .map_err(report)?;
@@ -1054,6 +1073,9 @@ pub struct CoverageRow {
     /// Whether the date range leaves the horizon calendar occurrences are
     /// materialised within, a calendar in scope.
     pub horizon_left: bool,
+    /// For a query bounded by date, the calendar items in scope whose
+    /// occurrences a bound cut before the range's end.
+    pub cut: u64,
 }
 
 impl From<&PimdirSearchCoverage> for CoverageRow {
@@ -1082,6 +1104,7 @@ impl From<&PimdirSearchCoverage> for CoverageRow {
                 PimdirSearchRemote::Augmented { exhaustive } => RemoteRow::Augmented { exhaustive },
             },
             horizon_left: coverage.horizon_left,
+            cut: coverage.cut,
         }
     }
 }
@@ -1137,6 +1160,13 @@ impl fmt::Display for CoverageRow {
             writeln!(
                 f,
                 " - the range leaves the horizon calendar occurrences are indexed within"
+            )?;
+        }
+        if self.cut > 0 {
+            writeln!(
+                f,
+                " - {} calendar item(s) cut by the occurrence bounds before the range ends",
+                self.cut
             )?;
         }
         Ok(())

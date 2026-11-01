@@ -27,7 +27,7 @@ use crate::{
         PimdirTier,
     },
     sync::{PimdirSync, PimdirSyncOptions, PimdirSyncReport},
-    upgrade::{PimdirUpgrade, PimdirUpgradeReport},
+    upgrade::{PimdirUpgrade, PimdirUpgradeOptions, PimdirUpgradeReport},
 };
 
 /// Why a run stopped short of its report.
@@ -101,9 +101,10 @@ impl PimdirSourceStore {
         yielded: PimdirYield,
     ) -> Result<Result<PimdirArg, PimdirYield>, PimdirError> {
         Ok(Ok(match yielded {
-            PimdirYield::WantsLoad { collection, scope } => {
-                PimdirArg::Load(self.load(&collection, &scope)?)
-            }
+            PimdirYield::WantsLoad {
+                collection,
+                selection,
+            } => PimdirArg::Load(self.load(&collection, &selection)?),
             PimdirYield::WantsLookupObject(links) => {
                 PimdirArg::LookupObject(self.lookup_objects(&links)?)
             }
@@ -181,15 +182,19 @@ impl PimdirSourceStore {
     }
 
     /// Raises `handles` in `collection` to `tier`, linking bodies the
-    /// store already holds before fetching (SYNC §6).
+    /// store already holds before fetching (SYNC §6), and settling a
+    /// divergence whose body it fetches by the source's policy, `opts`
+    /// (`(&sync_options).into()` for the options the source syncs under).
     pub fn upgrade<R: PimdirRemote>(
         &mut self,
         collection: impl Into<PimdirCollectionId>,
         handles: Vec<PimdirHandle>,
         tier: PimdirTier,
+        opts: PimdirUpgradeOptions,
         remote: &mut R,
     ) -> Result<PimdirUpgradeReport, PimdirRunError<R::Error, PimdirArgError>> {
-        self.run(PimdirUpgrade::new(collection, handles, tier), remote)
+        let upgrade = PimdirUpgrade::new(collection, handles, tier).options(opts);
+        self.run(upgrade, remote)
     }
 
     /// Stages a local edit with no network (SYNC §7).

@@ -35,7 +35,9 @@ fn placement(collection: &str, handle: &str, link: &str) -> PimdirPlacement {
         collection: PimdirCollectionId(collection.into()),
         handle: PimdirHandle(handle.into()),
         link_id: Some(PimdirLinkId(link.into())),
-        object: Some(PimdirHash("cafebabe".into())),
+        object: Some(PimdirHash(
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+        )),
         level: PimdirLevel::Full,
         summary: None,
         flags: PimdirFlags::default(),
@@ -45,7 +47,9 @@ fn placement(collection: &str, handle: &str, link: &str) -> PimdirPlacement {
         base: Some(PimdirBase {
             flags: PimdirFlags::default(),
             revision: None,
-            object: Some(PimdirHash("cafebabe".into())),
+            object: Some(PimdirHash(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into(),
+            )),
         }),
         origin: None,
     }
@@ -71,7 +75,7 @@ fn seeded(dir: &Path) -> PimdirSourceStore {
         .write(vec![
             PimdirWriteOp::StoreObject {
                 object: PimdirObject {
-                    hash: PimdirHash("cafebabe".into()),
+                    hash: PimdirHash("cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()),
                     size: 4,
                 },
                 body: Some(b"body".to_vec()),
@@ -178,7 +182,12 @@ fn a_message_lists_its_attachments_and_takes_them_with_it() {
     assert_eq!(
         read,
         [
-            ("part:m#2", "Attachments", Some("2"), Some("cafebabe")),
+            (
+                "part:m#2",
+                "Attachments",
+                Some("2"),
+                Some("cafebabecafebabecafebabecafebabecafebabecafebabecafe")
+            ),
             ("part:m#3", "Attachments", Some("3"), None),
         ],
         "in the order recorded, the stand-in read, a saved copy's body held"
@@ -222,45 +231,6 @@ fn a_message_lists_its_attachments_and_takes_them_with_it() {
         store.seq_for_link("Docs", "part:m#2").unwrap().is_some(),
         "the saved copy stays"
     );
-}
-
-/// A store an earlier build of draft-04 wrote has no file summaries: a
-/// reader lists its attachments as the reconciliation leaves them, the
-/// table empty, so each without its summary, and its owner adds the table
-/// and the trigger on open (STORAGE §6).
-#[test]
-fn an_earlier_store_gains_the_files_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    drop(seeded(dir.path()));
-
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch(
-        "DROP TRIGGER item_reference_collects_files;
-         DROP TABLE file_summary;",
-    )
-    .unwrap();
-
-    let listed = || {
-        PimdirReader::open(dir.path())
-            .unwrap()
-            .list_attachments(None, &PimdirLinkId("m".into()))
-            .unwrap()
-    };
-    let older = listed();
-    assert_eq!(older.len(), 2, "both parts, read through their references");
-    assert!(older.iter().all(|file| file.summary.is_none()));
-
-    drop(PimdirStore::open(dir.path()).unwrap());
-    assert_eq!(listed(), older, "as the reconciled store lists them");
-    let declared: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name IN
-                 ('file_summary', 'item_reference_collects_files')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(declared, 2, "the table and its trigger");
 }
 
 /// The attachments collection carries the role `attachments`, and an
@@ -321,60 +291,4 @@ fn an_account_lists_its_attachments_and_deletes_unbound_files() {
             .unwrap(),
         "a bound file is its source's"
     );
-}
-
-/// A store whose role `CHECK` predates `attachments` is rebuilt on open,
-/// its rows kept (STORAGE §6).
-#[test]
-fn an_earlier_role_constraint_is_rebuilt_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    drop(seeded(dir.path()));
-
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch(
-        "PRAGMA writable_schema = ON;
-         UPDATE sqlite_schema SET sql = replace(sql,
-             ' OR (kind = ''application/octet-stream'' AND role = ''attachments'')', '')
-         WHERE name = 'collections';
-         PRAGMA writable_schema = OFF;",
-    )
-    .unwrap();
-    drop(conn);
-    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    let declared: String = conn
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE name = 'collections'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        !declared.contains("'attachments'"),
-        "the earlier constraint"
-    );
-    drop(conn);
-
-    let store = PimdirStore::open(dir.path()).unwrap();
-    store
-        .set_collection_role("Attachments", Some("attachments"))
-        .unwrap();
-    assert_eq!(store.list_collections().unwrap().len(), 3, "rows kept");
-    assert_eq!(store.count_items("INBOX").unwrap(), 1);
-    drop(store);
-
-    // NOTE: rebuilt from the canonical text, the stored statement is the
-    // one a fresh store holds, so the next open finds it current.
-    let fresh = tempfile::tempdir().unwrap();
-    drop(PimdirStore::open(fresh.path()).unwrap());
-    let declared = |dir: &Path| -> String {
-        rusqlite::Connection::open(dir.join("pimdir.db"))
-            .unwrap()
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE name = 'collections'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-    };
-    assert_eq!(declared(dir.path()), declared(fresh.path()));
 }

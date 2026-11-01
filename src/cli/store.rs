@@ -16,7 +16,7 @@ use crate::cli::{StoreFlags, bytes, report};
 /// Inspect the store as a whole.
 #[derive(Debug, Subcommand)]
 pub enum StoreCommand {
-    /// Summarise the store: schema, sources, counts and bytes.
+    /// Summarise the store: identity, versions, sources, counts and bytes.
     Info(StoreInfoCommand),
 }
 
@@ -29,11 +29,13 @@ impl StoreCommand {
     }
 }
 
-/// Summarise the store: schema version, sources, counts, bytes and change feed.
+/// Summarise the store: identity, versions, sources, counts, bytes and change
+/// feed.
 ///
 /// The counts are per collection, live and retained; the retained bytes are
-/// what `item purge` would reclaim. The change cursor is what a consumer
-/// deriving from the store (a search index) records.
+/// what `item purge` would reclaim. The store id, its incarnation and the
+/// change cursor are what a consumer deriving from the store (a search index)
+/// records.
 #[derive(Debug, Args)]
 pub struct StoreInfoCommand;
 
@@ -64,10 +66,18 @@ impl StoreInfoCommand {
         let live_bytes = read.live_bytes().map_err(report)?;
         let retained_bytes = read.retained_bytes().map_err(report)?;
         let cursor = read.change_cursor().map_err(report)?;
+        let meta = read.store_meta().map_err(report)?;
 
         printer.out(StoreInfoOutput {
             path,
-            schema_version: io_pimdir::sql::VERSION,
+            store_id: meta.store_id,
+            incarnation: meta.incarnation,
+            format_version: meta.format_version,
+            schema_version: meta.version,
+            read_version: meta.read_version,
+            produce_version: meta.produce_version,
+            derivation: meta.derivation,
+            sync_version: meta.sync_version,
             sources: read.distinct_sources().map_err(report)?,
             collections,
             live_items: live,
@@ -100,9 +110,24 @@ pub struct StoreCollectionCount {
 pub struct StoreInfoOutput {
     /// The store directory.
     pub path: String,
-    /// The schema version: the one this build services, which the reader
-    /// verified the store to be stamped with, since it refuses any other.
+    /// The store's id, 32 lowercase hex digits drawn at its creation.
+    pub store_id: String,
+    /// The store's incarnation, raised when a copy of it is restored.
+    pub incarnation: i64,
+    /// The STORAGE version whose schema the store holds, the one this build
+    /// opens, since the reader refuses any other.
+    pub format_version: String,
+    /// The schema version.
     pub schema_version: i64,
+    /// The lowest schema version a reader must implement to read the store.
+    pub read_version: i64,
+    /// The lowest schema version a producer must implement to enqueue.
+    pub produce_version: i64,
+    /// The Annex A revision the store's summaries stand under.
+    pub derivation: i64,
+    /// The SYNC version whose engine wrote the sync state, none before an
+    /// engine wrote.
+    pub sync_version: Option<String>,
     /// The sources the store has synced against.
     pub sources: Vec<String>,
     /// Per-collection counts.
@@ -128,7 +153,22 @@ pub struct StoreInfoOutput {
 impl fmt::Display for StoreInfoOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Store at {}", self.path)?;
-        writeln!(f, " - schema version: {}", self.schema_version)?;
+        writeln!(
+            f,
+            " - id: {}, incarnation {}",
+            self.store_id, self.incarnation
+        )?;
+        writeln!(
+            f,
+            " - format: {}, schema version {} (read {}, produce {})",
+            self.format_version, self.schema_version, self.read_version, self.produce_version
+        )?;
+        writeln!(
+            f,
+            " - derivation: revision {}, sync: {}",
+            self.derivation,
+            self.sync_version.as_deref().unwrap_or("none yet")
+        )?;
         writeln!(
             f,
             " - sources: {}",

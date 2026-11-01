@@ -47,10 +47,7 @@ fn store(dir: &Path) -> PimdirSourceStore {
 }
 
 fn blob_of(dir: &Path, hash: &PimdirHash) -> std::path::PathBuf {
-    dir.join("objects")
-        .join(&hash.0[0..2])
-        .join(&hash.0[2..4])
-        .join(&hash.0)
+    dir.join("objects").join(&hash.0[0..2]).join(&hash.0)
 }
 
 /// Writes one body to the blob tree and stops there: the first half of

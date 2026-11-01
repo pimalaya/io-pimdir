@@ -4,7 +4,8 @@
 //! resource, summarised from the master component, one row in the table
 //! of its type. Times are carried verbatim with the parameters that give
 //! them meaning; the one resolved instant is the sort key, read through
-//! the `VTIMEZONE` the resource itself carries and nothing else.
+//! the `VTIMEZONE` the resource itself carries, else the IANA time zone
+//! database `jiff` bundles, the one the index expands occurrences through.
 
 use alloc::{
     format,
@@ -12,12 +13,17 @@ use alloc::{
     vec::Vec,
 };
 
+use jiff::{
+    civil,
+    tz::{AmbiguousOffset, TimeZone},
+};
+
 use crate::{
     placement::{PimdirLinkId, PimdirSortKey},
     summary::{
         PimdirAddress, PimdirDerivation, PimdirSummary,
-        contact::{PimdirContentLine, split_unescaped, unescape},
-        hash_key, time, unfold,
+        contact::{PimdirContentLine, split_unescaped, split_unquoted, split_value, unescape},
+        hash_key, logical_lines, time, unfold,
     },
 };
 
@@ -410,10 +416,11 @@ fn until(rrule: &str) -> Option<String> {
 
 /// The instant a start names, normalised to RFC 3339 in UTC (Annex A.3).
 ///
-/// A UTC date-time is an instant already; a zoned one resolves through
-/// the resource's own `VTIMEZONE`; a zone that will not resolve reads as
-/// floating; a date-only value reads as midnight UTC; a floating one
-/// reads its wall time as UTC.
+/// A UTC date-time is an instant already. A zoned one resolves through
+/// the first that names its `TZID` byte for byte: the resource's own
+/// `VTIMEZONE`, then the IANA time zone database bundled with `jiff`;
+/// one neither names reads as floating. A date-only value reads as
+/// midnight UTC; a floating one reads its wall time as UTC.
 fn instant(time: &PimdirTime, zones: &[&Component]) -> Option<String> {
     let bytes = time.value.as_bytes();
     let year = time::digits(bytes, 0, 4)? as i32;
@@ -435,133 +442,154 @@ fn instant(time: &PimdirTime, zones: &[&Component]) -> Option<String> {
     if bytes.get(15) == Some(&b'Z') {
         return Some(time::rfc3339(local));
     }
+    let Some(tzid) = time.tzid.as_deref() else {
+        return Some(time::rfc3339(local));
+    };
 
-    let zone = time.tzid.as_deref().and_then(|tzid| {
-        zones
-            .iter()
-            .find(|zone| zone.value("TZID").as_deref() == Some(tzid))
-    });
+    let zone = zones
+        .iter()
+        .find(|zone| zone.value("TZID").as_deref() == Some(tzid));
+    let instant = match zone {
+        Some(zone) => resolve(zone, local),
+        None => iana(tzid, local).unwrap_or(local),
+    };
 
-    match zone {
-        Some(zone) => Some(time::rfc3339(resolve(zone, local, year))),
-        None => Some(time::rfc3339(local)),
-    }
+    Some(time::rfc3339(instant))
+}
+
+/// The instant a wall time names in a zone of the IANA time zone database
+/// (Annex A.3, RFC 7809), or `None` when the database names no zone
+/// `tzid`, matched byte for byte. A wall time a transition repeats or
+/// skips takes the offset in effect before it (RFC 5545 §3.3.5).
+pub(crate) fn iana(tzid: &str, local: i64) -> Option<i64> {
+    let zone = TimeZone::get(tzid)
+        .ok()
+        .filter(|zone| zone.iana_name() == Some(tzid))?;
+
+    let (year, month, day) = time::civil_from_days(local.div_euclid(86_400));
+    let seconds = local.rem_euclid(86_400);
+    let wall = civil::DateTime::new(
+        i16::try_from(year).ok()?,
+        i8::try_from(month).ok()?,
+        i8::try_from(day).ok()?,
+        (seconds / 3_600) as i8,
+        (seconds % 3_600 / 60) as i8,
+        (seconds % 60) as i8,
+        0,
+    )
+    .ok()?;
+
+    let offset = match zone.to_ambiguous_timestamp(wall).offset() {
+        AmbiguousOffset::Unambiguous { offset } => offset,
+        AmbiguousOffset::Gap { before, .. } | AmbiguousOffset::Fold { before, .. } => before,
+    };
+
+    Some(local - i64::from(offset.seconds()))
 }
 
 /// The instant a wall time names in a zone the resource carries.
 ///
-/// An ambiguous hour takes the offset in effect before the transition
-/// and a nonexistent one the offset after it, both the numerically
-/// greater offset and the earlier instant, so one rule serves both.
-fn resolve(zone: &Component, local: i64, year: i32) -> i64 {
-    let transitions = transitions(zone, year);
+/// A wall time a transition repeats or skips takes the offset in effect
+/// before it (RFC 5545 §3.3.5): of a repeated one the earlier instant, a
+/// skipped one read at the offset before the gap. Any other takes the one
+/// offset in effect at the instant it names.
+fn resolve(zone: &Component, local: i64) -> i64 {
+    let transitions = transitions(zone, local);
     if transitions.is_empty() {
         return local;
     }
 
-    let mut valid: Option<i64> = None;
-    let mut earliest: Option<i64> = None;
-    for offset in offsets(&transitions) {
-        let instant = local - offset;
-        earliest = Some(earliest.map_or(instant, |current: i64| current.min(instant)));
-        if in_effect(&transitions, instant) == offset {
-            valid = Some(valid.map_or(instant, |current: i64| current.min(instant)));
+    for transition in &transitions {
+        let before = transition.at + transition.from;
+        let after = transition.at + transition.to;
+        if before.min(after) <= local && local < before.max(after) {
+            return local - transition.from;
         }
     }
 
-    valid.or(earliest).unwrap_or(local)
+    let mut offsets: Vec<i64> = Vec::new();
+    for transition in &transitions {
+        for offset in [transition.from, transition.to] {
+            if !offsets.contains(&offset) {
+                offsets.push(offset);
+            }
+        }
+    }
+    offsets
+        .into_iter()
+        .find(|offset| in_effect(&transitions, local - offset) == *offset)
+        .map_or_else(
+            || local - in_effect(&transitions, local),
+            |offset| local - offset,
+        )
 }
 
-/// One offset change a `VTIMEZONE` states.
+/// One onset a `VTIMEZONE` observance states: the instant it begins and
+/// the offsets on either side of it, in seconds.
 struct Transition {
     at: i64,
-    to: i64,
     from: i64,
+    to: i64,
 }
 
-/// The transitions a zone states over the years around `year`.
+/// The most periods an observance's `RRULE` is followed for from its
+/// `DTSTART` (Annex A.3), the last onset found standing beyond them.
+const ZONE_PERIODS_MAX: i64 = 1_000_000;
+
+/// How far from a wall time, in seconds of local time, an onset can skip
+/// or repeat it: an offset is under a day, so a transition spans under two,
+/// and three leave a margin.
+const NEAR: i64 = 3 * 86_400;
+
+/// The transitions of a zone that bear on the wall time `local`, sorted:
+/// each observance's first onset, its last one more than [`NEAR`] before
+/// `local`, and every one within [`NEAR`] of it.
 ///
-/// It reads `FREQ=YEARLY` with `BYMONTH` and `BYDAY`, what every zone a
-/// real calendar writes carries; a subcomponent whose rule this cannot
-/// read contributes its `DTSTART` alone.
-fn transitions(zone: &Component, year: i32) -> Vec<Transition> {
+/// An observance's `RRULE` is read when it steps by a fixed span
+/// (`SECONDLY` to `WEEKLY`, with `INTERVAL`, `COUNT` and `UNTIL` alone),
+/// or when it is `YEARLY` in one `BYMONTH` by `BYDAY`, an ordinal before
+/// it or a `BYMONTHDAY` beside it, with `INTERVAL`, `COUNT` and `UNTIL`:
+/// the shapes zones are written in. One it cannot read contributes its
+/// `DTSTART` alone.
+fn transitions(zone: &Component, local: i64) -> Vec<Transition> {
     let mut transitions = Vec::new();
 
-    for change in &zone.children {
-        if !matches!(change.name.as_str(), "STANDARD" | "DAYLIGHT") {
+    for observance in &zone.children {
+        if !matches!(observance.name.as_str(), "STANDARD" | "DAYLIGHT") {
             continue;
         }
 
         let (Some(from), Some(to)) = (
-            change.value("TZOFFSETFROM").as_deref().and_then(offset),
-            change.value("TZOFFSETTO").as_deref().and_then(offset),
+            observance.value("TZOFFSETFROM").as_deref().and_then(offset),
+            observance.value("TZOFFSETTO").as_deref().and_then(offset),
         ) else {
             continue;
         };
-        let Some(start) = change.value("DTSTART") else {
-            continue;
-        };
-        let bytes = start.as_bytes();
-        let (Some(hour), Some(minute), Some(second)) = (
-            time::digits(bytes, 9, 2),
-            time::digits(bytes, 11, 2),
-            time::digits(bytes, 13, 2),
-        ) else {
+        let Some(start) = observance.value("DTSTART").as_deref().and_then(wall) else {
             continue;
         };
 
-        match change.value("RRULE").as_deref().and_then(yearly) {
-            Some((month, ordinal, weekday)) => {
-                for year in year - 1..=year + 1 {
-                    let Some(day) = nth_weekday(year, month, ordinal, weekday) else {
-                        continue;
-                    };
-                    transitions.push(Transition {
-                        at: time::unix(year, month, day, hour, minute, second) - from,
-                        to,
-                        from,
-                    });
-                }
-            }
-            None => {
-                let (Some(year), Some(month), Some(day)) = (
-                    time::digits(bytes, 0, 4),
-                    time::digits(bytes, 4, 2),
-                    time::digits(bytes, 6, 2),
-                ) else {
-                    continue;
-                };
-                transitions.push(Transition {
-                    at: time::unix(year as i32, month, day, hour, minute, second) - from,
-                    to,
-                    from,
-                });
-            }
-        }
+        let rule = observance
+            .value("RRULE")
+            .as_deref()
+            .and_then(ZoneRule::parse);
+        let onsets = match rule {
+            Some(rule) => rule.onsets(start, from, local),
+            None => Vec::from([start]),
+        };
+        transitions.extend(onsets.into_iter().map(|onset| Transition {
+            at: onset - from,
+            from,
+            to,
+        }));
     }
 
     transitions.sort_by_key(|transition| transition.at);
     transitions
 }
 
-/// Every offset the transitions put in effect, the first one's origin included.
-fn offsets(transitions: &[Transition]) -> Vec<i64> {
-    let mut offsets = Vec::new();
-    for offset in transitions
-        .first()
-        .map(|first| first.from)
-        .into_iter()
-        .chain(transitions.iter().map(|transition| transition.to))
-    {
-        if !offsets.contains(&offset) {
-            offsets.push(offset);
-        }
-    }
-
-    offsets
-}
-
-/// The offset in effect at an instant.
+/// The offset in effect at an instant: the one the latest onset at or
+/// before it puts in effect, else the first onset's origin.
 fn in_effect(transitions: &[Transition], instant: i64) -> i64 {
     transitions
         .iter()
@@ -585,55 +613,215 @@ fn offset(raw: &str) -> Option<i64> {
     Some(if bytes[0] == b'-' { -offset } else { offset })
 }
 
-/// The `(month, ordinal, weekday)` a yearly transition rule names.
-fn yearly(rrule: &str) -> Option<(u32, i32, u32)> {
-    let mut yearly = false;
-    let mut month = None;
-    let mut byday = None;
-
-    for part in rrule.split(';') {
-        let Some((name, value)) = part.split_once('=') else {
-            continue;
-        };
-        match name.to_uppercase().as_str() {
-            "FREQ" => yearly = value.eq_ignore_ascii_case("YEARLY"),
-            "BYMONTH" => month = value.parse::<u32>().ok(),
-            "BYDAY" => byday = Some(value.to_uppercase()),
-            _ => {}
-        }
-    }
-
-    if !yearly {
+/// A `YYYYMMDDTHHMMSS` date-time as seconds of its wall clock from the
+/// epoch, a trailing `Z` ignored.
+fn wall(value: &str) -> Option<i64> {
+    let bytes = value.trim().as_bytes();
+    if bytes.get(8) != Some(&b'T') {
         return None;
     }
 
-    let byday = byday?;
-    let (ordinal, day) = byday.split_at(byday.len().checked_sub(2)?);
-    let weekday = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"]
-        .iter()
-        .position(|name| *name == day)? as u32;
-
-    Some((month?, ordinal.parse().unwrap_or(1), weekday))
+    Some(time::unix(
+        time::digits(bytes, 0, 4)? as i32,
+        time::digits(bytes, 4, 2)?,
+        time::digits(bytes, 6, 2)?,
+        time::digits(bytes, 9, 2)?,
+        time::digits(bytes, 11, 2)?,
+        time::digits(bytes, 13, 2)?,
+    ))
 }
 
-/// The day of the month the `n`th weekday falls on, from the end when negative.
-fn nth_weekday(year: i32, month: u32, ordinal: i32, weekday: u32) -> Option<u32> {
-    let length = time::days_in_month(year, month);
-    if length == 0 || ordinal == 0 {
-        return None;
+/// An observance's `RRULE` in a shape the zone resolution reads.
+struct ZoneRule {
+    /// The onsets a rule states, by its shape.
+    shape: ZoneShape,
+    /// `INTERVAL`, 1 when absent.
+    interval: i64,
+    /// `COUNT`, the onsets including the `DTSTART`.
+    count: Option<i64>,
+    /// `UNTIL` as wall-clock seconds, and whether it is UTC.
+    until: Option<(i64, bool)>,
+}
+
+/// What a rule's periods each yield.
+enum ZoneShape {
+    /// One onset a period, a fixed number of seconds apart.
+    Step(i64),
+    /// The days of one month a year that are one weekday, the `n`th of
+    /// them only (from the end when negative) or those in a day list.
+    Yearly {
+        month: u32,
+        weekday: u32,
+        ordinal: Option<i32>,
+        days: Vec<u32>,
+    },
+}
+
+impl ZoneRule {
+    /// Reads a rule, `None` for a shape [`transitions`] does not follow.
+    fn parse(rrule: &str) -> Option<Self> {
+        let mut freq = None;
+        let mut interval = 1;
+        let mut count = None;
+        let mut until = None;
+        let mut month = None;
+        let mut byday = None;
+        let mut days = Vec::new();
+
+        for part in rrule.split(';') {
+            let (name, value) = part.split_once('=')?;
+            match name.to_ascii_uppercase().as_str() {
+                "FREQ" => freq = Some(value.to_ascii_uppercase()),
+                "INTERVAL" => interval = value.parse().ok().filter(|interval| *interval > 0)?,
+                "COUNT" => count = Some(value.parse().ok()?),
+                "UNTIL" => until = Some((wall(value)?, value.trim().ends_with('Z'))),
+                "BYMONTH" => {
+                    month = Some(
+                        value
+                            .parse()
+                            .ok()
+                            .filter(|month| (1..=12).contains(month))?,
+                    )
+                }
+                "BYDAY" => byday = Some(value.to_ascii_uppercase()),
+                "BYMONTHDAY" => {
+                    for day in value.split(',') {
+                        days.push(day.parse().ok().filter(|day| (1..=31).contains(day))?);
+                    }
+                }
+                "WKST" => {}
+                _ => return None,
+            }
+        }
+
+        let step = match freq?.as_str() {
+            "SECONDLY" => Some(1),
+            "MINUTELY" => Some(60),
+            "HOURLY" => Some(3_600),
+            "DAILY" => Some(86_400),
+            "WEEKLY" => Some(7 * 86_400),
+            "YEARLY" => None,
+            _ => return None,
+        };
+        let shape = match (step, month, byday) {
+            (Some(step), None, None) if days.is_empty() => ZoneShape::Step(step),
+            (None, Some(month), Some(byday)) => {
+                let (ordinal, day) = byday.split_at(byday.len().checked_sub(2)?);
+                let weekday = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"]
+                    .iter()
+                    .position(|name| *name == day)? as u32;
+                let ordinal = match ordinal {
+                    "" => None,
+                    ordinal => Some(ordinal.parse().ok().filter(|ordinal| *ordinal != 0)?),
+                };
+                ZoneShape::Yearly {
+                    month,
+                    weekday,
+                    ordinal,
+                    days,
+                }
+            }
+            _ => return None,
+        };
+
+        Some(Self {
+            shape,
+            interval,
+            count,
+            until,
+        })
     }
 
-    let day = if ordinal > 0 {
-        let first = time::days_from_civil(year, month, 1);
-        let shift = (7 + weekday - time::weekday(first)) % 7;
-        1 + shift as i32 + (ordinal - 1) * 7
-    } else {
-        let last = time::days_from_civil(year, month, length);
-        let shift = (7 + time::weekday(last) - weekday) % 7;
-        length as i32 - shift as i32 + (ordinal + 1) * 7
-    };
+    /// The local onsets from `start` that bear on the wall time `local`:
+    /// the first, the last more than [`NEAR`] before it and those within
+    /// [`NEAR`] of it, at most [`ZONE_PERIODS_MAX`] periods followed.
+    fn onsets(&self, start: i64, from: i64, local: i64) -> Vec<i64> {
+        let (low, high) = (local - NEAR, local + NEAR);
+        let mut onsets = Vec::from([start]);
+        let mut before = None;
 
-    (1..=length as i32).contains(&day).then_some(day as u32)
+        // NOTE: the onsets in order, the `DTSTART` the first of `COUNT`.
+        let mut push = |onset: i64, index: i64, onsets: &mut Vec<i64>| -> bool {
+            let past_until = self.until.is_some_and(|(until, utc)| match utc {
+                true => onset - from > until,
+                false => onset > until,
+            });
+            if past_until || self.count.is_some_and(|count| index >= count) || onset > high {
+                return false;
+            }
+            match onset < low {
+                true => before = Some(onset),
+                false => onsets.push(onset),
+            }
+            true
+        };
+
+        match &self.shape {
+            ZoneShape::Step(step) => {
+                let step = step * self.interval;
+                let last = ZONE_PERIODS_MAX - 1;
+                let first = (low - start).div_euclid(step).clamp(0, last);
+                let from = match first {
+                    0 => 1,
+                    first => first,
+                };
+                for index in from..=last {
+                    if !push(start + index * step, index, &mut onsets) {
+                        break;
+                    }
+                }
+            }
+            ZoneShape::Yearly {
+                month,
+                weekday,
+                ordinal,
+                days,
+            } => {
+                let (first, ..) = time::civil_from_days(start.div_euclid(86_400));
+                let clock = start.rem_euclid(86_400);
+                let mut index = 0;
+                'periods: for period in 0..ZONE_PERIODS_MAX {
+                    let Some(year) = i32::try_from(period * self.interval)
+                        .ok()
+                        .and_then(|years| first.checked_add(years))
+                        .filter(|year| *year <= 9999)
+                    else {
+                        break;
+                    };
+                    let length = time::days_in_month(year, *month) as i32;
+                    let mut matching: Vec<u32> = (1..=length as u32)
+                        .filter(|day| {
+                            time::weekday(time::days_from_civil(year, *month, *day)) == *weekday
+                        })
+                        .filter(|day| days.is_empty() || days.contains(day))
+                        .collect();
+                    if let Some(ordinal) = ordinal {
+                        let at = match *ordinal > 0 {
+                            true => usize::try_from(ordinal - 1).ok(),
+                            false => matching.len().checked_sub(ordinal.unsigned_abs() as usize),
+                        };
+                        matching = at
+                            .and_then(|at| matching.get(at).copied())
+                            .into_iter()
+                            .collect();
+                    }
+                    for day in matching {
+                        let onset = time::days_from_civil(year, *month, day) * 86_400 + clock;
+                        if onset <= start {
+                            continue;
+                        }
+                        index += 1;
+                        if !push(onset, index, &mut onsets) {
+                            break 'periods;
+                        }
+                    }
+                }
+            }
+        }
+
+        onsets.extend(before);
+        onsets
+    }
 }
 
 /// Whether a resource asks its source to notify its attendees (STORAGE
@@ -646,13 +834,110 @@ pub fn scheduled(body: &[u8]) -> bool {
             .iter()
             .filter(|line| line.is("ATTENDEE") || line.is("ORGANIZER"))
             .collect();
-        let server = |line: &&PimdirContentLine| {
-            !line.param("SCHEDULE-AGENT").is_some_and(|agent| {
-                agent.eq_ignore_ascii_case("CLIENT") || agent.eq_ignore_ascii_case("NONE")
-            })
+
+        people.iter().any(|line| line.is("ATTENDEE")) && people.iter().any(|line| notified(line))
+    })
+}
+
+/// The resource with `SCHEDULE-AGENT=NONE` written on every `ORGANIZER`
+/// and `ATTENDEE` lacking `SCHEDULE-AGENT=CLIENT` or `NONE`, in every
+/// component naming an `ATTENDEE` (Annex B.1): how a producer records
+/// the user's acceptance that nobody is notified, which [`scheduled`]
+/// then reads false. A rewritten line is folded at 75 octets; every other
+/// line is kept byte for byte.
+pub fn unschedule(body: &[u8]) -> Vec<u8> {
+    let lines = logical_lines(body);
+    let parsed: Vec<Option<PimdirContentLine>> = lines
+        .iter()
+        .map(|(_, line)| PimdirContentLine::parse(line))
+        .collect();
+
+    // NOTE: a property belongs to the component it is read in as
+    // `components` reads them: a child of the root, time zones aside.
+    let mut depth = 0usize;
+    let mut current = None;
+    let mut attended: Vec<bool> = Vec::new();
+    let mut owners: Vec<Option<usize>> = Vec::with_capacity(parsed.len());
+    for line in &parsed {
+        let Some(line) = line else {
+            owners.push(None);
+            continue;
+        };
+        match line.name.as_str() {
+            "BEGIN" => {
+                depth += 1;
+                if depth == 2 {
+                    attended.push(false);
+                    let zone = line.value.trim().eq_ignore_ascii_case("VTIMEZONE");
+                    current = (!zone).then(|| attended.len() - 1);
+                }
+                owners.push(None);
+            }
+            "END" => {
+                if depth == 2 {
+                    current = None;
+                }
+                depth = depth.saturating_sub(1);
+                owners.push(None);
+            }
+            name if depth == 2 => {
+                if let (Some(component), "ATTENDEE") = (current, name) {
+                    attended[component] = true;
+                }
+                owners.push(current);
+            }
+            _ => owners.push(None),
+        }
+    }
+
+    let mut unscheduled = Vec::with_capacity(body.len());
+    for (((raw, text), line), owner) in lines.iter().zip(&parsed).zip(&owners) {
+        let marked = owner.is_some_and(|component| attended[component])
+            && line.as_ref().is_some_and(|line| {
+                (line.is("ORGANIZER") || line.is("ATTENDEE")) && notified(line)
+            });
+        let Some((head, value)) = split_value(text).filter(|_| marked) else {
+            unscheduled.extend_from_slice(raw);
+            continue;
         };
 
-        people.iter().any(|line| line.is("ATTENDEE")) && people.iter().any(server)
+        let mut params = split_unquoted(head, ';');
+        params.retain(|param| {
+            !param
+                .split_once('=')
+                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("SCHEDULE-AGENT"))
+        });
+        let text = format!("{};SCHEDULE-AGENT=NONE:{value}", params.join(";"));
+
+        // NOTE: folded at 75 octets, on a character boundary, with the
+        // line ending the line had (RFC 5545 §3.1).
+        let ending: &[u8] = match raw.ends_with(b"\r\n") {
+            true => b"\r\n",
+            false if raw.ends_with(b"\n") => b"\n",
+            false => b"",
+        };
+        let mut width = 0;
+        for char in text.chars() {
+            if width + char.len_utf8() > 75 {
+                unscheduled.extend_from_slice(if ending.is_empty() { b"\r\n" } else { ending });
+                unscheduled.push(b' ');
+                width = 1;
+            }
+            let mut bytes = [0; 4];
+            unscheduled.extend_from_slice(char.encode_utf8(&mut bytes).as_bytes());
+            width += char.len_utf8();
+        }
+        unscheduled.extend_from_slice(ending);
+    }
+
+    unscheduled
+}
+
+/// Whether an `ORGANIZER` or `ATTENDEE` is one a server notifies, lacking
+/// `SCHEDULE-AGENT=CLIENT` or `NONE` (RFC 6638 §7.1).
+fn notified(line: &PimdirContentLine) -> bool {
+    !line.param("SCHEDULE-AGENT").is_some_and(|agent| {
+        agent.eq_ignore_ascii_case("CLIENT") || agent.eq_ignore_ascii_case("NONE")
     })
 }
 
@@ -866,7 +1151,7 @@ CONTACT;ALTREP=\"https://x.org/ann\":Ann <ANN@X.org>\r\nEND:VTODO\r\nEND:VCALEND
     }
 
     #[test]
-    fn the_ambiguous_and_missing_hours_take_the_greater_offset() {
+    fn the_ambiguous_and_skipped_hours_take_the_offset_before() {
         let with_start = |start: &str| {
             let body = alloc::format!(
                 "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Paris\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Europe/Paris:{start}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -880,8 +1165,110 @@ CONTACT;ALTREP=\"https://x.org/ann\":Ann <ANN@X.org>\r\nEND:VTODO\r\nEND:VCALEND
         );
         assert_eq!(
             with_start("20260329T023000"),
-            "2026-03-29T00:30:00Z",
-            "the skipped hour reads as summer time"
+            "2026-03-29T01:30:00Z",
+            "the skipped hour reads as winter time"
         );
+    }
+
+    /// The pre-2007 United States rule stops at its `UNTIL`, so the last
+    /// week of October 2026 reads under the later rule alone, in summer time.
+    #[test]
+    fn an_observance_rule_stops_at_its_until() {
+        let body = b"BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Eastern\r\n\
+BEGIN:STANDARD\r\nDTSTART:19671029T020000\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20061029T060000Z\r\nEND:STANDARD\r\n\
+BEGIN:DAYLIGHT\r\nDTSTART:20070311T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\nEND:DAYLIGHT\r\n\
+BEGIN:STANDARD\r\nDTSTART:20071104T020000\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Eastern:20261028T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(derive(body).sort_key.as_str(), "2026-10-28T16:00:00Z");
+    }
+
+    /// A rule stepping by a fixed span is followed, within its `COUNT`.
+    #[test]
+    fn an_observance_rule_stepping_weekly_is_followed() {
+        let with_count = |count: &str| {
+            let body = alloc::format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Weekly\r\n\
+BEGIN:STANDARD\r\nDTSTART:20260104T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0000\r\n\
+RRULE:FREQ=WEEKLY\r\nEND:STANDARD\r\n\
+BEGIN:DAYLIGHT\r\nDTSTART:20260101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0100\r\n\
+RRULE:FREQ=WEEKLY{count}\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Weekly:20260109T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            );
+            derive(body.as_bytes()).sort_key.0
+        };
+        assert_eq!(with_count(""), "2026-01-09T11:00:00Z", "Thursday's onset");
+        assert_eq!(
+            with_count(";COUNT=1"),
+            "2026-01-09T12:00:00Z",
+            "its first alone"
+        );
+    }
+
+    /// A `TZID` no `VTIMEZONE` defines resolves through the IANA database
+    /// by its exact name, the offset before a gap included; another
+    /// spelling reads as floating.
+    #[test]
+    fn a_tzid_without_its_vtimezone_resolves_through_the_database() {
+        let with_start = |tzid: &str, start: &str| {
+            let body = alloc::format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID={tzid}:{start}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            );
+            derive(body.as_bytes()).sort_key.0
+        };
+        assert_eq!(
+            with_start("America/New_York", "20261101T013000"),
+            "2026-11-01T05:30:00Z",
+            "the repeated hour reads as summer time"
+        );
+        assert_eq!(
+            with_start("Europe/Paris", "20260329T023000"),
+            "2026-03-29T01:30:00Z",
+            "the skipped hour reads as winter time"
+        );
+        assert_eq!(
+            with_start("europe/paris", "20260814T090000"),
+            "2026-08-14T09:00:00Z",
+            "matched byte for byte"
+        );
+    }
+
+    /// Accepting that nobody is notified marks every person of a component
+    /// naming an attendee, a server agent replaced, a long line folded, and
+    /// leaves the rest as it was: a marked person, an alarm's attendee, a
+    /// component naming none, a time zone.
+    #[test]
+    fn an_unscheduled_resource_is_scheduled_no_more() {
+        let long = "a".repeat(70);
+        let body = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Z\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:e\r\nORGANIZER;CN=\"Ann: A\":mailto:ann@x.org\r\n\
+ATTENDEE;SCHEDULE-AGENT=SERVER;RSVP=TRUE:mailto:\r\n bob@x.org\r\n\
+ATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:cid@x.org\r\n\
+ATTENDEE;CN={long}:mailto:dan@x.org\r\n\
+BEGIN:VALARM\r\nACTION:EMAIL\r\nATTENDEE:mailto:ann@x.org\r\nEND:VALARM\r\n\
+END:VEVENT\r\nBEGIN:VEVENT\r\nUID:e\r\nRECURRENCE-ID:20261010T090000Z\r\n\
+ORGANIZER:mailto:ann@x.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        assert!(scheduled(body.as_bytes()));
+
+        let unscheduled = unschedule(body.as_bytes());
+        assert!(!scheduled(&unscheduled));
+        let expected = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Z\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:e\r\nORGANIZER;CN=\"Ann: A\";SCHEDULE-AGENT=NONE:mailto:ann@x.org\r\n\
+ATTENDEE;RSVP=TRUE;SCHEDULE-AGENT=NONE:mailto:bob@x.org\r\n\
+ATTENDEE;SCHEDULE-AGENT=CLIENT:mailto:cid@x.org\r\n\
+ATTENDEE;CN={}\r\n {};SCHEDULE-AGENT=NONE:mailto:dan@x.org\r\n\
+BEGIN:VALARM\r\nACTION:EMAIL\r\nATTENDEE:mailto:ann@x.org\r\nEND:VALARM\r\n\
+END:VEVENT\r\nBEGIN:VEVENT\r\nUID:e\r\nRECURRENCE-ID:20261010T090000Z\r\n\
+ORGANIZER:mailto:ann@x.org\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            &long[..63],
+            &long[63..],
+        );
+        assert_eq!(String::from_utf8(unscheduled.clone()).unwrap(), expected);
+        assert_eq!(unschedule(&unscheduled), unscheduled, "marked once");
     }
 }

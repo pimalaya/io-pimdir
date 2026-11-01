@@ -28,12 +28,13 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 - **Several sources per item**: one shared item and a base per source, so a change one server folded in reaches the others on their next sync with no cross-merge.
 - **Typed summaries**: what a reader lists from without the body, one table per kind with the people an item names, derived the same way by every writer and checked against the format's vectors.
 - **Deduplicated bodies**: each body is stored once by content hash, so a message filed in two mailboxes costs one copy and a body already held is linked without a download.
-- **Retention**: an item every source dropped is kept, hidden and restorable until an explicit purge.
+- **Retention**: an item every source dropped is kept, hidden and restorable until an explicit purge, and an erase removes its bytes from the store's files, the search index's included.
+- **The user's alone**: a store is created with directories `0700` and files `0600`, one other users can read or write is refused, a lock file is opened without following a link, every database is opened untrusted, and an error recorded in the store is scrubbed of credentials.
 - **Action queue**: processes that do not own the store stage their bodies under the store's lock and append actions the owner applies exactly once, a create naming a key the collection holds or has queued refused at once.
 - **Change feed**: every row carries a stamp, so an index or a window folds what moved since it last looked.
 - **Three roles, three handles**: one owner that writes, any number of producers that enqueue, any number of readers that take no lock.
 - **Stable error codes**: every failure carries a kebab-case code a client maps to its own output, and no message advises deleting a store.
-- **Operator CLI**: inspect a store while a sync runs, read the trash, restore or purge, prune the queue, check consistency, collect what nothing references, dump the store.
+- **Operator CLI**: inspect a store while a sync runs, read the trash, restore, purge or erase, prune the queue, check consistency, collect what nothing references, empty the quarantine, dump the store.
 - **Conformance suite**: the specification's sync and summary vectors run against the real store in the test suite.
 
 > [!TIP]
@@ -41,16 +42,23 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 ## Specification
 
-io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard: the owner store STORAGE.md specifies, with its reader and producer profiles, and the engine SYNC.md describes. This release implements storage-draft-07 and sync-draft-06: the canonical schema and statements of that text are vendored under spec/ byte for byte and generated into the crate at build time, the summaries follow Annex A, and the engine reproduces the sync vectors. The reference index of search-draft-07 ships behind the `search` feature (off by default, enabled by the operator CLI), checked against the search vectors: with `search` alone the query language, the extraction and the refresh, an I/O-free coroutine yielding typed reads and writes, build without SQLite, so an app holding its own database keeps the same index, and with `client` too `PimdirIndex` runs it over SQLite; it is **experimental**, its API and index build free to change in a minor release.
+io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard. As STORAGE.md §17, SYNC.md §12 and SEARCH.md §12 ask, it states its conformance as:
 
-Known deviations, each bounded and stated in cairn/spec/summaries.md:
+> storage-draft-08 owner, sync-draft-07 engine, search-draft-08 indexer (canonical) and query client
 
-- Annex A.0: an encoded word in an 8-bit charset other than `iso-8859-1`, `us-ascii` and `windows-1252` is read as UTF-8, lossily, the crate depending on no charset library.
-- Annex A.1: the walk of a message's parts stops at `MIME_DEPTH_MAX` (64) levels of nesting, which Annex A states no bound for; a part nested deeper is examined neither for the attachment mark nor for an invitation.
+The owner profile holds the reader's and the producer's, and the crate offers each as a handle of its own (`PimdirReader`, `PimdirProducer`, `PimdirStore`); the engine runs the five verbs against a connector you provide, which owes SYNC.md §4 and is not part of this crate. The canonical schema, statements, payload schemas and vectors are vendored under spec/ byte for byte at the pimdir revision spec/REVISION names, the statements generated into the crate at build time, and every vector case passes (tests/pending_vectors.txt is empty). The search index ships behind the `search` feature (off by default, enabled by the operator CLI): with `search` alone the query language, the extraction and the refresh, an I/O-free coroutine yielding typed reads and writes, build without SQLite, so an app holding its own database keeps the same index, and with `client` too `PimdirIndex` runs it over SQLite; it is **experimental**, its API and index build free to change in a minor release.
+
+> [!IMPORTANT]
+> Drafts are exact: a store opens under storage-draft-08 alone. A store of any earlier draft, which every earlier release of this crate wrote, is refused by every profile and never migrated: move it aside and let its sync engine create and sync a new one.
+
+Known deviations, each bounded and stated in cairn/spec/summaries.md or cairn/spec/store.md:
+
+- Annex A.1: a build without the `charset-tables` feature (which `client` enables, so only the no_std summary alone lacks it) keeps an encoded word in a charset other than UTF-8 and windows-1252 as its literal text, having no table for it.
+- STORAGE §18 on Windows: no access list granting the user alone is set, so a store's directories and files take the one their parent directory hands down (a user profile's is its user's), and a store other users can read is not detected there.
 
 A store is created in WAL mode, which STORAGE §4.1 recommends for a local store. On a network filesystem (STORAGE §8), switch it once to a rollback journal, with no process holding it open (`sqlite3 pimdir.db 'PRAGMA journal_mode = DELETE'`): no handle of this crate sets the journal mode of an existing store again.
 
-A client that only lists a store, or only queues an action, needs the reader or the producer handle and nothing of the engine; the standard's GUIDE.md §1 says what each profile owes, and this crate's handles meet it.
+A client that only lists a store, or only queues an action, needs the reader or the producer handle and nothing of the engine; STORAGE.md §17 says what each profile owes, and this crate's handles meet it.
 
 ## Installation
 
@@ -81,8 +89,10 @@ pimdir -s ~/mail collection list
 pimdir -s ~/mail item list INBOX --retained
 pimdir -s ~/mail item restore 42
 pimdir -s ~/mail item purge --older-than 90d
+pimdir -s ~/mail item erase 42
 pimdir -s ~/mail queue list --parked
 pimdir -s ~/mail check
+pimdir -s ~/mail quarantine empty
 ```
 
 Run `pimdir --help` for the full command tree and flags, add `--json` to any command for machine-readable output, and `pimdir json-schema` describes that output. The CLI contract lives in [cairn/spec/cli.md](./cairn/spec/cli.md). The whole library API is documented on [docs.rs](https://docs.rs/io-pimdir/latest/io_pimdir).

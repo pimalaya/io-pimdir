@@ -14,7 +14,7 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    fs::{self, File},
+    fs::File,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
 };
@@ -22,7 +22,7 @@ use std::{
 use anyhow::{Result, bail};
 use clap::Args;
 use io_pimdir::{
-    client::{blobs::PimdirBlobs, reader::PimdirReader},
+    client::{blobs::PimdirBlobs, modes, reader::PimdirReader},
     object::PimdirHash,
     placement::PimdirLevel,
 };
@@ -38,8 +38,9 @@ use crate::cli::{StoreFlags, bytes, now, report, summary};
 const PAGE: usize = 500;
 
 /// The dump format's own version, bumped when its shape changes: 2 carries
-/// the summary columns and address rows where 1 carried a raw meta string.
-const FORMAT_VERSION: i64 = 2;
+/// the summary columns and address rows where 1 carried a raw meta string,
+/// and 3 lays the bodies at one shard level, as the store does.
+const FORMAT_VERSION: i64 = 3;
 
 /// Dump a store to a directory.
 ///
@@ -81,7 +82,7 @@ impl ExportCommand {
                 self.dir.display()
             );
         }
-        fs::create_dir_all(self.dir.join("items"))?;
+        modes::create_dir_all(&self.dir.join("items"))?;
 
         let mut collections = Vec::new();
         let mut hashes = BTreeSet::new();
@@ -143,7 +144,7 @@ impl ExportCommand {
             "object_bytes": object_bytes,
             "missing_objects": missing,
         });
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        create(&manifest_path)?.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
 
         printer.out(ExportOutput {
             dir: self.dir,
@@ -163,7 +164,7 @@ impl ExportCommand {
         path: &Path,
         hashes: &mut BTreeSet<String>,
     ) -> Result<u64> {
-        let mut file = BufWriter::new(File::create(path)?);
+        let mut file = BufWriter::new(create(path)?);
         let mut after: Option<(String, i64)> = None;
         let mut count = 0;
 
@@ -212,7 +213,7 @@ impl ExportCommand {
         path: &Path,
         hashes: &mut BTreeSet<String>,
     ) -> Result<u64> {
-        let mut file = BufWriter::new(File::create(path)?);
+        let mut file = BufWriter::new(create(path)?);
         let mut after: Option<i64> = None;
         let mut count = 0;
 
@@ -262,35 +263,42 @@ impl ExportCommand {
         let mut total = 0;
         let mut missing = Vec::new();
 
+        let dump = PimdirBlobs::open(&self.dir);
         for hash in hashes {
-            let Some(mut reader) = blobs.reader(&PimdirHash(hash.clone()))? else {
-                warn!("the body of object {hash} is missing from the blob store");
-                missing.push(hash.clone());
+            let hash = PimdirHash(hash.clone());
+            // NOTE: read whole and checked before a byte is copied (STORAGE
+            // §7): a body failing its name is missing, never dumped.
+            let Some(mut body) = blobs.verified(&hash)? else {
+                warn!(
+                    "the body of object {} is missing from the blob store",
+                    hash.0
+                );
+                missing.push(hash.0);
                 continue;
             };
 
-            let path = self.object_path(hash);
+            let path = dump.path(&hash)?;
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+                modes::create_dir_all(parent)?;
             }
-            let mut file = File::create(&path)?;
-            total += io::copy(&mut reader, &mut file)?;
+            let mut file = create(&path)?;
+            total += io::copy(&mut body, &mut file)?;
             file.flush()?;
             copied += 1;
         }
 
         Ok((copied, total, missing))
     }
+}
 
-    /// A body's path inside the dump, mirroring the store's own sharding.
-    fn object_path(&self, hash: &str) -> PathBuf {
-        let objects = self.dir.join("objects");
-        if hash.len() >= 4 {
-            objects.join(&hash[0..2]).join(&hash[2..4]).join(hash)
-        } else {
-            objects.join(hash)
-        }
-    }
+/// Creates or truncates a file of the dump `0600`, as the store's own (spec
+/// §18): the dump holds what the store holds.
+fn create(path: &Path) -> io::Result<File> {
+    modes::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
 }
 
 /// The detail ladder as its lowercase name (the dump never carries the column

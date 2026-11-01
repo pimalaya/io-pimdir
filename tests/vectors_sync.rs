@@ -2,9 +2,12 @@
 //! specification's vectors/sync/ is built into a real store, run through
 //! the engine against a scripted remote, and compared as parsed rows.
 //!
-//! The spec is a sibling checkout, so the suite skips when it is absent.
+//! The vectors are the vendored copy under spec/vectors/, so the suite
+//! always runs; a case a later phase fixes is on tests/pending_vectors.txt.
 
 #![cfg(feature = "client")]
+
+mod pending;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,7 +20,7 @@ use io_pimdir::{
     client::{PimdirSourceStore, PimdirStore},
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     coroutine::{PimdirArg, PimdirCoroutine, PimdirCoroutineState, PimdirYield},
-    hash::PimdirHashAlgo,
+    hash,
     mutate::PimdirMutation,
     object::{PimdirHash, PimdirObject},
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId},
@@ -39,11 +42,9 @@ use io_pimdir::{
 use rusqlite::{Connection, named_params, params};
 use serde_json::{Map, Value, json};
 
-fn spec_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .join("pimdir");
-    dir.join("vectors/sync").is_dir().then_some(dir)
+/// The specification's vectors, vendored at the revision spec/REVISION names.
+fn spec_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("spec")
 }
 
 /// Bodies by label, the store rows and the pushes name them by.
@@ -134,7 +135,7 @@ fn seed_flags(
 
 /// Seeds a store from a case's `store` object.
 fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
-    let owner = PimdirStore::open_with_hash(dir, Some(PimdirHashAlgo::Blake3)).unwrap();
+    let owner = PimdirStore::open(dir).unwrap();
     let blobs = owner.blobs();
     let stage = owner.blob_stage();
     let mut hashes = BTreeMap::new();
@@ -152,7 +153,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
     // stated `corrupt` a file whose bytes do not hash to its name (SYNC §11).
     let damaged = |object: &Value, key: &str| object[key].as_bool();
     let damage = |label: &str, object: &Value| {
-        let path = blobs.path(&bodies.hashes[label].clone().into());
+        let path = blobs.path(&bodies.hashes[label].clone().into()).unwrap();
         if damaged(object, "blob") == Some(false) {
             fs::remove_file(&path).unwrap();
         } else if damaged(object, "corrupt") == Some(true) {
@@ -428,7 +429,6 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
 struct Scripted {
     spec: PathBuf,
     kind: String,
-    algo: PimdirHashAlgo,
     bodies: Bodies,
     /// The pages still to serve, in order.
     pages: Vec<PimdirRemoteSnapshot>,
@@ -465,8 +465,11 @@ impl Scripted {
     /// The meta a member carries, read from its fixture (SYNC §11): for
     /// mail without the body, the attachment mark and the size the source
     /// states where the case states them (Annex A.1); for a file, the key
-    /// and summary its source states, the bytes saying nothing (A.7).
-    fn meta(spec: &Path, kind: &str, meta: &Value) -> PimdirRemoteMeta {
+    /// and summary its source states, the bytes saying nothing (A.7). A
+    /// member stating `carries` carries the fixture as its body, as a DAV
+    /// listing may (SYNC §4).
+    fn meta(spec: &Path, kind: &str, member: &Value) -> PimdirRemoteMeta {
+        let meta = &member["meta"];
         if kind == file::KIND {
             return PimdirRemoteMeta::new(stated_file(meta));
         }
@@ -479,7 +482,14 @@ impl Scripted {
             ),
             _ => summary::derive(kind, &body).expect("a known kind"),
         };
-        PimdirRemoteMeta::new(derivation)
+        let carried = PimdirRemoteMeta::new(derivation);
+        match member["carries"].as_bool() {
+            Some(true) => carried.with_body(PimdirFetchedBody::Inline {
+                hash: hash::hash(&body),
+                bytes: body,
+            }),
+            _ => carried,
+        }
     }
 
     /// One page as a case spells it, `snapshot` or one of `pages`.
@@ -497,7 +507,7 @@ impl Scripted {
                     handle: PimdirHandle::from(item["handle"].as_str().unwrap()),
                     flags: flags(&item["flags"]),
                     revision: item["revision"].as_str().map(String::from),
-                    meta: Self::meta(spec, kind, &item["meta"]),
+                    meta: Self::meta(spec, kind, item),
                 })
                 .collect(),
             vanished: page["vanished"]
@@ -513,6 +523,14 @@ impl Scripted {
             checkpoint: page["checkpoint"]
                 .as_str()
                 .map(|checkpoint| PimdirCheckpoint(checkpoint.as_bytes().to_vec())),
+            narrowed: page["narrowed"].as_bool().unwrap_or(false),
+            enumerated: page["enumerated"].as_array().map(|handles| {
+                handles
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(PimdirHandle::from)
+                    .collect()
+            }),
         }
     }
 
@@ -690,7 +708,7 @@ impl PimdirRemote for Scripted {
                 body: match tier {
                     PimdirTier::Meta => None,
                     PimdirTier::Full => Some(PimdirFetchedBody::Inline {
-                        hash: self.algo.hash(&body),
+                        hash: hash::hash(&body),
                         bytes: body,
                     }),
                 },
@@ -928,7 +946,13 @@ fn run(store: &mut PimdirSourceStore, case: &Value, remote: &mut Scripted) -> Ra
                 _ => PimdirTier::Meta,
             };
             store
-                .upgrade(collection, handles, tier, remote)
+                .upgrade(
+                    collection,
+                    handles,
+                    tier,
+                    (&options(&run["options"])).into(),
+                    remote,
+                )
                 .unwrap()
                 .events
         }
@@ -1256,10 +1280,7 @@ fn assert_same_pushes(label: &str, expected: &[Value], actual: &[Value]) {
 
 #[test]
 fn every_sync_vector_reproduces() {
-    let Some(spec) = spec_dir() else {
-        println!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let spec = spec_dir();
 
     let mut paths: Vec<PathBuf> = fs::read_dir(spec.join("vectors/sync"))
         .unwrap()
@@ -1269,17 +1290,14 @@ fn every_sync_vector_reproduces() {
     paths.sort();
     assert!(!paths.is_empty(), "the sync vectors carry no case");
 
-    // NOTE: every case runs, so a run names every vector it fails at once.
-    let failed: Vec<String> = paths
+    let outcomes = paths
         .iter()
-        .filter(|path| std::panic::catch_unwind(|| reproduce(&spec, path)).is_err())
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .map(|path| {
+            let case = path.file_stem().unwrap().to_string_lossy().into_owned();
+            (case, pending::check(|| reproduce(&spec, path)))
+        })
         .collect();
-    assert!(
-        failed.is_empty(),
-        "{} sync vectors fail: {failed:#?}",
-        failed.len()
-    );
+    pending::settle("sync", outcomes);
 }
 
 /// Builds one case into a store, runs it and compares what it expects.
@@ -1292,6 +1310,10 @@ fn reproduce(spec: &Path, path: &Path) {
             case["label"].as_str().unwrap_or("")
         );
         println!("{label}");
+        // NOTE: a case of another format version states fields this
+        // runner would read under another meaning, or not at all (SYNC
+        // §11), so it is refused rather than run.
+        assert_eq!(case["v"], 2, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 
@@ -1320,7 +1342,6 @@ fn reproduce(spec: &Path, path: &Path) {
         let mut remote = Scripted {
             spec: spec.to_path_buf(),
             kind,
-            algo: PimdirHashAlgo::Blake3,
             bodies: bodies.clone(),
             pages,
             interrupted_after: remote_spec["interrupted_after"]

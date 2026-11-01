@@ -13,7 +13,7 @@ use io_pimdir::{
     client::{PimdirSourceStore, PimdirStore, producer::PimdirProducer},
     codec::PimdirAction,
     collection::PimdirCollectionId,
-    hash::PimdirHashAlgo,
+    hash,
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -26,6 +26,7 @@ use io_pimdir::{
         file::{self, PimdirFileSummary},
         mail,
     },
+    upgrade::PimdirUpgradeOptions,
 };
 
 const MAIL: &str = "message/rfc822";
@@ -72,7 +73,7 @@ total=3A 42=E2=82=AC\r\n\
 const LINK: &str = "invoice-7@example.org";
 
 fn hash_of(body: &[u8]) -> PimdirHash {
-    PimdirHashAlgo::default().hash(body)
+    hash::hash(body)
 }
 
 fn store_object(body: &[u8]) -> PimdirWriteOp {
@@ -681,6 +682,7 @@ fn an_upgrade_linking_a_held_body_takes_the_columns_its_body_gave() {
             "Archive",
             vec![PimdirHandle::from("9")],
             PimdirTier::Full,
+            PimdirUpgradeOptions::default(),
             &mut Unreached,
         )
         .unwrap();
@@ -692,4 +694,36 @@ fn an_upgrade_linking_a_held_body_takes_the_columns_its_body_gave() {
         columns(&mut store, "Archive", INVITE_LINK),
         (Some(INVITE.len() as u64), Some(false), Some(UID.into()))
     );
+}
+
+/// A body is checked against its name before anything walked off it is
+/// recorded (pimdir STORAGE §7): the walk stops at the last boundary, and
+/// the rest is read for the check, so a body failing its name past that
+/// point stands for no attachment.
+#[test]
+fn a_body_failing_its_name_past_the_walk_stands_for_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+
+    // NOTE: an epilogue past the walk's first chunk, so the walk is done
+    // before the read reaching the end checks the body.
+    let epilogue = "an epilogue the walk never needs\r\n".repeat(4096);
+    let sound = [BODY, epilogue.as_bytes()].concat();
+    let mut corrupt = sound.clone();
+    let last = corrupt.len() - 3;
+    corrupt[last] ^= 1;
+    store
+        .write(vec![
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: hash_of(&sound),
+                    size: corrupt.len(),
+                },
+                body: Some(corrupt),
+            },
+            PimdirWriteOp::UpsertPlacement(placement("INBOX", "1", LINK, Some(&sound))),
+        ])
+        .unwrap();
+
+    assert!(stand_ins(&store, LINK).is_empty());
 }

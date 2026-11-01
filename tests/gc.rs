@@ -58,11 +58,7 @@ fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
 }
 
 fn blob_exists(dir: &std::path::Path, hash: &str) -> bool {
-    dir.join("objects")
-        .join(&hash[0..2])
-        .join(&hash[2..4])
-        .join(hash)
-        .exists()
+    dir.join("objects").join(&hash[0..2]).join(hash).exists()
 }
 
 /// The pattern the collector exists for: bodies stored in one batch,
@@ -77,31 +73,56 @@ fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
     // consumer streaming bodies ahead of their metadata does
     store
         .write(vec![
-            store_object("cafebabe", b"first"),
-            store_object("beef0000", b"second"),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"first",
+            ),
+            store_object(
+                "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+                b"second",
+            ),
         ])
         .unwrap();
-    assert!(blob_exists(dir.path(), "cafebabe"));
-    assert!(blob_exists(dir.path(), "beef0000"));
+    assert!(blob_exists(
+        dir.path(),
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+    ));
+    assert!(blob_exists(
+        dir.path(),
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+    ));
 
     // batch two attaches one of them, both having survived
     store
         .write(vec![PimdirWriteOp::UpsertPlacement(placement(
-            "1", "mid:a", "cafebabe",
+            "1",
+            "mid:a",
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
         ))])
         .unwrap();
     assert_eq!(
         store.list_items("INBOX", None, 10).unwrap()[0].object,
-        Some(PimdirHash("cafebabe".into()))
+        Some(PimdirHash(
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()
+        ))
     );
 
     // the one nothing attached is what a collection is for
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.objects, collected.blobs), (1, 1));
     assert_eq!(collected.bytes, 6);
-    assert!(blob_exists(dir.path(), "cafebabe"), "still referenced");
     assert!(
-        !blob_exists(dir.path(), "beef0000"),
+        blob_exists(
+            dir.path(),
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+        ),
+        "still referenced"
+    );
+    assert!(
+        !blob_exists(
+            dir.path(),
+            "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+        ),
         "referenced by nothing"
     );
 }
@@ -115,15 +136,26 @@ fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .write(vec![
-            store_object("cafebabe", b"body"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"body",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            )),
         ])
         .unwrap();
 
     // a body on disk that no batch ever indexed
-    let shard = dir.path().join("objects/de/ad");
+    let shard = dir.path().join("objects/de");
     fs::create_dir_all(&shard).unwrap();
-    fs::write(shard.join("deadbeef"), b"crashed").unwrap();
+    fs::write(
+        shard.join("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"),
+        b"crashed",
+    )
+    .unwrap();
 
     // a half-written body belongs to a writer that has not committed, so
     // the collector leaves it alone
@@ -132,8 +164,19 @@ fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.objects, collected.blobs), (0, 1));
     assert_eq!(collected.bytes, 7);
-    assert!(!shard.join("deadbeef").exists(), "the orphan is taken");
-    assert!(blob_exists(dir.path(), "cafebabe"), "the live body is not");
+    assert!(
+        !shard
+            .join("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead")
+            .exists(),
+        "the orphan is taken"
+    );
+    assert!(
+        blob_exists(
+            dir.path(),
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+        ),
+        "the live body is not"
+    );
     assert!(dir.path().join("objects/.tmp-1-1").exists(), "in flight");
 }
 
@@ -145,8 +188,15 @@ fn a_purge_retires_rows_and_the_collector_reclaims_the_bytes() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store
         .write(vec![
-            store_object("cafebabe", b"body"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"body",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            )),
         ])
         .unwrap();
     store
@@ -162,13 +212,19 @@ fn a_purge_retires_rows_and_the_collector_reclaims_the_bytes() {
         .unwrap();
     assert_eq!(purged.items, 1);
     assert!(
-        blob_exists(dir.path(), "cafebabe"),
+        blob_exists(
+            dir.path(),
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+        ),
         "released, not reclaimed"
     );
 
     let collected = store.collect_garbage().unwrap();
     assert_eq!(collected.bytes, 4);
-    assert!(!blob_exists(dir.path(), "cafebabe"));
+    assert!(!blob_exists(
+        dir.path(),
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+    ));
 }
 
 /// The repair `check --fix` runs: a drifted count settled from the
@@ -179,8 +235,15 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
     store
         .write(vec![
-            store_object("cafebabe", b"body"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe")),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"body",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            )),
         ])
         .unwrap();
 
@@ -204,7 +267,10 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
     // settled, not swept: the item still references the body, so the
     // repair leaves it at one and the collector finds nothing
     assert_eq!(store.collect_garbage().unwrap().blobs, 0);
-    assert!(blob_exists(dir.path(), "cafebabe"));
+    assert!(blob_exists(
+        dir.path(),
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+    ));
     assert_eq!(
         store.recompute_refcounts().unwrap(),
         0,

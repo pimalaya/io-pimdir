@@ -16,10 +16,15 @@
 //! field's value; anywhere else it is refused. Nothing here is FTS5
 //! syntax: the compiler escapes every token.
 //!
-//! A refused query answers one fault, found in three passes: the phrases,
-//! the parentheses, then the terms and operators in reading order. Offsets
-//! are Unicode scalar values into the query, half open, so an agent can
-//! point at the part it has to correct.
+//! A query is bounded (SEARCH §8.3): [`LENGTH_MAX`] scalar values,
+//! [`GROUPS_MAX`] groups open at once and [`TERMS_MAX`] terms, each refused
+//! as `limit-exceeded`. A refused query answers one fault, found in four
+//! passes: the length, the phrases, the parentheses with their nesting,
+//! then the terms and operators in reading order, their count among them.
+//! The descent recurses once per group, so the nesting bound, checked
+//! before it runs, bounds its depth. Offsets are Unicode scalar values into
+//! the query, half open, so an agent can point at the part it has to
+//! correct.
 
 use alloc::{
     boxed::Box,
@@ -32,9 +37,17 @@ use core::fmt;
 
 use crate::{reference::PimdirReferenceRole, summary::PimdirAddressRole};
 
-/// The most parentheses and negations a query nests: this
-/// implementation's bound, refused as `unbalanced-parenthesis` beyond.
-pub const NESTING_MAX: usize = 64;
+/// The most Unicode scalar values a query holds (SEARCH §8.3), refused
+/// from the first one past it to the end.
+pub const LENGTH_MAX: usize = 1024;
+
+/// The most groups a query holds open at once (SEARCH §8.3), the `(`
+/// opening one more refused.
+pub const GROUPS_MAX: usize = 32;
+
+/// The most terms a query holds (SEARCH §8.3), the first one past it
+/// refused before its own checks.
+pub const TERMS_MAX: usize = 128;
 
 /// Every field of SEARCH §8's table, in its order.
 pub const FIELDS: &[&str] = &[
@@ -158,6 +171,15 @@ impl PimdirQuery {
     /// Parses a query, or refuses it with what to correct (SEARCH §8.4).
     pub fn parse(query: &str) -> Result<Self, PimdirQueryError> {
         let chars: Vec<char> = query.chars().collect();
+        if chars.len() > LENGTH_MAX {
+            return Err(PimdirQueryError::new(
+                PimdirQueryErrorCode::LimitExceeded,
+                format!("The query holds more than {LENGTH_MAX} characters"),
+                LENGTH_MAX,
+                chars.len(),
+                &[],
+            ));
+        }
 
         let tokens = lex(&chars)?;
         if tokens.is_empty() {
@@ -175,8 +197,9 @@ impl PimdirQuery {
             chars: &chars,
             tokens,
             at: 0,
+            terms: 0,
         };
-        parser.disjunction(None, 0)
+        parser.disjunction(None)
     }
 
     /// Every term of the query, depth first, with whether an odd number
@@ -617,6 +640,9 @@ pub enum PimdirQueryErrorCode {
     DanglingOperator,
     /// A `*` other than a trailing prefix wildcard: `invalid-wildcard`.
     InvalidWildcard,
+    /// A query past a bound of SEARCH §8.3, its length, its nesting or
+    /// its terms: `limit-exceeded`.
+    LimitExceeded,
 }
 
 impl PimdirQueryErrorCode {
@@ -631,6 +657,7 @@ impl PimdirQueryErrorCode {
             Self::UnbalancedParenthesis => "unbalanced-parenthesis",
             Self::DanglingOperator => "dangling-operator",
             Self::InvalidWildcard => "invalid-wildcard",
+            Self::LimitExceeded => "limit-exceeded",
         }
     }
 }
@@ -750,37 +777,50 @@ fn is_separator(c: char) -> bool {
     is_space(c) || matches!(c, '(' | ')' | '"')
 }
 
-/// The second pass: refuses the leftmost parenthesis closing nothing or
-/// never closed.
+/// The parentheses pass: refuses the leftmost parenthesis closing nothing,
+/// never closed, or opening a group past [`GROUPS_MAX`] open at once.
 fn balance(tokens: &[Token]) -> Result<(), PimdirQueryError> {
     let mut open = Vec::new();
     let mut faults = Vec::new();
     for token in tokens {
-        match token.kind.clone() {
-            TokenKind::Open => open.push(token.start),
-            TokenKind::Close if open.pop().is_none() => faults.push(token.start),
+        match token.kind {
+            TokenKind::Open => {
+                if open.len() == GROUPS_MAX {
+                    faults.push((token.start, PimdirQueryErrorCode::LimitExceeded));
+                }
+                open.push(token.start);
+            }
+            TokenKind::Close if open.pop().is_none() => {
+                faults.push((token.start, PimdirQueryErrorCode::UnbalancedParenthesis));
+            }
             _ => (),
         }
     }
+    let unclosed = open
+        .into_iter()
+        .map(|start| (start, PimdirQueryErrorCode::UnbalancedParenthesis));
+    faults.extend(unclosed);
 
-    let Some(first) = faults.into_iter().chain(open).min() else {
+    let Some((first, code)) = faults.into_iter().min_by_key(|(start, _)| *start) else {
         return Ok(());
     };
-    Err(PimdirQueryError::new(
-        PimdirQueryErrorCode::UnbalancedParenthesis,
-        "This parenthesis is never closed, or closes no group",
-        first,
-        first + 1,
-        &[],
-    ))
+    let message = match code {
+        PimdirQueryErrorCode::LimitExceeded => {
+            format!("This parenthesis opens more than {GROUPS_MAX} groups at once")
+        }
+        _ => String::from("This parenthesis is never closed, or closes no group"),
+    };
+    Err(PimdirQueryError::new(code, message, first, first + 1, &[]))
 }
 
-/// The third pass: a recursive descent, `or` over `and` over `not`, each
-/// term checked as it is read.
+/// The last pass: a recursive descent, `or` over `and` over `not`, each
+/// term counted then checked as it is read.
 struct Parser<'a> {
     chars: &'a [char],
     tokens: Vec<Token>,
     at: usize,
+    /// The terms read so far.
+    terms: usize,
 }
 
 impl Parser<'_> {
@@ -801,15 +841,11 @@ impl Parser<'_> {
 
     /// `disjunction`; `expected_by` is the operator a missing operand
     /// leaves dangling.
-    fn disjunction(
-        &mut self,
-        expected_by: Option<usize>,
-        depth: usize,
-    ) -> Result<PimdirQuery, PimdirQueryError> {
-        let mut operands = vec![self.conjunction(expected_by, depth)?];
+    fn disjunction(&mut self, expected_by: Option<usize>) -> Result<PimdirQuery, PimdirQueryError> {
+        let mut operands = vec![self.conjunction(expected_by)?];
         while let Some(TokenKind::Or) = self.peek() {
             self.at += 1;
-            operands.push(self.conjunction(Some(self.at - 1), depth)?);
+            operands.push(self.conjunction(Some(self.at - 1))?);
         }
 
         Ok(match operands.len() {
@@ -818,17 +854,13 @@ impl Parser<'_> {
         })
     }
 
-    fn conjunction(
-        &mut self,
-        expected_by: Option<usize>,
-        depth: usize,
-    ) -> Result<PimdirQuery, PimdirQueryError> {
-        let mut operands = vec![self.negation(expected_by, depth)?];
+    fn conjunction(&mut self, expected_by: Option<usize>) -> Result<PimdirQuery, PimdirQueryError> {
+        let mut operands = vec![self.negation(expected_by)?];
         loop {
             match self.peek() {
                 Some(TokenKind::And) => {
                     self.at += 1;
-                    operands.push(self.negation(Some(self.at - 1), depth)?);
+                    operands.push(self.negation(Some(self.at - 1))?);
                 }
                 Some(
                     TokenKind::Open
@@ -836,7 +868,7 @@ impl Parser<'_> {
                     | TokenKind::Text(_)
                     | TokenKind::Field { .. }
                     | TokenKind::Not { .. },
-                ) => operands.push(self.negation(None, depth)?),
+                ) => operands.push(self.negation(None)?),
                 _ => break,
             }
         }
@@ -847,11 +879,7 @@ impl Parser<'_> {
         })
     }
 
-    fn negation(
-        &mut self,
-        expected_by: Option<usize>,
-        depth: usize,
-    ) -> Result<PimdirQuery, PimdirQueryError> {
+    fn negation(&mut self, expected_by: Option<usize>) -> Result<PimdirQuery, PimdirQueryError> {
         let mut first = None;
         let mut count = 0;
         while let Some(TokenKind::Not { bare }) = self.peek() {
@@ -863,18 +891,14 @@ impl Parser<'_> {
             self.at += 1;
         }
 
-        let mut node = self.primary(first.or(expected_by), depth + count)?;
+        let mut node = self.primary(first.or(expected_by))?;
         for _ in 0..count {
             node = PimdirQuery::Not(Box::new(node));
         }
         Ok(node)
     }
 
-    fn primary(
-        &mut self,
-        expected_by: Option<usize>,
-        depth: usize,
-    ) -> Result<PimdirQuery, PimdirQueryError> {
+    fn primary(&mut self, expected_by: Option<usize>) -> Result<PimdirQuery, PimdirQueryError> {
         match self.peek() {
             None | Some(TokenKind::Close | TokenKind::And | TokenKind::Or) => {
                 // NOTE: an empty query is refused before, so a missing
@@ -886,14 +910,17 @@ impl Parser<'_> {
 
         let token = self.tokens[self.at].clone();
         self.at += 1;
-        if depth >= NESTING_MAX {
-            return Err(PimdirQueryError::new(
-                PimdirQueryErrorCode::UnbalancedParenthesis,
-                format!("The query nests deeper than {NESTING_MAX} groups or negations"),
-                token.start,
-                token.end,
-                &[],
-            ));
+        if token.kind != TokenKind::Open {
+            self.terms += 1;
+            if self.terms > TERMS_MAX {
+                return Err(PimdirQueryError::new(
+                    PimdirQueryErrorCode::LimitExceeded,
+                    format!("The query holds more than {TERMS_MAX} terms"),
+                    token.start,
+                    token.end,
+                    &[],
+                ));
+            }
         }
 
         match token.kind.clone() {
@@ -908,7 +935,7 @@ impl Parser<'_> {
                         TERM_START,
                     ));
                 }
-                let inner = self.disjunction(None, depth + 1)?;
+                let inner = self.disjunction(None)?;
                 // NOTE: the parentheses balance, so this is the `)`.
                 self.at += 1;
                 Ok(inner)
@@ -1288,15 +1315,45 @@ mod tests {
         assert!(err.message.contains("quote the word"));
     }
 
+    /// Each bound of SEARCH §8.3 holds at its value and refuses one past
+    /// it: the length whatever else the query holds, the nesting beside an
+    /// unbalanced parenthesis by the leftmost, the count before the term's
+    /// own checks.
     #[test]
-    fn nesting_is_bounded() {
-        let deep = format!(
-            "{}a{}",
-            "(".repeat(NESTING_MAX + 1),
-            ")".repeat(NESTING_MAX + 1)
+    fn a_query_is_bounded_in_the_stated_pass_order() {
+        let groups = |n: usize| format!("{}a{}", "(".repeat(n), ")".repeat(n));
+        assert!(PimdirQuery::parse(&groups(GROUPS_MAX)).is_ok());
+        assert_eq!(
+            refusal(&groups(GROUPS_MAX + 1)),
+            ("limit-exceeded", GROUPS_MAX, GROUPS_MAX + 1)
         );
-        assert_eq!(refusal(&deep).0, "unbalanced-parenthesis");
-        assert!(PimdirQuery::parse(&"not ".repeat(NESTING_MAX + 1)).is_err());
+        let unbalanced = format!(") {}", groups(GROUPS_MAX + 1));
+        assert_eq!(refusal(&unbalanced), ("unbalanced-parenthesis", 0, 1));
+        let unbalanced = format!("{} )", groups(GROUPS_MAX + 1));
+        assert_eq!(
+            refusal(&unbalanced),
+            ("limit-exceeded", GROUPS_MAX, GROUPS_MAX + 1)
+        );
+
+        let terms = |n: usize| vec!["a"; n].join(" ");
+        assert!(PimdirQuery::parse(&terms(TERMS_MAX)).is_ok());
+        let past = format!("{} x:y", terms(TERMS_MAX));
+        assert_eq!(
+            refusal(&past),
+            ("limit-exceeded", 2 * TERMS_MAX, 2 * TERMS_MAX + 3)
+        );
+
+        let long = format!("\"{}", "a".repeat(LENGTH_MAX));
+        assert_eq!(
+            refusal(&long),
+            ("limit-exceeded", LENGTH_MAX, LENGTH_MAX + 1)
+        );
+        assert!(PimdirQuery::parse(&"a".repeat(LENGTH_MAX)).is_ok());
+        assert_eq!(
+            refusal(&"not ".repeat(LENGTH_MAX / 4)).0,
+            "dangling-operator",
+            "a run of negations is read without recursing"
+        );
     }
 
     #[test]

@@ -12,34 +12,29 @@
 //! than by running any implementation, so this crate can genuinely
 //! disagree with them.
 //!
-//! The spec is a sibling checkout rather than a vendored copy, so the
-//! test skips when it is absent and runs when the two sit side by side.
+//! The vectors are the vendored copy under spec/vectors/, so the suite
+//! always runs; a case a later phase fixes is on tests/pending_vectors.txt.
 
 #![cfg(feature = "client")]
 
+mod pending;
+
 use std::{fs, io::Write, path::PathBuf};
 
-use io_pimdir::object::PimdirHash;
 use io_pimdir::{
     client::{PimdirStore, blobs::PimdirBlobs},
-    hash::PimdirHashAlgo,
+    hash::{self, PimdirHasher},
+    object::PimdirHash,
 };
 use serde_json::Value;
 
-/// The canonical spec checkout, beside this one.
-fn spec_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .join("pimdir");
+/// The vectors of vectors/objects.json, vendored at the revision
+/// spec/REVISION names.
+fn vectors() -> Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("spec/vectors/objects.json");
+    let text = fs::read_to_string(path).unwrap();
 
-    dir.join("vectors/objects.json").is_file().then_some(dir)
-}
-
-fn vectors() -> Option<Value> {
-    let spec = spec_dir()?;
-    let text = fs::read_to_string(spec.join("vectors/objects.json")).unwrap();
-
-    Some(serde_json::from_str(&text).unwrap())
+    serde_json::from_str(&text).unwrap()
 }
 
 /// The body a case describes: its bytes verbatim, or the pattern the long
@@ -74,47 +69,43 @@ fn body(case: &Value) -> Vec<u8> {
     }
 }
 
-/// Object naming is the format's one MUST: every body names the same
-/// under both algorithms, and lands at the same sharded path.
+/// Object naming is the format's one MUST: every body names what the
+/// vectors say under BLAKE3, and lands at the same sharded path.
 #[test]
 fn every_body_names_what_the_format_says() {
-    let Some(vectors) = vectors() else {
-        eprintln!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let vectors = vectors();
+    assert_eq!(vectors["v"], 2, "objects.json at another version");
 
     let cases = vectors["objects"].as_array().unwrap();
     assert!(!cases.is_empty(), "the vectors carry no object");
 
-    for case in cases {
-        let label = case["label"].as_str().unwrap();
-        let body = body(case);
+    let outcomes = cases
+        .iter()
+        .map(|case| {
+            let label = case["label"].as_str().unwrap().to_string();
+            (label, pending::check(|| names(case)))
+        })
+        .collect();
+    pending::settle("objects", outcomes);
+}
 
-        for (algo, spelling) in [
-            (PimdirHashAlgo::Blake3, "blake3"),
-            (PimdirHashAlgo::Sha256_128, "sha256-128"),
-        ] {
-            let expected = &case[spelling];
-            let name = algo.hash(&body);
-            assert_eq!(
-                name.0,
-                expected["name"].as_str().unwrap(),
-                "{label} under {spelling}",
-            );
+/// One case's body names what it states, and lands at its path.
+fn names(case: &Value) {
+    let label = case["label"].as_str().unwrap();
+    let expected = &case["blake3"];
+    let name = hash::hash(&body(case));
+    assert_eq!(name.0, expected["name"].as_str().unwrap(), "{label}");
 
-            // the shard path §5 derives from the name is as normative as
-            // the name: two writers agreeing on the name and disagreeing
-            // on where it lives still never find each other's bodies.
-            // Rooted at an empty store directory, so the path reads
-            // exactly as the vectors write it.
-            let blobs = PimdirBlobs::open("", algo);
-            assert_eq!(
-                blobs.path(&PimdirHash(name.0.clone())),
-                PathBuf::from(expected["path"].as_str().unwrap()),
-                "{label} under {spelling} lands elsewhere",
-            );
-        }
-    }
+    // the shard path §5 derives from the name is as normative as the name:
+    // two writers agreeing on the name and disagreeing on where it lives
+    // still never find each other's bodies. Rooted at an empty store
+    // directory, so the path reads exactly as the vectors write it.
+    let blobs = PimdirBlobs::open("");
+    assert_eq!(
+        blobs.path(&PimdirHash(name.0.clone())).unwrap(),
+        PathBuf::from(expected["path"].as_str().unwrap()),
+        "{label} lands elsewhere",
+    );
 }
 
 /// A body fed in pieces names what the same body fed whole names.
@@ -124,29 +115,21 @@ fn every_body_names_what_the_format_says() {
 /// 1025 bytes because that is BLAKE3's chunk boundary.
 #[test]
 fn a_streamed_body_names_what_a_whole_one_names() {
-    let Some(vectors) = vectors() else {
-        eprintln!("skipped: no pimdir spec checkout beside this one");
-        return;
-    };
+    let vectors = vectors();
 
     for case in vectors["objects"].as_array().unwrap() {
         let label = case["label"].as_str().unwrap();
         let body = body(case);
 
-        for (algo, spelling) in [
-            (PimdirHashAlgo::Blake3, "blake3"),
-            (PimdirHashAlgo::Sha256_128, "sha256-128"),
-        ] {
-            let mut hasher = algo.hasher();
-            for chunk in body.chunks(7) {
-                hasher.update(chunk);
-            }
-            assert_eq!(
-                hasher.finish().0,
-                case[spelling]["name"].as_str().unwrap(),
-                "{label} under {spelling}, streamed in 7-byte pieces",
-            );
+        let mut hasher = PimdirHasher::new();
+        for chunk in body.chunks(7) {
+            hasher.update(chunk);
         }
+        assert_eq!(
+            hasher.finish().0,
+            case["blake3"]["name"].as_str().unwrap(),
+            "{label}, streamed in 7-byte pieces",
+        );
     }
 }
 
@@ -164,7 +147,7 @@ fn the_collector_unlinks_only_the_files_at_their_shard_path() {
     writer.write_all(b"orphan").unwrap();
     let orphan = writer.commit().unwrap();
     assert_eq!(orphan.size, 6);
-    let orphan = blobs.path(&blobs.hash(b"orphan"));
+    let orphan = blobs.path(&blobs.hash(b"orphan")).unwrap();
 
     // a temporary, a foreign file at the root and one inside a shard
     let objects = dir.path().join("objects");
@@ -175,9 +158,14 @@ fn the_collector_unlinks_only_the_files_at_their_shard_path() {
     let stray = orphan.parent().unwrap().join("notes.txt");
     fs::write(&stray, b"not a body either").unwrap();
 
-    assert_eq!(blobs.files().unwrap().len(), 1, "only the orphan is a body");
+    assert_eq!(
+        blobs.scan().unwrap().files.len(),
+        1,
+        "only the orphan is a body"
+    );
     let report = store.collect_garbage().unwrap();
     assert_eq!((report.objects, report.blobs, report.bytes), (0, 1, 6));
+    assert_eq!(report.strays.len(), 3, "the three are reported");
     assert!(!orphan.is_file(), "the orphan is taken");
     assert!(tmp.is_file(), "a writer's temporary is not");
     assert!(readme.is_file() && stray.is_file(), "nor a foreign file");

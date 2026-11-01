@@ -20,7 +20,7 @@ use io_pimdir::{
     client::{PimdirSourceStore, PimdirStore, reader::PimdirItem},
     collection::{PimdirCheckpoint, PimdirCollectionId},
     hub::PimdirHub,
-    load::{PimdirLoadScope, PimdirLoaded},
+    load::{PimdirLoadSelection, PimdirLoaded},
     mutate::PimdirMutation,
     object::PimdirHash,
     placement::{
@@ -35,7 +35,7 @@ use io_pimdir::{
     },
     summary::{PimdirSummary, mail::PimdirMailSummary},
     sync::{PimdirSyncOptions, PimdirSyncReport},
-    upgrade::PimdirUpgradeReport,
+    upgrade::{PimdirUpgradeOptions, PimdirUpgradeReport},
 };
 use tempfile::TempDir;
 
@@ -118,7 +118,13 @@ where
         tier: PimdirTier,
     ) -> Result<PimdirUpgradeReport, String> {
         self.store
-            .upgrade(collection, handles, tier, &mut self.remote)
+            .upgrade(
+                collection,
+                handles,
+                tier,
+                PimdirUpgradeOptions::default(),
+                &mut self.remote,
+            )
             .map_err(|err| err.to_string())
     }
 
@@ -149,7 +155,7 @@ impl Storage<'_> {
     /// Every placement of `collection`, probes included.
     pub fn rows(&self, collection: &str) -> Vec<PimdirPlacement> {
         self.0
-            .load(&collection.into(), &PimdirLoadScope::All)
+            .load(&collection.into(), &PimdirLoadSelection::All)
             .expect("the collection loads")
             .placements
     }
@@ -171,7 +177,7 @@ impl Storage<'_> {
         self.0
             .load(
                 &collection.into(),
-                &PimdirLoadScope::Handles(vec![handle.clone()]),
+                &PimdirLoadSelection::Handles(vec![handle.clone()]),
             )
             .expect("the collection loads")
             .placements
@@ -201,7 +207,7 @@ impl Storage<'_> {
 
     pub fn checkpoint(&self, collection: &str) -> Option<PimdirCheckpoint> {
         self.0
-            .load(&collection.into(), &PimdirLoadScope::Links(vec![]))
+            .load(&collection.into(), &PimdirLoadSelection::Links(vec![]))
             .expect("the collection loads")
             .checkpoint
     }
@@ -464,7 +470,7 @@ impl MemRemote {
 /// The content hash a store of the default algorithm names a body by
 /// (STORAGE §5): a body read back is checked against its name (§7).
 pub fn hash(body: &[u8]) -> PimdirHash {
-    io_pimdir::hash::PimdirHashAlgo::default().hash(body)
+    io_pimdir::hash::hash(body)
 }
 
 /// The summary the fake remote derives for a member: a mail row whose
@@ -535,6 +541,8 @@ impl PimdirRemote for MemRemote {
             last: true,
             cursor: None,
             checkpoint: Some(checkpoint),
+            narrowed: false,
+            enumerated: None,
         }))
     }
 

@@ -29,6 +29,11 @@ pub struct PimdirSearchCoverage {
     /// calendar in scope: an occurrence outside it is not seen. Always
     /// false for the store's own reads, which read no occurrence.
     pub horizon_left: bool,
+    /// For a query bounded by date, the calendar items in scope whose
+    /// occurrences a bound of SEARCH §7 cut before the range's end
+    /// (`cut_before`, SEARCH §8.2): the range does not see all of theirs.
+    /// Always zero for the store's own reads.
+    pub cut: u64,
 }
 
 impl PimdirSearchCoverage {
@@ -44,17 +49,20 @@ impl PimdirSearchCoverage {
         self.temporal.merge(&other.temporal);
         self.remote.merge(&other.remote);
         self.horizon_left |= other.horizon_left;
+        self.cut += other.cut;
     }
 
     /// Whether the answer is the whole answer: nothing bodiless or
     /// unindexed in scope, the range wholly held and inside the horizon,
-    /// and no server-side search left partial.
+    /// no series cut before its end, and no server-side search left
+    /// partial.
     pub fn is_complete(&self) -> bool {
         self.local.bodiless.values().all(|count| *count == 0)
             && self.local.unindexed == 0
             && self.temporal == PimdirSearchTemporal::Full
             && self.remote != PimdirSearchRemote::Augmented { exhaustive: false }
             && !self.horizon_left
+            && self.cut == 0
     }
 }
 
@@ -249,12 +257,14 @@ mod tests {
             ),
             remote: PimdirSearchRemote::Augmented { exhaustive: true },
             horizon_left: false,
+            cut: 1,
         };
         coverage.merge(&other);
         coverage.merge(&mail);
 
         assert_eq!(coverage.local.bodiless["message/rfc822"], 4);
         assert_eq!(coverage.local.unindexed, 3);
+        assert_eq!(coverage.cut, 1);
         assert_eq!(
             coverage.temporal,
             bounded(

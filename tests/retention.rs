@@ -14,7 +14,7 @@ use io_pimdir::{
     client::{PimdirError, PimdirStore},
     codec::PimdirAction,
     collection::{PimdirCheckpoint, PimdirCollectionId},
-    load::PimdirLoadScope,
+    load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -25,6 +25,7 @@ use io_pimdir::{
         PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot, PimdirTier,
     },
     sync::{PimdirSyncOptions, PimdirSyncReport},
+    upgrade::PimdirUpgradeOptions,
 };
 
 fn inbox() -> PimdirCollectionId {
@@ -66,11 +67,7 @@ fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
 }
 
 fn blob_exists(dir: &Path, hash: &str) -> bool {
-    dir.join("objects")
-        .join(&hash[0..2])
-        .join(&hash[2..4])
-        .join(hash)
-        .exists()
+    dir.join("objects").join(&hash[0..2]).join(hash).exists()
 }
 
 fn drop_placement(handle: &str) -> PimdirWriteOp {
@@ -100,8 +97,16 @@ fn an_expunge_retains_the_item_and_its_body() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
-            store_object("cafebabe", b"abc"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"abc",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &["\\Seen"],
+            )),
         ])
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
@@ -112,7 +117,7 @@ fn an_expunge_retains_the_item_and_its_body() {
     // gone from the sync seam and from the live reads
     assert!(
         store
-            .load(&inbox(), &PimdirLoadScope::All)
+            .load(&inbox(), &PimdirLoadSelection::All)
             .unwrap()
             .placements
             .is_empty()
@@ -128,7 +133,12 @@ fn an_expunge_retains_the_item_and_its_body() {
     assert_eq!(retained[0].link_id.0, "mid:a");
     assert!(retained[0].flags.contains("\\Seen"));
     assert_eq!(retained[0].level, PimdirLevel::Full);
-    assert_eq!(retained[0].object, Some(PimdirHash("cafebabe".into())));
+    assert_eq!(
+        retained[0].object,
+        Some(PimdirHash(
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe".into()
+        ))
+    );
     let retention = retained[0].retention.as_ref().expect("a retained row");
     assert_eq!(retention.size, Some(3));
     assert_eq!(retention.by.as_deref(), Some("local"));
@@ -140,7 +150,10 @@ fn an_expunge_retains_the_item_and_its_body() {
     assert_eq!(store.count_retained(inbox()).unwrap(), 1);
     assert_eq!(store.retained_bytes().unwrap(), 3);
     assert!(
-        blob_exists(dir.path(), "cafebabe"),
+        blob_exists(
+            dir.path(),
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+        ),
         "the retained row pins its body against the sweep"
     );
 
@@ -169,16 +182,20 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
             "INBOX",
             vec![PimdirHandle("1".into())],
             PimdirTier::Full,
+            PimdirUpgradeOptions::default(),
             &mut remote,
         )
         .unwrap();
     assert_eq!(store.count_items("INBOX").unwrap(), 1);
 
-    // the source expunges the item and the sync observes the vanish
+    // the source expunges the item and the sync observes the vanish, the
+    // caller confirming the emptied listing a round would park on
     remote.remove("1");
-    let report = store
-        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
-        .unwrap();
+    let confirmed = PimdirSyncOptions {
+        accept_absences: true,
+        ..Default::default()
+    };
+    let report = store.sync("INBOX", confirmed, &mut remote).unwrap();
     assert_eq!(report.pulled, 1, "the vanish is observed");
     assert_eq!(store.count_retained(inbox()).unwrap(), 1);
 
@@ -212,8 +229,16 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
-            store_object("cafebabe", b"abc"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &["\\Seen"])),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"abc",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &["\\Seen"],
+            )),
         ])
         .unwrap();
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
@@ -226,7 +251,7 @@ fn a_reappearing_link_id_revives_the_retained_row() {
         .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "9",
             "mid:a",
-            "cafebabe",
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
             &["\\Flagged"],
         ))])
         .unwrap();
@@ -237,15 +262,27 @@ fn a_reappearing_link_id_revives_the_retained_row() {
     assert!(items[0].flags.contains("\\Flagged"), "new content adopted");
     assert!(store.list_retained(inbox(), None, 10).unwrap().is_empty());
     assert_eq!(store.retained_bytes().unwrap(), 0);
-    assert!(blob_exists(dir.path(), "cafebabe"));
+    assert!(blob_exists(
+        dir.path(),
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+    ));
 
     // the pin hand-over was exact: retiring it again keeps the body once
     // more, and purging then reclaims it
     store.write(vec![drop_placement("9")]).unwrap();
-    assert!(blob_exists(dir.path(), "cafebabe"));
+    assert!(blob_exists(
+        dir.path(),
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+    ));
     assert!(store.purge(inbox(), seq).unwrap());
     assert_eq!(store.collect_garbage().unwrap().blobs, 1);
-    assert!(!blob_exists(dir.path(), "cafebabe"), "no refcount leak");
+    assert!(
+        !blob_exists(
+            dir.path(),
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+        ),
+        "no refcount leak"
+    );
 }
 
 #[test]
@@ -293,7 +330,7 @@ fn a_queued_add_restores_a_retained_item() {
 
     // staged as a local creation, so the next sync pushes it back
     let projected = store
-        .load(&inbox(), &PimdirLoadScope::All)
+        .load(&inbox(), &PimdirLoadSelection::All)
         .unwrap()
         .placements;
     assert_eq!(projected.len(), 1);
@@ -306,10 +343,26 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
-            store_object("cafebabe", b"abc"),
-            store_object("beef0000", b"defgh"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
-            PimdirWriteOp::UpsertPlacement(placement("2", "mid:b", "beef0000", &[])),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"abc",
+            ),
+            store_object(
+                "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+                b"defgh",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &[],
+            )),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "2",
+                "mid:b",
+                "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+                &[],
+            )),
         ])
         .unwrap();
     let live = store.list_items("INBOX", None, 10).unwrap();
@@ -324,12 +377,18 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
     assert_eq!(store.count_retained(inbox()).unwrap(), 0);
     assert_eq!(store.collect_garbage().unwrap().blobs, 1);
     assert!(
-        !blob_exists(dir.path(), "cafebabe"),
+        !blob_exists(
+            dir.path(),
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+        ),
         "the last reference went with the row"
     );
     // the other item is untouched, body included
     assert_eq!(store.count_items("INBOX").unwrap(), 1);
-    assert!(blob_exists(dir.path(), "beef0000"));
+    assert!(blob_exists(
+        dir.path(),
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+    ));
     assert!(store.get_item("INBOX", seq_b).unwrap().is_some());
 
     // purging what is already gone reports nothing to purge
@@ -342,12 +401,36 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
-            store_object("cafebabe", b"old"),
-            store_object("beef0000", b"edge"),
-            store_object("d0d00000", b"recent"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:old", "cafebabe", &[])),
-            PimdirWriteOp::UpsertPlacement(placement("2", "mid:edge", "beef0000", &[])),
-            PimdirWriteOp::UpsertPlacement(placement("3", "mid:new", "d0d00000", &[])),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"old",
+            ),
+            store_object(
+                "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+                b"edge",
+            ),
+            store_object(
+                "dodododododododododododododododododododododododododo",
+                b"recent",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:old",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &[],
+            )),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "2",
+                "mid:edge",
+                "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+                &[],
+            )),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "3",
+                "mid:new",
+                "dodododododododododododododododododododododododododo",
+                &[],
+            )),
         ])
         .unwrap();
     store
@@ -376,7 +459,10 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     assert_eq!(report.items, 1, "only the January one");
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.blobs, collected.bytes), (1, 3));
-    assert!(!blob_exists(dir.path(), "cafebabe"));
+    assert!(!blob_exists(
+        dir.path(),
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+    ));
     let kept: Vec<String> = store
         .list_retained(inbox(), None, 10)
         .unwrap()
@@ -384,8 +470,14 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
         .map(|item| item.link_id.0)
         .collect();
     assert_eq!(kept, ["mid:edge", "mid:new"]);
-    assert!(blob_exists(dir.path(), "beef0000"));
-    assert!(blob_exists(dir.path(), "d0d00000"));
+    assert!(blob_exists(
+        dir.path(),
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+    ));
+    assert!(blob_exists(
+        dir.path(),
+        "dodododododododododododododododododododododododododo"
+    ));
 
     // a cutoff past every stamp empties the trash
     let report = store
@@ -396,8 +488,14 @@ fn purge_retained_before_respects_the_cutoff_boundary() {
     assert_eq!(store.retained_bytes().unwrap(), 0);
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.blobs, collected.bytes), (2, 10));
-    assert!(!blob_exists(dir.path(), "beef0000"));
-    assert!(!blob_exists(dir.path(), "d0d00000"));
+    assert!(!blob_exists(
+        dir.path(),
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+    ));
+    assert!(!blob_exists(
+        dir.path(),
+        "dodododododododododododododododododododododododododo"
+    ));
 }
 
 #[test]
@@ -410,15 +508,23 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
 
     left.write(vec![
-        store_object("cafebabe", b"abc"),
-        PimdirWriteOp::UpsertPlacement(placement("L1", "mid:a", "cafebabe", &["\\Seen"])),
+        store_object(
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            b"abc",
+        ),
+        PimdirWriteOp::UpsertPlacement(placement(
+            "L1",
+            "mid:a",
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+            &["\\Seen"],
+        )),
     ])
     .unwrap();
     right
         .write(vec![PimdirWriteOp::UpsertPlacement(placement(
             "R1",
             "mid:a",
-            "cafebabe",
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
             &["\\Seen"],
         ))])
         .unwrap();
@@ -427,7 +533,7 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     // is a tombstone rather than retained
     left.write(vec![drop_placement("L1")]).unwrap();
     let projected = right
-        .load(&inbox(), &PimdirLoadScope::All)
+        .load(&inbox(), &PimdirLoadSelection::All)
         .unwrap()
         .placements;
     assert_eq!(projected.len(), 1);
@@ -451,7 +557,7 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
         .unwrap();
     assert!(
         right
-            .load(&inbox(), &PimdirLoadScope::All)
+            .load(&inbox(), &PimdirLoadSelection::All)
             .unwrap()
             .placements
             .is_empty()
@@ -466,7 +572,10 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
         Some("right"),
         "the source whose removal retired it"
     );
-    assert!(blob_exists(dir.path(), "cafebabe"));
+    assert!(blob_exists(
+        dir.path(),
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+    ));
 }
 
 #[test]
@@ -475,10 +584,28 @@ fn the_retained_page_is_keyed_on_seq_and_exclusive() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
-            store_object("cafebabe", b"shared"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:a", "cafebabe", &[])),
-            PimdirWriteOp::UpsertPlacement(placement("2", "mid:b", "cafebabe", &[])),
-            PimdirWriteOp::UpsertPlacement(placement("3", "mid:c", "cafebabe", &[])),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"shared",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:a",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &[],
+            )),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "2",
+                "mid:b",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &[],
+            )),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "3",
+                "mid:c",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &[],
+            )),
         ])
         .unwrap();
     store
@@ -526,15 +653,9 @@ impl MemRemote {
     }
 }
 
-/// A stable, store-agnostic content hash for the fake bodies: the store
-/// is hash-agnostic, and only stability matters here.
+/// The content hash of a fake body, as the store names it.
 fn fake_hash(body: &[u8]) -> PimdirHash {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in body {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    PimdirHash(format!("{hash:016x}"))
+    io_pimdir::hash::hash(body)
 }
 
 impl PimdirRemote for MemRemote {
@@ -615,16 +736,32 @@ fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("dav");
     store
         .write(vec![
-            store_object("cafebabe", b"BEGIN:VCARD\r\nFN:A\r\nEND:VCARD\r\n"),
-            PimdirWriteOp::UpsertPlacement(placement("card.vcf", "hash:aaaa", "cafebabe", &[])),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"BEGIN:VCARD\r\nFN:A\r\nEND:VCARD\r\n",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "card.vcf",
+                "hash:aaaa",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &[],
+            )),
         ])
         .unwrap();
     let old_seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
 
     store
         .write(vec![
-            store_object("beef0000", b"BEGIN:VCARD\r\nFN:B\r\nEND:VCARD\r\n"),
-            PimdirWriteOp::UpsertPlacement(placement("card.vcf", "hash:bbbb", "beef0000", &[])),
+            store_object(
+                "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+                b"BEGIN:VCARD\r\nFN:B\r\nEND:VCARD\r\n",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "card.vcf",
+                "hash:bbbb",
+                "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+                &[],
+            )),
         ])
         .unwrap();
 
@@ -634,7 +771,7 @@ fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
     assert_eq!(live[0].link_id.0, "hash:bbbb");
     assert_ne!(live[0].seq, old_seq, "a derived key draws its own seq");
     let projected = store
-        .load(&inbox(), &PimdirLoadScope::All)
+        .load(&inbox(), &PimdirLoadSelection::All)
         .unwrap()
         .placements;
     assert_eq!(projected.len(), 1, "the handle names one item");
@@ -654,7 +791,10 @@ fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
     );
     assert_eq!(store.collect_garbage().unwrap().blobs, 0);
     assert!(
-        blob_exists(dir.path(), "cafebabe"),
+        blob_exists(
+            dir.path(),
+            "cafebabecafebabecafebabecafebabecafebabecafebabecafe"
+        ),
         "retention pins the body"
     );
 
@@ -663,7 +803,7 @@ fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
     let collision = store.write(vec![PimdirWriteOp::UpsertPlacement(placement(
         "other.vcf",
         "hash:bbbb",
-        "beef0000",
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
         &[],
     ))]);
     assert!(
@@ -674,7 +814,7 @@ fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
 
 /// The name a body is filed under in a store of the default algorithm.
 fn store_hash(body: &[u8]) -> String {
-    io_pimdir::hash::PimdirHashAlgo::default().hash(body).0
+    io_pimdir::hash::hash(body).0
 }
 
 /// A purge cutoff is an instant written as the stamps are (STORAGE §11.2):
@@ -687,8 +827,16 @@ fn a_purge_cutoff_not_written_as_the_stamps_are_is_refused() {
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
     store
         .write(vec![
-            store_object("cafebabe", b"old"),
-            PimdirWriteOp::UpsertPlacement(placement("1", "mid:old", "cafebabe", &[])),
+            store_object(
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                b"old",
+            ),
+            PimdirWriteOp::UpsertPlacement(placement(
+                "1",
+                "mid:old",
+                "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+                &[],
+            )),
         ])
         .unwrap();
     store.write(vec![drop_placement("1")]).unwrap();

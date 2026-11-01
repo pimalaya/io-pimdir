@@ -55,6 +55,7 @@ use crate::cli::{
     gc::GcCommand,
     item::ItemCommand,
     json_schema,
+    quarantine::QuarantineCommand,
     queue::QueueCommand,
     search::{CountCommand, IndexCommand, SearchCommand, ShowCommand, TagCommand, ThreadCommand},
     store::StoreCommand,
@@ -98,7 +99,7 @@ enum Command {
     /// Inspect the store's collections (mailboxes, address books, calendars).
     #[command(subcommand, alias = "collections")]
     Collection(CollectionCommand),
-    /// Inspect, restore and purge items.
+    /// Inspect, restore, purge and erase items.
     #[command(subcommand, alias = "items")]
     Item(ItemCommand),
     /// Inspect and prune the action queue.
@@ -111,6 +112,9 @@ enum Command {
     Check(CheckCommand),
     /// Reclaim what nothing references any more.
     Gc(GcCommand),
+    /// Empty the bodies that failed their name.
+    #[command(subcommand, alias = "quarantines")]
+    Quarantine(QuarantineCommand),
     /// Dump the store to a directory.
     Export(ExportCommand),
     /// Fold the store's changes into its search index.
@@ -143,6 +147,7 @@ impl Command {
             Self::Store(cmd) => cmd.execute(printer, store),
             Self::Check(cmd) => cmd.execute(printer, store),
             Self::Gc(cmd) => cmd.execute(printer, store),
+            Self::Quarantine(cmd) => cmd.execute(printer, store),
             Self::Export(cmd) => cmd.execute(printer, store),
             Self::Index(cmd) => cmd.execute(printer, store),
             Self::Search(cmd) => cmd.execute(printer, store),

@@ -7,13 +7,19 @@
 
 use core::fmt;
 
-use alloc::string::{String, ToString};
+use alloc::{
+    collections::BTreeSet,
+    format,
+    string::{String, ToString},
+};
 
 use serde_json::{Map, Value, json};
 
 use crate::{
+    capability,
     collection::PimdirCollectionId,
     hub::PimdirHubConflict,
+    intent::{self, PimdirCollectionCreate, PimdirInvitation, PimdirSubmit},
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
 };
@@ -49,9 +55,8 @@ pub fn level_to_int(level: PimdirLevel) -> i64 {
     }
 }
 
-/// The inverse of [`level_to_int`]: `2` is `Full`, and anything else
-/// `Meta`, the `0` an earlier draft wrote for a probed or pulled row
-/// included (STORAGE §13), a claim the next upgrade revisits.
+/// The inverse of [`level_to_int`]: `2` is `Full` and `1` `Meta`, the
+/// only two the schema holds (STORAGE §13).
 pub fn level_from_int(value: i64) -> PimdirLevel {
     match value {
         2 => PimdirLevel::Full,
@@ -100,9 +105,10 @@ pub enum PimdirAction {
     Add {
         /// The item's key; `None` derives it from the body.
         link_id: Option<PimdirLinkId>,
-        /// The initial flag set.
+        /// The initial flag set, known: an unknown one is no payload.
         flags: PimdirFlags,
-        /// The body's hash, written durably by the producer before enqueueing.
+        /// The body's hash, written durably by the producer before
+        /// enqueueing; a payload requires it, so `None` is refused there.
         object: Option<PimdirHash>,
         /// The item this one replaces (§15.3): applied with its tombstone in
         /// one transaction, its delete held until this add is pushed.
@@ -154,16 +160,20 @@ pub enum PimdirAction {
         /// The source the user chose.
         source: Option<String>,
     },
-    /// An application's own intent, which the store skips rather than parks.
+    /// An intent, of Annex B.2 or an application's own, which the store
+    /// skips rather than applies.
     ///
     /// The owner that recognises the kind performs it out of band and
-    /// acknowledges it by dropping the row.
+    /// acknowledges it by dropping the row. An Annex B.2 intent is read
+    /// strictly by its type in [`crate::intent`], a malformed one parked.
     Unknown {
         /// The raw `queue.action` kind.
         kind: String,
         /// The raw versioned JSON payload, verbatim.
         payload: String,
-        /// The body the payload's `object` field pins, by the shared convention.
+        /// The body the row pins, its `queue.object_hash` (§15.3): what a
+        /// producer building the action and the queue reads set, `None`
+        /// from [`action_from_payload`], which reads the payload alone.
         object_hash: Option<PimdirHash>,
     },
 }
@@ -227,18 +237,23 @@ impl PimdirAction {
     }
 }
 
-/// A malformed action payload, which the owner parks the row with.
+/// A malformed action payload (STORAGE §15.3), which a producer refuses
+/// at the enqueue and the owner parks the row with, naming the member.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirActionError {
     /// The payload is not a JSON object.
     Json,
     /// The payload's leading `v` is missing or unsupported.
     UnknownVersion(Option<i64>),
-    /// A required field is missing or has the wrong shape.
+    /// A member the payload's schema requires is missing.
     MissingField(&'static str),
-    /// A field breaks a rule of its intent (Annex B.2).
+    /// A member the payload's version does not define, by its name: a
+    /// payload changing shape takes the next `v`.
+    UnknownField(String),
+    /// A member is of another type than its schema states, or breaks a
+    /// rule of its action or intent (Annex B.2).
     Invalid {
-        /// The field.
+        /// The member.
         field: &'static str,
         /// The rule it breaks.
         reason: &'static str,
@@ -254,6 +269,12 @@ impl fmt::Display for PimdirActionError {
             Self::MissingField(field) => {
                 write!(f, "Pimdir action payload misses field: {field}")
             }
+            Self::UnknownField(field) => {
+                write!(
+                    f,
+                    "Pimdir action payload holds field {field}, which its version does not define"
+                )
+            }
             Self::Invalid { field, reason } => {
                 write!(
                     f,
@@ -267,6 +288,10 @@ impl fmt::Display for PimdirActionError {
 impl core::error::Error for PimdirActionError {}
 
 /// Encodes an action to its versioned JSON payload (`v: 1`).
+///
+/// What the action holds is written as it is: an `add` with no `object`
+/// or an unknown flag set encodes to a payload [`action_from_payload`]
+/// refuses, which is how a producer refuses it at the enqueue.
 pub fn action_to_payload(action: &PimdirAction) -> String {
     if let PimdirAction::Unknown { payload, .. } = action {
         return payload.clone();
@@ -330,58 +355,101 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
     Value::Object(map).to_string()
 }
 
-/// Decodes a kind and its payload, strictly: a malformed payload is an
-/// error the owner parks with, an unknown kind an intent it skips.
+/// Decodes a kind and its payload strictly, as payloads/ types it at
+/// `v: 1` (STORAGE §15.3): a member missing, of another type, breaking its
+/// rule or one the version does not define is an error the owner parks
+/// with and a producer refuses at the enqueue, a version it does not know
+/// one it skips.
+///
+/// An intent of Annex B.2 is read whole by its type in [`crate::intent`]
+/// and kept as [`PimdirAction::Unknown`], as is an application's own kind,
+/// read as a JSON object alone. Neither names its body here: that is the
+/// row's `queue.object_hash`, which the queue reads fill in.
 pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, PimdirActionError> {
-    let value: Value = serde_json::from_str(payload).map_err(|_| PimdirActionError::Json)?;
-    let map = value.as_object().ok_or(PimdirActionError::Json)?;
+    let action = match kind {
+        "add" => {
+            let map = members(payload, &["link_id", "flags", "object", "supersedes"])?;
+            PimdirAction::Add {
+                link_id: label(map.get("link_id"), "link_id")?.map(PimdirLinkId),
+                flags: required(flags(map.get("flags"), "flags")?, "flags")?,
+                object: Some(required(hash(map.get("object"), "object")?, "object")?),
+                supersedes: supersedes(map.get("supersedes"))?,
+            }
+        }
+        "set-flags" => {
+            let map = members(payload, &["seq", "flags"])?;
+            PimdirAction::SetFlags {
+                seq: required(seq(map.get("seq"), "seq")?, "seq")?,
+                flags: required(flags(map.get("flags"), "flags")?, "flags")?,
+            }
+        }
+        "remove" => {
+            let map = members(payload, &["seq"])?;
+            PimdirAction::Remove {
+                seq: required(seq(map.get("seq"), "seq")?, "seq")?,
+            }
+        }
+        "move" | "copy" => {
+            let map = members(payload, &["seq", "to"])?;
+            let seq = required(seq(map.get("seq"), "seq")?, "seq")?;
+            let to = PimdirCollectionId(required(label(map.get("to"), "to")?, "to")?);
+            match kind {
+                "move" => PimdirAction::Move { seq, to },
+                _ => PimdirAction::Copy { seq, to },
+            }
+        }
+        "update" => {
+            let map = members(payload, &["seq", "object", "if_match"])?;
+            PimdirAction::Update {
+                seq: required(seq(map.get("seq"), "seq")?, "seq")?,
+                object: required(hash(map.get("object"), "object")?, "object")?,
+                if_match: hash(map.get("if_match"), "if_match")?,
+            }
+        }
+        "set-performer" => {
+            let map = members(payload, &["capability", "source"])?;
+            let capability = required(text(map.get("capability"), "capability")?, "capability")?;
+            if !capability::is_name(&capability) {
+                return Err(PimdirActionError::Invalid {
+                    field: "capability",
+                    reason: "a capability is lowercase words of letters, digits and hyphens joined by periods",
+                });
+            }
+            PimdirAction::SetPerformer {
+                capability,
+                source: label(map.get("source"), "source")?,
+            }
+        }
+        _ => {
+            // NOTE: read for its errors alone, the payload kept verbatim.
+            match kind {
+                intent::SUBMIT => {
+                    PimdirSubmit::from_payload(payload)?;
+                }
+                intent::CALENDAR_REPLY | intent::CALENDAR_CANCEL => {
+                    PimdirInvitation::from_payload(kind, payload)?;
+                }
+                intent::COLLECTION_CREATE => {
+                    PimdirCollectionCreate::from_payload(payload)?;
+                }
+                _ => {
+                    members_any(payload)?;
+                }
+            }
+            PimdirAction::Unknown {
+                kind: kind.to_string(),
+                payload: payload.to_string(),
+                object_hash: None,
+            }
+        }
+    };
 
-    let version = map.get("v").and_then(Value::as_i64);
-    if version != Some(1) {
-        return Err(PimdirActionError::UnknownVersion(version));
-    }
-
-    match kind {
-        "add" => Ok(PimdirAction::Add {
-            link_id: get_string(map, "link_id")?.map(PimdirLinkId),
-            flags: flags_from_value(map.get("flags")),
-            object: get_string(map, "object")?.map(PimdirHash),
-            supersedes: get_supersedes(map)?,
-        }),
-        "set-flags" => Ok(PimdirAction::SetFlags {
-            seq: require_seq(map)?,
-            flags: flags_from_value(map.get("flags")),
-        }),
-        "remove" => Ok(PimdirAction::Remove {
-            seq: require_seq(map)?,
-        }),
-        "move" => Ok(PimdirAction::Move {
-            seq: require_seq(map)?,
-            to: PimdirCollectionId(require_string(map, "to")?),
-        }),
-        "copy" => Ok(PimdirAction::Copy {
-            seq: require_seq(map)?,
-            to: PimdirCollectionId(require_string(map, "to")?),
-        }),
-        "update" => Ok(PimdirAction::Update {
-            seq: require_seq(map)?,
-            object: PimdirHash(require_string(map, "object")?),
-            if_match: get_string(map, "if_match")?.map(PimdirHash),
-        }),
-        "set-performer" => Ok(PimdirAction::SetPerformer {
-            capability: require_string(map, "capability")?,
-            source: get_string(map, "source")?,
-        }),
-        other => Ok(PimdirAction::Unknown {
-            kind: other.to_string(),
-            payload: payload.to_string(),
-            object_hash: get_string(map, "object")?.map(PimdirHash),
-        }),
-    }
+    Ok(action)
 }
 
-/// A flag set as a JSON array, `null` for an unknown one: an action states
-/// an intent, and an unknown set must not read as clearing every flag.
+/// A flag set as a JSON array, `null` for an unknown one, which no payload
+/// at `v: 1` holds: an unknown set must not read as clearing every flag,
+/// so an action carrying one is refused rather than queued.
 fn flags_to_value(flags: &PimdirFlags) -> Value {
     match flags.known() {
         None => Value::Null,
@@ -389,67 +457,168 @@ fn flags_to_value(flags: &PimdirFlags) -> Value {
     }
 }
 
-fn flags_from_value(value: Option<&Value>) -> PimdirFlags {
+/// The members of a payload at `v: 1`, each one of `defined` or `v`: a
+/// payload that is no JSON object, states another version or holds a
+/// member its version does not define is refused, the version first, so
+/// a later producer's payload is skipped rather than parked (§15.2).
+pub(crate) fn members(
+    payload: &str,
+    defined: &[&str],
+) -> Result<Map<String, Value>, PimdirActionError> {
+    let map = members_any(payload)?;
+
+    let undefined = map
+        .keys()
+        .find(|member| *member != "v" && !defined.contains(&member.as_str()));
+    if let Some(member) = undefined {
+        return Err(PimdirActionError::UnknownField(member.clone()));
+    }
+
+    Ok(map)
+}
+
+/// The members of a payload at `v: 1`, whatever they are: an
+/// application's own kind, whose schema the store does not know.
+fn members_any(payload: &str) -> Result<Map<String, Value>, PimdirActionError> {
+    let value: Value = serde_json::from_str(payload).map_err(|_| PimdirActionError::Json)?;
+    let Value::Object(map) = value else {
+        return Err(PimdirActionError::Json);
+    };
+
+    let version = map.get("v").and_then(Value::as_i64);
+    if version != Some(1) {
+        return Err(PimdirActionError::UnknownVersion(version));
+    }
+
+    Ok(map)
+}
+
+/// A member the schema requires.
+pub(crate) fn required<T>(value: Option<T>, field: &'static str) -> Result<T, PimdirActionError> {
+    value.ok_or(PimdirActionError::MissingField(field))
+}
+
+/// A `text` member: any string.
+pub(crate) fn text(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<String>, PimdirActionError> {
     match value {
-        None | Some(Value::Null) => PimdirFlags::Unknown,
-        Some(value) => PimdirFlags::Known(
-            value
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
+        None => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(PimdirActionError::Invalid {
+            field,
+            reason: "a string is expected",
+        }),
     }
 }
 
-fn get_string(
-    map: &Map<String, Value>,
+/// A `key`, `id`, `collection`, `addr` or `label` member: a non-empty
+/// string.
+pub(crate) fn label(
+    value: Option<&Value>,
     field: &'static str,
 ) -> Result<Option<String>, PimdirActionError> {
-    match map.get(field) {
+    let label = text(value, field)?;
+    if label.as_deref() == Some("") {
+        return Err(PimdirActionError::Invalid {
+            field,
+            reason: "a non-empty string is expected",
+        });
+    }
+    Ok(label)
+}
+
+/// An `n` member: an integer from 1, the public id it names.
+pub(crate) fn seq(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<i64>, PimdirActionError> {
+    match value {
         None => Ok(None),
-        Some(value) => match value.as_str() {
-            Some(text) => Ok(Some(text.to_string())),
-            None => Err(PimdirActionError::MissingField(field)),
+        Some(value) => match value.as_i64() {
+            Some(seq) if seq >= 1 => Ok(Some(seq)),
+            _ => Err(PimdirActionError::Invalid {
+                field,
+                reason: "an integer from 1 is expected",
+            }),
         },
     }
 }
 
-fn require_string(
-    map: &Map<String, Value>,
+/// A `hash` member: an object name (§5), never a path.
+fn hash(
+    value: Option<&Value>,
     field: &'static str,
-) -> Result<String, PimdirActionError> {
-    get_string(map, field)?.ok_or(PimdirActionError::MissingField(field))
-}
-
-/// An `add`'s `supersedes`, strictly: absent is none, anything but an
-/// object naming a collection and a seq is malformed and parks the row.
-fn get_supersedes(map: &Map<String, Value>) -> Result<Option<PimdirSupersedes>, PimdirActionError> {
-    let Some(value) = map.get("supersedes") else {
+) -> Result<Option<PimdirHash>, PimdirActionError> {
+    let Some(hash) = text(value, field)?.map(PimdirHash) else {
         return Ok(None);
     };
-    let field = PimdirActionError::MissingField("supersedes");
-    let inner = value.as_object().ok_or(field.clone())?;
-    let collection = inner
-        .get("collection")
-        .and_then(Value::as_str)
-        .ok_or(field.clone())?;
-    let seq = inner.get("seq").and_then(Value::as_i64).ok_or(field)?;
-    Ok(Some(PimdirSupersedes {
-        collection: PimdirCollectionId(collection.to_string()),
-        seq,
-    }))
+    if !hash.is_name() {
+        return Err(PimdirActionError::Invalid {
+            field,
+            reason: "an object name is expected, 52 characters of a to z and 2 to 7",
+        });
+    }
+    Ok(Some(hash))
 }
 
-fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
-    map.get("seq")
-        .and_then(Value::as_i64)
-        .ok_or(PimdirActionError::MissingField("seq"))
+/// A `[…]` member: a flag set as distinct flags, each one the store holds
+/// (§13).
+fn flags(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<PimdirFlags>, PimdirActionError> {
+    let invalid = PimdirActionError::Invalid {
+        field,
+        reason: "an array of distinct flags of printable ASCII is expected",
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Value::Array(items) = value else {
+        return Err(invalid);
+    };
+
+    let mut flags = BTreeSet::new();
+    for item in items {
+        match item.as_str() {
+            Some(flag) if is_flag(flag) && flags.insert(flag.to_string()) => {}
+            _ => return Err(invalid),
+        }
+    }
+
+    Ok(Some(PimdirFlags::Known(flags)))
+}
+
+/// An `add`'s `supersedes`: absent is none, else an object naming exactly
+/// a collection and a seq.
+fn supersedes(value: Option<&Value>) -> Result<Option<PimdirSupersedes>, PimdirActionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Value::Object(inner) = value else {
+        return Err(PimdirActionError::Invalid {
+            field: "supersedes",
+            reason: "an object naming a collection and a seq is expected",
+        });
+    };
+
+    let undefined = inner
+        .keys()
+        .find(|member| !matches!(member.as_str(), "collection" | "seq"));
+    if let Some(member) = undefined {
+        return Err(PimdirActionError::UnknownField(format!(
+            "supersedes.{member}"
+        )));
+    }
+
+    let collection = label(inner.get("collection"), "supersedes.collection")?;
+    let seq = seq(inner.get("seq"), "supersedes.seq")?;
+    Ok(Some(PimdirSupersedes {
+        collection: PimdirCollectionId(required(collection, "supersedes.collection")?),
+        seq: required(seq, "supersedes.seq")?,
+    }))
 }
 
 #[cfg(test)]
@@ -510,7 +679,6 @@ mod tests {
         for level in [PimdirLevel::Meta, PimdirLevel::Full] {
             assert_eq!(level_from_int(level_to_int(level)), level);
         }
-        assert_eq!(level_from_int(0), PimdirLevel::Meta);
         for policy in [
             PimdirHubConflict::Manual,
             PimdirHubConflict::PreferIncoming,
@@ -520,20 +688,42 @@ mod tests {
         }
     }
 
+    /// The object names of the empty body and of `len-1` (objects.json).
+    const EMPTY: &str = "v4jutopv7gq2nicajxvdnxgjjgn4wjojvxarfn6mtkj4vza7gjra";
+    const LEN_1: &str = "fu5n5x7rdnq7cteiny227ibwonw43b5hjut3lqkrais5b5ms4ijq";
+
     #[test]
     fn a_malformed_supersedes_is_refused_and_an_absent_one_is_none() {
-        for payload in [
-            r#"{"v":1,"flags":[],"supersedes":"inbox"}"#,
-            r#"{"v":1,"flags":[],"supersedes":{"seq":3}}"#,
-            r#"{"v":1,"flags":[],"supersedes":{"collection":"inbox","seq":"3"}}"#,
-        ] {
-            assert_eq!(
-                action_from_payload("add", payload),
-                Err(PimdirActionError::MissingField("supersedes")),
-                "{payload}"
-            );
-        }
-        let plain = action_from_payload("add", r#"{"v":1,"flags":[]}"#).unwrap();
+        let refused = |supersedes: &str| {
+            let payload =
+                format!(r#"{{"v":1,"flags":[],"object":"{EMPTY}","supersedes":{supersedes}}}"#);
+            action_from_payload("add", &payload).unwrap_err()
+        };
+        assert!(matches!(
+            refused(r#""inbox""#),
+            PimdirActionError::Invalid {
+                field: "supersedes",
+                ..
+            }
+        ));
+        assert_eq!(
+            refused(r#"{"seq":3}"#),
+            PimdirActionError::MissingField("supersedes.collection")
+        );
+        assert!(matches!(
+            refused(r#"{"collection":"inbox","seq":"3"}"#),
+            PimdirActionError::Invalid {
+                field: "supersedes.seq",
+                ..
+            }
+        ));
+        assert_eq!(
+            refused(r#"{"collection":"inbox","seq":3,"by":"me"}"#),
+            PimdirActionError::UnknownField("supersedes.by".into())
+        );
+
+        let payload = format!(r#"{{"v":1,"flags":[],"object":"{EMPTY}"}}"#);
+        let plain = action_from_payload("add", &payload).unwrap();
         assert!(matches!(
             plain,
             PimdirAction::Add {
@@ -549,13 +739,13 @@ mod tests {
             PimdirAction::Add {
                 link_id: Some(PimdirLinkId("mid:new".into())),
                 flags: PimdirFlags::from_iter(["\\Draft"]),
-                object: Some(PimdirHash("cafebabe".into())),
+                object: Some(PimdirHash(EMPTY.into())),
                 supersedes: None,
             },
             PimdirAction::Add {
                 link_id: None,
                 flags: PimdirFlags::default(),
-                object: None,
+                object: Some(PimdirHash(LEN_1.into())),
                 supersedes: Some(PimdirSupersedes {
                     collection: PimdirCollectionId("Inbox".into()),
                     seq: 3,
@@ -576,13 +766,17 @@ mod tests {
             },
             PimdirAction::Update {
                 seq: 8,
-                object: PimdirHash("beef0000".into()),
+                object: PimdirHash(LEN_1.into()),
                 if_match: None,
             },
             PimdirAction::Update {
                 seq: 9,
-                object: PimdirHash("beef0000".into()),
-                if_match: Some(PimdirHash("cafebabe".into())),
+                object: PimdirHash(LEN_1.into()),
+                if_match: Some(PimdirHash(EMPTY.into())),
+            },
+            PimdirAction::SetPerformer {
+                capability: "mail.submit".into(),
+                source: Some("smtp".into()),
             },
         ];
         for action in actions {
@@ -593,25 +787,132 @@ mod tests {
         }
     }
 
+    /// What no payload at `v: 1` holds encodes to one the decode refuses,
+    /// so a producer re-reading its own payload refuses the action.
     #[test]
-    fn a_malformed_payload_errors_and_a_foreign_kind_survives_whole() {
-        assert_eq!(
-            action_from_payload("remove", "not json"),
-            Err(PimdirActionError::Json)
-        );
-        assert_eq!(
-            action_from_payload("remove", "{\"v\":2,\"seq\":1}"),
-            Err(PimdirActionError::UnknownVersion(Some(2)))
-        );
-        assert_eq!(
-            action_from_payload("remove", "{\"v\":1}"),
-            Err(PimdirActionError::MissingField("seq"))
-        );
+    fn an_add_without_a_body_or_a_known_flag_set_encodes_to_a_refused_payload() {
+        let refused = |action: PimdirAction| {
+            action_from_payload(action.kind(), &action_to_payload(&action)).unwrap_err()
+        };
 
-        let payload = "{\"v\":1,\"object\":\"cafebabe\",\"to\":[\"a@b.c\"]}";
-        let decoded = action_from_payload("submit", payload).unwrap();
-        assert_eq!(decoded.kind(), "submit");
-        assert_eq!(decoded.object_hash(), Some(&PimdirHash("cafebabe".into())));
+        let bodiless = PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: None,
+            supersedes: None,
+        };
+        assert_eq!(refused(bodiless), PimdirActionError::MissingField("object"));
+
+        let unread = PimdirAction::SetFlags {
+            seq: 1,
+            flags: PimdirFlags::Unknown,
+        };
+        assert!(matches!(
+            refused(unread),
+            PimdirActionError::Invalid { field: "flags", .. }
+        ));
+    }
+
+    /// A payload is valid whole or malformed (§15.3), the error naming the
+    /// member, and a version this codec does not know is told apart.
+    #[test]
+    fn a_malformed_payload_names_its_member() {
+        let invalid = |field| PimdirActionError::Invalid { field, reason: "" };
+        let cases = [
+            ("remove", "not json".into(), PimdirActionError::Json),
+            ("remove", "[1]".into(), PimdirActionError::Json),
+            (
+                "remove",
+                r#"{"seq":1}"#.into(),
+                PimdirActionError::UnknownVersion(None),
+            ),
+            (
+                "remove",
+                r#"{"v":2,"seq":1}"#.into(),
+                PimdirActionError::UnknownVersion(Some(2)),
+            ),
+            (
+                "remove",
+                r#"{"v":1}"#.into(),
+                PimdirActionError::MissingField("seq"),
+            ),
+            ("remove", r#"{"v":1,"seq":-3}"#.into(), invalid("seq")),
+            ("remove", r#"{"v":1,"seq":1.5}"#.into(), invalid("seq")),
+            ("move", r#"{"v":1,"seq":1,"to":null}"#.into(), invalid("to")),
+            (
+                "add",
+                format!(r#"{{"v":1,"object":"{EMPTY}"}}"#),
+                PimdirActionError::MissingField("flags"),
+            ),
+            (
+                "add",
+                format!(r#"{{"v":1,"flags":null,"object":"{EMPTY}"}}"#),
+                invalid("flags"),
+            ),
+            (
+                "add",
+                format!(r#"{{"v":1,"flags":[1],"object":"{EMPTY}"}}"#),
+                invalid("flags"),
+            ),
+            (
+                "add",
+                format!(r#"{{"v":1,"flags":[""],"object":"{EMPTY}"}}"#),
+                invalid("flags"),
+            ),
+            (
+                "add",
+                format!(r#"{{"v":1,"flags":[],"object":"{EMPTY}","link_id":""}}"#),
+                invalid("link_id"),
+            ),
+            (
+                "add",
+                r#"{"v":1,"flags":[],"object":"objects/v4/v4"}"#.into(),
+                invalid("object"),
+            ),
+            (
+                "update",
+                format!(r#"{{"v":1,"seq":1,"object":"{EMPTY}","if_match":7}}"#),
+                invalid("if_match"),
+            ),
+            (
+                "set-flags",
+                r#"{"v":1,"seq":1,"flags":[],"why":"x"}"#.into(),
+                PimdirActionError::UnknownField("why".into()),
+            ),
+            (
+                "set-performer",
+                r#"{"v":1,"capability":"mail..submit"}"#.into(),
+                invalid("capability"),
+            ),
+            (
+                "set-performer",
+                r#"{"v":1,"capability":"mail.submit","source":""}"#.into(),
+                invalid("source"),
+            ),
+            (
+                "x-fax-send",
+                r#"{"to":"+33"}"#.into(),
+                PimdirActionError::UnknownVersion(None),
+            ),
+        ];
+        for (kind, payload, expected) in cases {
+            let err = action_from_payload(kind, &payload).unwrap_err();
+            match (&err, &expected) {
+                (
+                    PimdirActionError::Invalid { field, .. },
+                    PimdirActionError::Invalid { field: named, .. },
+                ) => assert_eq!(field, named, "{kind} {payload}"),
+                _ => assert_eq!(err, expected, "{kind} {payload}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_application_kind_survives_whole_and_names_no_body() {
+        let payload = r#"{"v":1,"object":5,"to":["+33"]}"#;
+        let decoded = action_from_payload("x-fax-send", payload).unwrap();
+        assert_eq!(decoded.kind(), "x-fax-send");
+        assert_eq!(decoded.object_hash(), None, "the body is the row's");
         assert_eq!(action_to_payload(&decoded), payload);
     }
 }
