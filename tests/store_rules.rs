@@ -9,7 +9,9 @@
 use std::path::Path;
 
 use io_pimdir::{
-    client::{PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer},
+    client::{
+        PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
+    },
     codec::PimdirAction,
     placement::PimdirFlags,
 };
@@ -109,6 +111,41 @@ fn an_unknown_payload_version_is_skipped_not_parked() {
         })
         .unwrap();
     assert_eq!((attempts, error), (0, None), "untouched");
+}
+
+/// A row a later producer queued stays pending for ever, the drain
+/// skipping it (STORAGE §15.2), so a reader listing what is queued skips
+/// it too rather than failing the whole read on it.
+#[test]
+fn a_reader_skips_a_row_of_a_later_payload_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = opened(dir.path());
+    drop(store);
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute(
+        io_pimdir::sql::ENQUEUE_ACTION,
+        rusqlite::named_params! {
+            ":producer": "later",
+            ":collection": "INBOX",
+            ":action": "add",
+            ":payload": r#"{"v":2,"flags":[]}"#,
+            ":object_hash": None::<String>,
+        },
+    )
+    .unwrap();
+    drop(conn);
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    producer
+        .enqueue("INBOX", &PimdirAction::Remove { seq: 9999 }, None)
+        .unwrap();
+    drop(producer);
+
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let pending = reader.pending_actions("INBOX").unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert!(matches!(pending[0].action, PimdirAction::Remove { .. }));
+    assert_eq!(reader.count_pending_creates("INBOX").unwrap(), 0);
 }
 
 /// A body whose bytes no longer hash to its name is no body (STORAGE §7):

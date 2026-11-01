@@ -1983,12 +1983,12 @@ impl fmt::Display for PimdirError {
             ),
             Self::Version { found: Some(found) } => write!(
                 f,
-                "Pimdir store is {found}, not this program's {}: a store opens under its own version alone, so move it aside and sync a new one",
+                "Pimdir store is {found}, not this program's {}: a store opens under its own version alone, so let the sync engine that wrote it push what it queued, then move it aside and sync a new one",
                 sql::FORMAT_VERSION
             ),
             Self::Version { found: None } => write!(
                 f,
-                "Pimdir store names no format version, as a draft before {0} wrote it, and this program is {0}: a store opens under its own version alone, so move it aside and sync a new one",
+                "Pimdir store names no format version, as a draft before {0} wrote it, and this program is {0}: a store opens under its own version alone, so let the sync engine that wrote it push what it queued, then move it aside and sync a new one",
                 sql::FORMAT_VERSION
             ),
             Self::Uncreated => write!(
@@ -2025,7 +2025,7 @@ impl fmt::Display for PimdirError {
             ),
             Self::SyncVersion { found } => write!(
                 f,
-                "Pimdir store's sync state was written by {found}, not this program's {}: a store syncs under one engine version, so move it aside and sync a new one",
+                "Pimdir store's sync state was written by {found}, not this program's {}: a store syncs under one engine version, so let the engine that wrote it push what it queued, then move it aside and sync a new one",
                 SYNC_VERSION
             ),
             Self::Busy => write!(

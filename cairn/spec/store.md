@@ -514,7 +514,11 @@ An `update` stating `if_match` SHALL fold only when it names the body the item h
 A parked row SHALL NOT overlay, its error asserting that it will not be applied
 without an operator. A pending row whose payload the reader cannot decode
 SHALL be skipped by the overlay, never fail the read: the drain is what parks
-it, and the strict `pending_actions` read still reports it as an error.
+it, and the strict `pending_actions` read still reports it as an error. A row
+stating a later payload version SHALL be skipped by every pending read, the
+strict one included, as the drain skips it (STORAGE §15.2): it stays pending
+for a later owner, and failing on it would fail every read until then
+(tests/store_rules.rs `a_reader_skips_a_row_of_a_later_payload_version`).
 
 The overlay SHALL be chosen when the reader is built rather than per call, so
 one handle cannot answer two ways about one collection.

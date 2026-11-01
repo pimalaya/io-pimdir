@@ -685,14 +685,21 @@ pub struct PimdirDrainOverruled {
 }
 
 /// Reads pending rows, a collection's or every collection's, decoding
-/// each payload strictly: a malformed one is the read's error.
+/// each payload strictly: a malformed one is the read's error, until the
+/// drain parks it. A row stating a later payload version is skipped, as
+/// the drain skips it (§15.2): it stays pending for a later owner, and
+/// failing on it would fail every read until then.
 pub(crate) fn pending_actions(
     conn: &Connection,
     collection: Option<&str>,
 ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
     let mut actions = Vec::new();
     for row in pending_rows(conn, collection)? {
-        actions.push(row.decode()?);
+        match row.decode() {
+            Ok(action) => actions.push(action),
+            Err(PimdirActionError::UnknownVersion(Some(_))) => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(actions)
 }
