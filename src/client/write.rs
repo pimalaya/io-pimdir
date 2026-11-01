@@ -322,6 +322,12 @@ pub(crate) fn apply(
                     .or_default()
                     .push(PimdirWriteOp::Overrule { collection, handle });
             }
+            PimdirWriteOp::Settle { collection, handle } => {
+                hub_ops
+                    .entry(collection.0.clone())
+                    .or_default()
+                    .push(PimdirWriteOp::Settle { collection, handle });
+            }
             PimdirWriteOp::StoreObject { object, body } => {
                 if let Some(body) = body {
                     blobs.write(&object.hash, &body)?;

@@ -71,6 +71,8 @@ pub enum PimdirMutation {
     /// The new object is stored, the placement repointed at it and marked
     /// dirty, its base keeping the synced body so the next sync derives
     /// the push. Editing a conflict resolves it, a tombstone is revived.
+    /// A person's edit settles the item's conflict too, whatever body it
+    /// keeps, stating [`Settle`](PimdirWriteOp::Settle) before its upsert.
     Edit {
         /// The placement to update.
         handle: PimdirHandle,
@@ -342,6 +344,15 @@ impl PimdirMutate {
                 overrule,
                 ..
             } => {
+                // NOTE: an item's conflict projects `Conflict` for every
+                // live binding and `Tombstone` once another source deleted
+                // it (SYNC §3), and the item is not loaded here: the write
+                // settles it, when one stands (SYNC §7).
+                let settling = !*overrule
+                    && matches!(
+                        source.status,
+                        PimdirStatus::Conflict | PimdirStatus::Tombstone
+                    );
                 source.object = Some(object.hash.clone());
                 source.level = PimdirLevel::Full;
                 if summary.is_some() {
@@ -389,6 +400,12 @@ impl PimdirMutate {
                 // conflict's bodies against (SYNC §7, §9).
                 if *overrule {
                     ops.push(PimdirWriteOp::Overrule {
+                        collection: source.collection.clone(),
+                        handle: source.handle.clone(),
+                    });
+                }
+                if settling {
+                    ops.push(PimdirWriteOp::Settle {
                         collection: source.collection.clone(),
                         handle: source.handle.clone(),
                     });
@@ -1136,8 +1153,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[2]);
         };
         assert_eq!(p.status, PimdirStatus::Dirty);
         assert_eq!(p.conflict_revision, None);
@@ -1182,8 +1199,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[2]);
         };
         let base = p.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
@@ -1231,8 +1248,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[2]);
         };
         let base = p.base.as_ref().expect("the resolution establishes a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
@@ -1299,8 +1316,8 @@ mod tests {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[2]);
         };
 
         assert_eq!(p.status, PimdirStatus::Dirty);
@@ -1311,6 +1328,54 @@ mod tests {
         );
         let base = p.base.as_ref().expect("a base");
         assert_eq!(base.revision.as_deref(), Some("r2"));
+    }
+
+    /// A person's edit of a placement an item conflict may project states
+    /// the settle before its upsert (SYNC §7); an overruling one states
+    /// the overrule instead, and one of a placement in no conflict neither.
+    #[test]
+    fn a_persons_edit_of_a_conflict_states_the_settle() {
+        use crate::object::{PimdirHash, PimdirObject};
+
+        let ops = |status, overrule| {
+            let mutation = PimdirMutation::Edit {
+                overrule,
+                if_match: None,
+                sort_key: Default::default(),
+                handle: PimdirHandle::from("1"),
+                object: PimdirObject {
+                    hash: PimdirHash::from("h3"),
+                    size: 6,
+                },
+                body: b"merged".to_vec(),
+                summary: None,
+            };
+            let mut mutate = PimdirMutate::new("inbox", mutation);
+            let _ = mutate.resume(None);
+            let mut loaded = loaded("1");
+            loaded.placements[0].status = status;
+            match mutate.resume(Some(PimdirArg::Load(loaded))) {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops
+                    .iter()
+                    .map(|op| match op {
+                        PimdirWriteOp::StoreObject { .. } => "store",
+                        PimdirWriteOp::Settle { handle, .. } if handle.as_str() == "1" => "settle",
+                        PimdirWriteOp::Overrule { .. } => "overrule",
+                        PimdirWriteOp::UpsertPlacement(_) => "upsert",
+                        op => panic!("unexpected {op:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                state => panic!("expected WantsWrite, got {state:?}"),
+            }
+        };
+
+        for status in [PimdirStatus::Conflict, PimdirStatus::Tombstone] {
+            assert_eq!(ops(status, false), ["store", "settle", "upsert"]);
+            assert_eq!(ops(status, true), ["store", "overrule", "upsert"]);
+        }
+        for status in [PimdirStatus::Clean, PimdirStatus::Dirty] {
+            assert_eq!(ops(status, false), ["store", "upsert"]);
+        }
     }
 
     /// Services the target read a staged create makes, answering `holds`.
@@ -1536,8 +1601,8 @@ mod tests {
             state => panic!("expected WantsWrite, got {state:?}"),
         };
 
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[2]);
         };
         assert_eq!(p.status, PimdirStatus::Dirty);
         assert_eq!(p.origin, None, "a revived row is going nowhere: {p:?}",);
@@ -1646,8 +1711,8 @@ mod tests {
             state => panic!("expected WantsWrite, got {state:?}"),
         };
 
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[1] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[1]);
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[2] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[2]);
         };
         assert_eq!(p.status, PimdirStatus::Dirty);
         assert_eq!(p.conflict_revision, None, "the divergence is settled");

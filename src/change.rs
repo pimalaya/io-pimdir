@@ -392,6 +392,19 @@ pub enum PimdirWriteOp {
         /// The placement whose conflict the next upsert settles.
         handle: PimdirHandle,
     },
+    /// Settle the item's conflict by the next upsert of `handle`, a
+    /// person's resolution (SYNC §7): the item takes the upsert's body
+    /// whatever body it keeps, `items.conflicted` cleared and its
+    /// `conflict_object` released, keeping nothing it discards. What a
+    /// non-overruling [`Edit`](crate::mutate::PimdirMutation::Edit) of a
+    /// placement projecting `Conflict` or `Tombstone` stages before its
+    /// upsert; an item in no conflict ignores it.
+    Settle {
+        /// The collection holding the placement.
+        collection: PimdirCollectionId,
+        /// The placement whose item's conflict the next upsert settles.
+        handle: PimdirHandle,
+    },
 }
 
 #[cfg(test)]

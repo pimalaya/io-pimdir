@@ -172,6 +172,9 @@ pub struct PimdirHub {
     /// The handles whose next upsert is an overruling edit (SYNC §7),
     /// within the batch being absorbed.
     overruling: BTreeSet<PimdirHandle>,
+    /// The handles whose next upsert is a person's edit settling its
+    /// item's conflict (SYNC §7), within the batch being absorbed.
+    settling: BTreeSet<PimdirHandle>,
     /// The items a settle left holding a body whose summary the hub does
     /// not hold, the diverging body a fill's `prefer-incoming` adopted,
     /// for the storage to derive from its bytes (SYNC §9).
@@ -353,6 +356,9 @@ impl PimdirHub {
                 PimdirWriteOp::Overrule { handle, .. } => {
                     self.overruling.insert(handle.clone());
                 }
+                PimdirWriteOp::Settle { handle, .. } => {
+                    self.settling.insert(handle.clone());
+                }
                 // NOTE: the sync state is the storage's, by source.
                 PimdirWriteOp::StoreObject { .. }
                 | PimdirWriteOp::SetCheckpoint { .. }
@@ -365,6 +371,7 @@ impl PimdirHub {
         }
         self.rebinding.clear();
         self.overruling.clear();
+        self.settling.clear();
     }
 
     /// Folds one upsert in, refreshing the source's binding.
@@ -384,6 +391,7 @@ impl PimdirHub {
         if overruling {
             self.keep_overruled(source, &link, placement);
         }
+        let settling = self.settling.remove(&placement.handle);
 
         let policy = self.conflict;
         let released = self.rebinding.remove(&(source.clone(), link.clone()));
@@ -442,7 +450,20 @@ impl PimdirHub {
             item.sort_key = placement.sort_key.clone();
         }
 
-        let verdict = Self::reconcile_content(item, source, placement, policy);
+        // NOTE: a person's edit of a conflicted item resolves it whatever
+        // body it keeps and whichever source it is made through, losing
+        // what it discards (SYNC §7): the three facts would read a body
+        // restated, or one made through the source the item moved away
+        // from, as no settle or as a divergence again.
+        let verdict = match settling && item.conflicted && placement.object.is_some() {
+            true => {
+                item.object = placement.object.clone();
+                item.conflicted = false;
+                item.conflict_object = None;
+                PimdirVerdict::default()
+            }
+            false => Self::reconcile_content(item, source, placement, policy),
+        };
         // NOTE: an overruling edit restating the shared body settles the
         // item's conflict, whose diverging body it kept (SYNC §7, §9); a
         // source merely restating it says nothing of the other's.
@@ -1434,6 +1455,53 @@ mod tests {
         assert_eq!(item.object, Some(PimdirHash::from("o1")));
         assert_eq!(item.conflict_object, Some(PimdirHash::from("o2")));
         assert!(hub.overruled.is_empty());
+    }
+
+    /// A person's settle (SYNC §7) is the next upsert of its own handle's:
+    /// a sync restating a body settles nothing, and a settle stated for
+    /// another handle neither, while the person's edit keeping the item's
+    /// body through the source it moved away from clears the conflict.
+    #[test]
+    fn a_settle_resolves_the_item_conflict_by_its_own_upsert_alone() {
+        let mut hub = content_hub(PimdirHubConflict::Manual);
+        let right = PimdirSourceId::from("right");
+        hub.absorb(&"left".into(), &[content_upsert("l1", "o-left")]);
+        hub.absorb(&right, &[content_upsert("r1", "o-right")]);
+        let conflicted = |hub: &PimdirHub| hub.items[&PimdirLinkId::from("m1")].conflicted;
+        assert!(conflicted(&hub));
+
+        let settle = |handle: &str| PimdirWriteOp::Settle {
+            collection: "inbox".into(),
+            handle: PimdirHandle::from(handle),
+        };
+        hub.absorb(&right, &[content_upsert("r1", "o-right")]);
+        assert!(conflicted(&hub), "a sync restating its body");
+        hub.absorb(&right, &[settle("l1"), content_upsert("r1", "o-right")]);
+        assert!(conflicted(&hub), "a settle of another handle");
+
+        let PimdirWriteOp::UpsertPlacement(mut kept) = content_upsert("r1", "o-left") else {
+            unreachable!()
+        };
+        kept.status = PimdirStatus::Dirty;
+        kept.base = Some(PimdirBase {
+            flags: PimdirFlags::default(),
+            revision: Some("r1".into()),
+            object: Some(PimdirHash::from("o-right")),
+        });
+        hub.absorb(
+            &right,
+            &[settle("r1"), PimdirWriteOp::UpsertPlacement(kept)],
+        );
+        let item = &hub.items[&PimdirLinkId::from("m1")];
+        assert!(!item.conflicted && item.conflict_object.is_none());
+        assert_eq!(item.object, Some(PimdirHash::from("o-left")));
+        assert_eq!(
+            item.sources[&right].shared_object,
+            Some(PimdirHash::from("o-left"))
+        );
+        assert!(hub.overruled.is_empty(), "a person keeps nothing");
+        assert_eq!(placements(&hub, "right")[0].status, PimdirStatus::Dirty);
+        assert_eq!(placements(&hub, "left")[0].status, PimdirStatus::Clean);
     }
 
     /// Only left edited since both agreed, so the body is adopted.

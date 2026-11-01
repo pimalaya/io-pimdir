@@ -86,7 +86,7 @@ A body a policy does not adopt SHALL be kept (vectors/sync/14, 85, 86): the shar
 
 The three facts SHALL be read against the base the binding held, never the base the upsert carries. Whether the content is mutable SHALL be judged across every binding of the item and the placement's own base, any revision meaning mutable. An immutable kind never diverges: a based binding whose base holds a body while the item holds another SHALL adopt the item's body into its base.
 
-Under `Manual` every binding of a conflicted item SHALL project `Conflict` carrying no `conflict_revision` (pimdir SYNC §3), and `absorb` SHALL clear `conflicted` and `conflict_object` when an upsert settles the item: a live upsert adopted as the shared body, a policy settling a divergence, or a tombstone. A divergence the write records is answered in `PimdirWritten::conflicted`.
+Under `Manual` every binding of a conflicted item SHALL project `Conflict` carrying no `conflict_revision` (pimdir SYNC §3), and `absorb` SHALL clear `conflicted` and `conflict_object` when an upsert settles the item: a live upsert adopted as the shared body, a policy settling a divergence, a person's edit, or a tombstone. A person's edit is the upsert a `PimdirWriteOp::Settle` of its handle precedes in the batch ([mutate](mutate.md)): over a conflicted item it SHALL be adopted as the shared body whatever the three facts read, the conflict cleared and its `conflict_object` released, the verdict recording no divergence and no loser, and the source's `shared_object` moving to that body (pimdir SYNC §7). The op is the next upsert of that handle's alone, and an absorb ends it. A divergence the write records is answered in `PimdirWritten::conflicted`.
 
 A source SHALL NOT diverge from itself: its own body folded into the hub and not yet pushed leaves its sync base behind the shared body, and only `shared_object` tells that gap from another source folding in. An upsert leaving a conflicted binding SHALL count as the source having changed its body whatever body it carries.
 
@@ -101,6 +101,11 @@ Flags are unaffected (element-wise, never conflicting).
 - GIVEN an item flagged conflicted under `Manual`
 - WHEN any source's placements are projected
 - THEN each projects `Conflict` with no revision, and an edit through any of them settles the item for all
+
+#### Scenario: A person's settle is its own upsert's
+- GIVEN an item conflicted under `Manual`
+- WHEN a sync restates a body, or a `Settle` names another handle than the upsert it precedes
+- THEN the conflict stands; the upsert its own `Settle` precedes clears it, keeping nothing, even restating the item's body through the source the item moved away from (src/hub.rs `a_settle_resolves_the_item_conflict_by_its_own_upsert_alone`)
 
 #### Scenario: A clean fast-forward adopts the new body
 - GIVEN two sources agreeing on a body, then only one editing it
