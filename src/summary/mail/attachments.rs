@@ -239,11 +239,23 @@ impl PimdirAttachmentWalk {
     /// Ends the message, answering its attachments in document order and
     /// its invitation.
     pub fn finish_parts(mut self) -> PimdirParts {
-        if self.open || self.cr {
-            if self.cr {
-                self.cr = false;
+        // NOTE: a `\r` ending the message ends its last line as the
+        // derivation reads a line, at a line feed or at the end alike
+        // (`parts`, `unfold`): a delimiter cut before its `\n` still
+        // delimits, and a header line drops it. A part's content keeps
+        // it, as the derivation's slice of the part does.
+        if self.cr {
+            self.cr = false;
+            if self.route == Route::Undecided
+                && let Some((level, close)) = self.delimiter()
+            {
+                self.delimit(level, close);
+                self.route = Route::Done;
+            } else if !matches!(self.mode, Mode::Header { .. }) {
                 self.content(b"\r");
             }
+        }
+        if self.open {
             self.end_line(0);
         }
         if matches!(self.mode, Mode::Header { .. }) {
@@ -403,8 +415,15 @@ impl PimdirAttachmentWalk {
             let room = HEADER_MAX.saturating_sub(block.len());
             let line = &self.head[..self.head.len().min(room)];
             block.extend_from_slice(line);
+            // NOTE: a line its own `\r` ends breaks at `\r\n`, so the
+            // block reads that `\r` as the line's own, as the raw block
+            // the derivation unfolds does, never as its line break.
             if block.len() < HEADER_MAX {
-                block.push(b'\n');
+                let terminator: &[u8] = match line.last() {
+                    Some(b'\r') => b"\r\n",
+                    _ => b"\n",
+                };
+                block.extend_from_slice(terminator);
             }
         }
     }

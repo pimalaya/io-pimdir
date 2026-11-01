@@ -5,8 +5,9 @@
 //!
 //! A table pins the cases the format names (base64, quoted-printable,
 //! folded `UID` lines, nested multiparts, a calendar part disposed as an
-//! attachment or inline, a truncated message, no `UID`); a property then
-//! builds messages from those pieces at random, cut anywhere.
+//! attachment or inline, a truncated message, one cut inside a line
+//! break, a header line holding a `\r`, no `UID`); a property then builds
+//! messages from those pieces at random, cut anywhere.
 
 use io_pimdir::summary::{
     PimdirSummary,
@@ -141,6 +142,29 @@ fn the_walk_reads_the_invitation_the_derivation_reads() {
 --in\r\nContent-Type: text/calendar\r\n\r\nUID:cut-inner\r\n\
 --out\r\nContent-Type: text/calendar\r\n\r\nUID:after\r\n--out--\r\n";
     assert_eq!(agrees(cut_inner, 90).as_deref(), Some("after"));
+
+    let cut_line_feed = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/calendar\r\nContent-Disposition: attachment\r\n\r\nUID:last\r\n\
+--b--\r";
+    assert!(derived(cut_line_feed).0);
+    assert_eq!(
+        agrees(cut_line_feed, 0).as_deref(),
+        Some("last"),
+        "a delimiter cut before its line feed"
+    );
+
+    let stray_cr = b"Content-Type: multipart/mixed; boundary=b\r\n\r\r\n\
+Content-Disposition: attachment\r\n\r\n\
+--b\r\nContent-Type: text/calendar\r\n\r\nUID:after-cr\r\n--b--\r\n";
+    assert!(
+        derived(stray_cr).0,
+        "a line holding a `\\r` is no empty one"
+    );
+    assert_eq!(agrees(stray_cr, 50).as_deref(), Some("after-cr"));
+
+    let header_cut = b"Content-Type: text/calendar\r\nContent-Disposition: attachment\r";
+    assert!(derived(header_cut).0);
+    assert_eq!(agrees(header_cut, 20), None);
 
     let foreign = b"Content-Type: text/calendar\r\nContent-Transfer-Encoding: base64\r\n\r\nVUlEOng=\r\n!\r\n";
     assert_eq!(agrees(foreign, 10), None, "base64 over a foreign byte");
@@ -296,6 +320,30 @@ impl Builder {
     }
 }
 
+/// The message the property built from `seed`, cut at `truncate`.
+fn built(seed: u64, crlf: bool, truncate: Option<usize>) -> Vec<u8> {
+    let mut builder = Builder {
+        state: seed,
+        eol: if crlf { "\r\n" } else { "\n" },
+    };
+    let mut body = format!("Subject: built{0}Message-ID: <m@x>{0}", builder.eol).into_bytes();
+    body.extend(builder.entity(0));
+    if let Some(at) = truncate {
+        body.truncate(at.min(body.len()));
+    }
+    body
+}
+
+#[test]
+fn a_built_message_cut_before_its_last_line_feed_reads_alike() {
+    // NOTE: the property's case of 2026-11-01, the message cut between
+    // the `\r` and the `\n` of its closing delimiter.
+    let body = built(1794814323191950817, true, Some(1242));
+    assert!(body.ends_with(b"\r\n--b047--\r"));
+    assert!(derived(&body).0);
+    agrees(&body, 0);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -306,12 +354,6 @@ proptest! {
         truncate in proptest::option::of(0usize..4096),
         cut in 0usize..4096,
     ) {
-        let mut builder = Builder { state: seed, eol: if crlf { "\r\n" } else { "\n" } };
-        let mut body = format!("Subject: built{0}Message-ID: <m@x>{0}", builder.eol).into_bytes();
-        body.extend(builder.entity(0));
-        if let Some(at) = truncate {
-            body.truncate(at.min(body.len()));
-        }
-        agrees(&body, cut);
+        agrees(&built(seed, crlf, truncate), cut);
     }
 }
