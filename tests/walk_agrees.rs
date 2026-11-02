@@ -153,9 +153,12 @@ fn the_walk_reads_the_invitation_the_derivation_reads() {
         "a delimiter cut before its line feed"
     );
 
-    let stray_cr = b"Content-Type: multipart/mixed; boundary=b\r\n\r\r\n\
-Content-Disposition: attachment\r\n\r\n\
---b\r\nContent-Type: text/calendar\r\n\r\nUID:after-cr\r\n--b--\r\n";
+    // NOTE: the multipart and its bare file are read only when the header
+    // block goes on past the line holding a `\r`.
+    let stray_cr = b"Subject: cr\r\n\r\r\n\
+Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/calendar\r\n\r\nUID:after-cr\r\n\
+--b\r\nContent-Type: application/pdf\r\n\r\n%PDF\r\n--b--\r\n";
     assert!(
         derived(stray_cr).0,
         "a line holding a `\\r` is no empty one"
@@ -181,8 +184,10 @@ Content-Disposition: attachment\r\n\r\n\
     let soft = b"Content-Type: text/calendar\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nUID:ab=\r\ncd=4\r\n";
     agrees(soft, 70);
 
+    // NOTE: a multipart message has no section, so its own disposition
+    // makes no mark (Annex A.1).
     let disposed = b"Content-Type: multipart/mixed; boundary=b\r\nContent-Disposition: attachment\r\n\r\n--b\r\n\r\nx\r\n--b--\r\n";
-    assert!(derived(disposed).0);
+    assert!(!derived(disposed).0);
     agrees(disposed, 10);
 }
 

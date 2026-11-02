@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Added pimdir storage-draft-08, sync-draft-07 and search-draft-08, vendored at pimdir 3d6a04e with vectors/ and payloads/ (spec/REVISION). **Breaking.**
+- Added pimdir storage-draft-08, sync-draft-07 and search-draft-08, vendored at pimdir fbd25c9 with vectors/ and payloads/ (spec/REVISION). **Breaking.**
 
   A store an earlier draft or an earlier release of this crate wrote is refused by every profile, never reconciled nor migrated: move it aside and let its sync engine create a new one, every app built on this crate reinstalling its store.
 
@@ -146,6 +146,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- Changed the attachment mark and the stand-ins to follow pimdir's rule (STORAGE Annex A.1, §14.3): a part with no `Content-Disposition` now counts when it is neither text nor multipart and carries no `Content-ID` (a lone PDF, a forwarded `message/rfc822`), and an unknown disposition counts as `attachment`, where only `Content-Disposition: attachment` did. The RFC 1847 protocol parts (every child of a `multipart/encrypted`, the signature of a `multipart/signed`) never count, a disposed signature included, nor does a multipart message's own disposition. A stand-in is recorded once, so a store keeps the marks it recorded before.
 - Changed `load::PimdirLoadScope` to `PimdirLoadSelection`, `PimdirYield::WantsLoad`'s `scope` to `selection` and `PimdirSourceStore::load`'s second parameter likewise: STORAGE §2 calls `All`, `Handles` and `Links` a selection, a scope being the date window (decision 7 of the-crate-follows-storage-draft-08). **Breaking.**
 - Changed `PimdirSourceStore::upgrade` to take a `PimdirUpgradeOptions` before the remote (`PimdirUpgradeOptions::default()` settles nothing, `Manual`). **Breaking.**
 - Changed `PimdirParked::guard` to take whether the listing named a member, parking on any absence when it named none. **Breaking.**

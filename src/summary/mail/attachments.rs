@@ -28,7 +28,7 @@ use alloc::{
 
 use super::{
     MIME_DEPTH_MAX, MIME_ENTITIES_MAX, boundary, charset_decode, decode, delimits, field,
-    header_fields, hex_pair,
+    header_fields, hex_pair, is_protocol_part, makes_mark, mark_media_type,
 };
 use crate::summary::file::PimdirFileSummary;
 
@@ -112,9 +112,6 @@ pub struct PimdirAttachmentWalk {
     /// The invitation a part that ended gave: `Some(None)` for a `UID`
     /// too long to read, which ends the search as a read one does.
     invitation: Option<Option<String>>,
-    /// Whether the message's own header block disposes it as an
-    /// attachment: a multipart one has no section, so no summary.
-    disposed: bool,
     /// The entities read, the message's own counted: a part beginning
     /// past [`MIME_ENTITIES_MAX`] is skipped, its delimiters still read.
     read: usize,
@@ -151,6 +148,9 @@ struct Frame {
     /// Whether the invitation was read before the child under way began,
     /// so a child cut short takes back only one it gave.
     invited_before: bool,
+    /// The multipart's media type, as the attachment mark reads it, which
+    /// tells whether its children are RFC 1847 protocol parts.
+    media: String,
 }
 
 /// What the lines of the current entity are.
@@ -192,7 +192,6 @@ impl PimdirAttachmentWalk {
             found: Vec::new(),
             calendar: None,
             invitation: None,
-            disposed: false,
             read: 1,
         }
     }
@@ -273,7 +272,7 @@ impl PimdirAttachmentWalk {
                 self.invitation = None;
             }
         }
-        let attachment = self.disposed || !self.found.is_empty();
+        let attachment = !self.found.is_empty();
         PimdirParts {
             attachments: self.found,
             attachment,
@@ -497,12 +496,17 @@ impl PimdirAttachmentWalk {
         };
         let headers = header_fields(&block);
 
-        let attached = field(&headers, "content-disposition")
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"));
-        if depth == 0 && attached {
-            self.disposed = true;
-        }
+        let media = mark_media_type(&headers);
+        // NOTE: the entity's multipart is the innermost level open, the
+        // message's own entity having none; a multipart message makes no
+        // mark, having no section (Annex A.1).
+        let protocol = depth > 0
+            && self
+                .frames
+                .last()
+                .is_some_and(|frame| is_protocol_part(&frame.media, frame.children));
+        let multipart_message = depth == 0 && media.starts_with("multipart/");
+        let attached = !multipart_message && makes_mark(&headers, protocol);
         let content_type = field(&headers, "content-type");
         let opened = match content_type.and_then(boundary) {
             Some(boundary) if depth < MIME_DEPTH_MAX && boundary.len() + 4 <= LINE_HEAD => {
@@ -538,6 +542,7 @@ impl PimdirAttachmentWalk {
                     children: 0,
                     child_start: None,
                     invited_before: false,
+                    media,
                 });
                 self.mode = Mode::Skip;
             }
@@ -1165,6 +1170,16 @@ mod tests {
         whole
     }
 
+    /// The mark the whole-body derivation states for `body`, a message.
+    fn derived_mark(body: &[u8]) -> Option<bool> {
+        let mut message = b"Message-ID: <m@x>\r\n".to_vec();
+        message.extend_from_slice(body);
+        match crate::summary::mail::derive(&message).summary {
+            Some(crate::summary::PimdirSummary::Mail(mail)) => mail.attachment,
+            _ => unreachable!("a message derives a mail summary"),
+        }
+    }
+
     #[test]
     fn the_attachments_of_a_mixed_message_are_its_disposed_parts() {
         let body = b"Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n\
@@ -1211,6 +1226,60 @@ Content-Transfer-Encoding: base64\r\n\r\nAAEC\r\n";
                 "1"
             )]
         );
+    }
+
+    #[test]
+    fn a_part_sent_bare_as_a_file_is_an_attachment() {
+        let body = b"Content-Type: multipart/mixed; boundary=m\r\n\r\n\
+--m\r\n\
+Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=s\r\n\r\n\
+--s\r\n\
+Content-Type: multipart/related; boundary=r\r\n\r\n\
+--r\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:logo\">\r\n\
+--r\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n\r\nPNG\r\n\
+--r--\r\n\
+--s\r\n\
+Content-Type: application/pgp-signature\r\n\
+Content-Disposition: attachment; filename=signature.asc\r\n\r\nSIG\r\n\
+--s--\r\n\
+--m\r\nContent-Type: application/pdf; name=order.pdf\r\n\r\n%PDF\r\n\
+--m\r\nContent-Type: text/csv\r\n\r\na,b\r\n\
+--m\r\nContent-Type: Text/Plain\r\nContent-Disposition: X-Unknown\r\n\r\nkept\r\n\
+--m\r\nContent-Type: nonsense\r\n\r\nplain\r\n\
+--m--\r\n";
+
+        assert_eq!(
+            walked(body),
+            vec![
+                summary("order.pdf", Some("application/pdf"), 4, "2"),
+                summary("", Some("text/plain"), 4, "4"),
+            ]
+        );
+        assert_eq!(derived_mark(body), Some(true));
+    }
+
+    #[test]
+    fn the_protocol_parts_of_an_encrypted_message_are_no_attachment() {
+        let body = b"Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=e\r\n\r\n\
+--e\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n\
+--e\r\nContent-Type: application/octet-stream\r\n\r\nSEALED\r\n\
+--e--\r\n";
+
+        assert_eq!(walked(body), vec![]);
+        assert_eq!(derived_mark(body), Some(false));
+    }
+
+    #[test]
+    fn a_multipart_message_disposed_as_an_attachment_makes_no_mark() {
+        let body = b"Content-Type: multipart/mixed; boundary=m\r\n\
+Content-Disposition: attachment\r\n\r\n\
+--m\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--m--\r\n";
+
+        let mut walk = PimdirAttachmentWalk::new();
+        walk.feed(body);
+        assert!(!walk.finish_parts().attachment);
+        assert_eq!(derived_mark(body), Some(false));
     }
 
     #[test]

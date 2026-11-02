@@ -111,7 +111,7 @@ impl PimdirMailSummary {
 pub fn derive(body: &[u8]) -> PimdirDerivation {
     let (headers, rest) = split_headers(body);
     let headers = header_fields(headers);
-    let attachment = has_attachment(&headers, rest, 0, &mut 0);
+    let attachment = has_attachment(&headers, rest, 0, &mut 0, false);
 
     let mut summary = from_headers(&headers, Some(body.len() as u64), attachment);
     summary.invitation = invitation(&headers, rest, 0, &mut 0);
@@ -848,21 +848,24 @@ fn field<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 /// Whether the entity, nested `depth` multipart levels down, or a part under
-/// it, carries `Content-Disposition: attachment`, walking multipart bodies by
-/// their boundary down to [`MIME_DEPTH_MAX`] and through
+/// it, makes the attachment mark ([`makes_mark`]), walking multipart bodies
+/// by their boundary down to [`MIME_DEPTH_MAX`] and through
 /// [`MIME_ENTITIES_MAX`] entities in document order, `read` counting them,
-/// this one included.
+/// this one included. `protocol` says the entity is an RFC 1847 protocol
+/// part of the multipart holding it.
 fn has_attachment(
     headers: &[(String, String)],
     body: &[u8],
     depth: usize,
     read: &mut usize,
+    protocol: bool,
 ) -> bool {
     *read += 1;
-    if field(headers, "content-disposition")
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"))
-    {
+    let media = mark_media_type(headers);
+    // NOTE: the message's own entity, when a multipart, has no section
+    // and makes no mark (Annex A.1).
+    let multipart_message = depth == 0 && media.starts_with("multipart/");
+    if !multipart_message && makes_mark(headers, protocol) {
         return true;
     }
 
@@ -874,10 +877,64 @@ fn has_attachment(
         return false;
     };
 
-    parts(body, &boundary).into_iter().any(|part| {
-        let (headers, body) = split_headers(part);
-        *read < MIME_ENTITIES_MAX && has_attachment(&header_fields(headers), body, depth + 1, read)
-    })
+    parts(body, &boundary)
+        .into_iter()
+        .enumerate()
+        .any(|(index, part)| {
+            let (headers, body) = split_headers(part);
+            let protocol = is_protocol_part(&media, index + 1);
+            *read < MIME_ENTITIES_MAX
+                && has_attachment(&header_fields(headers), body, depth + 1, read, protocol)
+        })
+}
+
+/// Whether one entity makes the attachment mark (Annex A.1): disposed as an
+/// attachment, its `Content-Disposition` type any but `inline` (RFC 2183
+/// §2.8 reads an unknown one as `attachment`), or stating no disposition
+/// and sent bare as a file, neither `multipart/*` nor `text/*` and named by
+/// no `Content-ID`. An RFC 1847 protocol part, `protocol`, never makes it.
+fn makes_mark(headers: &[(String, String)], protocol: bool) -> bool {
+    if protocol {
+        return false;
+    }
+
+    let disposition = field(headers, "content-disposition")
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+    if !disposition.is_empty() {
+        return !disposition.eq_ignore_ascii_case("inline");
+    }
+
+    let media = mark_media_type(headers);
+    !media.starts_with("multipart/")
+        && !media.starts_with("text/")
+        && field(headers, "content-id").is_none()
+}
+
+/// The media type the attachment mark reads (Annex A.1): the `Content-Type`
+/// value up to its first `;`, trimmed and lowercased, `text/plain` when the
+/// field is absent, under a `multipart/digest` too, or when the value holds
+/// not exactly one `/` (RFC 2045 §5.2).
+fn mark_media_type(headers: &[(String, String)]) -> String {
+    let media = field(headers, "content-type")
+        .and_then(|value| value.split(';').next())
+        .map(|media| media.trim().to_lowercase())
+        .unwrap_or_default();
+
+    if media.matches('/').count() == 1 {
+        media
+    } else {
+        "text/plain".to_string()
+    }
+}
+
+/// Whether the `index`th child (from 1) of a multipart of media type
+/// `parent` is an RFC 1847 protocol part: every child of a
+/// `multipart/encrypted`, every child but the first of a
+/// `multipart/signed`.
+fn is_protocol_part(parent: &str, index: usize) -> bool {
+    parent == "multipart/encrypted" || (parent == "multipart/signed" && index > 1)
 }
 
 /// The first `UID` of the first `text/calendar` part in document order,
@@ -1059,11 +1116,23 @@ mod tests {
     fn an_attachment_is_found_under_a_nested_multipart() {
         let body = b"Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain\r\n\r\nhi\r\n--inner--\r\n--outer\r\nContent-Disposition: attachment; filename=a.pdf\r\n\r\n%PDF\r\n--outer--\r\n";
         let (headers, rest) = split_headers(body);
-        assert!(has_attachment(&header_fields(headers), rest, 0, &mut 0));
+        assert!(has_attachment(
+            &header_fields(headers),
+            rest,
+            0,
+            &mut 0,
+            false
+        ));
 
         let plain = b"Content-Type: text/plain\r\n\r\nhi\r\n";
         let (headers, rest) = split_headers(plain);
-        assert!(!has_attachment(&header_fields(headers), rest, 0, &mut 0));
+        assert!(!has_attachment(
+            &header_fields(headers),
+            rest,
+            0,
+            &mut 0,
+            false
+        ));
     }
 
     #[test]
