@@ -4,13 +4,13 @@
 //! `object_text` and `summary_text` rows and of the snippets re-read for
 //! the hits shown.
 //!
-//! Mail goes through mail-parser: the MIME walk, transfer encodings,
-//! charsets, RFC 2047 and RFC 2231, `text/plain` preferred within an
-//! alternative and `text/html` reduced to text, under the bounds the
-//! summaries keep ([`MIME_DEPTH_MAX`], [`MIME_ENTITIES_MAX`]). A vCard goes
-//! through vcard-rs and an iCalendar resource through ical-rs. A file, a
-//! placement holding no body and a body no parser accepts are read from
-//! their summary and address rows.
+//! Mail goes through mime-rs: the MIME tree, transfer encodings, charsets,
+//! RFC 2047 and RFC 2231, `text/plain` preferred within an alternative and
+//! `text/html` reduced to text (`html`), under the bounds the summaries
+//! keep ([`MIME_DEPTH_MAX`], [`MIME_ENTITIES_MAX`]). A vCard goes through
+//! vcard-rs and an iCalendar resource through ical-rs. A file, a placement
+//! holding no body and a body no parser accepts are read from their
+//! summary and address rows.
 
 use alloc::{
     borrow::Cow,
@@ -22,13 +22,16 @@ use alloc::{
 use core::ops::Range;
 
 use ical::{param::IcalParam, tree::cst::IcalCst, value::IcalValue};
-use mail_parser::{
-    Address, Message, MessageParser, MimeHeaders, PartType, decoders::html::html_to_text,
+use mime::{
+    codec::charset,
+    header::marker::{BCC, CC, FROM, MimeHeaderMarker, SUBJECT, TO},
+    tree::{body::MimeBodyNode, cst::MimeCst, entity::MimeEntity, parse::MimeParseOptions},
+    value::address::MimeAddressList,
 };
 use vcard::{tree::cst::VcardCst, value::VcardValue};
 
 use crate::{
-    search::{chunk, fold},
+    search::{chunk, fold, html},
     summary::{
         PimdirAddress, PimdirAddressRole, PimdirSummary,
         mail::{MIME_DEPTH_MAX, MIME_ENTITIES_MAX, attachments},
@@ -121,41 +124,59 @@ impl PimdirExtract {
     /// [`Unparseable`](PimdirExtractStatus::Unparseable) with every field
     /// empty, which the caller fills from the summary.
     pub fn mail(body: &[u8]) -> Self {
-        let Some(message) = MessageParser::default().parse(body) else {
-            return Self {
-                status: PimdirExtractStatus::Unparseable,
-                ..Default::default()
-            };
-        };
-
-        let mut extract = Self {
-            title: message.subject().unwrap_or_default().to_string(),
+        // NOTE: the walk bounds the entities it reads, the parse none, so
+        // a multipart holding the 10,000th entity is still split.
+        let opts = MimeParseOptions {
+            max_entities: Some(usize::MAX),
             ..Default::default()
         };
+        let cst = MimeCst::parse_with(body, opts);
+        let root = &cst.root;
 
-        let roles = [
-            (message.from(), &mut extract.from),
-            (message.to(), &mut extract.to),
-            (message.cc(), &mut extract.cc),
-            (message.bcc(), &mut extract.bcc),
-        ];
-        for (address, field) in roles {
-            if let Some(address) = address {
-                push(field, &names(address));
+        let mut extract = if root.header.fields().next().is_none() {
+            let Some(text) = headless(body) else {
+                return Self {
+                    status: PimdirExtractStatus::Unparseable,
+                    ..Default::default()
+                };
+            };
+
+            Self {
+                body: text,
+                ..Default::default()
             }
-        }
-        for field in [&extract.from, &extract.to, &extract.cc, &extract.bcc] {
-            push(&mut extract.people, field);
-        }
+        } else {
+            let mut extract = Self {
+                title: last::<SUBJECT>(root).unwrap_or_default(),
+                ..Default::default()
+            };
 
-        if is_encrypted(message.root_part()) {
-            extract.status = PimdirExtractStatus::Encrypted;
-            return extract;
-        }
+            let roles = [
+                (last::<FROM>(root), &mut extract.from),
+                (last::<TO>(root), &mut extract.to),
+                (last::<CC>(root), &mut extract.cc),
+                (last::<BCC>(root), &mut extract.bcc),
+            ];
+            for (addresses, field) in roles {
+                if let Some(addresses) = addresses {
+                    push(field, &names(&addresses));
+                }
+            }
+            for field in [&extract.from, &extract.to, &extract.cc, &extract.bcc] {
+                push(&mut extract.people, field);
+            }
 
-        let mut walk = Walk::over(&message);
-        walk.part(&message, 0);
-        extract.body = walk.body.join("\n\n");
+            if is_encrypted(&media_type(root, false)) {
+                extract.status = PimdirExtractStatus::Encrypted;
+                return extract;
+            }
+
+            let walk = Walk::over(root);
+            let mut texts = Vec::new();
+            walk.part(Some(0), &mut texts);
+            extract.body = texts.join("\n\n");
+            extract
+        };
 
         // NOTE: the attachments are the stand-ins' (STORAGE §14.3), so an
         // inline part, an invitation's calendar among them, is none.
@@ -396,137 +417,212 @@ impl PimdirExtract {
     }
 }
 
-/// The text parts the MIME walk gathers.
-struct Walk {
-    /// Whether the walk of the parts reads each part, by id (STORAGE Annex
-    /// A.1): an unread one and every part under it give no text.
-    read: Vec<bool>,
-    body: Vec<String>,
+/// The parts the MIME walk reads, whose text it gathers.
+struct Walk<'t, 'a> {
+    /// The entities the walk of the parts reads (STORAGE Annex A.1), by id
+    /// in document order: an unread one and every part under it give no
+    /// text.
+    parts: Vec<Part<'t, 'a>>,
 }
 
-impl Walk {
-    /// The walk of `message`'s parts as Annex A.1 bounds it: in document
+/// One entity the walk reads.
+struct Part<'t, 'a> {
+    entity: &'t MimeEntity<'a>,
+    /// Its media type, lowercased.
+    media: (String, String),
+    /// The ids of a multipart's children, `None` for one the walk leaves
+    /// unread.
+    children: Vec<Option<usize>>,
+}
+
+impl<'t, 'a> Walk<'t, 'a> {
+    /// The walk of a message's parts as Annex A.1 bounds it: in document
     /// order, a multipart before its children, none deeper than
     /// [`MIME_DEPTH_MAX`] and none after the [`MIME_ENTITIES_MAX`]th, the
     /// message's own counted; a `message/rfc822` part is one, not opened.
-    fn over(message: &Message) -> Self {
-        let mut read = vec![false; message.parts.len()];
-        let mut count = 0;
-        let mut pending = vec![(0usize, 0usize)];
+    fn over(root: &'t MimeEntity<'a>) -> Self {
+        let mut parts: Vec<Part<'t, 'a>> = Vec::new();
+        let mut pending = vec![(root, 0usize, None::<(usize, usize)>, false)];
 
-        while let Some((id, depth)) = pending.pop() {
-            if depth > MIME_DEPTH_MAX || count >= MIME_ENTITIES_MAX {
+        while let Some((entity, depth, slot, digest)) = pending.pop() {
+            if depth > MIME_DEPTH_MAX || parts.len() >= MIME_ENTITIES_MAX {
                 continue;
             }
-            let Some(part) = message.parts.get(id).filter(|_| !read[id]) else {
-                continue;
+
+            let id = parts.len();
+            if let Some((parent, index)) = slot {
+                parts[parent].children[index] = Some(id);
+            }
+
+            let children = match &entity.body {
+                MimeBodyNode::Multipart(multipart) => &multipart.parts[..],
+                _ => &[],
             };
-            read[id] = true;
-            count += 1;
-            if let PartType::Multipart(children) = &part.body {
-                for child in children.iter().rev() {
-                    pending.push((*child as usize, depth + 1));
-                }
+            let media = media_type(entity, digest);
+            let digest = media.0 == "multipart" && media.1 == "digest";
+            parts.push(Part {
+                entity,
+                media,
+                children: vec![None; children.len()],
+            });
+
+            for (index, child) in children.iter().enumerate().rev() {
+                pending.push((&child.entity, depth + 1, Some((id, index)), digest));
             }
         }
 
-        Self {
-            read,
-            body: Vec::new(),
-        }
+        Self { parts }
     }
 
-    /// Whether the walk reads the part `id`.
-    fn reads(&self, id: usize) -> bool {
-        self.read.get(id).copied().unwrap_or(false)
-    }
-
-    /// Gathers the text of the part `id` when the walk reads it.
-    fn part(&mut self, message: &Message, id: usize) {
-        if !self.reads(id) {
-            return;
-        }
-        let Some(part) = message.parts.get(id) else {
+    /// Gathers into `texts` the text of the part `id` when the walk reads
+    /// it.
+    fn part(&self, id: Option<usize>, texts: &mut Vec<String>) {
+        let Some(part) = id.and_then(|id| self.parts.get(id)) else {
             return;
         };
 
-        let (ctype, subtype) = media_type(part);
-        let attached = part
-            .content_disposition()
-            .is_some_and(|disposition| disposition.ctype().eq_ignore_ascii_case("attachment"));
+        let entity = part.entity;
+        let (ctype, subtype) = &part.media;
+        let attached = entity
+            .disposition()
+            .is_some_and(|disposition| disposition.kind.eq_ignore_ascii_case("attachment"));
 
-        match &part.body {
-            PartType::Multipart(children) if subtype == "alternative" => {
-                let chosen = children
+        match &entity.body {
+            MimeBodyNode::Multipart(_) if subtype == "alternative" => {
+                let chosen = part
+                    .children
                     .iter()
-                    .find(|child| self.has_plain(message, **child as usize))
-                    .or(children.last());
+                    .find(|child| self.has_plain(**child))
+                    .or(part.children.last());
                 if let Some(child) = chosen {
-                    self.part(message, *child as usize);
+                    self.part(*child, texts);
                 }
             }
-            PartType::Multipart(_) if is_encrypted(part) => (),
-            PartType::Multipart(children) => {
-                for child in children {
-                    self.part(message, *child as usize);
+            MimeBodyNode::Multipart(_) if is_encrypted(&part.media) => (),
+            MimeBodyNode::Multipart(_) => {
+                for child in &part.children {
+                    self.part(*child, texts);
                 }
             }
-            PartType::Text(text) if !attached && ctype == "text" && subtype == "plain" => {
-                self.body.push(text.to_string());
+            MimeBodyNode::Leaf(_) if !attached && ctype == "text" && subtype == "plain" => {
+                texts.push(text(entity));
             }
-            PartType::Html(html) if !attached => self.body.push(html_to_text(html)),
+            MimeBodyNode::Leaf(_) if !attached && ctype == "text" && subtype == "html" => {
+                texts.push(html::to_text(&text(entity)));
+            }
             _ => (),
         }
     }
 
     /// Whether the part `id` is, or holds among the parts the walk reads,
     /// a `text/plain` part an alternative prefers.
-    fn has_plain(&self, message: &Message, id: usize) -> bool {
-        if !self.reads(id) {
-            return false;
-        }
-        let Some(part) = message.parts.get(id) else {
+    fn has_plain(&self, id: Option<usize>) -> bool {
+        let Some(part) = id.and_then(|id| self.parts.get(id)) else {
             return false;
         };
 
-        match &part.body {
-            PartType::Text(_) => media_type(part) == ("text".into(), "plain".into()),
-            PartType::Multipart(children) => children
-                .iter()
-                .any(|child| self.has_plain(message, *child as usize)),
+        match &part.entity.body {
+            MimeBodyNode::Leaf(_) => part.media == ("text".into(), "plain".into()),
+            MimeBodyNode::Multipart(_) => part.children.iter().any(|child| self.has_plain(*child)),
             _ => false,
         }
     }
 }
 
-/// A part's media type, lowercased, `text/plain` when it states none.
-fn media_type<'a>(part: &impl MimeHeaders<'a>) -> (String, String) {
-    match part.content_type() {
-        Some(ctype) => (
-            ctype.ctype().to_ascii_lowercase(),
-            ctype.subtype().unwrap_or_default().to_ascii_lowercase(),
-        ),
-        None => ("text".into(), "plain".into()),
+/// The last field the marker names, read in its form: a repeated field
+/// reads as its last occurrence.
+pub(crate) fn last<M: MimeHeaderMarker>(entity: &MimeEntity) -> Option<M::Value> {
+    let field = entity.header.get_all(&M::KIND).last()?;
+    M::from_value(field.read_as(M::KIND.spec().form))
+}
+
+/// The text of a message holding no header field: what follows its first
+/// line of blanks alone, as UTF-8; `None` when no such line ends its first
+/// block.
+fn headless(body: &[u8]) -> Option<String> {
+    let mut rest = body;
+
+    loop {
+        let end = rest.iter().position(|byte| *byte == b'\n')?;
+        let (line, next) = rest.split_at(end + 1);
+        rest = next;
+
+        if line[..end].iter().all(u8::is_ascii_whitespace) {
+            return Some(String::from_utf8_lossy(rest).into_owned());
+        }
     }
 }
 
-/// Whether a part is an encrypted body (SEARCH §6): `multipart/encrypted`
-/// or `application/pkcs7-mime`.
-fn is_encrypted<'a>(part: &impl MimeHeaders<'a>) -> bool {
+/// A leaf's text: transfer-decoded and transcoded from its `charset`, UTF-8
+/// without one; no byte order mark is sniffed and flowed text is kept as
+/// written.
+fn text(entity: &MimeEntity) -> String {
+    let Some(bytes) = entity.decoded() else {
+        return String::new();
+    };
+    let label = entity.content_type().param("charset");
+
+    // NOTE: a US-ASCII label reads as windows-1252, as the WHATWG Encoding
+    // Standard reads it, so the 8-bit bytes of a mislabelled part keep their
+    // letters.
+    let label = match label.as_deref() {
+        Some(label)
+            if charset::is_utf8_label(label)
+                && !charset::clean_label(label)
+                    .to_ascii_lowercase()
+                    .contains("utf") =>
+        {
+            "windows-1252"
+        }
+        Some(label) => label,
+        None => "utf-8",
+    };
+
+    match charset::transcode(label, &bytes) {
+        Some(decoded) => decoded.text.into_owned(),
+        None => String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+/// An entity's media type, lowercased: when it states none, `text/plain`,
+/// or `message/rfc822` for a part of a `multipart/digest` (`digest`).
+///
+/// Refs: <https://datatracker.ietf.org/doc/html/rfc2046#section-5.1.5>
+fn media_type(entity: &MimeEntity, digest: bool) -> (String, String) {
+    let media = entity.content_type();
+
+    // NOTE: the `text/plain` an entity stating no type reads as is the only
+    // one with no raw value.
+    if digest && media.raw.is_empty() {
+        return ("message".into(), "rfc822".into());
+    }
+
+    (
+        String::from_utf8_lossy(media.top).to_ascii_lowercase(),
+        String::from_utf8_lossy(media.sub).to_ascii_lowercase(),
+    )
+}
+
+/// Whether a media type is an encrypted body's (SEARCH §6):
+/// `multipart/encrypted` or `application/pkcs7-mime`.
+fn is_encrypted(media: &(String, String)) -> bool {
     matches!(
-        media_type(part),
+        media,
         (ctype, subtype) if (ctype == "multipart" && subtype == "encrypted")
             || (ctype == "application" && matches!(subtype.as_str(), "pkcs7-mime" | "x-pkcs7-mime"))
     )
 }
 
-/// The names and addresses of an address header, one per line.
-fn names(address: &Address) -> String {
+/// The names and addresses of an address field, one per line.
+fn names(addresses: &MimeAddressList) -> String {
     let mut text = String::new();
-    for addr in address.iter() {
+    for mailbox in addresses.mailboxes() {
         push(
             &mut text,
-            &person(addr.name(), addr.address().unwrap_or_default()),
+            &person(
+                mailbox.name.as_deref(),
+                mailbox.address.as_deref().unwrap_or_default(),
+            ),
         );
     }
     text

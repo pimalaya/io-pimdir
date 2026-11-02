@@ -89,6 +89,33 @@ fn the_extraction_reads_the_parts_the_walk_reads() {
     assert!(!extract.body.contains("unread"));
 }
 
+/// The extraction reads a repeated field as its last, a US-ASCII part as
+/// windows-1252, a digest's untyped part as a message, and a body holding
+/// no header field after its first blank line.
+#[test]
+fn the_extraction_reads_mail_as_it_always_has() {
+    let extract = PimdirExtract::mail(
+        b"Subject: first\r\nSubject: last\r\n\
+Content-Type: text/plain; charset=us-ascii\r\n\r\ncaf\xe9\r\n",
+    );
+    assert_eq!(extract.title, "last");
+    assert_eq!(extract.body, "café\r\n");
+
+    let extract = PimdirExtract::mail(
+        b"Content-Type: multipart/digest; boundary=d\r\n\r\n\
+--d\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n\
+--d\r\nContent-Type: text/plain\r\n\r\ntyped\r\n--d--\r\n",
+    );
+    assert_eq!(extract.body, "typed");
+
+    let extract = PimdirExtract::mail(b"no field\n\nthe body\n");
+    assert_eq!(extract.status, PimdirExtractStatus::Ok);
+    assert_eq!(extract.body, "the body\n");
+
+    let extract = PimdirExtract::mail(b"no field\nno blank line\n");
+    assert_eq!(extract.status, PimdirExtractStatus::Unparseable);
+}
+
 /// One run over a one-message feed, answered by hand: the body indexed
 /// with its text folded, the placement put, the thread written, the cursor
 /// recorded past the row.

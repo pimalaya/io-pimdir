@@ -28,16 +28,22 @@ use alloc::{
 };
 
 use log::trace;
-use mail_parser::MessageParser;
+use mime::{
+    header::marker::{IN_REPLY_TO, REFERENCES},
+    tree::{cst::MimeCst, parse::MimeParseOptions},
+};
 
 use crate::{
     object::PimdirHash,
-    search::refresh::{PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexOp},
+    search::{
+        extract::last,
+        refresh::{PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexOp},
+    },
 };
 
 /// The parent a held body names, by hash (SEARCH §9): `Some` with what
 /// its headers name, possibly nothing, `None` for a body that could not be
-/// read or whose headers do not parse, its summary's then.
+/// read or whose headers hold no field, its summary's then.
 pub(crate) type Heads = BTreeMap<PimdirHash, Option<Option<String>>>;
 
 /// What a relink still needs read before it can answer.
@@ -56,16 +62,23 @@ impl Need {
 }
 
 /// The parent a body's headers name (SEARCH §9): its first `In-Reply-To`
-/// id, else its last `References` id; `None` when the headers do not
-/// parse.
+/// id, else its last `References` id, a repeated field read as its last;
+/// `None` when the headers hold no field.
 pub(crate) fn parent(body: &[u8]) -> Option<Option<String>> {
-    let message = MessageParser::default().parse_headers(body)?;
-    let first = message
-        .in_reply_to()
-        .as_text_list()
-        .and_then(|ids| ids.first())
-        .or_else(|| message.references().as_text_list()?.last());
-    Some(first.map(|id| id.to_string()).filter(|id| !id.is_empty()))
+    let opts = MimeParseOptions {
+        structure_depth: Some(0),
+        ..Default::default()
+    };
+    let cst = MimeCst::parse_with(body, opts);
+    let root = &cst.root;
+
+    root.header.fields().next()?;
+
+    let first = last::<IN_REPLY_TO>(root)
+        .and_then(|ids| ids.into_iter().next())
+        .or_else(|| last::<REFERENCES>(root)?.pop());
+
+    Some(first.filter(|id| !id.is_empty()))
 }
 
 /// Rereads the parents of the message ids a batch touched and recomputes

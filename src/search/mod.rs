@@ -22,6 +22,8 @@ pub mod extract;
 #[cfg(feature = "search")]
 pub mod fold;
 #[cfg(feature = "search")]
+mod html;
+#[cfg(feature = "search")]
 pub mod occurrence;
 #[cfg(feature = "search")]
 pub mod query;
