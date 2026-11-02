@@ -16,12 +16,13 @@ use rusqlite::{Connection, OptionalExtension, named_params};
 use crate::{
     capability::{
         self, CALENDAR_CANCEL, CALENDAR_CANCEL_OCCURRENCE, CALENDAR_REPLY,
-        CALENDAR_REPLY_OCCURRENCE, COLLECTION_CREATE, MAIL_SUBMIT, MAIL_SUBMIT_COPY,
-        PimdirCapability, PimdirPartial, PimdirRefusal, PimdirSourceCapabilities, PimdirSupport,
+        CALENDAR_REPLY_OCCURRENCE, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME,
+        MAIL_SUBMIT, MAIL_SUBMIT_COPY, PimdirCapability, PimdirPartial, PimdirRefusal,
+        PimdirSourceCapabilities, PimdirSupport,
     },
     client::{PimdirError, blobs::PimdirBlobs, rows, write},
     codec::{self, PimdirAction, PimdirActionError},
-    intent::{self, PimdirCollectionCreate},
+    intent::{self, PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename},
     object::PimdirHash,
     placement::PimdirFlags,
     sql,
@@ -308,17 +309,28 @@ fn gate_by_kind(
                     collection_create_anchor(conn, collection, &create)?;
                     None
                 }
+                COLLECTION_RENAME => {
+                    PimdirCollectionRename::from_payload(payload)?;
+                    None
+                }
+                COLLECTION_DELETE => {
+                    PimdirCollectionDelete::from_payload(payload)?;
+                    None
+                }
                 _ => intent_option(capability, payload)?,
             };
 
             // NOTE: an account whose sources declare nothing predates §15.6,
             // and its owner picks the performer as it always did; but it
             // would widen an occurrence to the whole series, and knows no
-            // collection-create (Annex B.2).
+            // collection intent (Annex B.2).
             let account = account_of(conn, collection)?;
             let named = intent_source(payload);
             if !account_declared(conn, account.as_deref())? {
-                if capability == COLLECTION_CREATE {
+                if matches!(
+                    capability,
+                    COLLECTION_CREATE | COLLECTION_RENAME | COLLECTION_DELETE
+                ) {
                     return Err(PimdirError::NoPerformer {
                         capability: capability.to_string(),
                     });
@@ -418,7 +430,7 @@ pub(crate) fn backstop_intent(
 
     let account = account_of(conn, collection)?;
     let option = match capability {
-        COLLECTION_CREATE => None,
+        COLLECTION_CREATE | COLLECTION_RENAME | COLLECTION_DELETE => None,
         _ => intent_option(capability, payload)?,
     };
     for needed in [Some(capability), option].into_iter().flatten() {

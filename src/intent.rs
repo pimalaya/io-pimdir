@@ -1,8 +1,9 @@
 //! # Intents
 //!
 //! The typed payloads of the Annex B.2 intents this crate validates: a
-//! message to send, a collection created on a source's server, and the
-//! invitation reply and cancel with their optional occurrence. An intent
+//! message to send, a collection created, renamed or deleted on a
+//! source's server, and the invitation reply and cancel with their
+//! optional occurrence. An intent
 //! travels as [`PimdirAction::Unknown`], so the store keeps its payload
 //! verbatim and skips it; these types build that action for a producer
 //! and read it back for a performer, strictly as payloads/ types it
@@ -31,6 +32,10 @@ pub const CALENDAR_REPLY: &str = "calendar-reply";
 pub const CALENDAR_CANCEL: &str = "calendar-cancel";
 /// The kind of the `collection.create` intent.
 pub const COLLECTION_CREATE: &str = "collection-create";
+/// The kind of the `collection.rename` intent.
+pub const COLLECTION_RENAME: &str = "collection-rename";
+/// The kind of the `collection.delete` intent.
+pub const COLLECTION_DELETE: &str = "collection-delete";
 
 /// A collection to create on the performer's server (Annex B.2,
 /// `collection-create`).
@@ -109,6 +114,101 @@ impl PimdirCollectionCreate {
         };
         create.validate()?;
         Ok(create)
+    }
+}
+
+/// The collection the action is queued on, renamed on the performer's
+/// server (Annex B.2, `collection-rename`).
+///
+/// Anchored on that collection, which the payload does not restate, so a
+/// rename of it in the store leaves the row addressing it. The parent and
+/// the items are kept, and the new name reaches the store with the
+/// performer's next sync.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirCollectionRename {
+    /// The source performing it (§15.6).
+    pub source: String,
+    /// The new label, one level of the hierarchy, as
+    /// [`PimdirCollectionCreate::name`] is.
+    pub name: String,
+}
+
+impl PimdirCollectionRename {
+    /// Checks the payload's own rules: a named `source`, a `name` neither
+    /// blank nor holding a control character.
+    pub fn validate(&self) -> Result<(), PimdirActionError> {
+        validate_source(&self.source)?;
+        if self.name.trim().is_empty() {
+            return Err(PimdirActionError::Invalid {
+                field: "name",
+                reason: "a collection-rename needs a non-blank name",
+            });
+        }
+        if self.name.chars().any(char::is_control) {
+            return Err(PimdirActionError::Invalid {
+                field: "name",
+                reason: "a collection name holds no control character",
+            });
+        }
+        Ok(())
+    }
+
+    /// The queue action carrying it, validated first.
+    pub fn to_action(&self) -> Result<PimdirAction, PimdirActionError> {
+        self.validate()?;
+        let mut map = versioned();
+        map.insert("source".into(), json!(self.source));
+        map.insert("name".into(), json!(self.name));
+        Ok(intent(COLLECTION_RENAME, map))
+    }
+
+    /// Reads a `collection-rename` payload strictly.
+    pub fn from_payload(payload: &str) -> Result<Self, PimdirActionError> {
+        let map = codec::members(payload, &["source", "name"])?;
+        let rename = Self {
+            source: codec::required(codec::label(map.get("source"), "source")?, "source")?,
+            name: codec::required(codec::label(map.get("name"), "name")?, "name")?,
+        };
+        rename.validate()?;
+        Ok(rename)
+    }
+}
+
+/// The collection the action is queued on, deleted on the performer's
+/// server with the items it holds (Annex B.2, `collection-delete`).
+///
+/// Anchored on that collection, never taking another: a performer
+/// finding a collection under it on the server parks the row. The store
+/// removes no item for it, the deletion reaching it with the performer's
+/// next sync.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirCollectionDelete {
+    /// The source performing it (§15.6).
+    pub source: String,
+}
+
+impl PimdirCollectionDelete {
+    /// Checks the payload's own rule: a named `source`.
+    pub fn validate(&self) -> Result<(), PimdirActionError> {
+        validate_source(&self.source)
+    }
+
+    /// The queue action carrying it, validated first.
+    pub fn to_action(&self) -> Result<PimdirAction, PimdirActionError> {
+        self.validate()?;
+        let mut map = versioned();
+        map.insert("source".into(), json!(self.source));
+        Ok(intent(COLLECTION_DELETE, map))
+    }
+
+    /// Reads a `collection-delete` payload strictly.
+    pub fn from_payload(payload: &str) -> Result<Self, PimdirActionError> {
+        let map = codec::members(payload, &["source"])?;
+        let delete = Self {
+            source: codec::required(codec::label(map.get("source"), "source")?, "source")?,
+        };
+        delete.validate()?;
+        Ok(delete)
     }
 }
 

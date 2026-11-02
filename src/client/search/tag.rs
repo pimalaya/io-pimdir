@@ -159,7 +159,7 @@ impl PimdirIndex {
                                 collection.declared.iter().any(|source| {
                                     source.declared.as_ref().is_some_and(|declared| {
                                         !matches!(
-                                            declared.get(needed),
+                                            capability::gating(declared, needed).1,
                                             Some((PimdirSupport::Full | PimdirSupport::Partial, _))
                                         )
                                     })

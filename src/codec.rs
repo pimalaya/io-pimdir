@@ -20,7 +20,10 @@ use crate::{
     capability,
     collection::PimdirCollectionId,
     hub::PimdirHubConflict,
-    intent::{self, PimdirCollectionCreate, PimdirInvitation, PimdirSubmit},
+    intent::{
+        self, PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename,
+        PimdirInvitation, PimdirSubmit,
+    },
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
 };
@@ -445,6 +448,12 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
                 }
                 intent::COLLECTION_CREATE => {
                     PimdirCollectionCreate::from_payload(payload)?;
+                }
+                intent::COLLECTION_RENAME => {
+                    PimdirCollectionRename::from_payload(payload)?;
+                }
+                intent::COLLECTION_DELETE => {
+                    PimdirCollectionDelete::from_payload(payload)?;
                 }
                 _ => {
                     members_any(payload)?;

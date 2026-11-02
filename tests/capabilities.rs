@@ -13,7 +13,10 @@ use io_pimdir::{
     client::{PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer},
     codec::{PimdirAction, PimdirActionError},
     collection::PimdirCollectionId,
-    intent::{self, PimdirCollectionCreate, PimdirIntentItem, PimdirInvitation, PimdirPartstat},
+    intent::{
+        self, PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename,
+        PimdirIntentItem, PimdirInvitation, PimdirPartstat,
+    },
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -593,6 +596,118 @@ fn a_collection_is_created_by_a_source_that_declares_it_under_its_anchor() {
         None,
     ) else {
         panic!("the anchor is a collection of a declared kind");
+    };
+}
+
+#[test]
+fn a_collection_is_renamed_and_deleted_on_itself_by_a_source_declaring_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _) = seeded(dir.path());
+    // the provider keeps its INBOX fixed
+    let mut imap = mail(&[]);
+    for name in [capability::COLLECTION_RENAME, capability::COLLECTION_DELETE] {
+        imap.push(PimdirCapability {
+            collection: Some("INBOX".into()),
+            name: name.into(),
+            support: PimdirSupport::None,
+            detail: Some("the inbox is fixed".into()),
+        });
+    }
+    store.declare("graph", &imap).unwrap();
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let renamed = producer
+        .enqueue_collection_rename("Archive", "Archive 2026", None)
+        .unwrap();
+    let deleted = producer.enqueue_collection_delete("Archive", None).unwrap();
+
+    // both queued on the collection they address, which no payload restates
+    let pending = producer.pending_actions("Archive").unwrap();
+    let kinds: Vec<_> = pending
+        .iter()
+        .map(|pending| match &pending.action {
+            PimdirAction::Unknown { kind, payload, .. } => {
+                (pending.id, kind.clone(), payload.clone())
+            }
+            _ => panic!("an intent travels as an unknown kind"),
+        })
+        .collect();
+    assert_eq!(kinds.len(), 2);
+    assert_eq!(
+        (kinds[0].0, kinds[0].1.as_str()),
+        (renamed, intent::COLLECTION_RENAME)
+    );
+    assert_eq!(
+        PimdirCollectionRename::from_payload(&kinds[0].2).unwrap(),
+        PimdirCollectionRename {
+            source: "graph".into(),
+            name: "Archive 2026".into(),
+        }
+    );
+    assert_eq!(
+        (kinds[1].0, kinds[1].1.as_str()),
+        (deleted, intent::COLLECTION_DELETE)
+    );
+    assert_eq!(
+        PimdirCollectionDelete::from_payload(&kinds[1].2).unwrap(),
+        PimdirCollectionDelete {
+            source: "graph".into()
+        }
+    );
+
+    // the collection's own row refuses both there
+    for refused in [
+        producer.enqueue_collection_rename("INBOX", "Inbox", None),
+        producer.enqueue_collection_delete("INBOX", None),
+    ] {
+        let Err(PimdirError::NoPerformer { .. }) = refused else {
+            panic!("a fixed collection has no performer");
+        };
+    }
+
+    // a payload restating the collection, or a rename without a name, is
+    // malformed
+    let intent = |kind: &str, payload: &str| PimdirAction::Unknown {
+        kind: kind.into(),
+        payload: payload.into(),
+        object_hash: None,
+    };
+    let Err(PimdirError::Action(_)) = producer.enqueue(
+        "Archive",
+        &intent(
+            intent::COLLECTION_RENAME,
+            r#"{"v":1,"source":"graph","name":"a","collection":"Archive"}"#,
+        ),
+        None,
+    ) else {
+        panic!("the collection renamed is the anchor alone");
+    };
+    let Err(PimdirError::Action(PimdirActionError::MissingField("name"))) = producer.enqueue(
+        "Archive",
+        &intent(intent::COLLECTION_RENAME, r#"{"v":1,"source":"graph"}"#),
+        None,
+    ) else {
+        panic!("a rename needs a name");
+    };
+}
+
+#[test]
+fn a_collection_rename_or_delete_needs_a_declared_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = seeded(dir.path());
+    drop(store);
+
+    // an owner declaring nothing predates the intents and would skip them
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let Err(PimdirError::NoPerformer { .. }) =
+        producer.enqueue_collection_rename("Archive", "Old", None)
+    else {
+        panic!("nobody performs a collection-rename");
+    };
+    let Err(PimdirError::NoPerformer { .. }) = producer.enqueue_collection_delete("Archive", None)
+    else {
+        panic!("nobody performs a collection-delete");
     };
 }
 

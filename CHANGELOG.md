@@ -6,10 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Added pimdir storage-draft-08, sync-draft-07 and search-draft-08, vendored at pimdir fbd25c9 with vectors/ and payloads/ (spec/REVISION). **Breaking.**
+- Added pimdir storage-draft-08, sync-draft-07 and search-draft-08, vendored at pimdir b63b39a with vectors/ and payloads/ (spec/REVISION). **Breaking.**
 
   A store an earlier draft or an earlier release of this crate wrote is refused by every profile, never reconciled nor migrated: move it aside and let its sync engine create a new one, every app built on this crate reinstalling its store.
 
+- Added the `collection-rename` and `collection-delete` intents (pimdir storage-draft-08 Annex B.2): `capability::COLLECTION_RENAME` and `COLLECTION_DELETE`, declared in every domain's list, the `intent` module's `PimdirCollectionRename` and `PimdirCollectionDelete`, and `PimdirProducer::enqueue_collection_rename` and `enqueue_collection_delete`, each anchored on the collection it addresses.
+- Added `capability::MAIL_FLAGS_IMPORTANT` and `MAIL_FLAGS_JUNK` (pimdir Annex B.1), read only where a row states them, and `capability::gating`: a change of `$Important` or `$Junk` is gated by its own row, else by `mail.flags.keywords`, so a declaration without them reads as before.
 - Added `PimdirRemoteSnapshot::narrowed` and `enumerated`, what a connector states of a round its listing a date filter narrowed (pimdir SYNC §4, §5). **Breaking:** a struct literal names them; the constructors (`round`, `page`, `delta`, `band_head`) state neither.
 
   A connector narrowing a round by any date filter sets `narrowed` on every page of that round and on no other, and on its last page hands `enumerated`, every handle the collection holds read by an enumeration no date filter narrowed, where its source offers one: IMAP narrowing by `SENTSINCE` hands `UID SEARCH ALL`, JMAP narrowing by `after` an `Email/query` filtered by the mailbox alone, Graph narrowing by `receivedDateTime` the folder's message ids, Gmail narrowing by `after:` the label's ids where it lists them. Such a round finds absent only a member dated before it opened, or one the enumeration lacks: an undated draft received before the filter's window and a message whose `Date` runs ahead of its arrival are no longer dropped.

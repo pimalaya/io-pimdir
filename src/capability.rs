@@ -34,7 +34,15 @@ pub const MAIL_FLAGS_FLAGGED: &str = "mail.flags.flagged";
 pub const MAIL_FLAGS_ANSWERED: &str = "mail.flags.answered";
 /// A change of `\Draft`.
 pub const MAIL_FLAGS_DRAFT: &str = "mail.flags.draft";
-/// A change of any other flag.
+/// A change of `$Important` (RFC 8457), outside the base set: read only
+/// where a row states it, [`MAIL_FLAGS_KEYWORDS`] gating it for a source
+/// stating none (Annex B.1).
+pub const MAIL_FLAGS_IMPORTANT: &str = "mail.flags.important";
+/// A change of `$Junk` (RFC 9051 §2.3.2), read as
+/// [`MAIL_FLAGS_IMPORTANT`] is.
+pub const MAIL_FLAGS_JUNK: &str = "mail.flags.junk";
+/// A change of any other flag, and of `$Important` or `$Junk` for a
+/// source stating no row for theirs.
 pub const MAIL_FLAGS_KEYWORDS: &str = "mail.flags.keywords";
 /// Sending a message, the `submit` intent (Annex B.2).
 pub const MAIL_SUBMIT: &str = "mail.submit";
@@ -45,9 +53,18 @@ pub const MAIL_SUBMIT_COPY: &str = "mail.submit.copy";
 /// intent (Annex B.2): its domain, `collection`, holds for every kind, so
 /// it is declared whatever kinds the source syncs.
 pub const COLLECTION_CREATE: &str = "collection.create";
+/// Renaming the collection the action is queued on, the
+/// `collection-rename` intent (Annex B.2), held for every kind as
+/// [`COLLECTION_CREATE`] is.
+pub const COLLECTION_RENAME: &str = "collection.rename";
+/// Deleting the collection the action is queued on with its items, the
+/// `collection-delete` intent, held for every kind.
+pub const COLLECTION_DELETE: &str = "collection.delete";
 
 /// Every capability of Annex B's base set in the mail domain, what a
-/// declaration of a mail source writes whole (§15.6).
+/// declaration of a mail source writes whole (§15.6):
+/// [`MAIL_FLAGS_IMPORTANT`] and [`MAIL_FLAGS_JUNK`] are written only where
+/// the owner knows them.
 pub const MAIL: &[&str] = &[
     MAIL_MESSAGE_ADD,
     MAIL_MESSAGE_COPY,
@@ -61,6 +78,8 @@ pub const MAIL: &[&str] = &[
     MAIL_SUBMIT,
     MAIL_SUBMIT_COPY,
     COLLECTION_CREATE,
+    COLLECTION_RENAME,
+    COLLECTION_DELETE,
 ];
 
 /// Adding a card to an address book.
@@ -82,6 +101,8 @@ pub const CONTACTS: &[&str] = &[
     CONTACTS_CARD_MOVE,
     CONTACTS_CARD_COPY,
     COLLECTION_CREATE,
+    COLLECTION_RENAME,
+    COLLECTION_DELETE,
 ];
 
 /// Adding a calendar resource.
@@ -130,6 +151,8 @@ pub const CALENDAR: &[&str] = &[
     CALENDAR_REPLY_OCCURRENCE,
     CALENDAR_CANCEL_OCCURRENCE,
     COLLECTION_CREATE,
+    COLLECTION_RENAME,
+    COLLECTION_DELETE,
 ];
 
 /// How well a source supports a capability (STORAGE §13).
@@ -264,6 +287,8 @@ pub fn intent_capability(kind: &str) -> Option<&'static str> {
         "calendar-reply" => Some(CALENDAR_REPLY),
         "calendar-cancel" => Some(CALENDAR_CANCEL),
         "collection-create" => Some(COLLECTION_CREATE),
+        "collection-rename" => Some(COLLECTION_RENAME),
+        "collection-delete" => Some(COLLECTION_DELETE),
         _ => None,
     }
 }
@@ -364,23 +389,24 @@ pub fn check(
             continue;
         };
         for capability in needed {
-            match declared.get(capability) {
+            let (capability, row) = gating(declared, capability);
+            match row {
                 Some((PimdirSupport::Full, _)) => {}
                 Some((PimdirSupport::Partial, detail)) => partials.push(PimdirPartial {
-                    capability: capability.clone(),
+                    capability: capability.to_string(),
                     source: source.source.clone(),
                     detail: detail.clone(),
                 }),
                 Some((PimdirSupport::None, detail)) => {
                     return Err(PimdirRefusal {
-                        capability: capability.clone(),
+                        capability: capability.to_string(),
                         source: source.source.clone(),
                         detail: detail.clone(),
                     });
                 }
                 None => {
                     return Err(PimdirRefusal {
-                        capability: capability.clone(),
+                        capability: capability.to_string(),
                         source: source.source.clone(),
                         detail: None,
                     });
@@ -389,6 +415,23 @@ pub fn check(
         }
     }
     Ok(partials)
+}
+
+/// The row of a declaration gating `capability`, with the name it is
+/// read under (Annex B.1): a change of `$Important` or `$Junk` is gated
+/// by its own row where the source states one, `none` included, and by
+/// [`MAIL_FLAGS_KEYWORDS`] where it states none, so a declaration
+/// written before the two reads as it did.
+pub fn gating<'a>(
+    declared: &'a BTreeMap<String, (PimdirSupport, Option<String>)>,
+    capability: &'a str,
+) -> (&'a str, Option<&'a (PimdirSupport, Option<String>)>) {
+    match declared.get(capability) {
+        None if capability == MAIL_FLAGS_IMPORTANT || capability == MAIL_FLAGS_JUNK => {
+            (MAIL_FLAGS_KEYWORDS, declared.get(MAIL_FLAGS_KEYWORDS))
+        }
+        row => (capability, row),
+    }
 }
 
 /// Whether a calendar resource is a VTODO one, the component its master is
@@ -442,6 +485,8 @@ fn flag_changes(kind: &str, before: &BTreeSet<String>, after: &BTreeSet<String>)
             "\\flagged" => MAIL_FLAGS_FLAGGED,
             "\\answered" => MAIL_FLAGS_ANSWERED,
             "\\draft" => MAIL_FLAGS_DRAFT,
+            "$important" => MAIL_FLAGS_IMPORTANT,
+            "$junk" => MAIL_FLAGS_JUNK,
             _ => MAIL_FLAGS_KEYWORDS,
         })
         .map(ToString::to_string)
@@ -493,12 +538,60 @@ mod tests {
         };
 
         assert_eq!(
-            required(MAIL_KIND, &action, &flags(&["\\Seen", "$Junk"])),
+            required(MAIL_KIND, &action, &flags(&["\\Seen", "$Label"])),
             vec![
                 MAIL_FLAGS_FLAGGED.to_string(),
                 MAIL_FLAGS_KEYWORDS.to_string()
             ]
         );
+    }
+
+    /// `$Important` and `$Junk` name their own capability, whatever their
+    /// case (Annex B.1).
+    #[test]
+    fn important_and_junk_name_their_own_capability() {
+        let action = PimdirAction::SetFlags {
+            seq: 1,
+            flags: flags(&["$important", "$Junk"]),
+        };
+
+        assert_eq!(
+            required(MAIL_KIND, &action, &flags(&[])),
+            vec![
+                MAIL_FLAGS_IMPORTANT.to_string(),
+                MAIL_FLAGS_JUNK.to_string()
+            ]
+        );
+    }
+
+    /// A source with a row for `$Important` is gated by it, `none`
+    /// included; one without is gated by `mail.flags.keywords`, so a
+    /// declaration written before the row reads as it did.
+    #[test]
+    fn important_reads_its_own_row_else_the_keywords_one() {
+        use PimdirSupport::{Full, None};
+        let needed = vec![MAIL_FLAGS_IMPORTANT.to_string()];
+
+        let gmail = declared(
+            "gmail",
+            &[(MAIL_FLAGS_KEYWORDS, None), (MAIL_FLAGS_IMPORTANT, Full)],
+        );
+        assert!(check(&needed, &[gmail]).is_ok());
+
+        let imap = declared("imap", &[(MAIL_FLAGS_KEYWORDS, Full)]);
+        assert!(check(&needed, &[imap]).is_ok());
+
+        let graph = declared(
+            "graph",
+            &[(MAIL_FLAGS_KEYWORDS, Full), (MAIL_FLAGS_IMPORTANT, None)],
+        );
+        let refusal = check(&needed, &[graph]).unwrap_err();
+        assert_eq!(refusal.capability, MAIL_FLAGS_IMPORTANT);
+
+        let older = declared("older", &[(MAIL_FLAGS_KEYWORDS, None)]);
+        let refusal = check(&needed, &[older]).unwrap_err();
+        assert_eq!(refusal.capability, MAIL_FLAGS_KEYWORDS);
+        assert_eq!(refusal.source, "older");
     }
 
     #[test]
@@ -576,7 +669,7 @@ mod tests {
         assert_eq!(partials[0].capability, MAIL_MESSAGE_REMOVE);
     }
 
-    /// Annex B names 30 capabilities, each lowercase words joined by
+    /// Annex B names 34 capabilities, each lowercase words joined by
     /// periods, the first its domain, none an application's own.
     #[test]
     fn every_capability_follows_annex_bs_grammar_in_its_domain() {
@@ -585,6 +678,7 @@ mod tests {
             ("contacts", CONTACTS),
             ("calendar", CALENDAR),
             ("calendar", &[CALENDAR_COMPONENT_VTODO]),
+            ("mail", &[MAIL_FLAGS_IMPORTANT, MAIL_FLAGS_JUNK]),
         ];
 
         let mut names = BTreeSet::new();
@@ -596,7 +690,7 @@ mod tests {
                 names.insert(*name);
             }
         }
-        assert_eq!(names.len(), 30);
+        assert_eq!(names.len(), 34);
 
         for name in ["x-fax.send", "mail.submit.copy", "calendar.online-meeting"] {
             assert!(is_name(name), "{name}");

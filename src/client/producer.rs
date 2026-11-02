@@ -25,7 +25,10 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params};
 
 use crate::{
-    capability::{COLLECTION_CREATE, PimdirPartial, PimdirSourceCapabilities},
+    capability::{
+        COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, PimdirPartial,
+        PimdirSourceCapabilities,
+    },
     change::PimdirWriteOp,
     client::{
         PimdirDuplicate, PimdirError, PimdirSourceStore, bind_list,
@@ -41,7 +44,7 @@ use crate::{
     coroutine::*,
     hash::PimdirHasher,
     hub::PimdirSourceId,
-    intent::PimdirCollectionCreate,
+    intent::{PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename},
     load::{PimdirLoadSelection, PimdirLoaded},
     mutate::{self, PimdirMutate, PimdirMutation},
     object::{PimdirHash, PimdirObject},
@@ -522,6 +525,42 @@ impl PimdirProducer {
         };
         let action = create.to_action()?;
         self.enqueue(anchor, &action, None)
+    }
+
+    /// Enqueues a `collection-rename` (Annex B.2): `collection` renamed
+    /// `name` on the performer's server, its parent and items kept. The
+    /// performer is resolved at `collection` as
+    /// [`enqueue_collection_create`](Self::enqueue_collection_create)
+    /// resolves it. Returns the row's id; the new name arrives with the
+    /// performer's next sync.
+    pub fn enqueue_collection_rename(
+        &mut self,
+        collection: &str,
+        name: &str,
+        chosen: Option<&str>,
+    ) -> Result<i64, PimdirError> {
+        let rename = PimdirCollectionRename {
+            source: self.performer(collection, COLLECTION_RENAME, chosen)?,
+            name: name.to_string(),
+        };
+        let action = rename.to_action()?;
+        self.enqueue(collection, &action, None)
+    }
+
+    /// Enqueues a `collection-delete` (Annex B.2): `collection` deleted
+    /// on the performer's server with its items, never with another
+    /// collection. Returns the row's id; the deletion arrives with the
+    /// performer's next sync, the store removing no item for it.
+    pub fn enqueue_collection_delete(
+        &mut self,
+        collection: &str,
+        chosen: Option<&str>,
+    ) -> Result<i64, PimdirError> {
+        let delete = PimdirCollectionDelete {
+            source: self.performer(collection, COLLECTION_DELETE, chosen)?,
+        };
+        let action = delete.to_action()?;
+        self.enqueue(collection, &action, None)
     }
 }
 

@@ -11,7 +11,10 @@ use std::{fs, path::PathBuf};
 
 use io_pimdir::{
     codec,
-    intent::{PimdirCollectionCreate, PimdirInvitation, PimdirSubmit},
+    intent::{
+        PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename, PimdirInvitation,
+        PimdirSubmit,
+    },
 };
 use serde_json::Value;
 
@@ -50,6 +53,12 @@ fn reads(case: &Value) {
             .map(drop)
             .map_err(|err| err.to_string()),
         "collection-create" => PimdirCollectionCreate::from_payload(&payload)
+            .map(drop)
+            .map_err(|err| err.to_string()),
+        "collection-rename" => PimdirCollectionRename::from_payload(&payload)
+            .map(drop)
+            .map_err(|err| err.to_string()),
+        "collection-delete" => PimdirCollectionDelete::from_payload(&payload)
             .map(drop)
             .map_err(|err| err.to_string()),
         "submit" => PimdirSubmit::from_payload(&payload)
