@@ -65,8 +65,8 @@ clap = { version = "4.4", default-features = false, features = ["derive", "std",
 encoding_rs = { version = "0.8", default-features = false, features = ["alloc"], optional = true }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 humantime = { version = "2.2", default-features = false, optional = true }
-jiff = { version = "0.2.33", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
 ical-rs = { version = "0.6", default-features = false, features = ["parser", "tzdb"], optional = true }
+jiff = { version = "0.2.33", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
 log = { version = "0.4", default-features = false }
 mime-rs = { version = "0.0.1", git = "https://github.com/pimalaya/mime-rs", rev = "d7ea03296a197647a6effeb593a8528b47bdb0ed", default-features = false, features = ["parser", "base64", "encoding"], optional = true }
 pimalaya-cli = { version = "0.2", default-features = false, features = ["prompt", "table", "terminal"], optional = true }
