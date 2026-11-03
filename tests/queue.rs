@@ -9,7 +9,7 @@ use std::{fs, path::Path, sync::mpsc, thread, time::Duration};
 
 use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
-    collection::PimdirCollectionId,
+    collection::{PimdirCheckpoint, PimdirCollectionId},
     load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
@@ -418,6 +418,67 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
     assert_eq!(archive[0].link_id.0, "mid:b");
     assert_eq!(archive[0].seq, seq_b);
     assert!(store.get_item("INBOX", seq_b).unwrap().is_none());
+}
+
+#[test]
+fn a_queued_bodiless_move_applies_into_a_target_its_source_syncs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    store.ensure_collection("Trash", "message/rfc822").unwrap();
+    store
+        .ensure_collection("Archive", "message/rfc822")
+        .unwrap();
+    let listed = |handle: &str, link: &str| {
+        let mut listed = placement(handle, link, "", &[]);
+        listed.object = None;
+        listed.level = PimdirLevel::Meta;
+        listed.base = Some(PimdirBase {
+            flags: PimdirFlags::default(),
+            revision: None,
+            object: None,
+        });
+        PimdirWriteOp::UpsertPlacement(listed)
+    };
+    store
+        .write(vec![
+            listed("1", "mid:a"),
+            listed("2", "mid:b"),
+            PimdirWriteOp::SetCheckpoint {
+                collection: PimdirCollectionId("Trash".into()),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
+        ])
+        .unwrap();
+    let seq_of = |link: &str| {
+        store
+            .list_items("INBOX", None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.link_id.0 == link)
+            .unwrap()
+            .seq
+    };
+    let (seq_a, seq_b) = (seq_of("mid:a"), seq_of("mid:b"));
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    for (seq, to) in [(seq_a, "Trash"), (seq_b, "Archive")] {
+        let to = PimdirCollectionId(to.into());
+        producer
+            .enqueue("INBOX", &PimdirAction::Move { seq, to }, None)
+            .unwrap();
+    }
+
+    let report = store.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked),
+        (1, 1),
+        "Trash, which the source syncs, takes it; Archive cannot"
+    );
+    let trash = store.list_items("Trash", None, 10).unwrap();
+    assert_eq!(trash.len(), 1);
+    assert_eq!(trash[0].link_id.0, "mid:a");
+    assert!(store.list_items("Archive", None, 10).unwrap().is_empty());
 }
 
 #[test]

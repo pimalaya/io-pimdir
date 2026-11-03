@@ -1272,18 +1272,23 @@ fn acting_source(
     own: &PimdirSourceId,
     collection: &str,
 ) -> Result<PimdirSourceId, PimdirError> {
-    let sources = tx
-        .prepare(sql::COLLECTION_SOURCES)?
-        .query_map(named_params! { ":collection": collection }, |r| {
-            r.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let sources = collection_sources(tx, collection)?;
     let acting = match sources.contains(&own.0) {
         true => own.0.clone(),
         false => sources.into_iter().next().unwrap_or_else(|| own.0.clone()),
     };
 
     Ok(PimdirSourceId(acting))
+}
+
+/// The sources syncing `collection`, by a binding or a checkpoint.
+fn collection_sources(tx: &Connection, collection: &str) -> Result<Vec<String>, PimdirError> {
+    Ok(tx
+        .prepare(sql::COLLECTION_SOURCES)?
+        .query_map(named_params! { ":collection": collection }, |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Stages the writes one queued action folds into the store (§15.3),
@@ -1540,7 +1545,11 @@ fn stage_action(
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
 
-    let mut mutate = PimdirMutate::new(collection_id.clone(), mutation);
+    let syncs_target = match mutation.create_target() {
+        Some(target) => collection_sources(tx, &target.0)?.contains(&source.0),
+        None => false,
+    };
+    let mut mutate = PimdirMutate::new(collection_id.clone(), mutation).syncs_target(syncs_target);
     let _ = mutate.resume(None);
     let placements = hub.project(&collection_id, source);
     let conflicted = hub.conflicted(&placements);
