@@ -149,6 +149,15 @@ where
         .map(|p| p.handle)
         .collect();
     let _ = client.upgrade(collection, handles, PimdirTier::Meta);
+
+    let awaiting: Vec<PimdirHandle> = client
+        .storage()
+        .rows(collection)
+        .into_iter()
+        .filter(|p| p.status != PimdirStatus::Tombstone && p.awaits_base())
+        .map(|p| p.handle)
+        .collect();
+    let _ = client.upgrade(collection, awaiting, PimdirTier::Full);
 }
 
 /// The named, live rows of `collection`: what a consumer can act on.

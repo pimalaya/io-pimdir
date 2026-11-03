@@ -567,6 +567,7 @@ impl PimdirRemote for MemRemote {
             checkpoint: Some(checkpoint),
             narrowed: false,
             enumerated: None,
+            capped: false,
         }))
     }
 

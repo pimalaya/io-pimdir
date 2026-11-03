@@ -43,7 +43,7 @@ Applying a fetched item SHALL set the placement's `link_id` from the fetch **onl
 - THEN the heavy member is fetched concurrently with the light ones, results are matched by handle, and no fetch order is assumed
 
 ### Requirement: An upgrade revisits what it never got
-An upgrade SHALL revisit a placement whose level claims a tier it does not hold: `Full` with no object, `Meta` with no summary (pimdir SYNC §3, §6). The `Meta` tier exists for this alone. The level is a claim and the payload is the fact, and nothing else revisits what already reads as reached, so such a row would be skipped for good.
+An upgrade SHALL revisit a placement whose level claims a tier it does not hold: `Full` with no object, or holding a body over a base naming a revision and no body, whose push waits for it; `Meta` with no summary (pimdir SYNC §3, §5, §6). The `Meta` tier exists for this alone. The level is a claim and the payload is the fact, and nothing else revisits what already reads as reached, so such a row would be skipped for good.
 
 #### Scenario: A body-less full row
 - GIVEN a placement recorded at `Full` holding no object
@@ -127,7 +127,7 @@ Any other fetched body SHALL be settled by the source's policy (`PimdirUpgradeOp
 - THEN the fetched body lands as the conflict object and the local body is untouched
 
 ### Requirement: A fetch moves the base
-A `Full` fetch over a placement holding no staged edit SHALL set the base to the fetched body and revision (pimdir SYNC §6, vectors/sync/30): a body the source just handed over is what the two agree on, and a base left behind it read every fetched body as an edit to push. Over a staged edit, a body its base does not hold, a fetch reporting the base's own revision keeps the local body and moves nothing; one reporting a revision the base never held is the both-changed case and SHALL mark a `Conflict` at the fetched revision with the fetched body as `conflict_object`, the local body kept.
+A `Full` fetch over a placement holding no staged edit SHALL set the base to the fetched body and revision (pimdir SYNC §6, vectors/sync/30): a body the source just handed over is what the two agree on, and a base left behind it read every fetched body as an edit to push. Over a staged edit, a body its base does not hold, a fetch reporting the base's own revision keeps the local body, a base naming no body taking the fetched one (vectors/sync/133); one reporting a revision the base never held is the both-changed case and SHALL mark a `Conflict` at the fetched revision with the fetched body as `conflict_object`, the local body kept.
 
 #### Scenario: A hydration is not an edit
 - GIVEN a clean placement at `r1` with no body

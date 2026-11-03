@@ -278,6 +278,8 @@ pub struct PimdirSyncReport {
     /// The round this run parked rather than closed, its last page
     /// finding most of its scope absent (SYNC §5).
     pub parked: Option<PimdirParked>,
+    /// Based bindings a capped round did not list (SYNC §5).
+    pub unlisted: usize,
     /// The per-item events this sync emitted, in order, each once the
     /// write recording it committed (SYNC §5).
     pub events: Vec<PimdirSyncEvent>,
@@ -634,6 +636,7 @@ impl PimdirSync {
             checkpoint,
             narrowed,
             enumerated,
+            capped,
         } = snapshot;
 
         // NOTE: the join walks both sides in handle order and pairs each
@@ -731,6 +734,7 @@ impl PimdirSync {
             checkpoint,
             narrowed,
             enumerated,
+            capped: capped && kind == PageKind::Last,
         });
         self.local.clear();
         self.unstamped.clear();
@@ -843,6 +847,15 @@ impl PimdirSync {
                     .collect(),
             };
             trace!("found absent in scope: {absent:?}");
+
+            let absent = match page.capped {
+                true => {
+                    debug!("capped listing, {} unlisted members kept", absent.len());
+                    self.report.unlisted = absent.len();
+                    Vec::new()
+                }
+                false => absent,
+            };
 
             // NOTE: a listing dropping most of a large scope is read as a
             // truncated or emptied answer until the caller confirms it, and
@@ -1546,6 +1559,10 @@ impl PimdirSync {
                     if !(self.opts.push && self.opts.rights.content) {
                         return self.refuse_delete(local);
                     }
+                    if local.awaits_base() {
+                        debug!("hold {}: its base body is unread", handle.as_str());
+                        return None;
+                    }
                     let object = local.object.clone().expect("a staged edited body");
                     self.pending.insert(handle.clone(), Pending::Content(local));
                     return Some(PimdirChangeKind::Update {
@@ -1750,6 +1767,10 @@ impl PimdirSync {
             (false, true) => ContentOutcome::Rewritten(self.pull_content(local, item)),
             (true, false) => {
                 if !(self.opts.push && self.opts.rights.content) {
+                    return ContentOutcome::Untouched;
+                }
+                if local.awaits_base() {
+                    debug!("hold {}: its base body is unread", local.handle.as_str());
                     return ContentOutcome::Untouched;
                 }
                 self.push_content(local, base.revision.clone())
@@ -2567,6 +2588,8 @@ struct Page {
     /// The handles an unfiltered enumeration listed, on a narrowed last
     /// page.
     enumerated: Option<Vec<PimdirHandle>>,
+    /// Whether the source caps the round this last page closes.
+    capped: bool,
 }
 
 /// What a page lands once merged and pushed.
@@ -4506,6 +4529,7 @@ mod tests {
             checkpoint: None,
             narrowed: false,
             enumerated: None,
+            capped: false,
         };
         let local = vec![synced("1", &[]), synced("2", &[])];
 

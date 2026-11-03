@@ -203,7 +203,15 @@ impl PimdirSourceStore {
         collection: impl Into<PimdirCollectionId>,
         mutation: PimdirMutation,
     ) -> Result<PimdirMutateReport, PimdirRunError<Infallible, PimdirMutateError>> {
-        self.run(PimdirMutate::new(collection, mutation), &mut PimdirOffline)
+        let syncs_target = match mutation.create_target() {
+            Some(target) => self
+                .collection_sources(target)
+                .map_err(PimdirRunError::Store)?
+                .contains(&self.source.0),
+            None => false,
+        };
+        let mutate = PimdirMutate::new(collection, mutation).syncs_target(syncs_target);
+        self.run(mutate, &mut PimdirOffline)
     }
 
     /// Reconciles a collection with its remote (SYNC §5).

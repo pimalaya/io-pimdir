@@ -524,6 +524,7 @@ impl Scripted {
                 .as_str()
                 .map(|checkpoint| PimdirCheckpoint(checkpoint.as_bytes().to_vec())),
             narrowed: page["narrowed"].as_bool().unwrap_or(false),
+            capped: page["capped"].as_bool().unwrap_or(false),
             enumerated: page["enumerated"].as_array().map(|handles| {
                 handles
                     .iter()
@@ -805,7 +806,7 @@ fn mutation(
             .handle
             .clone()
     };
-    let target = || PimdirCollectionId::from(value["target"].as_str().unwrap());
+    let target = || PimdirCollectionId::from(value["to"].as_str().unwrap());
     let derived = |body: &[u8]| summary::derive(kind, body);
 
     Some(match value["kind"].as_str().unwrap() {

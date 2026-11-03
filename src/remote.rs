@@ -169,6 +169,8 @@ pub struct PimdirRemoteSnapshot {
     /// any member, undated or dated after it opened included, whose
     /// handle it lacks.
     pub enumerated: Option<Vec<PimdirHandle>>,
+    /// Whether the source caps the round's listing (SYNC §4, §5).
+    pub capped: bool,
 }
 
 impl PimdirRemoteSnapshot {
@@ -183,6 +185,7 @@ impl PimdirRemoteSnapshot {
             checkpoint,
             narrowed: false,
             enumerated: None,
+            capped: false,
         }
     }
 
@@ -201,6 +204,7 @@ impl PimdirRemoteSnapshot {
             checkpoint,
             narrowed: false,
             enumerated: None,
+            capped: false,
         }
     }
 
@@ -219,6 +223,7 @@ impl PimdirRemoteSnapshot {
             checkpoint: Some(checkpoint),
             narrowed: false,
             enumerated: None,
+            capped: false,
         }
     }
 
@@ -235,6 +240,7 @@ impl PimdirRemoteSnapshot {
             checkpoint: None,
             narrowed: false,
             enumerated: None,
+            capped: false,
         }
     }
 }

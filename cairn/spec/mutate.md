@@ -40,7 +40,7 @@ A `Copy` or a `Move` SHALL read the target collection for the identity it is car
 
 The read SHALL ask for the key a second copy would take beside the identity itself, and SHALL be made against the target rather than the collection the mutation reads, which cannot answer it. A source placement holding no identity yet stages its create without the read, having no key to collide with.
 
-A `Copy` or a `Move` of a placement holding neither a body nor a based binding SHALL fail with `PimdirMutateError::Undeliverable`: the create could neither upload nor server-copy, and would sit pending for ever (pimdir SYNC §7).
+A `Copy` or a `Move` of a placement holding no body SHALL fail with `PimdirMutateError::Undeliverable` unless its binding is based and the run's source syncs the target (`PimdirMutate::syncs_target`, which `PimdirSourceStore::mutate` reads from `collection_sources`, `false` by default): only that source holds the origin a bodiless create is copied from, and another source is offered the create once the body is held (pimdir SYNC §7; vectors/sync/135).
 
 #### Scenario: A copy into a collection that holds the identity
 - GIVEN a target collection holding a live placement under an identity

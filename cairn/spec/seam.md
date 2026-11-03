@@ -112,3 +112,6 @@ A storage SHALL answer `PimdirYield::WantsVerify` with the bodies that read whol
 
 ### Requirement: A narrowed listing says so
 A connector narrowing a round's listing by any date filter SHALL set `PimdirRemoteSnapshot::narrowed` on every page of that round and on no other page, and on its last page SHOULD hand `enumerated`, every handle the collection holds on the source read by an enumeration no date filter narrowed, where the source offers one (pimdir SYNC §4, §5): IMAP narrowing by `SENTSINCE` hands `UID SEARCH ALL`, JMAP narrowing by `after` an `Email/query` filtered by the mailbox alone, Graph narrowing by `receivedDateTime` the folder's message ids, Gmail narrowing by `after:` the label's ids where it lists them. A filter lists a member only when it matches, so it misses an undated member received before its window and one whose `Date` runs ahead of its arrival, and the engine finds such a member absent only on the enumeration's word. The constructors (`round`, `page`, `delta`, `band_head`) state neither.
+
+### Requirement: A capped listing says so
+A connector knowing that its source caps a collection's listing SHALL set `PimdirRemoteSnapshot::capped` on every page of that collection's rounds and on no other (pimdir SYNC §4, §5). The constructors state none.

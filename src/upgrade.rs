@@ -164,7 +164,9 @@ impl PimdirUpgrade {
                     PimdirTier::Full => match (is_conflicted(p), &p.object) {
                         (true, _) => p.conflict_object.is_none(),
                         (false, Some(object)) => {
-                            p.level < PimdirLevel::Full || self.missing.contains(object)
+                            p.level < PimdirLevel::Full
+                                || self.missing.contains(object)
+                                || p.awaits_base()
                         }
                         (false, None) => true,
                     },

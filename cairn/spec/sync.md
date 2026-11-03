@@ -348,6 +348,22 @@ A round whose last page states `narrowed` (`PimdirRemoteSnapshot::narrowed`, set
 - WHEN the round's last page lands
 - THEN the 5 October member is dropped `Deleted` and the other two stay as they were (vectors/sync/107; a narrowed enumeration lacking the undated member drops it, vectors/sync/47; a resumed round's enumeration, tests/scoped_sync.rs `a_resumed_narrowed_round_drops_only_what_its_enumeration_lacks`)
 
+### Requirement: A capped listing proves no absence
+A round whose last page states `capped` SHALL find no member absent: it closes as any round does, drops only vanished handles, and counts the based bindings in scope it did not list in `PimdirSyncReport::unlisted` (pimdir SYNC §5).
+
+#### Scenario: A folder under a size limit
+- GIVEN a based binding a capped round's last page does not list
+- WHEN the page lands
+- THEN the binding stays, the item stays live, and the round closes (vectors/sync/134)
+
+### Requirement: An edit over an unread base waits for it
+A placement holding a body over a base naming a revision and no body (`PimdirPlacement::awaits_base`) SHALL derive no `Update`, nor the `Remove` a move's staged edit rides ahead of, until an upgrade reads that base (pimdir SYNC §5).
+
+#### Scenario: An edit after a bodiless pull
+- GIVEN a card whose base names `r2` and no body, holding a local edit
+- WHEN a sync lists it still at `r2`
+- THEN nothing is pushed and the rows stay as they were (vectors/sync/132)
+
 ### Requirement: A scope bounds mail only
 `PimdirSyncOptions::scope` is unbounded by default. `PimdirSourceStore::sync` and `prepare_sync` SHALL refuse a bounded scope on a collection whose kind is not `message/rfc822`, naming the kind (`PimdirError::Scope`).
 

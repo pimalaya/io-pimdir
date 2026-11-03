@@ -354,6 +354,15 @@ impl PimdirPlacement {
 
         (!synced).then_some(object)
     }
+
+    /// Whether a held body faces a base naming no body (SYNC §5).
+    pub fn awaits_base(&self) -> bool {
+        self.object.is_some()
+            && self
+                .base
+                .as_ref()
+                .is_some_and(|base| base.revision.is_some() && base.object.is_none())
+    }
 }
 
 #[cfg(test)]

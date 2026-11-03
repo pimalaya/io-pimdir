@@ -179,7 +179,7 @@ impl PimdirMutation {
     }
 
     /// The target of a staged create, else `None`.
-    fn create_target(&self) -> Option<&PimdirCollectionId> {
+    pub(crate) fn create_target(&self) -> Option<&PimdirCollectionId> {
         match self {
             Self::Copy { target, .. } | Self::Move { target, .. } => Some(target),
             _ => None,
@@ -387,6 +387,8 @@ pub struct PimdirMutate {
     mutation: PimdirMutation,
     /// The source of a staged create, held while the target's keys are read.
     source: Option<PimdirPlacement>,
+    /// Whether the run's source syncs the target (SYNC §7).
+    syncs_target: bool,
     /// Whether the edited placement's item is conflicted, which a
     /// resolution settles (SYNC §7).
     item_conflicted: bool,
@@ -403,9 +405,17 @@ impl PimdirMutate {
             collection,
             mutation,
             source: None,
+            syncs_target: false,
             item_conflicted: false,
             state: State::Start,
         }
+    }
+
+    /// Whether the run's source syncs the target, `false` by default
+    /// (SYNC §7).
+    pub fn syncs_target(mut self, syncs: bool) -> Self {
+        self.syncs_target = syncs;
+        self
     }
 
     /// Stages the writes for the loaded `source` placement.
@@ -718,7 +728,8 @@ impl PimdirCoroutine for PimdirMutate {
                     if let Some(target) = self.mutation.create_target()
                         && let Some(hint) = placement.link_id.clone()
                     {
-                        if placement.object.is_none() && placement.base.is_none() {
+                        let copyable = placement.base.is_some() && self.syncs_target;
+                        if placement.object.is_none() && !copyable {
                             let err = PimdirMutateError::Undeliverable(handle.as_str().into());
                             return PimdirCoroutineState::Complete(Err(err));
                         }
@@ -1620,7 +1631,7 @@ mod tests {
             handle: PimdirHandle::from("1"),
             target: "archive".into(),
         };
-        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
         let _ = mutate.resume(None);
 
         match mutate.resume(Some(PimdirArg::Load(loaded("1")))) {
@@ -1665,7 +1676,7 @@ mod tests {
             handle: PimdirHandle::from("1"),
             target: "archive".into(),
         };
-        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
         let _ = mutate.resume(None);
         let _ = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
         let ops = stage(&mut mutate, Vec::new());
@@ -1717,7 +1728,7 @@ mod tests {
             handle: PimdirHandle::from("1"),
             target: "archive".into(),
         };
-        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
         let _ = mutate.resume(None);
         let _ = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
 
@@ -1739,7 +1750,7 @@ mod tests {
             handle: PimdirHandle::from("1"),
             target: "archive".into(),
         };
-        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
         let _ = mutate.resume(None);
         let _ = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
 

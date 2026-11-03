@@ -1068,6 +1068,7 @@ mod tests {
             checkpoint: None,
             narrowed: false,
             enumerated: None,
+            capped: false,
         };
 
         match answer(page) {
