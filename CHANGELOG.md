@@ -148,6 +148,7 @@ All notable changes to this project are documented in this file. The format is b
 - Added `PimdirHub::conflicted`.
 
 - Added the `charset-tables` feature (adding encoding_rs 0.8 alloc-only), which `client` enables (decision 5): `summary::mail::charset_decode` decodes every label of the WHATWG Encoding Standard through `Encoding::for_label_no_replacement`, `decode_without_bom_handling` so the label holds against a byte-order mark; gbk, big5, euc-jp, iso-2022-jp, shift_jis, euc-kr, the windows-125x and iso-8859-x rows and utf-16 decode through their tables, and an encoded word in a label the table names with no encoding behind it (iso-2022-kr among them), or in none, is kept as written (pimdir STORAGE Annex A.1). A build without the feature keeps an encoded word in a charset other than UTF-8 and windows-1252 as written.
+- Added simd-cpu 0.1 (`std`) as a direct dependency under `cli`: `pimdir` installs the running CPU's token first thing in `main`, so the base64 and quoted-printable codecs under mime-rs and pimalaya-cli run their SIMD paths instead of the portable baseline.
 
 ### Changed
 

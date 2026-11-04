@@ -35,7 +35,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["client", "vendored"]
 client = ["charset-tables", "dep:fs4", "dep:rusqlite", "dep:rustix"]
 search = ["dep:ical-rs", "dep:mime-rs", "dep:unicode-normalization", "dep:vcard-rs"]
-cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars"]
+cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars", "dep:simd-cpu"]
 charset-tables = ["dep:encoding_rs"]
 vendored = ["rusqlite?/bundled"]
 
@@ -74,6 +74,7 @@ rusqlite = { version = "0.41", default-features = false, optional = true }
 schemars = { version = "1", default-features = false, features = ["derive", "std"], optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+simd-cpu = { version = "0.1", default-features = false, features = ["std"], optional = true }
 unicode-normalization = { version = "0.1", default-features = false, optional = true }
 vcard-rs = { version = "0.6", default-features = false, features = ["parser"], optional = true }
 

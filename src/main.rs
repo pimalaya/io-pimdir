@@ -46,6 +46,7 @@ use pimalaya_cli::{
     long_version,
     printer::{Printer, StdoutPrinter},
 };
+use simd_cpu::SimdCpu;
 
 use crate::cli::{
     StoreFlags,
@@ -62,6 +63,10 @@ use crate::cli::{
 };
 
 fn main() {
+    // NOTE: the base64 and quoted-printable codecs below read the
+    // installed CPU token, the portable baseline until one is installed.
+    let _ = SimdCpu::install_detected();
+
     let cli = Cli::parse();
 
     Logger::try_init(&cli.log).expect("init logger");
