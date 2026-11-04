@@ -22,6 +22,7 @@ const CARD: &[u8] = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:blob\r\nFN:Blob\r\nEND:V
 
 /// A card longer than a copy's buffer, so a stream would hand on its
 /// first bytes before the read reaching its end checks it.
+#[cfg(feature = "cli")]
 fn long_card() -> Vec<u8> {
     let note = "x".repeat(64 * 1024);
     format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:long\r\nFN:Long\r\nNOTE:{note}\r\nEND:VCARD\r\n")

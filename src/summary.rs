@@ -379,6 +379,7 @@ pub(crate) fn same_message(held: Option<&PimdirSummary>, listed: Option<&PimdirS
 /// Whether a member's summary names the message a retained row's does
 /// (STORAGE §9): [`same_message`], and the same `size` where both state
 /// one, no source holding the retained message any more to tell them apart.
+#[cfg(feature = "client")]
 pub(crate) fn same_retained_message(
     held: Option<&PimdirSummary>,
     listed: Option<&PimdirSummary>,
