@@ -115,10 +115,10 @@ The CLI SHALL expose, at minimum:
 
 - `collection list`: id, kind, name, role, generation, coverage (`all`,
   `since …` or `-` while a source never closed a round; `coveredSince`,
-  `coveredUntil`, `coveredAt` in JSON), live count and retained count.
+  `coveredUntil`, `coveredAt` in JSON), live count and retained count, plus `description`, `color` and `default` in JSON.
 - `item list`: a collection's live items in the kind's own order with the
   summary's title, or its retained ones with `--retained`, keyset-paged with
-  `--after` and `--limit`.
+  `--page-token` and `--limit`, printing `nextPage`.
 - `item show`: one item by its public `seq`, across every collection that holds
   it, retained placements included, each with its summary row and addresses as
   stored and the bindings its sources hold it under.
@@ -149,21 +149,40 @@ The CLI SHALL expose, at minimum:
   blob files a crash left, reporting what it freed and how many entries of objects/ it left as no body (`strays`).
 - `quarantine empty`: unlink every file of quarantine/ (STORAGE §7) through `PimdirStore::empty_quarantine`, under the staging lock, reporting the files and bytes freed and the entries left that are no file (`pimdir-quarantine-empty`). `gc` never touches quarantine/.
 - `export`: a portable dump of the store.
-- `index` folds the store's change feed into index.db; `search` and `count` answer a SEARCH.md §8 query, each hit addressed as `(account, seq)` with its placements, what it matched (`body`, `summary` or none) and a snippet, every answer with its coverage, after refreshing the index within `--refresh-timeout`; `show SEQ --account ACCOUNT` prints a hit's item as extraction reads it. `search --threads` collapses hits to threads (`pimdir-search-threads`), `--limit` and `--offset` then counting threads. `thread SEQ --account ACCOUNT` prints the item's thread (`pimdir-thread`). `tag QUERY --add FLAG --remove FLAG` stages one `set-flags` per placement that changes, each as the source syncing its collection, previews it with `--dry-run`, and reads each placement's outcome back from the store (`pimdir-tag`). A refused query prints SEARCH §8.4's refusal object (`pimdir-query-error` in `json-schema`) and exits with status 1.
+- `index` folds the store's change feed into index.db; `search` and `count` answer a SEARCH.md §8 query, each hit addressed as `(account, seq)` with its placements, what it matched (`body`, `summary` or none) and a snippet, every answer with its coverage, after refreshing the index within `--refresh-timeout`; `show SEQ --account ACCOUNT` prints a hit's item as extraction reads it. `search --threads` collapses hits to threads, printed under `threads` where hits print under `hits`, `--limit` and `--page-token` then counting threads. `thread SEQ --account ACCOUNT` prints the item's thread (`pimdir-thread`). `tag QUERY --add FLAG --remove FLAG` stages one `set-flags` per placement that changes, each as the source syncing its collection, previews it with `--dry-run`, and reads each placement's outcome back from the store (`pimdir-tag`). A refused query (SEARCH §8.4) fails with `query-refused`, its message naming the fault, where it lies and what would be valid there.
 
 Every command SHALL render as JSON under `--json`, write logs to stderr only,
-and carry its own `--help` text. The one carve-out is `item export` to stdout, whose output is the body's raw bytes: it SHALL refuse `--json` unless `--output` names a file, and then reports the write as JSON.
+and carry its own `--help` text. `item export` to stdout writes the body's raw bytes, and under `--json` prints it as `{data, size, mime}`, `data` in base64 and `mime` the collection's declared media type, `application/octet-stream` when none.
 
 ### Requirement: The JSON output is a contract
-Every data command SHALL hand the printer one output type deriving `Display`, `Serialize` and `JsonSchema`, with camelCase keys on it and on every nested row and status enum, and a `json-schema` subcommand SHALL list every command's output type by its dash-joined path (`pimdir-item-list`), so a consumer can validate what `--json` prints. The summary row is the one value printed with the store's own column names, since it is printed as stored.
+Every data command SHALL hand the printer one output type deriving `Display`, `Serialize` and `JsonSchema`, with camelCase keys on it and on every nested row and kebab-case values on every status enum, and a `json-schema` subcommand SHALL list every command's output type by its dash-joined path (`pimdir-item-list`), so a consumer can validate what `--json` prints. The summary row is the one value printed with the store's own column names, since it is printed as stored.
 
 ### Requirement: The JSON contract is described and versioned
-`pimdir json-schema` SHALL describe, under the key `pimdir-error`, the failure object every command prints under `--json`. Every generated schema SHALL carry an `$id` naming the contract version, which is the minor version while pimdir is below 1.0 (`v0.8`) and the major version after. Every registered payload SHALL be a JSON object, and every runnable command SHALL have a schema whose key names it, `pimdir-error` and the variants `pimdir-search-threads` and `pimdir-query-error` aside, both checked by a test. A list SHALL be printed under a key naming its rows, `collection list` printing `{"collections": [...]}`. Piped `--json` output SHALL print one value per line.
+`pimdir json-schema` SHALL describe, under the key `pimdir-error`, the failure object every command prints under `--json`. Every generated schema SHALL carry an `$id` naming the contract version, which is the minor version while pimdir is below 1.0 (`v0.8`) and the major version after. Every registered payload SHALL be a JSON object, and every runnable command SHALL have a schema whose key names it, `pimdir-error` aside, both checked by a test with no exemption: a command printing one of two shapes (`search` with or without `--threads`, `item export` with or without `--output`) is described by both, their keys telling them apart. `pimdir-error` SHALL describe the failure object with its `code` typed by pimdir's code enum. A list SHALL be printed under a key naming its rows, `collection list` printing `{"collections": [...]}`. Piped `--json` output SHALL print one value per line.
 
 #### Scenario: A caller reads a failure against its schema
 - GIVEN `pimdir json-schema pimdir-error`
 - WHEN it runs
 - THEN the schema of the JSON failure object is printed, its `$id` being `https://pimalaya.org/schemas/pimdir/v0.8/pimdir-error.json`
+
+### Requirement: The JSON follows pimalaya-cli's contract
+The `--json` output SHALL follow pimalaya-cli's output and error specs, as every Pimalaya binary does. A value pimdir defines (a status, a coverage kind) SHALL be kebab-case. Every key of pimdir's own types SHALL be printed, `null` when the value is absent; a collection's undeclared `kind` is `null`, not an empty string. A queue row's id SHALL print as `row` wherever it appears (`queue list`, `queue status`, `queue cancel`, `item restore`, `tag`). A collection row SHALL carry the shared `{id, name, description, color, default}`, `default` being whether its source states the `default` role (STORAGE §14), beside the store's own columns. A queue row SHALL print its `payload` as the queue stores it, never a summary the CLI composed. The item's public id stays `seq`, the pimdir drafts' name for it, wherever a receipt names the item.
+
+A write SHALL answer a receipt: `item restore` its `seq`, `collection`, `linkId`, `row` and `queued`; `item purge` its `cutoff` and `count`; `export` the `path` it wrote; `item export --output` the `path` and `size` written. A listing that can stop short (`item list`, `search`) SHALL print `nextPage`, `null` on its last page, and take it back through `--page-token`; `--after` and `--offset` remain hidden aliases.
+
+Every failure SHALL print pimalaya-cli's failure object with a kebab-case `code`, `null` when none applies: a store failure carries io-pimdir's `PimdirError::code` by its spelling, and the CLI's own failures carry `item-not-found`, `collection-required`, `item-live`, `body-absent`, `body-missing`, `row-not-found`, `source-required`, `confirmation-required`, `cancelled`, `page-token-invalid` or `dump-exists`. A refused query SHALL fail with `query-refused`, its message naming the fault, where it lies, and what would be valid there.
+
+A command that ran to its end short of full success SHALL print its result, then exit 2, its `--help` saying when: `check` leaving a problem `--fix` does not repair, `item restore` whose drain left the item retained, `tag` with a placement neither planned, unchanged, applied nor queued, `export` leaving a body out, `quarantine empty` leaving an entry in place.
+
+#### Scenario: A body exported under JSON
+- GIVEN a mail item holding its body
+- WHEN `pimdir --json item export SEQ` runs without `--output`
+- THEN it prints `{data, size, mime}`, `data` the body in base64 and `mime` `message/rfc822` (tests/cli_json.rs `an_exported_body_travels_as_data`)
+
+#### Scenario: A check finding a quarantined body
+- GIVEN a store whose quarantine/ holds a file
+- WHEN `pimdir --json check --fix` runs
+- THEN it prints the file under `quarantined` and exits 2 (tests/cli_json.rs `a_check_leaving_a_problem_exits_2`)
 
 ### Requirement: The toolkit verbs are singular
 `completion`, `manual` and `json-schema` SHALL be spelled singular, each with its plural as a hidden alias, as every Pimalaya CLI spells them.

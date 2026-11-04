@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Args;
 use io_pimdir::{
     client::{blobs::PimdirBlobs, modes, reader::PimdirReader},
@@ -32,7 +32,11 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::cli::{StoreFlags, bytes, now, report, summary};
+use crate::cli::{
+    StoreFlags, bytes,
+    error::{ErrorCode, partial, report},
+    now, summary,
+};
 
 /// How many items are read per page while dumping a collection.
 const PAGE: usize = 500;
@@ -50,6 +54,9 @@ const FORMAT_VERSION: i64 = 3;
 /// the dump carries no interpretation of any kind. Use it to snapshot a store
 /// before a risky operation, to move one between machines, or to look at a
 /// store with ordinary text tools.
+///
+/// Exits 2 once the result is printed when a body was missing from the blob
+/// store and left out of the dump.
 #[derive(Debug, Args)]
 pub struct ExportCommand {
     /// Directory to write the dump into (created if missing).
@@ -77,10 +84,10 @@ impl ExportCommand {
 
         let manifest_path = self.dir.join("manifest.json");
         if manifest_path.exists() && !self.force {
-            bail!(
+            return Err(ErrorCode::DumpExists.error(format!(
                 "{} already holds a dump: pass --force to overwrite it",
                 self.dir.display()
-            );
+            )));
         }
         modes::create_dir_all(&self.dir.join("items"))?;
 
@@ -146,14 +153,21 @@ impl ExportCommand {
         });
         create(&manifest_path)?.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
 
+        let short = !missing.is_empty();
+
         printer.out(ExportOutput {
-            dir: self.dir,
+            path: self.dir,
             collections: collection_count,
             items,
             objects,
             bytes: object_bytes,
             missing,
-        })
+        })?;
+
+        match short {
+            true => Err(partial()),
+            false => Ok(()),
+        }
     }
 
     /// Dumps a collection's live items, page by page, returning how many.
@@ -315,7 +329,7 @@ fn level(level: PimdirLevel) -> &'static str {
 #[serde(rename_all = "camelCase")]
 pub struct ExportOutput {
     /// Where the dump was written.
-    pub dir: PathBuf,
+    pub path: PathBuf,
     /// How many collections it describes.
     pub collections: usize,
     /// How many items it holds.
@@ -337,7 +351,7 @@ impl fmt::Display for ExportOutput {
             self.items,
             self.objects,
             bytes(self.bytes),
-            self.dir.display()
+            self.path.display()
         )?;
 
         if !self.missing.is_empty() {

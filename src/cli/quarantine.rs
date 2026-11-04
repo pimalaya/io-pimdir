@@ -13,7 +13,10 @@ use pimalaya_cli::printer::Printer;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, bytes, confirm, report};
+use crate::cli::{
+    StoreFlags, bytes, confirm,
+    error::{partial, report},
+};
 
 /// Manage the bodies that failed their name.
 #[derive(Debug, Subcommand)]
@@ -37,6 +40,9 @@ impl QuarantineCommand {
 /// the only copy of something; `pimdir check` lists them. Emptying cannot be
 /// undone. Takes the owner role, fails while a producer is staging a body,
 /// and asks first unless `--yes` is passed.
+///
+/// Exits 2 once the result is printed when it left an entry in place that
+/// is neither a file nor a link.
 #[derive(Debug, Args)]
 pub struct QuarantineEmptyCommand {
     /// Do not ask for confirmation.
@@ -59,11 +65,18 @@ impl QuarantineEmptyCommand {
 
         let emptied = owner.empty_quarantine().map_err(report)?;
 
+        let left = emptied.left.len();
+
         printer.out(QuarantineEmptyOutput {
             files: emptied.files,
             bytes: emptied.bytes,
-            left: emptied.left.len(),
-        })
+            left,
+        })?;
+
+        match left {
+            0 => Ok(()),
+            _ => Err(partial()),
+        }
     }
 }
 

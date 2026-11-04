@@ -23,7 +23,10 @@ use pimalaya_cli::printer::Printer;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, bytes, report};
+use crate::cli::{
+    StoreFlags, bytes,
+    error::{partial, report},
+};
 
 /// How many entries of each kind the text output prints before summarising the
 /// rest. The JSON output always carries them all.
@@ -36,6 +39,10 @@ const SHOWN: usize = 20;
 /// row references (which `pimdir gc` reclaims), entries of objects/ that are no
 /// body (left in place) and the files quarantine/ holds. Reading only, unless
 /// `--fix` is passed.
+///
+/// Exits 2 once the result is printed when it found a problem it left
+/// unrepaired: anything but the drift and the dangling bindings `--fix`
+/// repairs.
 #[derive(Debug, Args)]
 pub struct CheckCommand {
     /// Repair what can be repaired from what the store already holds.
@@ -117,6 +124,14 @@ impl CheckCommand {
             cleared = owner.clear_dangling_bindings().map_err(report)?;
         }
 
+        // NOTE: `--fix` repairs the drift and the dangling bindings; the
+        // rest is gc's, quarantine's or a resync's to settle.
+        let unrepaired = !orphans.is_empty()
+            || !scan.strays.is_empty()
+            || !quarantined.is_empty()
+            || !missing.is_empty()
+            || (!self.fix && (!drift.is_empty() || !dangling.is_empty()));
+
         printer.out(CheckOutput {
             orphans: orphans
                 .into_iter()
@@ -142,7 +157,12 @@ impl CheckCommand {
             minted,
             repaired,
             cleared,
-        })
+        })?;
+
+        match unrepaired {
+            true => Err(partial()),
+            false => Ok(()),
+        }
     }
 }
 

@@ -11,7 +11,7 @@ use pimalaya_cli::{
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, or_dash, report};
+use crate::cli::{StoreFlags, error::report, or_dash};
 
 /// Inspect the store's collections.
 ///
@@ -55,8 +55,11 @@ impl CollectionListCommand {
                 live: store.count_items(&collection.id).map_err(report)?,
                 retained: store.count_retained(&collection.id).map_err(report)?.max(0) as u64,
                 id: collection.id,
-                kind: collection.kind,
+                kind: Some(collection.kind).filter(|kind| !kind.is_empty()),
                 name: collection.name,
+                description: collection.description,
+                color: collection.color,
+                default: collection.role.as_deref() == Some("default"),
                 generation: collection.generation,
                 role: collection.role,
                 covered_since: collection
@@ -81,28 +84,31 @@ impl CollectionListCommand {
 pub struct CollectionRow {
     /// The stable collection id.
     pub id: String,
-    /// The declared IANA media type, empty when a sync created it before any
-    /// consumer declared one.
-    pub kind: String,
+    /// The declared IANA media type, `None` when a sync created it before
+    /// any consumer declared one.
+    pub kind: Option<String>,
     /// The display name.
     pub name: String,
+    /// The description its source states, if any.
+    pub description: Option<String>,
+    /// The color its source states, if any.
+    pub color: Option<String>,
+    /// Whether its source states it is the default calendar or address
+    /// book (the `default` role, STORAGE §14).
+    pub default: bool,
     /// The handle-space epoch.
     pub generation: i64,
     /// What the source states the collection is for (`sent`, `default`).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Live items.
     pub live: u64,
     /// The floor of the scope every source has listed whole, `None` for
     /// none or while one source never closed a round.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub covered_since: Option<String>,
     /// Its ceiling, exclusive, `None` for none.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub covered_until: Option<String>,
     /// When the oldest of those rounds closed, `None` while one source
     /// never closed one: no coverage at all.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub covered_at: Option<String>,
     /// Retained (soft-deleted) items.
     pub retained: u64,
@@ -155,7 +161,7 @@ impl fmt::Display for CollectionsOutput {
         for row in &self.collections {
             table.add_row(vec![
                 Cell::new(&row.id),
-                Cell::new(or_dash(Some(row.kind.as_str()).filter(|k| !k.is_empty()))),
+                Cell::new(or_dash(row.kind.as_deref())),
                 Cell::new(&row.name),
                 Cell::new(or_dash(row.role.as_deref())),
                 Cell::new(row.generation),

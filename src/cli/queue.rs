@@ -8,9 +8,12 @@
 
 use std::fmt;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Args, Subcommand};
-use io_pimdir::{client::producer::PimdirActionStatus, codec::PimdirAction};
+use io_pimdir::{
+    client::producer::PimdirActionStatus,
+    codec::{PimdirAction, action_to_payload},
+};
 use log::warn;
 use pimalaya_cli::{
     printer::Printer,
@@ -19,7 +22,11 @@ use pimalaya_cli::{
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, confirm, or_dash, report};
+use crate::cli::{
+    StoreFlags, confirm,
+    error::{ErrorCode, report},
+    or_dash,
+};
 
 /// Inspect and prune the store's action queue.
 #[derive(Debug, Subcommand)]
@@ -65,12 +72,13 @@ impl QueueListCommand {
         if self.parked {
             for action in store.parked_actions().map_err(report)? {
                 rows.push(QueueRow {
-                    id: action.id,
+                    row: action.id,
                     created_at: action.created_at,
                     producer: action.producer,
                     collection: action.collection,
                     kind: action.action,
-                    summary: action.payload,
+                    target: action.payload.clone(),
+                    payload: action.payload,
                     attempts: action.attempts,
                     error: Some(action.error),
                 });
@@ -82,12 +90,13 @@ impl QueueListCommand {
                     Ok(actions) => {
                         for action in actions {
                             rows.push(QueueRow {
-                                id: action.id,
+                                row: action.id,
                                 created_at: action.created_at,
                                 producer: action.producer,
                                 collection: action.collection,
                                 kind: action.action.kind().to_string(),
-                                summary: summary(&action.action),
+                                target: summary(&action.action),
+                                payload: action_to_payload(&action.action),
                                 attempts: action.attempts,
                                 error: None,
                             });
@@ -101,7 +110,7 @@ impl QueueListCommand {
                     }
                 }
             }
-            rows.sort_by_key(|row| row.id);
+            rows.sort_by_key(|row| row.row);
         }
 
         printer.out(QueueOutput {
@@ -141,10 +150,12 @@ impl QueueCancelCommand {
         let dropped = store.owner()?.drop_action(self.id).map_err(report)?;
 
         if !dropped {
-            bail!("no queued action with id {}", self.id);
+            return Err(
+                ErrorCode::RowNotFound.error(format!("no queued action with id {}", self.id))
+            );
         }
 
-        printer.out(QueueCancelOutput { id: self.id })
+        printer.out(QueueCancelOutput { row: self.id })
     }
 }
 
@@ -165,100 +176,109 @@ impl QueueStatusCommand {
     /// Prints the action's status.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         let status = store.read()?.action_status(self.id).map_err(report)?;
-        let output = match status {
+        let mut output = QueueStatusOutput {
+            row: self.id,
+            status: QueueStatus::Unknown,
+            collection: None,
+            kind: None,
+            attempts: None,
+            error: None,
+            applied_at: None,
+            seq: None,
+        };
+
+        match status {
             PimdirActionStatus::Pending {
                 collection,
                 kind,
                 attempts,
-            } => QueueStatusOutput {
-                id: self.id,
-                status: "pending",
-                collection: Some(collection),
-                kind: Some(kind),
-                attempts: Some(attempts),
-                ..Default::default()
-            },
+            } => {
+                output.status = QueueStatus::Pending;
+                output.collection = Some(collection);
+                output.kind = Some(kind);
+                output.attempts = Some(attempts);
+            }
             PimdirActionStatus::Parked {
                 collection,
                 kind,
                 attempts,
                 error,
-            } => QueueStatusOutput {
-                id: self.id,
-                status: "parked",
-                collection: Some(collection),
-                kind: Some(kind),
-                attempts: Some(attempts),
-                error: Some(error),
-                ..Default::default()
-            },
+            } => {
+                output.status = QueueStatus::Parked;
+                output.collection = Some(collection);
+                output.kind = Some(kind);
+                output.attempts = Some(attempts);
+                output.error = Some(error);
+            }
             PimdirActionStatus::Applied {
                 applied_at,
                 collection,
                 seq,
-            } => QueueStatusOutput {
-                id: self.id,
-                status: "applied",
-                collection: Some(collection),
-                applied_at: Some(applied_at),
-                seq,
-                ..Default::default()
-            },
-            PimdirActionStatus::Unknown => QueueStatusOutput {
-                id: self.id,
-                status: "unknown",
-                ..Default::default()
-            },
-        };
+            } => {
+                output.status = QueueStatus::Applied;
+                output.collection = Some(collection);
+                output.applied_at = Some(applied_at);
+                output.seq = seq;
+            }
+            PimdirActionStatus::Unknown => (),
+        }
+
         printer.out(output)
     }
 }
 
+/// Where a queue row stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueueStatus {
+    /// Queued, waiting for the owner's next drain.
+    Pending,
+    /// Queued, refused by the owner until an operator acts.
+    Parked,
+    /// Applied, its receipt still kept.
+    Applied,
+    /// Found nowhere: cancelled, or applied before its receipt was pruned.
+    Unknown,
+}
+
 /// The `queue status` output.
-#[derive(Debug, Default, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueStatusOutput {
-    /// The action's id.
-    pub id: i64,
-    /// `pending`, `parked`, `applied` or `unknown` (cancelled, or applied
-    /// before its receipt was pruned).
-    pub status: &'static str,
-    /// The collection it was queued on.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The queue row, by the id its enqueue answered.
+    pub row: i64,
+    /// Where it stands.
+    pub status: QueueStatus,
+    /// The collection it was queued on, `None` when unknown.
     pub collection: Option<String>,
     /// The action kind, while queued.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Apply attempts so far, while queued.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub attempts: Option<i64>,
     /// The failure that parked it.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// When the owner applied it.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<String>,
     /// The item an applied add created.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<i64>,
 }
 
 impl fmt::Display for QueueStatusOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id = self.id;
+        let id = self.row;
         let collection = or_dash(self.collection.as_deref());
         match self.status {
-            "pending" => writeln!(f, "Action {id} is pending on {collection}"),
-            "parked" => writeln!(
+            QueueStatus::Pending => writeln!(f, "Action {id} is pending on {collection}"),
+            QueueStatus::Parked => writeln!(
                 f,
                 "Action {id} is parked on {collection}: {}",
                 or_dash(self.error.as_deref())
             ),
-            "applied" => match self.seq {
+            QueueStatus::Applied => match self.seq {
                 Some(seq) => writeln!(f, "Action {id} was applied: item {seq} in {collection}"),
                 None => writeln!(f, "Action {id} was applied on {collection}"),
             },
-            _ => writeln!(
+            QueueStatus::Unknown => writeln!(
                 f,
                 "Action {id} is neither queued nor applied recently: cancelled, or applied before its receipt was pruned"
             ),
@@ -323,8 +343,8 @@ fn summary(action: &PimdirAction) -> String {
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueRow {
-    /// The row's append id.
-    pub id: i64,
+    /// The queue row, by its append id.
+    pub row: i64,
     /// The instant SQLite stamped the row with.
     pub created_at: String,
     /// The process that enqueued it.
@@ -333,8 +353,12 @@ pub struct QueueRow {
     pub collection: String,
     /// The action kind.
     pub kind: String,
-    /// A content-free summary (the raw payload for a parked row).
-    pub summary: String,
+    /// The action's payload, as the queue stores it.
+    pub payload: String,
+    /// What the text table shows of it: ids, hashes and flags, or the
+    /// payload of a parked row.
+    #[serde(skip)]
+    pub target: String,
     /// Apply attempts so far.
     pub attempts: i64,
     /// The failure that parked the row, when parked.
@@ -381,12 +405,12 @@ impl fmt::Display for QueueOutput {
 
             for action in &self.actions {
                 let mut row = vec![
-                    Cell::new(action.id),
+                    Cell::new(action.row),
                     Cell::new(&action.created_at),
                     Cell::new(&action.producer),
                     Cell::new(&action.collection),
                     Cell::new(&action.kind),
-                    Cell::new(&action.summary),
+                    Cell::new(&action.target),
                     Cell::new(action.attempts),
                 ];
                 if self.parked {
@@ -415,12 +439,12 @@ impl fmt::Display for QueueOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueCancelOutput {
-    /// The dropped action's id.
-    pub id: i64,
+    /// The dropped queue row.
+    pub row: i64,
 }
 
 impl fmt::Display for QueueCancelOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Dropped queued action {}", self.id)
+        writeln!(f, "Dropped queued action {}", self.row)
     }
 }

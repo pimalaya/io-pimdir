@@ -8,7 +8,7 @@
 use std::{
     fmt,
     fs::File,
-    io::{self, Write, stdout},
+    io::{self, Read, Write, stdout},
     path::PathBuf,
 };
 
@@ -26,6 +26,7 @@ use io_pimdir::{
 };
 use log::warn;
 use pimalaya_cli::{
+    output::Bytes,
     printer::Printer,
     table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
 };
@@ -33,7 +34,11 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::cli::{StoreFlags, bytes, confirm, now, or_dash, report, summary};
+use crate::cli::{
+    StoreFlags, bytes, confirm,
+    error::{ErrorCode, partial, report},
+    now, or_dash, summary,
+};
 
 /// The default page size of an item listing.
 const DEFAULT_LIMIT: usize = 50;
@@ -76,7 +81,7 @@ impl ItemCommand {
 /// List a collection's items, one page at a time.
 ///
 /// The listing is keyset-paged: it never truncates silently, and tells you the
-/// cursor to pass to `--after` for the next page. Live items come in the
+/// token to pass to `--page-token` for the next page. Live items come in the
 /// kind's own order (newest mail first, contacts and calendars ascending) with
 /// the summary's title, retained ones by public id.
 #[derive(Debug, Args)]
@@ -89,9 +94,12 @@ pub struct ItemListCommand {
     #[arg(long)]
     pub retained: bool,
 
-    /// Resume after this cursor, as the previous page printed it.
-    #[arg(long, value_name = "CURSOR")]
-    pub after: Option<String>,
+    /// Resume a listing at the given page.
+    ///
+    /// The token is the `nextPage` value a previous listing printed, given
+    /// back as it is.
+    #[arg(long = "page-token", alias = "after", value_name = "TOKEN")]
+    pub page_token: Option<String>,
 
     /// Maximum number of items to print.
     #[arg(long, short = 'n', value_name = "COUNT", default_value_t = DEFAULT_LIMIT)]
@@ -108,11 +116,9 @@ impl ItemListCommand {
         let probe = limit.saturating_add(1);
 
         let mut rows: Vec<ItemRow> = if self.retained {
-            let after = match &self.after {
+            let after = match &self.page_token {
                 None => None,
-                Some(cursor) => Some(cursor.parse::<i64>().map_err(|_| {
-                    anyhow::anyhow!("--after takes a seq with --retained, got {cursor:?}")
-                })?),
+                Some(token) => Some(token.parse::<i64>().map_err(|_| invalid_token(token))?),
             };
             store
                 .list_retained(&self.collection, after, probe)
@@ -123,15 +129,11 @@ impl ItemListCommand {
         } else {
             // NOTE: the cursor is the pair a sort-key page is total on,
             // spelled `seq:sort_key` since a seq carries no colon.
-            let after = match &self.after {
+            let after = match &self.page_token {
                 None => None,
-                Some(cursor) => {
-                    let (seq, key) = cursor.split_once(':').ok_or_else(|| {
-                        anyhow::anyhow!("--after takes the cursor a page printed, got {cursor:?}")
-                    })?;
-                    let seq: i64 = seq.parse().map_err(|_| {
-                        anyhow::anyhow!("--after takes the cursor a page printed, got {cursor:?}")
-                    })?;
+                Some(token) => {
+                    let (seq, key) = token.split_once(':').ok_or_else(|| invalid_token(token))?;
+                    let seq: i64 = seq.parse().map_err(|_| invalid_token(token))?;
                     Some((key.to_string(), seq))
                 }
             };
@@ -149,7 +151,7 @@ impl ItemListCommand {
 
         let truncated = rows.len() > limit;
         rows.truncate(limit);
-        let next = truncated
+        let next_page = truncated
             .then(|| rows.last().map(|row| row.cursor(self.retained)))
             .flatten();
 
@@ -157,9 +159,16 @@ impl ItemListCommand {
             collection: self.collection,
             retained: self.retained,
             items: rows,
-            next,
+            next_page,
         })
     }
+}
+
+/// The failure of a page token no listing printed.
+fn invalid_token(token: &str) -> anyhow::Error {
+    ErrorCode::PageTokenInvalid.error(format!(
+        "--page-token takes the nextPage a listing printed, got {token:?}"
+    ))
 }
 
 /// Show one item by its public id, across every collection holding it.
@@ -186,7 +195,8 @@ impl ItemShowCommand {
         let found = locate(&read, self.seq, self.collection.as_deref())?;
 
         if found.is_empty() {
-            bail!("no item with seq {} in this store", self.seq);
+            return Err(ErrorCode::ItemNotFound
+                .error(format!("no item with seq {} in this store", self.seq)));
         }
 
         let mut placements = Vec::with_capacity(found.len());
@@ -218,8 +228,9 @@ impl ItemShowCommand {
 /// Write one item's body out, byte for byte.
 ///
 /// The bytes are the ones the store holds, with no decoding, no re-encoding and
-/// no rendering. Without `--output` they go to stdout, which is why `--json`
-/// then has nothing to say and is refused.
+/// no rendering. Without `--output` they go to stdout, as they are, or under
+/// `--json` as base64 `data` with their `size` and the collection's media type
+/// as `mime`.
 #[derive(Debug, Args)]
 pub struct ItemExportCommand {
     /// Public id of the item (`seq`).
@@ -238,38 +249,46 @@ pub struct ItemExportCommand {
 impl ItemExportCommand {
     /// Streams the item's body to stdout or to the given file.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
-        if printer.is_json() && self.output.is_none() {
-            bail!("a body is raw bytes, not JSON: write it to a file with --output");
-        }
-
         let read = store.read()?;
         let found = one(
             locate(&read, self.seq, self.collection.as_deref())?,
             self.seq,
         )?;
         let Some(hash) = found.object() else {
-            bail!(
+            return Err(ErrorCode::BodyAbsent.error(format!(
                 "seq {} holds no body in {} (its detail level is {})",
                 self.seq,
                 found.collection,
                 level_name(found.level())
-            );
+            )));
         };
 
         // NOTE: read whole and checked before a byte is served (STORAGE
         // §7): a body failing its name is missing.
         let blobs = read.blobs();
         let Some(mut reader) = blobs.verified(&PimdirHash(hash.clone()))? else {
-            bail!(
+            return Err(ErrorCode::BodyMissing.error(format!(
                 "the body of seq {} is missing from the blob store or fails its name (hash {hash}); run `pimdir check`",
                 self.seq
-            );
+            )));
         };
 
         let hash = hash.clone();
         let collection = found.collection.clone();
 
         match self.output {
+            // NOTE: under JSON the body travels as data, the collection's
+            // declared media type naming it.
+            None if printer.is_json() => {
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data)?;
+                let mime = read
+                    .collection_kind(&collection)
+                    .map_err(report)?
+                    .filter(|kind| !kind.is_empty())
+                    .unwrap_or_else(|| String::from("application/octet-stream"));
+                printer.out_bytes(Bytes { data, mime })
+            }
             None => {
                 let mut out = stdout().lock();
                 io::copy(&mut reader, &mut out)?;
@@ -278,13 +297,13 @@ impl ItemExportCommand {
             }
             Some(path) => {
                 let mut file = File::create(&path)?;
-                let written = io::copy(&mut reader, &mut file)?;
+                let size = io::copy(&mut reader, &mut file)?;
                 file.flush()?;
                 printer.out(ItemExportOutput {
                     seq: self.seq,
                     collection,
                     hash,
-                    bytes: written,
+                    size,
                     path,
                 })
             }
@@ -300,6 +319,10 @@ impl ItemExportCommand {
 /// applies straight away when the owner role is free; when a sync holds it,
 /// the action stays queued and applies at the next drain. Either way nothing
 /// is lost.
+///
+/// Exits 2 once the result is printed when the drain ran and the item is
+/// still not live: the store refused the action, which `pimdir queue list
+/// --parked` shows.
 #[derive(Debug, Args)]
 pub struct ItemRestoreCommand {
     /// Public id of the retained item (`seq`).
@@ -321,11 +344,10 @@ impl ItemRestoreCommand {
         )?;
         let item = &found.item;
         if item.retention.is_none() {
-            bail!(
+            return Err(ErrorCode::ItemLive.error(format!(
                 "seq {} is already live in {}: only a retained item can be restored",
-                self.seq,
-                found.collection
-            );
+                self.seq, found.collection
+            )));
         }
         // NOTE: resolved before the enqueue, so an unresolvable write
         // source fails while nothing has been appended yet.
@@ -376,9 +398,15 @@ impl ItemRestoreCommand {
             seq: self.seq,
             collection: found.collection,
             link_id: item.link_id.0.clone(),
-            action: id,
+            row: id,
+            queued: status == RestoreStatus::Queued,
             status,
-        })
+        })?;
+
+        match status {
+            RestoreStatus::Refused => Err(partial()),
+            RestoreStatus::Applied | RestoreStatus::Queued => Ok(()),
+        }
     }
 }
 
@@ -450,7 +478,7 @@ impl ItemPurgeCommand {
 
         printer.out(ItemPurgeOutput {
             cutoff: Some(cutoff),
-            items: purged.items,
+            count: purged.items,
         })
     }
 
@@ -459,10 +487,10 @@ impl ItemPurgeCommand {
         let read = store.read()?;
         let found = one(locate(&read, seq, self.collection.as_deref())?, seq)?;
         let Some(retention) = &found.item.retention else {
-            bail!(
+            return Err(ErrorCode::ItemLive.error(format!(
                 "seq {seq} is live in {}: purge only destroys retained items, remove it first",
                 found.collection
-            );
+            )));
         };
         let size = retention.size.unwrap_or(0);
         drop(read);
@@ -489,7 +517,7 @@ impl ItemPurgeCommand {
 
         printer.out(ItemPurgeOutput {
             cutoff: None,
-            items: 1,
+            count: 1,
         })
     }
 }
@@ -534,11 +562,10 @@ impl ItemEraseCommand {
                 .item_bindings(&found.collection, found.item.link_id.as_str())
                 .map_err(report)?;
             if !bound.is_empty() {
-                bail!(
+                return Err(ErrorCode::ItemLive.error(format!(
                     "seq {} is live in {} and a source syncs it: remove it first, then erase it once retained",
-                    self.seq,
-                    found.collection
-                );
+                    self.seq, found.collection
+                )));
             }
         }
         drop(read);
@@ -647,14 +674,14 @@ fn retained(store: &PimdirReader, collection: &str, seq: i64) -> Result<Option<P
 /// Reduces a lookup to exactly one placement, or explains the ambiguity.
 fn one(found: Vec<Found>, seq: i64) -> Result<Found> {
     match found.len() {
-        0 => bail!("no item with seq {seq} in this store"),
+        0 => Err(ErrorCode::ItemNotFound.error(format!("no item with seq {seq} in this store"))),
         1 => Ok(found.into_iter().next().unwrap()),
         _ => {
             let collections: Vec<&str> = found.iter().map(|f| f.collection.as_str()).collect();
-            bail!(
+            Err(ErrorCode::CollectionRequired.error(format!(
                 "seq {seq} is placed in several collections ({}): pick one with --collection",
                 collections.join(", ")
-            )
+            )))
         }
     }
 }
@@ -745,8 +772,9 @@ pub struct ItemsOutput {
     pub retained: bool,
     /// The page.
     pub items: Vec<ItemRow>,
-    /// The cursor to resume from, `None` when the page is the last one.
-    pub next: Option<String>,
+    /// The token `--page-token` resumes from, `None` when the page is the
+    /// last one.
+    pub next_page: Option<String>,
 }
 
 impl fmt::Display for ItemsOutput {
@@ -807,8 +835,8 @@ impl fmt::Display for ItemsOutput {
 
         // NOTE: a page that stops short says so, or an operator would
         // mistake one page for the whole collection.
-        if let Some(next) = &self.next {
-            writeln!(f, "More items follow: continue with --after {next}")?;
+        if let Some(next) = &self.next_page {
+            writeln!(f, "More items follow: continue with --page-token {next}")?;
         }
 
         Ok(())
@@ -1004,8 +1032,8 @@ pub struct ItemExportOutput {
     pub collection: String,
     /// The body's content hash.
     pub hash: String,
-    /// How many bytes were written.
-    pub bytes: u64,
+    /// The size of the body written, in bytes.
+    pub size: u64,
     /// Where they were written.
     pub path: PathBuf,
 }
@@ -1015,16 +1043,16 @@ impl fmt::Display for ItemExportOutput {
         writeln!(
             f,
             "Wrote {} of item {} to {}",
-            bytes(self.bytes),
+            bytes(self.size),
             self.seq,
             self.path.display()
         )
     }
 }
 
-/// What became of a restore.
-#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+/// What became of a restore, which the text form says and the JSON tells
+/// by `queued` and the exit status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreStatus {
     /// The action was applied and the item is live again.
     Applied,
@@ -1046,8 +1074,13 @@ pub struct ItemRestoreOutput {
     /// Its cross-source link id.
     pub link_id: String,
     /// The queue row the restore was appended as.
-    pub action: i64,
-    /// What became of that row.
+    pub row: i64,
+    /// Whether the row waits for the store's sync engine: another writer
+    /// held the store lock. `false` with exit status 2 when the drain ran
+    /// and the item is still not live.
+    pub queued: bool,
+    /// What became of the row, for the text form.
+    #[serde(skip)]
     pub status: RestoreStatus,
 }
 
@@ -1062,7 +1095,7 @@ impl fmt::Display for ItemRestoreOutput {
             RestoreStatus::Queued => writeln!(
                 f,
                 "Restore of item {} into {} queued as action {}: another writer holds the store lock, so it applies at the next sync",
-                self.seq, self.collection, self.action
+                self.seq, self.collection, self.row
             ),
             RestoreStatus::Refused => writeln!(
                 f,
@@ -1080,13 +1113,13 @@ pub struct ItemPurgeOutput {
     /// The cutoff a time-based purge used, `None` for a single item.
     pub cutoff: Option<String>,
     /// How many items were destroyed.
-    pub items: usize,
+    pub count: usize,
 }
 
 impl fmt::Display for ItemPurgeOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Purged {} item(s)", self.items)?;
-        if self.items > 0 {
+        writeln!(f, "Purged {} item(s)", self.count)?;
+        if self.count > 0 {
             writeln!(f, "Run `pimdir gc` to reclaim the bodies they released")?;
         }
         Ok(())

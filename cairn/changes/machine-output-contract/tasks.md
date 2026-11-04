@@ -10,4 +10,4 @@ change: machine-output-contract
 - [x] Print `collection list` under `collections`
 - [x] CHANGELOG
 - [x] Fold into cairn/spec/cli.md; log; land
-- [ ] Move to the pimalaya-cli 0.3.0 release once published
+- [x] Move to the pimalaya-cli 0.3.0 release once published

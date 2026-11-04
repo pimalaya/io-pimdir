@@ -158,7 +158,11 @@ fn the_tag_verb_previews_queues_while_held_and_applies_when_free() {
     let (status, refused) = pimdir(dir, &["tag", "foo:bar", "--add", "x"]);
     assert_eq!(
         (status, refused["code"].as_str()),
-        (1, Some("unknown-field"))
+        (1, Some("query-refused"))
+    );
+    assert!(
+        refused["error"].as_str().unwrap().contains("unknown-field"),
+        "the failure names the fault: {refused}"
     );
     assert_eq!(queue(), empty, "a refused query stages nothing");
 
@@ -234,15 +238,18 @@ fn a_tag_stages_each_placement_as_the_source_syncing_its_collection() {
 
     let (status, tagged) = pimdir(dir, &["tag", "alpha", "--add", "flagged"]);
     assert_eq!(
-        status, 0,
-        "several sources in the store, one per collection"
+        status, 2,
+        "a placement of an ambiguous source is not tagged"
     );
     assert_eq!(
         sourced(&tagged),
         BTreeMap::from([
             ("INBOX".into(), entry("applied", &["imap"])),
             ("Notes".into(), entry("applied", &["jmap"])),
-            ("Shared".into(), entry("ambiguousSource", &["imap", "jmap"])),
+            (
+                "Shared".into(),
+                entry("ambiguous-source", &["imap", "jmap"])
+            ),
         ])
     );
     assert_eq!(flags(dir, "Notes", seq), ["\\Flagged"]);
@@ -275,7 +282,7 @@ fn a_tag_stages_each_placement_as_the_source_syncing_its_collection() {
             "--dry-run",
         ],
     );
-    assert_eq!(status, 0);
+    assert_eq!(status, 2, "a placement of an unsynced source would not be");
     assert_eq!(
         sourced(&elsewhere)["INBOX"],
         entry("unsynced", &["imap"]),

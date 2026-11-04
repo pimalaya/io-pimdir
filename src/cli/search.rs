@@ -7,12 +7,12 @@
 //! address, `(account, seq)`, its placements, what it matched and a
 //! passage of its text. `search` and `count` refresh the index first,
 //! within `--refresh-timeout`, and say in their coverage what they could
-//! not fold in. A refused query prints its refusal object (SEARCH §8.4)
-//! and exits with status 1.
+//! not fold in. A refused query (SEARCH §8.4) fails with `query-refused`,
+//! its message saying where it is wrong and what would be accepted.
 
 use std::{
     collections::BTreeMap,
-    fmt, process,
+    fmt,
     time::{Duration, Instant},
 };
 
@@ -27,7 +27,7 @@ use io_pimdir::{
     placement::PimdirLevel,
     search::{
         coverage::{PimdirSearchCoverage, PimdirSearchRemote, PimdirSearchTemporal},
-        query::{PimdirQuery, PimdirQueryError},
+        query::PimdirQuery,
         tag::PimdirSearchTagSource,
     },
 };
@@ -35,7 +35,11 @@ use pimalaya_cli::printer::Printer;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, or_dash, report};
+use crate::cli::{
+    StoreFlags,
+    error::{ErrorCode, partial, refusal, report},
+    or_dash,
+};
 
 /// The default page size of a search.
 const DEFAULT_LIMIT: usize = 50;
@@ -105,16 +109,19 @@ pub struct SearchCommand {
     #[arg(long, short = 'n', value_name = "COUNT", default_value_t = DEFAULT_LIMIT)]
     pub limit: usize,
 
-    /// Skip this many hits first, as the previous page's `nextOffset`.
-    #[arg(long, value_name = "COUNT", default_value_t = 0)]
-    pub offset: usize,
+    /// Resume a listing at the given page.
+    ///
+    /// The token is the `nextPage` value a previous listing printed, given
+    /// back as it is.
+    #[arg(long = "page-token", alias = "offset", value_name = "TOKEN")]
+    pub page_token: Option<String>,
 
     /// Collapse the hits to their mail threads.
     ///
     /// Prints one entry per thread in each account, with its id (which
     /// `thread:` takes), how many messages it holds there, its first and
     /// last date and its hits; an item other than mail stands alone.
-    /// `--limit` and `--offset` then count threads.
+    /// `--limit` and `--page-token` then count threads.
     #[arg(long)]
     pub threads: bool,
 
@@ -125,13 +132,22 @@ pub struct SearchCommand {
 impl SearchCommand {
     /// Prints one page of hits with the coverage.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
-        let query = parse(printer, &self.query)?;
+        let query = parse(&self.query)?;
         let index = self.refresh.index(store)?;
         let limit = self.limit.max(1);
+        // NOTE: the token is the offset of the next page, as its decimal.
+        let offset = match &self.page_token {
+            None => 0,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                ErrorCode::PageTokenInvalid.error(format!(
+                    "--page-token takes the nextPage a listing printed, got {token:?}"
+                ))
+            })?,
+        };
         let options = PimdirSearchOptions {
             sort: self.sort.into(),
             limit,
-            offset: self.offset,
+            offset,
             clock: PimdirSearchClock::default(),
         };
 
@@ -140,7 +156,9 @@ impl SearchCommand {
 
             return printer.out(SearchThreadsOutput {
                 query: self.query,
-                next_offset: answer.more.then_some(self.offset + answer.threads.len()),
+                next_page: answer
+                    .more
+                    .then(|| (offset + answer.threads.len()).to_string()),
                 threads: answer.threads.iter().map(ThreadRow::from).collect(),
                 coverage: CoverageRow::from(&answer.coverage),
             });
@@ -150,7 +168,9 @@ impl SearchCommand {
 
         printer.out(SearchOutput {
             query: self.query,
-            next_offset: answer.more.then_some(self.offset + answer.hits.len()),
+            next_page: answer
+                .more
+                .then(|| (offset + answer.hits.len()).to_string()),
             hits: answer.hits.iter().map(HitRow::from).collect(),
             coverage: CoverageRow::from(&answer.coverage),
         })
@@ -174,7 +194,7 @@ pub struct CountCommand {
 impl CountCommand {
     /// Prints the count with the coverage.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
-        let query = parse(printer, &self.query)?;
+        let query = parse(&self.query)?;
         let index = self.refresh.index(store)?;
 
         let answer = index
@@ -215,11 +235,11 @@ impl ShowCommand {
             .item(self.account.as_deref(), self.seq)
             .map_err(report)?
         else {
-            anyhow::bail!(
-                "No live item {} in account {}",
+            return Err(ErrorCode::ItemNotFound.error(format!(
+                "no live item {} in account {}",
                 self.seq,
                 or_dash(self.account.as_deref())
-            );
+            )));
         };
 
         let extract = item.extract;
@@ -273,6 +293,10 @@ impl ShowCommand {
 /// `\Seen`, `\Flagged`, `\Answered` and `\Draft`; any other flag is
 /// written as given. `--dry-run` prints what would be staged and writes
 /// nothing.
+///
+/// Exits 2 once the result is printed when a placement is not tagged and a
+/// run would not tag it: unknown flags, an ambiguous or unsynced source, an
+/// unsupported change, or an action the store refused.
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args(["add", "remove"])))]
 pub struct TagCommand {
@@ -300,7 +324,7 @@ pub struct TagCommand {
 impl TagCommand {
     /// Plans the tag, then stages and applies it unless dry.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
-        let query = parse(printer, &self.query)?;
+        let query = parse(&self.query)?;
         let index = self.refresh.index(store)?;
         let plan = index
             .tag(
@@ -367,7 +391,7 @@ impl TagCommand {
             }
         }
 
-        let hits = plan
+        let hits: Vec<TagHitRow> = plan
             .hits
             .iter()
             .map(|hit| TagHitRow {
@@ -422,12 +446,17 @@ impl TagCommand {
                             sources,
                             syncs: placement.syncs,
                             missing: placement.missing.clone(),
-                            action: staged.map(|(_, action)| *action),
+                            row: staged.map(|(_, row)| *row),
                         }
                     })
                     .collect(),
             })
             .collect();
+
+        let short = hits
+            .iter()
+            .flat_map(|hit| &hit.placements)
+            .any(|placement| placement.status.falls_short());
 
         printer.out(TagOutput {
             query: self.query,
@@ -436,7 +465,12 @@ impl TagCommand {
             remove: plan.remove.into_iter().collect(),
             hits,
             coverage: CoverageRow::from(&plan.coverage),
-        })
+        })?;
+
+        match short {
+            true => Err(partial()),
+            false => Ok(()),
+        }
     }
 }
 
@@ -469,11 +503,11 @@ impl ThreadCommand {
             .thread(self.account.as_deref(), self.seq)
             .map_err(report)?
         else {
-            anyhow::bail!(
-                "No live item {} in account {}",
+            return Err(ErrorCode::ItemNotFound.error(format!(
+                "no live item {} in account {}",
                 self.seq,
                 or_dash(self.account.as_deref())
-            );
+            )));
         };
 
         printer.out(ThreadRow::from(&thread))
@@ -539,26 +573,9 @@ impl From<SortArg> for PimdirSearchSort {
     }
 }
 
-/// Parses a query, printing its refusal and exiting when refused.
-fn parse(printer: &mut impl Printer, query: &str) -> Result<PimdirQuery> {
-    match PimdirQuery::parse(query) {
-        Ok(query) => Ok(query),
-        Err(err) => refuse(printer, query, err),
-    }
-}
-
-/// Prints a refusal (SEARCH §8.4) and exits with status 1.
-fn refuse<T>(printer: &mut impl Printer, query: &str, err: PimdirQueryError) -> Result<T> {
-    printer.out(QueryErrorOutput {
-        query: query.into(),
-        code: err.code.as_str().into(),
-        message: err.message,
-        start: err.start,
-        end: err.end,
-        expected: err.expected,
-        fields: err.fields,
-    })?;
-    process::exit(1)
+/// Parses a query, failing with its refusal (SEARCH §8.4).
+fn parse(query: &str) -> Result<PimdirQuery> {
+    PimdirQuery::parse(query).map_err(|err| refusal(query, err))
 }
 
 fn level_name(level: PimdirLevel) -> &'static str {
@@ -615,8 +632,8 @@ pub struct SearchOutput {
     pub query: String,
     /// The hits, in the order asked.
     pub hits: Vec<HitRow>,
-    /// The `--offset` of the next page, `null` on the last.
-    pub next_offset: Option<usize>,
+    /// The token `--page-token` resumes from, `null` on the last page.
+    pub next_page: Option<String>,
     /// What the answer could not see.
     pub coverage: CoverageRow,
 }
@@ -648,8 +665,8 @@ impl fmt::Display for SearchOutput {
                 writeln!(f, " - {snippet}")?;
             }
         }
-        if let Some(offset) = self.next_offset {
-            writeln!(f, "More hits follow: pass --offset {offset}")?;
+        if let Some(token) = &self.next_page {
+            writeln!(f, "More hits follow: pass --page-token {token}")?;
         }
         write!(f, "{}", self.coverage)
     }
@@ -664,8 +681,8 @@ pub struct SearchThreadsOutput {
     pub query: String,
     /// The threads, in the order of their first hit.
     pub threads: Vec<ThreadRow>,
-    /// The `--offset` of the next page, `null` on the last.
-    pub next_offset: Option<usize>,
+    /// The token `--page-token` resumes from, `null` on the last page.
+    pub next_page: Option<String>,
     /// What the answer could not see.
     pub coverage: CoverageRow,
 }
@@ -695,8 +712,8 @@ impl fmt::Display for SearchThreadsOutput {
                 writeln!(f, " - {} [{}] {}", hit.seq, hit.kind, hit.title)?;
             }
         }
-        if let Some(offset) = self.next_offset {
-            writeln!(f, "More threads follow: pass --offset {offset}")?;
+        if let Some(token) = &self.next_page {
+            writeln!(f, "More threads follow: pass --page-token {token}")?;
         }
         write!(f, "{}", self.coverage)
     }
@@ -888,12 +905,12 @@ pub struct TagPlacementRow {
     /// is staged for it.
     pub missing: Vec<String>,
     /// The queue row staged for it, `null` when none was.
-    pub action: Option<i64>,
+    pub row: Option<i64>,
 }
 
 /// What became of one placement a tag reaches.
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "kebab-case")]
 pub enum TagStatus {
     /// A dry run: an action would be staged.
     Planned,
@@ -926,13 +943,26 @@ impl TagStatus {
         match self {
             Self::Planned => "planned",
             Self::Unchanged => "unchanged",
-            Self::UnknownFlags => "unknownFlags",
-            Self::AmbiguousSource => "ambiguousSource",
+            Self::UnknownFlags => "unknown-flags",
+            Self::AmbiguousSource => "ambiguous-source",
             Self::Unsynced => "unsynced",
             Self::Unsupported => "unsupported",
             Self::Applied => "applied",
             Self::Queued => "queued",
             Self::Refused => "refused",
+        }
+    }
+
+    /// Whether the placement does not end up tagged, nor will by a run
+    /// without `--dry-run`: the tag exits 2.
+    fn falls_short(self) -> bool {
+        match self {
+            Self::Planned | Self::Unchanged | Self::Applied | Self::Queued => false,
+            Self::UnknownFlags
+            | Self::AmbiguousSource
+            | Self::Unsynced
+            | Self::Unsupported
+            | Self::Refused => true,
         }
     }
 }
@@ -1031,7 +1061,7 @@ impl From<&PimdirSearchPlacement> for PlacementRow {
 
 /// What a text term matched, or what an item's text was read from.
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Matched {
     /// The body.
     Body,
@@ -1187,7 +1217,7 @@ pub struct LocalRow {
 
 /// The temporal axis.
 #[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum TemporalRow {
     /// Every queried collection holds every member of the range.
     Full,
@@ -1208,7 +1238,7 @@ pub enum TemporalRow {
 
 /// The remote axis.
 #[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum RemoteRow {
     /// Only the local store was searched.
     LocalOnly,
@@ -1217,49 +1247,6 @@ pub enum RemoteRow {
         /// Whether the server answered every match.
         exhaustive: bool,
     },
-}
-
-/// The refusal of a query (SEARCH §8.4), printed by `search`, `count` and
-/// `tag` before they exit with status 1.
-#[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryErrorOutput {
-    /// The query as given.
-    pub query: String,
-    /// `empty-query`, `unknown-field`, `invalid-value`, `invalid-date`,
-    /// `unterminated-phrase`, `unbalanced-parenthesis`,
-    /// `dangling-operator` or `invalid-wildcard`.
-    pub code: String,
-    /// The fault, as a sentence.
-    pub message: String,
-    /// The first character at fault, counted in Unicode scalar values.
-    pub start: usize,
-    /// The character after the last at fault.
-    pub end: usize,
-    /// What would have been valid at `start`.
-    pub expected: Vec<String>,
-    /// Every field name, for a field refused.
-    pub fields: Vec<String>,
-}
-
-impl fmt::Display for QueryErrorOutput {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Query refused ({}): {}", self.code, self.message)?;
-        writeln!(f, "  {}", self.query)?;
-        writeln!(
-            f,
-            "  {}{}",
-            " ".repeat(self.start),
-            "^".repeat((self.end - self.start).max(1))
-        )?;
-        if !self.expected.is_empty() {
-            writeln!(f, "Expected: {}", self.expected.join(", "))?;
-        }
-        if !self.fields.is_empty() {
-            writeln!(f, "Fields: {}", self.fields.join(", "))?;
-        }
-        Ok(())
-    }
 }
 
 /// The `show` output: an item as the index reads it.

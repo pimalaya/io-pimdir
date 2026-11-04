@@ -14,7 +14,7 @@ use pimalaya_cli::printer::Printer;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, bytes, report};
+use crate::cli::{StoreFlags, bytes, error::report};
 
 /// Reclaim what nothing references any more.
 ///

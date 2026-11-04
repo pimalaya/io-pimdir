@@ -14,6 +14,7 @@
 
 pub mod check;
 pub mod collection;
+pub mod error;
 pub mod export;
 pub mod gc;
 pub mod item;
@@ -30,10 +31,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::Result;
 use clap::Args;
 use io_pimdir::client::{PimdirError, PimdirStore, producer::PimdirProducer, reader::PimdirReader};
 use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
+
+use crate::cli::error::{ErrorCode, report};
 
 /// The producer name recorded on every queue row this tool appends, so an
 /// operator reading `queue list` can tell CLI-originated actions apart from a
@@ -73,11 +76,11 @@ impl StoreFlags {
     pub fn ensure_store(&self) -> Result<()> {
         let db = self.store.join("pimdir.db");
         if !db.is_file() {
-            bail!(
+            return Err(ErrorCode::StoreUncreated.error(format!(
                 "no pimdir store at {}: {} not found",
                 self.store.display(),
                 db.display()
-            );
+            )));
         }
         Ok(())
     }
@@ -134,11 +137,12 @@ impl StoreFlags {
         let sources = read.distinct_sources().map_err(report)?;
         match sources.len() {
             1 => Ok(sources.into_iter().next().unwrap()),
-            0 => bail!("this store syncs no source yet: name the one to write as with --source"),
-            _ => bail!(
+            0 => Err(ErrorCode::SourceRequired
+                .error("this store syncs no source yet: name the one to write as with --source")),
+            _ => Err(ErrorCode::SourceRequired.error(format!(
                 "this store syncs several sources ({}): pick the one to write as with --source",
                 sources.join(", ")
-            ),
+            ))),
         }
     }
 
@@ -147,35 +151,6 @@ impl StoreFlags {
     pub fn producer(&self) -> Result<PimdirProducer> {
         self.ensure_store()?;
         PimdirProducer::open(&self.store, PRODUCER).map_err(report)
-    }
-}
-
-/// Turns a store error into an operator-facing one.
-///
-/// The lock contention case is the one that matters: it is not a failure of the
-/// command, it means somebody else is writing, so it reports as a sentence
-/// naming the likely cause instead of a raw error dump.
-pub fn report(err: PimdirError) -> anyhow::Error {
-    match err {
-        PimdirError::Owned(store) => {
-            anyhow!(
-                "another process owns the store at {} (a sync is running?); retry once it releases",
-                store.display()
-            )
-        }
-        PimdirError::Staging(store) => {
-            anyhow!(
-                "a producer is staging a body in the store at {} (a frontend is open?); \
-                 retry once it is done",
-                store.display()
-            )
-        }
-        PimdirError::Busy => {
-            anyhow!(
-                "another writer holds the store lock (a sync is running?); retry once it releases"
-            )
-        }
-        err => anyhow!(err),
     }
 }
 
@@ -189,11 +164,12 @@ pub fn confirm(printer: &impl Printer, yes: bool, question: &str) -> Result<()> 
     }
 
     if printer.is_json() || !stdout().is_terminal() || !stdin().is_terminal() {
-        bail!("refusing to destroy data without a confirmation: pass --yes to proceed");
+        return Err(ErrorCode::ConfirmationRequired
+            .error("refusing to destroy data without a confirmation: pass --yes to proceed"));
     }
 
     if !prompt::bool(question, false)? {
-        bail!("cancelled");
+        return Err(ErrorCode::Cancelled.error("cancelled"));
     }
 
     Ok(())

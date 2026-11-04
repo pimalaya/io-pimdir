@@ -52,6 +52,7 @@ use crate::cli::{
     StoreFlags,
     check::CheckCommand,
     collection::CollectionCommand,
+    error::ErrorCode,
     export::ExportCommand,
     gc::GcCommand,
     item::ItemCommand,
@@ -73,7 +74,7 @@ fn main() {
     let mut printer = StdoutPrinter::new(&cli.json);
 
     let result = cli.command.execute(&mut printer, &cli.store);
-    ErrorReport::eval(&mut printer, result)
+    ErrorReport::<ErrorCode>::eval_coded(&mut printer, result)
 }
 
 /// Top-level command-line interface parser.

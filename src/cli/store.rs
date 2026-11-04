@@ -11,7 +11,7 @@ use pimalaya_cli::{
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, bytes, report};
+use crate::cli::{StoreFlags, bytes, error::report};
 
 /// Inspect the store as a whole.
 #[derive(Debug, Subcommand)]
