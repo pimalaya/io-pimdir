@@ -22,7 +22,7 @@ use crate::cli::{
         ItemsOutput,
     },
     quarantine::QuarantineEmptyOutput,
-    queue::{QueueCancelOutput, QueueOutput},
+    queue::{QueueCancelOutput, QueueOutput, QueueStatusOutput},
     search::{
         CountOutput, IndexOutput, QueryErrorOutput, SearchOutput, SearchThreadsOutput, ShowOutput,
         TagOutput, ThreadRow,
@@ -46,6 +46,7 @@ pub fn registry() -> JsonSchemaRegistry {
     registry.insert::<ItemEraseOutput>("pimdir-item-erase");
     registry.insert::<QueueOutput>("pimdir-queue-list");
     registry.insert::<QueueCancelOutput>("pimdir-queue-cancel");
+    registry.insert::<QueueStatusOutput>("pimdir-queue-status");
     registry.insert::<StoreInfoOutput>("pimdir-store-info");
     registry.insert::<CheckOutput>("pimdir-check");
     registry.insert::<GcOutput>("pimdir-gc");
@@ -66,8 +67,37 @@ pub fn registry() -> JsonSchemaRegistry {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
+    use crate::Cli;
+
+    use super::*;
+
+    /// The keys naming an output a flag or a refusal selects rather than a
+    /// command: `search --threads`, and the refusal `search`, `count` and
+    /// `tag` print for a query they cannot run.
+    const VARIANTS: &[&str] = &["pimdir-search-threads", "pimdir-query-error"];
+
+    /// Every runnable command is described, and every key names one: a
+    /// renamed subcommand cannot leave a schema nobody can ask for, nor a
+    /// new one print undescribed data.
+    #[test]
+    fn the_registry_matches_the_command_tree() {
+        let problems: Vec<String> = registry()
+            .check(&Cli::command(), &[])
+            .into_iter()
+            .filter(|problem| {
+                !VARIANTS
+                    .iter()
+                    .any(|key| problem.starts_with(&format!("{key}:")))
+            })
+            .collect();
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
     #[test]
     fn every_payload_is_an_object() {
-        assert_eq!(super::registry().non_object_roots(), Vec::<&str>::new());
+        assert_eq!(registry().non_object_roots(), Vec::<String>::new());
     }
 }

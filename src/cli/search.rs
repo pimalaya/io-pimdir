@@ -1219,8 +1219,8 @@ pub enum RemoteRow {
     },
 }
 
-/// The refusal of a query (SEARCH §8.4), printed by `search` and `count`
-/// before they exit with status 1.
+/// The refusal of a query (SEARCH §8.4), printed by `search`, `count` and
+/// `tag` before they exit with status 1.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryErrorOutput {
