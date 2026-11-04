@@ -3,17 +3,14 @@
 //! Maps a command's dash-joined path, prefixed `pimdir-`, to the JSON
 //! Schema of its `--json` output. [`JsonSchemaCommand`] writes one file
 //! per entry, so the map is the CLI's machine-readable contract: one
-//! entry per data command, none for the toolkit verbs, and `pimdir-error`
-//! for the failure object every command prints instead. A flag changing a
+//! entry per command, the toolkit verbs included, and `pimdir-error` for
+//! the failure object every command prints instead. A flag changing a
 //! command's output shape has its own entry, its name appended:
 //! `pimdir-search-threads` for `search --threads`.
 //!
 //! [`JsonSchemaCommand`]: pimalaya_cli::clap::commands::JsonSchemaCommand
 
-use std::collections::BTreeMap;
-
 use pimalaya_cli::{clap::commands::JsonSchemaRegistry, error::ErrorReport};
-use schemars::schema_for;
 
 use crate::cli::{
     check::CheckOutput,
@@ -38,46 +35,33 @@ use crate::cli::{
 /// Each value describes the type the command hands to the printer, and
 /// `pimdir-error` the failure object every command prints instead.
 pub fn registry() -> JsonSchemaRegistry {
-    let mut schemas = BTreeMap::new();
+    let mut registry = JsonSchemaRegistry::new("pimdir", env!("CARGO_PKG_VERSION"));
 
-    macro_rules! insert {
-        ($key:expr, $ty:ty) => {
-            schemas.insert(
-                $key.to_string(),
-                serde_json::to_value(schema_for!($ty)).unwrap(),
-            );
-        };
-    }
+    registry.insert::<CollectionsOutput>("pimdir-collection-list");
+    registry.insert::<ItemsOutput>("pimdir-item-list");
+    registry.insert::<ItemShowOutput>("pimdir-item-show");
+    registry.insert::<ItemExportOutput>("pimdir-item-export");
+    registry.insert::<ItemRestoreOutput>("pimdir-item-restore");
+    registry.insert::<ItemPurgeOutput>("pimdir-item-purge");
+    registry.insert::<ItemEraseOutput>("pimdir-item-erase");
+    registry.insert::<QueueOutput>("pimdir-queue-list");
+    registry.insert::<QueueCancelOutput>("pimdir-queue-cancel");
+    registry.insert::<StoreInfoOutput>("pimdir-store-info");
+    registry.insert::<CheckOutput>("pimdir-check");
+    registry.insert::<GcOutput>("pimdir-gc");
+    registry.insert::<QuarantineEmptyOutput>("pimdir-quarantine-empty");
+    registry.insert::<ExportOutput>("pimdir-export");
+    registry.insert::<IndexOutput>("pimdir-index");
+    registry.insert::<SearchOutput>("pimdir-search");
+    registry.insert::<SearchThreadsOutput>("pimdir-search-threads");
+    registry.insert::<CountOutput>("pimdir-count");
+    registry.insert::<ShowOutput>("pimdir-show");
+    registry.insert::<ThreadRow>("pimdir-thread");
+    registry.insert::<TagOutput>("pimdir-tag");
+    registry.insert::<QueryErrorOutput>("pimdir-query-error");
+    registry.insert::<ErrorReport>("pimdir-error");
 
-    insert!("pimdir-collection-list", CollectionsOutput);
-    insert!("pimdir-item-list", ItemsOutput);
-    insert!("pimdir-item-show", ItemShowOutput);
-    insert!("pimdir-item-export", ItemExportOutput);
-    insert!("pimdir-item-restore", ItemRestoreOutput);
-    insert!("pimdir-item-purge", ItemPurgeOutput);
-    insert!("pimdir-item-erase", ItemEraseOutput);
-    insert!("pimdir-queue-list", QueueOutput);
-    insert!("pimdir-queue-cancel", QueueCancelOutput);
-    insert!("pimdir-store-info", StoreInfoOutput);
-    insert!("pimdir-check", CheckOutput);
-    insert!("pimdir-gc", GcOutput);
-    insert!("pimdir-quarantine-empty", QuarantineEmptyOutput);
-    insert!("pimdir-export", ExportOutput);
-    insert!("pimdir-index", IndexOutput);
-    insert!("pimdir-search", SearchOutput);
-    insert!("pimdir-search-threads", SearchThreadsOutput);
-    insert!("pimdir-count", CountOutput);
-    insert!("pimdir-show", ShowOutput);
-    insert!("pimdir-thread", ThreadRow);
-    insert!("pimdir-tag", TagOutput);
-    insert!("pimdir-query-error", QueryErrorOutput);
-    insert!("pimdir-error", ErrorReport);
-
-    JsonSchemaRegistry {
-        bin: "pimdir",
-        version: env!("CARGO_PKG_VERSION"),
-        schemas,
-    }
+    registry
 }
 
 #[cfg(test)]
