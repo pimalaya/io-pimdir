@@ -20,11 +20,11 @@ pub const TOKENIZER: &str = "unicode61 remove_diacritics 0";
 /// `init_index_meta` writes in `index_meta.format_version`: this draft's
 /// name. An index of the canonical shape at an earlier version, or naming
 /// none, is rebuilt; one at a later version is refused.
-pub const FORMAT_VERSION: &str = "search-draft-08";
+pub const FORMAT_VERSION: &str = "search-draft-09";
 
 /// The draft number of [`FORMAT_VERSION`], versions being ordered by it
 /// below every release (SEARCH §2).
-pub const FORMAT_DRAFT: u32 = 8;
+pub const FORMAT_DRAFT: u32 = 9;
 
 /// The index shape this crate builds and reads (SEARCH §2), which
 /// `init_index_meta` writes in `index_meta.shape`.
@@ -59,28 +59,32 @@ WHERE changed > :since AND deleted = 0 AND retained_at IS NULL
 /// its kind's component and title, in collection order.
 pub const LOAD_HIT_PLACEMENTS: &str = r#"SELECT i.collection, i.link_id,
        CASE WHEN i.flags_known = 1
-            THEN coalesce((SELECT group_concat(f.flag, ' ') FROM store.placement_flag f
-                           WHERE f.collection = i.collection AND f.link_id = i.link_id), '') END AS flags,
+            THEN trim(CASE WHEN i.marks & 1 THEN '\Seen ' ELSE '' END
+                   || CASE WHEN i.marks & 2 THEN '\Answered ' ELSE '' END
+                   || CASE WHEN i.marks & 4 THEN '\Flagged ' ELSE '' END
+                   || CASE WHEN i.marks & 8 THEN '\Draft ' ELSE '' END
+                   || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
+                   || coalesce((SELECT group_concat(g.flag, ' ') FROM store.placement_flag g WHERE g.item = i.id), '')) END AS flags,
        i.object_hash, i.sort_key, i.level, c.kind,
        CASE c.kind
          WHEN 'message/rfc822' THEN 'mail'
          WHEN 'text/vcard' THEN 'contact'
          WHEN 'application/octet-stream' THEN 'file'
          WHEN 'text/calendar' THEN CASE
-           WHEN e.link_id IS NOT NULL THEN 'event'
-           WHEN t.link_id IS NOT NULL THEN 'task'
-           WHEN j.link_id IS NOT NULL THEN 'journal'
+           WHEN e.item IS NOT NULL THEN 'event'
+           WHEN t.item IS NOT NULL THEN 'task'
+           WHEN j.item IS NOT NULL THEN 'journal'
          END
        END,
        coalesce(m.subject, k.fn, e.summary, t.summary, j.summary, f.name, '')
 FROM store.items i
 JOIN store.collections c ON c.id = i.collection
-LEFT JOIN store.mail_summary m ON m.collection = i.collection AND m.link_id = i.link_id
-LEFT JOIN store.contact_summary k ON k.collection = i.collection AND k.link_id = i.link_id
-LEFT JOIN store.event_summary e ON e.collection = i.collection AND e.link_id = i.link_id
-LEFT JOIN store.task_summary t ON t.collection = i.collection AND t.link_id = i.link_id
-LEFT JOIN store.journal_summary j ON j.collection = i.collection AND j.link_id = i.link_id
-LEFT JOIN store.file_summary f ON f.collection = i.collection AND f.link_id = i.link_id
+LEFT JOIN store.mail_summary m ON m.item = i.id
+LEFT JOIN store.contact_summary k ON k.item = i.id
+LEFT JOIN store.event_summary e ON e.item = i.id
+LEFT JOIN store.task_summary t ON t.item = i.id
+LEFT JOIN store.journal_summary j ON j.item = i.id
+LEFT JOIN store.file_summary f ON f.item = i.id
 WHERE i.seq = :seq AND c.account IS :account AND i.deleted = 0 AND i.retained_at IS NULL
 ORDER BY i.collection;"#;
 
@@ -123,7 +127,8 @@ ORDER BY p.collection, p.seq LIMIT 1;"#;
 /// The first `In-Reply-To` id of a message id's summary (STORAGE Annex
 /// A.1), the parent of a message the index holds no body of (SEARCH §9).
 pub const MESSAGE_IN_REPLY_TO: &str = r#"SELECT r.msg_id FROM placement p
-JOIN store.mail_in_reply_to r ON r.collection = p.collection AND r.link_id = p.link_id
+JOIN store.items i ON i.collection = p.collection AND i.link_id = p.link_id
+JOIN store.mail_in_reply_to r ON r.item = i.id
 WHERE p.link_id = :link_id
 ORDER BY p.collection, p.seq, r.position LIMIT 1;"#;
 

@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: a-delta-loads-what-it-names
-status: active
+status: landed
 created: 2026-10-18
 ---
 

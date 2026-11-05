@@ -70,7 +70,7 @@ mod join;
 /// The version of SYNC.md this engine follows (SYNC §10), which a store
 /// records in `store_meta.sync_version` with the engine's first write: a
 /// store naming another is refused before any verb runs.
-pub const SYNC_VERSION: &str = "sync-draft-07";
+pub const SYNC_VERSION: &str = "sync-draft-08";
 
 /// Which push kinds a writable source may derive.
 ///
@@ -724,7 +724,16 @@ impl PimdirSync {
                 narrowed,
                 enumerated: enumerated.clone(),
             },
-            PageKind::Delta | PageKind::Parked => PimdirLoadSelection::All,
+            // NOTE: a delta reasons about what it does not list only
+            // through what owes a push, which the store names (SYNC §10);
+            // a last page counts every bound member of its scope (§5).
+            PageKind::Delta | PageKind::Parked => PimdirLoadSelection::Owing(
+                items
+                    .iter()
+                    .map(|item| item.handle.clone())
+                    .chain(vanished.iter().cloned())
+                    .collect(),
+            ),
         };
         self.page = Some(Page {
             kind,
@@ -2333,7 +2342,10 @@ impl PimdirCoroutine for PimdirSync {
                 let partial = self.page.as_ref().is_some_and(|page| {
                     matches!(
                         page.kind,
-                        PageKind::Partial | PageKind::DeltaHead | PageKind::BandHead
+                        PageKind::Partial
+                            | PageKind::Delta
+                            | PageKind::DeltaHead
+                            | PageKind::BandHead
                     )
                 });
                 let hints = self.hints();
@@ -3570,6 +3582,50 @@ mod tests {
         };
         assert_eq!(p.handle.as_str(), "2");
         assert!(p.flags.contains("seen"));
+    }
+
+    /// A delta loads what it lists or drops, what owes a push and its
+    /// hints' holders, never the whole collection (SYNC §10).
+    #[test]
+    fn a_delta_loads_what_owes_a_push_never_the_collection() {
+        crate::testlog::init();
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let mut page = Some(delta(
+            vec![remote("2", &["seen"])],
+            vec![PimdirHandle::from("3")],
+        ));
+        let mut selections = Vec::new();
+        let mut arg = None;
+
+        loop {
+            match sync.resume(arg.take()) {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { selection, .. }) => {
+                    selections.push(selection);
+                    arg = Some(PimdirArg::Load(PimdirLoaded::default()));
+                }
+                PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { .. }) => {
+                    let page = page.take().expect("one page to enumerate");
+                    arg = Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page)));
+                }
+                _ => break,
+            }
+        }
+
+        let listed = vec![PimdirHandle::from("2"), PimdirHandle::from("3")];
+        assert!(
+            selections.contains(&PimdirLoadSelection::Owing(listed)),
+            "{selections:?}"
+        );
+        assert!(
+            selections
+                .iter()
+                .any(|s| matches!(s, PimdirLoadSelection::Links(_))),
+            "the hints' holders: {selections:?}"
+        );
+        assert!(
+            !selections.contains(&PimdirLoadSelection::All),
+            "{selections:?}"
+        );
     }
 
     /// An unlisted dirty handle derives its pending push against its own base.

@@ -44,6 +44,32 @@ pub fn flags_from_column(joined: Option<&str>) -> PimdirFlags {
     )
 }
 
+/// The system flags a row holds as bits (STORAGE §13), each by its exact
+/// bytes, in the order of their bits: `\Seen` 1, `\Answered` 2, `\Flagged`
+/// 4, `\Draft` 8, `\Deleted` 16. Every other flag, `\seen` included, is a
+/// row.
+pub const MARKS: [&str; 5] = ["\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"];
+
+/// A flag's bit in `marks` or `base_marks` (STORAGE §13), `None` for a
+/// flag held as a row.
+pub fn mark_of(flag: &str) -> Option<i64> {
+    MARKS
+        .iter()
+        .position(|mark| *mark == flag)
+        .map(|position| 1 << position)
+}
+
+/// A set's system flags as the `marks` or `base_marks` column holds them
+/// (STORAGE §13), `0` for an unknown set.
+pub fn marks_to_int(flags: &PimdirFlags) -> i64 {
+    flags
+        .known()
+        .into_iter()
+        .flatten()
+        .filter_map(|flag| mark_of(flag))
+        .sum()
+}
+
 /// Whether the store holds `flag` (STORAGE §13): non-empty and printable
 /// ASCII without a space, as IMAP flags and JMAP keywords are. A set
 /// holding another is refused before it is written.

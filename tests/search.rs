@@ -1600,12 +1600,12 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
     for (altered, version, shape) in [
         (
             "UPDATE index_meta SET shape = 'fts4'",
-            Some("search-draft-08"),
+            Some("search-draft-09"),
             Some("fts4"),
         ),
         (
-            "UPDATE index_meta SET format_version = 'search-draft-09'",
-            Some("search-draft-09"),
+            "UPDATE index_meta SET format_version = 'search-draft-10'",
+            Some("search-draft-10"),
             Some("canonical"),
         ),
         (
@@ -1670,7 +1670,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         drop(index);
         assert_eq!(
             index_meta(dir.path(), "format_version"),
-            rusqlite::types::Value::Text("search-draft-08".into()),
+            rusqlite::types::Value::Text("search-draft-09".into()),
             "{altered}"
         );
     }
@@ -2261,8 +2261,9 @@ mod memory {
             let mut stmt = self
                 .store
                 .prepare(
-                    "SELECT role, address, name FROM store.item_address \
-                     WHERE collection = ?1 AND link_id = ?2 ORDER BY role, position",
+                    "SELECT a.role, a.address, a.name FROM store.item_address a \
+                     JOIN store.items i ON i.id = a.item \
+                     WHERE i.collection = ?1 AND i.link_id = ?2 ORDER BY a.role, a.position",
                 )
                 .unwrap();
             let addresses = stmt
@@ -2311,8 +2312,9 @@ mod memory {
                 .find_map(|((collection, _), _)| {
                     self.store
                         .query_row(
-                            "SELECT msg_id FROM store.mail_in_reply_to \
-                             WHERE collection = ?1 AND link_id = ?2 ORDER BY position LIMIT 1",
+                            "SELECT r.msg_id FROM store.mail_in_reply_to r \
+                             JOIN store.items i ON i.id = r.item \
+                             WHERE i.collection = ?1 AND i.link_id = ?2 ORDER BY r.position LIMIT 1",
                             params![collection, link_id],
                             |r| r.get(0),
                         )
@@ -2376,9 +2378,9 @@ mod memory {
                                     coalesce(e.recurring, t.recurring), coalesce(e.until, t.until) \
                              FROM store.items i JOIN store.collections c ON c.id = i.collection \
                              LEFT JOIN store.event_summary e \
-                               ON e.collection = i.collection AND e.link_id = i.link_id \
+                               ON e.item = i.id \
                              LEFT JOIN store.task_summary t \
-                               ON t.collection = i.collection AND t.link_id = i.link_id \
+                               ON t.item = i.id \
                              WHERE c.kind = 'text/calendar' AND i.deleted = 0",
                         )
                         .unwrap();
@@ -2423,9 +2425,14 @@ mod memory {
                     for (collection, seq) in &self.missing {
                         rows.extend(self.feed(
                             "SELECT i.collection, i.link_id, i.seq, i.object_hash, \
-                               CASE WHEN i.flags_known = 1 THEN coalesce((SELECT group_concat(f.flag, ' ') \
-                                 FROM store.placement_flag f WHERE f.collection = i.collection \
-                                 AND f.link_id = i.link_id), '') END, \
+                               CASE WHEN i.flags_known = 1 THEN trim( \
+                                 CASE WHEN i.marks & 1 THEN '\\Seen ' ELSE '' END \
+                                 || CASE WHEN i.marks & 2 THEN '\\Answered ' ELSE '' END \
+                                 || CASE WHEN i.marks & 4 THEN '\\Flagged ' ELSE '' END \
+                                 || CASE WHEN i.marks & 8 THEN '\\Draft ' ELSE '' END \
+                                 || CASE WHEN i.marks & 16 THEN '\\Deleted ' ELSE '' END \
+                                 || coalesce((SELECT group_concat(f.flag, ' ') \
+                                 FROM store.placement_flag f WHERE f.item = i.id), '')) END, \
                                i.deleted, i.retained_at, c.kind, c.account, i.changed \
                              FROM store.items i JOIN store.collections c ON c.id = i.collection \
                              WHERE i.collection = ?1 AND i.seq = ?2",

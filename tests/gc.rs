@@ -254,8 +254,8 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
     conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
     conn.execute("UPDATE objects SET refcount = 7", []).unwrap();
     conn.execute(
-        "INSERT INTO bindings(collection, link_id, source, handle) \
-         VALUES('INBOX', 'mid:gone', 'remote', 'x')",
+        "INSERT INTO bindings(item, collection, source, handle) \
+         VALUES(424242, 'INBOX', 'remote', 'x')",
         [],
     )
     .unwrap();

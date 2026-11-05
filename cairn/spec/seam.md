@@ -66,7 +66,7 @@ This refines the retention decision point above rather than replacing it: a stor
 - THEN the item is not marked deleted and the other source projects it unchanged
 
 ### Requirement: A load states what it needs
-`PimdirYield::WantsLoad` SHALL carry a `PimdirLoadSelection` in its `selection` (STORAGE §2 names `All`, `Handles` and `Links` a selection, a scope being the date window): `All`, `Handles`, `Links`, or `LastPage`. A mutation asks for the one placement it edits, or, for an `Add`, every row holding the link id it must not collide with; an upgrade asks for the handles it raises; a delta and a rebuild ask for the whole collection, and a round's last page for the whole collection with what the page states of its listing (`LastPage { narrowed, enumerated }`), the store answering the bindings the round finds absent from `list_unstamped_bindings` bound with them, because only they reason about what is missing from it, a page before the last asks for the `Handles` it lists and the `Links` of the hints it carries, and a sync first asks for `Handles` naming none, its sync state alone (checkpoint, coverage, round).
+`PimdirYield::WantsLoad` SHALL carry a `PimdirLoadSelection` in its `selection` (STORAGE §2 names `All`, `Handles` and `Links` a selection, a scope being the date window): `All`, `Handles`, `Links`, `Owing`, or `LastPage`. A mutation asks for the one placement it edits, or, for an `Add`, every row holding the link id it must not collide with; an upgrade asks for the handles it raises; a delta asks for `Owing` of the handles it lists and finds vanished, the store answering those and the placements `list_owing_bindings` and `list_lacking_items` name (pimdir SYNC §10), then for the `Links` of the hints it carries; a rebuild asks for the whole collection, and a round's last page for the whole collection with what the page states of its listing (`LastPage { narrowed, enumerated }`), the store answering the bindings the round finds absent from `list_unstamped_bindings` bound with them, because what it finds absent and whether it parks are counted over every based binding of its scope (pimdir SYNC §5), a page before the last asks for the `Handles` it lists and the `Links` of the hints it carries, and a sync first asks for `Handles` naming none, its sync state alone (checkpoint, coverage, round).
 
 A load names the collection it reads, which is the coroutine's own except where a verb acts across two: a `Copy` or a `Move` reads its target for the identity it is carrying into it (mutate.md), that being the one question the collection it edits cannot answer.
 
@@ -76,6 +76,10 @@ The selection is a floor, not a ceiling: a storage SHALL return at least the pla
 - GIVEN a storage that honours the scope exactly
 - WHEN any mutation other than `Add` runs
 - THEN it is served only the placement it names, and still produces the same writes
+
+#### Scenario: A delta loads what owes a push
+- src/sync.rs `a_delta_loads_what_owes_a_push_never_the_collection`: a delta listing one member and dropping another asks for `Owing` of both and for its hints' `Links`, never `All`
+- tests/owing_load.rs `a_delta_loads_what_it_names_and_what_owes_a_push`: over 50 clean placements, one off its base by a bit and one by a row, `Owing` of one clean handle answers those three
 
 ### Requirement: A write batch is applied in order
 The store's write SHALL apply the ops in the order they are listed, and atomically. Ordering is what a batch naming one handle twice rests on, which the engine does emit: a sync that resurrects a locally deleted item writes the provisional row, pushes it, and supersedes the same handle once the remote assigns one, and the drop is the answer.

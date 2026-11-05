@@ -1002,7 +1002,7 @@ fn a_page_across_collections_merges_each_collections_order() {
         assert!(
             steps
                 .iter()
-                .any(|step| step.contains("USING INDEX items_by_sort (collection=?")),
+                .any(|step| step.contains("INDEX items_by_sort (collection=?")),
             "{name} seeks each collection's order: {steps:?}"
         );
         // NOTE: the merge orders the union of the per-collection pages,

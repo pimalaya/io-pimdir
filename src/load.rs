@@ -43,6 +43,12 @@ pub enum PimdirLoadSelection {
     },
     /// The placements holding these handles.
     Handles(Vec<PimdirHandle>),
+    /// The placements holding these handles, and every one that may owe
+    /// the source a push or a propagation: the bindings
+    /// `list_owing_bindings` names and the items `list_lacking_items`
+    /// names (STORAGE §14, SYNC §10). What a delta loads, so its load
+    /// grows with what moved, not with the collection.
+    Owing(Vec<PimdirHandle>),
     /// Every placement holding one of these link ids, however many rows.
     Links(Vec<PimdirLinkId>),
 }

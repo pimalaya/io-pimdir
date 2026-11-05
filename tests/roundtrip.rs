@@ -1016,7 +1016,7 @@ fn an_unknown_flag_set_stores_no_row_and_loads_back_unknown() {
     let stored: Vec<(i64, i64)> = conn
         .prepare(
             "SELECT flags_known, (SELECT count(*) FROM placement_flag f \
-             WHERE f.collection = i.collection AND f.link_id = i.link_id) \
+             WHERE f.item = i.id) \
              FROM items i ORDER BY link_id",
         )
         .unwrap()

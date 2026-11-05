@@ -757,8 +757,8 @@ fn item_conflict_state(dir: &Path) -> (bool, bool) {
 fn is_conflicted(dir: &Path, collection: usize, source: usize, link: usize) -> bool {
     peek(dir)
         .query_row(
-            "SELECT conflicted FROM bindings \
-             WHERE collection = ?1 AND link_id = ?2 AND source = ?3",
+            "SELECT b.conflicted FROM bindings b JOIN items i ON i.id = b.item \
+             WHERE i.collection = ?1 AND i.link_id = ?2 AND b.source = ?3",
             rusqlite::params![COLLECTIONS[collection], LINKS[link], SOURCES[source]],
             |row| row.get::<_, i64>(0),
         )

@@ -23,7 +23,7 @@ include!(concat!(env!("OUT_DIR"), "/canonical.rs"));
 /// The STORAGE version whose schema the canonical migrations hold (§4.2),
 /// which `init_store_meta` writes as `store_meta.format_version`: a store
 /// naming another is refused by every profile.
-pub const FORMAT_VERSION: &str = "storage-draft-08";
+pub const FORMAT_VERSION: &str = "storage-draft-09";
 
 /// Declares the crate's own statements and the [`OWN`] index in one
 /// expansion, so a statement is added in one place.
@@ -80,11 +80,12 @@ MINTED_KEYS = r#"SELECT collection, count(*) FROM items
 WHERE link_id GLOB 'dup:*' AND deleted = 0 AND retained_at IS NULL
 GROUP BY collection ORDER BY collection;"#;
 
-/// The bindings whose item is gone, the one dangling row a repair clears.
-DANGLING_BINDINGS = r#"SELECT b.collection, b.link_id, b.source FROM bindings b
-WHERE NOT EXISTS (SELECT 1 FROM items i
-  WHERE i.collection = b.collection AND i.link_id = b.link_id)
-ORDER BY b.collection, b.link_id, b.source;"#;
+/// The bindings whose item is gone, the one dangling row a repair clears,
+/// the item named by its placement id, `#` before it, since its link id
+/// went with it.
+DANGLING_BINDINGS = r#"SELECT b.collection, '#' || b.item, b.source FROM bindings b
+WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.id = b.item)
+ORDER BY b.collection, b.item, b.source;"#;
 
 /// The items whose body is not indexed; reported, never repaired.
 DANGLING_ITEM_OBJECTS = r#"SELECT collection, link_id, object_hash FROM items
@@ -99,8 +100,7 @@ ORDER BY id;"#;
 /// Deletes the bindings whose item is gone: unreachable rows, and the one
 /// dangling row a repair can clear without guessing.
 DELETE_DANGLING_BINDINGS = r#"DELETE FROM bindings WHERE NOT EXISTS (
-  SELECT 1 FROM items i
-  WHERE i.collection = bindings.collection AND i.link_id = bindings.link_id);"#;
+  SELECT 1 FROM items i WHERE i.id = bindings.item);"#;
 
 /// The live items holding no body per collection kind, over the collections
 /// of the `collections` slot (STORAGE §4.4): the canonical search `coverage`

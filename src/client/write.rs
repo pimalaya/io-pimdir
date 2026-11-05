@@ -90,6 +90,24 @@ impl PimdirSourceStore {
                 }
                 read_hub(conn, &collection.0, Some(&links))?
             }
+            PimdirLoadSelection::Owing(handles) => {
+                let key = named_params! { ":collection": collection.0, ":source": self.source.0 };
+                let owing: Vec<String> = rows(conn, sql::LIST_OWING_BINDINGS, key, |r| r.get(0))?;
+                let mut links: Vec<String> =
+                    rows(conn, sql::LIST_LACKING_ITEMS, key, |r| r.get(0))?;
+                let named = owing
+                    .into_iter()
+                    .map(PimdirHandle)
+                    .chain(handles.iter().cloned());
+                for handle in named {
+                    let bound = link_for_handle(conn, &collection.0, &self.source, &handle)?;
+                    let offered = || handle.as_str().strip_prefix('\u{1}').map(String::from);
+                    links.extend(bound.or_else(offered));
+                }
+                links.sort();
+                links.dedup();
+                read_hub(conn, &collection.0, Some(&links))?
+            }
         };
 
         let mut failed = None;
@@ -1583,6 +1601,7 @@ fn keep_overruled(
             ":link_id": key.0,
             ":seq": seq,
             ":flags_known": lost.flags.known().is_some(),
+            ":marks": codec::marks_to_int(&lost.flags),
             ":object_hash": lost.object.0,
             ":sort_key": lost.sort_key.0.as_str(),
             ":level": codec::level_to_int(PimdirLevel::Full),
@@ -1698,6 +1717,7 @@ fn insert_item(
             ":link_id": link.0,
             ":seq": seq,
             ":flags_known": item.flags.known().is_some(),
+            ":marks": codec::marks_to_int(&item.flags),
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
@@ -1813,6 +1833,7 @@ fn update_item(
             ":collection": collection,
             ":link_id": link.0,
             ":flags_known": item.flags.known().is_some(),
+            ":marks": codec::marks_to_int(&item.flags),
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
@@ -1824,12 +1845,13 @@ fn update_item(
     write_flags(conn, collection, &link.0, None, &item.flags)
 }
 
-/// Writes a flag set to its rows after the row it belongs to (§13, §14):
-/// a placement's with no `source`, else that source's base. The set fills
-/// the `flags` slot, empty for an unknown one, then `retain_flags` and
-/// `add_flags`, or their base twins, run; a set written as it was moves
-/// no row and draws no stamp. A flag the store cannot hold is
-/// [`PimdirError::Flag`], refused before any is written, never trimmed.
+/// Writes a flag set's rows after the row it belongs to (§13, §14): a
+/// placement's with no `source`, else that source's base. The row write
+/// carried its system flags as bits ([`codec::marks_to_int`]); its other
+/// flags fill the `flags` slot, empty for an unknown set, then
+/// `retain_flags` and `add_flags`, or their base twins, run; a set written
+/// as it was moves no row and draws no stamp. A flag the store cannot hold
+/// is [`PimdirError::Flag`], refused before any is written, never trimmed.
 pub(crate) fn write_flags(
     conn: &Connection,
     collection: &str,
@@ -1840,7 +1862,12 @@ pub(crate) fn write_flags(
     if let Some(flag) = flags.invalid() {
         return Err(PimdirError::Flag(flag.into()));
     }
-    bind_list(conn, "flags", flags.known().into_iter().flatten())?;
+    let others = flags.known().into_iter().flatten();
+    bind_list(
+        conn,
+        "flags",
+        others.filter(|flag| codec::mark_of(flag).is_none()),
+    )?;
 
     match source {
         None => {
@@ -2193,6 +2220,7 @@ fn insert_binding(
             ":source": source.0,
             ":handle": binding.handle.0,
             ":base_flags_known": base_flags(binding).known().is_some(),
+            ":base_marks": codec::marks_to_int(base_flags(binding)),
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
             ":base_present": binding.base.is_some() as i64,
@@ -2225,6 +2253,7 @@ fn update_binding(
             ":link_id": link.0,
             ":source": source.0,
             ":base_flags_known": base_flags(binding).known().is_some(),
+            ":base_marks": codec::marks_to_int(base_flags(binding)),
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
             ":base_present": binding.base.is_some() as i64,

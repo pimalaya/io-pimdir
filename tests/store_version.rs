@@ -161,7 +161,7 @@ fn the_index_refuses_a_store_of_another_version_and_makes_nothing() {
 /// every profile, naming its version and this one's.
 #[test]
 fn a_store_of_another_version_is_refused_by_every_profile_and_never_written() {
-    for marker in ["storage-v1", "storage-draft-07", "storage-draft-09"] {
+    for marker in ["storage-v1", "storage-draft-07", "storage-draft-10"] {
         let dir = altered(&format!(
             "UPDATE store_meta SET format_version = '{marker}'"
         ));
@@ -269,7 +269,7 @@ fn a_fresh_store_names_this_draft_and_an_identity() {
     let dir = tempfile::tempdir().unwrap();
     let store = PimdirStore::open(dir.path()).unwrap();
     let meta = store.store_meta().unwrap();
-    assert_eq!(meta.format_version, "storage-draft-08");
+    assert_eq!(meta.format_version, "storage-draft-09");
     assert_eq!(
         (meta.version, meta.read_version, meta.produce_version),
         (1, 1, 1)

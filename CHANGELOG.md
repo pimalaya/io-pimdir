@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **BREAKING**: Added pimdir storage-draft-09, sync-draft-08 and search-draft-09, vendored at pimdir 1d34d2f.
+
+  A placement is keyed by an integer id every child row carries, and its system flags (`\Seen`, `\Answered`, `\Flagged`, `\Draft`, `\Deleted`) are bits of the row (`codec::MARKS`, `codec::mark_of`, `codec::marks_to_int`), every other flag a row. A store an earlier draft wrote is refused by every profile, never migrated: move it aside and let its sync engine create a new one.
+
+- **BREAKING**: Added `PimdirLoadSelection::Owing`, what a delta loads: the handles it lists and drops, and every placement that may owe the source a push (`list_owing_bindings`, `list_lacking_items`), then its hints' `Links`. A delta no longer loads the whole collection.
+
 ### Changed
 
 - Prepared every statement the client runs more than once through a statement cache of 256 per connection, enabling rusqlite's `cache` feature (hashlink, and foldhash under Zlib, now allowed): a store write prepared its trigger programs on every call. Writing 50,000 listed messages through the owner went from 17.6 s to 2.9 s.

@@ -18,6 +18,7 @@ use std::{
 use io_pimdir::{
     change::{PimdirChange, PimdirChangeKind},
     client::{PimdirSourceStore, PimdirStore, blobs::PimdirBlobs},
+    codec,
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     coroutine::{PimdirArg, PimdirCoroutine, PimdirCoroutineState, PimdirYield},
     hash,
@@ -110,6 +111,15 @@ fn flags_json(flags: &Option<String>) -> Value {
 
 /// Writes a case's flag array to the rows of `retain` and `add` (STORAGE
 /// §13), after the row they belong to: the set in the `flags` slot.
+/// A case's flag set's system flags as the row's bits (STORAGE §13), `0`
+/// for an unknown set.
+fn marks(value: &Value) -> i64 {
+    let flags = value.as_array().into_iter().flatten();
+    flags
+        .filter_map(|flag| codec::mark_of(flag.as_str().unwrap()))
+        .sum()
+}
+
 fn seed_flags(
     conn: &Connection,
     value: &Value,
@@ -118,7 +128,12 @@ fn seed_flags(
     key: &[(&str, &dyn rusqlite::ToSql)],
 ) {
     conn.execute(sql::CLEAR_PARAM, []).unwrap();
-    for (position, flag) in value.as_array().into_iter().flatten().enumerate() {
+    let others = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|flag| codec::mark_of(flag.as_str().unwrap()).is_none());
+    for (position, flag) in others.enumerate() {
         conn.execute(
             sql::BIND_PARAM,
             named_params! {
@@ -206,6 +221,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":link_id": item["link_id"].as_str().unwrap(),
                 ":seq": seq,
                 ":flags_known": item.get("flags").is_some_and(|f| !f.is_null()),
+                ":marks": marks(&item["flags"]),
                 ":object_hash": bodies.hash(&item["object"]),
                 ":sort_key": item["sort_key"].as_str().unwrap_or(""),
                 ":level": item["level"].as_i64().unwrap_or(0),
@@ -265,6 +281,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":source": binding["source"].as_str().unwrap(),
                 ":handle": binding["handle"].as_str().unwrap(),
                 ":base_flags_known": binding.get("base_flags").is_some_and(|f| !f.is_null()),
+                ":base_marks": marks(&binding["base_flags"]),
                 ":base_object": bodies.hash(&binding["base_object"]),
                 ":base_revision": binding["base_revision"].as_str(),
                 ":base_present": binding["base_present"].as_i64().unwrap_or(0),
@@ -305,7 +322,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
     for binding in store["bindings"].as_array().unwrap() {
         if let Some(round) = binding.get("round") {
             conn.execute(
-                "UPDATE bindings SET round = ?1 WHERE collection = ?2 AND link_id = ?3 AND source = ?4",
+                "UPDATE bindings SET round = ?1 WHERE item = (SELECT id FROM items WHERE collection = ?2 AND link_id = ?3) AND source = ?4",
                 params![
                     round.as_i64(),
                     binding["collection"].as_str().unwrap(),
@@ -335,7 +352,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             })
             .collect();
         let query = format!(
-            "INSERT INTO {table} (collection, link_id, {}) VALUES (?1, ?2, {})",
+            "INSERT INTO {table} (item, {}) VALUES ((SELECT id FROM items WHERE collection = ?1 AND link_id = ?2), {})",
             columns
                 .iter()
                 .map(|c| c.as_str())
@@ -360,8 +377,8 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             for (position, value) in values.as_array().into_iter().flatten().enumerate() {
                 conn.execute(
                     &format!(
-                        "INSERT INTO {list} (collection, link_id, position, {value_column}) \
-                         VALUES (?1, ?2, ?3, ?4)"
+                        "INSERT INTO {list} (item, position, {value_column}) \
+                         VALUES ((SELECT id FROM items WHERE collection = ?1 AND link_id = ?2), ?3, ?4)"
                     ),
                     params![
                         entry["collection"].as_str().unwrap(),
@@ -1016,10 +1033,10 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
 
     let query = match table {
         "items" => {
-            "SELECT collection, link_id, seq, CASE WHEN flags_known = 1 THEN coalesce((SELECT group_concat(f.flag, ' ') FROM placement_flag f WHERE f.collection = items.collection AND f.link_id = items.link_id), '') END, object_hash, level, deleted, retained_at, retained_by, sort_key, conflicted, conflict_object FROM items ORDER BY collection, link_id"
+            "SELECT i.collection, i.link_id, i.seq, CASE WHEN i.flags_known = 1 THEN trim(CASE WHEN i.marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN i.marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN i.marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN i.marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN i.marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(f.flag, ' ') FROM placement_flag f WHERE f.item = i.id), '')) END, i.object_hash, i.level, i.deleted, i.retained_at, i.retained_by, i.sort_key, i.conflicted, i.conflict_object FROM items i ORDER BY i.collection, i.link_id"
         }
         "bindings" => {
-            "SELECT collection, link_id, source, handle, CASE WHEN base_flags_known = 1 THEN coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.collection = bindings.collection AND g.link_id = bindings.link_id AND g.source = bindings.source), '') END, base_object, base_revision, base_present, conflicted, conflict_revision, conflict_object, shared_object, round FROM bindings ORDER BY collection, link_id, source"
+            "SELECT b.collection, i.link_id, b.source, b.handle, CASE WHEN b.base_flags_known = 1 THEN trim(CASE WHEN b.base_marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN b.base_marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN b.base_marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN b.base_marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN b.base_marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.item = b.item AND g.source = b.source), '')) END, b.base_object, b.base_revision, b.base_present, b.conflicted, b.conflict_revision, b.conflict_object, b.shared_object, b.round FROM bindings b JOIN items i ON i.id = b.item ORDER BY b.collection, i.link_id, b.source"
         }
         "sources" => {
             "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until, round_band FROM sources ORDER BY collection, source"
@@ -1028,13 +1045,13 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
             "SELECT id, account, kind, conflict, generation, name, role FROM collections ORDER BY id"
         }
         "addresses" => {
-            "SELECT collection, link_id, role, position, address, name FROM item_address ORDER BY collection, link_id, role, position"
+            "SELECT i.collection, i.link_id, a.role, a.position, a.address, a.name FROM item_address a JOIN items i ON i.id = a.item ORDER BY i.collection, i.link_id, a.role, a.position"
         }
         "references" => {
             "SELECT from_kind, from_link_id, to_kind, to_link_id, role, origin FROM item_reference ORDER BY from_kind, from_link_id, to_kind, to_link_id, role"
         }
         "supersessions" => {
-            "SELECT collection, link_id, by_collection, by_link_id FROM supersessions ORDER BY collection, link_id"
+            "SELECT i.collection, i.link_id, j.collection, j.link_id FROM supersessions s JOIN items i ON i.id = s.item JOIN items j ON j.id = s.by_item ORDER BY i.collection, i.link_id"
         }
         _ => panic!("unknown table {table}"),
     };
@@ -1163,7 +1180,7 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
                 entry["link_id"].as_str().unwrap()
             ];
             let query = format!(
-                "SELECT {} FROM {table} WHERE collection = ?1 AND link_id = ?2",
+                "SELECT {} FROM {table} WHERE item = (SELECT id FROM items WHERE collection = ?1 AND link_id = ?2)",
                 columns.join(", ")
             );
             let row = conn
@@ -1197,7 +1214,7 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
                     let values: Vec<String> = conn
                         .prepare(&format!(
                             "SELECT {value_column} FROM {list} \
-                             WHERE collection = ?1 AND link_id = ?2 ORDER BY position"
+                             WHERE item = (SELECT id FROM items WHERE collection = ?1 AND link_id = ?2) ORDER BY position"
                         ))
                         .unwrap()
                         .query_map(key, |r| r.get(0))

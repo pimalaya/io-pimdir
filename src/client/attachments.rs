@@ -407,6 +407,7 @@ pub(crate) fn insert_file(
             ":link_id": link.as_str(),
             ":seq": seq,
             ":flags_known": 1,
+            ":marks": 0,
             ":object_hash": None::<String>,
             ":sort_key": summary.sort_key().0,
             ":level": 1,
