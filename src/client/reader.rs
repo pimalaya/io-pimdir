@@ -26,7 +26,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params};
 use crate::{
     capability::PimdirSourceCapabilities,
     client::{
-        PimdirError, bind_list,
+        PimdirError, PreparedCached, bind_list,
         blobs::PimdirBlobs,
         capability, modes, prepare_connection,
         producer::{
@@ -573,7 +573,7 @@ impl PimdirReader {
         let collection = collection.as_ref();
         Ok(self
             .conn
-            .query_row(
+            .query_row_cached(
                 sql::LOAD_ACCOUNT,
                 named_params! { ":collection": collection },
                 |r| r.get::<_, Option<String>>(0),
@@ -590,7 +590,7 @@ impl PimdirReader {
         let collection = collection.as_ref();
         Ok(self
             .conn
-            .query_row(
+            .query_row_cached(
                 sql::LOAD_KIND,
                 named_params! { ":collection": collection },
                 |r| r.get::<_, String>(0),
@@ -631,7 +631,7 @@ impl PimdirReader {
         let collection = collection.as_ref();
         Ok(self
             .conn
-            .query_row(
+            .query_row_cached(
                 sql::LOAD_GENERATION,
                 named_params! { ":collection": collection },
                 |r| r.get(0),
@@ -888,7 +888,7 @@ impl PimdirReader {
         let collection = collection.as_ref();
         Ok(self
             .conn
-            .query_row(
+            .query_row_cached(
                 sql::SEQ_BY_LINK,
                 named_params! { ":collection": collection, ":link_id": link_id },
                 |row| row.get(0),
@@ -964,7 +964,7 @@ impl PimdirReader {
     /// A collection's live item count.
     pub fn count_items(&self, collection: impl AsRef<str>) -> Result<u64, PimdirError> {
         let collection = collection.as_ref();
-        let count: i64 = self.conn.query_row(
+        let count: i64 = self.conn.query_row_cached(
             sql::COUNT_ITEMS,
             named_params! { ":collection": collection },
             |r| r.get(0),
@@ -1155,7 +1155,7 @@ impl PimdirReader {
 
     /// A collection's trash count, every deleted row.
     pub fn count_retained(&self, collection: impl AsRef<str>) -> Result<i64, PimdirError> {
-        Ok(self.conn.query_row(
+        Ok(self.conn.query_row_cached(
             sql::COUNT_RETAINED,
             named_params! { ":collection": collection.as_ref() },
             |r| r.get(0),
@@ -1165,7 +1165,9 @@ impl PimdirReader {
     /// The bytes retention holds store-wide, each body counted once: an
     /// upper bound on what a purge would reclaim.
     pub fn retained_bytes(&self) -> Result<u64, PimdirError> {
-        let bytes: i64 = self.conn.query_row(sql::RETAINED_BYTES, [], |r| r.get(0))?;
+        let bytes: i64 = self
+            .conn
+            .query_row_cached(sql::RETAINED_BYTES, [], |r| r.get(0))?;
         Ok(bytes.max(0) as u64)
     }
 
@@ -1270,20 +1272,22 @@ impl PimdirReader {
     /// The change feed's cursor (§4.5), recorded beside what a consumer
     /// derives (`load_change_cursor`).
     pub fn change_cursor(&self) -> Result<PimdirChangeCursor, PimdirError> {
-        Ok(self.conn.query_row(sql::LOAD_CHANGE_CURSOR, [], |r| {
-            Ok(PimdirChangeCursor {
-                changed: r.get(0)?,
-                purges: r.get(1)?,
-                store_id: r.get(2)?,
-                incarnation: r.get(3)?,
-            })
-        })?)
+        Ok(self
+            .conn
+            .query_row_cached(sql::LOAD_CHANGE_CURSOR, [], |r| {
+                Ok(PimdirChangeCursor {
+                    changed: r.get(0)?,
+                    purges: r.get(1)?,
+                    store_id: r.get(2)?,
+                    incarnation: r.get(3)?,
+                })
+            })?)
     }
 
     /// The store's `store_meta` row (`load_store_meta`): its versions, its
     /// identity and its counters.
     pub fn store_meta(&self) -> Result<PimdirStoreMeta, PimdirError> {
-        Ok(self.conn.query_row(sql::LOAD_STORE_META, [], |r| {
+        Ok(self.conn.query_row_cached(sql::LOAD_STORE_META, [], |r| {
             Ok(PimdirStoreMeta {
                 version: r.get(1)?,
                 hash_algo: r.get(2)?,
@@ -1469,7 +1473,7 @@ impl PimdirReader {
             "collections",
             collections.iter().map(|c| c.as_ref()),
         )?;
-        let count: i64 = self.conn.query_row(
+        let count: i64 = self.conn.query_row_cached(
             sql::COUNT_MAIL,
             named_params! {
                 ":seen": filter.seen,
@@ -1559,7 +1563,7 @@ impl PimdirReader {
             "collections",
             collections.iter().map(|c| c.as_ref()),
         )?;
-        let (count, size, unknown): (i64, i64, i64) = self.conn.query_row(
+        let (count, size, unknown): (i64, i64, i64) = self.conn.query_row_cached(
             sql::SUM_MAIL,
             named_params! {
                 ":seen": filter.seen,
@@ -1700,7 +1704,7 @@ impl PimdirReader {
     ) -> Result<Option<PimdirEndpointView>, PimdirError> {
         Ok(self
             .conn
-            .query_row(
+            .query_row_cached(
                 sql::DESCRIBE_ENDPOINT,
                 named_params! { ":kind": endpoint.kind, ":link_id": endpoint.link_id.as_str() },
                 |row| {
@@ -2044,7 +2048,7 @@ impl PimdirReader {
         for table in &tables {
             let item = self
                 .conn
-                .query_row(
+                .query_row_cached(
                     table.get_sql(),
                     named_params! { ":collection": collection, ":seq": seq },
                     |row| {

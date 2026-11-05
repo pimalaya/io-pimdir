@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Prepared every statement the client runs more than once through a statement cache of 256 per connection, enabling rusqlite's `cache` feature (hashlink, and foldhash under Zlib, now allowed): a store write prepared its trigger programs on every call. Writing 50,000 listed messages through the owner went from 17.6 s to 2.9 s.
+
 ## [0.9.0] - 2026-11-04
 
 ### Added

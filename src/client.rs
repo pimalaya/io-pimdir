@@ -341,7 +341,7 @@ impl PimdirStore {
                 }
                 let last = page.len() < PAGE as usize;
                 if last && at + 1 == lists.len() {
-                    tx.execute(
+                    tx.execute_cached(
                         sql::SET_DERIVATION,
                         named_params! { ":derivation": schema::DERIVATION },
                     )?;
@@ -404,7 +404,7 @@ impl PimdirStore {
         kind: &str,
     ) -> Result<(), PimdirError> {
         self.conn
-            .execute(
+            .execute_cached(
                 sql::SET_COLLECTION_KIND,
                 named_params! {
                     ":collection": collection.as_ref(),
@@ -429,7 +429,7 @@ impl PimdirStore {
         name: &str,
     ) -> Result<(), PimdirError> {
         self.conn
-            .execute(
+            .execute_cached(
                 sql::SET_COLLECTION_NAME,
                 named_params! {
                     ":collection": collection.as_ref(),
@@ -466,7 +466,7 @@ impl PimdirStore {
             });
         }
         self.conn
-            .execute(
+            .execute_cached(
                 sql::SET_COLLECTION_ROLE,
                 named_params! { ":collection": collection, ":role": role },
             )
@@ -490,7 +490,7 @@ impl PimdirStore {
         origin: PimdirReferenceOrigin,
     ) -> Result<Option<PimdirReference>, PimdirError> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 sql::ADD_REFERENCE,
                 named_params! {
                     ":from_kind": from.kind,
@@ -516,7 +516,7 @@ impl PimdirStore {
         role: &PimdirReferenceRole,
     ) -> Result<Option<PimdirReference>, PimdirError> {
         self.conn
-            .query_row(
+            .query_row_cached(
                 sql::REMOVE_REFERENCE,
                 named_params! {
                     ":from_kind": from.kind,
@@ -561,11 +561,11 @@ impl PimdirStore {
             .map_err(busy_or_sql)?;
         let key = named_params! { ":collection": collection, ":link_id": link_id.as_str() };
         let held: Option<i64> = tx
-            .query_row(sql::SEQ_BY_LINK, key, |row| row.get(0))
+            .query_row_cached(sql::SEQ_BY_LINK, key, |row| row.get(0))
             .optional()?;
         let seq = match held {
             Some(seq) => {
-                tx.execute(
+                tx.execute_cached(
                     sql::SET_SORT_KEY,
                     named_params! {
                         ":collection": collection,
@@ -626,7 +626,7 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         let synced = tx
-            .prepare(sql::COLLECTION_SOURCES)?
+            .prepare_cached(sql::COLLECTION_SOURCES)?
             .exists(named_params! { ":collection": collection })?;
         if synced {
             return Err(PimdirError::Synced {
@@ -670,7 +670,7 @@ impl PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        tx.execute(
+        tx.execute_cached(
             sql::SET_COLLECTION_KIND,
             named_params! {
                 ":collection": TIME_COLLECTION,
@@ -678,7 +678,7 @@ impl PimdirStore {
                 ":kind": "text/calendar",
             },
         )?;
-        tx.execute(
+        tx.execute_cached(
             sql::SET_COLLECTION_NAME,
             named_params! {
                 ":collection": TIME_COLLECTION,
@@ -697,7 +697,7 @@ impl PimdirStore {
         account: Option<&str>,
     ) -> Result<(), PimdirError> {
         self.conn
-            .execute(
+            .execute_cached(
                 sql::SET_COLLECTION_ACCOUNT,
                 named_params! { ":collection": collection.as_ref(), ":account": account },
             )
@@ -712,7 +712,7 @@ impl PimdirStore {
         policy: PimdirHubConflict,
     ) -> Result<(), PimdirError> {
         self.conn
-            .execute(
+            .execute_cached(
                 sql::SET_CONFLICT,
                 named_params! {
                     ":collection": collection.as_ref(),
@@ -731,7 +731,7 @@ impl PimdirStore {
         sort_key: &str,
     ) -> Result<(), PimdirError> {
         self.conn
-            .execute(
+            .execute_cached(
                 sql::SET_SORT_KEY,
                 named_params! {
                     ":collection": collection.as_ref(),
@@ -756,11 +756,11 @@ impl PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        tx.execute(
+        tx.execute_cached(
             sql::RENAME_QUEUE_TARGETS,
             named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
         )?;
-        tx.execute(
+        tx.execute_cached(
             sql::RENAME_COLLECTION,
             named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
         )?;
@@ -783,8 +783,9 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         let key = named_params! { ":collection": collection };
-        let pins: bool = tx.query_row(sql::COLLECTION_HOLDS_OBJECTS, key, |row| row.get(0))?;
-        let deleted = match tx.execute(sql::DELETE_COLLECTION, key) {
+        let pins: bool =
+            tx.query_row_cached(sql::COLLECTION_HOLDS_OBJECTS, key, |row| row.get(0))?;
+        let deleted = match tx.execute_cached(sql::DELETE_COLLECTION, key) {
             Err(rusqlite::Error::SqliteFailure(err, Some(message)))
                 if err.code == ErrorCode::ConstraintViolation
                     && message == "collection holds queued actions" =>
@@ -796,7 +797,7 @@ impl PimdirStore {
             deleted => deleted?,
         };
         if pins {
-            tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+            tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
         }
         tx.commit().map_err(busy_or_sql)?;
         Ok(deleted > 0)
@@ -820,7 +821,7 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         let pinned: Option<(Option<String>, Option<String>)> = tx
-            .prepare(sql::DELETE_UNBOUND_ITEM)?
+            .prepare_cached(sql::DELETE_UNBOUND_ITEM)?
             .query_row(
                 named_params! { ":collection": collection.as_ref(), ":link_id": link_id.as_str() },
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -844,7 +845,7 @@ impl PimdirStore {
             .map_err(busy_or_sql)?;
 
         let pinned: Option<(Option<String>, Option<String>)> = tx
-            .prepare(sql::PURGE_ITEM)?
+            .prepare_cached(sql::PURGE_ITEM)?
             .query_row(
                 named_params! { ":collection": collection.as_ref(), ":seq": seq },
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -967,7 +968,7 @@ impl PimdirStore {
             named_params! { ":collection": collection.as_ref(), ":before": before },
             |row| row.get(0),
         )?;
-        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+        tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(PimdirCollectReport { seqs })
     }
@@ -1000,14 +1001,14 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         bind_list(&tx, "collections", collections.iter().map(AsRef::as_ref))?;
-        tx.execute(sql::RELEASE_BASES_BEFORE, named_params! { ":until": until })?;
+        tx.execute_cached(sql::RELEASE_BASES_BEFORE, named_params! { ":until": until })?;
         let seqs: Vec<i64> = rows(
             &tx,
             sql::RELEASE_BEFORE,
             named_params! { ":until": until },
             |row| row.get(0),
         )?;
-        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
+        tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(PimdirReleaseReport { seqs })
     }
@@ -1038,8 +1039,8 @@ impl PimdirStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        tx.execute(sql::RECOMPUTE_REFCOUNTS, [])?;
-        let objects = tx.execute(sql::DELETE_GARBAGE_OBJECTS, [])?;
+        tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
+        let objects = tx.execute_cached(sql::DELETE_GARBAGE_OBJECTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
 
         let mut report = PimdirGcReport {
@@ -1050,7 +1051,7 @@ impl PimdirStore {
         // file named well in its own shard, and anything else is a stray
         // left in place (§5).
         let scan = self.blobs().scan()?;
-        let mut exists = self.conn.prepare(sql::OBJECT_EXISTS)?;
+        let mut exists = self.conn.prepare_cached(sql::OBJECT_EXISTS)?;
         for blob in scan.files {
             if exists.exists(named_params! { ":hash": blob.hash })? {
                 continue;
@@ -1142,7 +1143,7 @@ impl PimdirStore {
     /// returning how many rows disagreed.
     pub fn recompute_refcounts(&self) -> Result<usize, PimdirError> {
         self.conn
-            .execute(sql::RECOMPUTE_REFCOUNTS, [])
+            .execute_cached(sql::RECOMPUTE_REFCOUNTS, [])
             .map_err(busy_or_sql)
     }
 
@@ -1150,7 +1151,7 @@ impl PimdirStore {
     /// one dangling row a repair clears without guessing.
     pub fn clear_dangling_bindings(&self) -> Result<usize, PimdirError> {
         self.conn
-            .execute(sql::DELETE_DANGLING_BINDINGS, [])
+            .execute_cached(sql::DELETE_DANGLING_BINDINGS, [])
             .map_err(busy_or_sql)
     }
 
@@ -1162,7 +1163,7 @@ impl PimdirStore {
     /// above both.
     pub fn raise_incarnation(&self, replaced: Option<i64>) -> Result<i64, PimdirError> {
         self.conn
-            .execute(
+            .execute_cached(
                 sql::RAISE_INCARNATION,
                 named_params! { ":replaced": replaced },
             )
@@ -1284,9 +1285,9 @@ impl PimdirStore {
         }
         let hash = action.object_hash().cloned();
         if let Some(hash) = &hash {
-            tx.execute(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
+            tx.execute_cached(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
         }
-        tx.execute(
+        tx.execute_cached(
             sql::ENQUEUE_ACTION,
             named_params! {
                 ":producer": producer,
@@ -1316,14 +1317,14 @@ impl PimdirStore {
     pub fn fail_action(&self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
         let Some(error) = error else {
             self.conn
-                .execute(sql::BUMP_ATTEMPTS, named_params! { ":id": id })
+                .execute_cached(sql::BUMP_ATTEMPTS, named_params! { ":id": id })
                 .map_err(busy_or_sql)?;
             return Ok(());
         };
 
         let error = security::scrub(error);
         self.conn
-            .execute(
+            .execute_cached(
                 sql::PARK_ACTION,
                 named_params! { ":id": id, ":error": error },
             )
@@ -1345,14 +1346,47 @@ impl PimdirSourceStore {
     }
 }
 
-/// Runs one statement and collects every row through `map`.
+/// Runs one statement and collects every row through `map`, the statement
+/// kept in the connection's cache.
 pub(crate) fn rows<T>(
     conn: &Connection,
     sql: &str,
     params: impl Params,
     map: impl FnMut(&Row) -> rusqlite::Result<T>,
 ) -> rusqlite::Result<Vec<T>> {
-    conn.prepare(sql)?.query_map(params, map)?.collect()
+    conn.prepare_cached(sql)?.query_map(params, map)?.collect()
+}
+
+/// `execute` and `query_row` through the connection's statement cache.
+///
+/// Preparing a statement compiles the programs of the triggers it fires,
+/// which for the store's writes costs about as much again as running them,
+/// so a statement the crate runs more than once is prepared once per
+/// connection. A query compiled per search, whose text is new each time,
+/// keeps the uncached methods.
+pub(crate) trait PreparedCached {
+    /// [`Connection::execute`], prepared once.
+    fn execute_cached<P: Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+
+    /// [`Connection::query_row`], prepared once.
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl PreparedCached for Connection {
+    fn execute_cached<P: Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
 }
 
 /// Fills the list parameter `slot` of the canonical statements with
@@ -1364,8 +1398,8 @@ pub(crate) fn bind_list<V: ToSql>(
     slot: &str,
     values: impl IntoIterator<Item = V>,
 ) -> rusqlite::Result<()> {
-    conn.execute(sql::CLEAR_PARAM, [])?;
-    let mut bind = conn.prepare(sql::BIND_PARAM)?;
+    conn.execute_cached(sql::CLEAR_PARAM, [])?;
+    let mut bind = conn.prepare_cached(sql::BIND_PARAM)?;
     for (position, value) in values.into_iter().enumerate() {
         bind.execute(named_params! {
             ":slot": slot,
@@ -1380,6 +1414,11 @@ pub(crate) fn bind_list<V: ToSql>(
 /// statement fails busy (STORAGE §4.1): long enough for a large write
 /// batch of the owner, or of a same-source worker, to commit.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many prepared statements a connection keeps ([`PreparedCached`]):
+/// above the distinct statements a write batch, a sync's load and an index
+/// refresh run together, rusqlite's default of 16 holding a fraction.
+const STATEMENT_CACHE: usize = 256;
 
 /// The durability every connection sets (STORAGE §4.1): a commit synced
 /// before it reports, and a deleted row's bytes overwritten (§11.5).
@@ -1415,6 +1454,7 @@ pub(crate) fn prepare_connection(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute_batch(DURABILITY)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     conn.execute_batch(sql::CREATE_PARAM)
 }
 
@@ -1430,7 +1470,7 @@ const CHECKPOINT_TRIES: usize = 3;
 pub(crate) fn checkpoint(conn: &Connection) -> Result<(), PimdirError> {
     for _ in 0..CHECKPOINT_TRIES {
         let (busy, log, done): (i64, i64, i64) = conn
-            .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
+            .query_row_cached("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(busy_or_sql)?;
@@ -1447,7 +1487,7 @@ pub(crate) fn checkpoint(conn: &Connection) -> Result<(), PimdirError> {
 /// pin it held, `None` when no row had that id.
 fn cancel_queued(conn: &Connection, id: i64) -> Result<Option<Option<String>>, PimdirError> {
     Ok(conn
-        .query_row(sql::CANCEL_ACTION, named_params! { ":id": id }, |r| {
+        .query_row_cached(sql::CANCEL_ACTION, named_params! { ":id": id }, |r| {
             r.get(0)
         })
         .optional()?)
@@ -1457,7 +1497,7 @@ fn cancel_queued(conn: &Connection, id: i64) -> Result<Option<Option<String>>, P
 /// `None` when no row has that id.
 fn queued_collection(conn: &Connection, id: i64) -> Result<Option<String>, PimdirError> {
     Ok(conn
-        .query_row(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
+        .query_row_cached(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
             r.get::<_, String>(3)
         })
         .optional()?)
@@ -1471,7 +1511,7 @@ pub(crate) fn record_receipt(
     collection: &str,
     seq: Option<i64>,
 ) -> Result<(), PimdirError> {
-    conn.execute(
+    conn.execute_cached(
         sql::RECORD_RECEIPT,
         named_params! { ":id": id, ":collection": collection, ":seq": seq },
     )?;
@@ -1489,7 +1529,7 @@ pub(crate) fn release_pins(
         return Ok(());
     }
     bind_list(conn, "hashes", &hashes)?;
-    conn.execute(sql::RELEASE_PINS, [])?;
+    conn.execute_cached(sql::RELEASE_PINS, [])?;
     Ok(())
 }
 

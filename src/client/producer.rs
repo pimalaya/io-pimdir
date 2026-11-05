@@ -31,7 +31,7 @@ use crate::{
     },
     change::PimdirWriteOp,
     client::{
-        PimdirDuplicate, PimdirError, PimdirSourceStore, bind_list,
+        PimdirDuplicate, PimdirError, PimdirSourceStore, PreparedCached, bind_list,
         blobs::{PimdirBlobCheck, PimdirBlobStage, PimdirBlobWriter, PimdirBlobs},
         busy_or_sql, capability,
         lock::PimdirLock,
@@ -426,20 +426,20 @@ impl PimdirProducer {
         if let (Some(object), Some(body)) = (object, body) {
             self.blobs.write(&object.hash, body)?;
         }
-        tx.execute(
+        tx.execute_cached(
             sql::ENSURE_COLLECTION,
             named_params! { ":collection": collection, ":account": self.account.as_deref() },
         )?;
         if let Some(object) = object {
-            tx.execute(
+            tx.execute_cached(
                 sql::STORE_OBJECT,
                 named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
             )?;
         }
         if let Some(hash) = &hash {
-            tx.execute(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
+            tx.execute_cached(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
         }
-        tx.execute(
+        tx.execute_cached(
             sql::ENQUEUE_ACTION,
             named_params! {
                 ":producer": self.producer,
@@ -617,7 +617,7 @@ pub enum PimdirActionStatus {
 /// Reads where the row `id` stands: `load_action`, then `load_receipt`.
 pub(crate) fn action_status(conn: &Connection, id: i64) -> Result<PimdirActionStatus, PimdirError> {
     let queued = conn
-        .query_row(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
+        .query_row_cached(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
             Ok((
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
@@ -643,7 +643,7 @@ pub(crate) fn action_status(conn: &Connection, id: i64) -> Result<PimdirActionSt
     }
 
     let receipt = conn
-        .query_row(sql::LOAD_RECEIPT, named_params! { ":id": id }, |r| {
+        .query_row_cached(sql::LOAD_RECEIPT, named_params! { ":id": id }, |r| {
             Ok(PimdirActionStatus::Applied {
                 applied_at: r.get(0)?,
                 collection: r.get(1)?,
@@ -861,7 +861,7 @@ fn duplicate(
     }
 
     let live = conn
-        .query_row(
+        .query_row_cached(
             sql::LIVE_ITEM_FOR_LINK,
             named_params! { ":collection": collection, ":link_id": link_id.0 },
             |r| r.get::<_, i64>(0),
@@ -999,12 +999,12 @@ impl PimdirSourceStore {
     /// (§15.4), returning how many went.
     pub fn prune_receipts(&mut self) -> Result<usize, PimdirError> {
         let conn = &self.store.reader.conn;
-        let before: String = conn.query_row(
+        let before: String = conn.query_row_cached(
             "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', :age)",
             named_params! { ":age": format!("-{} days", Self::RECEIPT_DAYS) },
             |r| r.get(0),
         )?;
-        conn.execute(sql::PRUNE_RECEIPTS, named_params! { ":before": before })
+        conn.execute_cached(sql::PRUNE_RECEIPTS, named_params! { ":before": before })
             .map_err(busy_or_sql)
     }
 
@@ -1031,7 +1031,7 @@ impl PimdirSourceStore {
             .map_err(busy_or_sql)?;
 
         let claimed = tx
-            .prepare(sql::CLAIM_ACTION)?
+            .prepare_cached(sql::CLAIM_ACTION)?
             .query_row(named_params! { ":id": row.id }, |r| r.get::<_, i64>(0))
             .optional()?;
         if claimed.is_none() {
@@ -1077,7 +1077,7 @@ impl PimdirSourceStore {
                     return Ok(outcome);
                 }
                 if let Some(hash) = &row.object_hash {
-                    tx.execute(
+                    tx.execute_cached(
                         sql::ADJUST_REFCOUNT,
                         named_params! { ":delta": -1, ":hash": hash },
                     )?;
@@ -1115,14 +1115,14 @@ impl PimdirSourceStore {
             }
         }
         if let Some(hash) = &row.object_hash {
-            tx.execute(
+            tx.execute_cached(
                 sql::ADJUST_REFCOUNT,
                 named_params! { ":delta": -1, ":hash": hash },
             )?;
         }
         let seq = match created {
             Some(link) => tx
-                .query_row(
+                .query_row_cached(
                     sql::SEQ_BY_LINK,
                     named_params! { ":collection": collection, ":link_id": link.0 },
                     |r| r.get::<_, i64>(0),
@@ -1163,7 +1163,7 @@ fn supersede(
 ) -> Result<Result<(), PimdirOutcome>, PimdirError> {
     let collection = superseded.collection.0.as_str();
     let item: Option<PimdirItem> = tx
-        .query_row(
+        .query_row_cached(
             sql::GET_ITEM,
             named_params! { ":collection": collection, ":seq": superseded.seq },
             item_from_row,
@@ -1185,7 +1185,7 @@ fn supersede(
             write::apply(tx, blobs, &source, account, ops)?;
         }
         Err(PimdirOutcome::Skipped | PimdirOutcome::Unbound(_)) => {
-            tx.execute(
+            tx.execute_cached(
                 sql::RETAIN_ITEM,
                 named_params! {
                     ":collection": collection,
@@ -1196,7 +1196,7 @@ fn supersede(
         }
         Err(outcome) => return Ok(Err(outcome)),
     }
-    tx.execute(
+    tx.execute_cached(
         sql::SUPERSEDE_ITEM,
         named_params! {
             ":collection": collection,
@@ -1284,7 +1284,7 @@ fn acting_source(
 /// The sources syncing `collection`, by a binding or a checkpoint.
 fn collection_sources(tx: &Connection, collection: &str) -> Result<Vec<String>, PimdirError> {
     Ok(tx
-        .prepare(sql::COLLECTION_SOURCES)?
+        .prepare_cached(sql::COLLECTION_SOURCES)?
         .query_map(named_params! { ":collection": collection }, |r| {
             r.get::<_, String>(0)
         })?
@@ -1342,7 +1342,7 @@ fn stage_action(
             )));
         };
         let live = tx
-            .query_row(
+            .query_row_cached(
                 sql::LIVE_ITEM_FOR_LINK,
                 named_params! { ":collection": collection, ":link_id": link.0 },
                 |r| r.get::<_, i64>(0),
@@ -1392,7 +1392,7 @@ fn stage_action(
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
     let item: Option<PimdirItem> = tx
-        .query_row(
+        .query_row_cached(
             sql::GET_ITEM,
             named_params! { ":collection": collection, ":seq": seq },
             item_from_row,
@@ -1451,7 +1451,7 @@ fn stage_action(
     let handle = match &named {
         Some((_, handle)) => Some(handle.0.clone()),
         None => tx
-            .query_row(
+            .query_row_cached(
                 sql::HANDLE_FOR_LINK,
                 named_params! {
                     ":collection": collection,
@@ -1470,7 +1470,7 @@ fn stage_action(
         None => {
             bind_list(tx, "links", [&item.link_id.0])?;
             let bound = tx
-                .query_row(
+                .query_row_cached(
                     sql::LOAD_BINDINGS_BY_LINK,
                     named_params! { ":collection": collection },
                     |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
@@ -1627,7 +1627,7 @@ fn unbound(
     action: &PimdirAction,
 ) -> Result<Result<(PimdirSourceId, Vec<PimdirWriteOp>), PimdirOutcome>, PimdirError> {
     let synced = tx
-        .prepare(sql::COLLECTION_SOURCES)?
+        .prepare_cached(sql::COLLECTION_SOURCES)?
         .exists(named_params! { ":collection": collection })?;
     let outcome = match action {
         PimdirAction::Remove { .. } => PimdirOutcome::Unbound(link.clone()),
@@ -1661,7 +1661,7 @@ fn apply_unbound(
 ) -> Result<Result<(), PimdirOutcome>, PimdirError> {
     match action {
         PimdirAction::Remove { .. } => {
-            tx.execute(
+            tx.execute_cached(
                 sql::RETAIN_ITEM,
                 named_params! {
                     ":collection": collection,

@@ -21,7 +21,7 @@ use rusqlite::{OptionalExtension, named_params};
 use serde::Serialize;
 
 use crate::{
-    client::{PimdirError, reader::PimdirReader, rows},
+    client::{PimdirError, PreparedCached, reader::PimdirReader, rows},
     sql,
 };
 
@@ -74,7 +74,7 @@ pub struct PimdirDangling {
 impl PimdirReader {
     /// How many objects are indexed and what they weigh in total.
     pub fn object_stats(&self) -> Result<PimdirObjectStats, PimdirError> {
-        let (count, bytes) = self.conn.query_row(sql::OBJECT_STATS, [], |r| {
+        let (count, bytes) = self.conn.query_row_cached(sql::OBJECT_STATS, [], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
         })?;
         Ok(PimdirObjectStats {
@@ -88,7 +88,9 @@ impl PimdirReader {
     /// An object a live and a retained item share counts here, since
     /// purging the retained one would not free it.
     pub fn live_bytes(&self) -> Result<u64, PimdirError> {
-        let bytes: i64 = self.conn.query_row(sql::LIVE_BYTES, [], |r| r.get(0))?;
+        let bytes: i64 = self
+            .conn
+            .query_row_cached(sql::LIVE_BYTES, [], |r| r.get(0))?;
         Ok(bytes.max(0) as u64)
     }
 
@@ -96,7 +98,7 @@ impl PimdirReader {
     pub fn object_size(&self, hash: &str) -> Result<Option<u64>, PimdirError> {
         let size: Option<i64> = self
             .conn
-            .query_row(sql::OBJECT_SIZE, named_params! { ":hash": hash }, |r| {
+            .query_row_cached(sql::OBJECT_SIZE, named_params! { ":hash": hash }, |r| {
                 r.get(0)
             })
             .optional()?;
@@ -109,7 +111,7 @@ impl PimdirReader {
     /// A preview, so a confirmation can say what is at stake; the purge itself
     /// is the authority, and the collector is what frees the bytes.
     pub fn retained_before(&self, cutoff: &str) -> Result<(u64, u64), PimdirError> {
-        let (count, bytes) = self.conn.query_row(
+        let (count, bytes) = self.conn.query_row_cached(
             sql::COUNT_RETAINED_BEFORE,
             named_params! { ":cutoff": cutoff },
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),

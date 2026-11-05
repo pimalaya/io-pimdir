@@ -17,7 +17,7 @@ use log::trace;
 use rusqlite::{Connection, OptionalExtension, Transaction, named_params};
 
 use crate::{
-    client::{PimdirError, bind_list, blobs::PimdirBlobs, rows, write::tables_of},
+    client::{PimdirError, PreparedCached, bind_list, blobs::PimdirBlobs, rows, write::tables_of},
     codec,
     object::PimdirHash,
     placement::PimdirLinkId,
@@ -117,7 +117,7 @@ impl Statements<'_> {
                 for key in placements {
                     if !kinds.contains_key(&key.collection) {
                         let kind: Option<String> = tx
-                            .query_row(
+                            .query_row_cached(
                                 sql::LOAD_KIND,
                                 named_params! { ":collection": key.collection },
                                 |r| r.get(0),
@@ -184,7 +184,7 @@ impl Statements<'_> {
     /// The index's `index_meta` with the store's change cursor.
     fn meta(&self) -> Result<PimdirIndexMeta, PimdirError> {
         let tx = self.tx;
-        let mut meta = tx.query_row(search::LOAD_INDEX_META, [], |r| {
+        let mut meta = tx.query_row_cached(search::LOAD_INDEX_META, [], |r| {
             let start: String = r.get(4)?;
             let end: String = r.get(5)?;
             Ok(PimdirIndexMeta {
@@ -198,7 +198,7 @@ impl Statements<'_> {
             })
         })?;
         (meta.head, meta.purges) =
-            tx.query_row(sql::LOAD_CHANGE_CURSOR, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            tx.query_row_cached(sql::LOAD_CHANGE_CURSOR, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(meta)
     }
 
@@ -241,7 +241,7 @@ impl Statements<'_> {
     ) -> Result<Option<PimdirIndexPlacement>, PimdirError> {
         Ok(self
             .tx
-            .query_row(
+            .query_row_cached(
                 search::LOAD_PLACEMENT,
                 named_params! { ":collection": collection, ":seq": seq },
                 |r| {
@@ -260,7 +260,7 @@ impl Statements<'_> {
     fn placement_id(&self, collection: &str, seq: i64) -> Result<Option<i64>, PimdirError> {
         Ok(self
             .tx
-            .query_row(
+            .query_row_cached(
                 search::LOAD_PLACEMENT,
                 named_params! { ":collection": collection, ":seq": seq },
                 |r| r.get(0),
@@ -272,7 +272,7 @@ impl Statements<'_> {
     fn object(&self, hash: &PimdirHash) -> Result<Option<i64>, PimdirError> {
         Ok(self
             .tx
-            .query_row(
+            .query_row_cached(
                 search::OBJECT_INDEXED,
                 named_params! { ":hash": hash.0 },
                 |r| r.get(0),
@@ -285,7 +285,7 @@ impl Statements<'_> {
         let tx = self.tx;
         let key = named_params! { ":link_id": link_id };
         let row = tx
-            .query_row(search::LOAD_MESSAGE, key, |r| {
+            .query_row_cached(search::LOAD_MESSAGE, key, |r| {
                 Ok(PimdirIndexMessageRow {
                     thread: r.get(0)?,
                     parent: r.get(1)?,
@@ -294,15 +294,15 @@ impl Statements<'_> {
             .optional()?;
         let children = rows(tx, search::MESSAGE_CHILDREN, key, |r| r.get(0))?;
         let (count, sort_key, first, last): (i64, Option<String>, Option<String>, Option<String>) =
-            tx.query_row(search::MESSAGE_PRESENCE, key, |r| {
+            tx.query_row_cached(search::MESSAGE_PRESENCE, key, |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
         let hash = tx
-            .query_row(search::MESSAGE_HASH, key, |r| r.get::<_, String>(0))
+            .query_row_cached(search::MESSAGE_HASH, key, |r| r.get::<_, String>(0))
             .optional()?
             .map(PimdirHash);
         let in_reply_to = tx
-            .query_row(search::MESSAGE_IN_REPLY_TO, key, |r| r.get(0))
+            .query_row_cached(search::MESSAGE_IN_REPLY_TO, key, |r| r.get(0))
             .optional()?;
 
         Ok(PimdirIndexMessage {
@@ -325,12 +325,12 @@ impl Statements<'_> {
             PimdirIndexOp::PutObject(object) => self.put_object(object)?,
             PimdirIndexOp::DropObject(hash) => {
                 if let Some(id) = self.object(&hash)? {
-                    tx.execute(search::DELETE_OBJECT, named_params! { ":rowid": id })?;
+                    tx.execute_cached(search::DELETE_OBJECT, named_params! { ":rowid": id })?;
                 }
-                tx.execute(search::DELETE_OBJECT_ROW, named_params! { ":hash": hash.0 })?;
+                tx.execute_cached(search::DELETE_OBJECT_ROW, named_params! { ":hash": hash.0 })?;
             }
             PimdirIndexOp::PutPlacement(placement) => {
-                tx.query_row(
+                tx.query_row_cached(
                     search::UPSERT_PLACEMENT,
                     named_params! {
                         ":collection": placement.collection,
@@ -343,14 +343,14 @@ impl Statements<'_> {
             }
             PimdirIndexOp::DropPlacement { collection, seq } => {
                 let id: Option<i64> = tx
-                    .query_row(
+                    .query_row_cached(
                         search::DELETE_PLACEMENT,
                         named_params! { ":collection": collection, ":seq": seq },
                         |r| r.get(0),
                     )
                     .optional()?;
                 if let Some(id) = id {
-                    tx.execute(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
+                    tx.execute_cached(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
                 }
             }
             PimdirIndexOp::PutSummaryText {
@@ -359,13 +359,13 @@ impl Statements<'_> {
                 text,
             } => {
                 if let Some(id) = self.placement_id(&collection, seq)? {
-                    tx.execute(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
+                    tx.execute_cached(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
                     self.put_summary_text(id, &text)?;
                 }
             }
             PimdirIndexOp::DropSummaryText { collection, seq } => {
                 if let Some(id) = self.placement_id(&collection, seq)? {
-                    tx.execute(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
+                    tx.execute_cached(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
                 }
             }
             PimdirIndexOp::ReplaceFlags {
@@ -374,9 +374,9 @@ impl Statements<'_> {
                 flags,
             } => {
                 let key = named_params! { ":collection": collection, ":seq": seq };
-                tx.execute(search::REPLACE_FLAGS, key)?;
+                tx.execute_cached(search::REPLACE_FLAGS, key)?;
                 for flag in flags {
-                    tx.execute(
+                    tx.execute_cached(
                         search::INSERT_FLAG,
                         named_params! { ":flag": flag, ":collection": collection, ":seq": seq },
                     )?;
@@ -389,13 +389,13 @@ impl Statements<'_> {
                 cut,
             } => {
                 let key = named_params! { ":collection": collection, ":seq": seq };
-                tx.execute(search::REPLACE_OCCURRENCES, key)?;
-                tx.execute(
+                tx.execute_cached(search::REPLACE_OCCURRENCES, key)?;
+                tx.execute_cached(
                     search::SET_CUT,
                     named_params! { ":cut": cut, ":collection": collection, ":seq": seq },
                 )?;
                 for occurrence in occurrences {
-                    tx.execute(
+                    tx.execute_cached(
                         search::INSERT_OCCURRENCE,
                         named_params! {
                             ":collection": collection,
@@ -411,26 +411,26 @@ impl Statements<'_> {
                 thread,
                 parent,
             } => {
-                tx.execute(
+                tx.execute_cached(
                     search::UPSERT_MESSAGE,
                     named_params! { ":link_id": link_id, ":thread": thread, ":parent": parent },
                 )?;
             }
             PimdirIndexOp::PutMissing(key) => {
-                tx.execute(
+                tx.execute_cached(
                     search::INSERT_MISSING,
                     named_params! { ":collection": key.collection, ":seq": key.seq },
                 )?;
             }
             PimdirIndexOp::DropMissing(key) => {
-                tx.execute(
+                tx.execute_cached(
                     search::DELETE_MISSING,
                     named_params! { ":collection": key.collection, ":seq": key.seq },
                 )?;
             }
             PimdirIndexOp::PruneThread(thread) => {
                 let key = named_params! { ":thread": thread };
-                tx.execute(search::UNPARENT_MESSAGES, key)?;
+                tx.execute_cached(search::UNPARENT_MESSAGES, key)?;
                 let pruned: Vec<String> = rows(tx, search::PRUNE_MESSAGES, key, |r| r.get(0))?;
                 trace!("pruned {} message row(s) of thread {thread}", pruned.len());
             }
@@ -440,7 +440,7 @@ impl Statements<'_> {
                 last,
                 count,
             } => {
-                tx.execute(
+                tx.execute_cached(
                     search::UPSERT_THREAD,
                     named_params! {
                         ":id": id,
@@ -451,13 +451,13 @@ impl Statements<'_> {
                 )?;
             }
             PimdirIndexOp::DropThread(id) => {
-                tx.execute(search::DELETE_THREAD, named_params! { ":id": id })?;
+                tx.execute_cached(search::DELETE_THREAD, named_params! { ":id": id })?;
             }
             PimdirIndexOp::SetCursor {
                 store_change,
                 store_purges,
             } => {
-                tx.execute(
+                tx.execute_cached(
                     search::SET_INDEX_CURSOR,
                     named_params! {
                         ":store_change": store_change,
@@ -466,7 +466,7 @@ impl Statements<'_> {
                 )?;
             }
             PimdirIndexOp::SetHorizon(horizon) => {
-                tx.execute(
+                tx.execute_cached(
                     search::SET_HORIZON,
                     named_params! {
                         ":horizon_start": horizon.start,
@@ -475,13 +475,13 @@ impl Statements<'_> {
                 )?;
             }
             PimdirIndexOp::SetTzdbVersion(version) => {
-                tx.execute(
+                tx.execute_cached(
                     search::SET_TZDB_VERSION,
                     named_params! { ":tzdb_version": version },
                 )?;
             }
             PimdirIndexOp::SetFloatingZone(zone) => {
-                tx.execute(
+                tx.execute_cached(
                     search::SET_FLOATING_ZONE,
                     named_params! { ":floating_zone": zone },
                 )?;
@@ -494,7 +494,7 @@ impl Statements<'_> {
     /// categories, its text keyed on the row's id, and its chunks.
     fn put_object(&self, object: PimdirIndexObject) -> Result<(), PimdirError> {
         let tx = self.tx;
-        let id: i64 = tx.query_row(
+        let id: i64 = tx.query_row_cached(
             search::INSERT_OBJECT,
             named_params! {
                 ":hash": object.hash.0,
@@ -508,14 +508,14 @@ impl Statements<'_> {
             |r| r.get(0),
         )?;
         for value in &object.categories {
-            tx.execute(
+            tx.execute_cached(
                 search::INSERT_OBJECT_CATEGORY,
                 named_params! { ":object": id, ":value": value },
             )?;
         }
 
         let text = &object.text;
-        tx.execute(
+        tx.execute_cached(
             search::INSERT_OBJECT_TEXT,
             named_params! {
                 ":rowid": id,
@@ -536,7 +536,7 @@ impl Statements<'_> {
             },
         )?;
         for (ord, chunk) in object.chunks.iter().enumerate() {
-            tx.execute(
+            tx.execute_cached(
                 search::INSERT_CHUNK,
                 named_params! {
                     ":object": id,
@@ -552,7 +552,7 @@ impl Statements<'_> {
 
     /// Writes a placement's summary text keyed on its row's id.
     fn put_summary_text(&self, id: i64, text: &PimdirIndexText) -> Result<(), PimdirError> {
-        self.tx.execute(
+        self.tx.execute_cached(
             search::INSERT_SUMMARY_TEXT,
             named_params! {
                 ":rowid": id,
@@ -584,7 +584,7 @@ pub(crate) fn summary(
     let mut found = None;
     for table in tables_of(kind) {
         let item = conn
-            .prepare(table.get_sql())?
+            .prepare_cached(table.get_sql())?
             .query_row(key, |row| {
                 Ok((row.get::<_, String>(1)?, table.read_row(row, 6)?))
             })

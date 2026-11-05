@@ -13,7 +13,7 @@ use std::{collections::BTreeMap, sync::LazyLock};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params};
 
 use crate::{
-    client::{PimdirError, busy_or_sql, rows},
+    client::{PimdirError, PreparedCached, busy_or_sql, rows},
     hash::HASH_ALGO,
     sql,
     sync::SYNC_VERSION,
@@ -42,7 +42,7 @@ pub(crate) fn init(conn: &mut Connection) -> Result<(), PimdirError> {
         .transaction_with_behavior(TransactionBehavior::Deferred)
         .map_err(busy_or_sql)?;
     tx.execute_batch(sql::MIGRATION_0001)?;
-    tx.execute(
+    tx.execute_cached(
         sql::INIT_STORE_META,
         named_params! { ":version": 1, ":derivation": DERIVATION },
     )?;
@@ -77,7 +77,7 @@ pub(crate) fn check(conn: &Connection) -> Result<(), PimdirError> {
 
     let format: Option<String> = match has_column(conn, "store_meta", "format")? {
         true => conn
-            .query_row("SELECT format FROM store_meta WHERE id = 1", [], |r| {
+            .query_row_cached("SELECT format FROM store_meta WHERE id = 1", [], |r| {
                 r.get(0)
             })
             .optional()?,
@@ -94,7 +94,7 @@ pub(crate) fn check(conn: &Connection) -> Result<(), PimdirError> {
         return Err(PimdirError::Version { found: None });
     }
     let (version, hash_algo, format_version): (i64, String, String) =
-        conn.query_row(sql::LOAD_STORE_META, [], |r| {
+        conn.query_row_cached(sql::LOAD_STORE_META, [], |r| {
             Ok((r.get(1)?, r.get(2)?, r.get(8)?))
         })?;
     if format_version != sql::FORMAT_VERSION {
@@ -141,9 +141,9 @@ pub(crate) fn check(conn: &Connection) -> Result<(), PimdirError> {
 /// A store at an earlier revision keeps its own until its re-derivation
 /// lands.
 pub(crate) fn record_derivation(conn: &Connection) -> rusqlite::Result<()> {
-    let stored: i64 = conn.query_row(sql::LOAD_STORE_META, [], |r| r.get(7))?;
+    let stored: i64 = conn.query_row_cached(sql::LOAD_STORE_META, [], |r| r.get(7))?;
     if stored > DERIVATION {
-        conn.execute(
+        conn.execute_cached(
             sql::SET_DERIVATION,
             named_params! { ":derivation": DERIVATION },
         )?;
@@ -155,7 +155,7 @@ pub(crate) fn record_derivation(conn: &Connection) -> rusqlite::Result<()> {
 /// before any engine wrote (`load_store_meta`), refusing one naming
 /// another than this crate's [`SYNC_VERSION`] (STORAGE §4.3, SYNC §10).
 pub(crate) fn sync_version(conn: &Connection) -> Result<Option<String>, PimdirError> {
-    let found: Option<String> = conn.query_row(sql::LOAD_STORE_META, [], |r| r.get(13))?;
+    let found: Option<String> = conn.query_row_cached(sql::LOAD_STORE_META, [], |r| r.get(13))?;
     match found {
         Some(found) if found != SYNC_VERSION => Err(PimdirError::SyncVersion { found }),
         found => Ok(found),
@@ -217,7 +217,7 @@ fn user_version(conn: &Connection) -> Result<i64, PimdirError> {
 /// §3).
 fn holds_schema(conn: &Connection) -> Result<bool, PimdirError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             "SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1",
             [],
             |_| Ok(()),
@@ -229,7 +229,7 @@ fn holds_schema(conn: &Connection) -> Result<bool, PimdirError> {
 /// Whether `table` has `column`, `false` for a table the database lacks.
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, PimdirError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
             [table, column],
             |_| Ok(()),

@@ -32,7 +32,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, named_params};
 
 use crate::{
-    client::{PimdirError, bind_list, blobs::PimdirBlobs, schema, write::kind_of},
+    client::{PimdirError, PreparedCached, bind_list, blobs::PimdirBlobs, schema, write::kind_of},
     hub::PimdirHub,
     object::PimdirHash,
     placement::PimdirLinkId,
@@ -101,7 +101,7 @@ pub(crate) fn gaining(
     }
 
     let account: Option<String> = conn
-        .query_row(
+        .query_row_cached(
             sql::LOAD_ACCOUNT,
             named_params! { ":collection": collection },
             |row| row.get(0),
@@ -113,7 +113,7 @@ pub(crate) fn gaining(
     // the account, which is what a move, a copy or a second label carry;
     // a writer-derived key never matches, so its body is always read.
     bind_list(conn, "links", bodies.iter().map(|(link, _)| link.as_str()))?;
-    let mut stmt = conn.prepare(sql::LOOKUP_OBJECTS)?;
+    let mut stmt = conn.prepare_cached(sql::LOOKUP_OBJECTS)?;
     let held: BTreeMap<(String, String), i64> = stmt
         .query_map(named_params! { ":account": account.as_deref() }, |row| {
             Ok((
@@ -207,7 +207,7 @@ fn held_columns(
     account: Option<&str>,
 ) -> rusqlite::Result<(Option<bool>, Option<String>)> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             sql::HELD_MAIL_SUMMARY,
             named_params! {
                 ":link_id": link.as_str(),
@@ -276,7 +276,7 @@ pub(crate) fn record(conn: &Connection, entering: Entering) -> Result<(), Pimdir
                 continue;
             };
             let held: Option<i64> = conn
-                .query_row(
+                .query_row_cached(
                     sql::SEQ_BY_LINK,
                     named_params! { ":collection": collection, ":link_id": key.0 },
                     |row| row.get(0),
@@ -285,7 +285,7 @@ pub(crate) fn record(conn: &Connection, entering: Entering) -> Result<(), Pimdir
             if held.is_none() {
                 insert_file(conn, &collection, &key, &summary)?;
             }
-            conn.query_row(
+            conn.query_row_cached(
                 sql::ADD_REFERENCE,
                 named_params! {
                     ":from_kind": MAIL,
@@ -337,7 +337,7 @@ fn walk(blobs: &PimdirBlobs, hash: &PimdirHash) -> Result<Option<PimdirParts>, P
 /// role, else the one under [`NAME`], declared and given the role here.
 /// `None` when that id is taken by a collection of another kind.
 fn collection_of(conn: &Connection, account: Option<&str>) -> Result<Option<String>, PimdirError> {
-    let mut stmt = conn.prepare(sql::LIST_COLLECTIONS_BY_ACCOUNT)?;
+    let mut stmt = conn.prepare_cached(sql::LIST_COLLECTIONS_BY_ACCOUNT)?;
     let held: Option<String> = stmt
         .query_map(named_params! { ":account": account }, |row| {
             Ok((
@@ -359,22 +359,22 @@ fn collection_of(conn: &Connection, account: Option<&str>) -> Result<Option<Stri
         None => format!("\u{1}{NAME}"),
     };
     let declared: Option<String> = conn
-        .query_row(sql::LOAD_KIND, named_params! { ":collection": id }, |row| {
+        .query_row_cached(sql::LOAD_KIND, named_params! { ":collection": id }, |row| {
             row.get(0)
         })
         .optional()?;
     if declared.is_some_and(|kind| !kind.is_empty() && kind != file::KIND) {
         return Ok(None);
     }
-    conn.execute(
+    conn.execute_cached(
         sql::SET_COLLECTION_KIND,
         named_params! { ":collection": id, ":account": account, ":kind": file::KIND },
     )?;
-    conn.execute(
+    conn.execute_cached(
         sql::SET_COLLECTION_NAME,
         named_params! { ":collection": id, ":account": account, ":name": NAME },
     )?;
-    conn.execute(
+    conn.execute_cached(
         sql::SET_COLLECTION_ROLE,
         named_params! { ":collection": id, ":role": ROLE },
     )?;
@@ -390,7 +390,7 @@ pub(crate) fn insert_file(
     summary: &PimdirFileSummary,
 ) -> rusqlite::Result<i64> {
     let shared: Option<i64> = conn
-        .query_row(
+        .query_row_cached(
             sql::SEQ_FOR_LINK_ANY,
             named_params! { ":collection": collection, ":link_id": link.as_str() },
             |row| row.get(0),
@@ -398,9 +398,9 @@ pub(crate) fn insert_file(
         .optional()?;
     let seq = match shared {
         Some(seq) => seq,
-        None => conn.query_row(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
+        None => conn.query_row_cached(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
     };
-    conn.execute(
+    conn.execute_cached(
         sql::INSERT_ITEM,
         named_params! {
             ":collection": collection,
@@ -427,7 +427,7 @@ pub(crate) fn upsert_file_summary(
     summary: &PimdirFileSummary,
 ) -> rusqlite::Result<()> {
     schema::record_derivation(conn)?;
-    conn.execute(
+    conn.execute_cached(
         sql::UPSERT_FILE_SUMMARY,
         named_params! {
             ":collection": collection,

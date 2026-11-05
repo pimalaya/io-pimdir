@@ -54,7 +54,8 @@ use rusqlite::{
 
 use crate::{
     client::{
-        PimdirError, bind_list, busy_or_sql, checkpoint, lock, modes, prepare_connection,
+        PimdirError, PreparedCached, bind_list, busy_or_sql, checkpoint, lock, modes,
+        prepare_connection,
         reader::PimdirReader,
         rows, schema,
         search::{
@@ -470,7 +471,7 @@ impl PimdirIndex {
     pub fn cursor(&self) -> Result<i64, PimdirError> {
         Ok(self
             .conn
-            .query_row(search::LOAD_INDEX_META, [], |row| row.get(2))?)
+            .query_row_cached(search::LOAD_INDEX_META, [], |row| row.get(2))?)
     }
 
     /// Folds the store's change feed into the index (SEARCH §4), in
@@ -594,9 +595,9 @@ impl PimdirIndex {
     /// handle opened by [`open_query`](Self::open_query) is
     /// [`PimdirError::IndexQueryOnly`].
     pub fn erase(&mut self) -> Result<PimdirIndexReport, PimdirError> {
-        let zone: Option<String> = self
-            .conn
-            .query_row(search::LOAD_INDEX_META, [], |row| row.get(11))?;
+        let zone: Option<String> =
+            self.conn
+                .query_row_cached(search::LOAD_INDEX_META, [], |row| row.get(11))?;
         let options = PimdirIndexRefreshOptions {
             floating_zone: zone.unwrap_or_else(|| occurrence::FLOATING_ZONE.into()),
             ..Default::default()
@@ -662,7 +663,7 @@ impl PimdirIndex {
         for hit in found {
             let thread: Option<String> = self
                 .conn
-                .query_row(
+                .query_row_cached(
                     search::HIT_THREAD,
                     named_params! { ":seq": hit.seq, ":account": hit.account },
                     |row| row.get(0),
@@ -687,7 +688,7 @@ impl PimdirIndex {
         for (thread, found) in groups.into_iter().skip(options.offset).take(options.limit) {
             let account = found[0].account.clone();
             let (count, first, last) = match &thread {
-                Some(thread) => self.conn.query_row(
+                Some(thread) => self.conn.query_row_cached(
                     search::THREAD_SPAN,
                     named_params! { ":thread": thread, ":account": account },
                     |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
@@ -736,7 +737,7 @@ impl PimdirIndex {
             for placement in &placements {
                 thread = self
                     .conn
-                    .query_row(
+                    .query_row_cached(
                         search::THREAD_OF,
                         named_params! { ":link_id": placement.link_id.0 },
                         |row| row.get::<_, String>(0),
@@ -785,7 +786,7 @@ impl PimdirIndex {
             }
         }
         hits.sort_by(|a, b| (&a.sort_key, a.seq).cmp(&(&b.sort_key, b.seq)));
-        let (count, first, last) = self.conn.query_row(
+        let (count, first, last) = self.conn.query_row_cached(
             search::THREAD_SPAN,
             named_params! { ":thread": thread, ":account": account },
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
@@ -912,19 +913,18 @@ impl PimdirIndex {
         let sql = compiled.select(sort, page.filter(|_| sort != PimdirSearchSort::Name));
         trace!("search statement: {sql}");
 
-        let mut found = rows(
-            &self.conn,
-            &sql,
-            params_from_iter(compiled.params.iter()),
-            |row| {
+        // NOTE: prepared uncached, its text being this query's alone.
+        let mut statement = self.conn.prepare(&sql).map_err(unanswerable)?;
+        let mut found = statement
+            .query_map(params_from_iter(compiled.params.iter()), |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(5)?,
                 ))
-            },
-        )
-        .map_err(unanswerable)?;
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(unanswerable)?;
         if sort == PimdirSearchSort::Name {
             // NOTE: the title folded as STORAGE Annex A.2 folds `fn`,
             // ties to the seq then the account, as the SQL order gave.
@@ -985,7 +985,7 @@ impl PimdirIndex {
                 if let Some(hash) = &placement.object {
                     let body = self
                         .conn
-                        .query_row(
+                        .query_row_cached(
                             search::MATCH_OBJECT,
                             named_params! { ":match": probe.expression, ":hash": hash.0 },
                             |_| Ok(()),
@@ -999,7 +999,7 @@ impl PimdirIndex {
                 if probe.summary && matched.is_none() {
                     let summary = self
                         .conn
-                        .query_row(
+                        .query_row_cached(
                             search::MATCH_SUMMARY,
                             named_params! {
                                 ":match": probe.expression,
@@ -1026,7 +1026,7 @@ impl PimdirIndex {
         let categories = self.categories(query)?;
         let compiled = Compiled::new(query, ends, categories, now);
 
-        self.conn.execute(search::CLEAR_TERM_MATCH, [])?;
+        self.conn.execute_cached(search::CLEAR_TERM_MATCH, [])?;
         for matches in &compiled.matches {
             trace!("text term statement: {}", matches.sql);
             self.conn
@@ -1251,13 +1251,15 @@ impl PimdirIndex {
         for (kind, count) in bodiless {
             coverage.local.bodiless.insert(kind, count as u64);
         }
-        let unindexed: i64 = self.conn.query_row(
+        let unindexed: i64 = self.conn.query_row_cached(
             search::COUNT_UNINDEXED,
             named_params! { ":since": self.cursor()? },
             |r| r.get(0),
         )?;
         coverage.local.unindexed = unindexed as u64;
-        let behind: i64 = self.conn.query_row(search::BEHIND, [], |r| r.get(0))?;
+        let behind: i64 = self
+            .conn
+            .query_row_cached(search::BEHIND, [], |r| r.get(0))?;
         coverage.local.behind = behind.max(0) as u64;
 
         // NOTE: a range leaves the horizon when it starts before it or ends
@@ -1269,16 +1271,16 @@ impl PimdirIndex {
             .any(|(term, _)| matches!(term.predicate, PimdirQueryPredicate::Date(_)));
         let calendar = collections.iter().any(|c| c.kind == "text/calendar");
         if dated && calendar {
-            let cut: i64 =
-                self.conn
-                    .query_row(search::CUT_BEFORE, named_params! { ":end": until }, |r| {
-                        r.get(0)
-                    })?;
+            let cut: i64 = self.conn.query_row_cached(
+                search::CUT_BEFORE,
+                named_params! { ":end": until },
+                |r| r.get(0),
+            )?;
             coverage.cut = cut as u64;
         }
         let (start, end): (String, String) =
             self.conn
-                .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(4)?, r.get(5)?)))?;
+                .query_row_cached(search::LOAD_INDEX_META, [], |r| Ok((r.get(4)?, r.get(5)?)))?;
         coverage.horizon_left = dated
             && calendar
             && (since
@@ -1312,7 +1314,7 @@ fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     conn.execute_batch(search::CREATE_TERM_MATCH)?;
 
     let store = dir.join("pimdir.db").canonicalize()?;
-    conn.execute(
+    conn.execute_cached(
         "ATTACH DATABASE ?1 AS store",
         [format!("file:{}?mode=ro", uri_path(&store))],
     )?;
@@ -1353,7 +1355,7 @@ enum PimdirIndexHeld {
 /// own (STORAGE §4.5).
 fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     let objects: i64 =
-        conn.query_row("SELECT count(*) FROM main.sqlite_schema", [], |r| r.get(0))?;
+        conn.query_row_cached("SELECT count(*) FROM main.sqlite_schema", [], |r| r.get(0))?;
     if objects == 0 {
         return Ok(PimdirIndexHeld::Empty);
     }
@@ -1371,7 +1373,7 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     let named: Option<(Option<String>, Option<String>)> = match columns.is_empty() {
         true => None,
         false => conn
-            .query_row(
+            .query_row_cached(
                 &format!(
                     "SELECT {}, {} FROM main.index_meta WHERE id = 1",
                     column("format_version"),
@@ -1415,7 +1417,7 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
         return Ok(PimdirIndexHeld::Stale);
     }
     let (version, tokenizer, change, id, incarnation): (i64, String, i64, String, i64) = conn
-        .query_row(search::LOAD_INDEX_META, [], |r| {
+        .query_row_cached(search::LOAD_INDEX_META, [], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(7)?, r.get(8)?))
         })?;
     if version != search::VERSION || tokenizer != search::TOKENIZER {
@@ -1436,7 +1438,7 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     }
 
     let (head, store_id, store_incarnation): (i64, String, i64) =
-        conn.query_row(sql::LOAD_CHANGE_CURSOR, [], |r| {
+        conn.query_row_cached(sql::LOAD_CHANGE_CURSOR, [], |r| {
             Ok((r.get(0)?, r.get(2)?, r.get(3)?))
         })?;
     if id != store_id || incarnation != store_incarnation || change > head {
@@ -1519,7 +1521,7 @@ fn init(conn: &mut Connection) -> Result<(), PimdirError> {
         }
     }
     tx.pragma_update(Some("main"), "user_version", search::VERSION)?;
-    tx.execute(
+    tx.execute_cached(
         search::INIT_INDEX_META,
         named_params! { ":version": search::VERSION, ":tokenizer": search::TOKENIZER },
     )?;

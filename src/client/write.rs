@@ -19,7 +19,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, named_pa
 use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
-        PimdirError, PimdirSourceStore, attachments, bind_list,
+        PimdirError, PimdirSourceStore, PreparedCached, attachments, bind_list,
         blobs::{self, PimdirBlobCheck, PimdirBlobs},
         busy_or_sql, release_pins, rows, schema,
     },
@@ -296,7 +296,7 @@ impl PimdirSourceStore {
         // NOTE: the engine's first write records its version (STORAGE
         // §4.3), and one of another version refuses the batch whole.
         if schema::sync_version(&tx)?.is_none() {
-            tx.execute(
+            tx.execute_cached(
                 sql::SET_SYNC_VERSION,
                 named_params! { ":sync_version": SYNC_VERSION },
             )?;
@@ -357,7 +357,7 @@ pub(crate) fn apply(
             // (`PimdirBlobs::stage`); writing them again would read the
             // whole body back to verify the name it finds held (§5).
             PimdirWriteOp::StoreObject { object, .. } => {
-                tx.execute(
+                tx.execute_cached(
                     sql::STORE_OBJECT,
                     named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
                 )?;
@@ -367,7 +367,7 @@ pub(crate) fn apply(
                 checkpoint,
             } => {
                 ensure_collection(tx, &collection.0, account)?;
-                tx.execute(
+                tx.execute_cached(
                     sql::UPSERT_CHECKPOINT,
                     named_params! {
                         ":collection": collection.0,
@@ -382,7 +382,7 @@ pub(crate) fn apply(
                 band,
             } => {
                 ensure_collection(tx, &collection.0, account)?;
-                tx.execute(
+                tx.execute_cached(
                     sql::OPEN_ROUND,
                     named_params! {
                         ":collection": collection.0,
@@ -402,7 +402,7 @@ pub(crate) fn apply(
                 cursor,
                 checkpoint,
             } => {
-                tx.execute(
+                tx.execute_cached(
                     sql::SET_ROUND_CURSOR,
                     named_params! {
                         ":collection": collection.0,
@@ -417,7 +417,7 @@ pub(crate) fn apply(
                 coverage,
                 checkpoint,
             } => {
-                tx.execute(
+                tx.execute_cached(
                     sql::CLOSE_ROUND,
                     named_params! {
                         ":collection": collection.0,
@@ -429,7 +429,7 @@ pub(crate) fn apply(
                 )?;
             }
             PimdirWriteOp::SetCoverage { collection, scope } => {
-                tx.execute(
+                tx.execute_cached(
                     sql::SET_COVERAGE,
                     named_params! {
                         ":collection": collection.0,
@@ -556,14 +556,14 @@ pub(crate) fn apply(
             "handles",
             handles.iter().map(|handle| handle.0.as_str()),
         )?;
-        tx.execute(
+        tx.execute_cached(
             sql::STAMP_BINDINGS,
             named_params! { ":collection": collection.0, ":source": source.0 },
         )?;
     }
 
     for collection in rekeyed {
-        tx.query_row(
+        tx.query_row_cached(
             sql::BUMP_GENERATION,
             named_params! { ":collection": collection },
             |row| row.get::<_, i64>(0),
@@ -578,7 +578,7 @@ fn ensure_collection(
     collection: &str,
     account: Option<&str>,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    conn.execute_cached(
         sql::ENSURE_COLLECTION,
         named_params! { ":collection": collection, ":account": account },
     )?;
@@ -602,7 +602,7 @@ pub(crate) fn sync_state(
 ) -> Result<PimdirSyncState, PimdirError> {
     let key = named_params! { ":collection": collection, ":source": source.0 };
     let loaded = conn
-        .query_row(sql::LOAD_CHECKPOINT, key, |r| {
+        .query_row_cached(sql::LOAD_CHECKPOINT, key, |r| {
             Ok((
                 r.get::<_, Option<Vec<u8>>>(0)?,
                 r.get::<_, Option<String>>(1)?,
@@ -620,7 +620,7 @@ pub(crate) fn sync_state(
     };
 
     let round = conn
-        .query_row(sql::LOAD_ROUND, key, |r| {
+        .query_row_cached(sql::LOAD_ROUND, key, |r| {
             Ok(r.get::<_, Option<String>>(1)?.map(|started_at| {
                 Ok::<_, rusqlite::Error>(PimdirRound {
                     started_at,
@@ -725,7 +725,7 @@ pub(crate) fn link_for_handle(
     source: &PimdirSourceId,
     handle: &PimdirHandle,
 ) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
+    conn.query_row_cached(
         sql::LINK_FOR_HANDLE,
         named_params! {
             ":collection": collection,
@@ -747,7 +747,7 @@ fn origin_for(
     let Some(link) = &placement.link_id else {
         return Ok(None);
     };
-    conn.query_row(
+    conn.query_row_cached(
         sql::ORIGIN_FOR_LINK,
         named_params! {
             ":collection": placement.collection.0,
@@ -776,7 +776,7 @@ fn destination_for(
     let Some(link) = &placement.link_id else {
         return Ok(None);
     };
-    conn.query_row(
+    conn.query_row_cached(
         sql::DESTINATION_FOR_LINK,
         named_params! {
             ":collection": placement.collection.0,
@@ -830,7 +830,7 @@ pub(crate) fn read_hub(
     let mut hub = PimdirHub::default();
 
     if let Some(policy) = conn
-        .query_row(
+        .query_row_cached(
             sql::LOAD_CONFLICT,
             named_params! { ":collection": collection },
             |r| r.get::<_, String>(0),
@@ -907,7 +907,7 @@ pub(crate) fn read_hub(
 /// a producer and a reader call it too.
 pub(crate) fn kind_of(conn: &Connection, collection: &str) -> Result<String, PimdirError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             sql::LOAD_KIND,
             named_params! { ":collection": collection },
             |r| r.get::<_, String>(0),
@@ -1332,7 +1332,7 @@ fn save_hub_diff(
                     item.summary.as_ref(),
                 )?;
                 if summary_moved && !columns_moved {
-                    conn.execute(
+                    conn.execute_cached(
                         sql::STAMP_ITEM,
                         named_params! { ":collection": collection, ":link_id": link.0 },
                     )?;
@@ -1345,11 +1345,11 @@ fn save_hub_diff(
         }
 
         if unbound && prev.is_some_and(|prev| !prev.sources.is_empty()) {
-            conn.execute(
+            conn.execute_cached(
                 sql::RETAIN_ITEM,
                 named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
             )?;
-            conn.execute(
+            conn.execute_cached(
                 sql::DELETE_ITEM_BINDINGS,
                 named_params! { ":collection": collection, ":link_id": link.0 },
             )?;
@@ -1371,7 +1371,7 @@ fn held_elsewhere(
     link: &PimdirLinkId,
     object: Option<&PimdirHash>,
 ) -> rusqlite::Result<bool> {
-    conn.query_row(
+    conn.query_row_cached(
         sql::HELD_ELSEWHERE,
         named_params! {
             ":collection": collection,
@@ -1391,12 +1391,12 @@ fn purge_retained(
     collection: &str,
     link: &PimdirLinkId,
 ) -> Result<(), PimdirError> {
-    let seq: i64 = conn.query_row(
+    let seq: i64 = conn.query_row_cached(
         sql::RETAINED_ITEM,
         named_params! { ":collection": collection, ":link_id": link.0 },
         |r| r.get(0),
     )?;
-    let (object, conflict_object): (Option<String>, Option<String>) = conn.query_row(
+    let (object, conflict_object): (Option<String>, Option<String>) = conn.query_row_cached(
         sql::PURGE_ITEM,
         named_params! { ":collection": collection, ":seq": seq },
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1465,7 +1465,7 @@ fn mint_other_messages(
             let taken = old.items.contains_key(&key)
                 || claimed.contains(&key)
                 || conn
-                    .query_row(
+                    .query_row_cached(
                         sql::SEQ_BY_LINK,
                         named_params! { ":collection": collection, ":link_id": key.0 },
                         |_| Ok(()),
@@ -1502,7 +1502,7 @@ fn retained_summary(
     link: &PimdirLinkId,
 ) -> Result<Option<Option<PimdirSummary>>, PimdirError> {
     let retained = conn
-        .query_row(
+        .query_row_cached(
             sql::RETAINED_ITEM,
             named_params! { ":collection": collection, ":link_id": link.0 },
             |_| Ok(()),
@@ -1562,7 +1562,7 @@ fn keep_overruled(
         if hub.items.contains_key(key) {
             return Ok(true);
         }
-        conn.query_row(
+        conn.query_row_cached(
             sql::SEQ_BY_LINK,
             named_params! { ":collection": collection, ":link_id": key.0 },
             |_| Ok(()),
@@ -1575,8 +1575,8 @@ fn keep_overruled(
         key = key.minted(&lost.handle);
     }
 
-    let seq: i64 = conn.query_row(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?;
-    conn.execute(
+    let seq: i64 = conn.query_row_cached(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?;
+    conn.execute_cached(
         sql::INSERT_ITEM,
         named_params! {
             ":collection": collection,
@@ -1593,11 +1593,11 @@ fn keep_overruled(
     )?;
     write_flags(conn, collection, &key.0, None, &lost.flags)?;
     write_summary(conn, collection, &key, None, lost.summary.as_ref())?;
-    conn.execute(
+    conn.execute_cached(
         sql::RETAIN_ITEM,
         named_params! { ":collection": collection, ":link_id": key.0, ":source": lost.source.0 },
     )?;
-    conn.execute(
+    conn.execute_cached(
         sql::ADJUST_REFCOUNT,
         named_params! { ":delta": 1, ":hash": lost.object.0 },
     )?;
@@ -1680,7 +1680,7 @@ fn insert_item(
     let existing = match link.is_derived() {
         true => None,
         false => conn
-            .query_row(
+            .query_row_cached(
                 sql::SEQ_FOR_LINK_ANY,
                 named_params! { ":collection": collection, ":link_id": link.0 },
                 |row| row.get::<_, i64>(0),
@@ -1689,9 +1689,9 @@ fn insert_item(
     };
     let seq = match existing {
         Some(seq) => seq,
-        None => conn.query_row(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
+        None => conn.query_row_cached(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
     };
-    conn.execute(
+    conn.execute_cached(
         sql::INSERT_ITEM,
         named_params! {
             ":collection": collection,
@@ -1733,7 +1733,7 @@ fn revive_item(
     kept: &mut Vec<PimdirOverruled>,
 ) -> Result<bool, PimdirError> {
     let pinned: Option<(Option<String>, Option<String>)> = conn
-        .query_row(
+        .query_row_cached(
             sql::RETAINED_ITEM,
             named_params! { ":collection": collection, ":link_id": link.0 },
             |row| Ok((row.get(1)?, row.get(2)?)),
@@ -1782,13 +1782,13 @@ fn revive_item(
         _ => {}
     }
 
-    conn.execute(
+    conn.execute_cached(
         sql::REVIVE_ITEM,
         named_params! { ":collection": collection, ":link_id": link.0 },
     )?;
     update_item(conn, collection, link, item)?;
     for hash in [object, conflict_object].into_iter().flatten() {
-        conn.execute(
+        conn.execute_cached(
             sql::ADJUST_REFCOUNT,
             named_params! { ":delta": -1, ":hash": hash },
         )?;
@@ -1807,7 +1807,7 @@ fn update_item(
     link: &PimdirLinkId,
     item: &PimdirHubItem,
 ) -> Result<(), PimdirError> {
-    conn.execute(
+    conn.execute_cached(
         sql::UPDATE_ITEM,
         named_params! {
             ":collection": collection,
@@ -1845,8 +1845,8 @@ pub(crate) fn write_flags(
     match source {
         None => {
             let key = named_params! { ":collection": collection, ":link_id": link_id };
-            conn.execute(sql::RETAIN_FLAGS, key)?;
-            conn.execute(sql::ADD_FLAGS, key)?;
+            conn.execute_cached(sql::RETAIN_FLAGS, key)?;
+            conn.execute_cached(sql::ADD_FLAGS, key)?;
         }
         Some(source) => {
             let key = named_params! {
@@ -1854,8 +1854,8 @@ pub(crate) fn write_flags(
                 ":link_id": link_id,
                 ":source": source,
             };
-            conn.execute(sql::RETAIN_BASE_FLAGS, key)?;
-            conn.execute(sql::ADD_BASE_FLAGS, key)?;
+            conn.execute_cached(sql::RETAIN_BASE_FLAGS, key)?;
+            conn.execute_cached(sql::ADD_BASE_FLAGS, key)?;
         }
     }
     Ok(())
@@ -1874,24 +1874,24 @@ fn link_references(
     let key = named_params! { ":link_id": link.0 };
     match summary {
         Some(PimdirSummary::Mail(mail)) => {
-            conn.execute(sql::LINK_SENDERS_OF, key)?;
+            conn.execute_cached(sql::LINK_SENDERS_OF, key)?;
             if mail.invitation.is_some() {
-                conn.execute(sql::LINK_INVITATIONS_OF, key)?;
+                conn.execute_cached(sql::LINK_INVITATIONS_OF, key)?;
             }
-            conn.execute(sql::LINK_SOURCES_TO, key)?;
+            conn.execute_cached(sql::LINK_SOURCES_TO, key)?;
         }
         Some(PimdirSummary::Contact(_)) => {
-            conn.execute(sql::LINK_MAIL_FROM, key)?;
+            conn.execute_cached(sql::LINK_MAIL_FROM, key)?;
         }
         Some(PimdirSummary::Event(_) | PimdirSummary::Task(_) | PimdirSummary::Journal(_)) => {
-            conn.execute(sql::LINK_INVITATIONS_TO, key)?;
-            conn.execute(sql::LINK_PARENTS_TO, key)?;
+            conn.execute_cached(sql::LINK_INVITATIONS_TO, key)?;
+            conn.execute_cached(sql::LINK_PARENTS_TO, key)?;
             if let Some(PimdirSummary::Task(task)) = summary {
                 if task.parent.is_some() {
-                    conn.execute(sql::LINK_PARENTS_OF, key)?;
+                    conn.execute_cached(sql::LINK_PARENTS_OF, key)?;
                 }
                 if task.mid.is_some() {
-                    conn.execute(sql::LINK_SOURCES_OF, key)?;
+                    conn.execute_cached(sql::LINK_SOURCES_OF, key)?;
                 }
             }
         }
@@ -1923,7 +1923,7 @@ pub(crate) fn rederive_item(
     )?;
     let key_moved = held.sort_key != derivation.sort_key;
     if key_moved {
-        conn.execute(
+        conn.execute_cached(
             sql::SET_SORT_KEY,
             named_params! {
                 ":collection": collection,
@@ -1936,7 +1936,7 @@ pub(crate) fn rederive_item(
         link_references(conn, link, derivation.summary.as_ref())?;
     }
     if summary_moved || key_moved {
-        conn.execute(sql::STAMP_ITEM, key)?;
+        conn.execute_cached(sql::STAMP_ITEM, key)?;
     }
 
     Ok(summary_moved || key_moved)
@@ -1963,16 +1963,16 @@ fn write_summary(
         && new.is_none_or(|new| PimdirSummaryTable::of(new) != PimdirSummaryTable::of(old))
         && let Some(delete) = PimdirSummaryTable::of(old).delete_sql()
     {
-        conn.execute(delete, key)?;
+        conn.execute_cached(delete, key)?;
     }
-    conn.execute(sql::REPLACE_ADDRESSES, key)?;
+    conn.execute_cached(sql::REPLACE_ADDRESSES, key)?;
 
     let Some(new) = new else {
         return Ok(true);
     };
 
     match new {
-        PimdirSummary::Mail(mail) => conn.execute(
+        PimdirSummary::Mail(mail) => conn.execute_cached(
             sql::UPSERT_MAIL_SUMMARY,
             named_params! {
                 ":collection": collection,
@@ -1987,7 +1987,7 @@ fn write_summary(
                 ":invitation": mail.invitation,
             },
         )?,
-        PimdirSummary::Contact(contact) => conn.execute(
+        PimdirSummary::Contact(contact) => conn.execute_cached(
             sql::UPSERT_CONTACT_SUMMARY,
             named_params! {
                 ":collection": collection,
@@ -1998,7 +1998,7 @@ fn write_summary(
                 ":org": contact.org,
             },
         )?,
-        PimdirSummary::Event(event) => conn.execute(
+        PimdirSummary::Event(event) => conn.execute_cached(
             sql::UPSERT_EVENT_SUMMARY,
             named_params! {
                 ":collection": collection,
@@ -2014,7 +2014,7 @@ fn write_summary(
                 ":until": event.until,
             },
         )?,
-        PimdirSummary::Task(task) => conn.execute(
+        PimdirSummary::Task(task) => conn.execute_cached(
             sql::UPSERT_TASK_SUMMARY,
             named_params! {
                 ":collection": collection,
@@ -2038,7 +2038,7 @@ fn write_summary(
                 ":created": task.created,
             },
         )?,
-        PimdirSummary::Journal(journal) => conn.execute(
+        PimdirSummary::Journal(journal) => conn.execute_cached(
             sql::UPSERT_JOURNAL_SUMMARY,
             named_params! {
                 ":collection": collection,
@@ -2050,7 +2050,7 @@ fn write_summary(
                 ":dtstart_value": journal.dtstart.as_ref().map(PimdirTime::value_kind),
             },
         )?,
-        PimdirSummary::File(file) => conn.execute(
+        PimdirSummary::File(file) => conn.execute_cached(
             sql::UPSERT_FILE_SUMMARY,
             named_params! {
                 ":collection": collection,
@@ -2065,9 +2065,9 @@ fn write_summary(
 
     match new {
         PimdirSummary::Mail(mail) => {
-            conn.execute(sql::REPLACE_IN_REPLY_TO, key)?;
+            conn.execute_cached(sql::REPLACE_IN_REPLY_TO, key)?;
             for (position, id) in mail.in_reply_to.iter().enumerate() {
-                conn.execute(
+                conn.execute_cached(
                     sql::INSERT_IN_REPLY_TO,
                     named_params! {
                         ":collection": collection,
@@ -2079,9 +2079,9 @@ fn write_summary(
             }
         }
         PimdirSummary::Task(task) => {
-            conn.execute(sql::REPLACE_CATEGORIES, key)?;
+            conn.execute_cached(sql::REPLACE_CATEGORIES, key)?;
             for (position, value) in task.categories.iter().enumerate() {
-                conn.execute(
+                conn.execute_cached(
                     sql::INSERT_CATEGORY,
                     named_params! {
                         ":collection": collection,
@@ -2098,7 +2098,7 @@ fn write_summary(
     let mut position: HashMap<PimdirAddressRole, i64> = HashMap::new();
     for (role, address) in new.addresses() {
         let at = position.entry(role).or_insert(0);
-        conn.execute(
+        conn.execute_cached(
             sql::INSERT_ADDRESS,
             named_params! {
                 ":collection": collection,
@@ -2144,7 +2144,7 @@ fn release_bindings(
             }
         };
         if released {
-            conn.execute(
+            conn.execute_cached(
                 sql::DELETE_BINDING,
                 named_params! { ":collection": collection, ":link_id": link.0, ":source": source.0 },
             )?;
@@ -2185,7 +2185,7 @@ fn insert_binding(
     source: &PimdirSourceId,
     binding: &PimdirBinding,
 ) -> Result<(), PimdirError> {
-    conn.execute(
+    conn.execute_cached(
         sql::INSERT_BINDING,
         named_params! {
             ":collection": collection,
@@ -2218,7 +2218,7 @@ fn update_binding(
     source: &PimdirSourceId,
     binding: &PimdirBinding,
 ) -> Result<(), PimdirError> {
-    conn.execute(
+    conn.execute_cached(
         sql::UPDATE_BINDING,
         named_params! {
             ":collection": collection,
@@ -2297,7 +2297,7 @@ fn adjust_refcounts(
     for (hash, new_count) in new {
         let delta = new_count - old.get(hash).copied().unwrap_or(0);
         if delta != 0 {
-            conn.execute(
+            conn.execute_cached(
                 sql::ADJUST_REFCOUNT,
                 named_params! { ":delta": delta, ":hash": hash },
             )?;
@@ -2305,7 +2305,7 @@ fn adjust_refcounts(
     }
     for (hash, old_count) in old {
         if !new.contains_key(hash) {
-            conn.execute(
+            conn.execute_cached(
                 sql::ADJUST_REFCOUNT,
                 named_params! { ":delta": -old_count, ":hash": hash },
             )?;
@@ -2419,7 +2419,7 @@ pub(crate) fn put_unbound(
         sources: BTreeMap::new(),
     };
 
-    conn.execute(
+    conn.execute_cached(
         sql::STORE_OBJECT,
         named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
     )?;
@@ -2442,7 +2442,7 @@ pub(crate) fn put_unbound(
                 item.summary.as_ref(),
             )?;
             if summary_moved && !columns_moved {
-                conn.execute(
+                conn.execute_cached(
                     sql::STAMP_ITEM,
                     named_params! { ":collection": collection, ":link_id": link.0 },
                 )?;
@@ -2456,7 +2456,7 @@ pub(crate) fn put_unbound(
     new.items.insert(link.clone(), item);
     adjust_refcounts(conn, &object_refs(&old), &object_refs(&new))?;
 
-    Ok(conn.query_row(
+    Ok(conn.query_row_cached(
         sql::SEQ_BY_LINK,
         named_params! { ":collection": collection, ":link_id": link.0 },
         |row| row.get(0),

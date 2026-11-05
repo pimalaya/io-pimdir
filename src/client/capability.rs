@@ -20,7 +20,7 @@ use crate::{
         MAIL_SUBMIT, MAIL_SUBMIT_COPY, PimdirCapability, PimdirPartial, PimdirRefusal,
         PimdirSourceCapabilities, PimdirSupport,
     },
-    client::{PimdirError, blobs::PimdirBlobs, rows, write},
+    client::{PimdirError, PreparedCached, blobs::PimdirBlobs, rows, write},
     codec::{self, PimdirAction, PimdirActionError},
     intent::{self, PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename},
     object::PimdirHash,
@@ -79,7 +79,7 @@ pub(crate) fn performer(
     capability: &str,
 ) -> Result<Option<String>, PimdirError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             sql::LOAD_PERFORMER,
             named_params! { ":account": account, ":capability": capability },
             |r| r.get(0),
@@ -418,7 +418,7 @@ pub(crate) fn backstop_intent(
         return Ok(());
     };
     let declared = conn
-        .query_row(
+        .query_row_cached(
             "SELECT 1 FROM capabilities WHERE source = :source LIMIT 1",
             named_params! { ":source": source },
             |_| Ok(()),
@@ -454,12 +454,12 @@ pub(crate) fn declare(
     source: &str,
     capabilities: &[PimdirCapability],
 ) -> Result<(), PimdirError> {
-    conn.execute(
+    conn.execute_cached(
         sql::DELETE_CAPABILITIES,
         named_params! { ":source": source },
     )?;
     for row in capabilities {
-        conn.execute(
+        conn.execute_cached(
             sql::SET_CAPABILITY,
             named_params! {
                 ":account": account,
@@ -485,7 +485,7 @@ pub(crate) fn set_performer(
     let account = account_of(conn, collection)?;
     let params = named_params! { ":account": account, ":capability": capability };
     let Some(source) = source else {
-        conn.execute(sql::DELETE_PERFORMER, params)?;
+        conn.execute_cached(sql::DELETE_PERFORMER, params)?;
         return Ok(());
     };
     if !candidates(conn, account.as_deref(), None, capability)?
@@ -498,7 +498,7 @@ pub(crate) fn set_performer(
             detail: None,
         }));
     }
-    conn.execute(
+    conn.execute_cached(
         sql::SET_PERFORMER,
         named_params! { ":account": account, ":capability": capability, ":source": source },
     )?;
@@ -514,7 +514,7 @@ pub(crate) fn intent_source(payload: &str) -> Option<String> {
 /// Whether any source of `account` has declared its capabilities.
 fn account_declared(conn: &Connection, account: Option<&str>) -> Result<bool, PimdirError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             "SELECT 1 FROM capabilities WHERE account IS :account LIMIT 1",
             named_params! { ":account": account },
             |_| Ok(()),
@@ -574,7 +574,7 @@ fn intent_copy(payload: &str) -> Option<String> {
 
 fn account_of(conn: &Connection, collection: &str) -> Result<Option<String>, PimdirError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             sql::LOAD_ACCOUNT,
             named_params! { ":collection": collection },
             |r| r.get::<_, Option<String>>(0),
@@ -589,7 +589,7 @@ fn item_object(
     seq: i64,
 ) -> Result<Option<PimdirHash>, PimdirError> {
     let hash = conn
-        .query_row(
+        .query_row_cached(
             sql::GET_ITEM,
             named_params! { ":collection": collection, ":seq": seq },
             |r| r.get::<_, Option<String>>(3),
@@ -601,7 +601,7 @@ fn item_object(
 
 fn item_flags(conn: &Connection, collection: &str, seq: i64) -> Result<PimdirFlags, PimdirError> {
     let flags = conn
-        .query_row(
+        .query_row_cached(
             sql::GET_ITEM,
             named_params! { ":collection": collection, ":seq": seq },
             |r| r.get::<_, Option<String>>(2),
