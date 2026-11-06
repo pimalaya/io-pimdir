@@ -73,7 +73,8 @@ impl PimdirIndex {
         debug!("planning a tag adding {add:?} and removing {remove:?}");
 
         let now = clock.now();
-        let mut compiled = self.compile(query, now)?;
+        let zone = clock.time_zone()?;
+        let mut compiled = self.compile(query, now, &zone)?;
         let found = self.found(&mut compiled, PimdirSearchSort::Date, None)?;
 
         let mut pending: BTreeMap<String, Vec<PimdirPendingAction>> = BTreeMap::new();
@@ -195,7 +196,7 @@ impl PimdirIndex {
             add,
             remove,
             hits,
-            coverage: self.coverage(query, now)?,
+            coverage: self.coverage(query, now, &zone)?,
         })
     }
 }

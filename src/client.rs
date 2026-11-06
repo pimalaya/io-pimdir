@@ -1852,8 +1852,8 @@ pub enum PimdirError {
         /// Its `index_meta.shape`, `None` without one.
         shape: Option<String>,
     },
-    /// The zone an indexer states for floating times (SEARCH §7) names no
-    /// zone of the IANA time zone database.
+    /// A zone stated for floating times (SEARCH §7) or a query's dates
+    /// (§8.1) is not an IANA zone.
     #[cfg(feature = "search")]
     IndexZone(String),
     /// A refresh was asked of an index opened for queries alone (SEARCH
@@ -2181,7 +2181,7 @@ impl fmt::Display for PimdirError {
             #[cfg(feature = "search")]
             Self::IndexZone(zone) => write!(
                 f,
-                "Pimdir search cannot read floating times in {zone}: name a zone of the IANA time zone database"
+                "Pimdir search cannot read times in {zone}: name a zone of the IANA time zone database"
             ),
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(index) => write!(

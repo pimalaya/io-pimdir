@@ -8,11 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-09, sync-draft-08 and search-draft-09, vendored at pimdir 1d34d2f.
+- **BREAKING**: Added pimdir storage-draft-09, sync-draft-08 and search-draft-09, vendored at pimdir 8c16bb1.
 
   A placement is keyed by an integer id every child row carries, and its system flags (`\Seen`, `\Answered`, `\Flagged`, `\Draft`, `\Deleted`) are bits of the row (`codec::MARKS`, `codec::mark_of`, `codec::marks_to_int`), every other flag a row. A store an earlier draft wrote is refused by every profile, never migrated: move it aside and let its sync engine create a new one.
 
 - **BREAKING**: Added `PimdirLoadSelection::Owing`, what a delta loads: the handles it lists and drops, and every placement that may owe the source a push (`list_owing_bindings`, `list_lacking_items`), then its hints' `Links`. A delta no longer loads the whole collection.
+
+- **BREAKING**: Added `PimdirSearchClock::zone`, the IANA zone a query's years, months, days, `today` and `yesterday` are read in, UTC when `None`.
+
+  `PimdirSearchClock` and `PimdirSearchOptions` are no longer `Copy`. An unknown zone fails the query with `index-zone-unknown`.
+
+- Added `PimdirIndex::floating_zone`, the zone the index reads floating times in, on a query-only handle too.
+- Added `--zone` to the CLI's `search`, `count` and `tag`, the index's floating zone by default.
 
 ### Changed
 

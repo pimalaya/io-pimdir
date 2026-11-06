@@ -289,3 +289,25 @@ fn a_tag_stages_each_placement_as_the_source_syncing_its_collection() {
         "never staged as a source not syncing the collection"
     );
 }
+
+#[test]
+fn a_query_reads_its_days_in_its_zone() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    file_message(dir, "INBOX", "late@x", 23, &[]);
+    let count = |args: &[&str]| {
+        let (status, output) = pimdir(dir, &[&["count", "date:2026-08-02"], args].concat());
+        (status, output["count"].as_u64(), output["code"].clone())
+    };
+
+    assert_eq!(count(&[]).1, Some(0), "23:00Z is 1 August in UTC");
+    assert_eq!(count(&["--zone", "Europe/Paris"]).1, Some(1));
+    assert_eq!(
+        count(&["--floating-zone", "Europe/Paris"]).1,
+        Some(1),
+        "the index's zone by default"
+    );
+    let (status, _, code) = count(&["--zone", "Mars/Olympus"]);
+    assert_eq!((status, code.as_str()), (1, Some("index-zone-unknown")));
+}

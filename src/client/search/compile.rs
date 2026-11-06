@@ -17,6 +17,7 @@ use alloc::{
     vec::Vec,
 };
 
+use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use rusqlite::types::Value;
 
 use crate::{
@@ -71,13 +72,21 @@ pub(crate) struct Compiled {
     categories: Categories,
     /// The instant relative dates resolve against, Unix seconds.
     now: i64,
+    /// The zone calendar spans are read in.
+    zone: TimeZone,
 }
 
 impl Compiled {
     /// Compiles a query, `ends` holding the items each `linked:` term
     /// names and `categories` the task categories each `category:` term
-    /// names, its relative dates resolved against `now` (Unix seconds).
-    pub(crate) fn new(query: &PimdirQuery, ends: Ends, categories: Categories, now: i64) -> Self {
+    /// names, its dates resolved against `now` (Unix seconds) in `zone`.
+    pub(crate) fn new(
+        query: &PimdirQuery,
+        ends: Ends,
+        categories: Categories,
+        now: i64,
+        zone: TimeZone,
+    ) -> Self {
         let undated: Vec<&str> = query
             .terms()
             .into_iter()
@@ -98,6 +107,7 @@ impl Compiled {
             ends,
             categories,
             now,
+            zone,
         };
         compiled.condition = compiled.node(query, false, &undated);
         compiled
@@ -433,7 +443,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 format!("SELECT i.collection, i.seq {live} AND i.collection = {collection}")
             }
             PimdirQueryPredicate::Date(range) => {
-                let (since, until) = bounds(range, self.now);
+                let (since, until) = bounds(range, self.now, &self.zone);
                 // NOTE: an open side is the earliest or the latest instant an
                 // RFC 3339 string can spell.
                 let occurring = self.embed(
@@ -636,50 +646,61 @@ pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
 /// The instants a range spans (SEARCH §8.1), `[since, until)` as RFC 3339
 /// in UTC, either side `None` open: from the start of its first point's
 /// span to the end of its last's, a calendar point spanning its day,
-/// month or year in UTC, `today` and `yesterday` theirs around `now`
+/// month or year in `zone`, `today` and `yesterday` theirs around `now`
 /// (Unix seconds), and a relative amount the instant that long before
 /// `now`, its span alone running from that instant to `now`.
 ///
 /// A single point is parsed as a range from it to itself, so `2w..2w`
 /// reads as `2w` alone.
-pub(crate) fn bounds(range: &PimdirQueryDateRange, now: i64) -> (Option<String>, Option<String>) {
+pub(crate) fn bounds(
+    range: &PimdirQueryDateRange,
+    now: i64,
+    zone: &TimeZone,
+) -> (Option<String>, Option<String>) {
     let single = range.start.is_some() && range.start == range.end;
-    let since = range.start.as_ref().map(|point| span(point, now).0);
+    let since = range.start.as_ref().map(|point| span(point, now, zone).0);
     let until = range.end.as_ref().map(|point| match point {
         PimdirQueryDate::Relative { .. } if single => now,
-        point => span(point, now).1,
+        point => span(point, now, zone).1,
     });
     (since.map(time::rfc3339), until.map(time::rfc3339))
 }
 
-/// The span of one date point, `[start, end)` in Unix seconds, a
-/// relative amount spanning its instant alone; nothing before the first
-/// instant of year 0, so an amount reaching past it is no wider.
-fn span(point: &PimdirQueryDate, now: i64) -> (i64, i64) {
+/// The span of one date point, `[start, end)` in Unix seconds, its days
+/// read in `zone`; a relative amount spans its instant, never before year 0.
+fn span(point: &PimdirQueryDate, now: i64, zone: &TimeZone) -> (i64, i64) {
     let day = |year: u16, month: u8, day: u8| {
-        time::days_from_civil(i32::from(year), u32::from(month), u32::from(day)) * DAY
+        time::days_from_civil(i32::from(year), u32::from(month), u32::from(day))
     };
-    let midnight = now.div_euclid(DAY) * DAY;
+    let start = |days: i64| start_of_day(days, zone);
+    let today = Timestamp::from_second(now).map_or(now.div_euclid(DAY), |instant| {
+        let date = instant.to_zoned(zone.clone()).date();
+        time::days_from_civil(
+            i32::from(date.year()),
+            date.month() as u32,
+            date.day() as u32,
+        )
+    });
 
     match *point {
-        PimdirQueryDate::Year(year) => (day(year, 1, 1), day(year + 1, 1, 1)),
+        PimdirQueryDate::Year(year) => (start(day(year, 1, 1)), start(day(year + 1, 1, 1))),
         PimdirQueryDate::Month { year, month } => {
             let next = match month {
                 12 => day(year + 1, 1, 1),
                 month => day(year, month + 1, 1),
             };
-            (day(year, month, 1), next)
+            (start(day(year, month, 1)), start(next))
         }
         PimdirQueryDate::Day {
             year,
             month,
             day: date,
         } => {
-            let start = day(year, month, date);
-            (start, start + DAY)
+            let first = day(year, month, date);
+            (start(first), start(first + 1))
         }
-        PimdirQueryDate::Today => (midnight, midnight + DAY),
-        PimdirQueryDate::Yesterday => (midnight - DAY, midnight),
+        PimdirQueryDate::Today => (start(today), start(today + 1)),
+        PimdirQueryDate::Yesterday => (start(today - 1), start(today)),
         PimdirQueryDate::Relative { amount, unit } => {
             let amount = i64::from(amount);
             let instant = match unit {
@@ -701,6 +722,18 @@ fn span(point: &PimdirQueryDate, now: i64) -> (i64, i64) {
             (instant, instant)
         }
     }
+}
+
+/// The first instant of a day counted from 1970-01-01 in `zone`, its UTC
+/// midnight past the years jiff places.
+fn start_of_day(days: i64, zone: &TimeZone) -> i64 {
+    let (year, month, day) = time::civil_from_days(days);
+    i16::try_from(year)
+        .ok()
+        .and_then(|year| Date::new(year, month as i8, day as i8).ok())
+        .and_then(|date| date.to_zoned(zone.clone()).ok())
+        .and_then(|zoned| zoned.start_of_day().ok())
+        .map_or(days * DAY, |zoned| zoned.timestamp().as_second())
 }
 
 /// The FTS5 expression of a text term: the text folded as the indexer
@@ -752,11 +785,16 @@ mod tests {
     };
 
     fn bounds_of(value: &str, now: i64) -> (Option<String>, Option<String>) {
+        bounds_in(value, now, "UTC")
+    }
+
+    fn bounds_in(value: &str, now: i64, zone: &str) -> (Option<String>, Option<String>) {
+        let zone = TimeZone::get(zone).unwrap();
         match PimdirQuery::parse(&format!("date:{value}")).unwrap() {
             PimdirQuery::Term(PimdirQueryTerm {
                 predicate: PimdirQueryPredicate::Date(range),
                 ..
-            }) => bounds(&range, now),
+            }) => bounds(&range, now, &zone),
             _ => panic!("a date term"),
         }
     }
@@ -788,6 +826,75 @@ mod tests {
             bounds_of("99999y", now).0.as_deref(),
             Some("0000-01-01T00:00:00Z"),
             "nothing before year 0"
+        );
+    }
+
+    #[test]
+    fn calendar_spans_start_at_the_zone_midnight() {
+        let span = |since: &str, until: &str| (Some(since.into()), Some(until.into()));
+        let after = time::unix(2026, 12, 31, 23, 30, 0);
+        let before = time::unix(2026, 12, 31, 22, 30, 0);
+
+        assert_eq!(
+            bounds_in("today", after, "Europe/Paris"),
+            span("2026-12-31T23:00:00Z", "2027-01-01T23:00:00Z"),
+            "00:30 in Paris is already the new year's first day"
+        );
+        assert_eq!(
+            bounds_of("today", after),
+            span("2026-12-31T00:00:00Z", "2027-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            bounds_in("today", before, "Europe/Paris"),
+            span("2026-12-30T23:00:00Z", "2026-12-31T23:00:00Z"),
+            "23:30 in Paris is still the old year's last day"
+        );
+        assert_eq!(
+            bounds_in(
+                "yesterday",
+                time::unix(2027, 1, 1, 23, 30, 0),
+                "Europe/Paris"
+            ),
+            span("2026-12-31T23:00:00Z", "2027-01-01T23:00:00Z")
+        );
+        assert_eq!(
+            bounds_in("2027", after, "Europe/Paris"),
+            span("2026-12-31T23:00:00Z", "2027-12-31T23:00:00Z")
+        );
+        assert_eq!(
+            bounds_in("2027-01", after, "Europe/Paris"),
+            span("2026-12-31T23:00:00Z", "2027-01-31T23:00:00Z")
+        );
+        assert_eq!(
+            bounds_in("2026-12-31", after, "Europe/Paris"),
+            span("2026-12-30T23:00:00Z", "2026-12-31T23:00:00Z")
+        );
+        assert_eq!(
+            bounds_in("1d", after, "Europe/Paris"),
+            span("2026-12-30T23:30:00Z", "2026-12-31T23:30:00Z"),
+            "a relative amount is an instant, whatever the zone"
+        );
+    }
+
+    #[test]
+    fn a_day_a_transition_moves_is_23_or_25_hours() {
+        let span = |since: &str, until: &str| (Some(since.into()), Some(until.into()));
+        let now = time::unix(2026, 8, 20, 12, 0, 0);
+
+        assert_eq!(
+            bounds_in("2026-10-25", now, "Europe/Paris"),
+            span("2026-10-24T22:00:00Z", "2026-10-25T23:00:00Z"),
+            "the clocks go back: 25 hours"
+        );
+        assert_eq!(
+            bounds_in("2027-03-28", now, "Europe/Paris"),
+            span("2027-03-27T23:00:00Z", "2027-03-28T22:00:00Z"),
+            "the clocks go forward: 23 hours"
+        );
+        assert_eq!(
+            bounds_in("2026-03-08", now, "America/Havana"),
+            span("2026-03-08T05:00:00Z", "2026-03-09T04:00:00Z"),
+            "a transition skipping midnight: the day starts at 01:00"
         );
     }
 }

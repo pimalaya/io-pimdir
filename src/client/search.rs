@@ -171,7 +171,7 @@ pub enum PimdirSearchSort {
 }
 
 /// One page of a search.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirSearchOptions {
     /// The order.
     pub sort: PimdirSearchSort,
@@ -179,7 +179,7 @@ pub struct PimdirSearchOptions {
     pub limit: usize,
     /// The hits skipped before the first answered.
     pub offset: usize,
-    /// The instant relative dates resolve against.
+    /// The instant and the zone the query's dates resolve in.
     pub clock: PimdirSearchClock,
 }
 
@@ -194,18 +194,27 @@ impl Default for PimdirSearchOptions {
     }
 }
 
-/// What a query's relative dates (`today`, `yesterday`, `2w`) resolve
-/// against (SEARCH §8.1). Calendar spans are read in UTC.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The instant and the zone a query's dates resolve in (SEARCH §8.1).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirSearchClock {
     /// The query's now, Unix seconds; `None` for the clock's.
     pub now: Option<i64>,
+    /// The IANA zone of its calendar spans, `None` for UTC.
+    pub zone: Option<String>,
 }
 
 impl PimdirSearchClock {
     /// The query's now, Unix seconds.
     pub fn now(&self) -> i64 {
         self.now.unwrap_or_else(unix_now)
+    }
+
+    /// The query's zone, [`PimdirError::IndexZone`] when unknown.
+    fn time_zone(&self) -> Result<TimeZone, PimdirError> {
+        match self.zone.as_deref() {
+            None => Ok(TimeZone::UTC),
+            Some(zone) => TimeZone::get(zone).map_err(|_| PimdirError::IndexZone(zone.into())),
+        }
     }
 }
 
@@ -474,6 +483,14 @@ impl PimdirIndex {
             .query_row_cached(search::LOAD_INDEX_META, [], |row| row.get(2))?)
     }
 
+    /// The IANA zone the index reads floating times in (SEARCH §7).
+    pub fn floating_zone(&self) -> Result<String, PimdirError> {
+        let zone: Option<String> =
+            self.conn
+                .query_row_cached(search::LOAD_INDEX_META, [], |row| row.get(11))?;
+        Ok(zone.unwrap_or_else(|| occurrence::FLOATING_ZONE.into()))
+    }
+
     /// Folds the store's change feed into the index (SEARCH §4), in
     /// transactions of at most `options.batch` rows, until the feed is
     /// exhausted or the deadline passes.
@@ -595,11 +612,8 @@ impl PimdirIndex {
     /// handle opened by [`open_query`](Self::open_query) is
     /// [`PimdirError::IndexQueryOnly`].
     pub fn erase(&mut self) -> Result<PimdirIndexReport, PimdirError> {
-        let zone: Option<String> =
-            self.conn
-                .query_row_cached(search::LOAD_INDEX_META, [], |row| row.get(11))?;
         let options = PimdirIndexRefreshOptions {
-            floating_zone: zone.unwrap_or_else(|| occurrence::FLOATING_ZONE.into()),
+            floating_zone: self.floating_zone()?,
             ..Default::default()
         };
         let report = self.refresh(&options)?;
@@ -624,7 +638,8 @@ impl PimdirIndex {
         options: &PimdirSearchOptions,
     ) -> Result<PimdirSearchOutput, PimdirError> {
         let now = options.clock.now();
-        let mut compiled = self.compile(query, now)?;
+        let zone = options.clock.time_zone()?;
+        let mut compiled = self.compile(query, now, &zone)?;
         // NOTE: one more than asked, so the page knows whether it is the
         // last without a count.
         let probe = options.limit.saturating_add(1);
@@ -640,7 +655,7 @@ impl PimdirIndex {
         Ok(PimdirSearchOutput {
             hits,
             more,
-            coverage: self.coverage(query, now)?,
+            coverage: self.coverage(query, now, &zone)?,
         })
     }
 
@@ -655,7 +670,8 @@ impl PimdirIndex {
         options: &PimdirSearchOptions,
     ) -> Result<PimdirSearchThreadsOutput, PimdirError> {
         let now = options.clock.now();
-        let mut compiled = self.compile(query, now)?;
+        let zone = options.clock.time_zone()?;
+        let mut compiled = self.compile(query, now, &zone)?;
         let found = self.found(&mut compiled, options.sort, None)?;
 
         let mut groups: Vec<(Option<String>, Vec<Found>)> = Vec::new();
@@ -712,7 +728,7 @@ impl PimdirIndex {
         Ok(PimdirSearchThreadsOutput {
             threads,
             more,
-            coverage: self.coverage(query, now)?,
+            coverage: self.coverage(query, now, &zone)?,
         })
     }
 
@@ -830,14 +846,15 @@ impl PimdirIndex {
     }
 
     /// How many hits a query has, with what the count could not see, its
-    /// relative dates resolved against `clock`.
+    /// dates resolved against `clock`.
     pub fn count(
         &self,
         query: &PimdirQuery,
         clock: &PimdirSearchClock,
     ) -> Result<PimdirSearchCountOutput, PimdirError> {
         let now = clock.now();
-        let compiled = self.compile(query, now)?;
+        let zone = clock.time_zone()?;
+        let compiled = self.compile(query, now, &zone)?;
         let count: i64 = self
             .conn
             .query_row(
@@ -849,7 +866,7 @@ impl PimdirIndex {
 
         Ok(PimdirSearchCountOutput {
             count: count as u64,
-            coverage: self.coverage(query, now)?,
+            coverage: self.coverage(query, now, &zone)?,
         })
     }
 
@@ -1021,10 +1038,15 @@ impl PimdirIndex {
 
     /// A query compiled with its `linked:` ends and its `category:` values
     /// resolved, its text terms' matches read into `temp.term_match`.
-    fn compile(&self, query: &PimdirQuery, now: i64) -> Result<Compiled, PimdirError> {
+    fn compile(
+        &self,
+        query: &PimdirQuery,
+        now: i64,
+        zone: &TimeZone,
+    ) -> Result<Compiled, PimdirError> {
         let ends = self.ends(query)?;
         let categories = self.categories(query)?;
-        let compiled = Compiled::new(query, ends, categories, now);
+        let compiled = Compiled::new(query, ends, categories, now, zone.clone());
 
         self.conn.execute_cached(search::CLEAR_TERM_MATCH, [])?;
         for matches in &compiled.matches {
@@ -1200,7 +1222,12 @@ impl PimdirIndex {
     /// (`coverage`) and those the index has not folded in yet, and for a
     /// query bounded by date the calendar items cut before its end
     /// (`cut_before`, SEARCH §8.2).
-    fn coverage(&self, query: &PimdirQuery, now: i64) -> Result<PimdirSearchCoverage, PimdirError> {
+    fn coverage(
+        &self,
+        query: &PimdirQuery,
+        now: i64,
+        zone: &TimeZone,
+    ) -> Result<PimdirSearchCoverage, PimdirError> {
         let conjuncts = match query {
             PimdirQuery::And(operands) => operands.iter().collect(),
             query => vec![query],
@@ -1222,7 +1249,7 @@ impl PimdirIndex {
                     collections.retain(|c| c.kind == compile::media_type(*kind))
                 }
                 PimdirQueryPredicate::Date(range) => {
-                    let (start, end) = compile::bounds(range, now);
+                    let (start, end) = compile::bounds(range, now, zone);
                     if start > since {
                         since = start;
                     }

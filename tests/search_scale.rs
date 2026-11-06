@@ -226,6 +226,7 @@ fn fifty_thousand_summaries_index_and_answer() {
     let options = PimdirSearchOptions {
         clock: PimdirSearchClock {
             now: Some(1_798_761_600),
+            ..Default::default()
         },
         ..Default::default()
     };

@@ -125,6 +125,11 @@ pub struct SearchCommand {
     #[arg(long)]
     pub threads: bool,
 
+    /// The IANA zone the query's days are read in (`UTC`, `Europe/Paris`),
+    /// the index's floating zone by default.
+    #[arg(long, value_name = "ZONE")]
+    pub zone: Option<String>,
+
     #[command(flatten)]
     pub refresh: RefreshFlags,
 }
@@ -148,7 +153,7 @@ impl SearchCommand {
             sort: self.sort.into(),
             limit,
             offset,
-            clock: PimdirSearchClock::default(),
+            clock: clock(&index, self.zone)?,
         };
 
         if self.threads {
@@ -187,6 +192,11 @@ pub struct CountCommand {
     #[arg(value_name = "QUERY")]
     pub query: String,
 
+    /// The IANA zone the query's days are read in (`UTC`, `Europe/Paris`),
+    /// the index's floating zone by default.
+    #[arg(long, value_name = "ZONE")]
+    pub zone: Option<String>,
+
     #[command(flatten)]
     pub refresh: RefreshFlags,
 }
@@ -198,7 +208,7 @@ impl CountCommand {
         let index = self.refresh.index(store)?;
 
         let answer = index
-            .count(&query, &PimdirSearchClock::default())
+            .count(&query, &clock(&index, self.zone)?)
             .map_err(report)?;
 
         printer.out(CountOutput {
@@ -317,6 +327,11 @@ pub struct TagCommand {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// The IANA zone the query's days are read in (`UTC`, `Europe/Paris`),
+    /// the index's floating zone by default.
+    #[arg(long, value_name = "ZONE")]
+    pub zone: Option<String>,
+
     #[command(flatten)]
     pub refresh: RefreshFlags,
 }
@@ -332,7 +347,7 @@ impl TagCommand {
                 &self.add,
                 &self.remove,
                 store.source.as_deref(),
-                &PimdirSearchClock::default(),
+                &clock(&index, self.zone)?,
             )
             .map_err(report)?;
 
@@ -576,6 +591,18 @@ impl From<SortArg> for PimdirSearchSort {
 /// Parses a query, failing with its refusal (SEARCH §8.4).
 fn parse(query: &str) -> Result<PimdirQuery> {
     PimdirQuery::parse(query).map_err(|err| refusal(query, err))
+}
+
+/// A query's clock in `zone`, else in the index's floating zone.
+fn clock(index: &PimdirIndex, zone: Option<String>) -> Result<PimdirSearchClock> {
+    let zone = match zone {
+        Some(zone) => zone,
+        None => index.floating_zone().map_err(report)?,
+    };
+    Ok(PimdirSearchClock {
+        now: None,
+        zone: Some(zone),
+    })
 }
 
 fn level_name(level: PimdirLevel) -> &'static str {

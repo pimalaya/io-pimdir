@@ -130,7 +130,8 @@ pub enum ErrorCode {
     IndexOutdated,
     /// The index is of another draft or shape.
     IndexVersion,
-    /// The zone the index reads floating times in is not an IANA zone.
+    /// A zone stated for floating times or a query's dates is not an IANA
+    /// zone.
     IndexZoneUnknown,
     /// A refresh was asked of an index opened for queries alone.
     IndexQueryOnly,

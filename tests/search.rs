@@ -292,11 +292,10 @@ fn every_search_vector_answers() {
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
     let vectors = json(&spec.join("vectors/search/queries.json"));
-    assert_eq!(vectors["v"], 2, "queries.json at another version");
+    assert_eq!(vectors["v"], 3, "queries.json at another version");
 
     // NOTE: the horizon is drawn around the vectors' now (SEARCH §11).
     let now = unix(vectors["now"].as_str().unwrap());
-    let clock = PimdirSearchClock { now: Some(now) };
     let mut index = PimdirIndex::open(dir.path()).unwrap();
     let report = index
         .refresh(&PimdirIndexRefreshOptions {
@@ -339,25 +338,65 @@ fn every_search_vector_answers() {
     let cases = vectors["cases"].as_array().unwrap();
     assert!(!cases.is_empty(), "the vectors carry no case");
 
+    let mut zones: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
     for case in cases {
-        let query = case["query"].as_str().unwrap();
-        let outcome = pending::check(|| answers(&index, &store, clock, case));
-        outcomes.push((case_name(query), outcome));
+        if let Some(zone) = case["zone"].as_str() {
+            zones.entry(zone).or_default().push(case);
+            continue;
+        }
+        let clock = clock_of(case, now, None);
+        let outcome = pending::check(|| answers(&index, &store, &clock, case));
+        outcomes.push((case_name(case), outcome));
+    }
+
+    // NOTE: a zoned case needs an index refreshed in its zone (SEARCH §11).
+    for (zone, cases) in zones {
+        index
+            .refresh(&PimdirIndexRefreshOptions {
+                now: Some(now),
+                floating_zone: zone.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let query_index = PimdirIndex::open_query(dir.path()).unwrap();
+        assert_eq!(query_index.floating_zone().unwrap(), zone);
+        for case in cases {
+            let clock = clock_of(case, now, Some(query_index.floating_zone().unwrap()));
+            let outcome = pending::check(|| answers(&query_index, &store, &clock, case));
+            outcomes.push((case_name(case), outcome));
+        }
     }
     pending::settle("queries", outcomes);
 }
 
+/// A case's clock: its own `now` or the file's, in `zone`.
+fn clock_of(case: &Value, now: i64, zone: Option<String>) -> PimdirSearchClock {
+    PimdirSearchClock {
+        now: Some(case["now"].as_str().map_or(now, unix)),
+        zone,
+    }
+}
+
 /// A case's name on the pending list: its query quoted, a long one cut to
-/// its first 40 characters and the count of the rest.
-fn case_name(query: &str) -> String {
+/// its first 40 characters and the count of the rest, then its zone and
+/// now where it states them.
+fn case_name(case: &Value) -> String {
+    let query = case["query"].as_str().unwrap();
     let length = query.chars().count();
-    match length > 60 {
+    let mut name = match length > 60 {
         true => {
             let head: String = query.chars().take(40).collect();
             format!("{head:?} and {} more characters", length - 40)
         }
         false => format!("{query:?}"),
+    };
+    if let Some(zone) = case["zone"].as_str() {
+        name += &format!(" in {zone}");
     }
+    if let Some(now) = case["now"].as_str() {
+        name += &format!(" at {now}");
+    }
+    name
 }
 
 /// One window of an agenda answers the occurrences it states.
@@ -394,7 +433,7 @@ fn occurs(index: &PimdirIndex, window: &Value) {
 }
 
 /// One case answers the hits, the coverage and the refusal it states.
-fn answers(index: &PimdirIndex, store: &Value, clock: PimdirSearchClock, case: &Value) {
+fn answers(index: &PimdirIndex, store: &Value, clock: &PimdirSearchClock, case: &Value) {
     let query = case["query"].as_str().unwrap();
 
     if let Some(error) = case.get("error") {
@@ -424,7 +463,7 @@ fn answers(index: &PimdirIndex, store: &Value, clock: PimdirSearchClock, case: &
         },
         limit: 100,
         offset: 0,
-        clock,
+        clock: clock.clone(),
     };
     if let Some(want) = case.get("threads") {
         let answer = index
@@ -485,7 +524,7 @@ fn answers(index: &PimdirIndex, store: &Value, clock: PimdirSearchClock, case: &
         );
     }
 
-    let count = index.count(&parsed, &clock).unwrap();
+    let count = index.count(&parsed, clock).unwrap();
     assert_eq!(count.count as usize, want.len(), "{query:?}: count");
 
     let expected = bodiless(store, &parsed);
@@ -1809,6 +1848,41 @@ fn another_floating_zone_re_expands_every_calendar_item() {
         starts(dir.path()),
         ["2026-08-01T09:00:00Z", "2026-08-01T12:00:00Z"]
     );
+}
+
+#[test]
+fn a_query_reads_the_index_zone_and_refuses_an_unknown_one() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(dir.path(), "INBOX", message("a@x", "Hello", "Text"), &[]);
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let query = PimdirIndex::open_query(dir.path()).unwrap();
+    assert_eq!(query.floating_zone().unwrap(), "UTC");
+
+    index
+        .refresh(&PimdirIndexRefreshOptions {
+            floating_zone: "Europe/Paris".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(query.floating_zone().unwrap(), "Europe/Paris");
+
+    let clock = PimdirSearchClock {
+        now: None,
+        zone: Some("Mars/Olympus".into()),
+    };
+    let today = PimdirQuery::parse("date:today").unwrap();
+    let Err(err) = query.count(&today, &clock) else {
+        panic!("an unknown zone answered");
+    };
+    assert_eq!(err.code(), "index-zone-unknown");
+    let options = PimdirSearchOptions {
+        clock,
+        ..Default::default()
+    };
+    assert!(query.search(&today, &options).is_err());
 }
 
 /// A body the blob directory does not hold when the index folds its row is
