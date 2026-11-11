@@ -25,11 +25,7 @@ use io_pimdir::{
     placement::{PimdirFlags, PimdirLevel},
 };
 use log::warn;
-use pimalaya_cli::{
-    output::Bytes,
-    printer::Printer,
-    table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
-};
+use pimalaya_cli::{columns::Columns, fields::Fields, output::Bytes, printer::Printer, sanitize};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
@@ -700,6 +696,15 @@ fn flag_list(flags: &PimdirFlags) -> Option<Vec<String>> {
     Some(flags.known()?.iter().cloned().collect())
 }
 
+/// The flags as the text output prints them, joined with `,`, `-` when
+/// none or never read.
+fn flags_text(flags: Option<&[String]>) -> String {
+    match flags.map(|flags| flags.join(",")) {
+        Some(flags) if !flags.is_empty() => sanitize::text(&flags).into_owned(),
+        _ => String::from("-"),
+    }
+}
+
 /// One item as every listing prints it.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -784,54 +789,37 @@ impl fmt::Display for ItemsOutput {
             return writeln!(f, "No {what} item in {}", self.collection);
         }
 
-        let mut table = Table::new();
-        let mut header = vec![Cell::new("SEQ")];
-        if self.retained {
-            header.push(Cell::new("LINK ID"));
+        // NOTE: the title, or a retained item's link id, reads last.
+        let header = if self.retained {
+            ["SEQ", "FLAGS", "LEVEL", "RETAINED AT", "BY", "LINK ID"].as_slice()
         } else {
-            header.push(Cell::new("TITLE"));
-        }
-        header.push(Cell::new("FLAGS"));
-        header.push(Cell::new("LEVEL"));
-        if self.retained {
-            header.push(Cell::new("RETAINED AT"));
-            header.push(Cell::new("BY"));
-        } else {
-            header.push(Cell::new("SORT KEY"));
-        }
-
-        table
-            .load_style(UTF8_FULL)
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(header);
+            ["SEQ", "FLAGS", "LEVEL", "SORT KEY", "TITLE"].as_slice()
+        };
+        let mut columns = Columns::new(header.iter().copied());
 
         for item in &self.items {
-            let mut row = vec![Cell::new(item.seq)];
+            let mut row = vec![
+                item.seq.to_string(),
+                flags_text(item.flags.as_deref()),
+                item.level.to_string(),
+            ];
+
             if self.retained {
-                row.push(Cell::new(&item.link_id));
+                let at = item.retained_at.as_deref().unwrap_or_default();
+                let by = item.retained_by.as_deref().unwrap_or_default();
+                row.push(sanitize::text(at).into_owned());
+                row.push(sanitize::text(by).into_owned());
+                row.push(sanitize::text(&item.link_id).into_owned());
             } else {
-                row.push(Cell::new(or_dash(item.title.as_deref())));
+                let title = item.title.as_deref().unwrap_or_default();
+                row.push(sanitize::text(&item.sort_key).into_owned());
+                row.push(sanitize::text(title).into_owned());
             }
-            row.push(Cell::new(or_dash(
-                item.flags
-                    .as_ref()
-                    .map(|flags| flags.join(" "))
-                    .filter(|f| !f.is_empty())
-                    .as_deref(),
-            )));
-            row.push(Cell::new(item.level));
-            if self.retained {
-                row.push(Cell::new(or_dash(item.retained_at.as_deref())));
-                row.push(Cell::new(or_dash(item.retained_by.as_deref())));
-            } else {
-                row.push(Cell::new(or_dash(
-                    Some(item.sort_key.as_str()).filter(|k| !k.is_empty()),
-                )));
-            }
-            table.add_row(row);
+
+            columns.push(row);
         }
 
-        writeln!(f, "{table}")?;
+        write!(f, "{columns}")?;
 
         // NOTE: a page that stops short says so, or an operator would
         // mistake one page for the whole collection.
@@ -924,98 +912,73 @@ pub struct ItemShowOutput {
 
 impl fmt::Display for ItemShowOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, placement) in self.placements.iter().enumerate() {
+        let mut blocks = Vec::new();
+
+        for placement in &self.placements {
             let item = &placement.item;
-            if index > 0 {
-                writeln!(f)?;
-            }
-            writeln!(f, "Item {} in {}", item.seq, item.collection)?;
-            writeln!(f, " - link id: {}", item.link_id)?;
-            writeln!(
-                f,
-                " - flags: {}",
-                or_dash(
-                    item.flags
-                        .as_ref()
-                        .map(|flags| flags.join(" "))
-                        .filter(|flags| !flags.is_empty())
-                        .as_deref()
-                )
-            )?;
-            writeln!(f, " - level: {}", item.level)?;
-            writeln!(f, " - object: {}", or_dash(item.object.as_deref()))?;
+            let table = item.summary.as_ref().and_then(|s| s["table"].as_str());
+            let mut fields = Fields::default();
+
+            fields.push("Seq", item.seq);
+            fields.push("Collection", sanitize::text(&item.collection));
+            fields.push("Link id", sanitize::text(&item.link_id));
+            fields.push("Flags", flags_text(item.flags.as_deref()));
+            fields.push("Level", item.level);
+            fields.push("Object", or_dash(item.object.as_deref()));
+
             if let Some(size) = item.size {
-                writeln!(f, " - size: {}", bytes(size))?;
+                fields.push("Size", bytes(size));
             }
+
             if let Some(at) = &item.retained_at {
-                writeln!(f, " - retained at: {at}")?;
-                writeln!(
-                    f,
-                    " - retained by: {}",
-                    or_dash(item.retained_by.as_deref())
-                )?;
+                let by = or_dash(item.retained_by.as_deref());
+                fields.push("Retained at", sanitize::text(at));
+                fields.push("Retained by", sanitize::text(by));
             }
-            match &item.summary {
-                Some(summary) => {
-                    for line in summary::lines(summary) {
-                        writeln!(f, "{line}")?;
-                    }
-                }
-                None => writeln!(f, " - summary: none")?,
+
+            fields.push("Summary", or_dash(table));
+            blocks.push(fields);
+
+            if let Some(summary) = &item.summary {
+                blocks.push(summary::fields(summary));
             }
 
             for binding in &placement.bindings {
-                writeln!(f, " - binding {}: {}", binding.source, binding.handle)?;
+                let mut fields = Fields::default();
+                fields.push("Binding", sanitize::text(&binding.source));
+                fields.push("Handle", sanitize::text(&binding.handle));
 
-                if !binding.base {
-                    writeln!(f, "    - base: none")?;
+                if binding.base {
+                    let object = or_dash(binding.base_object.as_deref());
+                    let revision = or_dash(binding.base_revision.as_deref());
+                    fields.push("Base object", object);
+                    fields.push("Base flags", flags_text(binding.base_flags.as_deref()));
+                    fields.push("Base revision", sanitize::text(revision));
                 } else {
-                    writeln!(
-                        f,
-                        "    - base object: {}",
-                        or_dash(binding.base_object.as_deref())
-                    )?;
-                    writeln!(
-                        f,
-                        "    - base flags: {}",
-                        or_dash(
-                            binding
-                                .base_flags
-                                .as_ref()
-                                .map(|flags| flags.join(" "))
-                                .filter(|flags| !flags.is_empty())
-                                .as_deref()
-                        )
-                    )?;
-                    writeln!(
-                        f,
-                        "    - base revision: {}",
-                        or_dash(binding.base_revision.as_deref())
-                    )?;
+                    fields.push("Base", "none");
                 }
 
-                writeln!(
-                    f,
-                    "    - shared object: {}",
-                    or_dash(binding.shared_object.as_deref())
-                )?;
+                fields.push("Shared object", or_dash(binding.shared_object.as_deref()));
 
-                // NOTE: the exception line. Printing it only when it applies
-                // is what makes a diverged binding stand out from the
-                // ordinary ones beside it.
+                // NOTE: printed only when it applies, so a diverged binding
+                // stands out from the ordinary ones beside it.
                 if binding.conflicted {
-                    writeln!(
-                        f,
-                        "    - conflicted at revision: {}",
-                        or_dash(binding.conflict_revision.as_deref())
-                    )?;
-                    writeln!(
-                        f,
-                        "    - conflict object: {}",
-                        or_dash(binding.conflict_object.as_deref())
-                    )?;
+                    let revision = or_dash(binding.conflict_revision.as_deref());
+                    let object = or_dash(binding.conflict_object.as_deref());
+                    fields.push("Conflicted at revision", sanitize::text(revision));
+                    fields.push("Conflict object", object);
                 }
+
+                blocks.push(fields);
             }
+        }
+
+        for (index, block) in blocks.iter().enumerate() {
+            if index > 0 {
+                writeln!(f)?;
+            }
+
+            write!(f, "{block}")?;
         }
 
         Ok(())
@@ -1156,5 +1119,128 @@ impl fmt::Display for ItemEraseOutput {
             writeln!(f, "Erased it from the search index too")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::cli::item::*;
+
+    /// A live INBOX item dated 2026-08-01 with the given title and flags.
+    fn item(seq: i64, title: Option<&str>, flags: Option<&[&str]>) -> ItemRow {
+        ItemRow {
+            collection: String::from("INBOX"),
+            seq,
+            link_id: format!("{seq}@example.org"),
+            flags: flags.map(|flags| flags.iter().map(|flag| flag.to_string()).collect()),
+            level: "full",
+            object: None,
+            size: None,
+            sort_key: String::from("2026-08-01T10:00:00Z"),
+            title: title.map(Into::into),
+            summary: None,
+            retained_at: None,
+            retained_by: None,
+        }
+    }
+
+    #[test]
+    fn a_live_list_ends_with_the_title_and_a_retained_one_with_the_link_id() {
+        let live = ItemsOutput {
+            collection: String::from("INBOX"),
+            retained: false,
+            items: vec![
+                item(
+                    3,
+                    Some("Invoice \u{202e}fdp.exe"),
+                    Some(&["\\Flagged", "\\Seen"]),
+                ),
+                item(1, None, None),
+            ],
+            next_page: Some(String::from("1:2026-08-01T10:00:00Z")),
+        };
+
+        let expected = "\
+SEQ  FLAGS           LEVEL  SORT KEY              TITLE
+3    \\Flagged,\\Seen  full   2026-08-01T10:00:00Z  Invoice \u{fffd}fdp.exe
+1    -               full   2026-08-01T10:00:00Z  -
+More items follow: continue with --page-token 1:2026-08-01T10:00:00Z
+";
+        assert_eq!(live.to_string(), expected);
+
+        let mut gone = item(2, None, Some(&[]));
+        gone.retained_at = Some(String::from("2026-11-11T18:13:39.892Z"));
+        gone.retained_by = Some(String::from("local"));
+
+        let retained = ItemsOutput {
+            collection: String::from("INBOX"),
+            retained: true,
+            items: vec![gone],
+            next_page: None,
+        };
+
+        let expected = "\
+SEQ  FLAGS  LEVEL  RETAINED AT               BY     LINK ID
+2    -      full   2026-11-11T18:13:39.892Z  local  2@example.org
+";
+        assert_eq!(retained.to_string(), expected);
+    }
+
+    #[test]
+    fn a_placement_prints_its_fields_its_summary_then_its_bindings() {
+        let mut shown = item(1, Some("Hi"), Some(&["\\Seen"]));
+        shown.object = Some(String::from("qlxg"));
+        shown.summary = Some(json!({
+            "addresses": [{"address": "alice@example.org", "name": "Alice", "role": "from"}],
+            "row": {"date": null, "subject": "Hi\u{1b}[2J"},
+            "table": "mail_summary",
+        }));
+
+        let binding = BindingRow {
+            source: String::from("local"),
+            handle: String::from("1"),
+            base: true,
+            base_flags: Some(vec![String::from("\\Seen")]),
+            base_object: Some(String::from("qlxg")),
+            base_revision: None,
+            conflicted: true,
+            conflict_revision: Some(String::from("7")),
+            conflict_object: None,
+            shared_object: Some(String::from("qlxg")),
+        };
+
+        let output = ItemShowOutput {
+            seq: 1,
+            placements: vec![ItemPlacement {
+                item: shown,
+                bindings: vec![binding],
+            }],
+        };
+
+        let expected = "\
+Seq:         1
+Collection:  INBOX
+Link id:     1@example.org
+Flags:       \\Seen
+Level:       full
+Object:      qlxg
+Summary:     mail_summary
+
+date:     -
+subject:  Hi\u{fffd}[2J
+from:     Alice <alice@example.org>
+
+Binding:                 local
+Handle:                  1
+Base object:             qlxg
+Base flags:              \\Seen
+Base revision:           -
+Shared object:           qlxg
+Conflicted at revision:  7
+Conflict object:         -
+";
+        assert_eq!(output.to_string(), expected);
     }
 }

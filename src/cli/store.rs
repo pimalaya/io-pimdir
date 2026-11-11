@@ -4,10 +4,7 @@ use std::fmt;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use pimalaya_cli::{
-    printer::Printer,
-    table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
-};
+use pimalaya_cli::{columns::Columns, fields::Fields, printer::Printer, sanitize};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -152,75 +149,114 @@ pub struct StoreInfoOutput {
 
 impl fmt::Display for StoreInfoOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Store at {}", self.path)?;
-        writeln!(
-            f,
-            " - id: {}, incarnation {}",
-            self.store_id, self.incarnation
-        )?;
-        writeln!(
-            f,
-            " - format: {}, schema version {} (read {}, produce {})",
-            self.format_version, self.schema_version, self.read_version, self.produce_version
-        )?;
-        writeln!(
-            f,
-            " - derivation: revision {}, sync: {}",
-            self.derivation,
-            self.sync_version.as_deref().unwrap_or("none yet")
-        )?;
-        writeln!(
-            f,
-            " - sources: {}",
-            if self.sources.is_empty() {
-                String::from("none yet")
-            } else {
-                self.sources.join(", ")
-            }
-        )?;
-        writeln!(
-            f,
-            " - items: {} live, {} retained",
-            self.live_items, self.retained_items
-        )?;
-        writeln!(
-            f,
-            " - objects: {} ({} total, {} live, {} retained)",
-            self.objects,
-            bytes(self.object_bytes),
-            bytes(self.live_bytes),
-            bytes(self.retained_bytes)
-        )?;
-        writeln!(
-            f,
-            " - change feed: last stamp {}, {} purge(s)",
-            self.last_change, self.purges
-        )?;
+        let sync_version = self.sync_version.as_deref().unwrap_or("-");
+        let sources = self.sources.join(",");
+        let sources = if sources.is_empty() { "-" } else { &sources };
+        let mut fields = Fields::default();
+
+        fields.push("Path", sanitize::text(&self.path));
+        fields.push("Store id", &self.store_id);
+        fields.push("Incarnation", self.incarnation);
+        fields.push("Format version", &self.format_version);
+        fields.push("Schema version", self.schema_version);
+        fields.push("Read version", self.read_version);
+        fields.push("Produce version", self.produce_version);
+        fields.push("Derivation", self.derivation);
+        fields.push("Sync version", sanitize::text(sync_version));
+        fields.push("Sources", sanitize::text(sources));
+        fields.push("Live items", self.live_items);
+        fields.push("Retained items", self.retained_items);
+        fields.push("Objects", self.objects);
+        fields.push("Object bytes", bytes(self.object_bytes));
+        fields.push("Live bytes", bytes(self.live_bytes));
+        fields.push("Retained bytes", bytes(self.retained_bytes));
+        fields.push("Last change", self.last_change);
+        fields.push("Purges", self.purges);
+
+        write!(f, "{fields}")?;
 
         if self.collections.is_empty() {
-            return writeln!(f, " - collections: none yet");
+            return Ok(());
         }
 
-        writeln!(f)?;
-
-        let mut table = Table::new();
-        table
-            .load_style(UTF8_FULL)
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                Cell::new("COLLECTION"),
-                Cell::new("LIVE"),
-                Cell::new("RETAINED"),
-            ]);
+        // NOTE: the collection id is the free-text column, so it reads last.
+        let mut columns = Columns::new(["LIVE", "RETAINED", "COLLECTION"]);
 
         for collection in &self.collections {
-            table.add_row(vec![
-                Cell::new(&collection.id),
-                Cell::new(collection.live),
-                Cell::new(collection.retained),
+            columns.push([
+                collection.live.to_string(),
+                collection.retained.to_string(),
+                sanitize::text(&collection.id).into_owned(),
             ]);
         }
 
-        writeln!(f, "{table}")
+        write!(f, "\n{columns}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::store::*;
+
+    #[test]
+    fn the_summary_prints_fields_then_its_collections() {
+        let output = StoreInfoOutput {
+            path: String::from("/var/pimdir"),
+            store_id: String::from("e2646df031cd876334410c4df14ebd86"),
+            incarnation: 1,
+            format_version: String::from("storage-draft-09"),
+            schema_version: 1,
+            read_version: 1,
+            produce_version: 1,
+            derivation: 3,
+            sync_version: None,
+            sources: vec![String::from("left"), String::from("right")],
+            collections: vec![
+                StoreCollectionCount {
+                    id: String::from("Archives/2026"),
+                    live: 120,
+                    retained: 0,
+                },
+                StoreCollectionCount {
+                    id: String::from("INBOX"),
+                    live: 2,
+                    retained: 1,
+                },
+            ],
+            live_items: 122,
+            retained_items: 1,
+            objects: 123,
+            object_bytes: 2048,
+            live_bytes: 1536,
+            retained_bytes: 512,
+            last_change: 11,
+            purges: 0,
+        };
+
+        let expected = "\
+Path:             /var/pimdir
+Store id:         e2646df031cd876334410c4df14ebd86
+Incarnation:      1
+Format version:   storage-draft-09
+Schema version:   1
+Read version:     1
+Produce version:  1
+Derivation:       3
+Sync version:     -
+Sources:          left,right
+Live items:       122
+Retained items:   1
+Objects:          123
+Object bytes:     2.0 KiB
+Live bytes:       1.5 KiB
+Retained bytes:   512 B
+Last change:      11
+Purges:           0
+
+LIVE  RETAINED  COLLECTION
+120   0         Archives/2026
+2     1         INBOX
+";
+        assert_eq!(output.to_string(), expected);
     }
 }

@@ -4,14 +4,11 @@ use std::fmt;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use pimalaya_cli::{
-    printer::Printer,
-    table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
-};
+use pimalaya_cli::{columns::Columns, printer::Printer, sanitize};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, error::report, or_dash};
+use crate::cli::{StoreFlags, error::report};
 
 /// Inspect the store's collections.
 ///
@@ -115,10 +112,10 @@ pub struct CollectionRow {
 }
 
 impl CollectionRow {
-    /// The coverage as the table shows it.
+    /// The coverage as the text list shows it, empty for none.
     fn coverage(&self) -> String {
         if self.covered_at.is_none() {
-            return String::from("-");
+            return String::new();
         }
         match (&self.covered_since, &self.covered_until) {
             (None, None) => String::from("all"),
@@ -143,34 +140,71 @@ impl fmt::Display for CollectionsOutput {
             return writeln!(f, "This store holds no collection yet");
         }
 
-        let mut table = Table::new();
-        table
-            .load_style(UTF8_FULL)
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                Cell::new("ID"),
-                Cell::new("KIND"),
-                Cell::new("NAME"),
-                Cell::new("ROLE"),
-                Cell::new("GEN"),
-                Cell::new("LIVE"),
-                Cell::new("COVERED"),
-                Cell::new("RETAINED"),
-            ]);
+        // NOTE: the name is the free-text column, so it reads last.
+        let header = [
+            "ID", "KIND", "ROLE", "GEN", "LIVE", "COVERED", "RETAINED", "NAME",
+        ];
+        let mut columns = Columns::new(header);
 
         for row in &self.collections {
-            table.add_row(vec![
-                Cell::new(&row.id),
-                Cell::new(or_dash(row.kind.as_deref())),
-                Cell::new(&row.name),
-                Cell::new(or_dash(row.role.as_deref())),
-                Cell::new(row.generation),
-                Cell::new(row.live),
-                Cell::new(row.coverage()),
-                Cell::new(row.retained),
+            let kind = row.kind.as_deref().unwrap_or_default();
+            let role = row.role.as_deref().unwrap_or_default();
+
+            columns.push([
+                sanitize::text(&row.id).into_owned(),
+                sanitize::text(kind).into_owned(),
+                sanitize::text(role).into_owned(),
+                row.generation.to_string(),
+                row.live.to_string(),
+                sanitize::text(&row.coverage()).into_owned(),
+                row.retained.to_string(),
+                sanitize::text(&row.name).into_owned(),
             ]);
         }
 
-        writeln!(f, "{table}")
+        write!(f, "{columns}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::collection::*;
+
+    /// A row with the given id, name and role, no kind and no coverage.
+    fn row(id: &str, name: &str, role: Option<&str>) -> CollectionRow {
+        CollectionRow {
+            id: id.into(),
+            kind: None,
+            name: name.into(),
+            description: None,
+            color: None,
+            default: false,
+            generation: 1,
+            role: role.map(Into::into),
+            live: 2,
+            covered_since: None,
+            covered_until: None,
+            covered_at: None,
+            retained: 0,
+        }
+    }
+
+    #[test]
+    fn the_list_prints_plain_columns_ending_with_the_name() {
+        let mut covered = row("INBOX", "Inbox \u{202e}gpj.exe", Some("inbox"));
+        covered.kind = Some("message/rfc822".into());
+        covered.covered_since = Some("2026-01-01".into());
+        covered.covered_at = Some("2026-11-11T10:00:00Z".into());
+
+        let output = CollectionsOutput {
+            collections: vec![covered, row("contacts", "Personal contacts", None)],
+        };
+
+        let expected = "\
+ID        KIND            ROLE   GEN  LIVE  COVERED           RETAINED  NAME
+INBOX     message/rfc822  inbox  1    2     since 2026-01-01  0         Inbox \u{fffd}gpj.exe
+contacts  -               -      1    2     -                 0         Personal contacts
+";
+        assert_eq!(output.to_string(), expected);
     }
 }

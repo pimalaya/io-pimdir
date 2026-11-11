@@ -51,7 +51,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [build-dependencies]
-pimalaya-cli = { version = "0.3", default-features = false, features = ["build"], optional = true }
+pimalaya-cli = { version = "0.4", default-features = false, features = ["build"], optional = true }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
@@ -61,7 +61,7 @@ tempfile = { version = "3", default-features = false }
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"], optional = true }
 blake3 = { version = "1", default-features = false }
-clap = { version = "4.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "wrap_help"], optional = true }
+clap = { version = "4.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"], optional = true }
 encoding_rs = { version = "0.8", default-features = false, features = ["alloc"], optional = true }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 humantime = { version = "2.2", default-features = false, optional = true }
@@ -69,7 +69,7 @@ ical-rs = { version = "0.7", default-features = false, features = ["parser", "tz
 jiff = { version = "0.2.33", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
 log = { version = "0.4", default-features = false }
 mime-rs = { version = "0.1", default-features = false, features = ["parser", "base64", "encoding"], optional = true }
-pimalaya-cli = { version = "0.3", default-features = false, features = ["prompt", "table", "terminal"], optional = true }
+pimalaya-cli = { version = "0.4", default-features = false, features = ["prompt", "terminal"], optional = true }
 rusqlite = { version = "0.41", default-features = false, features = ["cache"], optional = true }
 schemars = { version = "1", default-features = false, features = ["derive", "std"], optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: Changed the CLI's lists to print as plain text: an uppercase header, then one item per line in columns two spaces apart, an empty cell as `-`, with no border, no colour and no truncation.
+
+  The free-text column reads last (`collection list` ends with NAME, `item list` with TITLE or, under `--retained`, LINK ID, `queue list` with TARGET then, under `--parked`, ERROR, and the collection counts of `store info` with COLLECTION), and an item's flags join with `,`. The `--json` output is unchanged.
+
+- **BREAKING**: Changed the CLI's records to print as aligned `Label: value` lines: `store info`, its collection counts following as a list, and `item show`, each placement as the item's fields, its summary row's and each binding's, one blank line apart.
+- Changed the CLI's `--help` to print each paragraph on one line, no longer wrapped to the terminal width.
+- Bumped pimalaya-cli to 0.4.
+
+### Removed
+
+- Removed the comfy-table dependency.
+
+### Fixed
+
+- Fixed control and bidi characters from the store (collection ids and names, titles, flags, link ids, summary values, handles, queue payloads and errors) reaching the terminal through the text output of `collection list`, `item list`, `item show`, `queue list` and `store info`.
+
 ## [0.10.0] - 2026-11-11
 
 ### Added

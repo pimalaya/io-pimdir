@@ -208,7 +208,7 @@ pub fn bytes(count: u64) -> String {
     }
 }
 
-/// A value that may be absent, rendered as a dash in a table cell.
+/// A value that may be absent, rendered as a dash in the text output.
 pub fn or_dash(value: Option<&str>) -> &str {
     value.unwrap_or("-")
 }

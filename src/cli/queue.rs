@@ -15,10 +15,7 @@ use io_pimdir::{
     codec::{PimdirAction, action_to_payload},
 };
 use log::warn;
-use pimalaya_cli::{
-    printer::Printer,
-    table::{Cell, ContentArrangement, Table, presets::UTF8_FULL},
-};
+use pimalaya_cli::{columns::Columns, printer::Printer, sanitize};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -355,7 +352,7 @@ pub struct QueueRow {
     pub kind: String,
     /// The action's payload, as the queue stores it.
     pub payload: String,
-    /// What the text table shows of it: ids, hashes and flags, or the
+    /// What the text list shows of it: ids, hashes and flags, or the
     /// payload of a parked row.
     #[serde(skip)]
     pub target: String,
@@ -384,42 +381,43 @@ impl fmt::Display for QueueOutput {
             let what = if self.parked { "parked" } else { "pending" };
             writeln!(f, "No {what} action in this store's queue")?;
         } else {
-            let mut table = Table::new();
+            // NOTE: the target, then a parked row's error, read last.
             let mut header = vec![
-                Cell::new("ID"),
-                Cell::new("CREATED"),
-                Cell::new("PRODUCER"),
-                Cell::new("COLLECTION"),
-                Cell::new("ACTION"),
-                Cell::new("TARGET"),
-                Cell::new("TRIES"),
+                "ID",
+                "CREATED",
+                "PRODUCER",
+                "COLLECTION",
+                "ACTION",
+                "TRIES",
+                "TARGET",
             ];
+
             if self.parked {
-                header.push(Cell::new("ERROR"));
+                header.push("ERROR");
             }
 
-            table
-                .load_style(UTF8_FULL)
-                .set_content_arrangement(ContentArrangement::Dynamic)
-                .set_header(header);
+            let mut columns = Columns::new(header);
 
             for action in &self.actions {
                 let mut row = vec![
-                    Cell::new(action.row),
-                    Cell::new(&action.created_at),
-                    Cell::new(&action.producer),
-                    Cell::new(&action.collection),
-                    Cell::new(&action.kind),
-                    Cell::new(&action.target),
-                    Cell::new(action.attempts),
+                    action.row.to_string(),
+                    sanitize::text(&action.created_at).into_owned(),
+                    sanitize::text(&action.producer).into_owned(),
+                    sanitize::text(&action.collection).into_owned(),
+                    sanitize::text(&action.kind).into_owned(),
+                    action.attempts.to_string(),
+                    sanitize::text(&action.target).into_owned(),
                 ];
+
                 if self.parked {
-                    row.push(Cell::new(or_dash(action.error.as_deref())));
+                    let error = action.error.as_deref().unwrap_or_default();
+                    row.push(sanitize::text(error).into_owned());
                 }
-                table.add_row(row);
+
+                columns.push(row);
             }
 
-            writeln!(f, "{table}")?;
+            write!(f, "{columns}")?;
         }
 
         // NOTE: never silently short: a collection left out of the
@@ -446,5 +444,35 @@ pub struct QueueCancelOutput {
 impl fmt::Display for QueueCancelOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Dropped queued action {}", self.row)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::queue::*;
+
+    #[test]
+    fn a_parked_list_ends_with_the_target_then_the_error() {
+        let output = QueueOutput {
+            parked: true,
+            actions: vec![QueueRow {
+                row: 4,
+                created_at: String::from("2026-11-11T18:13:39.904Z"),
+                producer: String::from("himalaya"),
+                collection: String::from("INBOX"),
+                kind: String::from("set-flags"),
+                payload: String::from("{\"seq\":1}"),
+                target: String::from("{\"seq\":1}"),
+                attempts: 3,
+                error: Some(String::from("no such seq\u{7}")),
+            }],
+            undecodable: Vec::new(),
+        };
+
+        let expected = "\
+ID  CREATED                   PRODUCER  COLLECTION  ACTION     TRIES  TARGET     ERROR
+4   2026-11-11T18:13:39.904Z  himalaya  INBOX       set-flags  3      {\"seq\":1}  no such seq\u{fffd}
+";
+        assert_eq!(output.to_string(), expected);
     }
 }

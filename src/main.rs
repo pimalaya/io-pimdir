@@ -38,7 +38,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use pimalaya_cli::{
     clap::{
         args::{JsonFlag, LogFlags},
-        commands::{CompletionCommand, JsonSchemaCommand, ManualCommand},
+        commands::{
+            completion::CompletionCommand, json_schema::JsonSchemaCommand, manual::ManualCommand,
+        },
     },
     error::ErrorReport,
     footer,

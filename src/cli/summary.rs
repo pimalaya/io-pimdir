@@ -3,6 +3,7 @@
 //! serde, so this is the one adapter every verb prints a summary through.
 
 use io_pimdir::summary::{PimdirSummary, calendar::PimdirTime};
+use pimalaya_cli::{fields::Fields, sanitize};
 use serde_json::{Map, Value, json};
 
 /// A summary as `{ table, row, addresses }`, the columns spelled as the
@@ -20,31 +21,31 @@ pub fn json(summary: &PimdirSummary) -> Value {
     json!({ "table": table, "row": row, "addresses": addresses })
 }
 
-/// The lines `item show` prints under a placement, off the value
+/// The fields `item show` prints under a placement, off the value
 /// [`json()`] built: one per column, then one per address.
-pub fn lines(summary: &Value) -> Vec<String> {
-    let mut lines = vec![format!(
-        " - summary ({}):",
-        summary["table"].as_str().unwrap_or("?")
-    )];
+pub fn fields(summary: &Value) -> Fields<'_> {
+    let mut fields = Fields::default();
+
     for (column, value) in summary["row"].as_object().into_iter().flatten() {
         let value = match value {
             Value::Null => String::from("-"),
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
-        lines.push(format!("    - {column}: {value}"));
+        fields.push(column, sanitize::text(&value).into_owned());
     }
+
     for address in summary["addresses"].as_array().into_iter().flatten() {
         let role = address["role"].as_str().unwrap_or("?");
         let spec = address["address"].as_str().unwrap_or("?");
-        match address["name"].as_str() {
-            Some(name) => lines.push(format!("    - {role}: {name} <{spec}>")),
-            None => lines.push(format!("    - {role}: {spec}")),
-        }
+        let value = match address["name"].as_str() {
+            Some(name) => format!("{name} <{spec}>"),
+            None => spec.to_string(),
+        };
+        fields.push(role, sanitize::text(&value).into_owned());
     }
 
-    lines
+    fields
 }
 
 /// The summary's table and its columns, in the table's order.

@@ -8,9 +8,11 @@
 //! one of two shapes is described by both, through [`OneOf`], their keys
 //! telling them apart.
 //!
-//! [`JsonSchemaCommand`]: pimalaya_cli::clap::commands::JsonSchemaCommand
+//! [`JsonSchemaCommand`]: pimalaya_cli::clap::commands::json_schema::JsonSchemaCommand
 
-use pimalaya_cli::{clap::commands::JsonSchemaRegistry, error::ErrorReport, output::Bytes};
+use pimalaya_cli::{
+    clap::commands::json_schema::JsonSchemaRegistry, error::ErrorReport, output::Bytes,
+};
 use schemars::JsonSchema;
 
 use crate::cli::{
