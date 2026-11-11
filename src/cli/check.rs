@@ -19,7 +19,7 @@ use std::{collections::BTreeSet, fmt, path::PathBuf};
 use anyhow::Result;
 use clap::Args;
 use io_pimdir::client::blobs::PimdirBlobStrayKind;
-use pimalaya_cli::printer::Printer;
+use pimalaya_cli::{printer::Printer, sanitize};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -281,7 +281,8 @@ impl fmt::Display for CheckOutput {
                 bytes(self.orphan_bytes)
             )?;
             for orphan in self.orphans.iter().take(SHOWN) {
-                writeln!(f, " - {} ({})", orphan.hash, bytes(orphan.size))?;
+                let hash = sanitize::text(&orphan.hash);
+                writeln!(f, " - {hash} ({})", bytes(orphan.size))?;
             }
             more(f, self.orphans.len())?;
             writeln!(f, "   Reclaim them with `pimdir gc`")?;
@@ -294,7 +295,9 @@ impl fmt::Display for CheckOutput {
                 self.strays.len()
             )?;
             for stray in self.strays.iter().take(SHOWN) {
-                writeln!(f, " - {} ({})", stray.path.display(), stray.kind)?;
+                let path = stray.path.to_string_lossy();
+                let path = sanitize::text(&path);
+                writeln!(f, " - {path} ({})", stray.kind)?;
             }
             more(f, self.strays.len())?;
         }
@@ -306,7 +309,9 @@ impl fmt::Display for CheckOutput {
                 self.quarantined.len()
             )?;
             for path in self.quarantined.iter().take(SHOWN) {
-                writeln!(f, " - {}", path.display())?;
+                let path = path.to_string_lossy();
+                let path = sanitize::text(&path);
+                writeln!(f, " - {path}")?;
             }
             more(f, self.quarantined.len())?;
         }
@@ -318,6 +323,7 @@ impl fmt::Display for CheckOutput {
                 self.missing.len()
             )?;
             for hash in self.missing.iter().take(SHOWN) {
+                let hash = sanitize::text(hash);
                 writeln!(f, " - {hash}")?;
             }
             more(f, self.missing.len())?;
@@ -329,7 +335,9 @@ impl fmt::Display for CheckOutput {
                 writeln!(
                     f,
                     " - {}: stored {}, references {}",
-                    drift.hash, drift.stored, drift.expected
+                    sanitize::text(&drift.hash),
+                    drift.stored,
+                    drift.expected
                 )?;
             }
             more(f, self.drift.len())?;
@@ -341,7 +349,9 @@ impl fmt::Display for CheckOutput {
                 writeln!(
                     f,
                     " - {} {} points at a missing {}",
-                    dangling.kind, dangling.row, dangling.target
+                    sanitize::text(&dangling.kind),
+                    sanitize::text(&dangling.row),
+                    sanitize::text(&dangling.target)
                 )?;
             }
             more(f, self.dangling.len())?;
@@ -359,7 +369,8 @@ impl fmt::Display for CheckOutput {
                 "Minted keys, the second copies of an identity a source holds twice:"
             )?;
             for minted in self.minted.iter().take(SHOWN) {
-                writeln!(f, " - {}: {} item(s)", minted.collection, minted.items)?;
+                let collection = sanitize::text(&minted.collection);
+                writeln!(f, " - {collection}: {} item(s)", minted.items)?;
             }
             more(f, self.minted.len())?;
         }
@@ -395,5 +406,46 @@ fn stray_kind(kind: PimdirBlobStrayKind) -> &'static str {
         PimdirBlobStrayKind::Temporary => "temporary",
         PimdirBlobStrayKind::Link => "link",
         PimdirBlobStrayKind::Foreign => "foreign",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::check::*;
+
+    #[test]
+    fn the_findings_print_what_the_store_names_sanitized() {
+        let output = CheckOutput {
+            orphans: Vec::new(),
+            orphan_bytes: 0,
+            strays: vec![StrayEntry {
+                kind: "foreign",
+                path: PathBuf::from("objects/\u{1b}]52;c;aGk=\u{7}"),
+            }],
+            quarantined: Vec::new(),
+            missing: Vec::new(),
+            drift: Vec::new(),
+            dangling: vec![DanglingRow {
+                kind: String::from("binding"),
+                row: String::from("local/1\u{1b}[2J"),
+                target: String::from("item 7"),
+            }],
+            minted: vec![MintedKeys {
+                collection: String::from("INBOX\u{202e}"),
+                items: 2,
+            }],
+            repaired: 0,
+            cleared: 0,
+        };
+
+        let expected = "\
+1 entry(ies) under objects/ that are no body, left in place:
+ - objects/\u{fffd}]52;c;aGk=\u{fffd} (foreign)
+1 dangling row(s):
+ - binding local/1\u{fffd}[2J points at a missing item 7
+Minted keys, the second copies of an identity a source holds twice:
+ - INBOX\u{fffd}: 2 item(s)
+";
+        assert_eq!(output.to_string(), expected);
     }
 }

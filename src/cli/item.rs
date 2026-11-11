@@ -25,7 +25,13 @@ use io_pimdir::{
     placement::{PimdirFlags, PimdirLevel},
 };
 use log::warn;
-use pimalaya_cli::{columns::Columns, fields::Fields, output::Bytes, printer::Printer, sanitize};
+use pimalaya_cli::{
+    fields::Fields,
+    output::Bytes,
+    printer::Printer,
+    records::{Record, Records},
+    sanitize,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
@@ -789,42 +795,42 @@ impl fmt::Display for ItemsOutput {
             return writeln!(f, "No {what} item in {}", self.collection);
         }
 
-        // NOTE: the title, or a retained item's link id, reads last.
-        let header = if self.retained {
-            ["SEQ", "FLAGS", "LEVEL", "RETAINED AT", "BY", "LINK ID"].as_slice()
-        } else {
-            ["SEQ", "FLAGS", "LEVEL", "SORT KEY", "TITLE"].as_slice()
-        };
-        let mut columns = Columns::new(header.iter().copied());
+        let mut records = Records::default();
 
         for item in &self.items {
-            let mut row = vec![
-                item.seq.to_string(),
-                flags_text(item.flags.as_deref()),
-                item.level.to_string(),
-            ];
+            let flags = item.flags.iter().flatten();
+            let state = flags.map(|flag| sanitize::text(flag).into_owned());
+            let title = item.title.as_deref().unwrap_or_default();
+            let mut fields = Fields::default();
+
+            fields.push("Level", item.level);
 
             if self.retained {
-                let at = item.retained_at.as_deref().unwrap_or_default();
-                let by = item.retained_by.as_deref().unwrap_or_default();
-                row.push(sanitize::text(at).into_owned());
-                row.push(sanitize::text(by).into_owned());
-                row.push(sanitize::text(&item.link_id).into_owned());
+                let at = or_dash(item.retained_at.as_deref());
+                let by = or_dash(item.retained_by.as_deref());
+                fields.push("Retained at", sanitize::text(at));
+                fields.push("Retained by", sanitize::text(by));
+                fields.push("Link id", sanitize::text(&item.link_id));
             } else {
-                let title = item.title.as_deref().unwrap_or_default();
-                row.push(sanitize::text(&item.sort_key).into_owned());
-                row.push(sanitize::text(title).into_owned());
+                let key = Some(item.sort_key.as_str()).filter(|key| !key.is_empty());
+                fields.push("Sort key", sanitize::text(or_dash(key)));
             }
 
-            columns.push(row);
+            records.push(Record {
+                title: item.seq.to_string(),
+                state: state.collect(),
+                fields,
+                body: sanitize::text(title).into_owned(),
+            });
         }
 
-        write!(f, "{columns}")?;
+        write!(f, "{records}")?;
 
         // NOTE: a page that stops short says so, or an operator would
         // mistake one page for the whole collection.
         if let Some(next) = &self.next_page {
-            writeln!(f, "More items follow: continue with --page-token {next}")?;
+            let next = sanitize::text(next);
+            writeln!(f, "\nMore items follow: continue with --page-token {next}")?;
         }
 
         Ok(())
@@ -1147,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_list_ends_with_the_title_and_a_retained_one_with_the_link_id() {
+    fn a_list_prints_one_record_per_item_its_flags_as_state() {
         let live = ItemsOutput {
             collection: String::from("INBOX"),
             retained: false,
@@ -1155,7 +1161,7 @@ mod tests {
                 item(
                     3,
                     Some("Invoice \u{202e}fdp.exe"),
-                    Some(&["\\Flagged", "\\Seen"]),
+                    Some(&["\\Flagged", "$Junk\u{7}"]),
                 ),
                 item(1, None, None),
             ],
@@ -1163,14 +1169,21 @@ mod tests {
         };
 
         let expected = "\
-SEQ  FLAGS           LEVEL  SORT KEY              TITLE
-3    \\Flagged,\\Seen  full   2026-08-01T10:00:00Z  Invoice \u{fffd}fdp.exe
-1    -               full   2026-08-01T10:00:00Z  -
+3 (\\Flagged, $Junk\u{fffd})
+Level:     full
+Sort key:  2026-08-01T10:00:00Z
+
+    Invoice \u{fffd}fdp.exe
+
+1
+Level:     full
+Sort key:  2026-08-01T10:00:00Z
+
 More items follow: continue with --page-token 1:2026-08-01T10:00:00Z
 ";
         assert_eq!(live.to_string(), expected);
 
-        let mut gone = item(2, None, Some(&[]));
+        let mut gone = item(2, Some("Lunch?"), Some(&[]));
         gone.retained_at = Some(String::from("2026-11-11T18:13:39.892Z"));
         gone.retained_by = Some(String::from("local"));
 
@@ -1182,8 +1195,13 @@ More items follow: continue with --page-token 1:2026-08-01T10:00:00Z
         };
 
         let expected = "\
-SEQ  FLAGS  LEVEL  RETAINED AT               BY     LINK ID
-2    -      full   2026-11-11T18:13:39.892Z  local  2@example.org
+2
+Level:        full
+Retained at:  2026-11-11T18:13:39.892Z
+Retained by:  local
+Link id:      2@example.org
+
+    Lunch?
 ";
         assert_eq!(retained.to_string(), expected);
     }

@@ -31,7 +31,13 @@ use io_pimdir::{
         tag::PimdirSearchTagSource,
     },
 };
-use pimalaya_cli::printer::Printer;
+use pimalaya_cli::{
+    columns::Columns,
+    fields::Fields,
+    printer::Printer,
+    records::{Record, Records},
+    sanitize,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -669,28 +675,11 @@ impl fmt::Display for SearchOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.hits.is_empty() {
             writeln!(f, "No hit")?;
-        }
-        for hit in &self.hits {
-            let account = hit
-                .account
-                .as_deref()
-                .map(|account| format!(" --account {account}"))
-                .unwrap_or_default();
-            writeln!(f, "{}{account} [{}] {}", hit.seq, hit.kind, hit.title)?;
-            let collections: Vec<&str> = hit
-                .placements
-                .iter()
-                .map(|placement| placement.collection.as_str())
-                .collect();
-            writeln!(
-                f,
-                " - in {}, matched {}",
-                collections.join(", "),
-                hit.matched.map(Matched::as_str).unwrap_or("by its fields")
-            )?;
-            if let Some(snippet) = &hit.snippet {
-                writeln!(f, " - {snippet}")?;
-            }
+        } else {
+            let records = Records {
+                items: self.hits.iter().map(HitRow::record).collect(),
+            };
+            writeln!(f, "{records}")?;
         }
         if let Some(token) = &self.next_page {
             writeln!(f, "More hits follow: pass --page-token {token}")?;
@@ -718,26 +707,40 @@ impl fmt::Display for SearchThreadsOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.threads.is_empty() {
             writeln!(f, "No hit")?;
-        }
-        for thread in &self.threads {
-            let account = thread
-                .account
-                .as_deref()
-                .map(|account| format!(" in account {account}"))
-                .unwrap_or_default();
-            match &thread.thread {
-                Some(id) => writeln!(
-                    f,
-                    "Thread {id}{account}: {} message(s), {} to {}",
-                    thread.count,
-                    or_dash(thread.first.as_deref()),
-                    or_dash(thread.last.as_deref())
-                )?,
-                None => writeln!(f, "No thread{account}")?,
+        } else {
+            let mut records = Records::default();
+
+            for thread in &self.threads {
+                let mut fields = Fields::default();
+                let mut hits = Columns::default();
+
+                if let Some(account) = &thread.account {
+                    fields.push("Account", sanitize::text(account));
+                }
+
+                let first = or_dash(thread.first.as_deref());
+                let last = or_dash(thread.last.as_deref());
+                fields.push("Messages", thread.count);
+                fields.push("First", sanitize::text(first));
+                fields.push("Last", sanitize::text(last));
+
+                for hit in &thread.hits {
+                    hits.push([
+                        hit.seq.to_string(),
+                        sanitize::text(&hit.kind).into_owned(),
+                        sanitize::text(&hit.title).into_owned(),
+                    ]);
+                }
+
+                records.push(Record {
+                    title: sanitize::text(or_dash(thread.thread.as_deref())).into_owned(),
+                    state: Vec::new(),
+                    fields,
+                    body: hits.to_string(),
+                });
             }
-            for hit in &thread.hits {
-                writeln!(f, " - {} [{}] {}", hit.seq, hit.kind, hit.title)?;
-            }
+
+            writeln!(f, "{records}")?;
         }
         if let Some(token) = &self.next_page {
             writeln!(f, "More threads follow: pass --page-token {token}")?;
@@ -782,25 +785,29 @@ impl From<&PimdirSearchThread> for ThreadRow {
 
 impl fmt::Display for ThreadRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let account = self
-            .account
-            .as_deref()
-            .map(|account| format!(" in account {account}"))
-            .unwrap_or_default();
-        match &self.thread {
-            Some(id) => writeln!(
-                f,
-                "Thread {id}{account}: {} message(s), {} to {}",
-                self.count,
-                or_dash(self.first.as_deref()),
-                or_dash(self.last.as_deref())
-            )?,
-            None => writeln!(f, "No thread{account}: the item stands alone")?,
+        let mut fields = Fields::default();
+
+        fields.push("Thread", sanitize::text(or_dash(self.thread.as_deref())));
+
+        if let Some(account) = &self.account {
+            fields.push("Account", sanitize::text(account));
         }
-        for hit in &self.hits {
-            writeln!(f, " - {} {} {}", hit.seq, hit.sort_key, hit.title)?;
+
+        fields.push("Messages", self.count);
+        fields.push("First", sanitize::text(or_dash(self.first.as_deref())));
+        fields.push("Last", sanitize::text(or_dash(self.last.as_deref())));
+
+        write!(f, "{fields}")?;
+
+        if self.hits.is_empty() {
+            return Ok(());
         }
-        Ok(())
+
+        let records = Records {
+            items: self.hits.iter().map(HitRow::record).collect(),
+        };
+
+        write!(f, "\n{records}")
     }
 }
 
@@ -826,41 +833,58 @@ pub struct TagOutput {
 
 impl fmt::Display for TagOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.hits.is_empty() {
-            writeln!(f, "No hit: nothing to tag")?;
-        }
         let mut statuses = BTreeMap::new();
+        let mut records = Records::default();
+
         for hit in &self.hits {
-            writeln!(f, "{} [{}] {}", hit.seq, hit.kind, hit.title)?;
+            let mut fields = Fields::default();
+
+            if let Some(account) = &hit.account {
+                fields.push("Account", sanitize::text(account));
+            }
+
+            fields.push("Kind", sanitize::text(&hit.kind));
+            fields.push("Title", sanitize::text(&hit.title));
+
             for placement in &hit.placements {
-                *statuses.entry(placement.status.as_str()).or_insert(0) += 1;
-                let next = placement
-                    .next
-                    .as_ref()
-                    .map(|flags| flags.join(" "))
-                    .unwrap_or_else(|| "-".into());
-                writeln!(
-                    f,
-                    " - in {}: {} ({})",
-                    placement.collection,
-                    next,
-                    placement.status.as_str()
-                )?;
+                let status = placement.status.as_str();
+                let next = placement.next.as_ref().map(|flags| flags.join(" "));
+                let mut value = format!(
+                    "{}: {} ({status})",
+                    sanitize::text(&placement.collection),
+                    sanitize::text(next.as_deref().unwrap_or("-")),
+                );
+
                 if !placement.missing.is_empty() {
-                    writeln!(
-                        f,
-                        "   not staged: its source supports no {}",
-                        placement.missing.join(", ")
-                    )?;
+                    let missing = placement.missing.join(", ");
+                    let missing = sanitize::text(&missing);
+                    value.push_str(&format!("\nnot staged: its source supports no {missing}"));
                 } else if !placement.syncs && placement.source.is_some() {
                     let why = match hit.kind.as_str() {
                         "mail" => "its source declares no support for these flags",
                         _ => "its source carries no flags for this kind",
                     };
-                    writeln!(f, "   kept in the store only: {why}")?;
+                    value.push_str(&format!("\nkept in the store only: {why}"));
                 }
+
+                *statuses.entry(status).or_insert(0) += 1;
+                fields.push("Placement", value);
             }
+
+            records.push(Record {
+                title: hit.seq.to_string(),
+                state: Vec::new(),
+                fields,
+                body: String::new(),
+            });
         }
+
+        if self.hits.is_empty() {
+            writeln!(f, "No hit: nothing to tag")?;
+        } else {
+            writeln!(f, "{records}")?;
+        }
+
         for (status, count) in &statuses {
             writeln!(f, "{count} placement(s) {status}")?;
         }
@@ -1052,6 +1076,37 @@ impl From<&PimdirSearchHit> for HitRow {
     }
 }
 
+impl HitRow {
+    /// The hit as a text list prints it, its snippet as the body.
+    fn record(&self) -> Record<'static> {
+        let placements = self.placements.iter();
+        let collections = placements.map(|placement| placement.collection.as_str());
+        let collections = collections.collect::<Vec<_>>().join(", ");
+        let sort_key = Some(self.sort_key.as_str()).filter(|key| !key.is_empty());
+        let mut fields = Fields::default();
+
+        if let Some(account) = &self.account {
+            fields.push("Account", sanitize::text(account));
+        }
+
+        fields.push("Kind", sanitize::text(&self.kind));
+        fields.push("Title", sanitize::text(&self.title));
+        fields.push("Collections", sanitize::text(&collections));
+        fields.push("Sort key", sanitize::text(or_dash(sort_key)));
+
+        if let Some(matched) = self.matched {
+            fields.push("Matched", matched.as_str());
+        }
+
+        Record {
+            title: self.seq.to_string(),
+            state: Vec::new(),
+            fields,
+            body: sanitize::text(self.snippet.as_deref().unwrap_or_default()).into_owned(),
+        }
+    }
+}
+
 /// One placement of a hit.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1174,6 +1229,7 @@ impl fmt::Display for CoverageRow {
         writeln!(f, "Coverage: partial")?;
         for (kind, count) in &self.local.bodiless {
             if *count > 0 {
+                let kind = sanitize::text(kind);
                 writeln!(
                     f,
                     " - {count} {kind} item(s) without a body, searched by summary"
@@ -1201,9 +1257,11 @@ impl fmt::Display for CoverageRow {
         } = &self.temporal
         {
             if let Some(since) = since {
+                let since = sanitize::text(since);
                 writeln!(f, " - items before {since} are not all held")?;
             }
             if let Some(until) = until {
+                let until = sanitize::text(until);
                 writeln!(f, " - items from {until} on are not all held")?;
             }
             if *filling {
@@ -1303,47 +1361,53 @@ pub struct ShowOutput {
 
 impl fmt::Display for ShowOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let account = self
-            .account
-            .as_deref()
-            .map(|account| format!(" in account {account}"))
-            .unwrap_or_default();
-        writeln!(
-            f,
-            "Item {}{account} [{}] {}",
-            self.seq, self.kind, self.title
-        )?;
-        for placement in &self.placements {
-            writeln!(
-                f,
-                " - in {} as {} ({})",
-                placement.collection, placement.link_id, placement.level
-            )?;
-        }
-        writeln!(
-            f,
-            " - read from its {}, {}",
-            self.source.as_str(),
-            self.status
-        )?;
+        // NOTE: line by line, so a multi-line text keeps its breaks.
+        let lines = |text: &str| -> String {
+            let lines = text.trim_end().lines().map(sanitize::text);
+            lines.collect::<Vec<_>>().join("\n")
+        };
+        let mut fields = Fields::default();
 
-        let fields = [
-            ("people", &self.fields.people),
-            ("attachments", &self.fields.attachment),
-            ("place", &self.fields.place),
-            ("org", &self.fields.org),
+        fields.push("Seq", self.seq);
+
+        if let Some(account) = &self.account {
+            fields.push("Account", sanitize::text(account));
+        }
+
+        fields.push("Kind", sanitize::text(&self.kind));
+        fields.push("Title", sanitize::text(&self.title));
+
+        for placement in &self.placements {
+            let collection = sanitize::text(&placement.collection);
+            let link_id = sanitize::text(&placement.link_id);
+            let level = &placement.level;
+            fields.push("Placement", format!("{collection} as {link_id} ({level})"));
+        }
+
+        fields.push("Read from", self.source.as_str());
+        fields.push("Status", sanitize::text(&self.status));
+
+        let texts = [
+            ("People", &self.fields.people),
+            ("Attachments", &self.fields.attachment),
+            ("Place", &self.fields.place),
+            ("Org", &self.fields.org),
         ];
-        for (name, text) in fields {
+
+        for (label, text) in texts {
             if !text.is_empty() {
-                writeln!(f, " - {name}: {}", text.replace('\n', "; "))?;
+                fields.push(label, lines(text));
             }
         }
+
+        write!(f, "{fields}")?;
+
         for text in [&self.fields.body, &self.fields.note] {
             if !text.is_empty() {
-                writeln!(f)?;
-                writeln!(f, "{}", text.trim_end())?;
+                writeln!(f, "\n{}", lines(text))?;
             }
         }
+
         Ok(())
     }
 }
@@ -1394,4 +1458,286 @@ pub struct ChunkRow {
     pub start: usize,
     /// The byte after its last.
     pub end: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::search::*;
+
+    /// A complete coverage.
+    fn complete() -> CoverageRow {
+        CoverageRow {
+            complete: true,
+            local: LocalRow {
+                bodiless: BTreeMap::new(),
+                unindexed: 0,
+                behind: 0,
+            },
+            temporal: TemporalRow::Full,
+            remote: RemoteRow::LocalOnly,
+            horizon_left: false,
+            cut: 0,
+        }
+    }
+
+    /// The placement of an item in `collection`.
+    fn placement(collection: &str) -> PlacementRow {
+        PlacementRow {
+            collection: String::from(collection),
+            link_id: String::from("a@example.org"),
+            flags: Some(Vec::new()),
+            object: None,
+            level: String::from("full"),
+            sort_key: String::from("2026-08-01T10:00:00Z"),
+        }
+    }
+
+    /// A mail hit dated 2026-08-01 in INBOX, without account or snippet.
+    fn hit(seq: i64, title: &str) -> HitRow {
+        HitRow {
+            account: None,
+            seq,
+            kind: String::from("mail"),
+            title: String::from(title),
+            sort_key: String::from("2026-08-01T10:00:00Z"),
+            matched: None,
+            snippet: None,
+            placements: vec![placement("INBOX")],
+        }
+    }
+
+    #[test]
+    fn a_search_prints_one_record_per_hit_its_snippet_as_the_body() {
+        let mut invoice = hit(3, "Invoice \u{202e}fdp.exe");
+        invoice.account = Some(String::from("work"));
+        invoice.matched = Some(Matched::Body);
+        invoice.snippet = Some(String::from("…pay \u{1b}]52;c;aGk=\u{7} now…"));
+        invoice.placements.push(placement("Archives/2026"));
+
+        let mut alice = hit(7, "Alice");
+        alice.account = Some(String::from("work"));
+        alice.kind = String::from("contact");
+        alice.sort_key = String::from("alice");
+        alice.placements = vec![placement("contacts")];
+
+        let mut coverage = complete();
+        coverage.complete = false;
+        coverage
+            .local
+            .bodiless
+            .insert(String::from("text/vcard\u{1b}[2J"), 1);
+
+        let output = SearchOutput {
+            query: String::from("invoice"),
+            hits: vec![invoice, alice],
+            next_page: Some(String::from("2")),
+            coverage,
+        };
+
+        let expected = "\
+3
+Account:      work
+Kind:         mail
+Title:        Invoice \u{fffd}fdp.exe
+Collections:  INBOX, Archives/2026
+Sort key:     2026-08-01T10:00:00Z
+Matched:      body
+
+    …pay \u{fffd}]52;c;aGk=\u{fffd} now…
+
+7
+Account:      work
+Kind:         contact
+Title:        Alice
+Collections:  contacts
+Sort key:     alice
+
+More hits follow: pass --page-token 2
+Coverage: partial
+ - 1 text/vcard\u{fffd}[2J item(s) without a body, searched by summary
+";
+        assert_eq!(output.to_string(), expected);
+    }
+
+    #[test]
+    fn threads_print_one_record_each_their_hits_as_the_body() {
+        let mut alice = hit(7, "Alice");
+        alice.kind = String::from("contact");
+
+        let output = SearchThreadsOutput {
+            query: String::from("report or alice"),
+            threads: vec![
+                ThreadRow {
+                    account: None,
+                    thread: Some(String::from("a@example.org")),
+                    count: 3,
+                    first: Some(String::from("2026-08-01T10:00:00Z")),
+                    last: Some(String::from("2026-08-02T10:00:00Z")),
+                    hits: vec![hit(1, "Report"), hit(14, "Re: \u{1b}[31mReport")],
+                },
+                ThreadRow {
+                    account: None,
+                    thread: None,
+                    count: 1,
+                    first: None,
+                    last: None,
+                    hits: vec![alice],
+                },
+            ],
+            next_page: None,
+            coverage: complete(),
+        };
+
+        let expected = "\
+a@example.org
+Messages:  3
+First:     2026-08-01T10:00:00Z
+Last:      2026-08-02T10:00:00Z
+
+    1   mail  Report
+    14  mail  Re: \u{fffd}[31mReport
+
+-
+Messages:  1
+First:     -
+Last:      -
+
+    7  contact  Alice
+
+Coverage: complete
+";
+        assert_eq!(output.to_string(), expected);
+    }
+
+    #[test]
+    fn a_thread_prints_its_fields_then_its_hits() {
+        let mut first = hit(1, "Report");
+        first.snippet = Some(String::from("a words"));
+
+        let output = ThreadRow {
+            account: None,
+            thread: Some(String::from("a@example.org")),
+            count: 2,
+            first: Some(String::from("2026-08-01T10:00:00Z")),
+            last: Some(String::from("2026-08-01T10:00:00Z")),
+            hits: vec![first, hit(4, "Re: Report\u{7}")],
+        };
+
+        let expected = "\
+Thread:    a@example.org
+Messages:  2
+First:     2026-08-01T10:00:00Z
+Last:      2026-08-01T10:00:00Z
+
+1
+Kind:         mail
+Title:        Report
+Collections:  INBOX
+Sort key:     2026-08-01T10:00:00Z
+
+    a words
+
+4
+Kind:         mail
+Title:        Re: Report\u{fffd}
+Collections:  INBOX
+Sort key:     2026-08-01T10:00:00Z
+";
+        assert_eq!(output.to_string(), expected);
+    }
+
+    #[test]
+    fn a_tag_prints_one_record_per_hit_and_a_field_per_placement() {
+        let placement = |collection: &str, status, missing: &[&str]| TagPlacementRow {
+            collection: String::from(collection),
+            link_id: String::from("c@example.org"),
+            flags: Some(vec![String::from("\\Seen")]),
+            next: Some(vec![String::from("\\Flagged"), String::from("\\Seen")]),
+            status,
+            source: Some(String::from("local")),
+            sources: vec![String::from("local")],
+            syncs: true,
+            missing: missing.iter().map(|name| name.to_string()).collect(),
+            row: None,
+        };
+
+        let output = TagOutput {
+            query: String::from("invoice"),
+            dry_run: true,
+            add: vec![String::from("\\Flagged")],
+            remove: Vec::new(),
+            hits: vec![TagHitRow {
+                account: None,
+                seq: 3,
+                kind: String::from("mail"),
+                title: String::from("Invoice \u{202e}fdp.exe"),
+                placements: vec![
+                    placement("INBOX", TagStatus::Planned, &[]),
+                    placement("Old\u{1b}[2J", TagStatus::Unsupported, &["flags"]),
+                ],
+            }],
+            coverage: complete(),
+        };
+
+        let expected = "\
+3
+Kind:       mail
+Title:      Invoice \u{fffd}fdp.exe
+Placement:  INBOX: \\Flagged \\Seen (planned)
+Placement:  Old\u{fffd}[2J: \\Flagged \\Seen (unsupported)
+            not staged: its source supports no flags
+
+1 placement(s) planned
+1 placement(s) unsupported
+Coverage: complete
+";
+        assert_eq!(output.to_string(), expected);
+    }
+
+    #[test]
+    fn show_prints_fields_then_the_text_line_by_line() {
+        let output = ShowOutput {
+            account: None,
+            seq: 1,
+            kind: String::from("mail"),
+            title: String::from("Hi\u{1b}[2J"),
+            source: Matched::Body,
+            status: String::from("ok"),
+            placements: vec![placement("INBOX")],
+            fields: FieldsRow {
+                title: String::from("Hi\u{1b}[2J"),
+                people: String::from("Alice <alice@example.org>\nbob@example.org"),
+                body: String::from("Hello\n\u{1b}]52;c;aGk=\u{7}\n\nBye\n"),
+                attachment: String::new(),
+                place: String::new(),
+                org: String::new(),
+                note: String::new(),
+                from: String::new(),
+                to: String::new(),
+                cc: String::new(),
+                bcc: String::new(),
+                email: String::new(),
+                organizer: String::new(),
+                attendee: String::new(),
+            },
+            chunks: Vec::new(),
+        };
+
+        let expected = "\
+Seq:        1
+Kind:       mail
+Title:      Hi\u{fffd}[2J
+Placement:  INBOX as a@example.org (full)
+Read from:  body
+Status:     ok
+People:     Alice <alice@example.org>
+            bob@example.org
+
+Hello
+\u{fffd}]52;c;aGk=\u{fffd}
+
+Bye
+";
+        assert_eq!(output.to_string(), expected);
+    }
 }

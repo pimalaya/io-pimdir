@@ -15,7 +15,12 @@ use io_pimdir::{
     codec::{PimdirAction, action_to_payload},
 };
 use log::warn;
-use pimalaya_cli::{columns::Columns, printer::Printer, sanitize};
+use pimalaya_cli::{
+    fields::Fields,
+    printer::Printer,
+    records::{Record, Records},
+    sanitize,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -381,48 +386,42 @@ impl fmt::Display for QueueOutput {
             let what = if self.parked { "parked" } else { "pending" };
             writeln!(f, "No {what} action in this store's queue")?;
         } else {
-            // NOTE: the target, then a parked row's error, read last.
-            let mut header = vec![
-                "ID",
-                "CREATED",
-                "PRODUCER",
-                "COLLECTION",
-                "ACTION",
-                "TRIES",
-                "TARGET",
-            ];
-
-            if self.parked {
-                header.push("ERROR");
-            }
-
-            let mut columns = Columns::new(header);
+            let mut records = Records::default();
 
             for action in &self.actions {
-                let mut row = vec![
-                    action.row.to_string(),
-                    sanitize::text(&action.created_at).into_owned(),
-                    sanitize::text(&action.producer).into_owned(),
-                    sanitize::text(&action.collection).into_owned(),
-                    sanitize::text(&action.kind).into_owned(),
-                    action.attempts.to_string(),
-                    sanitize::text(&action.target).into_owned(),
-                ];
+                let mut fields = Fields::default();
+
+                fields.push("Created", sanitize::text(&action.created_at));
+                fields.push("Producer", sanitize::text(&action.producer));
+                fields.push("Collection", sanitize::text(&action.collection));
+                fields.push("Action", sanitize::text(&action.kind));
+                fields.push("Tries", action.attempts);
+                fields.push("Target", sanitize::text(&action.target));
 
                 if self.parked {
-                    let error = action.error.as_deref().unwrap_or_default();
-                    row.push(sanitize::text(error).into_owned());
+                    let error = or_dash(action.error.as_deref());
+                    fields.push("Error", sanitize::text(error));
                 }
 
-                columns.push(row);
+                records.push(Record {
+                    title: action.row.to_string(),
+                    state: Vec::new(),
+                    fields,
+                    body: String::new(),
+                });
             }
 
-            write!(f, "{columns}")?;
+            write!(f, "{records}")?;
+
+            if !self.undecodable.is_empty() {
+                writeln!(f)?;
+            }
         }
 
         // NOTE: never silently short: a collection left out of the
         // listing is said out loud.
         for collection in &self.undecodable {
+            let collection = sanitize::text(collection);
             writeln!(
                 f,
                 "The pending actions of {collection} could not be decoded and are not listed; the next drain will park them"
@@ -452,7 +451,7 @@ mod tests {
     use crate::cli::queue::*;
 
     #[test]
-    fn a_parked_list_ends_with_the_target_then_the_error() {
+    fn a_parked_list_prints_one_record_per_action() {
         let output = QueueOutput {
             parked: true,
             actions: vec![QueueRow {
@@ -470,8 +469,14 @@ mod tests {
         };
 
         let expected = "\
-ID  CREATED                   PRODUCER  COLLECTION  ACTION     TRIES  TARGET     ERROR
-4   2026-11-11T18:13:39.904Z  himalaya  INBOX       set-flags  3      {\"seq\":1}  no such seq\u{fffd}
+4
+Created:     2026-11-11T18:13:39.904Z
+Producer:    himalaya
+Collection:  INBOX
+Action:      set-flags
+Tries:       3
+Target:      {\"seq\":1}
+Error:       no such seq\u{fffd}
 ";
         assert_eq!(output.to_string(), expected);
     }

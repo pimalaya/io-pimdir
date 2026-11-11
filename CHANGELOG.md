@@ -8,11 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
-- **BREAKING**: Changed the CLI's lists to print as plain text: an uppercase header, then one item per line in columns two spaces apart, an empty cell as `-`, with no border, no colour and no truncation.
+- **BREAKING**: Changed the CLI's lists to print as plain text, with no border, no colour and no truncation.
 
-  The free-text column reads last (`collection list` ends with NAME, `item list` with TITLE or, under `--retained`, LINK ID, `queue list` with TARGET then, under `--parked`, ERROR, and the collection counts of `store info` with COLLECTION), and an item's flags join with `,`. The `--json` output is unchanged.
+  A wide list prints one record per item, the way `git log` prints commits: a title line with its state words in parentheses, aligned `Label: value` fields, then its free text indented by four spaces, one blank line between items. `collection list` titles each collection by its id, `item list` each item by its seq with its flags as state words and its title as the text, `queue list` each action by its id, `search` and `thread` each hit by its seq with its snippet as the text, `search --threads` each thread by its id with one line per hit as the text, and `tag` each hit by its seq with one field per placement. The collection counts of `store info` print as columns two spaces apart under an uppercase header. The `--json` output is unchanged.
 
-- **BREAKING**: Changed the CLI's records to print as aligned `Label: value` lines: `store info`, its collection counts following as a list, and `item show`, each placement as the item's fields, its summary row's and each binding's, one blank line apart.
+- **BREAKING**: Changed the CLI's records to print as aligned `Label: value` lines: `store info`, its collection counts following as a list, `item show`, each placement as the item's fields, its summary row's and each binding's, one blank line apart, `show`, then its body and note, and the thread of `thread`, then its hits.
 - Changed the CLI's `--help` to print each paragraph on one line, no longer wrapped to the terminal width.
 - Bumped pimalaya-cli to 0.4.
 
@@ -22,7 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
-- Fixed control and bidi characters from the store (collection ids and names, titles, flags, link ids, summary values, handles, queue payloads and errors) reaching the terminal through the text output of `collection list`, `item list`, `item show`, `queue list` and `store info`.
+- Fixed control and bidi characters from the store (collection ids and names, titles, flags, link ids, sort keys, summary values, handles, queue payloads and errors) reaching the terminal through the text output of `collection list`, `item list`, `item show`, `queue list` and `store info`.
+- Fixed control and bidi characters from the store (titles, snippets, extracted texts, kinds, collections, link ids, accounts, thread ids, the coverage's media types and dates, and `check`'s hashes, paths, rows and collections) reaching the terminal through the text output of `search`, `thread`, `tag`, `show` and `check`: a crafted subject could write the clipboard through OSC 52 or clear the screen.
 
 ## [0.10.0] - 2026-11-11
 

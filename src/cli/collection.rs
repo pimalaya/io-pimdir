@@ -4,11 +4,16 @@ use std::fmt;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use pimalaya_cli::{columns::Columns, printer::Printer, sanitize};
+use pimalaya_cli::{
+    fields::Fields,
+    printer::Printer,
+    records::{Record, Records},
+    sanitize,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, error::report};
+use crate::cli::{StoreFlags, error::report, or_dash};
 
 /// Inspect the store's collections.
 ///
@@ -112,10 +117,10 @@ pub struct CollectionRow {
 }
 
 impl CollectionRow {
-    /// The coverage as the text list shows it, empty for none.
+    /// The coverage as the text list shows it, `-` for none.
     fn coverage(&self) -> String {
         if self.covered_at.is_none() {
-            return String::new();
+            return String::from("-");
         }
         match (&self.covered_since, &self.covered_until) {
             (None, None) => String::from("all"),
@@ -140,29 +145,28 @@ impl fmt::Display for CollectionsOutput {
             return writeln!(f, "This store holds no collection yet");
         }
 
-        // NOTE: the name is the free-text column, so it reads last.
-        let header = [
-            "ID", "KIND", "ROLE", "GEN", "LIVE", "COVERED", "RETAINED", "NAME",
-        ];
-        let mut columns = Columns::new(header);
+        let mut records = Records::default();
 
         for row in &self.collections {
-            let kind = row.kind.as_deref().unwrap_or_default();
-            let role = row.role.as_deref().unwrap_or_default();
+            let mut fields = Fields::default();
 
-            columns.push([
-                sanitize::text(&row.id).into_owned(),
-                sanitize::text(kind).into_owned(),
-                sanitize::text(role).into_owned(),
-                row.generation.to_string(),
-                row.live.to_string(),
-                sanitize::text(&row.coverage()).into_owned(),
-                row.retained.to_string(),
-                sanitize::text(&row.name).into_owned(),
-            ]);
+            fields.push("Name", sanitize::text(&row.name));
+            fields.push("Kind", sanitize::text(or_dash(row.kind.as_deref())));
+            fields.push("Role", sanitize::text(or_dash(row.role.as_deref())));
+            fields.push("Generation", row.generation);
+            fields.push("Live", row.live);
+            fields.push("Coverage", sanitize::text(&row.coverage()));
+            fields.push("Retained", row.retained);
+
+            records.push(Record {
+                title: sanitize::text(&row.id).into_owned(),
+                state: Vec::new(),
+                fields,
+                body: String::new(),
+            });
         }
 
-        write!(f, "{columns}")
+        write!(f, "{records}")
     }
 }
 
@@ -190,20 +194,34 @@ mod tests {
     }
 
     #[test]
-    fn the_list_prints_plain_columns_ending_with_the_name() {
+    fn the_list_prints_one_record_per_collection() {
         let mut covered = row("INBOX", "Inbox \u{202e}gpj.exe", Some("inbox"));
         covered.kind = Some("message/rfc822".into());
         covered.covered_since = Some("2026-01-01".into());
         covered.covered_at = Some("2026-11-11T10:00:00Z".into());
 
         let output = CollectionsOutput {
-            collections: vec![covered, row("contacts", "Personal contacts", None)],
+            collections: vec![covered, row("contacts\u{1b}[2J", "Personal", None)],
         };
 
         let expected = "\
-ID        KIND            ROLE   GEN  LIVE  COVERED           RETAINED  NAME
-INBOX     message/rfc822  inbox  1    2     since 2026-01-01  0         Inbox \u{fffd}gpj.exe
-contacts  -               -      1    2     -                 0         Personal contacts
+INBOX
+Name:        Inbox \u{fffd}gpj.exe
+Kind:        message/rfc822
+Role:        inbox
+Generation:  1
+Live:        2
+Coverage:    since 2026-01-01
+Retained:    0
+
+contacts\u{fffd}[2J
+Name:        Personal
+Kind:        -
+Role:        -
+Generation:  1
+Live:        2
+Coverage:    -
+Retained:    0
 ";
         assert_eq!(output.to_string(), expected);
     }
