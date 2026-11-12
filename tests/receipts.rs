@@ -71,7 +71,7 @@ fn an_applied_add_names_the_item_it_created() {
     else {
         panic!("the drained add is applied");
     };
-    assert_eq!(collection, "Drafts");
+    assert_eq!(collection.as_deref(), Some("Drafts"));
     let reader = PimdirReader::open(dir.path()).unwrap();
     let items = reader.list_items("Drafts", None, 10).unwrap();
     assert_eq!(items.len(), 1);
@@ -240,7 +240,7 @@ fn an_acknowledged_intent_reads_applied_and_a_dropped_one_nowhere() {
     else {
         panic!("an acknowledged intent reads as applied");
     };
-    assert_eq!(collection, "INBOX");
+    assert_eq!(collection.as_deref(), Some("INBOX"));
     assert_eq!(seq, None);
     assert_eq!(
         producer.action_status(withdrawn).unwrap(),
@@ -270,6 +270,37 @@ fn a_parked_intent_is_acknowledged_too() {
     };
 }
 
+/// A receipt outlives the collection its row was queued on (STORAGE
+/// §15.4): the collection deleted, the action still reads applied, naming
+/// no collection, never withdrawn.
+#[test]
+fn a_receipt_outlives_its_collection_and_names_none() {
+    let dir = tempfile::tempdir().unwrap();
+    store(dir.path());
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, DRAFT);
+    let id = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
+    drain(dir.path());
+    let PimdirActionStatus::Applied { seq: created, .. } = producer.action_status(id).unwrap()
+    else {
+        panic!("the drained add is applied");
+    };
+    assert!(created.is_some());
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    assert!(owner.delete_collection("Drafts").unwrap());
+    drop(owner);
+
+    let PimdirActionStatus::Applied {
+        collection, seq, ..
+    } = producer.action_status(id).unwrap()
+    else {
+        panic!("the receipt went with its collection");
+    };
+    assert_eq!((collection, seq), (None, created));
+}
+
 #[test]
 fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
     let dir = tempfile::tempdir().unwrap();
@@ -297,7 +328,7 @@ fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
     else {
         panic!("a replaced intent reads as applied");
     };
-    assert_eq!((collection.as_str(), seq), ("INBOX", None));
+    assert_eq!((collection.as_deref(), seq), (Some("INBOX"), None));
 
     drain(dir.path());
     let PimdirActionStatus::Applied { seq: Some(_), .. } = producer.action_status(change).unwrap()

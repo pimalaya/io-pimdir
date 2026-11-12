@@ -2,10 +2,13 @@
 //! specification vendored under spec/, and bakes the CLI's build
 //! metadata.
 //!
-//! spec/ is a byte-for-byte copy of the pimdir repository's
-//! migrations/storage/, queries/storage/, migrations/search/ and
-//! queries/search/; one file per statement, named after it, the store's
-//! sorted by the profile that runs it. Re-vendor by copying the four
+//! spec/ is a byte-for-byte copy of the pimdir repository's migrations/
+//! and queries/ (with vectors/ and payloads/, which the suites read); one
+//! file per statement under queries/storage/<profile>/ and
+//! queries/search/, named after it. queries/signatures.json, the
+//! specification's own listing of every statement's parameters and
+//! columns, sits beside those directories and is no statement: only the
+//! profile directories are read. Re-vendor by copying the four
 //! directories over, and tests/spec_drift.rs proves the copy against a
 //! sibling checkout.
 

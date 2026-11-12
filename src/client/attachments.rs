@@ -32,7 +32,12 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, named_params};
 
 use crate::{
-    client::{PimdirError, PreparedCached, bind_list, blobs::PimdirBlobs, schema, write::kind_of},
+    client::{
+        PimdirError, PreparedCached, bind_list,
+        blobs::PimdirBlobs,
+        schema,
+        write::{kind_of, stated_size},
+    },
     hub::PimdirHub,
     object::PimdirHash,
     placement::PimdirLinkId,
@@ -211,7 +216,7 @@ fn held_columns(
             sql::HELD_MAIL_SUMMARY,
             named_params! {
                 ":link_id": link.as_str(),
-                ":object": hash.0,
+                ":hash": hash.0,
                 ":account": account,
             },
             |row| {
@@ -435,7 +440,7 @@ pub(crate) fn upsert_file_summary(
             ":link_id": link.as_str(),
             ":name": summary.name,
             ":media_type": summary.media_type,
-            ":size": summary.size.map(|size| size as i64),
+            ":size": summary.size.and_then(stated_size),
             ":part": summary.part,
         },
     )?;

@@ -85,9 +85,9 @@ or debug error dump.
 The CLI's owner role SHALL open the store through `open_current`: the CLI is never the store's sync engine, so it SHALL NOT create a store. A store of another draft, a damaged one or a foreign one fails every verb, whatever its role, with the library's sentence, which names both versions for another draft, written nothing. A verb that enqueues then drains (`item restore`, `tag`) SHALL leave its action queued and report it `queued` when another process owns the store or the database holds no schema yet.
 
 #### Scenario: A binary over another draft's store
-- GIVEN a store marked `storage-draft-09` whose `task_summary` carries a column that draft added
+- GIVEN a store marked `storage-draft-11` whose `task_summary` carries a column that draft added
 - WHEN `pimdir queue cancel`, `pimdir gc` or `pimdir item restore` runs
-- THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`, `a_restore_over_a_store_of_another_draft_is_refused`, its error naming `storage-draft-09`)
+- THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`, `a_restore_over_a_store_of_another_draft_is_refused`, its error naming `storage-draft-11`)
 
 ### Requirement: Destroying data is confirmed
 `item purge`, `item erase`, `quarantine empty` and `queue cancel` SHALL confirm interactively before destroying

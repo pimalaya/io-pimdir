@@ -655,8 +655,10 @@ pub enum PimdirActionStatus {
     Applied {
         /// The RFC 3339 instant it was applied at.
         applied_at: String,
-        /// The collection it was queued on.
-        collection: String,
+        /// The collection it was queued on, following its rename; `None`
+        /// once that collection is gone, a `collection-delete` applied
+        /// included (§15.4).
+        collection: Option<String>,
         /// The item an `add` created, or an acknowledged intent left when
         /// its performer knew it; `None` otherwise.
         seq: Option<i64>,

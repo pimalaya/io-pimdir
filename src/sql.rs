@@ -23,7 +23,7 @@ include!(concat!(env!("OUT_DIR"), "/canonical.rs"));
 /// The STORAGE version whose schema the canonical migrations hold (§4.2),
 /// which `init_store_meta` writes as `store_meta.format_version`: a store
 /// naming another is refused by every profile.
-pub const FORMAT_VERSION: &str = "storage-draft-09";
+pub const FORMAT_VERSION: &str = "storage-draft-10";
 
 /// Declares the crate's own statements and the [`OWN`] index in one
 /// expansion, so a statement is added in one place.
@@ -59,7 +59,7 @@ OBJECT_SIZE = r#"SELECT size FROM objects WHERE hash = :hash;"#;
 /// What a purge with this cutoff would retire, and what its bodies weigh.
 COUNT_RETAINED_BEFORE = r#"SELECT count(*), coalesce(sum(o.size), 0) FROM items i
 LEFT JOIN objects o ON o.hash = i.object_hash
-WHERE i.retained_at IS NOT NULL AND i.retained_at < :cutoff;"#;
+WHERE i.retained_at IS NOT NULL AND i.retained_at < :before;"#;
 
 /// The objects whose stored refcount disagrees with the six pointer columns.
 REFCOUNT_DRIFT = r#"WITH refs(hash) AS (

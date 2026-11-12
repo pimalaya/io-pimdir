@@ -118,7 +118,7 @@ fn a_cancel_leaves_a_store_of_another_draft_as_it_was() {
         .unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch(
-        "UPDATE store_meta SET format_version = 'storage-draft-10';
+        "UPDATE store_meta SET format_version = 'storage-draft-11';
          ALTER TABLE task_summary ADD COLUMN newer TEXT;",
     )
     .unwrap();
@@ -127,7 +127,7 @@ fn a_cancel_leaves_a_store_of_another_draft_as_it_was() {
 
     let refused = PimdirStore::cancel_action(dir.path(), id).err();
     assert!(
-        matches!(&refused, Some(PimdirError::Version { found: Some(found) }) if found == "storage-draft-10"),
+        matches!(&refused, Some(PimdirError::Version { found: Some(found) }) if found == "storage-draft-11"),
         "{refused:?}"
     );
     assert_eq!(

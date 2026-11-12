@@ -9,11 +9,17 @@
 use std::path::Path;
 
 use io_pimdir::{
+    change::PimdirWriteOp,
     client::{
         PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
     },
     codec::PimdirAction,
-    placement::PimdirFlags,
+    collection::PimdirCollectionId,
+    placement::{
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
+        PimdirStatus,
+    },
+    summary::{PimdirAddress, PimdirSummary, mail::PimdirMailSummary},
 };
 
 fn opened(dir: &Path) -> PimdirSourceStore {
@@ -68,6 +74,118 @@ fn a_collection_holding_a_queued_action_is_not_deleted() {
 
     assert!(store.drop_action(id).unwrap());
     assert!(store.delete_collection("INBOX").unwrap());
+}
+
+/// A size no `INTEGER` holds is written as unknown, never as the negative
+/// figure its bits read as, which the schema refuses (STORAGE §13): a
+/// listing stating one lands, and the row says nothing of its size.
+#[test]
+fn a_stated_size_no_integer_holds_is_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+
+    let member = |handle: &str, id: &str, size: u64| {
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            sort_key: Default::default(),
+            collection: PimdirCollectionId("INBOX".into()),
+            handle: PimdirHandle(handle.into()),
+            link_id: Some(PimdirLinkId(id.into())),
+            object: None,
+            level: PimdirLevel::Meta,
+            summary: Some(PimdirSummary::Mail(PimdirMailSummary {
+                message_id: Some(id.into()),
+                size: Some(size),
+                ..Default::default()
+            })),
+            flags: PimdirFlags::default(),
+            status: PimdirStatus::Clean,
+            conflict_revision: None,
+            conflict_object: None,
+            base: Some(PimdirBase {
+                flags: PimdirFlags::default(),
+                revision: None,
+                object: None,
+            }),
+            origin: None,
+        })
+    };
+    store
+        .write(vec![
+            member("1", "huge@example.org", u64::MAX),
+            member("2", "edge@example.org", i64::MAX as u64),
+        ])
+        .unwrap();
+
+    let size = |id: &str| {
+        let seq = store.seq_for_link("INBOX", id).unwrap().unwrap();
+        match store.get_item("INBOX", seq).unwrap().unwrap().summary {
+            Some(PimdirSummary::Mail(mail)) => mail.size,
+            other => panic!("{id}: no mail summary, {other:?}"),
+        }
+    };
+    assert_eq!(size("huge@example.org"), None);
+    assert_eq!(size("edge@example.org"), Some(i64::MAX as u64));
+}
+
+/// A domain is compared, never matched as a pattern (STORAGE §14.1,
+/// `list_domain_placements`): a `_` or a `%` in it stands for itself, and
+/// its ASCII letters compare in either case.
+#[test]
+fn a_domain_is_compared_never_a_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+
+    let from = |handle: &str, address: &str| {
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            sort_key: Default::default(),
+            collection: PimdirCollectionId("INBOX".into()),
+            handle: PimdirHandle(handle.into()),
+            link_id: Some(PimdirLinkId(format!("{handle}@id"))),
+            object: None,
+            level: PimdirLevel::Meta,
+            summary: Some(PimdirSummary::Mail(PimdirMailSummary {
+                from: vec![PimdirAddress {
+                    address: address.into(),
+                    name: None,
+                }],
+                ..Default::default()
+            })),
+            flags: PimdirFlags::default(),
+            status: PimdirStatus::Clean,
+            conflict_revision: None,
+            conflict_object: None,
+            base: Some(PimdirBase {
+                flags: PimdirFlags::default(),
+                revision: None,
+                object: None,
+            }),
+            origin: None,
+        })
+    };
+    store
+        .write(vec![
+            from("1", "ann@my_host.example"),
+            from("2", "bob@myxhost.example"),
+            from("3", "eve@sub.my_host.example"),
+        ])
+        .unwrap();
+
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let addresses = |domain: &str| -> Vec<String> {
+        let mut found: Vec<String> = reader
+            .domain_placements(domain, None)
+            .unwrap()
+            .into_iter()
+            .map(|placement| placement.address)
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(addresses("my_host.example"), ["ann@my_host.example"]);
+    assert_eq!(addresses("MY_HOST.Example"), ["ann@my_host.example"]);
+    assert_eq!(addresses("myxhost.example"), ["bob@myxhost.example"]);
+    assert!(addresses("%.example").is_empty());
+    assert!(addresses("host.example").is_empty(), "a whole domain");
 }
 
 /// A payload version the owner does not know, for a kind it knows, is a

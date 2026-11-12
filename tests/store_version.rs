@@ -161,7 +161,12 @@ fn the_index_refuses_a_store_of_another_version_and_makes_nothing() {
 /// every profile, naming its version and this one's.
 #[test]
 fn a_store_of_another_version_is_refused_by_every_profile_and_never_written() {
-    for marker in ["storage-v1", "storage-draft-07", "storage-draft-10"] {
+    for marker in [
+        "storage-v1",
+        "storage-draft-07",
+        "storage-draft-09",
+        "storage-draft-11",
+    ] {
         let dir = altered(&format!(
             "UPDATE store_meta SET format_version = '{marker}'"
         ));
@@ -269,7 +274,7 @@ fn a_fresh_store_names_this_draft_and_an_identity() {
     let dir = tempfile::tempdir().unwrap();
     let store = PimdirStore::open(dir.path()).unwrap();
     let meta = store.store_meta().unwrap();
-    assert_eq!(meta.format_version, "storage-draft-09");
+    assert_eq!(meta.format_version, "storage-draft-10");
     assert_eq!(
         (meta.version, meta.read_version, meta.produce_version),
         (1, 1, 1)
@@ -319,6 +324,29 @@ fn a_restored_copy_raises_its_incarnation() {
     assert!(second > first && second > replaced, "above both");
     let cursor = store.change_cursor().unwrap();
     assert_eq!((cursor.store_id, cursor.incarnation), (id, second));
+}
+
+/// Two restores of one backup, the replaced store unread, answer two
+/// incarnations (§8): the stride is drawn, so a consumer of one copy never
+/// takes the other for the store it followed.
+#[test]
+fn two_restores_of_one_backup_answer_two_incarnations() {
+    let backup = tempfile::tempdir().unwrap();
+    drop(PimdirStore::open(backup.path()).unwrap());
+
+    let restored = || {
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(backup.path(), dir.path());
+        restrict(dir.path());
+        let store = PimdirStore::open(dir.path()).unwrap();
+        let before = store.change_cursor().unwrap();
+        let raised = store.raise_incarnation(None).unwrap();
+        assert!(raised > before.incarnation, "above the copy's own");
+        (before.store_id, raised)
+    };
+    let (first, second) = (restored(), restored());
+    assert_eq!(first.0, second.0, "one store, restored twice");
+    assert_ne!(first.1, second.1, "never the same incarnation");
 }
 
 /// The engine's first write records its sync version (STORAGE §4.3); a

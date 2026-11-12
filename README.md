@@ -44,12 +44,12 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard. As STORAGE.md §17, SYNC.md §12 and SEARCH.md §12 ask, it states its conformance as:
 
-> storage-draft-09 owner, sync-draft-09 engine, search-draft-09 indexer (canonical) and query client
+> storage-draft-10 owner, sync-draft-10 engine, search-draft-10 indexer (canonical) and query client
 
 The owner profile holds the reader's and the producer's, and the crate offers each as a handle of its own (`PimdirReader`, `PimdirProducer`, `PimdirStore`); the engine runs the five verbs against a connector you provide, which owes SYNC.md §4 and is not part of this crate. The canonical schema, statements, payload schemas and vectors are vendored under spec/ byte for byte at the pimdir revision spec/REVISION names, the statements generated into the crate at build time, and every vector case passes (tests/pending_vectors.txt is empty). The search index ships behind the `search` feature (off by default, enabled by the operator CLI): with `search` alone the query language, the extraction and the refresh, an I/O-free coroutine yielding typed reads and writes, build without SQLite, so an app holding its own database keeps the same index, and with `client` too `PimdirIndex` runs it over SQLite; it is **experimental**, its API and index build free to change in a minor release.
 
 > [!IMPORTANT]
-> Drafts are exact: a store opens under storage-draft-09 alone, and its sync state under sync-draft-09. A store of any earlier draft, which every earlier release of this crate wrote, is refused by every profile and never migrated: move it aside and let its sync engine create and sync a new one.
+> Drafts are exact: a store opens under storage-draft-10 alone, and its sync state under sync-draft-10. A store of any earlier draft, which every earlier release of this crate wrote, is refused by every profile and never migrated: move it aside and let its sync engine create and sync a new one.
 
 Known deviations, each bounded and stated in cairn/spec/summaries.md or cairn/spec/store.md:
 

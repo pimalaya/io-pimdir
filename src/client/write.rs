@@ -407,6 +407,7 @@ pub(crate) fn apply(
                 scope,
                 band,
             } => {
+                shaped(&scope)?;
                 ensure_collection(tx, &collection.0, account)?;
                 tx.execute_cached(
                     sql::OPEN_ROUND,
@@ -443,6 +444,7 @@ pub(crate) fn apply(
                 coverage,
                 checkpoint,
             } => {
+                shaped(&coverage)?;
                 tx.execute_cached(
                     sql::CLOSE_ROUND,
                     named_params! {
@@ -455,6 +457,7 @@ pub(crate) fn apply(
                 )?;
             }
             PimdirWriteOp::SetCoverage { collection, scope } => {
+                shaped(&scope)?;
                 tx.execute_cached(
                     sql::SET_COVERAGE,
                     named_params! {
@@ -597,6 +600,15 @@ pub(crate) fn apply(
     }
 
     Ok(written)
+}
+
+/// Refuses a scope one of whose bounds the schema would (STORAGE §13),
+/// before its statement runs, so the failure names the bound.
+fn shaped(scope: &PimdirScope) -> Result<(), PimdirError> {
+    match scope.malformed_bound() {
+        Some(bound) => Err(PimdirError::ScopeBound(bound.into())),
+        None => Ok(()),
+    }
 }
 
 fn ensure_collection(
@@ -779,7 +791,7 @@ fn origin_for(
             ":collection": placement.collection.0,
             ":source": source.0,
             ":link_id": link.0,
-            ":object": placement.object.as_ref().map(|o| &o.0),
+            ":hash": placement.object.as_ref().map(|o| &o.0),
         },
         |r| {
             Ok(PimdirOrigin {
@@ -1403,7 +1415,7 @@ fn held_elsewhere(
         named_params! {
             ":collection": collection,
             ":link_id": link.0,
-            ":object": object.map(|hash| hash.0.as_str()),
+            ":hash": object.map(|hash| hash.0.as_str()),
         },
         |_| Ok(()),
     )
@@ -2018,7 +2030,7 @@ fn write_summary(
                 ":sender": mail.sender,
                 ":sender_name": mail.sender_name,
                 ":date": mail.date,
-                ":size": mail.size.map(|size| size as i64),
+                ":size": mail.size.and_then(stated_size),
                 ":attachment": mail.attachment.map(i64::from),
                 ":invitation": mail.invitation,
             },
@@ -2093,7 +2105,7 @@ fn write_summary(
                 ":link_id": link.0,
                 ":name": file.name,
                 ":media_type": file.media_type,
-                ":size": file.size.map(|size| size as i64),
+                ":size": file.size.and_then(stated_size),
                 ":part": file.part,
             },
         )?,
@@ -2109,7 +2121,7 @@ fn write_summary(
                         ":collection": collection,
                         ":link_id": link.0,
                         ":position": position as i64,
-                        ":msg_id": id,
+                        ":message_id": id,
                     },
                 )?;
             }
@@ -2281,6 +2293,12 @@ fn update_binding(
     )
 }
 
+/// A size a summary states as its column holds it (§13): one no `INTEGER`
+/// holds is unknown, never a negative figure.
+pub(crate) fn stated_size(size: u64) -> Option<i64> {
+    i64::try_from(size).ok()
+}
+
 /// A binding's base flag set as its rows hold it (§13): no base holds an
 /// unknown one.
 fn base_flags(binding: &PimdirBinding) -> &PimdirFlags {
@@ -2396,13 +2414,9 @@ pub(crate) fn binding_from_row(
     let conflict_object: Option<String> = row.get(9)?;
     let shared_object: Option<String> = row.get(10)?;
 
-    // NOTE: either witness (§13): the column is the fact, and the value
-    // columns stay one for a row written before the column existed.
-    let base = if base_present != 0
-        || base_flags.is_some()
-        || base_object.is_some()
-        || base_revision.is_some()
-    {
+    // NOTE: the one witness (§13): the schema lets no value column state
+    // a base without it.
+    let base = if base_present != 0 {
         Some(PimdirBase {
             flags: codec::flags_from_column(base_flags.as_deref()),
             revision: base_revision,

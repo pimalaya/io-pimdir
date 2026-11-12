@@ -1,7 +1,7 @@
 //! A mail sync lists newest first within a scope on the `Date` (pimdir
 //! SYNC.md §4, §5; STORAGE §4.3, §11.3, §14.1): members arrive named, a
 //! round lands page by page and closes with its coverage, which every
-//! reader lists with the collection, the owner collects below a date,
+//! reader lists with the collection, the owner evicts below a date,
 //! and the mail readers count, page and search across collections.
 
 #![cfg(feature = "client")]
@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use io_pimdir::{
-    change::PimdirChange,
+    change::{PimdirChange, PimdirWriteOp},
     client::{
         PimdirError, PimdirRunError, PimdirStore,
         reader::{PimdirMailFilter, PimdirMailSum, PimdirReader, like_pattern},
@@ -314,10 +314,73 @@ fn a_scope_on_another_kind_is_refused() {
     );
 }
 
-/// The owner's collection below a date removes what owes nothing, keeps
+/// A bound in another shape than a summary `date`, which the schema holds
+/// no scope in (STORAGE §13), is refused by name before a remote is asked
+/// or a row written, by a sync and by a write of a runner of its own.
+#[test]
+fn a_scope_bound_of_another_shape_is_refused_before_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let inbox = PimdirCollectionId::from("INBOX");
+
+    for bound in [
+        "2026-09-01",
+        "2026-09-01T00:00:00.000Z",
+        "2026-09-01T00:00:00+00:00",
+        "2026-09-01 00:00:00Z",
+        "",
+    ] {
+        let mut remote = Paged::default();
+        let refused = store.sync("INBOX", since(bound), &mut remote).unwrap_err();
+        assert!(
+            matches!(&refused, PimdirRunError::Store(PimdirError::ScopeBound(found)) if found == bound),
+            "{bound:?}: {refused}",
+        );
+        assert!(remote.requests.is_empty(), "{bound:?}: nothing listed");
+
+        let scope = PimdirScope {
+            since: None,
+            until: Some(bound.into()),
+        };
+        for op in [
+            PimdirWriteOp::OpenRound {
+                collection: inbox.clone(),
+                scope: scope.clone(),
+                band: false,
+            },
+            PimdirWriteOp::CloseRound {
+                collection: inbox.clone(),
+                coverage: scope.clone(),
+                checkpoint: None,
+            },
+            PimdirWriteOp::SetCoverage {
+                collection: inbox.clone(),
+                scope: scope.clone(),
+            },
+        ] {
+            let refused = store.write(vec![op]).unwrap_err();
+            assert_eq!(refused.code(), "scope-invalid", "{bound:?}: {refused}");
+        }
+    }
+    assert!(
+        store.list_coverage("INBOX").unwrap().is_empty(),
+        "no round opened"
+    );
+
+    store
+        .write(vec![PimdirWriteOp::OpenRound {
+            collection: inbox,
+            scope: PimdirScope::since("2026-09-01T00:00:00Z"),
+            band: false,
+        }])
+        .unwrap();
+}
+
+/// The owner's eviction below a date removes what owes nothing, keeps
 /// what does and what has no date, and pushes nothing (STORAGE §11.3).
 #[test]
-fn collecting_below_a_date_keeps_what_is_owed() {
+fn evicting_below_a_date_keeps_what_is_owed() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
@@ -367,14 +430,12 @@ fn collecting_below_a_date_keeps_what_is_owed() {
         .unwrap();
 
     let old_seq = store.seq_for_link("INBOX", "old@x").unwrap().unwrap();
-    let report = store
-        .collect_before("INBOX", "2026-10-01T00:00:00Z")
-        .unwrap();
+    let report = store.evict_before("INBOX", "2026-10-01T00:00:00Z").unwrap();
     assert_eq!(report.seqs, vec![old_seq]);
     assert_eq!(store.count_items("INBOX").unwrap(), 3);
     assert_eq!(store.count_retained("INBOX").unwrap(), 0, "no tombstone");
 
-    // NOTE: the next delta derives no push for what was collected.
+    // NOTE: the next delta derives no push for what was evicted.
     remote.pages = vec![PimdirEnumerated::Page(PimdirRemoteSnapshot::delta(
         Vec::new(),
         Vec::new(),
@@ -385,7 +446,7 @@ fn collecting_below_a_date_keeps_what_is_owed() {
         .unwrap();
     assert_eq!(
         report.pushed, 1,
-        "the owed flag, and nothing for the collected"
+        "the owed flag, and nothing for the evicted"
     );
 }
 

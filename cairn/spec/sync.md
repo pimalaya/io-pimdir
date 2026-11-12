@@ -365,7 +365,7 @@ A placement holding a body over a base naming a revision and no body (`PimdirPla
 - THEN nothing is pushed and the rows stay as they were (vectors/sync/132)
 
 ### Requirement: A scope bounds mail only
-`PimdirSyncOptions::scope` is unbounded by default. `PimdirSourceStore::sync` and `prepare_sync` SHALL refuse a bounded scope on a collection whose kind is not `message/rfc822`, naming the kind (`PimdirError::Scope`).
+`PimdirSyncOptions::scope` is unbounded by default. `PimdirSourceStore::sync` and `prepare_sync` SHALL refuse a bounded scope on a collection whose kind is not `message/rfc822`, naming the kind (`PimdirError::Scope`), and before it a scope one of whose bounds is not an instant in UTC at seconds precision (`2026-10-01T00:00:00Z`), naming the bound (`PimdirError::ScopeBound`, `scope-invalid`): the schema holds a bound in no other shape (STORAGE §13), and a `date` compares with it as text.
 
 ### Requirement: A resumed round lists its head first
 A run resuming an open round SHALL first ask for the round's head when the connector lists heads (`PimdirRemote::heads`, `PimdirSync::heads`). The head is a delta head from the round's checkpoint, or for a band round from the source's checkpoint, when the connector lists delta heads; else a band head from `round_started_at`, when it lists band heads; else none. It is checked against the run's scope and merged as a page before the last.

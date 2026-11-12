@@ -113,7 +113,7 @@ impl PimdirReader {
     pub fn retained_before(&self, cutoff: &str) -> Result<(u64, u64), PimdirError> {
         let (count, bytes) = self.conn.query_row_cached(
             sql::COUNT_RETAINED_BEFORE,
-            named_params! { ":cutoff": cutoff },
+            named_params! { ":before": cutoff },
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )?;
         Ok((count.max(0) as u64, bytes.max(0) as u64))

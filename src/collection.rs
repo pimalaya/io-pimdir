@@ -100,6 +100,18 @@ impl PimdirScope {
             && self.until.as_deref().is_none_or(|until| date < until)
     }
 
+    /// The first bound that is no instant in UTC at seconds precision
+    /// with the `Z` designator (`2026-10-01T00:00:00Z`), `None` when
+    /// both are: the one shape a store holds a bound in (STORAGE §13),
+    /// and the one a summary `date` compares with as text.
+    pub fn malformed_bound(&self) -> Option<&str> {
+        [&self.since, &self.until]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .find(|bound| !is_instant(bound))
+    }
+
     /// Whether `other` lies inside this scope, bounds included: a
     /// checkpoint made under this scope serves `other` (SYNC §5).
     pub fn covers(&self, other: &Self) -> bool {
@@ -178,6 +190,19 @@ impl PimdirScope {
             _ => None,
         }
     }
+}
+
+/// Whether `value` is written as `%Y-%m-%dT%H:%M:%SZ`, digit for digit.
+fn is_instant(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && bytes.iter().enumerate().all(|(at, byte)| match at {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
 }
 
 /// What one source's last closed round covered (STORAGE §4.3): the store

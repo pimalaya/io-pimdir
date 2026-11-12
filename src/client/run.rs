@@ -224,7 +224,8 @@ impl PimdirSourceStore {
     /// [`PimdirRemote::scope_bound`], and the heads it lists while a round
     /// is open its own [`PimdirRemote::heads`]. A bounded scope on a collection of
     /// another kind than mail is refused, naming the kind
-    /// ([`PimdirError::Scope`]).
+    /// ([`PimdirError::Scope`]), and a bound in another shape than a
+    /// summary `date` ([`PimdirError::ScopeBound`]).
     ///
     /// The pages that landed before a remote failure stay landed; a
     /// runner wanting their report drives [`PimdirSync`] itself and reads
@@ -254,6 +255,9 @@ impl PimdirSourceStore {
         scope_bound: bool,
     ) -> Result<PimdirSync, PimdirError> {
         let collection = collection.into();
+        if let Some(bound) = opts.scope.malformed_bound() {
+            return Err(PimdirError::ScopeBound(bound.into()));
+        }
         if !opts.scope.is_unbounded() {
             let kind = self.collection_kind(&collection)?.unwrap_or_default();
             let mail = kind.split(';').next().unwrap_or_default().trim() == "message/rfc822";

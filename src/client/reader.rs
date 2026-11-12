@@ -461,7 +461,7 @@ pub struct PimdirChangeCursor {
     /// The last stamp drawn: the next look asks for every stamp above it.
     pub changed: i64,
     /// How many rows left without a stamp: purged items, collected
-    /// objects and renamed collections.
+    /// objects, and renamed or deleted collections.
     pub purges: i64,
     /// The store's id, 32 lowercase hex digits drawn at its creation.
     pub store_id: String,
@@ -671,7 +671,9 @@ impl PimdirReader {
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
         let collection = collection.as_ref();
-        let after = after.unwrap_or("");
+        // NOTE: a `NULL` cursor is the first page (STORAGE §9.3); the
+        // overlay compares with the empty key, no link id being empty.
+        let floor = after.unwrap_or("");
         self.overlaid(
             collection,
             limit,
@@ -687,7 +689,7 @@ impl PimdirReader {
                     item_from_row,
                 )?)
             },
-            |item| item.link_id.0.as_str() > after,
+            |item| item.link_id.0.as_str() > floor,
             |left, right| left.link_id.0.cmp(&right.link_id.0),
         )
     }
@@ -701,14 +703,7 @@ impl PimdirReader {
         limit: usize,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
         let collection = collection.as_ref();
-        let (key, seq) = after.unwrap_or(("", 0));
-        self.sorted_page(
-            sql::LIST_ITEMS_PAGE_ASC,
-            collection,
-            Some((key, seq)),
-            limit,
-            false,
-        )
+        self.sorted_page(sql::LIST_ITEMS_PAGE_ASC, collection, after, limit, false)
     }
 
     /// The same page descending, `None` starting from the end.
@@ -762,12 +757,8 @@ impl PimdirReader {
                         statement,
                         named_params! {
                             ":collection": collection,
-                            ":after_key": match (&after, descending) {
-                                (None, true) => None,
-                                (None, false) => Some(""),
-                                (Some((key, _)), _) => Some(key.as_str()),
-                            },
-                            ":after_seq": after.as_ref().map(|(_, seq)| *seq).unwrap_or_default(),
+                            ":after_key": after.as_ref().map(|(key, _)| key.as_str()),
+                            ":after_seq": after.as_ref().map(|(_, seq)| *seq),
                             ":limit": limit as i64,
                         },
                         |row| {
@@ -833,7 +824,7 @@ impl PimdirReader {
                     named_params! {
                         ":collection": collection,
                         ":after_key": after.as_ref().map(|(key, _)| key.as_str()),
-                        ":after_seq": after.as_ref().map(|(_, seq)| *seq).unwrap_or_default(),
+                        ":after_seq": after.as_ref().map(|(_, seq)| *seq),
                         ":limit": limit as i64,
                     },
                     item_from_row,
@@ -1145,7 +1136,7 @@ impl PimdirReader {
             sql::LIST_RETAINED_PAGE,
             named_params! {
                 ":collection": collection,
-                ":after": after.unwrap_or(0),
+                ":after": after,
                 ":limit": limit as i64,
             },
             item_from_row,

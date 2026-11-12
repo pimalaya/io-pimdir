@@ -841,13 +841,13 @@ pub enum PimdirIndexRefreshYield {
     /// (`placements_gone`, `objects_gone`), answered by
     /// [`Gone`](PimdirIndexRefreshArg::Gone).
     ///
-    /// A purge or a collection rename is a yield of its own rather than a
-    /// row of the feed: the feed pages what the store holds by stamp, and
-    /// a purged item, a collected object or a renamed collection's old id
-    /// leaves no row to page and draws no stamp (STORAGE §4.5), so what is
-    /// gone is a comparison of the index with the store, asked once by the
-    /// run exhausting the feed when the purge count, which a rename moves
-    /// too, moved.
+    /// A purge, a collection rename or its delete is a yield of its own
+    /// rather than a row of the feed: the feed pages what the store holds
+    /// by stamp, and a purged item, a collected object, a renamed
+    /// collection's old id or a deleted one leaves no row to page and
+    /// draws no stamp (STORAGE §4.5), so what is gone is a comparison of
+    /// the index with the store, asked once by the run exhausting the feed
+    /// when the purge count, which a rename and a delete move too, moved.
     WantsGone,
     /// Apply these ops in order, inside the run's transaction, answered by
     /// [`Written`](PimdirIndexRefreshArg::Written).
@@ -1053,7 +1053,8 @@ pub struct PimdirIndexMeta {
     pub floating_zone: String,
     /// The store's last stamp drawn (`load_change_cursor`).
     pub head: i64,
-    /// The store's purge count (`load_change_cursor`), a rename counted.
+    /// The store's purge count (`load_change_cursor`), a collection's
+    /// rename and its delete counted.
     pub purges: i64,
 }
 

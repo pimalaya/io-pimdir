@@ -218,7 +218,7 @@ impl QueueStatusCommand {
                 seq,
             } => {
                 output.status = QueueStatus::Applied;
-                output.collection = Some(collection);
+                output.collection = collection;
                 output.applied_at = Some(applied_at);
                 output.seq = seq;
             }
@@ -251,7 +251,8 @@ pub struct QueueStatusOutput {
     pub row: i64,
     /// Where it stands.
     pub status: QueueStatus,
-    /// The collection it was queued on, `None` when unknown.
+    /// The collection it was queued on, `None` when unknown or, for an
+    /// applied action, deleted since.
     pub collection: Option<String>,
     /// The action kind, while queued.
     pub kind: Option<String>,
@@ -276,9 +277,18 @@ impl fmt::Display for QueueStatusOutput {
                 "Action {id} is parked on {collection}: {}",
                 or_dash(self.error.as_deref())
             ),
-            QueueStatus::Applied => match self.seq {
-                Some(seq) => writeln!(f, "Action {id} was applied: item {seq} in {collection}"),
-                None => writeln!(f, "Action {id} was applied on {collection}"),
+            QueueStatus::Applied => match (self.seq, &self.collection) {
+                (Some(seq), Some(_)) => {
+                    writeln!(f, "Action {id} was applied: item {seq} in {collection}")
+                }
+                (Some(seq), None) => writeln!(
+                    f,
+                    "Action {id} was applied: item {seq} in a collection deleted since"
+                ),
+                (None, Some(_)) => writeln!(f, "Action {id} was applied on {collection}"),
+                (None, None) => {
+                    writeln!(f, "Action {id} was applied on a collection deleted since")
+                }
             },
             QueueStatus::Unknown => writeln!(
                 f,
@@ -479,5 +489,36 @@ Target:      {\"seq\":1}
 Error:       no such seq\u{fffd}
 ";
         assert_eq!(output.to_string(), expected);
+    }
+
+    #[test]
+    fn an_applied_action_says_when_its_collection_is_gone() {
+        let status = |collection: Option<&str>, seq| QueueStatusOutput {
+            row: 4,
+            status: QueueStatus::Applied,
+            collection: collection.map(String::from),
+            kind: None,
+            attempts: None,
+            error: None,
+            applied_at: Some(String::from("2026-11-11T18:13:39.904Z")),
+            seq,
+        };
+
+        assert_eq!(
+            status(Some("Drafts"), Some(7)).to_string(),
+            "Action 4 was applied: item 7 in Drafts\n"
+        );
+        assert_eq!(
+            status(None, Some(7)).to_string(),
+            "Action 4 was applied: item 7 in a collection deleted since\n"
+        );
+        assert_eq!(
+            status(Some("Drafts"), None).to_string(),
+            "Action 4 was applied on Drafts\n"
+        );
+        assert_eq!(
+            status(None, None).to_string(),
+            "Action 4 was applied on a collection deleted since\n"
+        );
     }
 }

@@ -1639,12 +1639,12 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
     for (altered, version, shape) in [
         (
             "UPDATE index_meta SET shape = 'fts4'",
-            Some("search-draft-09"),
+            Some("search-draft-10"),
             Some("fts4"),
         ),
         (
-            "UPDATE index_meta SET format_version = 'search-draft-10'",
-            Some("search-draft-10"),
+            "UPDATE index_meta SET format_version = 'search-draft-11'",
+            Some("search-draft-11"),
             Some("canonical"),
         ),
         (
@@ -1693,6 +1693,7 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
 fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
     for altered in [
         "UPDATE index_meta SET format_version = 'search-draft-07'",
+        "UPDATE index_meta SET format_version = 'search-draft-09'",
         "ALTER TABLE index_meta DROP COLUMN format_version",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1709,7 +1710,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         drop(index);
         assert_eq!(
             index_meta(dir.path(), "format_version"),
-            rusqlite::types::Value::Text("search-draft-09".into()),
+            rusqlite::types::Value::Text("search-draft-10".into()),
             "{altered}"
         );
     }
@@ -2208,6 +2209,96 @@ fn a_rename_a_cut_pass_went_past_is_reconciled_by_the_next_one() {
     assert_eq!(report.removed, 2, "the old id's placements go");
 }
 
+/// An empty collection's delete draws no stamp and counts in the store's
+/// purges (STORAGE §4.5), so the next pass reconciles its keys though no
+/// item left, and drops nothing of the collections that stay (SEARCH §4).
+#[test]
+fn an_empty_collection_s_delete_is_reconciled() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store.ensure_collection("Empty", "message/rfc822").unwrap();
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let options = PimdirIndexRefreshOptions::default();
+    assert!(index.refresh(&options).unwrap().is_current());
+    assert!(!index.refresh(&options).unwrap().reconciled, "at rest");
+
+    let before = store.change_cursor().unwrap();
+    assert!(store.delete_collection("Empty").unwrap());
+    let after = store.change_cursor().unwrap();
+    assert_eq!(
+        (after.changed, after.purges),
+        (before.changed, before.purges + 1),
+        "no stamp, one purge"
+    );
+
+    let report = index.refresh(&options).unwrap();
+    assert!(report.reconciled, "the delete moved the count");
+    assert_eq!(report.removed, 0, "nothing of it was indexed");
+    assert_eq!(hits(&index, "alpha").len(), 1);
+    assert!(!index.refresh(&options).unwrap().reconciled, "recorded");
+}
+
+/// A horizon that rolled re-expands every live journal, a recurring one
+/// among them, a journal's summary not saying whether it recurs (SEARCH
+/// §7); one that did not move expands none.
+#[test]
+fn a_rolled_horizon_re_expands_a_recurring_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//x//EN\r\nBEGIN:VJOURNAL\r\n\
+        UID:log\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\n\
+        RRULE:FREQ=YEARLY\r\nSUMMARY:log\r\nEND:VJOURNAL\r\nEND:VCALENDAR\r\n"
+        .to_vec();
+    file_as(dir.path(), "local", "Journal", "text/calendar", journal);
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let mut refresh = |now: &str| {
+        index
+            .refresh(&PimdirIndexRefreshOptions {
+                now: Some(unix(now)),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let starts = |dir: &Path| -> Vec<String> {
+        PimdirIndex::open_query(dir)
+            .unwrap()
+            .occurrences_between("2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .map(|occurrence| occurrence.start)
+            .collect()
+    };
+
+    // NOTE: the horizon runs a year back and two forward (SEARCH §7).
+    assert_eq!(refresh("2026-08-20T00:00:00Z").expanded, 1);
+    assert_eq!(
+        starts(dir.path()),
+        [
+            "2026-01-05T09:00:00Z",
+            "2027-01-05T09:00:00Z",
+            "2028-01-05T09:00:00Z"
+        ]
+    );
+    assert_eq!(refresh("2026-08-20T00:00:00Z").expanded, 0, "nothing moved");
+
+    assert_eq!(refresh("2027-09-24T00:00:00Z").expanded, 1, "rolled");
+    assert_eq!(
+        starts(dir.path()),
+        [
+            "2027-01-05T09:00:00Z",
+            "2028-01-05T09:00:00Z",
+            "2029-01-05T09:00:00Z"
+        ]
+    );
+}
+
 /// A value of digits names the item of that seq and every item whose link
 /// id it is (SEARCH §8), a hit set rather than a guess.
 #[test]
@@ -2458,7 +2549,7 @@ mod memory {
                 .find_map(|((collection, _), _)| {
                     self.store
                         .query_row(
-                            "SELECT r.msg_id FROM store.mail_in_reply_to r \
+                            "SELECT r.message_id FROM store.mail_in_reply_to r \
                              JOIN store.items i ON i.id = r.item \
                              WHERE i.collection = ?1 AND i.link_id = ?2 ORDER BY r.position LIMIT 1",
                             params![collection, link_id],

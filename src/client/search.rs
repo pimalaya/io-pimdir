@@ -1123,7 +1123,7 @@ impl PimdirIndex {
         let mut described = (String::new(), String::new());
         let placements = rows(
             &self.conn,
-            search::LOAD_HIT_PLACEMENTS,
+            search::HIT,
             named_params! { ":seq": seq, ":account": account },
             |row| {
                 let kind: Option<String> = row.get(7)?;

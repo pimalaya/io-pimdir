@@ -70,7 +70,7 @@ mod join;
 /// The version of SYNC.md this engine follows (SYNC §10), which a store
 /// records in `store_meta.sync_version` with the engine's first write: a
 /// store naming another is refused before any verb runs.
-pub const SYNC_VERSION: &str = "sync-draft-09";
+pub const SYNC_VERSION: &str = "sync-draft-10";
 
 /// Which push kinds a writable source may derive.
 ///

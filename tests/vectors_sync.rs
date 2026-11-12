@@ -1244,7 +1244,7 @@ type Column<'a> = (&'a String, &'a Value);
 /// is kept in (STORAGE §4.3), `None` for a column of the summary's own.
 fn list_table(table: &str, column: &str) -> Option<(&'static str, &'static str)> {
     match (table, column) {
-        ("mail_summary", "in_reply_to") => Some(("mail_in_reply_to", "msg_id")),
+        ("mail_summary", "in_reply_to") => Some(("mail_in_reply_to", "message_id")),
         ("task_summary", "categories") => Some(("task_category", "value")),
         _ => None,
     }

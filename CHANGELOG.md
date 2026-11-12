@@ -8,9 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir sync-draft-09, vendored at pimdir 317768b.
+- **BREAKING**: Added pimdir storage-draft-10, sync-draft-10 and search-draft-10, vendored at pimdir 31da94c, the first batch of those drafts (the schema and the statements; their payloads, vectors and Annex A are those of the drafts before).
 
-  A store whose sync state an engine of sync-draft-08 wrote is refused (`sync-version`), never migrated, as one of this draft is refused by an engine of the last: a delivered create would read there as a member to push against and to find absent.
+  A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The schema holds the shapes of STORAGE §13 by `CHECK` (a base stated without `base_present`, an empty handle, source, link id, collection id or account, a `seq` below 1, a negative size, a stamp or a scope bound in another shape), so a row in another shape is refused where it was stored. A consumer running the `sql` constants over its own binding follows the renamed parameters (`:before` in `purge_retained_before`, `release_before` and `release_bases_before`; `:hash` in `held_elsewhere`, `held_mail_summary` and `origin_for_link`; `:message_id` in `insert_in_reply_to`), the column `mail_in_reply_to.message_id`, the index `items_deleted`, and may bind `NULL` as the first cursor of every paged read. spec/queries/signatures.json, the specification's listing of every statement's parameters and columns, is vendored with them.
+
+- Added `PimdirError::ScopeBound` (`scope-invalid`) and `PimdirScope::malformed_bound`: a scope bound that is not an instant in UTC at seconds precision (`2026-10-01T00:00:00Z`) is refused by `sync`, `prepare_sync` and `write` before anything is listed or written, where it was stored and compared as text.
+- Added `sql::search::HIT` as the read of a hit's placements: the canonical statement, re-signed `(:seq, :account)` and answering every live placement of the hit with its kind and title.
 
 - **BREAKING**: Added `PimdirPushResult::relocated`, which a connector sets on an accepted `Remove` carrying `to` that relocated the member rather than deleted it (SYNC §4): only a relocation delivers the destination's create.
 
@@ -25,10 +28,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - **BREAKING**: Added `PimdirGcReport::temporaries` and the `temporaries` member of `pimdir gc --json`: the temporary files the collector unlinked.
 - Added `PRAGMA journal_size_limit`, 4 MiB, on every connection, so a WAL one large write grew is truncated once checkpointed.
-- Added a bounded `PRAGMA incremental_vacuum` after `purge_retained_before`, `collect_before`, `release_before` and `collect_garbage` when they removed rows: at most 4,096 free pages go back to the filesystem per call, where pimdir.db never shrank before.
+- Added a bounded `PRAGMA incremental_vacuum` after `purge_retained_before`, `evict_before`, `release_before` and `collect_garbage` when they removed rows: at most 4,096 free pages go back to the filesystem per call, where pimdir.db never shrank before.
 
 ### Changed
 
+- **BREAKING**: Changed `PimdirStore::collect_before` to `PimdirStore::evict_before`, its report `PimdirCollectReport` to `PimdirEvictReport` and `sql::COLLECT_BEFORE` to `sql::EVICT_BEFORE`, as the standard names the act an eviction (pimdir STORAGE §11.3). No alias is kept.
+- **BREAKING**: Changed `PimdirActionStatus::Applied::collection` to an `Option<String>`: a receipt outlives the collection its row was queued on and then names none (pimdir STORAGE §15.4), where deleting the collection dropped the receipt and the action read `Unknown`. `pimdir queue status` prints such an action as applied on a collection deleted since, its JSON `collection` `null`.
+- **BREAKING**: Changed `PimdirStore::raise_incarnation` to answer an incarnation a random stride (1 to 2^31) above the copy's and the replaced store's, no longer the next integer: two restores of one backup answer two incarnations (pimdir STORAGE §8).
+- Changed a collection's delete to count in `PimdirChangeCursor::purges`, an empty collection's included, so a consumer of the change feed reconciles its keys (pimdir STORAGE §4.5); the search index does.
+- Changed the index to expand again every live journal when its horizon rolls, a journal's summary not saying whether it recurs (pimdir SEARCH §7): a recurring journal kept the occurrences of the horizon it was indexed under.
+- Changed a binding to be read as based from `base_present` alone, the one witness of a base (pimdir STORAGE §13).
 - Changed the upgrade to fetch no provisional handle: a pending or a delivered create waits for the page that lands it.
 - **BREAKING**: Changed the collector to unlink the temporary files a killed writer left: every period-prefixed regular file of objects/ and its shard directories, which `PimdirGcReport::strays` reported and left before.
 
@@ -48,11 +57,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Removed
 
+- **BREAKING**: Removed `sql::COMPONENT_OF` and `sql::search::MATCH_OBJECTS_RANKED`, cut by the standard and run by nothing here, and `sql::search::LOAD_HIT_PLACEMENTS`, the crate's own text of what `sql::search::HIT` now reads.
 - Removed the comfy-table dependency.
 
 ### Fixed
 
-- Fixed a collection running beside a verb or a write it did not see: the in-flight guard of `collect_garbage`, `collect_before` and `release_before` was read before their locks were taken, so a verb starting in between had the body it streamed swept as an orphan.
+- Fixed a mail or file summary stating a size above `i64::MAX` being stored as a negative size: it is written with an unknown size.
+- Fixed a collection running beside a verb or a write it did not see: the in-flight guard of `collect_garbage`, `evict_before` and `release_before` was read before their locks were taken, so a verb starting in between had the body it streamed swept as an orphan.
 - Fixed a blob write keeping a name another writer made without flushing its shard directory, a batch flushing one shard directory once per body, and the collector, so an erase, answering before its unlinks were durable.
 - Fixed the projection reading a known flag set as differing from an unknown base, or an unknown set from a known base: flag sets differ only when both are known (pimdir SYNC §3).
 - Fixed a calendar item leaving every agenda when the index re-expanded it (a horizon roll, another time zone database or floating zone) while its body could not be read: it keeps its occurrences, is recorded missing, and is expanded again by the pass that reads its body.

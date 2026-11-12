@@ -132,11 +132,11 @@ pub struct PimdirPurgeReport {
     pub items: usize,
 }
 
-/// What the owner's collection below a date removed (§11.3): rows, never
+/// What the owner's eviction below a date removed (§11.3): rows, never
 /// bytes, which the collector frees.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PimdirCollectReport {
-    /// The public ids of the items collected.
+pub struct PimdirEvictReport {
+    /// The public ids of the items evicted.
     pub seqs: Vec<i64>,
 }
 
@@ -895,7 +895,7 @@ impl PimdirStore {
         let pinned: Vec<(Option<String>, Option<String>)> = rows(
             &tx,
             sql::PURGE_RETAINED_BEFORE,
-            named_params! { ":cutoff": cutoff },
+            named_params! { ":before": cutoff },
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let items = pinned.len();
@@ -953,10 +953,10 @@ impl PimdirStore {
         Ok(PimdirEraseReport { erased, collected })
     }
 
-    /// The owner's manual collection of one mail collection below a date
+    /// The owner's manual eviction of one mail collection below a date
     /// (§11.3): every live item whose `date` is older than `before` (RFC
     /// 3339, `Z`) and that owes nothing, removed with its bindings,
-    /// summary and addresses, the public ids collected answered.
+    /// summary and addresses, the public ids evicted answered.
     ///
     /// An item owes something while it is conflicted, a binding of it is
     /// conflicted or has no base, or its flags differ from a binding's
@@ -969,11 +969,11 @@ impl PimdirStore {
     /// lock held exclusively, so none starts while it runs. An owner
     /// narrowing a scope records the narrower coverage with its next
     /// sync, not here.
-    pub fn collect_before(
+    pub fn evict_before(
         &mut self,
         collection: impl AsRef<str>,
         before: &str,
-    ) -> Result<PimdirCollectReport, PimdirError> {
+    ) -> Result<PimdirEvictReport, PimdirError> {
         let lock = Arc::clone(&self.lock);
         let _collecting = lock.collecting();
         if lock.in_flight() {
@@ -985,7 +985,7 @@ impl PimdirStore {
             .map_err(busy_or_sql)?;
         let seqs: Vec<i64> = rows(
             &tx,
-            sql::COLLECT_BEFORE,
+            sql::EVICT_BEFORE,
             named_params! { ":collection": collection.as_ref(), ":before": before },
             |row| row.get(0),
         )?;
@@ -994,12 +994,12 @@ impl PimdirStore {
         if !seqs.is_empty() {
             vacuum(&self.conn);
         }
-        Ok(PimdirCollectReport { seqs })
+        Ok(PimdirEvictReport { seqs })
     }
 
     /// The owner's release of the bodies of a set of mail collections
     /// below a sort key (§11.4): every live item whose `sort_key` is
-    /// below `until` (RFC 3339, `Z`; `None` for no ceiling), the undated
+    /// below `before` (RFC 3339, `Z`; `None` for no ceiling), the undated
     /// below any, goes back to `Meta`, keeping its summary, addresses,
     /// flags, bindings and public id, the public ids released answered.
     ///
@@ -1016,7 +1016,7 @@ impl PimdirStore {
     pub fn release_before(
         &mut self,
         collections: &[impl AsRef<str>],
-        until: Option<&str>,
+        before: Option<&str>,
     ) -> Result<PimdirReleaseReport, PimdirError> {
         let lock = Arc::clone(&self.lock);
         let _collecting = lock.collecting();
@@ -1028,11 +1028,14 @@ impl PimdirStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
         bind_list(&tx, "collections", collections.iter().map(AsRef::as_ref))?;
-        tx.execute_cached(sql::RELEASE_BASES_BEFORE, named_params! { ":until": until })?;
+        tx.execute_cached(
+            sql::RELEASE_BASES_BEFORE,
+            named_params! { ":before": before },
+        )?;
         let seqs: Vec<i64> = rows(
             &tx,
             sql::RELEASE_BEFORE,
-            named_params! { ":until": until },
+            named_params! { ":before": before },
             |row| row.get(0),
         )?;
         tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
@@ -1221,7 +1224,9 @@ impl PimdirStore {
     /// anything else opens it, so no consumer takes the copy for the store
     /// it followed. `replaced` is the incarnation of the store the copy
     /// replaces when that one could still be read, the new one rising
-    /// above both.
+    /// above both by a random stride of 1 to 2^31, never the next
+    /// integer: two restores of one backup answer two incarnations, and a
+    /// consumer compares for equality, reading no order in it.
     pub fn raise_incarnation(&self, replaced: Option<i64>) -> Result<i64, PimdirError> {
         self.conn
             .execute_cached(
@@ -1794,6 +1799,11 @@ pub enum PimdirError {
         /// Its declared kind, empty when undeclared.
         kind: String,
     },
+    /// A scope bound is not an instant written as a summary `date` is,
+    /// UTC at seconds precision (STORAGE §13): the shape a store holds a
+    /// bound in, and the one its textual comparison needs. Refused before
+    /// anything is written.
+    ScopeBound(String),
     /// A file was written to a collection of another kind than files
     /// (§14.3).
     NotFiles {
@@ -2002,6 +2012,7 @@ impl PimdirError {
     /// | `placement-unnamed` | [`Unnamed`](Self::Unnamed) |
     /// | `conflict-unread` | [`Unread`](Self::Unread) |
     /// | `scope-not-mail` | [`Scope`](Self::Scope) |
+    /// | `scope-invalid` | [`ScopeBound`](Self::ScopeBound) |
     /// | `collection-not-files` | [`NotFiles`](Self::NotFiles) |
     /// | `collection-synced` | [`Synced`](Self::Synced) |
     /// | `collection-not-unbound` | [`NotUnbound`](Self::NotUnbound) |
@@ -2046,6 +2057,7 @@ impl PimdirError {
             Self::Unnamed { .. } => "placement-unnamed",
             Self::Unread { .. } => "conflict-unread",
             Self::Scope { .. } => "scope-not-mail",
+            Self::ScopeBound(_) => "scope-invalid",
             Self::NotFiles { .. } => "collection-not-files",
             Self::Synced { .. } => "collection-synced",
             Self::NotUnbound { .. } => "collection-not-unbound",
@@ -2124,6 +2136,10 @@ impl fmt::Display for PimdirError {
             Self::Scope { collection, kind } => write!(
                 f,
                 "Pimdir sync refused: a scope bounds mail only, and collection {collection} holds {kind:?}"
+            ),
+            Self::ScopeBound(bound) => write!(
+                f,
+                "Pimdir scope bound {bound:?} is not an instant written as a date is, UTC at seconds precision (2026-06-01T00:00:00Z)"
             ),
             Self::NotFiles { collection, kind } => write!(
                 f,
