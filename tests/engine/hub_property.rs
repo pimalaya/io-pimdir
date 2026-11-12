@@ -451,8 +451,14 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 let Some(handle) = cluster.handle(source, &link) else {
                     continue;
                 };
-                let staged = cluster.sources[source]
-                    .mutate("inbox", PimdirMutation::SetFlags { handle, flags });
+                let staged = cluster.sources[source].mutate(
+                    "inbox",
+                    PimdirMutation::SetFlags {
+                        handle,
+                        flags,
+                        base: None,
+                    },
+                );
                 if staged.is_ok() && live(&cluster, &link) && !conflicted(&cluster, &link) {
                     ledger.entry(link).or_default().agree(source);
                 }
@@ -465,8 +471,14 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 let Some(handle) = cluster.handle(source, &link) else {
                     continue;
                 };
-                let staged =
-                    cluster.sources[source].mutate("inbox", PimdirMutation::Remove(handle));
+                let staged = cluster.sources[source].mutate(
+                    "inbox",
+                    PimdirMutation::Remove {
+                        handle,
+                        if_match: None,
+                        resolves: None,
+                    },
+                );
                 if staged.is_ok() {
                     ledger.entry(link).or_default().removed = true;
                 }

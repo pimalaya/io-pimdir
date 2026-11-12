@@ -87,4 +87,13 @@ pub struct PimdirLoaded {
     ///
     /// [`PimdirHub::conflicted`]: crate::hub::PimdirHub::conflicted
     pub conflicted: Vec<(PimdirHandle, Option<PimdirHash>)>,
+    /// The loaded `Created` placements the source binds not: the copies
+    /// the store offers it of items other sources hold (SYNC §3, §9), as
+    /// [`PimdirHub::offered`] answers. Every other `Created` placement is
+    /// a create of this source's own, pending or delivered, which a sync
+    /// reports a member minted apart from (`Disagreed`, SYNC §6); a
+    /// storage stating none has every create read as the source's own.
+    ///
+    /// [`PimdirHub::offered`]: crate::hub::PimdirHub::offered
+    pub offered: Vec<PimdirHandle>,
 }

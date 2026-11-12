@@ -36,7 +36,7 @@ use mime::{
 use crate::{
     object::PimdirHash,
     search::{
-        extract::last,
+        extract::first,
         refresh::{PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexOp},
     },
 };
@@ -62,7 +62,8 @@ impl Need {
 }
 
 /// The parent a body's headers name (SEARCH §9): its first `In-Reply-To`
-/// id, else its last `References` id, a repeated field read as its last;
+/// id, else its last `References` id, a field present twice read from
+/// its first occurrence, as STORAGE Annex A.1 reads one (SEARCH §6);
 /// `None` when the headers hold no field.
 pub(crate) fn parent(body: &[u8]) -> Option<Option<String>> {
     let opts = MimeParseOptions {
@@ -74,11 +75,11 @@ pub(crate) fn parent(body: &[u8]) -> Option<Option<String>> {
 
     root.header.fields().next()?;
 
-    let first = last::<IN_REPLY_TO>(root)
+    let parent = first::<IN_REPLY_TO>(root)
         .and_then(|ids| ids.into_iter().next())
-        .or_else(|| last::<REFERENCES>(root)?.pop());
+        .or_else(|| first::<REFERENCES>(root)?.pop());
 
-    Some(first.filter(|id| !id.is_empty()))
+    Some(parent.filter(|id| !id.is_empty()))
 }
 
 /// Rereads the parents of the message ids a batch touched and recomputes
@@ -387,6 +388,20 @@ mod tests {
         refresh::{PimdirIndexMessage, PimdirIndexOp, PimdirIndexPresence},
         thread::*,
     };
+
+    /// A reply's parent is read from the first `In-Reply-To` field, and
+    /// from the first `References` field's last id (SEARCH §6, §9).
+    #[test]
+    fn a_parent_is_read_from_the_first_occurrence() {
+        assert_eq!(
+            parent(b"In-Reply-To: <one@x>\r\nIn-Reply-To: <two@x>\r\n\r\n"),
+            Some(Some("one@x".to_string()))
+        );
+        assert_eq!(
+            parent(b"References: <a@x> <b@x>\r\nReferences: <c@x> <d@x>\r\n\r\n"),
+            Some(Some("b@x".to_string()))
+        );
+    }
 
     fn present(sort_key: &str, in_reply_to: Option<&str>) -> PimdirIndexMessage {
         PimdirIndexMessage {

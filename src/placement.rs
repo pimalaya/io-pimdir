@@ -227,6 +227,20 @@ impl PimdirFlags {
 
         Self::Known(kept.chain(local_adds).chain(remote_adds).collect())
     }
+
+    /// This set changed as `base` was changed into `flags` (SYNC §7): it,
+    /// plus each flag `flags` holds and `base` lacks, less each flag
+    /// `base` holds and `flags` lacks, every other flag as it stands.
+    /// `None` when any of the three is unknown: there is no set to add to
+    /// nor remove from.
+    pub fn changed(&self, base: &PimdirFlags, flags: &PimdirFlags) -> Option<PimdirFlags> {
+        let (held, base, flags) = (self.known()?, base.known()?, flags.known()?);
+
+        let mut changed = held.clone();
+        changed.extend(flags.difference(base).cloned());
+        changed.retain(|flag| !base.contains(flag) || flags.contains(flag));
+        Some(Self::Known(changed))
+    }
 }
 
 /// A known-empty set: unknown is stated outright, never defaulted to.

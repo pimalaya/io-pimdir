@@ -33,10 +33,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["client", "vendored"]
-client = ["charset-tables", "dep:fs4", "dep:rusqlite", "dep:rustix"]
+client = ["dep:fs4", "dep:rusqlite", "dep:rustix"]
 search = ["dep:ical-rs", "dep:mime-rs", "dep:unicode-normalization", "dep:vcard-rs"]
 cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars", "dep:simd-cpu"]
-charset-tables = ["dep:encoding_rs"]
 vendored = ["rusqlite?/bundled"]
 
 [profile.release]
@@ -62,7 +61,7 @@ tempfile = { version = "3", default-features = false }
 anyhow = { version = "1", default-features = false, features = ["std"], optional = true }
 blake3 = { version = "1", default-features = false }
 clap = { version = "4.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"], optional = true }
-encoding_rs = { version = "0.8", default-features = false, features = ["alloc"], optional = true }
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 humantime = { version = "2.2", default-features = false, optional = true }
 ical-rs = { version = "0.7", default-features = false, features = ["parser", "tzdb"], optional = true }

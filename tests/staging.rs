@@ -191,7 +191,7 @@ fn a_create_naming_a_live_or_pending_link_id_is_refused() {
         Err(PimdirError::Duplicate {
             existing: PimdirDuplicate::Pending(id),
             ..
-        }) if id == pending
+        }) if id == pending.id
     ));
     assert_eq!(producer.pending_actions("INBOX").unwrap().len(), 1);
 
@@ -203,7 +203,15 @@ fn a_create_naming_a_live_or_pending_link_id_is_refused() {
 
     // a live item a queued remove withdraws is no longer in the way
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     add(&mut producer, "mid:a").unwrap();
     let report = store.drain().unwrap();

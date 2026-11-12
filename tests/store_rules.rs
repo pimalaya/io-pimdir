@@ -43,10 +43,12 @@ fn a_collection_holding_a_queued_action_is_not_deleted() {
             &PimdirAction::SetFlags {
                 seq: 9999,
                 flags: PimdirFlags::from_iter(["\\Seen"]),
+                base: None,
             },
             None,
         )
-        .unwrap();
+        .unwrap()
+        .id;
     drop(producer);
 
     let refused = store.delete_collection("INBOX").unwrap_err();
@@ -211,7 +213,15 @@ fn an_unknown_payload_version_is_skipped_not_parked() {
     drop(conn);
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 9999 }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: 9999,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     drop(producer);
 
@@ -232,10 +242,11 @@ fn an_unknown_payload_version_is_skipped_not_parked() {
 }
 
 /// A row a later producer queued stays pending for ever, the drain
-/// skipping it (STORAGE §15.2), so a reader listing what is queued skips
-/// it too rather than failing the whole read on it.
+/// skipping it (STORAGE §15.2), and a reader listing what is queued lists
+/// it, folded into nothing, rather than hiding it or failing the whole
+/// read on it (§15.4): it is somebody's write the reader cannot show.
 #[test]
-fn a_reader_skips_a_row_of_a_later_payload_version() {
+fn a_reader_lists_a_row_of_a_later_payload_version_and_folds_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let store = opened(dir.path());
     drop(store);
@@ -255,15 +266,37 @@ fn a_reader_skips_a_row_of_a_later_payload_version() {
     drop(conn);
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 9999 }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: 9999,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     drop(producer);
 
     let reader = PimdirReader::open(dir.path()).unwrap();
     let pending = reader.pending_actions("INBOX").unwrap();
-    assert_eq!(pending.len(), 1, "{pending:?}");
-    assert!(matches!(pending[0].action, PimdirAction::Remove { .. }));
-    assert_eq!(reader.count_pending_creates("INBOX").unwrap(), 0);
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert_eq!(
+        pending[0].action,
+        PimdirAction::Unknown {
+            kind: "add".into(),
+            payload: r#"{"v":2,"flags":[]}"#.into(),
+            object_hash: None,
+        },
+        "listed with its action and its payload, read no further"
+    );
+    assert!(!pending[0].created_at.is_empty());
+    assert!(matches!(pending[1].action, PimdirAction::Remove { .. }));
+    assert_eq!(
+        reader.count_pending_creates("INBOX").unwrap(),
+        0,
+        "folded into nothing: an add the reader cannot read creates none"
+    );
 }
 
 /// A body whose bytes no longer hash to its name is no body (STORAGE §7):

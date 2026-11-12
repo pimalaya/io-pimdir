@@ -89,16 +89,17 @@ fn the_extraction_reads_the_parts_the_walk_reads() {
     assert!(!extract.body.contains("unread"));
 }
 
-/// The extraction reads a repeated field as its last, a US-ASCII part as
+/// The extraction reads a field present twice from its first occurrence,
+/// as STORAGE Annex A.1 reads one (SEARCH §6), a US-ASCII part as
 /// windows-1252, a digest's untyped part as a message, and a body holding
 /// no header field after its first blank line.
 #[test]
-fn the_extraction_reads_mail_as_it_always_has() {
+fn the_extraction_reads_mail_as_the_summary_does() {
     let extract = PimdirExtract::mail(
         b"Subject: first\r\nSubject: last\r\n\
 Content-Type: text/plain; charset=us-ascii\r\n\r\ncaf\xe9\r\n",
     );
-    assert_eq!(extract.title, "last");
+    assert_eq!(extract.title, "first");
     assert_eq!(extract.body, "café\r\n");
 
     let extract = PimdirExtract::mail(
@@ -209,5 +210,42 @@ fn a_refresh_runs_without_a_database() {
             store_change: 1,
             store_purges: 0,
         })
+    );
+}
+
+/// The index holds the subject and the people the summary row states
+/// (SEARCH §6): on the standard's fixture stating `Subject`, `From` and
+/// `Date` twice, and on a field whose name stands apart from its colon,
+/// the extraction reads what the derivation of Annex A.1 reads.
+#[test]
+fn the_extraction_and_the_summary_read_one_field() {
+    let fixture = |name: &str| {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("spec/vectors/fixtures")
+            .join(name);
+        std::fs::read(path).unwrap()
+    };
+    let summarized = |body: &[u8]| match io_pimdir::summary::mail::derive(body).summary {
+        Some(io_pimdir::summary::PimdirSummary::Mail(mail)) => mail,
+        summary => panic!("a mail summary, got {summary:?}"),
+    };
+
+    let body = fixture("mail-repeated-fields.eml");
+    let summary = summarized(&body);
+    let extract = PimdirExtract::mail(&body);
+    assert_eq!(extract.title, summary.subject);
+    let sender = summary.sender.expect("the first From");
+    assert!(extract.from.contains(&sender), "{:?}", extract.from);
+    assert_eq!(summary.from.len(), 1, "one address row, the first field's");
+
+    let body = b"Subject : apart\r\nFrom\t: Ann <ann@example.org>\r\n\r\nbody\r\n";
+    let summary = summarized(body);
+    let extract = PimdirExtract::mail(body);
+    assert_eq!(summary.subject, "apart");
+    assert_eq!(extract.title, summary.subject);
+    assert!(
+        extract.from.contains("ann@example.org"),
+        "{:?}",
+        extract.from
     );
 }

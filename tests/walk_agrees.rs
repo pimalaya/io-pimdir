@@ -362,3 +362,186 @@ proptest! {
         agrees(&built(seed, crlf, truncate), cut);
     }
 }
+
+/// The streamed walk against mime-rs's tree, the third reading of a
+/// message's parts the crate holds (the search extraction's): the two
+/// walkers are not merged, the streamed one carrying bounds Annex A.1
+/// does not have, so their agreement is measured here, on the entities
+/// that make the attachment mark.
+///
+/// They part on one case, which Annex A.1 does not state: the last child
+/// of a multipart never closed, ended by an outer delimiter or by the end
+/// of the message. The summaries' walk reads it as no part (a child no
+/// delimiter ends), mime-rs as one. The property compares the two under
+/// the walk's reading, and a case of its own pins the difference.
+#[cfg(feature = "search")]
+mod tree {
+    use io_pimdir::summary::mail::attachments;
+    use mime::tree::{
+        body::MimeBodyNode, cst::MimeCst, entity::MimeEntity, parse::MimeParseOptions,
+    };
+    use proptest::prelude::*;
+
+    /// An entity's media type as Annex A.1 reads it: the `Content-Type`
+    /// value up to its first `;`, trimmed and lowercased, `text/plain`
+    /// when the field is absent or the value holds not exactly one `/`.
+    fn media(entity: &MimeEntity) -> String {
+        let raw = String::from_utf8_lossy(entity.content_type().raw).into_owned();
+        let media = raw
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match media.matches('/').count() {
+            1 => media,
+            _ => String::from("text/plain"),
+        }
+    }
+
+    /// Whether an entity makes the attachment mark by Annex A.1's rule,
+    /// its place in the tree aside: disposed with any type but `inline`,
+    /// or, stating no disposition, neither a multipart nor a text and
+    /// named by no `Content-ID`.
+    fn marks(entity: &MimeEntity) -> bool {
+        let disposition = entity
+            .disposition()
+            .map(|disposition| disposition.kind.trim().to_ascii_lowercase())
+            .filter(|kind| !kind.is_empty());
+        match disposition {
+            Some(kind) => kind != "inline",
+            None => {
+                let media = media(entity);
+                !media.starts_with("multipart/")
+                    && !media.starts_with("text/")
+                    && entity.header.get("Content-ID").is_none()
+            }
+        }
+    }
+
+    /// The parts of mime-rs's tree making the mark, in document order,
+    /// each by its section (RFC 3501 §6.4.5) and its media type: the
+    /// message's own entity makes none when it is a multipart, nor does a
+    /// child of a `multipart/encrypted`, nor a child but the first of a
+    /// `multipart/signed`. With `ended`, the last child of a multipart
+    /// never closed is no part, nor is anything under it, as the
+    /// summaries' walk reads one no delimiter ends.
+    fn marked(body: &[u8], ended: bool) -> Vec<(String, String)> {
+        let opts = MimeParseOptions {
+            max_entities: Some(usize::MAX),
+            ..Default::default()
+        };
+        let cst = MimeCst::parse_with(body, opts);
+
+        let mut found = Vec::new();
+        let mut pending = vec![(&cst.root, String::new(), true)];
+        while let Some((entity, section, eligible)) = pending.pop() {
+            let media = media(entity);
+            match &entity.body {
+                MimeBodyNode::Multipart(multipart) => {
+                    if !section.is_empty() && eligible && marks(entity) {
+                        found.push((section.clone(), media.clone()));
+                    }
+                    let read = match ended && multipart.close.is_empty() {
+                        true => multipart.parts.len().saturating_sub(1),
+                        false => multipart.parts.len(),
+                    };
+                    for (index, part) in multipart.parts.iter().enumerate().take(read).rev() {
+                        let child = match section.is_empty() {
+                            true => format!("{}", index + 1),
+                            false => format!("{section}.{}", index + 1),
+                        };
+                        let protocol = media == "multipart/encrypted"
+                            || (media == "multipart/signed" && index > 0);
+                        pending.push((&part.entity, child, !protocol));
+                    }
+                }
+                _ => {
+                    let section = match section.is_empty() {
+                        true => String::from("1"),
+                        false => section,
+                    };
+                    if eligible && marks(entity) {
+                        found.push((section, media));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// What the streamed walk stands for: each attachment's section and
+    /// media type, in document order.
+    fn walked(body: &[u8]) -> Vec<(String, String)> {
+        attachments::parts(body)
+            .attachments
+            .into_iter()
+            .map(|file| {
+                (
+                    file.part.unwrap_or_default(),
+                    file.media_type
+                        .unwrap_or_else(|| String::from("text/plain")),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_tree_and_the_walk_name_the_same_attachments() {
+        let body = b"Content-Type: multipart/mixed; boundary=out\r\n\r\n\
+--out\r\nContent-Type: multipart/alternative; boundary=in\r\n\r\n\
+--in\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--in\r\nContent-Type: text/html\r\nContent-Disposition: form-data\r\n\r\n<p>hi</p>\r\n\
+--in--\r\n\
+--out\r\nContent-Type: application/pdf\r\n\r\n%PDF\r\n\
+--out\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\n\r\nPNG\r\n\
+--out\r\nContent-Type: text/calendar\r\nContent-Disposition: INLINE\r\n\r\nUID:x\r\n\
+--out--\r\n";
+        let expected = vec![
+            (String::from("1.2"), String::from("text/html")),
+            (String::from("2"), String::from("application/pdf")),
+        ];
+        assert_eq!(marked(body, true), expected);
+        assert_eq!(marked(body, false), expected);
+        assert_eq!(walked(body), expected);
+        assert!(attachments::parts(body).attachment);
+    }
+
+    /// Where the two readings part: a multipart never closed. Its last
+    /// child, which no delimiter of its own ends, is a part of mime-rs's
+    /// tree and none of the summaries' walk, so the search extraction
+    /// reads a text the summary's mark and stand-ins leave unread. Annex
+    /// A.1 states neither reading.
+    #[test]
+    fn a_child_no_delimiter_ends_is_a_part_of_the_tree_alone() {
+        let body = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: application/pdf\r\n\r\n%PDF\r\n\
+--b\r\nContent-Type: application/zip\r\n\r\nPK\r\n";
+        let first = (String::from("1"), String::from("application/pdf"));
+        let last = (String::from("2"), String::from("application/zip"));
+
+        assert_eq!(walked(body), vec![first.clone()]);
+        assert_eq!(marked(body, true), vec![first.clone()]);
+        assert_eq!(marked(body, false), vec![first, last]);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// On every message the generator builds, cut anywhere or whole,
+        /// the streamed walk stands for exactly the parts of mime-rs's
+        /// tree that make the mark, under the same sections and media
+        /// types, a child no delimiter ends being no part.
+        #[test]
+        fn a_built_message_has_the_attachments_its_tree_has(
+            seed in 1u64..,
+            crlf in any::<bool>(),
+            truncate in proptest::option::of(0usize..4096),
+        ) {
+            let body = super::built(seed, crlf, truncate);
+            let tree = marked(&body, true);
+            prop_assert_eq!(&walked(&body), &tree, "{:?}", String::from_utf8_lossy(&body));
+            prop_assert_eq!(attachments::parts(&body).attachment, !tree.is_empty());
+        }
+    }
+}

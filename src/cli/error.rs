@@ -100,6 +100,9 @@ pub enum ErrorCode {
     StoreInFlight,
     /// A path of the store is not its user's alone.
     StoreExposed,
+    /// The store is not the one that answered the action's handle: a copy
+    /// restored since.
+    StoreReset,
     /// A source of the store does not support the write.
     Unsupported,
     /// No source of the store can perform the intent.
@@ -164,6 +167,7 @@ const PIMDIR_CODES: &[(&str, ErrorCode)] = &[
     ("store-staging", ErrorCode::StoreStaging),
     ("store-in-flight", ErrorCode::StoreInFlight),
     ("store-exposed", ErrorCode::StoreExposed),
+    ("store-reset", ErrorCode::StoreReset),
     ("unsupported", ErrorCode::Unsupported),
     ("no-performer", ErrorCode::NoPerformer),
     ("ambiguous-performer", ErrorCode::AmbiguousPerformer),

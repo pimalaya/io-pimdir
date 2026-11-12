@@ -130,9 +130,16 @@ The CLI SHALL expose, at minimum:
   the trash, it does not delete synced data.
 - `item erase`: erase one item's bytes from the store's files (STORAGE §11.5): `PimdirStore::erase` (the purge of a retained item, or the delete of a live one no source binds, the collector, a `TRUNCATE` checkpoint of pimdir.db), then, when index.db exists, `PimdirIndex::erase` (the refresh with its thread prune, `optimize_text`, a `TRUNCATE` checkpoint of index.db), reporting the blob files unlinked and whether the index was erased (`pimdir-item-erase`). A live item a source binds SHALL be refused: remove it first.
 - `queue list`: pending actions, or parked ones with `--parked`.
-- `queue cancel`: drop one queue row by id.
-- `queue status`: where one queue row stands by id: pending, parked with its
-  error, applied with the item an add created, or unknown.
+- `queue cancel`: drop one queue row by id, or by the handle its enqueue
+  answered (the store id, the incarnation and the id joined by periods), which
+  is refused as `store-reset` when the store is no longer the one that answered
+  it.
+- `queue status`: where one queue row stands by id or by handle: pending,
+  parked with its error, applied with the item an add created, unknown, or
+  `reset` for a handle another store or incarnation answered. `item restore`
+  and `tag` print the handle of each row they queue, `handle` beside `row` in
+  their JSON. `queue list` prints a `set-flags` stating its base as the set
+  read and the set left, and a `remove`'s `if-match` and `resolves`.
 - `store info`: the store's id and incarnation, its format version (the reader
   verified it is the one this build opens, refusing any other), the schema
   version with the read and produce versions, the derivation revision and the

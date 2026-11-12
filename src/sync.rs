@@ -190,6 +190,20 @@ impl Default for PimdirSyncOptions {
 pub enum PimdirSyncEvent {
     /// A member a listing named, new to the store.
     Added(PimdirHandle),
+    /// A member minted apart from a pending or a delivered create of this
+    /// source holding its hint, its summary not agreeing with the create's
+    /// (SYNC §5, §6), reported after its
+    /// [`Added`](Self::Added): the create is no longer landed by it, so a
+    /// pending one is pushed beside the member and a delivered one goes
+    /// on waiting. Another message reusing the `Message-ID`, or the
+    /// create's own named from a summary its server decoded otherwise
+    /// (SYNC §4), which the comparison cannot tell apart.
+    Disagreed {
+        /// The member minted apart.
+        handle: PimdirHandle,
+        /// The key of the create it was minted apart from.
+        link_id: PimdirLinkId,
+    },
     /// A placement's flag set changed, pulled from the remote.
     FlagsChanged(PimdirHandle),
     /// A placement's body was replaced or dropped after a remote content
@@ -210,6 +224,32 @@ pub enum PimdirSyncEvent {
         /// The key of the retained item keeping the body.
         link_id: PimdirLinkId,
     },
+}
+
+/// A create a sync left waiting (SYNC §5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirWaiting {
+    /// The create's provisional handle.
+    pub handle: PimdirHandle,
+    /// Why no add was pushed for it.
+    pub reason: PimdirWaitReason,
+}
+
+/// Why a create waits rather than being pushed (SYNC §2, §5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PimdirWaitReason {
+    /// A pending create whose date the run's scope does not hold: it may
+    /// be its own arrival, relocated with its `Date` kept, which no page
+    /// of this scope lists, so its add waits for a round whose scope
+    /// holds it.
+    OutOfScope,
+    /// A delivered create: its server holds the member already, and it
+    /// waits for the page naming that member to land it.
+    Delivered,
+    /// A pending create holding neither a body to upload nor an origin to
+    /// copy from: no add can deliver it until an upgrade reads its body.
+    Undeliverable,
 }
 
 /// A round or a rekey that would drop more than half of at least
@@ -268,11 +308,11 @@ pub struct PimdirSyncReport {
     pub unanswered: usize,
     /// Placements whose stale body was dropped after a remote content change.
     pub refreshed: usize,
-    /// Pending creates whose add waits for a round whose scope holds their
-    /// date (SYNC §5): each may be its own arrival, relocated with its
-    /// `Date` kept, which no page of this scope lists. Delivered creates
-    /// waiting for the page naming their member count too (SYNC §2, §5).
-    pub waiting: usize,
+    /// The creates of this source the run pushed no add for and landed on
+    /// no member, each by its provisional handle with why it waits (SYNC
+    /// §2, §5), once each: what a caller reports, a create named here run
+    /// after run being one nothing is about to deliver.
+    pub waiting: Vec<PimdirWaiting>,
     /// Changes withheld because the body they upload failed its name or
     /// was missing (STORAGE §7): the placement stays as it was.
     pub unreadable: usize,
@@ -284,6 +324,20 @@ pub struct PimdirSyncReport {
     /// The per-item events this sync emitted, in order, each once the
     /// write recording it committed (SYNC §5).
     pub events: Vec<PimdirSyncEvent>,
+}
+
+impl PimdirSyncReport {
+    /// Reports the create under `handle` waiting for `reason` (SYNC §5),
+    /// once a run however many of its passes meet it.
+    fn wait(&mut self, handle: &PimdirHandle, reason: PimdirWaitReason) {
+        if self.waiting.iter().all(|waiting| &waiting.handle != handle) {
+            trace!("the create {} waits: {reason:?}", handle.as_str());
+            self.waiting.push(PimdirWaiting {
+                handle: handle.clone(),
+                reason,
+            });
+        }
+    }
 }
 
 /// I/O-free SYNC coroutine.
@@ -322,6 +376,9 @@ pub struct PimdirSync {
     /// The tombstones whose remove is held while the add superseding them
     /// is pending (SYNC §5).
     held: BTreeSet<PimdirHandle>,
+    /// The `Created` placements the store offers this source, which are
+    /// no create of its own (SYNC §3, §9).
+    offered: BTreeSet<PimdirHandle>,
     /// The member each pending create may be moved from (SYNC §3).
     superseded: BTreeMap<PimdirHandle, PimdirSuperseded>,
     /// The meta each listed member carried, by handle.
@@ -401,6 +458,7 @@ impl PimdirSync {
             local: BTreeMap::new(),
             unstamped: Vec::new(),
             held: BTreeSet::new(),
+            offered: BTreeSet::new(),
             superseded: BTreeMap::new(),
             metas: BTreeMap::new(),
             fresh: BTreeMap::new(),
@@ -749,6 +807,7 @@ impl PimdirSync {
         self.local.clear();
         self.unstamped.clear();
         self.held.clear();
+        self.offered.clear();
         self.superseded.clear();
 
         // NOTE: a narrowed round finds absent only what is dated before it
@@ -787,6 +846,7 @@ impl PimdirSync {
         }
         self.unstamped.extend(loaded.unstamped);
         self.held.extend(loaded.held);
+        self.offered.extend(loaded.offered);
         self.superseded.extend(loaded.superseded);
     }
 
@@ -1139,6 +1199,10 @@ impl PimdirSync {
             return;
         }
 
+        // NOTE: read before the member is keyed apart, to report it (SYNC
+        // §5, §6): the comparison cannot tell another message from this
+        // create's own, named from a value its server decoded otherwise.
+        let apart = self.disagreeing_create(item);
         let key = meta
             .link_id
             .claim(&item.handle, |key| claimed.contains(key));
@@ -1168,7 +1232,30 @@ impl PimdirSync {
             origin: None,
         };
         self.local.insert(item.handle.clone(), named);
-        self.fresh.insert(item.handle.clone(), Fresh::Named);
+        self.fresh
+            .insert(item.handle.clone(), Fresh::Named { apart });
+    }
+
+    /// The pending or delivered create of this source holding the hint of
+    /// `item` whose summary disagrees with the member's, by its link id:
+    /// the create the member is minted apart from, no longer landed by it
+    /// (SYNC §6). `None` when no create holds the hint, or one agrees.
+    fn disagreeing_create(&self, item: &PimdirRemoteItem) -> Option<PimdirLinkId> {
+        let hint = &item.meta.link_id;
+        let minted = hint.minted(&hint.provisional());
+        [hint, &minted].into_iter().find_map(|key| {
+            self.local
+                .values()
+                .find(|p| {
+                    p.link_id.as_ref() == Some(key)
+                        && ((p.status == PimdirStatus::Created && p.base.is_none())
+                            || p.delivered())
+                        && p.handle != item.handle
+                        && !self.offered.contains(&p.handle)
+                        && !summary::same_message(p.summary.as_ref(), item.meta.summary.as_ref())
+                })
+                .and_then(|p| p.link_id.clone())
+        })
     }
 
     /// Takes the pending create of this source holding `hint`, if any.
@@ -1451,9 +1538,17 @@ impl PimdirSync {
                     self.upsert(named);
                 }
                 match fresh {
-                    Fresh::Named => {
+                    Fresh::Named { apart } => {
                         self.report.pulled += 1;
-                        self.emit(PimdirSyncEvent::Added(handle));
+                        self.emit(PimdirSyncEvent::Added(handle.clone()));
+                        if let Some(link_id) = apart {
+                            debug!(
+                                "{} disagrees with the create {}, minted apart",
+                                handle.as_str(),
+                                link_id.as_str(),
+                            );
+                            self.emit(PimdirSyncEvent::Disagreed { handle, link_id });
+                        }
                     }
                     Fresh::Landed { conflicted, .. } => {
                         self.emit(PimdirSyncEvent::Created(handle.clone()));
@@ -1513,7 +1608,8 @@ impl PimdirSync {
                     .as_ref()
                     .is_some_and(PimdirPlacement::delivered)
             {
-                self.report.waiting += 1;
+                self.report
+                    .wait(&candidate.handle, PimdirWaitReason::Delivered);
             }
             if let Some(candidate) = merge.narrow(candidate) {
                 return Some(candidate);
@@ -1706,10 +1802,16 @@ impl PimdirSync {
                         "holding the create {} for a round whose scope holds it",
                         handle.as_str()
                     );
-                    self.report.waiting += 1;
+                    self.report.wait(&handle, PimdirWaitReason::OutOfScope);
                     return None;
                 }
                 let pushable = local.object.is_some() || local.origin.is_some();
+                // NOTE: neither a body to upload nor an origin to copy
+                // from: no add delivers it, whatever the run may push, so
+                // it is reported rather than left waiting unseen.
+                if !pushable {
+                    self.report.wait(&handle, PimdirWaitReason::Undeliverable);
+                }
                 if self.opts.push && self.opts.rights.add && pushable {
                     let add = PimdirChangeKind::Add {
                         handle: handle.clone(),
@@ -2676,8 +2778,10 @@ struct Landing {
 
 /// How the page named a member the join writes.
 enum Fresh {
-    /// Keyed afresh: a new item and binding.
-    Named,
+    /// Keyed afresh: a new item and binding, `apart` naming the pending
+    /// or delivered create of this source it was minted apart from on a
+    /// summary disagreement (SYNC §6).
+    Named { apart: Option<PimdirLinkId> },
     /// A pending create landed, its provisional handle superseded,
     /// `conflicted` when its arrival carried no body to agree on (SYNC
     /// §6).
@@ -4399,7 +4503,15 @@ mod tests {
 
         assert!(pushes.is_none(), "nothing to push: no body, no origin");
         assert!(report.parked.is_none(), "neither is a based member");
-        assert_eq!(report.waiting, 2, "both reported waiting");
+        let waiting = |handle: &str| PimdirWaiting {
+            handle: PimdirHandle::from(handle),
+            reason: PimdirWaitReason::Delivered,
+        };
+        assert_eq!(
+            report.waiting,
+            [waiting("\u{1}m1"), waiting("\u{1}m2")],
+            "both reported waiting, by handle, as delivered"
+        );
         assert!(
             upserted(&writes, "\u{1}m1").is_none() && upserted(&writes, "\u{1}m2").is_none(),
             "both wait as they were: {writes:?}",
@@ -6077,6 +6189,32 @@ mod tests {
         }
     }
 
+    /// A create holding neither a body nor an origin is delivered by no
+    /// add, and is reported waiting as undeliverable; before 2026-11-13
+    /// it derived nothing and was counted nowhere.
+    #[test]
+    fn a_create_holding_neither_body_nor_origin_is_reported_undeliverable() {
+        let mut create = pending_create();
+        create.object = None;
+        create.level = PimdirLevel::Meta;
+
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (pushes, _writes, report) = run(&mut sync, vec![create.clone()], vec![]);
+        assert!(pushes.is_none(), "nothing delivers it");
+        assert_eq!(
+            report.waiting,
+            [PimdirWaiting {
+                handle: create.handle,
+                reason: PimdirWaitReason::Undeliverable,
+            }]
+        );
+
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (pushes, _writes, report) = run(&mut sync, vec![pending_create()], vec![]);
+        assert!(pushes.is_some(), "a create holding its body is pushed");
+        assert!(report.waiting.is_empty());
+    }
+
     /// A create carrying no origin whose date the scope excludes waits for
     /// a round whose scope holds it (SYNC §5).
     #[test]
@@ -6096,7 +6234,13 @@ mod tests {
         let mut sync = PimdirSync::new("inbox", opts);
         let (pushes, _writes, report) = run(&mut sync, vec![create.clone()], vec![]);
         assert!(pushes.is_none(), "the create waits");
-        assert_eq!(report.waiting, 1);
+        assert_eq!(
+            report.waiting,
+            [PimdirWaiting {
+                handle: create.handle.clone(),
+                reason: PimdirWaitReason::OutOfScope,
+            }]
+        );
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let (pushes, _writes, _report) = run(&mut sync, vec![create], vec![]);

@@ -310,7 +310,7 @@ proptest! {
                 }
                 HostileOp::Remove(i) => {
                     if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                        let _ = client.mutate("inbox", PimdirMutation::Remove(handle));
+                        let _ = client.mutate("inbox", PimdirMutation::Remove { handle, if_match: None, resolves: None });
                     }
                 }
                 HostileOp::Copy(i) => {

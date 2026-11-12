@@ -53,7 +53,10 @@ fn an_applied_add_names_the_item_it_created() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let (action, object) = add(&producer, DRAFT);
-    let id = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
+    let id = producer
+        .enqueue("Drafts", &action, Some(&object))
+        .unwrap()
+        .id;
     assert_eq!(
         producer.action_status(id).unwrap(),
         PimdirActionStatus::Pending {
@@ -89,20 +92,34 @@ fn a_parked_row_reads_with_its_error_and_a_cancelled_one_nowhere() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let removal = producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 41 }, None)
-        .unwrap();
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: 41,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
+        .unwrap()
+        .id;
     let flags = producer
         .enqueue(
             "INBOX",
             &PimdirAction::SetFlags {
                 seq: 41,
                 flags: PimdirFlags::default(),
+                base: None,
             },
             None,
         )
-        .unwrap();
+        .unwrap()
+        .id;
     let (action, object) = add(&producer, DRAFT);
-    let cancelled = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
+    let cancelled = producer
+        .enqueue("Drafts", &action, Some(&object))
+        .unwrap()
+        .id;
     assert!(
         PimdirStore::open(dir.path())
             .unwrap()
@@ -140,8 +157,14 @@ fn a_duplicate_add_parks_and_names_no_item() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let (action, object) = add(&producer, DRAFT);
-    let first = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
-    let second = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
+    let first = producer
+        .enqueue("Drafts", &action, Some(&object))
+        .unwrap()
+        .id;
+    let second = producer
+        .enqueue("Drafts", &action, Some(&object))
+        .unwrap()
+        .id;
 
     drain(dir.path());
 
@@ -161,7 +184,10 @@ fn an_old_receipt_is_pruned() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let (action, object) = add(&producer, DRAFT);
-    let id = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
+    let id = producer
+        .enqueue("Drafts", &action, Some(&object))
+        .unwrap()
+        .id;
     drain(dir.path());
 
     let db = Connection::open(dir.path().join("pimdir.db")).unwrap();
@@ -218,8 +244,14 @@ fn an_acknowledged_intent_reads_applied_and_a_dropped_one_nowhere() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let (action, object) = submit(&producer, DRAFT);
-    let sent = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
-    let withdrawn = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+    let sent = producer
+        .enqueue("INBOX", &action, Some(&object))
+        .unwrap()
+        .id;
+    let withdrawn = producer
+        .enqueue("INBOX", &action, Some(&object))
+        .unwrap()
+        .id;
     assert_eq!(refcount(dir.path(), &object), 2);
 
     // the drain leaves intents to their performer
@@ -256,7 +288,10 @@ fn a_parked_intent_is_acknowledged_too() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let (action, object) = submit(&producer, DRAFT);
-    let id = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+    let id = producer
+        .enqueue("INBOX", &action, Some(&object))
+        .unwrap()
+        .id;
 
     let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
     owner.fail_action(id, Some("refused")).unwrap();
@@ -280,7 +315,10 @@ fn a_receipt_outlives_its_collection_and_names_none() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let (action, object) = add(&producer, DRAFT);
-    let id = producer.enqueue("Drafts", &action, Some(&object)).unwrap();
+    let id = producer
+        .enqueue("Drafts", &action, Some(&object))
+        .unwrap()
+        .id;
     drain(dir.path());
     let PimdirActionStatus::Applied { seq: created, .. } = producer.action_status(id).unwrap()
     else {
@@ -308,7 +346,10 @@ fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
 
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let (action, object) = submit(&producer, DRAFT);
-    let id = producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+    let id = producer
+        .enqueue("INBOX", &action, Some(&object))
+        .unwrap()
+        .id;
 
     let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
     let copy = PimdirAction::Add {

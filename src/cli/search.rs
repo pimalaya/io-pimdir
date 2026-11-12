@@ -467,7 +467,8 @@ impl TagCommand {
                             sources,
                             syncs: placement.syncs,
                             missing: placement.missing.clone(),
-                            row: staged.map(|(_, row)| *row),
+                            row: staged.map(|(_, row)| row.id),
+                            handle: staged.map(|(_, row)| row.to_string()),
                         }
                     })
                     .collect(),
@@ -957,6 +958,9 @@ pub struct TagPlacementRow {
     pub missing: Vec<String>,
     /// The queue row staged for it, `null` when none was.
     pub row: Option<i64>,
+    /// The row's handle, its id under the store's id and incarnation,
+    /// `null` when none was staged.
+    pub handle: Option<String>,
 }
 
 /// What became of one placement a tag reaches.
@@ -1659,6 +1663,7 @@ Sort key:     2026-08-01T10:00:00Z
             syncs: true,
             missing: missing.iter().map(|name| name.to_string()).collect(),
             row: None,
+            handle: None,
         };
 
         let output = TagOutput {

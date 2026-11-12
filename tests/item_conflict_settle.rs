@@ -276,6 +276,7 @@ fn queue_update(dir: &Path, seq: i64, bytes: &[u8], resolves: Option<&[&[u8]]>) 
             resolves,
         })
         .unwrap()
+        .id
 }
 
 /// The card's body as a reader overlaying the queue reads it (§15.4).
@@ -435,4 +436,171 @@ fn a_queued_resolution_runs_through_the_binding_it_names() {
         .expect("a base");
     assert_eq!(base.revision.as_deref(), Some("e2"));
     assert_eq!(base.object, Some(phone.hash(SERVER)));
+}
+
+/// Queues a `remove` of the card stating `resolves`, answering nothing.
+fn queue_remove(dir: &Path, seq: i64, if_match: Option<&[u8]>, resolves: Option<&[&[u8]]>) {
+    let mut producer = PimdirProducer::open(dir, "test").unwrap();
+    let action = PimdirAction::Remove {
+        seq,
+        if_match: if_match.map(hash::hash),
+        resolves: resolves.map(|bodies| bodies.iter().map(|body| hash::hash(body)).collect()),
+    };
+    producer.enqueue(CONTACTS, &action, None).unwrap();
+}
+
+/// Whether a reader overlaying the queue still lists the card (§15.4).
+fn listed(dir: &Path, seq: i64) -> bool {
+    let reader = PimdirReader::open(dir).unwrap().with_pending();
+    reader.get_item(CONTACTS, seq).unwrap().is_some()
+}
+
+/// A queued `remove` meeting the item's conflict parks naming it unless it
+/// is a resolution naming it (STORAGE §15.2, §15.3; SYNC §7; vectors/sync
+/// 143, 146): a delete queued before the conflict arose never deletes the
+/// diverging body unseen. One naming it tombstones the item, its conflict
+/// cleared and the diverging body released, the item keeping its own. The
+/// overlay takes the item out only where the drain applies the row.
+///
+/// Before draft-10's second batch every remove here applied, and the
+/// tombstone's upsert cleared the conflict whoever staged it.
+#[test]
+fn a_queued_remove_settles_only_the_conflict_it_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut phone, _server) = diverged(dir.path());
+    let seq = seq(&phone);
+    let server_body = phone.hash(SERVER);
+
+    // NOTE: an ordinary remove, of the body the item keeps.
+    queue_remove(dir.path(), seq, Some(PHONE), None);
+    assert!(listed(dir.path(), seq), "not folded");
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = phone.parked_actions().unwrap();
+    assert!(
+        parked[0].error.contains(&server_body.0),
+        "{}",
+        parked[0].error
+    );
+    let conflicts = phone.list_item_conflicts(None).unwrap();
+    assert_eq!(conflicts.len(), 1, "the conflict stands");
+    assert_eq!(conflicts[0].conflict_object, Some(server_body.clone()));
+    assert_eq!(refcount(dir.path(), &server_body), 2, "both bodies kept");
+
+    // a resolution naming another body parks the same
+    queue_remove(dir.path(), seq, None, Some(&[ANCESTOR]));
+    assert!(listed(dir.path(), seq), "not folded");
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+
+    // a remove stating a body the item does not hold parks before any
+    // conflict is read
+    queue_remove(dir.path(), seq, Some(MERGED), Some(&[SERVER]));
+    assert!(listed(dir.path(), seq), "not folded");
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = phone.parked_actions().unwrap();
+    let replaced = parked.last().unwrap();
+    assert!(
+        replaced.error.contains("body replaced"),
+        "{}",
+        replaced.error
+    );
+
+    // the person's resolution by deleting settles it
+    queue_remove(dir.path(), seq, Some(PHONE), Some(&[SERVER]));
+    assert!(!listed(dir.path(), seq), "folded: the item is taken out");
+    let report = phone.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked),
+        (1, 0),
+        "{:?}",
+        phone.parked_actions()
+    );
+    let hub = phone.load_hub(CONTACTS).unwrap();
+    let item = &hub.items[&PimdirLinkId(LINK.into())];
+    assert!(item.deleted, "tombstoned");
+    assert!(!item.conflicted, "the item's conflict cleared");
+    assert_eq!(item.conflict_object, None, "its body released");
+    assert_eq!(item.object, Some(phone.hash(PHONE)), "its own body kept");
+    assert_eq!(
+        refcount(dir.path(), &server_body),
+        1,
+        "the server's base alone holds the diverging body"
+    );
+    assert!(phone.refcount_drift().unwrap().is_empty());
+    assert_eq!(status(&phone), PimdirStatus::Tombstone);
+}
+
+/// A tombstone settles the item's conflict only when a `Settle` precedes
+/// it (STORAGE §14, SYNC §7): a `Move` meeting one, which the standard
+/// leaves open, stages its tombstone and its create as it always did, and
+/// the conflict stands under the deleted item with its diverging body
+/// pinned, where the write cleared it and released the body before.
+#[test]
+fn a_move_over_a_conflicted_item_keeps_the_diverging_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut phone, _server) = diverged(dir.path());
+    phone.ensure_collection("archive", "text/vcard").unwrap();
+    let server_body = phone.hash(SERVER);
+
+    phone
+        .mutate(
+            CONTACTS,
+            PimdirMutation::Move {
+                handle: PimdirHandle("1".into()),
+                target: PimdirCollectionId("archive".into()),
+            },
+        )
+        .unwrap();
+
+    let hub = phone.load_hub(CONTACTS).unwrap();
+    let item = &hub.items[&PimdirLinkId(LINK.into())];
+    assert!(item.deleted, "the source is tombstoned");
+    assert!(item.conflicted, "no resolution: the conflict stands");
+    assert_eq!(item.conflict_object, Some(server_body.clone()));
+    assert_eq!(
+        refcount(dir.path(), &server_body),
+        2,
+        "the item still pins the diverging body beside the server's base"
+    );
+    let moved = phone.load_hub("archive").unwrap();
+    assert_eq!(moved.items.len(), 1, "the create is staged in the target");
+    assert!(phone.refcount_drift().unwrap().is_empty());
+}
+
+/// An `add` superseding a conflicted item tombstones it as a `remove` of
+/// it would (STORAGE §15.3): stating no resolution, the remove is refused
+/// and the whole action parks, its add with it, the conflict and both
+/// bodies kept.
+#[test]
+fn an_add_superseding_a_conflicted_item_parks_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut phone, _server) = diverged(dir.path());
+    phone.ensure_collection("archive", "text/vcard").unwrap();
+    let seq = seq(&phone);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    producer
+        .enqueue_with_body("archive", MERGED, |object| PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: Some(object),
+            supersedes: Some(io_pimdir::codec::PimdirSupersedes {
+                collection: PimdirCollectionId(CONTACTS.into()),
+                seq,
+            }),
+        })
+        .unwrap();
+    drop(producer);
+
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    assert!(
+        phone.load_hub("archive").unwrap().items.is_empty(),
+        "the add was not applied alone"
+    );
+    let hub = phone.load_hub(CONTACTS).unwrap();
+    let item = &hub.items[&PimdirLinkId(LINK.into())];
+    assert!(!item.deleted && item.conflicted, "left as it stood");
 }

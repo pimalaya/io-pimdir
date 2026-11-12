@@ -7,6 +7,8 @@
 //! of mutable content is a new object, the old one dereferenced. Many
 //! placements sharing one object is the dedup and unified-view mechanism.
 
+use alloc::string::String;
+
 crate::pimdir_id! {
     /// The content hash naming an object in the object store (STORAGE §5).
     ///
@@ -51,6 +53,23 @@ pub struct PimdirObject {
     pub hash: PimdirHash,
     /// The byte size of the content.
     pub size: usize,
+}
+
+/// A body a row of the account holds under a link id, with the witnesses
+/// a link is checked against (STORAGE §9, §14; SYNC §6): what the storage
+/// answers a lookup with, one per holder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirHeldObject {
+    /// The body the row holds, its size the body's octets.
+    pub object: PimdirObject,
+    /// The `subject` the row's mail summary states; `None` for a row
+    /// holding no mail summary, as the two below, which a message agrees
+    /// with never.
+    pub subject: Option<String>,
+    /// The `date` the row's mail summary states.
+    pub date: Option<String>,
+    /// The `sender` the row's mail summary states.
+    pub sender: Option<String>,
 }
 
 #[cfg(test)]

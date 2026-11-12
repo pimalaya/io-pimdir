@@ -828,13 +828,30 @@ fn mutation(
     };
     let target = || PimdirCollectionId::from(value["to"].as_str().unwrap());
     let derived = |body: &[u8]| summary::derive(kind, body);
+    // NOTE: the diverging bodies a person's resolution names, by label
+    // (SYNC §7, §11).
+    let resolves = |value: &Value| {
+        value.as_array().map(|labels| {
+            labels
+                .iter()
+                .map(|label| PimdirHash::from(bodies.hash(label).expect("a body label")))
+                .collect::<Vec<_>>()
+        })
+    };
 
     Some(match value["kind"].as_str().unwrap() {
+        // NOTE: the set its producer read, where the case states one
+        // (SYNC §7, §11).
         "SetFlags" => PimdirMutation::SetFlags {
             handle: handle(),
             flags: flags(&value["flags"]),
+            base: value.get("base").map(flags),
         },
-        "Remove" => PimdirMutation::Remove(handle()),
+        "Remove" => PimdirMutation::Remove {
+            handle: handle(),
+            if_match: bodies.hash(&value["if_match"]).map(PimdirHash::from),
+            resolves: resolves(&value["resolves"]),
+        },
         "Edit" => {
             readable(store, bodies, &value["object"])?;
             let (object, body) = bodies.object(&value["object"]);
@@ -847,14 +864,7 @@ fn mutation(
                 body,
                 if_match: bodies.hash(&value["if_match"]).map(PimdirHash::from),
                 overrule: value["overrule"].as_bool().unwrap_or(false),
-                // NOTE: the diverging bodies a person's resolution names,
-                // by label (SYNC §7, §11).
-                resolves: value["resolves"].as_array().map(|labels| {
-                    labels
-                        .iter()
-                        .map(|label| PimdirHash::from(bodies.hash(label).expect("a body label")))
-                        .collect()
-                }),
+                resolves: resolves(&value["resolves"]),
             }
         }
         "Copy" => PimdirMutation::Copy {
@@ -907,6 +917,9 @@ fn event_json(event: &PimdirSyncEvent) -> Value {
         PimdirSyncEvent::Created(h) => ("Created", h),
         PimdirSyncEvent::Overruled { handle, link_id } => {
             return json!({ "kind": "Overruled", "handle": handle.0, "link_id": link_id.0 });
+        }
+        PimdirSyncEvent::Disagreed { handle, link_id } => {
+            return json!({ "kind": "Disagreed", "handle": handle.0, "link_id": link_id.0 });
         }
         event => panic!("unexpected event {event:?}"),
     };
@@ -1378,7 +1391,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 4, "{label}: the sync format's version");
+        assert_eq!(case["v"], 5, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 

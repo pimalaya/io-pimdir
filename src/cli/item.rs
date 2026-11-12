@@ -400,7 +400,8 @@ impl ItemRestoreCommand {
             seq: self.seq,
             collection: found.collection,
             link_id: item.link_id.0.clone(),
-            row: id,
+            row: id.id,
+            handle: id.to_string(),
             queued: status == RestoreStatus::Queued,
             status,
         })?;
@@ -1044,6 +1045,9 @@ pub struct ItemRestoreOutput {
     pub link_id: String,
     /// The queue row the restore was appended as.
     pub row: i64,
+    /// The row's handle, its id under the store's id and incarnation:
+    /// what `queue status` and `queue cancel` check the store against.
+    pub handle: String,
     /// Whether the row waits for the store's sync engine: another writer
     /// held the store lock. `false` with exit status 2 when the drain ran
     /// and the item is still not live.
@@ -1064,7 +1068,7 @@ impl fmt::Display for ItemRestoreOutput {
             RestoreStatus::Queued => writeln!(
                 f,
                 "Restore of item {} into {} queued as action {}: another writer holds the store lock, so it applies at the next sync",
-                self.seq, self.collection, self.row
+                self.seq, self.collection, self.handle
             ),
             RestoreStatus::Refused => writeln!(
                 f,

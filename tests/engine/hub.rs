@@ -690,7 +690,14 @@ fn a_removed_pending_create_leaves_no_binding() {
 
     mirror
         .a
-        .mutate("inbox", PimdirMutation::Remove(link.provisional()))
+        .mutate(
+            "inbox",
+            PimdirMutation::Remove {
+                handle: link.provisional(),
+                if_match: None,
+                resolves: None,
+            },
+        )
         .unwrap();
 
     assert!(mirror.bindings().is_empty(), "{:?}", mirror.hub());
@@ -725,7 +732,14 @@ fn a_removed_offered_member_is_deleted_on_its_holder() {
 
     mirror
         .b
-        .mutate("inbox", PimdirMutation::Remove(offered))
+        .mutate(
+            "inbox",
+            PimdirMutation::Remove {
+                handle: offered,
+                if_match: None,
+                resolves: None,
+            },
+        )
         .unwrap();
 
     assert_eq!(
@@ -774,7 +788,14 @@ fn a_withdrawn_create_beside_a_holder_deletes_the_item() {
 
     mirror
         .b
-        .mutate("inbox", PimdirMutation::Remove(pending))
+        .mutate(
+            "inbox",
+            PimdirMutation::Remove {
+                handle: pending,
+                if_match: None,
+                resolves: None,
+            },
+        )
         .unwrap();
 
     assert_eq!(

@@ -31,7 +31,7 @@ use crate::{
     coroutine::PimdirWritten,
     hub::{PimdirBinding, PimdirHub, PimdirHubItem, PimdirOverruled, PimdirSourceId},
     load::{PimdirLoadSelection, PimdirLoaded},
-    object::{PimdirHash, PimdirObject},
+    object::{PimdirHash, PimdirHeldObject, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
         PimdirPlacement, PimdirSortKey, PimdirStatus, PimdirSuperseded,
@@ -201,6 +201,7 @@ impl PimdirSourceStore {
             .collect();
 
         let conflicted = hub.conflicted(&placements);
+        let offered = hub.offered(&self.source, &placements);
 
         Ok(PimdirLoaded {
             placements,
@@ -211,19 +212,22 @@ impl PimdirSourceStore {
             held,
             superseded,
             conflicted,
+            offered,
         })
     }
 
     /// Resolves which link ids already hold a body, within this handle's
-    /// account (§14), each with its size, the witness a link is checked
-    /// against (SYNC §6); a writer-derived key never matches (§9). A body is
+    /// account (§14): each row holding one, with the body, its size and
+    /// the `subject`, `date` and `sender` its mail summary states, the
+    /// witnesses a link is checked against (SYNC §6), one per holder
+    /// stating another; a writer-derived key never matches (§9). A body is
     /// answered only once read whole and found to hash to its name (STORAGE
     /// §7), so a link never lands on a missing or failing one, which is
     /// moved into quarantine/ and fetched instead.
     pub fn lookup_objects(
         &self,
         links: &[PimdirLinkId],
-    ) -> Result<BTreeMap<PimdirLinkId, PimdirObject>, PimdirError> {
+    ) -> Result<BTreeMap<PimdirLinkId, Vec<PimdirHeldObject>>, PimdirError> {
         let conn = &self.store.reader.conn;
         bind_list(conn, "links", links.iter().map(|l| l.0.as_str()))?;
         let found = rows(
@@ -233,24 +237,32 @@ impl PimdirSourceStore {
             |r| {
                 Ok((
                     PimdirLinkId(r.get::<_, String>(0)?),
-                    PimdirObject {
-                        hash: PimdirHash(r.get::<_, String>(1)?),
-                        size: r.get::<_, i64>(2)?.max(0) as usize,
+                    PimdirHeldObject {
+                        object: PimdirObject {
+                            hash: PimdirHash(r.get::<_, String>(1)?),
+                            size: r.get::<_, i64>(2)?.max(0) as usize,
+                        },
+                        subject: r.get(3)?,
+                        date: r.get(4)?,
+                        sender: r.get(5)?,
                     },
                 ))
             },
         )?;
 
         let mut sound = BTreeSet::new();
-        let mut objects = BTreeMap::new();
-        for (link, object) in found {
-            if !sound.contains(&object.hash) {
-                if self.store.check_body(&object.hash)? != PimdirBlobCheck::Sound {
+        let mut objects: BTreeMap<PimdirLinkId, Vec<PimdirHeldObject>> = BTreeMap::new();
+        for (link, held) in found {
+            if !sound.contains(&held.object.hash) {
+                if self.store.check_body(&held.object.hash)? != PimdirBlobCheck::Sound {
                     continue;
                 }
-                sound.insert(object.hash.clone());
+                sound.insert(held.object.hash.clone());
             }
-            objects.insert(link, object);
+            let holders = objects.entry(link).or_default();
+            if !holders.contains(&held) {
+                holders.push(held);
+            }
         }
 
         Ok(objects)
@@ -1403,7 +1415,9 @@ fn save_hub_diff(
 }
 
 /// Whether the same account holds `link` live in another collection with
-/// the retiring body, or any body when the retiring row has none (§11).
+/// the retiring body, or, the retiring row holding none, at all: for a
+/// message only in a row agreeing with its subject, date and sender, which
+/// the statement reads from both rows itself (§9, §11.1).
 fn held_elsewhere(
     conn: &Connection,
     collection: &str,
@@ -1716,13 +1730,31 @@ fn insert_item(
     }
 
     // NOTE: a derived key states nothing the content carries and never
-    // shares a public id (§9.1).
+    // shares a public id (§9.1). A message shares only with a row that
+    // agrees with the summary being written, on its subject, date and
+    // sender (§9): one reusing a Message-ID another mailbox holds is
+    // another message there too, and draws its own. The three are read
+    // for mail alone and bound NULL for another kind.
+    let (subject, date, sender) = match &item.summary {
+        Some(PimdirSummary::Mail(mail)) => (
+            Some(mail.subject.as_str()),
+            mail.date.as_deref().filter(|date| !date.is_empty()),
+            mail.sender.as_deref(),
+        ),
+        _ => (None, None, None),
+    };
     let existing = match link.is_derived() {
         true => None,
         false => conn
             .query_row_cached(
                 sql::SEQ_FOR_LINK_ANY,
-                named_params! { ":collection": collection, ":link_id": link.0 },
+                named_params! {
+                    ":collection": collection,
+                    ":link_id": link.0,
+                    ":subject": subject,
+                    ":date": date,
+                    ":sender": sender,
+                },
                 |row| row.get::<_, i64>(0),
             )
             .optional()?,
@@ -2517,21 +2549,55 @@ pub(crate) fn put_unbound(
 
 /// Sets the flags of an item no source binds (§14.3), a queued
 /// `set-flags` the drain applies to the store alone, nothing having a
-/// change to push. An item absent or deleted is left as it is.
+/// change to push: replaced by `flags`, or, stating `base`, changed by
+/// what `flags` adds to and removes from it (§15.3). Answers `false`,
+/// writing nothing, for a change stating its base over an unknown set,
+/// which the drain parks. An item absent or deleted is left as it is.
 pub(crate) fn set_unbound_flags(
     conn: &Connection,
     collection: &str,
     link: &PimdirLinkId,
     flags: &PimdirFlags,
-) -> Result<(), PimdirError> {
+    base: Option<&PimdirFlags>,
+) -> Result<bool, PimdirError> {
     let hub = read_hub(conn, collection, Some(core::slice::from_ref(&link.0)))?;
     let Some(prev) = hub.items.get(link) else {
-        return Ok(());
+        return Ok(true);
     };
     let mut item = prev.clone();
-    item.flags = flags.clone();
+    item.flags = match base {
+        Some(base) => match prev.flags.changed(base, flags) {
+            Some(changed) => changed,
+            None => return Ok(false),
+        },
+        None => flags.clone(),
+    };
     if !item_columns_eq(prev, &item) {
         update_item(conn, collection, link, &item)?;
     }
+    Ok(true)
+}
+
+/// Settles the conflict of an item no source binds, a queued `remove`
+/// resolving it by deleting (§15.3, SYNC §7): `items.conflicted` cleared
+/// and its `conflict_object` released, the item keeping its body.
+pub(crate) fn settle_unbound(
+    conn: &Connection,
+    collection: &str,
+    link: &PimdirLinkId,
+) -> Result<(), PimdirError> {
+    let old = read_hub(conn, collection, Some(core::slice::from_ref(&link.0)))?;
+    let Some(prev) = old.items.get(link) else {
+        return Ok(());
+    };
+    let mut item = prev.clone();
+    item.conflicted = false;
+    item.conflict_object = None;
+    if !item_columns_eq(prev, &item) {
+        update_item(conn, collection, link, &item)?;
+    }
+    let mut new = old.clone();
+    new.items.insert(link.clone(), item);
+    adjust_refcounts(conn, &object_refs(&old), &object_refs(&new))?;
     Ok(())
 }

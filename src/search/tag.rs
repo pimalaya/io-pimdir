@@ -20,6 +20,7 @@ use alloc::{
 use core::fmt;
 
 use crate::{
+    codec::PimdirActionHandle,
     placement::{PimdirFlags, PimdirLinkId},
     search::coverage::PimdirSearchCoverage,
 };
@@ -116,8 +117,8 @@ pub struct PimdirSearchTagAction {
     pub source: String,
     /// The flag set it sets.
     pub flags: BTreeSet<String>,
-    /// The queue row's id.
-    pub action: i64,
+    /// The queue row's handle, as its enqueue answered it.
+    pub action: PimdirActionHandle,
 }
 
 /// A flag change a tag refuses.

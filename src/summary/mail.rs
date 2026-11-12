@@ -355,11 +355,12 @@ const WINDOWS_1252_LABELS: [&str; 17] = [
 /// dropped, matched without regard to ASCII case, and the octets decoded
 /// by the encoding it names, no byte order mark sniffed.
 ///
-/// The UTF-8 and windows-1252 labels decode in every build, ill-formed
-/// UTF-8 replaced (Annex A.0). The other encodings need the
-/// `charset-tables` feature (`encoding_rs`, which `client` enables): a
-/// build without it has no table for them and keeps such a label as one
-/// it does not know, a deviation from Annex A.1.
+/// Every build carries the tables, the legacy indexes among them
+/// (ISO-8859-2, KOI8-R, ISO-2022-JP, GBK and the rest), which Annex A.1
+/// has a writer carry: a build decoding fewer labels would derive other
+/// subjects, display names and `alt:` keys, silently. The UTF-8 and
+/// windows-1252 labels are read here, ill-formed UTF-8 replaced (Annex
+/// A.0), every other one through `encoding_rs`.
 pub fn charset_decode(charset: &str, octets: &[u8]) -> Option<String> {
     let label = charset
         .split('*')
@@ -374,11 +375,8 @@ pub fn charset_decode(charset: &str, octets: &[u8]) -> Option<String> {
         label if WINDOWS_1252_LABELS.contains(&label) => {
             Some(octets.iter().map(|byte| cp1252(*byte)).collect())
         }
-        #[cfg(feature = "charset-tables")]
         label => encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
             .map(|encoding| encoding.decode_without_bom_handling(octets).0.into_owned()),
-        #[cfg(not(feature = "charset-tables"))]
-        _ => None,
     }
 }
 
@@ -1328,19 +1326,15 @@ mod charset_table_tests {
     use super::decode;
 
     /// A legacy GBK subject of the kind older CN mail servers still emit by
-    /// the thousand a week: read with the tables, which `client` enables,
-    /// and kept as written by a build without them.
+    /// the thousand a week, read in every build, the no_std core's among
+    /// them: the tables are no feature (Annex A.1).
     #[test]
-    fn a_gbk_subject_is_read_with_the_tables_and_kept_without() {
+    fn a_gbk_subject_is_read_in_every_build() {
         let out = decode("=?gbk?B?1PbBv8r9vt3NrLK9sai45i0yNjEwMjk?=");
-        #[cfg(feature = "charset-tables")]
         assert_eq!(out, "增量数据同步报告-261029");
-        #[cfg(not(feature = "charset-tables"))]
-        assert_eq!(out, "=?gbk?B?1PbBv8r9vt3NrLK9sai45i0yNjEwMjk?=");
     }
 
     #[test]
-    #[cfg(feature = "charset-tables")]
     fn the_other_cjk_labels_read() {
         assert_eq!(decode("=?gb2312?B?uqO52A==?="), "海关");
         assert_eq!(decode("=?big5?B?rvzD9g==?="), "海關");

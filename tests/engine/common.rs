@@ -140,12 +140,22 @@ where
     /// then its binding's, as a resolution states them in `resolves`;
     /// `None` when it meets none, an ordinary edit settling nothing.
     pub fn shown(&self, collection: &str, handle: &PimdirHandle) -> Option<Vec<PimdirHash>> {
+        let shown: Vec<PimdirHash> = self.met(collection, handle).into_iter().flatten().collect();
+        (!shown.is_empty()).then_some(shown)
+    }
+
+    /// The conflicts an edit or a remove of `handle` meets (SYNC §7): the
+    /// diverging body of the item's, then of its binding's, `None` for
+    /// one nobody has read, which no resolution names.
+    pub fn met(&self, collection: &str, handle: &PimdirHandle) -> Vec<Option<PimdirHash>> {
         let selection = PimdirLoadSelection::Handles(vec![handle.clone()]);
         let loaded = self
             .store
             .load(&collection.into(), &selection)
             .expect("the placement loads");
-        let placement = loaded.placements.iter().find(|p| &p.handle == handle)?;
+        let Some(placement) = loaded.placements.iter().find(|p| &p.handle == handle) else {
+            return Vec::new();
+        };
         let item = loaded
             .conflicted
             .iter()
@@ -155,8 +165,7 @@ where
             .conflict_revision
             .is_some()
             .then(|| placement.conflict_object.clone());
-        let shown: Vec<PimdirHash> = item.chain(binding).flatten().collect();
-        (!shown.is_empty()).then_some(shown)
+        item.chain(binding).collect()
     }
 
     pub fn rekey(&mut self, collection: &str) -> Result<PimdirRekeyReport, String> {

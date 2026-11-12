@@ -117,20 +117,31 @@ impl PimdirIndex {
                     };
                     sources.insert(placement.collection.clone(), collection);
                 }
-                // NOTE: the flags a pending set-flags will set, so a tag
-                // staged behind it builds on it rather than undoing it
-                // (STORAGE §15.4).
-                let staged = pending[&placement.collection]
-                    .iter()
-                    .rev()
-                    .find_map(|pending| match &pending.action {
-                        PimdirAction::SetFlags { seq: at, flags } if *at == seq => {
-                            Some(flags.clone())
+                // NOTE: the flags the pending set-flags will leave, folded
+                // as the owner applies each, so a tag staged behind them
+                // builds on them rather than undoing them (STORAGE §15.4):
+                // one stating its base is the change it is, and nothing
+                // over an unknown set, where it parks.
+                for pending in &pending[&placement.collection] {
+                    let PimdirAction::SetFlags {
+                        seq: at,
+                        flags,
+                        base,
+                    } = &pending.action
+                    else {
+                        continue;
+                    };
+                    if *at != seq {
+                        continue;
+                    }
+                    match base {
+                        None => placement.flags = flags.clone(),
+                        Some(base) => {
+                            if let Some(changed) = placement.flags.changed(base, flags) {
+                                placement.flags = changed;
+                            }
                         }
-                        _ => None,
-                    });
-                if let Some(flags) = staged {
-                    placement.flags = flags;
+                    }
                 }
 
                 let next: Option<BTreeSet<String>> = placement.flags.known().map(|flags| {
@@ -151,6 +162,7 @@ impl PimdirIndex {
                         let action = PimdirAction::SetFlags {
                             seq,
                             flags: next.iter().collect(),
+                            base: Some(placement.flags.clone()),
                         };
                         let needed =
                             capability::required(&collection.kind, &action, &placement.flags);
@@ -225,9 +237,13 @@ impl PimdirSearchTagPlan {
                     continue;
                 }
                 let flags = placement.next.clone().unwrap_or_default();
+                // NOTE: the set the plan read is stated, so the owner
+                // applies the change alone and a flag a sync landed since
+                // survives it (STORAGE §15.3).
                 let action = PimdirAction::SetFlags {
                     seq: hit.seq,
                     flags: flags.iter().collect(),
+                    base: Some(placement.flags.clone()),
                 };
                 producer.check(&placement.collection, &action)?;
                 staged.push((

@@ -282,6 +282,30 @@ impl PimdirHub {
             .collect()
     }
 
+    /// The copies among `placements`, a projection of this hub for
+    /// `source`, that the source binds not, for
+    /// [`PimdirLoaded::offered`](crate::load::PimdirLoaded::offered): the
+    /// `Created` placements of items other sources hold (SYNC §3, §9),
+    /// which are no create of its own.
+    pub fn offered(
+        &self,
+        source: &PimdirSourceId,
+        placements: &[PimdirPlacement],
+    ) -> Vec<PimdirHandle> {
+        placements
+            .iter()
+            .filter(|placement| placement.status == PimdirStatus::Created)
+            .filter(|placement| {
+                placement
+                    .link_id
+                    .as_ref()
+                    .and_then(|link| self.items.get(link))
+                    .is_some_and(|item| !item.sources.contains_key(source))
+            })
+            .map(|placement| placement.handle.clone())
+            .collect()
+    }
+
     /// The placement for an item this source already holds.
     ///
     /// A recorded conflict outranks the base comparison, else the merge
@@ -405,10 +429,12 @@ impl PimdirHub {
     ///
     /// An unlinked placement is not hubbed yet. A tombstone keeps its
     /// binding and adopts no content, so an edit elsewhere still
-    /// resurrects it, while its known flags ride along and the item's
-    /// conflict is settled by the removal (SYNC §7, §9). An unknown flag
-    /// set or sort key never erases a known one. An immutable kind never
-    /// owes a body, so its binding's base adopts the shared one (SYNC §9).
+    /// resurrects it, while its known flags ride along; it settles the
+    /// item's conflict only when a `Settle` precedes it, a person's
+    /// resolution by deleting, the item keeping its body (SYNC §7, §9).
+    /// An unknown flag set or sort key never erases a known one. An
+    /// immutable kind never owes a body, so its binding's base adopts the
+    /// shared one (SYNC §9).
     fn absorb_upsert(&mut self, source: &PimdirSourceId, placement: &PimdirPlacement) {
         let Some(link) = placement.link_id.clone() else {
             return;
@@ -452,8 +478,14 @@ impl PimdirHub {
                 .and_then(|binding| binding.shared_object.clone());
 
             item.deleted = true;
-            item.conflicted = false;
-            item.conflict_object = None;
+            // NOTE: a tombstone settles the item's conflict only as a
+            // person's resolution, which states it (SYNC §7, STORAGE
+            // §14); any other leaves it standing, its diverging body
+            // kept under the deleted item.
+            if settling {
+                item.conflicted = false;
+                item.conflict_object = None;
+            }
             if !placement.flags.is_unknown() {
                 item.flags = placement.flags.clone();
             }
@@ -1630,6 +1662,47 @@ mod tests {
         assert!(hub.overruled.is_empty(), "a person keeps nothing");
         assert_eq!(placements(&hub, "right")[0].status, PimdirStatus::Dirty);
         assert_eq!(placements(&hub, "left")[0].status, PimdirStatus::Clean);
+    }
+
+    /// A tombstone settles the item's conflict only when a `Settle`
+    /// precedes it, a person's resolution by deleting (SYNC §7, STORAGE
+    /// §14): any other, a move's or a sync's, marks the item deleted and
+    /// leaves the conflict standing, its diverging body kept; the settle
+    /// clears it, the item keeping its own body under the tombstone.
+    /// Before draft-10's second batch every tombstone cleared it.
+    #[test]
+    fn a_tombstone_settles_the_item_conflict_only_when_stated() {
+        let mut hub = content_hub(PimdirHubConflict::Manual);
+        let right = PimdirSourceId::from("right");
+        hub.absorb(&"left".into(), &[content_upsert("l1", "o-left")]);
+        hub.absorb(&right, &[content_upsert("r1", "o-right")]);
+
+        let PimdirWriteOp::UpsertPlacement(mut tombstone) = content_upsert("r1", "o-left") else {
+            unreachable!()
+        };
+        tombstone.status = PimdirStatus::Tombstone;
+        let tombstone = PimdirWriteOp::UpsertPlacement(tombstone);
+
+        hub.absorb(&right, core::slice::from_ref(&tombstone));
+        let item = &hub.items[&PimdirLinkId::from("m1")];
+        assert!(item.deleted);
+        assert!(item.conflicted, "no resolution: the conflict stands");
+        assert_eq!(item.conflict_object, Some(PimdirHash::from("o-right")));
+
+        let settle = PimdirWriteOp::Settle {
+            collection: "inbox".into(),
+            handle: PimdirHandle::from("r1"),
+        };
+        hub.absorb(&right, &[settle, tombstone]);
+        let item = &hub.items[&PimdirLinkId::from("m1")];
+        assert!(item.deleted);
+        assert!(!item.conflicted && item.conflict_object.is_none());
+        assert_eq!(
+            item.object,
+            Some(PimdirHash::from("o-left")),
+            "a tombstone adopts no content"
+        );
+        assert!(hub.overruled.is_empty(), "a person keeps nothing");
     }
 
     /// Only left edited since both agreed, so the body is adopted.

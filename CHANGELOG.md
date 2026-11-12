@@ -8,10 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-10, sync-draft-10 and search-draft-10, vendored at pimdir 31da94c, the first batch of those drafts (the schema and the statements; their payloads, vectors and Annex A are those of the drafts before).
+- **BREAKING**: Added pimdir storage-draft-10, sync-draft-10 and search-draft-10, vendored at pimdir c315220, the first two batches of those drafts: the schema and the statements, then the payloads and identity.
 
   A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The schema holds the shapes of STORAGE §13 by `CHECK` (a base stated without `base_present`, an empty handle, source, link id, collection id or account, a `seq` below 1, a negative size, a stamp or a scope bound in another shape), so a row in another shape is refused where it was stored. A consumer running the `sql` constants over its own binding follows the renamed parameters (`:before` in `purge_retained_before`, `release_before` and `release_bases_before`; `:hash` in `held_elsewhere`, `held_mail_summary` and `origin_for_link`; `:message_id` in `insert_in_reply_to`), the column `mail_in_reply_to.message_id`, the index `items_deleted`, and may bind `NULL` as the first cursor of every paged read. spec/queries/signatures.json, the specification's listing of every statement's parameters and columns, is vendored with them.
 
+- **BREAKING**: Added `base` to `PimdirAction::SetFlags` and `PimdirMutation::SetFlags`, the flag set a producer read and changed into `flags` (pimdir STORAGE §15.3, SYNC §7).
+
+  With it the owner applies the change alone to the set the item holds when the row is applied, so a flag a sync landed or removed since survives; over an unknown set the mutation is refused (`PimdirMutateError::UnknownFlags`, `flags-unknown`) and the row parks. `None` replaces the set as before. `PimdirFlags::changed` computes it. The search tag plan states the set it read.
+
+- **BREAKING**: Added `if_match` and `resolves` to `PimdirAction::Remove` and to `PimdirMutation::Remove`, now a struct variant carrying its `handle`, on an update's rules (pimdir STORAGE §15.3, SYNC §7): a remove is refused, and its row parked, over another body than the one it names, over a conflict its `resolves` does not name, and over none when it states `resolves`.
+- Added `codec::payload_outcome` and `PimdirPayloadOutcome`: a payload is valid, malformed or unknown (pimdir STORAGE §15.3).
+- Added `PimdirSyncEvent::Disagreed { handle, link_id }`, reported after the `Added` of a member minted apart from a pending or a delivered create of its source whose summary disagrees with its own (pimdir SYNC §5, §6).
+- Added `PimdirLoaded::offered` and `PimdirHub::offered`: the `Created` placements a store offers a source that binds not their item, which a sync tells from the source's own creates. A storage servicing the seam itself fills it, or reports a disagreement with an offered copy too.
+- Added `PimdirHeldObject`, a body a row of the account holds under a link id with the `subject`, `date` and `sender` its mail summary states.
+- Added `PimdirActionHandle` and `PimdirStoreIdentity`: the handle an enqueue answers, the row's id under the store's id and incarnation, printed as the three joined by periods and parsed back; a bare id is a handle stating no store (pimdir STORAGE §4.5, §15.4).
+- Added `PimdirActionStatus::Reset` and `PimdirError::Reset` (`store-reset`): the store is no longer the one a handle was answered in. `pimdir queue status` prints `reset`, and `pimdir queue cancel` refuses.
+- Added `PimdirWaiting` and `PimdirWaitReason` (`OutOfScope`, `Delivered`, `Undeliverable`).
+- Added `handle` beside `row` in the JSON of `pimdir item restore` and `pimdir tag`.
 - Added `PimdirError::ScopeBound` (`scope-invalid`) and `PimdirScope::malformed_bound`: a scope bound that is not an instant in UTC at seconds precision (`2026-10-01T00:00:00Z`) is refused by `sync`, `prepare_sync` and `write` before anything is listed or written, where it was stored and compared as text.
 - Added `sql::search::HIT` as the read of a hit's placements: the canonical statement, re-signed `(:seq, :account)` and answering every live placement of the hit with its kind and title.
 
@@ -19,7 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - **BREAKING**: Added `PimdirWriteOp::DeliverPlacement`, the write recording a create delivered before any listing named it: an add accepted with no handle, or a relocation into it accepted (pimdir SYNC §2).
 
-  A delivered create derives nothing, is never found absent and lands on the page naming its member, so a delete or a move staged on it is held, then pushed against the listed handle, rather than withdrawn. `PimdirSyncReport::waiting` counts the delivered creates a run holds. A storage applying the write ops matches the new variant (`deliver_binding`).
+  A delivered create derives nothing, is never found absent and lands on the page naming its member, so a delete or a move staged on it is held, then pushed against the listed handle, rather than withdrawn. `PimdirSyncReport::waiting` names the delivered creates a run holds. A storage applying the write ops matches the new variant (`deliver_binding`).
 
 - Added `PimdirHandle::is_provisional`, `PimdirPlacement::delivered` and `PimdirLinkId::is_landable`.
 - Added the `version` module: `PimdirStoreVersion::opens` judges, I/O-free, whether a program of a profile (`PimdirProfile`), a schema version and a draft or released build (`PimdirFormat`, `PimdirProgram`) opens a store stating a `format_version`, a `version`, a `read_version` and a `produce_version`, answering a `PimdirVersionRefusal` otherwise (pimdir STORAGE §4.2).
@@ -32,6 +45,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- **BREAKING**: Changed a tombstone to settle no conflict by itself (pimdir STORAGE §14, SYNC §7, §9): the write clears an item's conflict under a tombstone only when a `PimdirWriteOp::Settle` precedes its upsert, which a `Remove` resolving it states. A `Move` over a conflicted item, or any other tombstone, leaves the conflict standing with its diverging body kept, where every tombstone cleared it and released the body. A storage applying the write ops follows.
+- **BREAKING**: Changed `codec::action_from_payload` to keep a payload unknown to the crate verbatim as `PimdirAction::Unknown`, read no further: a kind it holds no schema for, or a known one at another `v` than 1, none stated included. It answered `PimdirActionError::UnknownVersion`, and a known action stating no `v` was parked. The drain leaves such a row pending and untouched, and `pending_actions` lists it, where a row at a later version was left out of every read.
+- **BREAKING**: Changed `PimdirArg::LookupObject` and `PimdirSourceStore::lookup_objects` to answer every row of the account holding a body under a link id (`Vec<PimdirHeldObject>`), where they answered one `PimdirObject`. An upgrade links a message's body only from a row agreeing with its summary on subject, date and sender, and on its size where it states one (pimdir SYNC §6).
+- **BREAKING**: Changed a message to share its public id across mailboxes only with a row agreeing with its summary, and a bodiless row to be purged as held elsewhere only for a holder that agrees with it (pimdir STORAGE §9, §9.1, §11.1). A consumer running `sql::SEQ_FOR_LINK_ANY` over its own binding binds `:subject`, `:date` and `:sender`, `NULL` for another kind.
+- **BREAKING**: Changed every enqueue of `PimdirProducer` to answer a `PimdirActionHandle` where it answered the row's id, `PimdirEnqueued::id` to `PimdirEnqueued::handle`, and `PimdirSearchTagAction::action` to the handle. `action_status`, `drop_action` and `cancel_action` take a handle or a bare id.
+- **BREAKING**: Changed `PimdirSyncReport::waiting` from a count to the list of the creates left waiting, each with its reason; a create holding neither a body nor an origin is listed as undeliverable, where nothing counted it.
+- **BREAKING**: Changed the search extraction to read `Subject`, the address fields, `In-Reply-To` and `References` from their first occurrence, as the summary does (pimdir SEARCH §6), where it read the last; and to read a text part disposed with any type but `inline` as an attachment. A body indexed before keeps its text until it is indexed again.
+- Changed a card, an event, a task or a journal whose `UID` is empty, or of spaces and tabs alone, to be keyed by the `hash:` fallback, where the unusable `UID` was the key (pimdir STORAGE §9). An item named before keeps its key.
+- Changed `pimdir queue status` and `pimdir queue cancel` to take a handle or an id, and `pimdir queue list` to print a `set-flags`'s base and a `remove`'s `if-match` and `resolves`.
 - **BREAKING**: Changed `PimdirStore::collect_before` to `PimdirStore::evict_before`, its report `PimdirCollectReport` to `PimdirEvictReport` and `sql::COLLECT_BEFORE` to `sql::EVICT_BEFORE`, as the standard names the act an eviction (pimdir STORAGE §11.3). No alias is kept.
 - **BREAKING**: Changed `PimdirActionStatus::Applied::collection` to an `Option<String>`: a receipt outlives the collection its row was queued on and then names none (pimdir STORAGE §15.4), where deleting the collection dropped the receipt and the action read `Unknown`. `pimdir queue status` prints such an action as applied on a collection deleted since, its JSON `collection` `null`.
 - **BREAKING**: Changed `PimdirStore::raise_incarnation` to answer an incarnation a random stride (1 to 2^31) above the copy's and the replaced store's, no longer the next integer: two restores of one backup answer two incarnations (pimdir STORAGE §8).
@@ -57,6 +79,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Removed
 
+- **BREAKING**: Removed the `charset-tables` feature: encoding_rs is a plain dependency, `no_std` with `alloc`, so every build decodes every charset label of the WHATWG Encoding Standard (pimdir STORAGE Annex A.1). A build without the feature kept a word in a legacy charset as its literal text and derived other subjects and `alt:` keys silently. Drop the feature from a dependency line naming it; no alias is kept.
 - **BREAKING**: Removed `sql::COMPONENT_OF` and `sql::search::MATCH_OBJECTS_RANKED`, cut by the standard and run by nothing here, and `sql::search::LOAD_HIT_PLACEMENTS`, the crate's own text of what `sql::search::HIT` now reads.
 - Removed the comfy-table dependency.
 

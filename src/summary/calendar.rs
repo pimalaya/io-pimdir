@@ -19,11 +19,11 @@ use jiff::{
 };
 
 use crate::{
-    placement::{PimdirLinkId, PimdirSortKey},
+    placement::PimdirSortKey,
     summary::{
         PimdirAddress, PimdirDerivation, PimdirSummary,
         contact::{PimdirContentLine, split_unescaped, split_unquoted, split_value, unescape},
-        hash_key, logical_lines, time, unfold,
+        logical_lines, time, uid_key, unfold,
     },
 };
 
@@ -146,10 +146,7 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
                 .find(|child| child.name != "VTIMEZONE")
         })
         .and_then(|component| component.value("UID"));
-    let link_id = match &uid {
-        Some(uid) => PimdirLinkId::from_hint(uid.as_str()),
-        None => hash_key(body),
-    };
+    let link_id = uid_key(uid.as_deref(), body);
 
     let Some(master) = master else {
         return PimdirDerivation {

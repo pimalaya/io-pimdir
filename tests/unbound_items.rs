@@ -209,6 +209,7 @@ fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
             &PimdirAction::SetFlags {
                 seq,
                 flags: PimdirFlags::from_iter(["\\Flagged"]),
+                base: None,
             },
             None,
         )
@@ -249,7 +250,15 @@ fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
         )
         .unwrap();
     producer
-        .enqueue(TIME_COLLECTION, &PimdirAction::Remove { seq }, None)
+        .enqueue(
+            TIME_COLLECTION,
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     drop(producer);
 

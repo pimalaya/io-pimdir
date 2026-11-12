@@ -42,8 +42,17 @@ fn newer_store(dir: &Path) -> i64 {
     drop(store);
     let id = PimdirProducer::open(dir, "test")
         .unwrap()
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 1 }, None)
-        .unwrap();
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: 1,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
+        .unwrap()
+        .id;
     let conn = rusqlite::Connection::open(dir.join("pimdir.db")).unwrap();
     conn.execute_batch(
         "UPDATE store_meta SET format_version = 'storage-draft-11';

@@ -53,6 +53,23 @@ fn batch(collection: &str, handle: &str, link_id: &str, hash: &str) -> Vec<Pimdi
     ]
 }
 
+/// The newsletter both accounts hold, as a listing names it: with its
+/// summary, which is what makes the two rows one message and has them
+/// share a public id (STORAGE §9, §9.1).
+fn news(collection: &str, handle: &str) -> Vec<PimdirWriteOp> {
+    let hash = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let mut batch = batch(collection, handle, "<news@x>", hash);
+    if let Some(PimdirWriteOp::UpsertPlacement(placement)) = batch.last_mut() {
+        placement.summary = Some(io_pimdir::summary::PimdirSummary::Mail(
+            io_pimdir::summary::mail::PimdirMailSummary {
+                subject: "News".into(),
+                ..Default::default()
+            },
+        ));
+    }
+    batch
+}
+
 /// Two accounts, one mailbox each, both holding the same message.
 fn seed(dir: &std::path::Path) {
     let mut work = PimdirStore::open(dir)
@@ -61,13 +78,7 @@ fn seed(dir: &std::path::Path) {
         .for_source("server");
     work.ensure_collection("work/INBOX", "message/rfc822")
         .unwrap();
-    work.write(batch(
-        "work/INBOX",
-        "1",
-        "<news@x>",
-        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
-    ))
-    .unwrap();
+    work.write(news("work/INBOX", "1")).unwrap();
     drop(work);
 
     let mut home = PimdirStore::open(dir)
@@ -76,13 +87,7 @@ fn seed(dir: &std::path::Path) {
         .for_source("server");
     home.ensure_collection("home/INBOX", "message/rfc822")
         .unwrap();
-    home.write(batch(
-        "home/INBOX",
-        "9",
-        "<news@x>",
-        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
-    ))
-    .unwrap();
+    home.write(news("home/INBOX", "9")).unwrap();
 }
 
 #[test]

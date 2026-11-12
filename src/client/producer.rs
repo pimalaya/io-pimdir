@@ -39,7 +39,10 @@ use crate::{
         reader::{PimdirItem, item_from_row},
         record_receipt, rows, schema, write,
     },
-    codec::{self, PimdirAction, PimdirActionError, PimdirSupersedes},
+    codec::{
+        self, PimdirAction, PimdirActionError, PimdirActionHandle, PimdirPayloadOutcome,
+        PimdirStoreIdentity, PimdirSupersedes,
+    },
     collection::PimdirCollectionId,
     coroutine::*,
     hash::PimdirHasher,
@@ -248,11 +251,12 @@ impl PimdirProducer {
     }
 
     /// Appends one action to a collection's queue (§15.1), returning the
-    /// row's id: `ensure_collection`, at most one object upsert for the
-    /// body the caller staged through [`stage_body`](Self::stage_body) and
-    /// passes as `object`, hash and size together, the pin of the hash the
-    /// action names, and the insert. SQLite stamps `created_at`. A body the
-    /// store already indexes may be passed again or left out.
+    /// row's handle, its id under the store's identity (§4.5):
+    /// `ensure_collection`, at most one object upsert for the body the
+    /// caller staged through [`stage_body`](Self::stage_body) and passes as
+    /// `object`, hash and size together, the pin of the hash the action
+    /// names, and the insert. SQLite stamps `created_at`. A body the store
+    /// already indexes may be passed again or left out.
     ///
     /// An action whose payload its schema under payloads/ refuses (§15.3),
     /// an `add` without its `object` or a flag set never read among them,
@@ -268,12 +272,12 @@ impl PimdirProducer {
         collection: &str,
         action: &PimdirAction,
         object: Option<&PimdirObject>,
-    ) -> Result<i64, PimdirError> {
-        Ok(self.append(collection, action, object, None, None)?.id)
+    ) -> Result<PimdirActionHandle, PimdirError> {
+        Ok(self.append(collection, action, object, None, None)?.handle)
     }
 
     /// Appends an `add` creating an item under `link_id` (§15.1, §15.3),
-    /// returning the row's id, as [`enqueue`](Self::enqueue) does with
+    /// returning the row's handle, as [`enqueue`](Self::enqueue) does with
     /// the body [`stage_body`](Self::stage_body) answered as `object`.
     ///
     /// Refuses, appending nothing, a link id the drain would park: one a
@@ -288,7 +292,7 @@ impl PimdirProducer {
         flags: PimdirFlags,
         object: Option<&PimdirObject>,
         supersedes: Option<PimdirSupersedes>,
-    ) -> Result<i64, PimdirError> {
+    ) -> Result<PimdirActionHandle, PimdirError> {
         let action = PimdirAction::Add {
             link_id: Some(link_id.clone()),
             flags,
@@ -297,12 +301,12 @@ impl PimdirProducer {
         };
         Ok(self
             .append(collection, &action, object, None, Some(link_id))?
-            .id)
+            .handle)
     }
 
     /// Stages `body` and appends the action `action` builds from its hash
-    /// as one step (§15.1), answering the row's id: the gate of §15.6 and,
-    /// for an `add`, the duplicate check of
+    /// as one step (§15.1), answering the row's handle: the gate of §15.6
+    /// and, for an `add`, the duplicate check of
     /// [`enqueue_add`](Self::enqueue_add) run on the bytes in hand before
     /// anything reaches the blob tree, so a refused write leaves no body
     /// behind. An `add` naming no link id is checked under the key the
@@ -321,12 +325,14 @@ impl PimdirProducer {
         collection: &str,
         body: &[u8],
         action: impl FnOnce(PimdirHash) -> PimdirAction,
-    ) -> Result<i64, PimdirError> {
-        Ok(self.enqueue_with_body_checked(collection, body, action)?.id)
+    ) -> Result<PimdirActionHandle, PimdirError> {
+        Ok(self
+            .enqueue_with_body_checked(collection, body, action)?
+            .handle)
     }
 
     /// [`enqueue_with_body`](Self::enqueue_with_body), answering the row's
-    /// id and the partial supports the action passed the gate of §15.6
+    /// handle and the partial supports the action passed the gate of §15.6
     /// with, read with the body in hand: what [`check`](Self::check) would
     /// answer, for the frontend to show, without running the gate again.
     pub fn enqueue_with_body_checked(
@@ -383,7 +389,7 @@ impl PimdirProducer {
     /// The enqueue transaction, refusing an add whose `fresh` link id is
     /// taken first when one is given; `body`, the bytes of `object` when
     /// the caller has not staged them, is gated in hand and written once
-    /// every check passed. Answers the row's id and the partial supports
+    /// every check passed. Answers the row's handle and the partial supports
     /// the gate passed the action with.
     ///
     /// The staging lock is held across whatever body the action names
@@ -429,14 +435,18 @@ impl PimdirProducer {
         {
             return Err(PimdirError::Flag(flag.into()));
         }
-        // NOTE: a payload its schema refuses is never queued for the drain
-        // to park (§15.3); one at a version this crate does not know is a
-        // later program's, queued as it stands.
-        let payload = codec::action_to_payload(action);
-        match codec::action_from_payload(action.kind(), &payload) {
-            Ok(_) | Err(PimdirActionError::UnknownVersion(Some(_))) => {}
-            Err(err) => return Err(err.into()),
+        if let PimdirAction::SetFlags {
+            base: Some(base), ..
+        } = action
+            && let Some(flag) = base.invalid()
+        {
+            return Err(PimdirError::Flag(flag.into()));
         }
+        // NOTE: a payload its schema refuses is never queued for the drain
+        // to park (§15.3); one unknown to this crate, a later program's
+        // version or an application's own action, is queued as it stands.
+        let payload = codec::action_to_payload(action);
+        codec::action_from_payload(action.kind(), &payload)?;
         let partial = capability::gate(&self.conn, &self.blobs, collection, action, body)?;
         let hash = action.object_hash().cloned();
         // NOTE: before the transaction, so waiting out a collector never
@@ -503,9 +513,18 @@ impl PimdirProducer {
             },
         )?;
         let id = tx.last_insert_rowid();
+        // NOTE: read in the transaction that drew the id, so the handle
+        // names the store the row is in (§4.5, §15.4).
+        let store = store_identity(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
         self.pinned(hash.as_ref());
-        Ok(PimdirEnqueued { id, partial })
+        Ok(PimdirEnqueued {
+            handle: PimdirActionHandle {
+                id,
+                store: Some(store),
+            },
+            partial,
+        })
     }
 
     /// Runs an action through the gate of §15.6 without enqueueing it,
@@ -548,11 +567,16 @@ impl PimdirProducer {
         pending_actions(&self.conn, Some(collection))
     }
 
-    /// Where the row `id`, the one [`enqueue`](Self::enqueue) answered,
+    /// Where the row an [`enqueue`](Self::enqueue) answered the handle of
     /// stands (§15.4): pending, parked, applied with the item an `add`
-    /// created, or found nowhere.
-    pub fn action_status(&self, id: i64) -> Result<PimdirActionStatus, PimdirError> {
-        action_status(&self.conn, id)
+    /// created, found nowhere, or [`Reset`](PimdirActionStatus::Reset)
+    /// when the store is no longer the one the handle was answered in
+    /// (§4.5). A bare id is followed unchecked.
+    pub fn action_status(
+        &self,
+        action: impl Into<PimdirActionHandle>,
+    ) -> Result<PimdirActionStatus, PimdirError> {
+        action_status(&self.conn, &action.into())
     }
 
     /// Enqueues a `collection-create` (Annex B.2): a collection `name`
@@ -560,15 +584,15 @@ impl PimdirProducer {
     /// level anchored on `anchor`, a collection of the account and kind
     /// the new one takes. The performer is `chosen` when the user named a
     /// candidate, else resolved as [`performer`](Self::performer) does,
-    /// and written into the payload. Returns the row's id; the collection
-    /// arrives with the performer's next sync, labelled `name`.
+    /// and written into the payload. Returns the row's handle; the
+    /// collection arrives with the performer's next sync, labelled `name`.
     pub fn enqueue_collection_create(
         &mut self,
         anchor: &str,
         name: &str,
         parent: Option<&str>,
         chosen: Option<&str>,
-    ) -> Result<i64, PimdirError> {
+    ) -> Result<PimdirActionHandle, PimdirError> {
         let anchor = parent.unwrap_or(anchor);
         let create = PimdirCollectionCreate {
             source: self.performer(anchor, COLLECTION_CREATE, chosen)?,
@@ -583,14 +607,14 @@ impl PimdirProducer {
     /// `name` on the performer's server, its parent and items kept. The
     /// performer is resolved at `collection` as
     /// [`enqueue_collection_create`](Self::enqueue_collection_create)
-    /// resolves it. Returns the row's id; the new name arrives with the
+    /// resolves it. Returns the row's handle; the new name arrives with the
     /// performer's next sync.
     pub fn enqueue_collection_rename(
         &mut self,
         collection: &str,
         name: &str,
         chosen: Option<&str>,
-    ) -> Result<i64, PimdirError> {
+    ) -> Result<PimdirActionHandle, PimdirError> {
         let rename = PimdirCollectionRename {
             source: self.performer(collection, COLLECTION_RENAME, chosen)?,
             name: name.to_string(),
@@ -601,13 +625,13 @@ impl PimdirProducer {
 
     /// Enqueues a `collection-delete` (Annex B.2): `collection` deleted
     /// on the performer's server with its items, never with another
-    /// collection. Returns the row's id; the deletion arrives with the
+    /// collection. Returns the row's handle; the deletion arrives with the
     /// performer's next sync, the store removing no item for it.
     pub fn enqueue_collection_delete(
         &mut self,
         collection: &str,
         chosen: Option<&str>,
-    ) -> Result<i64, PimdirError> {
+    ) -> Result<PimdirActionHandle, PimdirError> {
         let delete = PimdirCollectionDelete {
             source: self.performer(collection, COLLECTION_DELETE, chosen)?,
         };
@@ -619,8 +643,8 @@ impl PimdirProducer {
 /// What [`PimdirProducer::enqueue_with_body_checked`] queued.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirEnqueued {
-    /// The row's id, which [`PimdirProducer::action_status`] follows.
-    pub id: i64,
+    /// The row's handle, which [`PimdirProducer::action_status`] follows.
+    pub handle: PimdirActionHandle,
     /// The partial supports the action passed the gate with (§15.6), each
     /// worth showing: the action is queued whatever they say.
     pub partial: Vec<PimdirPartial>,
@@ -666,10 +690,35 @@ pub enum PimdirActionStatus {
     /// In neither the queue nor the receipts: withdrawn by request, or
     /// applied or performed before its receipt was pruned.
     Unknown,
+    /// The store is no longer the one the handle was answered in, its id
+    /// or its incarnation another (§4.5): a restored copy, where the id
+    /// may name another row or none, so nothing is read of it. What the
+    /// producer queued is to be read again from the store as it stands.
+    Reset,
 }
 
-/// Reads where the row `id` stands: `load_action`, then `load_receipt`.
-pub(crate) fn action_status(conn: &Connection, id: i64) -> Result<PimdirActionStatus, PimdirError> {
+/// The store's identity (`load_change_cursor`, §4.5), which a handle is
+/// answered under and checked against.
+pub(crate) fn store_identity(conn: &Connection) -> Result<PimdirStoreIdentity, PimdirError> {
+    Ok(conn.query_row_cached(sql::LOAD_CHANGE_CURSOR, [], |r| {
+        Ok(PimdirStoreIdentity {
+            store_id: r.get(2)?,
+            incarnation: r.get(3)?,
+        })
+    })?)
+}
+
+/// Reads where the row `action` names stands: the store's identity
+/// against the handle's, then `load_action`, then `load_receipt`.
+pub(crate) fn action_status(
+    conn: &Connection,
+    action: &PimdirActionHandle,
+) -> Result<PimdirActionStatus, PimdirError> {
+    if action.store.is_some() && !action.names(&store_identity(conn)?) {
+        return Ok(PimdirActionStatus::Reset);
+    }
+    let id = action.id;
+
     let queued = conn
         .query_row_cached(sql::LOAD_ACTION, named_params! { ":id": id }, |r| {
             Ok((
@@ -779,20 +828,17 @@ pub struct PimdirDrainOverruled {
 
 /// Reads pending rows, a collection's or every collection's, decoding
 /// each payload strictly: a malformed one is the read's error, until the
-/// drain parks it. A row stating a later payload version is skipped, as
-/// the drain skips it (§15.2): it stays pending for a later owner, and
-/// failing on it would fail every read until then.
+/// drain parks it. A row whose action, or whose payload version, this
+/// crate does not know is listed as [`PimdirAction::Unknown`], its
+/// payload verbatim (§15.4): somebody's write a reader cannot show, never
+/// one it may hide, which the drain leaves pending for a later owner.
 pub(crate) fn pending_actions(
     conn: &Connection,
     collection: Option<&str>,
 ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
     let mut actions = Vec::new();
     for row in pending_rows(conn, collection)? {
-        match row.decode() {
-            Ok(action) => actions.push(action),
-            Err(PimdirActionError::UnknownVersion(Some(_))) => {}
-            Err(err) => return Err(err.into()),
-        }
+        actions.push(row.decode()?);
     }
     Ok(actions)
 }
@@ -928,7 +974,7 @@ fn duplicate(
     let withdrawn = pending.iter().any(|queued| {
         matches!(
             queued.action,
-            PimdirAction::Remove { seq: s } | PimdirAction::Move { seq: s, .. } if s == seq
+            PimdirAction::Remove { seq: s, .. } | PimdirAction::Move { seq: s, .. } if s == seq
         )
     });
     Ok((!withdrawn).then_some(PimdirDuplicate::Live(seq)))
@@ -976,13 +1022,6 @@ impl PimdirSourceStore {
         for row in pending {
             let action = match row.action() {
                 Ok(action) => action,
-                // NOTE: a version this owner does not know is a later
-                // producer's, skipped as an unknown kind is (§15.2); one
-                // missing is a malformed payload, parked.
-                Err(PimdirActionError::UnknownVersion(Some(_))) => {
-                    report.skipped += 1;
-                    continue;
-                }
                 Err(err) => {
                     self.fail_action(row.id, Some(&err.to_string()))?;
                     report.parked += 1;
@@ -990,6 +1029,13 @@ impl PimdirSourceStore {
                 }
             };
             if let PimdirAction::Unknown { kind, payload, .. } = &action {
+                // NOTE: a payload this owner does not know, its action or
+                // its version, is left pending and untouched, read no
+                // further and never parked (§15.2).
+                if codec::payload_outcome(kind, payload) == PimdirPayloadOutcome::Unknown {
+                    report.skipped += 1;
+                    continue;
+                }
                 let conn = &self.store.reader.conn;
                 match capability::backstop_intent(conn, &row.collection, kind, payload) {
                     Err(PimdirError::Unsupported(refusal)) => {
@@ -1233,6 +1279,8 @@ fn supersede(
     let acting = acting_source(tx, own, collection)?;
     let remove = PimdirAction::Remove {
         seq: superseded.seq,
+        if_match: None,
+        resolves: None,
     };
     match stage_action(tx, blobs, &acting, collection, &remove)? {
         Ok((source, ops)) => {
@@ -1440,7 +1488,7 @@ fn stage_action(
         | PimdirAction::Move { seq, .. }
         | PimdirAction::Copy { seq, .. }
         | PimdirAction::Update { seq, .. } => (*seq, false),
-        PimdirAction::Remove { seq } => (*seq, true),
+        PimdirAction::Remove { seq, .. } => (*seq, true),
         PimdirAction::Add { .. } => unreachable!("add staged above"),
         PimdirAction::SetPerformer { .. } => unreachable!("set-performer applied above"),
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
@@ -1460,9 +1508,14 @@ fn stage_action(
         };
     };
 
-    // NOTE: another write replaced the body this edit was made over since
-    // its producer read it; applying it would drop that write (§15.3).
+    // NOTE: another write replaced the body this edit or this remove was
+    // made over since its producer read it; applying it would drop that
+    // write, or delete it unseen (§15.3).
     if let PimdirAction::Update {
+        if_match: Some(read),
+        ..
+    }
+    | PimdirAction::Remove {
         if_match: Some(read),
         ..
     } = action
@@ -1472,8 +1525,12 @@ fn stage_action(
             .object
             .as_ref()
             .map_or("no body", |hash| hash.0.as_str());
+        let what = match removes {
+            true => "remove",
+            false => "edit",
+        };
         return Ok(Err(PimdirOutcome::Parked(format!(
-            "body replaced since it was read: the edit was made over {}, the item holds {held}",
+            "body replaced since it was read: the {what} was made over {}, the item holds {held}",
             read.0
         ))));
     }
@@ -1485,6 +1542,10 @@ fn stage_action(
     let hub = write::read_hub(tx, collection, Some(slice::from_ref(&item.link_id.0)))?;
     let named = match action {
         PimdirAction::Update {
+            resolves: Some(resolves),
+            ..
+        }
+        | PimdirAction::Remove {
             resolves: Some(resolves),
             ..
         } => hub.items.get(&item.link_id).and_then(|shared| {
@@ -1531,10 +1592,12 @@ fn stage_action(
                 )
                 .optional()?;
             let Some((source, handle)) = bound else {
-                // NOTE: an unbound item's update takes `resolves` on the
-                // terms a bound one does, its item's conflict the only
-                // one it meets (§15.3).
-                if let PimdirAction::Update { resolves, .. } = action {
+                // NOTE: an unbound item's update or remove takes
+                // `resolves` on the terms a bound one does, its item's
+                // conflict the only one it meets (§15.3).
+                if let PimdirAction::Update { resolves, .. }
+                | PimdirAction::Remove { resolves, .. } = action
+                {
                     let met: Vec<Option<PimdirHash>> = hub
                         .items
                         .get(&item.link_id)
@@ -1554,11 +1617,18 @@ fn stage_action(
     let source = &source;
 
     let mutation = match action {
-        PimdirAction::SetFlags { flags, .. } => PimdirMutation::SetFlags {
+        PimdirAction::SetFlags { flags, base, .. } => PimdirMutation::SetFlags {
             handle,
             flags: flags.clone(),
+            base: base.clone(),
         },
-        PimdirAction::Remove { .. } => PimdirMutation::Remove(handle),
+        PimdirAction::Remove {
+            if_match, resolves, ..
+        } => PimdirMutation::Remove {
+            handle,
+            if_match: if_match.clone(),
+            resolves: resolves.clone(),
+        },
         PimdirAction::Move { to, .. } => PimdirMutation::Move {
             handle,
             target: to.clone(),
@@ -1648,9 +1718,10 @@ fn stage_action(
     }
 }
 
-/// Why an `update` of item `seq` parks over the conflict it `met`, or over
-/// none, its resolution naming another (§15.3): the `conflict-unresolved`
-/// refusal of the engine's `Edit` (SYNC §7), for an item no source binds.
+/// Why an `update` or a `remove` of item `seq` parks over the conflict it
+/// `met`, or over none, its resolution naming another (§15.3): the
+/// `conflict-unresolved` refusal of the engine's `Edit` and `Remove`
+/// (SYNC §7), for an item no source binds.
 fn unresolved(seq: i64, met: &[Option<PimdirHash>], resolves: &Option<Vec<PimdirHash>>) -> String {
     let resolves = match resolves {
         Some(resolves) => mutate::names(resolves.iter().map(Some)),
@@ -1699,11 +1770,13 @@ fn unbound(
 }
 
 /// Applies an action on an item no source binds to the store alone, as
-/// [`unbound`] judged it: a `remove` retains it, a `set-flags` sets its
-/// flags, an `update` writes its new body as `put_item` does, its flags
-/// kept and its summary derived again; a body deriving no summary, or
-/// another key, parks. An `update`'s `if_match` was checked by
-/// [`stage_action`] before the item was found unbound (§15.3).
+/// [`unbound`] judged it: a `remove` retains it, settling the item's
+/// conflict its `resolves` names, a `set-flags` sets its flags, as a
+/// change when it states `base` and parking over an unknown set, an
+/// `update` writes its new body as `put_item` does, its flags kept and
+/// its summary derived again; a body deriving no summary, or another key,
+/// parks. An `if_match` and a `resolves` were checked by [`stage_action`]
+/// before the item was found unbound (§15.3).
 fn apply_unbound(
     tx: &Connection,
     blobs: &PimdirBlobs,
@@ -1714,7 +1787,13 @@ fn apply_unbound(
     action: &PimdirAction,
 ) -> Result<Result<(), PimdirOutcome>, PimdirError> {
     match action {
-        PimdirAction::Remove { .. } => {
+        PimdirAction::Remove { resolves, .. } => {
+            // NOTE: a resolution reaching here names the item's conflict,
+            // which it settles as it deletes, the item keeping its body
+            // (§15.3, SYNC §7); any other met none.
+            if resolves.is_some() {
+                write::settle_unbound(tx, collection, link)?;
+            }
             tx.execute_cached(
                 sql::RETAIN_ITEM,
                 named_params! {
@@ -1724,8 +1803,13 @@ fn apply_unbound(
                 },
             )?;
         }
-        PimdirAction::SetFlags { flags, .. } => {
-            write::set_unbound_flags(tx, collection, link, flags)?;
+        PimdirAction::SetFlags { flags, base, .. } => {
+            if !write::set_unbound_flags(tx, collection, link, flags, base.as_ref())? {
+                return Ok(Err(PimdirOutcome::Parked(format!(
+                    "item {} holds an unknown flag set, which a change stating its base cannot apply to",
+                    link.0
+                ))));
+            }
         }
         PimdirAction::Update { object, .. } => {
             let body = queued_body(blobs, object)?;

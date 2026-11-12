@@ -144,6 +144,7 @@ fn a_declared_source_refuses_a_move_it_cannot_push() {
     let flag = PimdirAction::SetFlags {
         seq,
         flags: PimdirFlags::from_iter(["\\Seen", "\\Flagged"]),
+        base: None,
     };
     producer.enqueue("INBOX", &flag, None).unwrap();
 }
@@ -307,9 +308,15 @@ fn a_scheduled_event_needs_a_source_that_notifies() {
     let (action, object) = add(&producer, &String::from_utf8(unscheduled).unwrap());
     producer.enqueue("work", &action, Some(&object)).unwrap();
 
-    let Err(PimdirError::Unsupported(_)) =
-        producer.enqueue("work", &PimdirAction::Remove { seq }, None)
-    else {
+    let Err(PimdirError::Unsupported(_)) = producer.enqueue(
+        "work",
+        &PimdirAction::Remove {
+            seq,
+            if_match: None,
+            resolves: None,
+        },
+        None,
+    ) else {
         panic!("removing a scheduled event should be refused");
     };
 }
@@ -506,7 +513,8 @@ fn a_copy_is_asked_of_the_sender_and_filed_once_sent() {
     assert_eq!(refusal.capability, capability::MAIL_SUBMIT_COPY);
     let id = producer
         .enqueue("INBOX", &submit(None), Some(&object))
-        .unwrap();
+        .unwrap()
+        .id;
     drop(producer);
 
     // the send performed, the intent gives way to the copy it asked for
@@ -545,7 +553,8 @@ fn a_collection_is_created_by_a_source_that_declares_it_under_its_anchor() {
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let id = producer
         .enqueue_collection_create("INBOX", "Projects", None, None)
-        .unwrap();
+        .unwrap()
+        .id;
     let pending = producer.pending_actions("INBOX").unwrap();
     let PimdirAction::Unknown { kind, payload, .. } = &pending[0].action else {
         panic!("an intent travels as an unknown kind");
@@ -619,8 +628,12 @@ fn a_collection_is_renamed_and_deleted_on_itself_by_a_source_declaring_it() {
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let renamed = producer
         .enqueue_collection_rename("Archive", "Archive 2026", None)
-        .unwrap();
-    let deleted = producer.enqueue_collection_delete("Archive", None).unwrap();
+        .unwrap()
+        .id;
+    let deleted = producer
+        .enqueue_collection_delete("Archive", None)
+        .unwrap()
+        .id;
 
     // both queued on the collection they address, which no payload restates
     let pending = producer.pending_actions("Archive").unwrap();
@@ -1053,7 +1066,7 @@ fn a_checked_enqueue_answers_the_partial_supports_it_passed_with() {
     assert_eq!(enqueued.partial[0].source, "dav");
     assert_eq!(
         producer.pending_actions("work").unwrap()[0].id,
-        enqueued.id,
+        enqueued.handle.id,
         "the row is queued"
     );
 }

@@ -39,7 +39,7 @@ use crate::{
             load_addresses, load_list, load_summaries, read_hub, tables_of,
         },
     },
-    codec::{self, PimdirAction},
+    codec::{self, PimdirAction, PimdirActionHandle},
     collection::{self, PimdirCoverage, PimdirScope},
     hash::{self, PimdirHasher},
     hub::{PimdirBinding, PimdirSourceId},
@@ -1169,10 +1169,16 @@ impl PimdirReader {
         pending_actions(&self.conn, None)
     }
 
-    /// Where the queue row `id` stands (§15.4): pending, parked, applied
-    /// with the item an `add` created, or found nowhere.
-    pub fn action_status(&self, id: i64) -> Result<PimdirActionStatus, PimdirError> {
-        action_status(&self.conn, id)
+    /// Where the queue row `action` names stands (§15.4): pending, parked,
+    /// applied with the item an `add` created, found nowhere, or
+    /// [`Reset`](PimdirActionStatus::Reset) when the store is no longer
+    /// the one the handle was answered in (§4.5). A bare id is followed
+    /// unchecked.
+    pub fn action_status(
+        &self,
+        action: impl Into<PimdirActionHandle>,
+    ) -> Result<PimdirActionStatus, PimdirError> {
+        action_status(&self.conn, &action.into())
     }
 
     /// A collection's pending actions in append order (§15.4).
@@ -1968,13 +1974,14 @@ struct PimdirPending {
     /// Items another collection's pending move or copy brings in, mapped
     /// to the collection their row is still read from.
     arrivals: BTreeMap<i64, String>,
-    /// The conflicts of the items a pending `update` edits, by public id,
-    /// which decide whether the drain applies it or parks it (§15.3).
+    /// The conflicts of the items a pending `update` or `remove` names,
+    /// by public id, which decide whether the drain applies it or parks
+    /// it (§15.3).
     standing: BTreeMap<i64, PimdirStanding>,
 }
 
 /// The conflicts an item stands in (SYNC §7), as the overlay reads what a
-/// pending `update` meets.
+/// pending `update` or `remove` meets.
 #[derive(Clone, Debug, Default)]
 struct PimdirStanding {
     /// The item's diverging body while it is conflicted, `None` within for
@@ -1985,7 +1992,8 @@ struct PimdirStanding {
 }
 
 impl PimdirStanding {
-    /// Whether the drain applies an `update` stating `resolves` (§15.3),
+    /// Whether the drain applies an `update` or a `remove` stating
+    /// `resolves` (§15.3),
     /// settling what it meets when it does. The binding it runs through is
     /// the owner's choice, which a reader does not know: an ordinary update
     /// applies only over no conflict at all, and a resolution only through
@@ -2019,9 +2027,12 @@ impl PimdirPending {
         self.edits
             .values()
             .filter(|actions| {
-                actions
-                    .iter()
-                    .any(|action| matches!(action, PimdirAction::Remove { .. }))
+                actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PimdirAction::Remove { .. } | PimdirAction::Move { .. }
+                    )
+                })
             })
             .count()
     }
@@ -2142,20 +2153,15 @@ impl PimdirReader {
             match &action.action {
                 PimdirAction::SetFlags { seq, .. }
                 | PimdirAction::Update { seq, .. }
-                | PimdirAction::Remove { seq }
+                | PimdirAction::Remove { seq, .. }
                     if here =>
                 {
                     pending.edits.entry(*seq).or_default().push(action.action);
                 }
                 PimdirAction::Move { seq, to } => {
                     if here && to.0 != collection {
-                        pending
-                            .edits
-                            .entry(*seq)
-                            .or_default()
-                            .push(PimdirAction::Remove { seq: *seq });
-                    }
-                    if !here && to.0 == collection {
+                        pending.edits.entry(*seq).or_default().push(action.action);
+                    } else if !here && to.0 == collection {
                         pending.arrivals.insert(*seq, from);
                     }
                 }
@@ -2173,21 +2179,29 @@ impl PimdirReader {
                         .edits
                         .entry(seq)
                         .or_default()
-                        .push(PimdirAction::Remove { seq });
+                        .push(PimdirAction::Remove {
+                            seq,
+                            if_match: None,
+                            resolves: None,
+                        });
                 }
                 _ => {}
             }
         }
 
-        // NOTE: an update meeting a conflict its `resolves` does not name
-        // parks (§15.3), so the conflicts it meets are read with it.
+        // NOTE: an update or a remove meeting a conflict its `resolves`
+        // does not name parks (§15.3), so the conflicts it meets are read
+        // with it.
         let updated: Vec<i64> = pending
             .edits
             .iter()
             .filter(|(_, actions)| {
-                actions
-                    .iter()
-                    .any(|action| matches!(action, PimdirAction::Update { .. }))
+                actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PimdirAction::Update { .. } | PimdirAction::Remove { .. }
+                    )
+                })
             })
             .map(|(seq, _)| *seq)
             .collect();
@@ -2269,9 +2283,11 @@ impl PimdirReader {
     }
 }
 
-/// Folds an item's pending actions into it, `None` when they take it out
-/// of the collection: `set-flags` is absolute, `update` repoints the body,
-/// over the conflicts the item stands in.
+/// Folds an item's pending actions into it as the owner would apply each
+/// (§15.4), `None` when they take it out of the collection: `set-flags`
+/// replaces the set or, stating its base, changes it, `update` repoints
+/// the body and `remove` takes the item out, over the conflicts the item
+/// stands in; a row the owner would park folds into nothing.
 fn fold(
     mut item: PimdirItem,
     actions: Option<&Vec<PimdirAction>>,
@@ -2280,6 +2296,18 @@ fn fold(
     let mut standing = standing.cloned().unwrap_or_default();
     for action in actions.into_iter().flatten() {
         match action {
+            // NOTE: a change stating its base is folded as the change it
+            // is, over the set the item shows, and as nothing over an
+            // unknown set, where the owner parks it (§15.4).
+            PimdirAction::SetFlags {
+                flags,
+                base: Some(base),
+                ..
+            } => {
+                if let Some(changed) = item.flags.changed(base, flags) {
+                    item.flags = changed;
+                }
+            }
             PimdirAction::SetFlags { flags, .. } => item.flags = flags.clone(),
             // NOTE: an edit naming a body the item will not hold when its
             // turn comes parks (§15.3), so the item reads as it will be;
@@ -2294,7 +2322,15 @@ fn fold(
                 item.object = Some(object.clone());
                 item.level = PimdirLevel::Full;
             }
-            PimdirAction::Remove { .. } => return None,
+            // NOTE: a remove parks on an update's terms (§15.3): naming a
+            // body the item will not hold, or meeting a conflict its
+            // `resolves` does not name, it takes nothing out.
+            PimdirAction::Remove {
+                if_match: Some(read),
+                ..
+            } if item.object.as_ref() != Some(read) => {}
+            PimdirAction::Remove { resolves, .. } if !standing.settle(resolves.as_ref()) => {}
+            PimdirAction::Remove { .. } | PimdirAction::Move { .. } => return None,
             _ => {}
         }
     }

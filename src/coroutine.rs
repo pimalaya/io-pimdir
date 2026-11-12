@@ -20,7 +20,7 @@ use crate::{
     change::{PimdirChange, PimdirWriteOp},
     collection::PimdirCollectionId,
     load::{PimdirLoadSelection, PimdirLoaded},
-    object::{PimdirHash, PimdirObject},
+    object::{PimdirHash, PimdirHeldObject},
     placement::{PimdirHandle, PimdirLinkId},
     remote::{PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirTier},
 };
@@ -172,10 +172,12 @@ pub enum PimdirArg {
     Push(Vec<PimdirPushResult>),
     /// Reply to [`PimdirYield::WantsLoad`].
     Load(PimdirLoaded),
-    /// Reply to [`PimdirYield::WantsLookupObject`], the link ids found
-    /// with the body each holds and its size, the witness the link needs
-    /// (SYNC §6).
-    LookupObject(BTreeMap<PimdirLinkId, PimdirObject>),
+    /// Reply to [`PimdirYield::WantsLookupObject`]: for each link id
+    /// found, every row of the account holding a body under it, with the
+    /// body, its size and the `subject`, `date` and `sender` the row
+    /// states, the witnesses a link needs (SYNC §6): the verb adopts a
+    /// body only from a holder that agrees with its placement.
+    LookupObject(BTreeMap<PimdirLinkId, Vec<PimdirHeldObject>>),
     /// Reply to [`PimdirYield::WantsWrite`] from a storage recording
     /// nothing beyond the ops: [`Written`](Self::Written) with nothing in
     /// it.

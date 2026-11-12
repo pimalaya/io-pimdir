@@ -361,9 +361,17 @@ pub fn required(kind: &str, action: &PimdirAction, current: &PimdirFlags) -> Vec
         PimdirAction::Move { .. } => needed.push(verb("move")),
         PimdirAction::Remove { .. } => needed.push(verb("remove")),
         PimdirAction::Update { .. } if domain != "mail" => needed.push(verb("update")),
-        PimdirAction::SetFlags { flags, .. } => {
-            if let Some(flags) = flags.known() {
-                needed.extend(flag_changes(kind, current, flags));
+        // NOTE: a change stating its base is read against the current set
+        // too, never against its base (Annex B.1): what it changes is
+        // what the set it leaves holds and the current one lacks, or the
+        // reverse, so a flag it adds that a sync landed needs nothing.
+        PimdirAction::SetFlags { flags, base, .. } => {
+            let left = match base {
+                Some(base) => PimdirFlags::Known(current.clone()).changed(base, flags),
+                None => Some(flags.clone()),
+            };
+            if let Some(left) = left.as_ref().and_then(PimdirFlags::known) {
+                needed.extend(flag_changes(kind, current, left));
             }
         }
         PimdirAction::Update { .. }
@@ -535,6 +543,7 @@ mod tests {
         let action = PimdirAction::SetFlags {
             seq: 1,
             flags: flags(&["\\Seen", "\\Flagged"]),
+            base: None,
         };
 
         assert_eq!(
@@ -553,6 +562,7 @@ mod tests {
         let action = PimdirAction::SetFlags {
             seq: 1,
             flags: flags(&["$important", "$Junk"]),
+            base: None,
         };
 
         assert_eq!(

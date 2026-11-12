@@ -32,7 +32,7 @@ use crate::{
     collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoadSelection,
-    object::{PimdirHash, PimdirObject},
+    object::{PimdirHash, PimdirHeldObject, PimdirObject},
     placement::{
         PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirStatus,
     },
@@ -696,19 +696,22 @@ impl PimdirCoroutine for PimdirUpgrade {
                     let Some(placement) = self.placements.get(&handle) else {
                         continue;
                     };
-                    // NOTE: linked only when the size the source served
-                    // agrees with the held body (SYNC §6): two messages
-                    // under one Message-ID with different bytes are the
-                    // wrong merge, and the summary's size is the witness.
+                    // NOTE: linked only from a row that agrees with the
+                    // summary the source served (SYNC §6): a message
+                    // reusing a Message-ID another mailbox holds is
+                    // another body, whatever its size, a size being a
+                    // witness and no identity. A body found missing is no
+                    // body to link.
                     let hit = placement
                         .link_id
                         .as_ref()
                         .filter(|_| !is_mutable(placement) && !is_conflicted(placement))
                         .and_then(|link| known.get(link))
-                        .filter(|object| size_agrees(placement, object.size))
-                        // NOTE: a body found missing is no body to link.
-                        .filter(|object| !self.missing.contains(&object.hash))
-                        .map(|object| object.hash.clone());
+                        .into_iter()
+                        .flatten()
+                        .filter(|held| agrees(placement, held))
+                        .find(|held| !self.missing.contains(&held.object.hash))
+                        .map(|held| held.object.hash.clone());
 
                     match hit {
                         Some(hash) => {
@@ -858,12 +861,26 @@ fn is_mutable(placement: &PimdirPlacement) -> bool {
         .is_some_and(|base| base.revision.is_some())
 }
 
-/// Whether a held body's size agrees with the size the source served in
-/// the placement's summary, a summary stating none agreeing with any.
-fn size_agrees(placement: &PimdirPlacement, size: usize) -> bool {
+/// Whether a body may be linked from the row `held` (SYNC §6, STORAGE
+/// §9): a message's only from a row agreeing with the summary the source
+/// served on `subject`, `date` and `sender`, byte for byte, an absent one
+/// matching an absent one, and on the size where the placement states
+/// one, against the body's octets. A row holding no mail summary agrees
+/// with no message, and a message whose summary nobody served with none;
+/// a placement of another kind agrees with anything.
+fn agrees(placement: &PimdirPlacement, held: &PimdirHeldObject) -> bool {
+    let date = |date: &Option<String>| date.clone().filter(|date| !date.is_empty());
     match &placement.summary {
-        Some(PimdirSummary::Mail(mail)) => mail.size.is_none_or(|served| served == size as u64),
-        _ => true,
+        Some(PimdirSummary::Mail(mail)) => {
+            held.subject.as_deref() == Some(mail.subject.as_str())
+                && date(&held.date) == date(&mail.date)
+                && held.sender == mail.sender
+                && mail
+                    .size
+                    .is_none_or(|served| served == held.object.size as u64)
+        }
+        Some(_) => true,
+        None => held.subject.is_none(),
     }
 }
 
@@ -917,6 +934,20 @@ mod tests {
         }
     }
 
+    /// One row holding the body `hash`, one octet long, under no mail
+    /// summary, as a lookup answers it.
+    fn held(hash: &str) -> Vec<PimdirHeldObject> {
+        vec![PimdirHeldObject {
+            object: PimdirObject {
+                hash: PimdirHash::from(hash),
+                size: 1,
+            },
+            subject: None,
+            date: None,
+            sender: None,
+        }]
+    }
+
     #[test]
     fn full_dedup_links_without_fetch() {
         crate::testlog::init();
@@ -935,13 +966,7 @@ mod tests {
         assert_eq!(links, vec![PimdirLinkId::from("msg-a")]);
 
         let mut known = BTreeMap::new();
-        known.insert(
-            PimdirLinkId::from("msg-a"),
-            PimdirObject {
-                hash: PimdirHash::from("h-a"),
-                size: 1,
-            },
-        );
+        known.insert(PimdirLinkId::from("msg-a"), held("h-a"));
 
         let ops = match up.resume(Some(PimdirArg::LookupObject(known))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
@@ -1812,13 +1837,7 @@ mod tests {
         let _ = up.resume(Some(PimdirArg::Load(loaded)));
 
         let mut known = BTreeMap::new();
-        known.insert(
-            PimdirLinkId::from("msg-a"),
-            PimdirObject {
-                hash: PimdirHash::from("h-a"),
-                size: 1,
-            },
-        );
+        known.insert(PimdirLinkId::from("msg-a"), held("h-a"));
 
         let handles = match up.resume(Some(PimdirArg::LookupObject(known))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsFetch { handles, .. }) => handles,
@@ -1870,9 +1889,9 @@ mod tests {
         placement: PimdirPlacement,
         known: BTreeMap<PimdirLinkId, PimdirHash>,
     ) -> PimdirCoroutineState<PimdirYield, Result<PimdirUpgradeReport, PimdirArgError>> {
-        let known: BTreeMap<PimdirLinkId, PimdirObject> = known
+        let known: BTreeMap<PimdirLinkId, Vec<PimdirHeldObject>> = known
             .into_iter()
-            .map(|(link, hash)| (link, PimdirObject { hash, size: 1 }))
+            .map(|(link, hash)| (link, held(hash.as_str())))
             .collect();
         let handle = placement.handle.clone();
         let loaded = PimdirLoaded {

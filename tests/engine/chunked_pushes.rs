@@ -42,6 +42,7 @@ fn dirty_client() -> Client {
                 PimdirMutation::SetFlags {
                     handle: PimdirHandle::from(handle(index)),
                     flags: PimdirFlags::from_iter(["seen"]),
+                    base: None,
                 },
             )
             .unwrap();

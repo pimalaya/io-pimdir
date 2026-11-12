@@ -178,3 +178,202 @@ fn an_add_of_the_same_message_over_a_retained_one_revives_it() {
     assert_eq!(link_of(&a, held.provisional().as_str()), held);
     assert_eq!(a.count_retained(inbox()).unwrap(), 0);
 }
+
+/// A member named in `collection` under `HELD`, its summary stating
+/// `subject`, holding `body` when it has one.
+fn filed(
+    collection: &str,
+    handle: &str,
+    subject: Option<&str>,
+    body: Option<&[u8]>,
+) -> Vec<PimdirWriteOp> {
+    let PimdirWriteOp::UpsertPlacement(mut placement) =
+        named(handle, subject.unwrap_or_default(), "alice@example.org")
+    else {
+        unreachable!()
+    };
+    placement.collection = PimdirCollectionId(collection.into());
+    if subject.is_none() {
+        placement.summary = None;
+    }
+    let mut ops = Vec::new();
+    if let Some(body) = body {
+        let object = PimdirObject {
+            hash: hash::hash(body),
+            size: body.len(),
+        };
+        placement.object = Some(object.hash.clone());
+        placement.level = PimdirLevel::Full;
+        placement.base.as_mut().unwrap().object = Some(object.hash.clone());
+        ops.push(PimdirWriteOp::StoreObject {
+            object,
+            body: Some(body.to_vec()),
+        });
+    }
+    ops.push(PimdirWriteOp::UpsertPlacement(placement));
+    ops
+}
+
+/// A store whose Archive holds `HELD`, the stand-up notes, under
+/// `subject`, with `body` when it holds one.
+fn archived(
+    dir: &std::path::Path,
+    subject: Option<&str>,
+    body: Option<&[u8]>,
+) -> PimdirSourceStore {
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    store
+        .ensure_collection("Archive", "message/rfc822")
+        .unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    store.write(filed("Archive", "5", subject, body)).unwrap();
+    store
+}
+
+fn seq_in(store: &PimdirSourceStore, collection: &str) -> i64 {
+    store
+        .seq_for_link(collection, HELD)
+        .unwrap()
+        .expect("the message has a public id there")
+}
+
+/// A message shares the public id of the row holding its `Message-ID` in
+/// another mailbox only when it agrees with that row (STORAGE §9, §9.1;
+/// vectors/sync/148): another message reusing the id, or a row holding no
+/// summary, which agrees with no message, has it draw its own. Before
+/// draft-10's second batch the key alone shared the `seq`.
+#[test]
+fn a_message_shares_a_seq_across_mailboxes_only_with_a_row_it_agrees_with() {
+    let dir = tempdir().unwrap();
+    let mut store = archived(dir.path(), Some("Stand-up notes"), None);
+    store
+        .write(filed("INBOX", "20", Some("Stand-up notes"), None))
+        .unwrap();
+    assert_eq!(
+        seq_in(&store, "INBOX"),
+        seq_in(&store, "Archive"),
+        "one message filed twice is one public id"
+    );
+
+    let dir = tempdir().unwrap();
+    let mut store = archived(dir.path(), Some("Stand-up notes"), None);
+    store
+        .write(filed("INBOX", "20", Some("Budget review"), None))
+        .unwrap();
+    assert_eq!(
+        link_of(&store, "20"),
+        PimdirLinkId::from(HELD),
+        "the key is free in INBOX, so it is taken bare"
+    );
+    assert_ne!(
+        seq_in(&store, "INBOX"),
+        seq_in(&store, "Archive"),
+        "another message reusing the id is another item"
+    );
+
+    let dir = tempdir().unwrap();
+    let mut store = archived(dir.path(), None, None);
+    store
+        .write(filed("INBOX", "20", Some("Stand-up notes"), None))
+        .unwrap();
+    assert_ne!(
+        seq_in(&store, "INBOX"),
+        seq_in(&store, "Archive"),
+        "a row holding no summary agrees with no message"
+    );
+}
+
+/// The lookup answers each row of the account holding a body under the
+/// key with its size and the subject, date and sender its summary states,
+/// the three absent for a row holding none (STORAGE §14, SYNC §6): the
+/// witnesses an upgrade links against, one per holder stating another.
+#[test]
+fn a_lookup_answers_each_holder_with_its_witnesses() {
+    let dir = tempdir().unwrap();
+    let mut store = archived(dir.path(), Some("Stand-up notes"), Some(b"the notes"));
+    store
+        .write(filed(
+            "INBOX",
+            "20",
+            Some("Budget review"),
+            Some(b"the budget"),
+        ))
+        .unwrap();
+    store.ensure_collection("Sent", "message/rfc822").unwrap();
+    store
+        .write(filed("Sent", "9", None, Some(b"a third body")))
+        .unwrap();
+
+    let found = store.lookup_objects(&[PimdirLinkId::from(HELD)]).unwrap();
+    let mut holders: Vec<(Option<String>, usize)> = found[&PimdirLinkId::from(HELD)]
+        .iter()
+        .map(|held| (held.subject.clone(), held.object.size))
+        .collect();
+    holders.sort();
+    assert_eq!(
+        holders,
+        [
+            (None, 12),
+            (Some("Budget review".into()), 10),
+            (Some("Stand-up notes".into()), 9),
+        ]
+    );
+    let notes = found[&PimdirLinkId::from(HELD)]
+        .iter()
+        .find(|held| held.subject.as_deref() == Some("Stand-up notes"))
+        .unwrap();
+    assert_eq!(notes.sender.as_deref(), Some("alice@example.org"));
+    assert_eq!(notes.date.as_deref(), Some("2026-08-01T10:00:00Z"));
+    assert_eq!(notes.object.hash, hash::hash(b"the notes"));
+}
+
+/// Whether INBOX's row under `HELD` is kept in the trash once its member
+/// is gone, the row holding no body.
+fn retained_after_the_drop(inbox_subject: Option<&str>, archive_subject: Option<&str>) -> bool {
+    let dir = tempdir().unwrap();
+    let mut store = archived(dir.path(), archive_subject, None);
+    store
+        .write(filed("INBOX", "20", inbox_subject, None))
+        .unwrap();
+    store
+        .write(vec![PimdirWriteOp::DropPlacement {
+            collection: inbox(),
+            handle: PimdirHandle::from("20"),
+            reason: PimdirDropReason::Deleted,
+        }])
+        .unwrap();
+
+    let trash = store.list_retained("INBOX", None, 10).unwrap();
+    assert!(trash.len() <= 1);
+    assert!(
+        store.seq_for_link("Archive", HELD).unwrap().is_some(),
+        "the holder is untouched"
+    );
+    !trash.is_empty()
+}
+
+/// A bodiless message losing its last binding is purged at once only for
+/// a live row of another mailbox of its account that agrees with it; a
+/// holder stating another message, or either row holding no summary,
+/// holds nothing of it, and the row is retained (STORAGE §9, §11.1;
+/// vectors/sync/149). Before draft-10's second batch any live holder of
+/// the key had the row purged.
+#[test]
+fn a_bodiless_row_is_held_elsewhere_only_by_a_row_that_agrees() {
+    assert!(
+        !retained_after_the_drop(Some("Stand-up notes"), Some("Stand-up notes")),
+        "the message moved, or was filed twice: nothing is lost by the purge"
+    );
+    assert!(
+        retained_after_the_drop(Some("Budget review"), Some("Stand-up notes")),
+        "another message reusing the id holds nothing of this one"
+    );
+    assert!(
+        retained_after_the_drop(Some("Stand-up notes"), None),
+        "a holder with no summary agrees with no message"
+    );
+    assert!(
+        retained_after_the_drop(None, Some("Stand-up notes")),
+        "nor does a retiring row holding none"
+    );
+}

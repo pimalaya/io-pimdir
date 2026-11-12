@@ -119,3 +119,12 @@ A connector narrowing a round's listing by any date filter SHALL set `PimdirRemo
 
 ### Requirement: A capped listing says so
 A connector knowing that its source caps a collection's listing SHALL set `PimdirRemoteSnapshot::capped` on every page of that collection's rounds and on no other (pimdir SYNC §4, §5). The constructors state none.
+
+### Requirement: A lookup answers every holder with its witnesses
+`PimdirArg::LookupObject` SHALL carry, by link id, a `PimdirHeldObject` per row of the account holding a body under it: the body's `PimdirObject` and the `subject`, `date` and `sender` its mail summary states, the three `None` for a row holding none (`lookup_objects`, pimdir STORAGE §14). The verb, not the storage, decides which holder agrees ([upgrade](upgrade.md)), so a storage answers every holder, once per distinct answer, and only bodies it read whole. Before draft-10's second batch the reply was one `PimdirObject` per link id, the size its only witness.
+
+### Requirement: A load says which creates are offered
+`PimdirLoaded` SHALL carry `offered`, the handles of the loaded `Created` placements the source binds not: the copies the store offers it of items other sources hold (`PimdirHub::offered`, pimdir SYNC §3, §9). A sync reads every other `Created` placement, and every delivered create, as a create of the source's own, and reports a member minted apart from one on a summary disagreement (`PimdirSyncEvent::Disagreed`, [sync](sync.md)). The field is empty by default: a storage stating none has every create read as the source's own, and so reports a disagreement with an offered copy too, never fewer.
+
+### Requirement: The seq decision stays the storage's
+No yield carries the public id: the write assigns a `seq` as it inserts an item, from the summary the upsert carries. A storage SHALL run `seq_for_link_any` bound with the `subject`, `date` and `sender` of the mail summary being written, the date `NULL` when unparseable, and with the three `NULL` for another kind or a message carrying no summary, and SHALL run it for no writer-derived key (pimdir STORAGE §9.1). `held_elsewhere` keeps its three parameters and reads both rows' summaries itself.

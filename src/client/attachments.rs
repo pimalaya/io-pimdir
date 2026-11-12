@@ -397,7 +397,15 @@ pub(crate) fn insert_file(
     let shared: Option<i64> = conn
         .query_row_cached(
             sql::SEQ_FOR_LINK_ANY,
-            named_params! { ":collection": collection, ":link_id": link.as_str() },
+            // NOTE: a file agrees with anything, the three fields a
+            // message is compared on bound NULL (§9.1).
+            named_params! {
+                ":collection": collection,
+                ":link_id": link.as_str(),
+                ":subject": None::<&str>,
+                ":date": None::<&str>,
+                ":sender": None::<&str>,
+            },
             |row| row.get(0),
         )
         .optional()?;

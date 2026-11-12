@@ -251,6 +251,19 @@ pub fn derive(kind: &str, body: &[u8]) -> Option<PimdirDerivation> {
     }
 }
 
+/// The key of a resource stating `uid` (STORAGE §9, Annex A.2): the hint
+/// verbatim when it is usable, not empty once trimmed of the space and
+/// the tab, no other character counting as whitespace here, the trim
+/// judging it and never changing it; else the `hash:` fallback of `body`,
+/// as for a resource stating none. An empty `UID`, or one of spaces
+/// alone, names no identity two resources could share.
+pub(crate) fn uid_key(uid: Option<&str>, body: &[u8]) -> PimdirLinkId {
+    match uid.filter(|uid| !uid.trim_matches([' ', '\t']).is_empty()) {
+        Some(uid) => PimdirLinkId::from_hint(uid),
+        None => hash_key(body),
+    }
+}
+
 /// The `hash:` fallback key of a body stating no identity (Annex A.2):
 /// the sixteen lowercase hexadecimal digits of its FNV-1a 64 digest.
 pub fn hash_key(body: &[u8]) -> PimdirLinkId {

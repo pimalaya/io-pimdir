@@ -494,6 +494,7 @@ fn check_conflict_model(ops: Vec<ConflictOp>) -> Result<(), TestCaseError> {
                     PimdirMutation::SetFlags {
                         handle: placement.handle,
                         flags,
+                        base: None,
                     },
                 );
             }
@@ -505,8 +506,14 @@ fn check_conflict_model(ops: Vec<ConflictOp>) -> Result<(), TestCaseError> {
                 let Some(placement) = cluster.placement(source, &link) else {
                     continue;
                 };
-                let staged = cluster.sources[source]
-                    .mutate("inbox", PimdirMutation::Remove(placement.handle));
+                let staged = cluster.sources[source].mutate(
+                    "inbox",
+                    PimdirMutation::Remove {
+                        handle: placement.handle,
+                        if_match: None,
+                        resolves: None,
+                    },
+                );
                 if staged.is_ok() {
                     ledger.entry(link).or_default().removed = true;
                 }

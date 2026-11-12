@@ -98,6 +98,7 @@ fn a_staged_flag_shows_on_the_overlaid_read_only() {
         &PimdirAction::SetFlags {
             seq: seqs[0],
             flags: PimdirFlags::from_iter(["\\Flagged"]),
+            base: None,
         },
     );
 
@@ -126,6 +127,7 @@ fn two_staged_actions_on_one_item_fold_in_append_order() {
         &PimdirAction::SetFlags {
             seq: seqs[0],
             flags: PimdirFlags::from_iter(["\\Flagged"]),
+            base: None,
         },
     );
     enqueue(
@@ -134,6 +136,7 @@ fn two_staged_actions_on_one_item_fold_in_append_order() {
         &PimdirAction::SetFlags {
             seq: seqs[0],
             flags: PimdirFlags::from_iter(["\\Answered"]),
+            base: None,
         },
     );
 
@@ -148,7 +151,15 @@ fn a_staged_removal_leaves_the_listing_and_the_count() {
     let dir = tempfile::tempdir().unwrap();
     let seqs = store(dir.path());
 
-    enqueue(dir.path(), "INBOX", &PimdirAction::Remove { seq: seqs[1] });
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::Remove {
+            seq: seqs[1],
+            if_match: None,
+            resolves: None,
+        },
+    );
 
     let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
     let listed: Vec<i64> = overlaid
@@ -297,7 +308,15 @@ fn a_parked_action_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let seqs = store(dir.path());
 
-    enqueue(dir.path(), "INBOX", &PimdirAction::Remove { seq: seqs[1] });
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::Remove {
+            seq: seqs[1],
+            if_match: None,
+            resolves: None,
+        },
+    );
 
     let owner = PimdirStore::open(dir.path()).unwrap();
     let id = owner.pending_actions("INBOX").unwrap()[0].id;
@@ -323,6 +342,7 @@ fn the_scoped_cancel_takes_the_owner_role_only_for_the_call() {
         &PimdirAction::SetFlags {
             seq: seqs[0],
             flags: PimdirFlags::from_iter(["\\Flagged"]),
+            base: None,
         },
     );
     let id = PimdirReader::open(dir.path())
@@ -370,7 +390,15 @@ fn a_page_stays_full_across_a_staged_removal() {
 
     // the first item of the collection goes, so a page of two asked from
     // the beginning has to reach past it rather than come back short
-    enqueue(dir.path(), "INBOX", &PimdirAction::Remove { seq: seqs[0] });
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::Remove {
+            seq: seqs[0],
+            if_match: None,
+            resolves: None,
+        },
+    );
 
     let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
     let page = overlaid.list_items("INBOX", None, 2).unwrap();
@@ -424,7 +452,8 @@ fn an_edit_that_will_park_is_not_folded() {
                 resolves: None,
             }
         })
-        .unwrap();
+        .unwrap()
+        .id;
     let first = producer
         .pending_actions("INBOX")
         .unwrap()

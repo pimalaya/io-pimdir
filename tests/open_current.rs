@@ -114,8 +114,17 @@ fn a_cancel_leaves_a_store_of_another_draft_as_it_was() {
     drop(store);
     let id = PimdirProducer::open(dir.path(), "test")
         .unwrap()
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 1 }, None)
-        .unwrap();
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: 1,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
+        .unwrap()
+        .id;
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch(
         "UPDATE store_meta SET format_version = 'storage-draft-11';

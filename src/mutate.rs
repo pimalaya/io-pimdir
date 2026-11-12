@@ -49,7 +49,8 @@ pub struct PimdirMutateReport {
 /// another collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirMutation {
-    /// Replace a placement's flag set.
+    /// Set a placement's flags: replaced by `flags`, or, carrying `base`,
+    /// changed by what `flags` adds to and removes from it.
     ///
     /// The change rides along with whatever else is pending: a create
     /// stays a create, a conflict stays one, a tombstone stays deleted.
@@ -58,14 +59,45 @@ pub enum PimdirMutation {
         handle: PimdirHandle,
         /// The new flag set.
         flags: PimdirFlags,
+        /// The set the caller read and changed into `flags` (a queued
+        /// `set-flags`'s `base`, STORAGE §15.3): the change alone is
+        /// applied to the set the placement holds when the mutation is
+        /// staged, that set plus each flag `flags` holds and `base`
+        /// lacks, less each flag `base` holds and `flags` lacks, so a
+        /// flag a sync landed or removed since is kept as the sync left
+        /// it. Refused, staging nothing, over a placement whose flags
+        /// are unknown ([`PimdirMutateError::UnknownFlags`]). `None`
+        /// replaces the set (SYNC §7).
+        base: Option<PimdirFlags>,
     },
     /// Mark a placement deleted, keeping it as a tombstone until synced.
     ///
-    /// On a conflicted placement it is the decision: the base adopts the
-    /// revision the conflict recorded, so the remove pushes against what
-    /// the remote holds (SYNC §7). On a pending create it withdraws the
-    /// create, the binding going with the write.
-    Remove(PimdirHandle),
+    /// On a pending create it withdraws the create, the binding going
+    /// with the write. It settles a conflict, the item's or its
+    /// binding's, only as a person's resolution naming it in `resolves`,
+    /// on an [`Edit`](Self::Edit)'s terms (SYNC §7): meeting one its
+    /// `resolves` does not name, or stating `resolves` and meeting none,
+    /// it is refused, staging nothing
+    /// ([`PimdirMutateError::Unresolved`]). Resolving its binding's
+    /// conflict it is the decision, the base adopting the conflict's
+    /// revision and body, so the remove pushes against what the remote
+    /// holds; resolving the item's, it states
+    /// [`Settle`](PimdirWriteOp::Settle) before its upsert, the item
+    /// keeping its body under the tombstone.
+    Remove {
+        /// The placement to remove.
+        handle: PimdirHandle,
+        /// The body the remove was decided over, when the producer states
+        /// it (a queued `remove`'s `if_match`, STORAGE §15.3): the remove
+        /// is refused, staging nothing, when the placement holds another
+        /// ([`PimdirMutateError::Replaced`]).
+        if_match: Option<PimdirHash>,
+        /// The diverging bodies a person's resolution by deleting was
+        /// decided over, the `conflict_object` of each conflict it was
+        /// shown; `None` for an ordinary remove, which settles no
+        /// conflict.
+        resolves: Option<Vec<PimdirHash>>,
+    },
     /// Replace a placement's body with locally edited content.
     ///
     /// The new object is stored, the placement repointed at it and marked
@@ -170,7 +202,7 @@ impl PimdirMutation {
     fn handle(&self) -> Option<&PimdirHandle> {
         match self {
             Self::SetFlags { handle, .. } => Some(handle),
-            Self::Remove(handle) => Some(handle),
+            Self::Remove { handle, .. } => Some(handle),
             Self::Edit { handle, .. } => Some(handle),
             Self::Copy { handle, .. } => Some(handle),
             Self::Move { handle, .. } => Some(handle),
@@ -194,7 +226,7 @@ impl PimdirMutation {
         match self {
             Self::Add { link_id, .. } => PimdirLoadSelection::Links(vec![link_id.clone()]),
             Self::SetFlags { handle, .. }
-            | Self::Remove(handle)
+            | Self::Remove { handle, .. }
             | Self::Edit { handle, .. }
             | Self::Copy { handle, .. }
             | Self::Move { handle, .. } => PimdirLoadSelection::Handles(vec![handle.clone()]),
@@ -212,30 +244,36 @@ pub enum PimdirMutateError {
     Unnamed(String),
     /// An `Add` names a link id a live placement already holds.
     LinkExists(String),
-    /// An `Edit` stating the body it was made over names one the
-    /// placement no longer holds: another write replaced it since.
+    /// An `Edit` or a `Remove` stating the body it was made over names
+    /// one the placement no longer holds: another write replaced it
+    /// since.
     Replaced {
-        /// The handle edited.
+        /// The handle edited or removed.
         handle: String,
-        /// The body the edit was made over.
+        /// The body the mutation was made over.
         read: PimdirHash,
         /// The body the placement holds, `None` for none.
         held: Option<PimdirHash>,
     },
-    /// An `Edit` stating no `overrule` meets a conflict its `resolves` does
-    /// not name, or states `resolves` and meets none (SYNC §7): settling
-    /// it would discard a diverging body nobody decided over.
+    /// An `Edit` stating no `overrule`, or a `Remove`, meets a conflict
+    /// its `resolves` does not name, or states `resolves` and meets none
+    /// (SYNC §7): settling it would discard a diverging body nobody
+    /// decided over.
     Unresolved {
-        /// The handle edited.
+        /// The handle edited or removed.
         handle: String,
-        /// The diverging body of each conflict the edit meets, the item's
-        /// then its binding's, `None` for one nobody has read; empty when
-        /// it meets none.
+        /// The diverging body of each conflict the mutation meets, the
+        /// item's then its binding's, `None` for one nobody has read;
+        /// empty when it meets none.
         met: Vec<Option<PimdirHash>>,
-        /// The bodies the edit's resolution names, `None` for an ordinary
-        /// edit.
+        /// The bodies the resolution names, `None` for an ordinary edit
+        /// or remove.
         resolves: Option<Vec<PimdirHash>>,
     },
+    /// A `SetFlags` carrying `base` names a placement whose flags are
+    /// unknown (SYNC §7): there is no set to change, and replacing it
+    /// would write the unread flags as removed.
+    UnknownFlags(String),
     /// A `Copy` or a `Move` names a placement with neither a body nor a
     /// based binding, which no create could deliver (SYNC §7).
     Undeliverable(String),
@@ -256,6 +294,7 @@ impl PimdirMutateError {
     /// | `item-duplicate` | [`LinkExists`](Self::LinkExists) |
     /// | `body-replaced` | [`Replaced`](Self::Replaced) |
     /// | `conflict-unresolved` | [`Unresolved`](Self::Unresolved) |
+    /// | `flags-unknown` | [`UnknownFlags`](Self::UnknownFlags) |
     /// | `placement-undeliverable` | [`Undeliverable`](Self::Undeliverable) |
     /// | `coroutine-arg` | [`Arg`](Self::Arg) |
     pub fn code(&self) -> &'static str {
@@ -265,6 +304,7 @@ impl PimdirMutateError {
             Self::LinkExists(_) => "item-duplicate",
             Self::Replaced { .. } => "body-replaced",
             Self::Unresolved { .. } => "conflict-unresolved",
+            Self::UnknownFlags(_) => "flags-unknown",
             Self::Undeliverable(_) => "placement-undeliverable",
             Self::Arg(_) => "coroutine-arg",
         }
@@ -295,9 +335,15 @@ impl fmt::Display for PimdirMutateError {
                     "Pimdir MUTATE failed: handle {handle} holds neither a body nor a base to copy from"
                 )
             }
+            Self::UnknownFlags(handle) => {
+                write!(
+                    f,
+                    "Pimdir MUTATE failed: handle {handle} holds an unknown flag set, which a change stating its base cannot apply to"
+                )
+            }
             Self::Replaced { handle, read, held } => write!(
                 f,
-                "Pimdir MUTATE failed: handle {handle} was edited over {} and holds {}",
+                "Pimdir MUTATE failed: handle {handle} was read at {} and holds {}",
                 read.as_str(),
                 held.as_ref().map_or("no body", PimdirHash::as_str),
             ),
@@ -426,20 +472,38 @@ impl PimdirMutate {
     /// the target.
     fn writes(&self, mut source: PimdirPlacement, key: Option<PimdirLinkId>) -> Vec<PimdirWriteOp> {
         match &self.mutation {
-            PimdirMutation::SetFlags { flags, .. } => {
-                source.flags = flags.clone();
+            PimdirMutation::SetFlags { flags, base, .. } => {
+                // NOTE: a change stating its base reaches here over a
+                // known set alone (SYNC §7).
+                source.flags = match base {
+                    Some(base) => source
+                        .flags
+                        .changed(base, flags)
+                        .unwrap_or_else(|| flags.clone()),
+                    None => flags.clone(),
+                };
                 if source.status == PimdirStatus::Clean {
                     source.status = PimdirStatus::Dirty;
                 }
                 vec![PimdirWriteOp::UpsertPlacement(source)]
             }
-            PimdirMutation::Remove(_) => {
+            PimdirMutation::Remove { .. } => {
+                // NOTE: a remove reaching here meets no conflict or is a
+                // resolution naming each it meets, so it settles the
+                // item's when it met one, stated to the write before the
+                // tombstone, which settles nothing by itself (SYNC §7).
+                let mut ops = Vec::new();
+                if self.item_conflicted {
+                    ops.push(PimdirWriteOp::Settle {
+                        collection: source.collection.clone(),
+                        handle: source.handle.clone(),
+                    });
+                }
                 source.status = PimdirStatus::Tombstone;
                 // NOTE: the decision on a divergence (SYNC §7): the base
                 // adopts the revision and body the conflict recorded, as
                 // an edit does, so the remove is gated on what the remote
-                // holds; an unfetched body leaves the base's unknown,
-                // never the old one, so a revival reads `Dirty`.
+                // holds. The body is read, a resolution naming it.
                 if let Some(revision) = source.conflict_revision.take() {
                     let settled = source.conflict_object.take();
                     let base = source.base.get_or_insert_with(|| PimdirBase {
@@ -450,20 +514,18 @@ impl PimdirMutate {
                     base.revision = Some(revision);
                     base.object = settled;
                 }
-                if source.base.is_some() {
-                    return vec![PimdirWriteOp::UpsertPlacement(source)];
-                }
-
                 // NOTE: a pending create is withdrawn (SYNC §7): the
                 // tombstone marks the item deleted, binding an offered
                 // copy if need be, and the drop takes that binding, so
                 // the item is retained or its holders push the delete.
-                let drop = PimdirWriteOp::DropPlacement {
+                let drop = source.base.is_none().then(|| PimdirWriteOp::DropPlacement {
                     collection: source.collection.clone(),
                     handle: source.handle.clone(),
                     reason: PimdirDropReason::Deleted,
-                };
-                vec![PimdirWriteOp::UpsertPlacement(source), drop]
+                });
+                ops.push(PimdirWriteOp::UpsertPlacement(source));
+                ops.extend(drop);
+                ops
             }
             PimdirMutation::Edit {
                 object,
@@ -677,9 +739,23 @@ impl PimdirCoroutine for PimdirMutate {
                         let err = PimdirMutateError::Unnamed(handle.as_str().into());
                         return PimdirCoroutineState::Complete(Err(err));
                     }
-                    // NOTE: another write replaced the body this edit was
-                    // made over since its producer read it (SYNC §7).
+                    // NOTE: a change stating the set it read has no set to
+                    // change over an unknown one (SYNC §7).
+                    if let PimdirMutation::SetFlags { flags, base, .. } = &self.mutation
+                        && let Some(base) = base
+                        && placement.flags.changed(base, flags).is_none()
+                    {
+                        let err = PimdirMutateError::UnknownFlags(handle.as_str().into());
+                        return PimdirCoroutineState::Complete(Err(err));
+                    }
+                    // NOTE: another write replaced the body this edit or
+                    // this remove was made over since its producer read it
+                    // (SYNC §7).
                     if let PimdirMutation::Edit {
+                        if_match: Some(read),
+                        ..
+                    }
+                    | PimdirMutation::Remove {
                         if_match: Some(read),
                         ..
                     } = &self.mutation
@@ -693,15 +769,17 @@ impl PimdirCoroutine for PimdirMutate {
                         return PimdirCoroutineState::Complete(Err(err));
                     }
                     // NOTE: a conflict is settled by an overrule or by a
-                    // person's resolution naming it (SYNC §7). A storage
-                    // stating no item conflict for a placement it projects
-                    // `Conflict` with no binding conflict reads as one
-                    // nobody has read, never as none.
+                    // person's resolution naming it, an edit's or a
+                    // remove's (SYNC §7). A storage stating no item
+                    // conflict for a placement it projects `Conflict` with
+                    // no binding conflict reads as one nobody has read,
+                    // never as none.
                     if let PimdirMutation::Edit {
                         overrule: false,
                         resolves,
                         ..
-                    } = &self.mutation
+                    }
+                    | PimdirMutation::Remove { resolves, .. } = &self.mutation
                     {
                         let item = loaded
                             .conflicted
@@ -853,6 +931,7 @@ mod tests {
         let mutation = PimdirMutation::SetFlags {
             handle: PimdirHandle::from("1"),
             flags: PimdirFlags::from_iter(["seen"]),
+            base: None,
         };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
@@ -875,6 +954,7 @@ mod tests {
         let mutation = PimdirMutation::SetFlags {
             handle: PimdirHandle::from("1"),
             flags: PimdirFlags::from_iter(["seen"]),
+            base: None,
         };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
@@ -901,6 +981,7 @@ mod tests {
         let mutation = PimdirMutation::SetFlags {
             handle: PimdirHandle::from("1"),
             flags: PimdirFlags::from_iter(["seen"]),
+            base: None,
         };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
@@ -922,7 +1003,11 @@ mod tests {
 
     #[test]
     fn remove_marks_tombstone() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
@@ -942,7 +1027,11 @@ mod tests {
     /// (SYNC §7).
     #[test]
     fn remove_withdraws_a_pending_create() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
@@ -970,7 +1059,11 @@ mod tests {
 
     #[test]
     fn unknown_handle_errors() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("nope"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("nope"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
@@ -985,7 +1078,11 @@ mod tests {
     /// A placement no link id names has no identity to stage anything under.
     #[test]
     fn an_unnamed_placement_refuses_a_mutation() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
@@ -1103,7 +1200,11 @@ mod tests {
 
     #[test]
     fn write_completes() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
         let _ = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
@@ -1116,7 +1217,11 @@ mod tests {
 
     #[test]
     fn missing_arg_errors() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
@@ -1131,7 +1236,11 @@ mod tests {
     /// A caller resuming a finished coroutine is told, not handed a success.
     #[test]
     fn a_completed_mutate_does_not_resume() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
         let _ = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
@@ -1153,7 +1262,11 @@ mod tests {
 
     #[test]
     fn unexpected_arg_errors() {
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: None,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
 
@@ -1769,7 +1882,14 @@ mod tests {
     /// A mutation touches one row; an `Add` sees only the rows it may hit.
     #[test]
     fn a_mutation_reads_only_what_it_edits() {
-        let mut mutate = PimdirMutate::new("inbox", PimdirMutation::Remove("7".into()));
+        let mut mutate = PimdirMutate::new(
+            "inbox",
+            PimdirMutation::Remove {
+                handle: "7".into(),
+                if_match: None,
+                resolves: None,
+            },
+        );
         match mutate.resume(None) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { selection, .. }) => {
                 assert_eq!(
@@ -1896,6 +2016,7 @@ mod tests {
         let mutation = PimdirMutation::SetFlags {
             handle: PimdirHandle::from("1"),
             flags: PimdirFlags::from_iter(["seen"]),
+            base: None,
         };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
@@ -1962,7 +2083,12 @@ mod tests {
         assert_eq!(base.object, Some(PimdirHash::from("remote")));
     }
 
-    fn remove_diverged(conflict_object: Option<PimdirHash>) -> PimdirPlacement {
+    /// A `Remove` staged on a placement diverged at `r2`, the diverging
+    /// body `conflict_object`, stating `resolves`.
+    fn remove_diverged(
+        conflict_object: Option<PimdirHash>,
+        resolves: Option<Vec<PimdirHash>>,
+    ) -> PimdirCoroutineState<PimdirYield, Result<PimdirMutateReport, PimdirMutateError>> {
         let mut loaded = loaded("1");
         loaded.placements[0].status = PimdirStatus::Conflict;
         loaded.placements[0].conflict_revision = Some("r2".into());
@@ -1973,39 +2099,216 @@ mod tests {
             object: Some(PimdirHash::from("h1")),
         });
 
-        let mutation = PimdirMutation::Remove(PimdirHandle::from("1"));
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves,
+        };
         let mut mutate = PimdirMutate::new("inbox", mutation);
         let _ = mutate.resume(None);
-        let ops = match mutate.resume(Some(PimdirArg::Load(loaded))) {
+        mutate.resume(Some(PimdirArg::Load(loaded)))
+    }
+
+    /// A remove naming the diverging body it meets is the decision: the
+    /// conflict clears and the base adopts its revision and body together
+    /// (SYNC §7, vectors/sync/32).
+    #[test]
+    fn a_remove_naming_the_conflict_adopts_the_diverging_body() {
+        let remote = PimdirHash::from("remote");
+        let ops = match remove_diverged(Some(remote.clone()), Some(vec![remote.clone()])) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
             state => panic!("expected WantsWrite, got {state:?}"),
         };
-
-        let PimdirWriteOp::UpsertPlacement(p) = &ops[0] else {
-            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        let [PimdirWriteOp::UpsertPlacement(p)] = &ops[..] else {
+            panic!("one upsert, no settle for a binding's conflict: {ops:?}");
         };
         assert_eq!(p.status, PimdirStatus::Tombstone);
         assert_eq!(p.conflict_revision, None, "the divergence is settled");
         assert_eq!(p.conflict_object, None);
-        p.clone()
+        let base = p.base.as_ref().expect("a base");
+        assert_eq!(base.revision.as_deref(), Some("r2"));
+        assert_eq!(base.object, Some(remote));
     }
 
-    /// A remove settling a divergence adopts its fetched body as the base.
+    /// A remove settles a conflict only as a resolution (SYNC §7): one
+    /// stating none over a conflict (vectors/sync/143), one naming a body
+    /// nobody has read (144), so no base ever pairs the observed revision
+    /// with the old body, and one naming another body are refused, staging
+    /// nothing. Before draft-10's second batch each tombstoned the
+    /// placement and adopted the conflict's revision.
     #[test]
-    fn a_remove_adopts_the_fetched_diverging_body() {
-        let p = remove_diverged(Some(PimdirHash::from("remote")));
-        let base = p.base.expect("a base");
-        assert_eq!(base.revision.as_deref(), Some("r2"));
-        assert_eq!(base.object, Some(PimdirHash::from("remote")));
+    fn a_remove_settles_only_the_conflict_it_names() {
+        let remote = PimdirHash::from("remote");
+        let refused = [
+            (Some(remote.clone()), None),
+            (None, None),
+            (None, Some(vec![remote.clone()])),
+            (Some(remote.clone()), Some(vec![PimdirHash::from("other")])),
+        ];
+        for (conflict_object, resolves) in refused {
+            match remove_diverged(conflict_object.clone(), resolves.clone()) {
+                PimdirCoroutineState::Complete(Err(err)) => {
+                    assert_eq!(err.code(), "conflict-unresolved");
+                    let PimdirMutateError::Unresolved { met, .. } = err else {
+                        panic!("expected Unresolved, got {err:?}");
+                    };
+                    assert_eq!(met, vec![conflict_object]);
+                }
+                state => panic!("{resolves:?}: expected a refusal, got {state:?}"),
+            }
+        }
     }
 
-    /// An unfetched diverging body leaves the base's unknown, never the old.
+    /// A remove stating a resolution and meeting no conflict is refused,
+    /// the conflict it was decided over being settled already.
     #[test]
-    fn a_remove_never_pairs_the_old_body_with_the_new_revision() {
-        let p = remove_diverged(None);
-        let base = p.base.expect("a base");
-        assert_eq!(base.revision.as_deref(), Some("r2"));
-        assert_eq!(base.object, None, "h1 is not what the remote holds at r2");
+    fn a_remove_resolving_no_conflict_is_refused() {
+        let mutation = PimdirMutation::Remove {
+            handle: PimdirHandle::from("1"),
+            if_match: None,
+            resolves: Some(vec![PimdirHash::from("remote")]),
+        };
+        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+        match mutate.resume(Some(PimdirArg::Load(loaded("1")))) {
+            PimdirCoroutineState::Complete(Err(PimdirMutateError::Unresolved { met, .. })) => {
+                assert!(met.is_empty());
+            }
+            state => panic!("expected a refusal, got {state:?}"),
+        }
+    }
+
+    /// A remove resolving its item's conflict states the settle before its
+    /// tombstone, which settles nothing by itself (SYNC §7, STORAGE §14,
+    /// vectors/sync/146); one stating no resolution is refused.
+    #[test]
+    fn a_remove_naming_the_item_conflict_states_the_settle() {
+        let theirs = PimdirHash::from("theirs");
+        let remove = |resolves: Option<Vec<PimdirHash>>| {
+            let mutation = PimdirMutation::Remove {
+                handle: PimdirHandle::from("1"),
+                if_match: None,
+                resolves,
+            };
+            let mut mutate = PimdirMutate::new("inbox", mutation);
+            let _ = mutate.resume(None);
+            let loaded = item_conflicted(PimdirStatus::Conflict, Some("theirs"));
+            mutate.resume(Some(PimdirArg::Load(loaded)))
+        };
+
+        let ops = match remove(Some(vec![theirs])) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let [
+            PimdirWriteOp::Settle { handle, .. },
+            PimdirWriteOp::UpsertPlacement(p),
+        ] = &ops[..]
+        else {
+            panic!("a settle, then the tombstone: {ops:?}");
+        };
+        assert_eq!(handle, &PimdirHandle::from("1"));
+        assert_eq!(p.status, PimdirStatus::Tombstone);
+
+        assert!(matches!(
+            remove(None),
+            PimdirCoroutineState::Complete(Err(PimdirMutateError::Unresolved { .. }))
+        ));
+    }
+
+    /// A remove stating the body it deletes is refused once the placement
+    /// holds another (SYNC §7, vectors/sync/145), and staged over the one
+    /// it names.
+    #[test]
+    fn a_guarded_remove_refuses_a_replaced_body() {
+        let remove = |read: &str| {
+            let mutation = PimdirMutation::Remove {
+                handle: PimdirHandle::from("1"),
+                if_match: Some(PimdirHash::from(read)),
+                resolves: None,
+            };
+            let mut mutate = PimdirMutate::new("inbox", mutation);
+            let _ = mutate.resume(None);
+            let mut loaded = loaded("1");
+            loaded.placements[0].object = Some(PimdirHash::from("held"));
+            mutate.resume(Some(PimdirArg::Load(loaded)))
+        };
+
+        match remove("read") {
+            PimdirCoroutineState::Complete(Err(err)) => {
+                assert_eq!(err.code(), "body-replaced");
+                let PimdirMutateError::Replaced { read, held, .. } = err else {
+                    panic!("expected Replaced, got {err:?}");
+                };
+                assert_eq!(read, PimdirHash::from("read"));
+                assert_eq!(held, Some(PimdirHash::from("held")));
+            }
+            state => panic!("expected a refusal, got {state:?}"),
+        }
+        assert!(matches!(
+            remove("held"),
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(_))
+        ));
+    }
+
+    /// A flag change stating the set its producer read is applied as a
+    /// change to the set the placement holds (SYNC §7, vectors/sync/141):
+    /// a flag landed since survives, the one the producer removed goes.
+    /// Replacing the set, as before draft-10's second batch, erased the
+    /// flag landed since.
+    #[test]
+    fn a_flag_change_stating_its_base_keeps_what_landed_since() {
+        let mutation = PimdirMutation::SetFlags {
+            handle: PimdirHandle::from("1"),
+            flags: PimdirFlags::from_iter(["answered", "seen"]),
+            base: Some(PimdirFlags::from_iter(["todo", "seen"])),
+        };
+        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let _ = mutate.resume(None);
+        let mut loaded = loaded("1");
+        loaded.placements[0].flags = PimdirFlags::from_iter(["todo", "flagged", "seen"]);
+
+        let ops = match mutate.resume(Some(PimdirArg::Load(loaded))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let PimdirWriteOp::UpsertPlacement(p) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            p.flags,
+            PimdirFlags::from_iter(["answered", "flagged", "seen"])
+        );
+        assert_eq!(p.status, PimdirStatus::Dirty);
+    }
+
+    /// A flag change stating its base is refused over an unknown set
+    /// (SYNC §7, vectors/sync/142), where one stating none replaces it.
+    #[test]
+    fn a_flag_change_stating_its_base_is_refused_over_an_unknown_set() {
+        let change = |base: Option<PimdirFlags>| {
+            let mutation = PimdirMutation::SetFlags {
+                handle: PimdirHandle::from("1"),
+                flags: PimdirFlags::from_iter(["seen"]),
+                base,
+            };
+            let mut mutate = PimdirMutate::new("inbox", mutation);
+            let _ = mutate.resume(None);
+            let mut loaded = loaded("1");
+            loaded.placements[0].flags = PimdirFlags::Unknown;
+            mutate.resume(Some(PimdirArg::Load(loaded)))
+        };
+
+        match change(Some(PimdirFlags::default())) {
+            PimdirCoroutineState::Complete(Err(err)) => {
+                assert_eq!(err.code(), "flags-unknown");
+            }
+            state => panic!("expected a refusal, got {state:?}"),
+        }
+        assert!(matches!(
+            change(None),
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(_))
+        ));
     }
 
     /// A failure names its cause, a contract break riding as the source.

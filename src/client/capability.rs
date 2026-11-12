@@ -21,7 +21,7 @@ use crate::{
         PimdirSourceCapabilities, PimdirSupport,
     },
     client::{PimdirError, PreparedCached, blobs::PimdirBlobs, rows, write},
-    codec::{self, PimdirAction, PimdirActionError},
+    codec::{self, PimdirAction, PimdirActionError, PimdirPayloadOutcome},
     intent::{self, PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename},
     object::PimdirHash,
     placement::PimdirFlags,
@@ -191,6 +191,8 @@ pub(crate) fn gate(
     {
         let remove = PimdirAction::Remove {
             seq: superseded.seq,
+            if_match: None,
+            resolves: None,
         };
         partials.extend(gate(conn, blobs, &superseded.collection.0, &remove, None)?);
     }
@@ -210,7 +212,7 @@ pub(crate) fn gate(
         _ => None,
     };
     let current = match action {
-        PimdirAction::Update { seq, .. } | PimdirAction::Remove { seq } => {
+        PimdirAction::Update { seq, .. } | PimdirAction::Remove { seq, .. } => {
             match item_object(conn, collection, *seq)? {
                 Some(hash) => blobs.get(&hash)?,
                 None => None,
@@ -224,7 +226,7 @@ pub(crate) fn gate(
     }
 
     let sources = match action {
-        PimdirAction::Update { seq, .. } | PimdirAction::Remove { seq } => {
+        PimdirAction::Update { seq, .. } | PimdirAction::Remove { seq, .. } => {
             at_item(conn, collection, *seq)?
         }
         _ => at_collection(conn, collection)?,
@@ -296,6 +298,11 @@ fn gate_by_kind(
     match action {
         PimdirAction::SetPerformer { .. } => Ok(Vec::new()),
         PimdirAction::Unknown { kind, payload, .. } => {
+            // NOTE: a payload unknown to this crate is read no further,
+            // an intent at a later version included (§15.3).
+            if codec::payload_outcome(kind, payload) == PimdirPayloadOutcome::Unknown {
+                return Ok(Vec::new());
+            }
             let Some(capability) = capability::intent_capability(kind) else {
                 return Ok(Vec::new());
             };
@@ -371,7 +378,7 @@ fn gate_by_kind(
             )?)
         }
         PimdirAction::SetFlags { seq, .. }
-        | PimdirAction::Remove { seq }
+        | PimdirAction::Remove { seq, .. }
         | PimdirAction::Move { seq, .. }
         | PimdirAction::Copy { seq, .. }
         | PimdirAction::Update { seq, .. } => {

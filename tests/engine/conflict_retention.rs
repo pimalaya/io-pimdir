@@ -151,7 +151,14 @@ fn a_conflicted_item_the_remote_deletes_never_reaches_the_retained_row_path() {
 fn a_retained_conflict_keeps_the_local_body_and_is_never_settled_by_a_later_sync() {
     let mut client = conflicted_client();
     client
-        .mutate("inbox", PimdirMutation::Remove(PimdirHandle::from("m1")))
+        .mutate(
+            "inbox",
+            PimdirMutation::Remove {
+                handle: PimdirHandle::from("m1"),
+                if_match: None,
+                resolves: Some(vec![hash(REMOTE)]),
+            },
+        )
         .unwrap();
     client.remote_mut().remove("inbox", "m1");
 
@@ -190,7 +197,14 @@ fn a_retained_conflict_keeps_the_local_body_and_is_never_settled_by_a_later_sync
 fn an_item_coming_back_revives_the_retained_one() {
     let mut client = conflicted_client();
     client
-        .mutate("inbox", PimdirMutation::Remove(PimdirHandle::from("m1")))
+        .mutate(
+            "inbox",
+            PimdirMutation::Remove {
+                handle: PimdirHandle::from("m1"),
+                if_match: None,
+                resolves: Some(vec![hash(REMOTE)]),
+            },
+        )
         .unwrap();
     client.remote_mut().remove("inbox", "m1");
     client.sync("inbox", PimdirSyncOptions::default()).unwrap();

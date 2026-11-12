@@ -79,8 +79,17 @@ fn a_source_less_handle_reads_purges_and_cancels() {
 
     let id = PimdirProducer::open(dir.path(), "test")
         .unwrap()
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
-        .unwrap();
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
+        .unwrap()
+        .id;
 
     let mut store = PimdirStore::open(dir.path()).unwrap();
     assert_eq!(store.list_collections().unwrap().len(), 1);

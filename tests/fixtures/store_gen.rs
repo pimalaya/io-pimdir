@@ -132,7 +132,7 @@ fn generate() {
                 "INBOX",
                 &PimdirAction::SetFlags {
                     seq: 9999,
-                    flags: PimdirFlags::from_iter(["\\Flagged"]),
+                    flags: PimdirFlags::from_iter(["\\Flagged"]), base: None,
                 },
                 None,
             )
@@ -143,7 +143,7 @@ fn generate() {
                 "INBOX",
                 &PimdirAction::SetFlags {
                     seq: seq_a,
-                    flags: PimdirFlags::from_iter(["\\Seen", "\\Answered"]),
+                    flags: PimdirFlags::from_iter(["\\Seen", "\\Answered"]), base: None,
                 },
                 None,
             )
@@ -171,7 +171,7 @@ fn generate() {
                 "INBOX",
                 &PimdirAction::SetFlags {
                     seq: seq_a,
-                    flags: PimdirFlags::from_iter(["\\Flagged"]),
+                    flags: PimdirFlags::from_iter(["\\Flagged"]), base: None,
                 },
                 None,
             )

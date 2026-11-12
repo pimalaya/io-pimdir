@@ -5,7 +5,7 @@
 //! §15.3): the part an implementation holding its own SQLite binding
 //! reuses.
 
-use core::fmt;
+use core::{fmt, str::FromStr};
 
 use alloc::{
     collections::BTreeSet,
@@ -122,6 +122,101 @@ pub struct PimdirSupersedes {
     pub seq: i64,
 }
 
+/// The identity of a store (STORAGE §4.5, §8): its id, drawn at its
+/// creation, and its incarnation, raised when a copy of it is restored.
+/// Another of either than the one recorded is a reset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirStoreIdentity {
+    /// The store's id, 32 lowercase hex digits.
+    pub store_id: String,
+    /// The store's incarnation, compared for equality alone.
+    pub incarnation: i64,
+}
+
+/// The handle of a queue row (STORAGE §4.5, §15.4): the id its enqueue
+/// answered, under the identity of the store that drew it, which a
+/// producer records with the id and checks when it follows or cancels
+/// the row, since a restored copy may hand the id to another row.
+///
+/// It prints as the store id, the incarnation and the id joined by
+/// periods (`e2646df031cd876334410c4df14ebd86.1.42`) and parses back. A
+/// bare id (`42`, or an `i64`) is a handle stating no store: it is
+/// followed unchecked, as before the identity was recorded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirActionHandle {
+    /// The row's id in the queue.
+    pub id: i64,
+    /// The store the id was drawn in, `None` for a bare id.
+    pub store: Option<PimdirStoreIdentity>,
+}
+
+impl PimdirActionHandle {
+    /// Whether the handle may name a row of the store `identity` (§4.5):
+    /// a bare id always, else only under the store id and the
+    /// incarnation it was answered in. `false` is a reset: the id may
+    /// name another row, or none, of a restored copy.
+    pub fn names(&self, identity: &PimdirStoreIdentity) -> bool {
+        self.store.as_ref().is_none_or(|store| store == identity)
+    }
+}
+
+impl From<i64> for PimdirActionHandle {
+    fn from(id: i64) -> Self {
+        Self { id, store: None }
+    }
+}
+
+impl From<&PimdirActionHandle> for PimdirActionHandle {
+    fn from(handle: &PimdirActionHandle) -> Self {
+        handle.clone()
+    }
+}
+
+impl fmt::Display for PimdirActionHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.store {
+            Some(store) => write!(f, "{}.{}.{}", store.store_id, store.incarnation, self.id),
+            None => write!(f, "{}", self.id),
+        }
+    }
+}
+
+/// A string that is no queue row handle: neither an id nor a store id,
+/// an incarnation and an id joined by periods.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PimdirActionHandleError;
+
+impl fmt::Display for PimdirActionHandleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Pimdir action handle is neither an id nor a store id, an incarnation and an id joined by periods"
+        )
+    }
+}
+
+impl core::error::Error for PimdirActionHandleError {}
+
+impl FromStr for PimdirActionHandle {
+    type Err = PimdirActionHandleError;
+
+    fn from_str(handle: &str) -> Result<Self, Self::Err> {
+        let id = |id: &str| id.parse::<i64>().map_err(|_| PimdirActionHandleError);
+        let parts: Vec<&str> = handle.split('.').collect();
+        match parts[..] {
+            [bare] => Ok(Self::from(id(bare)?)),
+            [store_id, incarnation, row] if !store_id.is_empty() => Ok(Self {
+                id: id(row)?,
+                store: Some(PimdirStoreIdentity {
+                    store_id: store_id.to_string(),
+                    incarnation: id(incarnation)?,
+                }),
+            }),
+            _ => Err(PimdirActionHandleError),
+        }
+    }
+}
+
 /// A queued mutation request (STORAGE §15.3).
 ///
 /// What a producer appends and the owner applies, existing items
@@ -144,17 +239,34 @@ pub enum PimdirAction {
         /// one transaction, its delete held until this add is pushed.
         supersedes: Option<PimdirSupersedes>,
     },
-    /// Replace the item's flag set, absolutely.
+    /// Set the item's flags: replaced by `flags`, or, stating `base`,
+    /// changed by what `flags` adds to and removes from it (§15.3).
     SetFlags {
         /// The item's public id.
         seq: i64,
         /// The new flag set.
         flags: PimdirFlags,
+        /// The set the producer read and changed into `flags` (§15.3):
+        /// the owner applies the change alone to the set the item holds
+        /// then, so a flag a sync landed or removed since survives, and
+        /// parks the row over an unknown set. `None` replaces the set,
+        /// for a producer writing one it never read.
+        base: Option<PimdirFlags>,
     },
     /// Remove the item from the collection; already absent is success.
     Remove {
         /// The item's public id.
         seq: i64,
+        /// The body the producer read and deletes (§15.3): the owner
+        /// parks the row when the item holds another; `None` removes
+        /// whatever it holds.
+        if_match: Option<PimdirHash>,
+        /// The diverging bodies a person's resolution by deleting was
+        /// decided over (§15.3), as an `update`'s: the remove settles
+        /// the conflicts it meets only when it names each, and parks
+        /// when it meets none. `None` for an ordinary remove, which
+        /// parks over any conflict.
+        resolves: Option<Vec<PimdirHash>>,
     },
     /// Refile the item into another collection.
     Move {
@@ -358,12 +470,26 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
                 );
             }
         }
-        PimdirAction::SetFlags { seq, flags } => {
+        PimdirAction::SetFlags { seq, flags, base } => {
             map.insert("seq".into(), json!(seq));
             map.insert("flags".into(), flags_to_value(flags));
+            if let Some(base) = base {
+                map.insert("base".into(), flags_to_value(base));
+            }
         }
-        PimdirAction::Remove { seq } => {
+        PimdirAction::Remove {
+            seq,
+            if_match,
+            resolves,
+        } => {
             map.insert("seq".into(), json!(seq));
+            if let Some(if_match) = if_match {
+                map.insert("if_match".into(), json!(if_match.0));
+            }
+            if let Some(resolves) = resolves {
+                let names: Vec<&str> = resolves.iter().map(PimdirHash::as_str).collect();
+                map.insert("resolves".into(), json!(names));
+            }
         }
         PimdirAction::Move { seq, to } | PimdirAction::Copy { seq, to } => {
             map.insert("seq".into(), json!(seq));
@@ -397,17 +523,89 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
     Value::Object(map).to_string()
 }
 
+/// The actions this crate holds a schema for at `v: 1` (STORAGE §15.3,
+/// Annex B.2): the store's own and the intents.
+const KNOWN_ACTIONS: [&str; 13] = [
+    "add",
+    "set-flags",
+    "remove",
+    "move",
+    "copy",
+    "update",
+    "set-performer",
+    intent::SUBMIT,
+    intent::CALENDAR_REPLY,
+    intent::CALENDAR_CANCEL,
+    intent::COLLECTION_CREATE,
+    intent::COLLECTION_RENAME,
+    intent::COLLECTION_DELETE,
+];
+
+/// What a payload is to this crate (STORAGE §15.3): one of three, which
+/// an owner applies, parks or leaves untouched, and a reader folds or
+/// lists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PimdirPayloadOutcome {
+    /// Its action and `v` name a schema, which accepts it.
+    Valid,
+    /// Its action and `v` name a schema, which refuses it: never enqueued
+    /// by a producer, parked by an owner.
+    Malformed,
+    /// Its action, or its `v` for an action this crate knows, names no
+    /// schema here, an application's own action included: read no
+    /// further, left pending and untouched by an owner, listed by a
+    /// reader, never parked.
+    Unknown,
+}
+
+/// Judges a kind and its payload (STORAGE §15.3): unknown when the kind is
+/// not one this crate holds a schema for or the payload states another
+/// `v` than 1, none included, whatever its other members hold; else valid
+/// or malformed as [`action_from_payload`] reads it.
+pub fn payload_outcome(kind: &str, payload: &str) -> PimdirPayloadOutcome {
+    match unknown(kind, payload) {
+        Ok(true) => PimdirPayloadOutcome::Unknown,
+        Ok(false) if action_from_payload(kind, payload).is_ok() => PimdirPayloadOutcome::Valid,
+        _ => PimdirPayloadOutcome::Malformed,
+    }
+}
+
+/// Whether a payload is unknown to this crate (STORAGE §15.3): its kind
+/// names no schema here, or its `v` is not 1. A payload of a known kind
+/// that is no JSON object is malformed, there being no `v` to read.
+fn unknown(kind: &str, payload: &str) -> Result<bool, PimdirActionError> {
+    if !KNOWN_ACTIONS.contains(&kind) {
+        return Ok(true);
+    }
+    let value: Value = serde_json::from_str(payload).map_err(|_| PimdirActionError::Json)?;
+    let Value::Object(map) = value else {
+        return Err(PimdirActionError::Json);
+    };
+
+    Ok(map.get("v").and_then(Value::as_i64) != Some(1))
+}
+
 /// Decodes a kind and its payload strictly, as payloads/ types it at
 /// `v: 1` (STORAGE §15.3): a member missing, of another type, breaking its
 /// rule or one the version does not define is an error the owner parks
-/// with and a producer refuses at the enqueue, a version it does not know
-/// one it skips.
+/// with and a producer refuses at the enqueue.
 ///
-/// An intent of Annex B.2 is read whole by its type in [`crate::intent`]
-/// and kept as [`PimdirAction::Unknown`], as is an application's own kind,
-/// read as a JSON object alone. Neither names its body here: that is the
-/// row's `queue.object_hash`, which the queue reads fill in.
+/// A payload unknown to this crate ([`payload_outcome`]), a kind it holds
+/// no schema for or a known one at another `v`, is no error: it is read
+/// no further and kept verbatim as [`PimdirAction::Unknown`], which an
+/// owner skips and a reader lists. An intent of Annex B.2 is read whole
+/// by its type in [`crate::intent`] and kept as [`PimdirAction::Unknown`]
+/// too. Neither names its body here: that is the row's
+/// `queue.object_hash`, which the queue reads fill in.
 pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, PimdirActionError> {
+    if unknown(kind, payload)? {
+        return Ok(PimdirAction::Unknown {
+            kind: kind.to_string(),
+            payload: payload.to_string(),
+            object_hash: None,
+        });
+    }
+
     let action = match kind {
         "add" => {
             let map = members(payload, &["link_id", "flags", "object", "supersedes"])?;
@@ -419,16 +617,19 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
             }
         }
         "set-flags" => {
-            let map = members(payload, &["seq", "flags"])?;
+            let map = members(payload, &["seq", "flags", "base"])?;
             PimdirAction::SetFlags {
                 seq: required(seq(map.get("seq"), "seq")?, "seq")?,
                 flags: required(flags(map.get("flags"), "flags")?, "flags")?,
+                base: flags(map.get("base"), "base")?,
             }
         }
         "remove" => {
-            let map = members(payload, &["seq"])?;
+            let map = members(payload, &["seq", "if_match", "resolves"])?;
             PimdirAction::Remove {
                 seq: required(seq(map.get("seq"), "seq")?, "seq")?,
+                if_match: hash(map.get("if_match"), "if_match")?,
+                resolves: hashes(map.get("resolves"), "resolves")?,
             }
         }
         "move" | "copy" => {
@@ -478,11 +679,8 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
                 intent::COLLECTION_RENAME => {
                     PimdirCollectionRename::from_payload(payload)?;
                 }
-                intent::COLLECTION_DELETE => {
-                    PimdirCollectionDelete::from_payload(payload)?;
-                }
                 _ => {
-                    members_any(payload)?;
+                    PimdirCollectionDelete::from_payload(payload)?;
                 }
             }
             PimdirAction::Unknown {
@@ -746,10 +944,21 @@ mod tests {
         added.retarget(to.clone());
         assert_eq!(added.target_collection(), Some(&to));
 
-        let mut removed = PimdirAction::Remove { seq: 3 };
+        let mut removed = PimdirAction::Remove {
+            seq: 3,
+            if_match: None,
+            resolves: None,
+        };
         removed.retarget(to);
         assert_eq!(removed.target_collection(), None);
-        assert_eq!(removed, PimdirAction::Remove { seq: 3 });
+        assert_eq!(
+            removed,
+            PimdirAction::Remove {
+                seq: 3,
+                if_match: None,
+                resolves: None
+            }
+        );
     }
 
     #[test]
@@ -832,8 +1041,13 @@ mod tests {
             PimdirAction::SetFlags {
                 seq: 4,
                 flags: PimdirFlags::from_iter(["\\Seen", "$flagged"]),
+                base: None,
             },
-            PimdirAction::Remove { seq: 5 },
+            PimdirAction::Remove {
+                seq: 5,
+                if_match: None,
+                resolves: None,
+            },
             PimdirAction::Move {
                 seq: 6,
                 to: PimdirCollectionId("Archive".into()),
@@ -892,6 +1106,7 @@ mod tests {
         let unread = PimdirAction::SetFlags {
             seq: 1,
             flags: PimdirFlags::Unknown,
+            base: None,
         };
         assert!(matches!(
             refused(unread),
@@ -907,16 +1122,6 @@ mod tests {
         let cases = [
             ("remove", "not json".into(), PimdirActionError::Json),
             ("remove", "[1]".into(), PimdirActionError::Json),
-            (
-                "remove",
-                r#"{"seq":1}"#.into(),
-                PimdirActionError::UnknownVersion(None),
-            ),
-            (
-                "remove",
-                r#"{"v":2,"seq":1}"#.into(),
-                PimdirActionError::UnknownVersion(Some(2)),
-            ),
             (
                 "remove",
                 r#"{"v":1}"#.into(),
@@ -976,9 +1181,19 @@ mod tests {
                 invalid("source"),
             ),
             (
-                "x-fax-send",
-                r#"{"to":"+33"}"#.into(),
-                PimdirActionError::UnknownVersion(None),
+                "set-flags",
+                r#"{"v":1,"seq":1,"flags":[],"base":null}"#.into(),
+                invalid("base"),
+            ),
+            (
+                "remove",
+                r#"{"v":1,"seq":1,"resolves":[]}"#.into(),
+                invalid("resolves"),
+            ),
+            (
+                "remove",
+                r#"{"v":1,"seq":1,"if_match":"../x"}"#.into(),
+                invalid("if_match"),
             ),
         ];
         for (kind, payload, expected) in cases {
@@ -991,6 +1206,53 @@ mod tests {
                 _ => assert_eq!(err, expected, "{kind} {payload}"),
             }
         }
+    }
+
+    /// A payload whose action, or whose `v` for a known action, names no
+    /// schema here is unknown (STORAGE §15.3): kept verbatim and read no
+    /// further, whatever its other members hold, never an error an owner
+    /// would park with. Before draft-10's second batch a known action
+    /// stating no `v` was refused as malformed, and one at `v` 2 was an
+    /// error the callers had to tell apart.
+    #[test]
+    fn a_payload_this_crate_does_not_know_is_kept_never_refused() {
+        let cases = [
+            ("remove", r#"{"seq":1}"#),
+            ("remove", r#"{"v":2,"seq":1}"#),
+            ("remove", r#"{"v":"1","seq":1}"#),
+            ("set-flags", r#"{"v":2,"seq":"5"}"#),
+            ("submit", r#"{"v":2}"#),
+            ("snooze", r#"{"v":1,"seq":5}"#),
+            ("x-fax-send", r#"{"to":"+33"}"#),
+            ("x-fax-send", "not json"),
+        ];
+        for (kind, payload) in cases {
+            assert_eq!(
+                payload_outcome(kind, payload),
+                PimdirPayloadOutcome::Unknown,
+                "{kind} {payload}"
+            );
+            let kept = PimdirAction::Unknown {
+                kind: kind.into(),
+                payload: payload.into(),
+                object_hash: None,
+            };
+            assert_eq!(action_from_payload(kind, payload), Ok(kept));
+        }
+
+        assert_eq!(
+            payload_outcome("remove", r#"{"v":1,"seq":1}"#),
+            PimdirPayloadOutcome::Valid
+        );
+        assert_eq!(
+            payload_outcome("remove", r#"{"v":1,"seq":0}"#),
+            PimdirPayloadOutcome::Malformed
+        );
+        assert_eq!(
+            payload_outcome("remove", "not json"),
+            PimdirPayloadOutcome::Malformed,
+            "a known action whose payload states no v to read"
+        );
     }
 
     #[test]

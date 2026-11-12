@@ -38,7 +38,7 @@ use crate::{
         reader::{PimdirReader, reference_from_row},
         write::kind_of,
     },
-    codec::{self, PimdirAction, PimdirActionError},
+    codec::{self, PimdirAction, PimdirActionError, PimdirActionHandle},
     hash,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
     object::{PimdirHash, PimdirObject},
@@ -1264,13 +1264,16 @@ impl PimdirStore {
     /// Opened through [`open_current`](Self::open_current): a consumer
     /// owning the store for one write never creates it, and a store this
     /// crate does not open is refused and left as it was.
-    pub fn cancel_action(dir: impl AsRef<Path>, id: i64) -> Result<bool, PimdirError> {
+    pub fn cancel_action(
+        dir: impl AsRef<Path>,
+        action: impl Into<PimdirActionHandle>,
+    ) -> Result<bool, PimdirError> {
         let dir = dir.as_ref();
         if !dir.join("pimdir.db").is_file() {
             return Err(PimdirError::Uncreated);
         }
 
-        Self::open_current(dir)?.drop_action(id)
+        Self::open_current(dir)?.drop_action(action)
     }
 
     /// Removes one queue row by request, pending or parked, releasing its
@@ -1278,11 +1281,31 @@ impl PimdirStore {
     /// records no receipt, so a producer reads the row as withdrawn
     /// (§15.4): an intent its owner performed is
     /// [`acknowledge_action`](Self::acknowledge_action)'s.
-    pub fn drop_action(&mut self, id: i64) -> Result<bool, PimdirError> {
+    ///
+    /// The row is named by the handle its enqueue answered, or by a bare
+    /// id. A handle answered by another store, or another incarnation of
+    /// this one, is refused as [`PimdirError::Reset`], removing nothing:
+    /// a restored copy may hand the id to another row (§4.5). A bare id
+    /// is taken unchecked.
+    pub fn drop_action(
+        &mut self,
+        action: impl Into<PimdirActionHandle>,
+    ) -> Result<bool, PimdirError> {
+        let action = action.into();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
+
+        let store = producer::store_identity(&tx)?;
+        if !action.names(&store) {
+            return Err(PimdirError::Reset {
+                action,
+                store_id: store.store_id,
+                incarnation: store.incarnation,
+            });
+        }
+        let id = action.id;
 
         let Some(hash) = cancel_queued(&tx, id)? else {
             return Ok(false);
@@ -1345,10 +1368,7 @@ impl PimdirStore {
             return Ok(false);
         };
         let payload = codec::action_to_payload(action);
-        match codec::action_from_payload(action.kind(), &payload) {
-            Ok(_) | Err(PimdirActionError::UnknownVersion(Some(_))) => {}
-            Err(err) => return Err(err.into()),
-        }
+        codec::action_from_payload(action.kind(), &payload)?;
         let hash = action.object_hash().cloned();
         if let Some(hash) = &hash {
             tx.execute_cached(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
@@ -1986,6 +2006,17 @@ pub enum PimdirError {
     /// (§8.1) is not an IANA zone.
     #[cfg(feature = "search")]
     IndexZone(String),
+    /// A queue row was named by a handle another store answered, or
+    /// another incarnation of this one (§4.5, §15.4): a restored copy,
+    /// where the id may name another row, so nothing was done with it.
+    Reset {
+        /// The handle given.
+        action: PimdirActionHandle,
+        /// The id of the store as it stands.
+        store_id: String,
+        /// Its incarnation.
+        incarnation: i64,
+    },
     /// A refresh was asked of an index opened for queries alone (SEARCH
     /// §3).
     #[cfg(feature = "search")]
@@ -2045,6 +2076,7 @@ impl PimdirError {
     /// | `index-outdated` | `IndexOutdated` (feature `search`) |
     /// | `index-version` | `IndexVersion` (feature `search`) |
     /// | `index-zone-unknown` | `IndexZone` (feature `search`) |
+    /// | `store-reset` | `Reset` |
     /// | `index-query-only` | `IndexQueryOnly` (feature `search`) |
     /// | `index-refresh-broken` | `Refresh` (feature `search`) |
     pub fn code(&self) -> &'static str {
@@ -2100,6 +2132,7 @@ impl PimdirError {
             Self::IndexVersion { .. } => "index-version",
             #[cfg(feature = "search")]
             Self::IndexZone(_) => "index-zone-unknown",
+            Self::Reset { .. } => "store-reset",
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(_) => "index-query-only",
             #[cfg(feature = "search")]
@@ -2318,6 +2351,14 @@ impl fmt::Display for PimdirError {
             Self::IndexZone(zone) => write!(
                 f,
                 "Pimdir search cannot read times in {zone}: name a zone of the IANA time zone database"
+            ),
+            Self::Reset {
+                action,
+                store_id,
+                incarnation,
+            } => write!(
+                f,
+                "Pimdir store is not the one action {action} was queued in: it is {store_id} at incarnation {incarnation}, a restored copy"
             ),
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(index) => write!(

@@ -12,7 +12,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use io_pimdir::{
     client::producer::PimdirActionStatus,
-    codec::{PimdirAction, action_to_payload},
+    codec::{PimdirAction, PimdirActionHandle, action_to_payload},
 };
 use log::warn;
 use pimalaya_cli::{
@@ -123,7 +123,8 @@ impl QueueListCommand {
     }
 }
 
-/// Drop one queued action, by the id `queue list` prints.
+/// Drop one queued action, by the id `queue list` prints or the handle
+/// its enqueue answered.
 ///
 /// Only the owner pops rows, so an action a producer enqueued cannot be taken
 /// back any other way: this is the undo. It works on a pending action and on a
@@ -131,9 +132,11 @@ impl QueueListCommand {
 /// first unless `--yes` is passed.
 #[derive(Debug, Args)]
 pub struct QueueCancelCommand {
-    /// Id of the queued action to drop.
-    #[arg(value_name = "ID")]
-    pub id: i64,
+    /// Id of the queued action to drop, or its handle (the store id, the
+    /// incarnation and the id joined by periods): a handle is refused when
+    /// the store is no longer the one that answered it.
+    #[arg(value_name = "ACTION")]
+    pub action: PimdirActionHandle,
 
     /// Do not ask for confirmation.
     #[arg(long, short = 'y')]
@@ -146,40 +149,43 @@ impl QueueCancelCommand {
         confirm(
             printer,
             self.yes,
-            &format!("Drop queued action {} for good?", self.id),
+            &format!("Drop queued action {} for good?", self.action),
         )?;
 
-        let dropped = store.owner()?.drop_action(self.id).map_err(report)?;
+        let id = self.action.id;
+        let dropped = store.owner()?.drop_action(self.action).map_err(report)?;
 
         if !dropped {
-            return Err(
-                ErrorCode::RowNotFound.error(format!("no queued action with id {}", self.id))
-            );
+            return Err(ErrorCode::RowNotFound.error(format!("no queued action with id {id}")));
         }
 
-        printer.out(QueueCancelOutput { row: self.id })
+        printer.out(QueueCancelOutput { row: id })
     }
 }
 
-/// Show where one action stands, by the id its enqueue answered.
+/// Show where one action stands, by the handle or the id its enqueue
+/// answered.
 ///
 /// Pending or parked while its row is queued; once the owner applied it,
 /// or performed and acknowledged an intent, its receipt says so and, for
 /// an add, names the seq of the item it created. A receipt is kept a week
-/// at least; an id found nowhere was cancelled, or applied before that.
+/// at least; an id found nowhere was cancelled, or applied before that. A
+/// handle the store did not answer, a copy restored since, reads `reset`.
 #[derive(Debug, Args)]
 pub struct QueueStatusCommand {
-    /// Id of the action, as the enqueue answered or `queue list` prints it.
-    #[arg(value_name = "ID")]
-    pub id: i64,
+    /// Id of the action, as `queue list` prints it, or its handle as the
+    /// enqueue answered it (the store id, the incarnation and the id
+    /// joined by periods).
+    #[arg(value_name = "ACTION")]
+    pub action: PimdirActionHandle,
 }
 
 impl QueueStatusCommand {
     /// Prints the action's status.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
-        let status = store.read()?.action_status(self.id).map_err(report)?;
+        let status = store.read()?.action_status(&self.action).map_err(report)?;
         let mut output = QueueStatusOutput {
-            row: self.id,
+            row: self.action.id,
             status: QueueStatus::Unknown,
             collection: None,
             kind: None,
@@ -223,6 +229,7 @@ impl QueueStatusCommand {
                 output.seq = seq;
             }
             PimdirActionStatus::Unknown => (),
+            PimdirActionStatus::Reset => output.status = QueueStatus::Reset,
         }
 
         printer.out(output)
@@ -241,6 +248,9 @@ pub enum QueueStatus {
     Applied,
     /// Found nowhere: cancelled, or applied before its receipt was pruned.
     Unknown,
+    /// The store is not the one that answered the handle: a copy restored
+    /// since, where the id may name another row, so nothing is read of it.
+    Reset,
 }
 
 /// The `queue status` output.
@@ -294,6 +304,10 @@ impl fmt::Display for QueueStatusOutput {
                 f,
                 "Action {id} is neither queued nor applied recently: cancelled, or applied before its receipt was pruned"
             ),
+            QueueStatus::Reset => writeln!(
+                f,
+                "Action {id} was queued in another store or another incarnation of this one: a copy restored since, where this id may name another action"
+            ),
         }
     }
 }
@@ -314,16 +328,36 @@ fn summary(action: &PimdirAction) -> String {
                 None => format!("link {link}"),
             }
         }
-        PimdirAction::SetFlags { seq, flags } => {
-            let flags: Vec<&str> = flags
-                .known()
-                .into_iter()
-                .flatten()
-                .map(String::as_str)
-                .collect();
-            format!("seq {seq} -> [{}]", flags.join(" "))
+        PimdirAction::SetFlags { seq, flags, base } => {
+            let joined = |flags: &io_pimdir::placement::PimdirFlags| {
+                let flags: Vec<&str> = flags
+                    .known()
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect();
+                flags.join(" ")
+            };
+            match base {
+                Some(base) => format!("seq {seq} [{}] -> [{}]", joined(base), joined(flags)),
+                None => format!("seq {seq} -> [{}]", joined(flags)),
+            }
         }
-        PimdirAction::Remove { seq } => format!("seq {seq}"),
+        PimdirAction::Remove {
+            seq,
+            if_match,
+            resolves,
+        } => {
+            let mut summary = format!("seq {seq}");
+            if let Some(read) = if_match {
+                summary.push_str(&format!(", if-match {}", read.0));
+            }
+            if let Some(resolves) = resolves {
+                let names: Vec<&str> = resolves.iter().map(|hash| hash.0.as_str()).collect();
+                summary.push_str(&format!(", resolves {}", names.join(" ")));
+            }
+            summary
+        }
         PimdirAction::Move { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Copy { seq, to } => format!("seq {seq} -> {}", to.0),
         PimdirAction::Update {

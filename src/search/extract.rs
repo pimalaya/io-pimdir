@@ -147,15 +147,15 @@ impl PimdirExtract {
             }
         } else {
             let mut extract = Self {
-                title: last::<SUBJECT>(root).unwrap_or_default(),
+                title: first::<SUBJECT>(root).unwrap_or_default(),
                 ..Default::default()
             };
 
             let roles = [
-                (last::<FROM>(root), &mut extract.from),
-                (last::<TO>(root), &mut extract.to),
-                (last::<CC>(root), &mut extract.cc),
-                (last::<BCC>(root), &mut extract.bcc),
+                (first::<FROM>(root), &mut extract.from),
+                (first::<TO>(root), &mut extract.to),
+                (first::<CC>(root), &mut extract.cc),
+                (first::<BCC>(root), &mut extract.bcc),
             ];
             for (addresses, field) in roles {
                 if let Some(addresses) = addresses {
@@ -483,9 +483,13 @@ impl<'t, 'a> Walk<'t, 'a> {
 
         let entity = part.entity;
         let (ctype, subtype) = &part.media;
-        let attached = entity
-            .disposition()
-            .is_some_and(|disposition| disposition.kind.eq_ignore_ascii_case("attachment"));
+        // NOTE: disposed as an attachment as Annex A.1's mark reads it:
+        // any disposition type but `inline`, a field holding none stating
+        // no disposition.
+        let attached = entity.disposition().is_some_and(|disposition| {
+            let kind = disposition.kind.trim();
+            !kind.is_empty() && !kind.eq_ignore_ascii_case("inline")
+        });
 
         match &entity.body {
             MimeBodyNode::Multipart(_) if subtype == "alternative" => {
@@ -529,10 +533,12 @@ impl<'t, 'a> Walk<'t, 'a> {
     }
 }
 
-/// The last field the marker names, read in its form: a repeated field
-/// reads as its last occurrence.
-pub(crate) fn last<M: MimeHeaderMarker>(entity: &MimeEntity) -> Option<M::Value> {
-    let field = entity.header.get_all(&M::KIND).last()?;
+/// The first field the marker names, in document order, read in its
+/// form: a field present twice is read from its first occurrence, as
+/// STORAGE Annex A.1 reads one (SEARCH §6), so the index holds the
+/// subject and the people the summary row states.
+pub(crate) fn first<M: MimeHeaderMarker>(entity: &MimeEntity) -> Option<M::Value> {
+    let field = entity.header.get_all(&M::KIND).next()?;
     M::from_value(field.read_as(M::KIND.spec().form))
 }
 

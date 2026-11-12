@@ -212,12 +212,26 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
         match op {
             PolicyOp::SetFlags(i, flags) => {
                 if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                    let _ = client.mutate("inbox", PimdirMutation::SetFlags { handle, flags });
+                    let _ = client.mutate(
+                        "inbox",
+                        PimdirMutation::SetFlags {
+                            handle,
+                            flags,
+                            base: None,
+                        },
+                    );
                 }
             }
             PolicyOp::Remove(i) => {
                 if let Some(handle) = nth(&live(&client, "inbox"), i) {
-                    let _ = client.mutate("inbox", PimdirMutation::Remove(handle));
+                    let _ = client.mutate(
+                        "inbox",
+                        PimdirMutation::Remove {
+                            handle,
+                            if_match: None,
+                            resolves: None,
+                        },
+                    );
                 }
             }
             PolicyOp::Edit(i, n) => {

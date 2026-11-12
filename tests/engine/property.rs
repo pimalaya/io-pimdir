@@ -15,6 +15,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    mem,
     rc::Rc,
 };
 
@@ -32,7 +33,7 @@ use io_pimdir::{
         PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirRemote,
         PimdirRemoteSnapshot, PimdirTier,
     },
-    sync::{PimdirSync, PimdirSyncOptions, PimdirSyncReport},
+    sync::{PimdirSync, PimdirSyncOptions, PimdirSyncReport, PimdirWaitReason},
     upgrade::PimdirUpgrade,
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
@@ -124,7 +125,7 @@ proptest! {
     fn coroutines_survive_any_arg_sequence(args in proptest::collection::vec(arb_arg(), 1..8)) {
         feed(PimdirOpen::new("inbox"), args.clone());
         feed(
-            PimdirMutate::new("inbox", PimdirMutation::Remove(PimdirHandle::from("1"))),
+            PimdirMutate::new("inbox", PimdirMutation::Remove { handle: PimdirHandle::from("1"), if_match: None, resolves: None }),
             args.clone(),
         );
         feed(
@@ -235,13 +236,13 @@ proptest! {
                 Op::LocalSetFlags(i, flags) => {
                     if let Some(handle) = nth(&named(&client, "inbox"), i) {
                         client
-                            .mutate("inbox", PimdirMutation::SetFlags { handle, flags })
+                            .mutate("inbox", PimdirMutation::SetFlags { handle, flags, base: None })
                             .unwrap();
                     }
                 }
                 Op::LocalRemove(i) => {
                     if let Some(handle) = nth(&named(&client, "inbox"), i) {
-                        client.mutate("inbox", PimdirMutation::Remove(handle)).unwrap();
+                        client.mutate("inbox", PimdirMutation::Remove { handle, if_match: None, resolves: None }).unwrap();
                     }
                 }
                 Op::ServerSetFlags(i, flags) => {
@@ -609,6 +610,7 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                         PimdirMutation::SetFlags {
                             handle: handle.clone(),
                             flags,
+                            base: None,
                         },
                     );
                     if staged.is_ok() {
@@ -620,8 +622,20 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
                 if let Some(handle) = nth(&live(&client), i) {
                     let held = held_object(&client, &handle);
                     let server_body = server_body(&client, &handle);
+                    // NOTE: a person deleting what they are shown names
+                    // the conflicts it meets, which the remove then
+                    // settles; one nobody has read is named by none and
+                    // refuses it (SYNC §7).
+                    let resolves = client.shown("inbox", &handle);
                     if client
-                        .mutate("inbox", PimdirMutation::Remove(handle.clone()))
+                        .mutate(
+                            "inbox",
+                            PimdirMutation::Remove {
+                                handle: handle.clone(),
+                                if_match: None,
+                                resolves,
+                            },
+                        )
                         .is_ok()
                     {
                         if let Some(held) = held {
@@ -1127,10 +1141,22 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
         );
     }
 
-    let report = client.sync("inbox", opts.clone()).unwrap();
-    prop_assert_eq!(report, PimdirSyncReport::default());
-    let report = client.sync("archive", opts.clone()).unwrap();
-    prop_assert_eq!(report, PimdirSyncReport::default());
+    // NOTE: a settled replica's sync does nothing. A cold move whose
+    // source went leaves a create holding neither a body nor an origin,
+    // which no add delivers: it is reported waiting, undeliverable, run
+    // after run (SYNC §5), and is the one thing a quiescent report names.
+    for collection in ["inbox", "archive"] {
+        let mut report = client.sync(collection, opts.clone()).unwrap();
+        let waiting = mem::take(&mut report.waiting);
+        prop_assert!(
+            waiting
+                .iter()
+                .all(|waiting| waiting.reason == PimdirWaitReason::Undeliverable),
+            "{:?}",
+            waiting
+        );
+        prop_assert_eq!(report, PimdirSyncReport::default());
+    }
     Ok(())
 }
 
@@ -1292,12 +1318,12 @@ proptest! {
             match op {
                 PairOp::LocalASetFlags(i, flags) => {
                     if let Some(handle) = nth(&named(&a, "inbox"), i) {
-                        a.mutate("inbox", PimdirMutation::SetFlags { handle, flags }).unwrap();
+                        a.mutate("inbox", PimdirMutation::SetFlags { handle, flags, base: None }).unwrap();
                     }
                 }
                 PairOp::LocalARemove(i) => {
                     if let Some(handle) = nth(&named(&a, "inbox"), i) {
-                        a.mutate("inbox", PimdirMutation::Remove(handle)).unwrap();
+                        a.mutate("inbox", PimdirMutation::Remove { handle, if_match: None, resolves: None }).unwrap();
                     }
                 }
                 PairOp::ServerSetFlags(i, flags) => {
@@ -1396,6 +1422,42 @@ fn duo_mutate(
     if let Some(handle) = nth(&named(client, "inbox"), index) {
         client.mutate("inbox", mutation(handle)).unwrap();
     }
+}
+
+/// A person deleting what they are shown: the remove names the diverging
+/// body of every conflict it meets, so it settles them, and one meeting a
+/// conflict nobody has read, which no resolution names, is refused,
+/// staging nothing (SYNC §7).
+fn duo_remove(client: &mut Replica, index: usize) {
+    if let Some(handle) = nth(&named(client, "inbox"), index) {
+        let met = client.met("inbox", &handle);
+        let unread = met.iter().any(Option::is_none);
+        let staged = client.mutate(
+            "inbox",
+            PimdirMutation::Remove {
+                handle,
+                if_match: None,
+                resolves: client_resolves(&met),
+            },
+        );
+        match unread {
+            true => assert!(staged.is_err(), "a remove over an unread conflict"),
+            false => staged.unwrap(),
+        }
+    }
+}
+
+/// The resolution naming every read conflict of `met`, none over none.
+fn client_resolves(met: &[Option<PimdirHash>]) -> Option<Vec<PimdirHash>> {
+    let mut named: Vec<PimdirHash> = Vec::new();
+    for body in met.iter().flatten() {
+        if !named.contains(body) {
+            named.push(body.clone());
+        }
+    }
+    (!met.is_empty())
+        .then_some(named)
+        .filter(|named| !named.is_empty())
 }
 
 fn duo_edit(client: &mut Replica, index: usize, tag: &str, n: u8) {
@@ -1500,19 +1562,19 @@ proptest! {
                 DuoOp::ASetFlags(i, flags) => {
                     duo_mutate(&mut a, i, |handle| PimdirMutation::SetFlags {
                         handle,
-                        flags: flags.clone(),
+                        flags: flags.clone(), base: None,
                     });
                 }
                 DuoOp::AEdit(i, n) => duo_edit(&mut a, i, "a", n),
-                DuoOp::ARemove(i) => duo_mutate(&mut a, i, PimdirMutation::Remove),
+                DuoOp::ARemove(i) => duo_remove(&mut a, i),
                 DuoOp::BSetFlags(i, flags) => {
                     duo_mutate(&mut b, i, |handle| PimdirMutation::SetFlags {
                         handle,
-                        flags: flags.clone(),
+                        flags: flags.clone(), base: None,
                     });
                 }
                 DuoOp::BEdit(i, n) => duo_edit(&mut b, i, "b", n),
-                DuoOp::BRemove(i) => duo_mutate(&mut b, i, PimdirMutation::Remove),
+                DuoOp::BRemove(i) => duo_remove(&mut b, i),
                 DuoOp::ServerAdd(n) => {
                     arrivals += 1;
                     let handle = format!("srv-{arrivals}");

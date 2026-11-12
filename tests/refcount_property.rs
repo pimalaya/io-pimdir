@@ -574,8 +574,13 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                 (1, Some(seq)) => Some(PimdirAction::SetFlags {
                     seq,
                     flags: PimdirFlags::from_iter(["\\Seen"]),
+                    base: None,
                 }),
-                (2, Some(seq)) => Some(PimdirAction::Remove { seq }),
+                (2, Some(seq)) => Some(PimdirAction::Remove {
+                    seq,
+                    if_match: None,
+                    resolves: None,
+                }),
                 (3, Some(seq)) => Some(PimdirAction::Move { seq, to: elsewhere }),
                 (4, Some(seq)) => Some(PimdirAction::Copy { seq, to: elsewhere }),
                 (5, Some(seq)) => hash.clone().map(|object| PimdirAction::Update {

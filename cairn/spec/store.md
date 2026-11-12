@@ -307,7 +307,8 @@ clash between mailboxes. The store SHALL assign a message's `seq` the first time
 inserts an item with that `link_id` in a collection of its kind, drawing from the
 **store-global** `store_meta.next_seq` counter, and reuse it for every later
 placement of the same `link_id` in a collection of the same kind
-(`seq_for_link_any` bound with `:collection`, STORAGE §9.1): a Message-ID spelling
+(`seq_for_link_any` bound with `:collection`, STORAGE §9.1), a message's only
+among the rows that agree with it (below): a Message-ID spelling
 an event's UID draws its own, and a collection whose kind is undeclared shares
 with none of a declared kind. The counter only ever increases, so a `seq` is
 **never reused** even after the message is deleted everywhere. `(collection, seq)`
@@ -555,10 +556,15 @@ A parked row SHALL NOT overlay, its error asserting that it will not be applied
 without an operator. A pending row whose payload the reader cannot decode
 SHALL be skipped by the overlay, never fail the read: the drain is what parks
 it, and the strict `pending_actions` read still reports it as an error. A row
-stating a later payload version SHALL be skipped by every pending read, the
-strict one included, as the drain skips it (STORAGE §15.2): it stays pending
-for a later owner, and failing on it would fail every read until then
-(tests/store_rules.rs `a_reader_skips_a_row_of_a_later_payload_version`).
+whose action, or whose payload version, the reader does not know SHALL be
+listed by every pending read, the strict one included, as `PimdirAction::Unknown`
+with its action and its payload verbatim, and folded into nothing (STORAGE
+§15.4): it is somebody's write the reader cannot show, never one it may hide,
+and failing on it would fail every read until a later owner applies it
+(tests/store_rules.rs
+`a_reader_lists_a_row_of_a_later_payload_version_and_folds_nothing`;
+tests/queue.rs `an_unknown_payload_stays_pending_untouched_and_listed`). Before
+draft-10's second batch such a row was left out of every read.
 
 The overlay SHALL be chosen when the reader is built rather than per call, so
 one handle cannot answer two ways about one collection.
@@ -672,7 +678,7 @@ A bodiless placement of a mutable kind (a card, a calendar resource, a file) rev
 - THEN the row revives under its key and `seq` at `Meta`, its base at `e2` naming no body, `n1` is a retained item under `dup:<id>#<id>` reported `Overruled` after the member's `Added`, and nothing is pushed (vectors/sync/108)
 
 ### Requirement: An owner skips the actions it cannot apply
-An action kind the store does not recognise SHALL decode as an opaque action (kind and raw payload) rather than an error, so one queue can carry store mutations any owner applies beside capability-bound intents (a mail submission) only a specific owner can perform. An Annex B.2 intent SHALL decode the same way once its type has read it strictly, a malformed one parked (below). The opaque action's body is the row's `queue.object_hash`, which the queue reads fill in: `codec::action_from_payload`, reading the payload alone, names none, and an intent's payload never names its body. A payload stating a version `v` this owner does not know, for any kind, SHALL be skipped the same way (STORAGE §15.2). A payload that is not JSON, or states no `v`, SHALL still park.
+An action kind the store does not recognise SHALL decode as an opaque action (kind and raw payload) rather than an error, so one queue can carry store mutations any owner applies beside capability-bound intents (a mail submission) only a specific owner can perform. An Annex B.2 intent SHALL decode the same way once its type has read it strictly, a malformed one parked (below). The opaque action's body is the row's `queue.object_hash`, which the queue reads fill in: `codec::action_from_payload`, reading the payload alone, names none, and an intent's payload never names its body. A payload unknown to this crate, its kind one it holds no schema for or its `v` another than 1 for a kind it knows, none stated included, SHALL be kept the same way and read no further, whatever its other members hold (STORAGE §15.2, §15.3): the drain leaves its row pending and untouched, never parks it as malformed, and runs no gate nor backstop on it, an intent at a later version included. A payload of a known kind that is not a JSON object SHALL still park, there being no `v` to read.
 
 The drain SHALL **skip** a row it cannot apply: the row stays pending, `error` `NULL` and `attempts` unbumped, is never parked (parking means permanently unappliable), and never blocks later actions in the same collection. The drain report SHALL count skips beside applies and parks.
 
@@ -680,9 +686,11 @@ The drain SHALL **skip** a row it cannot apply: the row stays pending, `error` `
 - tests/store_rules.rs `an_unknown_payload_version_is_skipped_not_parked`
 
 ### Requirement: A queued action can be cancelled or acknowledged
-`drop_action(id)` SHALL delete one queue row, pending or parked, releasing its
+`drop_action(action)` SHALL delete one queue row, pending or parked, releasing its
 object pin in the same transaction, and report whether the row existed. It
-withdraws a row by request and records no receipt.
+withdraws a row by request and records no receipt. The row is named by the
+handle its enqueue answered or by a bare id (below, "An enqueue answers a
+handle").
 `acknowledge_action(id, seq)` SHALL acknowledge an intent an owner performed
 out of band: delete the row, pending or parked, release its pin and record its
 receipt (`record_receipt`: the row's id, the collection it was queued on,
@@ -694,7 +702,7 @@ parks it (permanent). A collection's pending actions SHALL expose each row's
 
 Cancelling is an owner write, and it is the only retraction a queued create
 has: the kinds that address an existing item are retracted by their inverse
-instead, `set-flags` being absolute rather than a delta.
+instead, a `set-flags` stating no `base` being absolute rather than a delta.
 `PimdirStore::cancel_action(dir, id)` SHALL therefore perform it as a scoped
 operation, opening the store as owner, cancelling one row and releasing the lock
 before returning, so a consumer that is otherwise a reader and a producer never
@@ -1007,7 +1015,7 @@ A body an `add` or `update` names that the blob store lacks, or whose file does 
 - THEN `get` answers none, the first drain retries and moves the file into quarantine/, never unlinking it, and the second applies the add (tests/store_rules.rs `a_body_failing_its_name_is_no_body_and_the_owner_quarantines_it`)
 
 ### Requirement: A malformed payload is parked
-`codec::action_from_payload` SHALL read each action and intent at `v: 1` exactly as its schema under payloads/ types it (STORAGE §15.3, Annex B.2): no member its version does not define (`PimdirActionError::UnknownField`), every member it requires (`MissingField`: an `add`'s `flags` and `object`, a `set-flags`' `flags`, an intent's `source`), each of its type and rule (`Invalid`): `seq` an integer from 1, a body an object name (§5), a flag set an array of distinct flags of printable ASCII, a `key`, `id`, `collection`, `addr` or `label` non-empty, a `set-performer`'s capability of Annex B's grammar (`capability::is_name`), `rcpts` non-empty, `partstat` one of `ACCEPTED`, `TENTATIVE`, `DECLINED`, an intent's item named by exactly one of `seq` and `link_id`. An intent is read by its type in `intent` and kept as `PimdirAction::Unknown`; an application's own kind is read as a JSON object at `v: 1` alone. The version is read first, so a later version is skipped, never parked.
+`codec::action_from_payload` SHALL read each action and intent at `v: 1` exactly as its schema under payloads/ types it (STORAGE §15.3, Annex B.2): no member its version does not define (`PimdirActionError::UnknownField`), every member it requires (`MissingField`: an `add`'s `flags` and `object`, a `set-flags`' `flags`, an intent's `source`), each of its type and rule (`Invalid`): `seq` an integer from 1, a body an object name (§5), a flag set an array of distinct flags of printable ASCII, a `key`, `id`, `collection`, `addr` or `label` non-empty, a `set-performer`'s capability of Annex B's grammar (`capability::is_name`), `rcpts` non-empty, `partstat` one of `ACCEPTED`, `TENTATIVE`, `DECLINED`, an intent's item named by exactly one of `seq` and `link_id`. An intent is read by its type in `intent` and kept as `PimdirAction::Unknown`. A payload is judged one of three (`codec::payload_outcome`, `PimdirPayloadOutcome`; STORAGE §15.3): `Unknown` when its kind is none this crate holds a schema for, an application's own included, or its `v` is not 1, none stated included, read no further and kept verbatim as `PimdirAction::Unknown`, never an error; else `Valid` or `Malformed` as its schema says. `PimdirActionError::UnknownVersion` is answered by an intent's own type alone, which refuses a payload at another version rather than read it as `v` 1. A `set-flags` MAY state `base`, a flag set, and a `remove` `if_match`, an object name, and `resolves`, a non-empty array of distinct object names (`PimdirAction::SetFlags::base`, `PimdirAction::Remove::if_match` and `::resolves`).
 
 The producer SHALL encode the action and read its payload back before anything is written, refusing a malformed one as `PimdirError::Action` (`action-malformed`) naming the member: an `add` without its `object` and a flag set never read are refused there; `replace_action` refuses the change it would enqueue the same way. The drain SHALL park a malformed row, the error naming the member, never applying it in part nor ignoring a member, an intent's included, which an intent's performer reads with the same types.
 
@@ -1049,8 +1057,17 @@ Every read and write taking a collection SHALL take `impl AsRef<str>`, `PimdirCo
 ### Requirement: Conflicted items are listable
 `list_item_conflicts(account)` SHALL run `LIST_CONFLICTED_ITEMS` (STORAGE §14.1) and answer each item's collection, link id, `seq`, shared body and diverging body, so a consumer finds what waits for a cross-source decision without paging its collections.
 
-### Requirement: A lookup answers hash and size
-`lookup_objects` SHALL answer `PimdirObject`s, hash and size, `LOOKUP_OBJECTS` joining `objects`, for the size witness the upgrade applies before linking an immutable body (SYNC §6).
+### Requirement: A lookup answers every holder with its witnesses
+`lookup_objects` SHALL answer, by link id, a `PimdirHeldObject` per row of the handle's account holding a body under the key, once per distinct answer: the body's hash and size and the `subject`, `date` and `sender` the row's mail summary states, the three `None` for a row holding none (`LOOKUP_OBJECTS`, STORAGE §14), the witnesses the upgrade links against (SYNC §6, [upgrade](upgrade.md)), and only bodies it read whole.
+
+#### Scenario: Three holders of one key
+- tests/another_message.rs `a_lookup_answers_each_holder_with_its_witnesses`
+
+### Requirement: The agreement guards a hint across collections
+A message's hint another collection of its account holds names one message only where the two rows agree on `subject`, `date` and `sender`, byte for byte, `NULL` matching `NULL`, a row holding no summary agreeing with no message (STORAGE §9). The write SHALL so share a message's `seq` only with a row agreeing with the summary being written, the lowest among several, and draw its own otherwise: `seq_for_link_any` is bound with the three from the upsert's mail summary, an empty date as `NULL`, and with `NULL` for another kind or a message carrying no summary (§9.1, vectors/sync/148). A retiring row holding no body SHALL be purged at once only for a live holder that agrees with it, and retained otherwise: `held_elsewhere`, its parameters unchanged, reads both rows' summaries itself (§11.1, vectors/sync/149). A row of another kind agrees with anything.
+
+#### Scenario: Another message reusing the id, and a row with no summary
+- tests/another_message.rs `a_message_shares_a_seq_across_mailboxes_only_with_a_row_it_agrees_with`, `a_bodiless_row_is_held_elsewhere_only_by_a_row_that_agrees`
 
 ### Requirement: The schema check covers the triggers
 The open contract SHALL compare every table, index and trigger the store declares with the ones the canonical migrations create in an empty in-memory database, by their `sqlite_schema` text with `--` comments dropped and whitespace collapsed, and refuse a store naming this draft whose text differs, whose object one side lacks, or whose `user_version` is not the draft's 1, as `PimdirError::Damaged { object }` (`store-corrupt`), naming the first object found or `user_version`: drafts being exact, no difference is an earlier draft's (STORAGE §4.2), and the change feed and the collector's counts being the triggers', a store lacking one corrupts silently. `PimdirError::Stale` (`store-stale`) and `PimdirNotCurrent::Shape` are gone.
@@ -1333,7 +1350,7 @@ The key a body states (a `Message-ID`, a vCard or iCalendar `UID`) SHALL be file
 - tests/staging.rs `a_create_refused_for_its_link_id_stages_nothing`, tests/capabilities.rs `a_refused_create_stages_nothing`
 
 ### Requirement: An action on an item no source binds is the store's to settle
-The drain SHALL never skip an action on an existing item no source binds, which would leave the row pending for ever (STORAGE §15.2 reserves skipping for a kind, a payload version or an intent the owner does not run). A `remove` SHALL retain the item, a delete nobody pushes. In a collection no source syncs, an item kept on the device (`put_item`, STORAGE §14.3), a `set-flags` SHALL set its flags and an `update` SHALL write its new body as `put_item` writes one, its flags kept and its summary derived again, on an `update`'s usual terms: one whose `if_match` names another body than the item's parks naming both (STORAGE §15.3), checked before the item is found unbound; a body deriving no summary, or another key than the item's, parks. A `move` or a `copy` of such an item, and anything on an unbound item of a synced collection, SHALL park naming the item. Each applied row leaves its receipt and releases its pin as any other.
+The drain SHALL never skip an action on an existing item no source binds, which would leave the row pending for ever (STORAGE §15.2 reserves skipping for a kind, a payload version or an intent the owner does not run). A `remove` SHALL retain the item, a delete nobody pushes, on a bound one's terms: one whose `if_match` names another body parks, one meeting the item's conflict parks unless its `resolves` names it, and a resolution settles the conflict as it retains the item, the diverging body released (`write::settle_unbound`). In a collection no source syncs, an item kept on the device (`put_item`, STORAGE §14.3), a `set-flags` SHALL set its flags, as the change it is when it states `base` and parking over an unknown set, and an `update` SHALL write its new body as `put_item` writes one, its flags kept and its summary derived again, on an `update`'s usual terms: one whose `if_match` names another body than the item's parks naming both (STORAGE §15.3), checked before the item is found unbound; a body deriving no summary, or another key than the item's, parks. A `move` or a `copy` of such an item, and anything on an unbound item of a synced collection, SHALL park naming the item. Each applied row leaves its receipt and releases its pin as any other.
 
 #### Scenario: A device-only event edited, flagged, moved and removed
 - tests/unbound_items.rs `a_queued_action_on_an_item_no_source_binds_applies_or_parks` (failed before the change: the drain reported both rows skipped)
@@ -1414,3 +1431,17 @@ What a caller alone states and no rule of the crate shapes (an empty source, acc
 
 #### Scenario: A size above every integer
 - tests/store_rules.rs `a_stated_size_no_integer_holds_is_unknown`: `u64::MAX` lands with no size, `i64::MAX` with its own; the write fails on a `CHECK` with the wrapping cast
+
+### Requirement: A queued remove and a queued flag change say what their producer read
+The drain SHALL stage a `remove` as `PimdirMutation::Remove` carrying its `if_match` and its `resolves`, and a `set-flags` as `PimdirMutation::SetFlags` carrying its `base` ([mutate](mutate.md); STORAGE §15.2, §15.3). A `remove` whose `if_match` names another body than the item holds SHALL park naming both, checked before any binding is read; one meeting a conflict, the item's or that of the binding it runs through, SHALL park naming it unless its `resolves` names each, and one stating `resolves` and meeting none SHALL park; a resolution runs through a conflicted binding whose diverging body it names, as an `update`'s does. A `set-flags` stating `base` SHALL park over an item whose flag set is unknown. A producer refuses a `base` holding a flag the store cannot hold (`flag-invalid`) and an unknown set as a base (`action-malformed`). The capability gate reads a `set-flags` stating `base` against the current set, never against its base (Annex B.1).
+
+The overlay SHALL fold each as the owner would apply it (STORAGE §15.4): a `set-flags` stating `base` as the change it is over the set the item shows, and nothing over an unknown set; a `remove` whose `if_match` names another body than the item shows, or meeting a conflict its `resolves` does not name, takes nothing out. A pending `move` out of the collection takes the item out whatever conflicts it stands in, as the drain stages it. The search tag plan (`PimdirSearchTagPlan::stage`) states the set it read as `base`, folding the pending flag changes the same way.
+
+#### Scenario: The drain and the overlay agree
+- tests/queue.rs `a_queued_flag_change_stating_its_base_keeps_a_flag_landed_since`, `a_queued_flag_change_stating_its_base_parks_over_an_unknown_set`, `a_queued_remove_stating_its_body_parks_over_another`, `a_queued_remove_resolving_no_conflict_parks`; tests/item_conflict_settle.rs `a_queued_remove_settles_only_the_conflict_it_resolves`
+
+### Requirement: An enqueue answers a handle
+Every enqueue of `PimdirProducer` SHALL answer a `PimdirActionHandle`: the row's `id` under the identity of the store that drew it (`PimdirStoreIdentity`, its `store_id` and `incarnation`, read in the enqueue's transaction; STORAGE §4.5, §15.4), `PimdirEnqueued::handle` likewise. A handle prints as the three joined by periods and parses back (`Display`, `FromStr`); a bare id, an `i64` or its decimal string, is a handle stating no store. `PimdirProducer::action_status`, `PimdirReader::action_status`, `PimdirStore::drop_action` and `PimdirStore::cancel_action` SHALL take either: a handle answered under another store id or incarnation than the store's reads `PimdirActionStatus::Reset`, nothing read of the row, and is refused by a cancel as `PimdirError::Reset` (code `store-reset`), nothing removed, a restored copy handing the id to another row; a bare id is followed unchecked. `acknowledge_action`, `replace_action` and `fail_action`, an owner's on rows it just read, take the bare id.
+
+#### Scenario: A restore between the enqueue and the status
+- tests/queue.rs `a_handle_follows_its_row_until_the_stores_identity_moves`

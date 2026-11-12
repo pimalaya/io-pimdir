@@ -69,6 +69,21 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> PimdirPlac
     }
 }
 
+/// The placement with the summary a listing names a message by: a
+/// message shares its public id across collections only with a row whose
+/// summary agrees with its own, one holding none agreeing with no
+/// message (STORAGE §9, §9.1).
+fn summarized(mut placement: PimdirPlacement) -> PimdirPlacement {
+    let subject = placement.link_id.as_ref().unwrap().0.clone();
+    placement.summary = Some(io_pimdir::summary::PimdirSummary::Mail(
+        io_pimdir::summary::mail::PimdirMailSummary {
+            subject,
+            ..Default::default()
+        },
+    ));
+    placement
+}
+
 fn store_object(hash: &str, body: &[u8]) -> PimdirWriteOp {
     PimdirWriteOp::StoreObject {
         object: PimdirObject {
@@ -196,6 +211,7 @@ fn a_malformed_payload_is_refused_at_the_enqueue_and_parked_by_the_drain() {
     let unread = PimdirAction::SetFlags {
         seq,
         flags: PimdirFlags::Unknown,
+        base: None,
     };
     let Err(PimdirError::Action(PimdirActionError::Invalid { field: "flags", .. })) =
         producer.enqueue("INBOX", &unread, None)
@@ -290,6 +306,7 @@ fn set_flags_is_absolute_and_reapplies_idempotently() {
     let set = PimdirAction::SetFlags {
         seq,
         flags: PimdirFlags::from_iter(["\\Flagged"]),
+        base: None,
     };
 
     producer.enqueue("INBOX", &set, None).unwrap();
@@ -315,7 +332,15 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
 
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
@@ -330,7 +355,15 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
 
     // removing it again is success, not a park
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 0));
@@ -353,18 +386,18 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
         .write(vec![
             store_object("cafebabecafebabecafebabecafebabecafebabecafebabecafe", b"a"),
             store_object("cafebabfcafebabfcafebabfcafebabfcafebabfcafebabfcafe", b"b"),
-            PimdirWriteOp::UpsertPlacement(placement(
+            PimdirWriteOp::UpsertPlacement(summarized(placement(
                 "1",
                 "mid:a",
                 "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
                 &[],
-            )),
-            PimdirWriteOp::UpsertPlacement(placement(
+            ))),
+            PimdirWriteOp::UpsertPlacement(summarized(placement(
                 "2",
                 "mid:b",
                 "cafebabfcafebabfcafebabfcafebabfcafebabfcafebabfcafe",
                 &[],
-            )),
+            ))),
         ])
         .unwrap();
     let seq_of = |store: &PimdirStore, link: &str| {
@@ -533,7 +566,15 @@ fn a_parked_action_does_not_block_later_actions() {
 
     // an unappliable action, then a valid one behind it
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 9999 }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: 9999,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     // NOTE: remove-of-absent succeeds, so the parking case is set-flags.
     producer
@@ -542,6 +583,7 @@ fn a_parked_action_does_not_block_later_actions() {
             &PimdirAction::SetFlags {
                 seq: 9999,
                 flags: PimdirFlags::default(),
+                base: None,
             },
             None,
         )
@@ -552,6 +594,7 @@ fn a_parked_action_does_not_block_later_actions() {
             &PimdirAction::SetFlags {
                 seq,
                 flags: PimdirFlags::from_iter(["\\Answered"]),
+                base: None,
             },
             None,
         )
@@ -666,13 +709,17 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
         payload: r#"{"v":1,"source":"smtp","from":"me@b.c","rcpts":["a@b.c"]}"#.into(),
         object_hash: Some(object.hash.clone()),
     };
-    let id = producer.enqueue("INBOX", &submit, Some(&object)).unwrap();
+    let id = producer
+        .enqueue("INBOX", &submit, Some(&object))
+        .unwrap()
+        .id;
     producer
         .enqueue(
             "INBOX",
             &PimdirAction::SetFlags {
                 seq,
                 flags: PimdirFlags::from_iter(["\\Answered"]),
+                base: None,
             },
             None,
         )
@@ -725,7 +772,8 @@ fn an_acknowledged_action_releases_its_queued_body() {
             },
             Some(&object),
         )
-        .unwrap();
+        .unwrap()
+        .id;
     assert!(blob_exists(dir.path(), &object.hash.0));
 
     assert!(store.drop_action(id).unwrap());
@@ -752,8 +800,17 @@ fn a_failed_action_retries_until_it_is_parked() {
     let (mut store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let id = producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
-        .unwrap();
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
+        .unwrap()
+        .id;
 
     store.fail_action(id, None).unwrap();
     store.fail_action(id, None).unwrap();
@@ -784,8 +841,17 @@ fn a_parked_error_is_recorded_without_its_credentials() {
     let (store, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let id = producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
-        .unwrap();
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
+        .unwrap()
+        .id;
 
     store
         .fail_action(
@@ -962,6 +1028,7 @@ fn a_drain_applies_an_action_as_the_source_of_its_collection() {
             &PimdirAction::SetFlags {
                 seq,
                 flags: PimdirFlags::default(),
+                base: None,
             },
             None,
         )
@@ -1023,7 +1090,15 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
 
     // tombstone mid:a, which keeps its binding on handle 1 for the push
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq: seq_a }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: seq_a,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(store.drain().unwrap().applied, 1);
 
@@ -1045,6 +1120,7 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
             &PimdirAction::SetFlags {
                 seq: seq_b,
                 flags: PimdirFlags::from_iter(["\\Answered"]),
+                base: None,
             },
             None,
         )
@@ -1080,7 +1156,15 @@ fn a_remove_drained_by_a_stranger_tombstones_the_item_for_its_source() {
     let (owner, seq) = seeded(dir.path());
     let mut producer = PimdirProducer::open(dir.path(), "frontend").unwrap();
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
 
     let mut stranger = PimdirStore::open(dir.path()).unwrap().for_source("other");
@@ -1099,7 +1183,15 @@ fn a_remove_drained_by_a_stranger_tombstones_the_item_for_its_source() {
     assert_eq!(projected[0].status, PimdirStatus::Tombstone);
 
     producer
-        .enqueue("INBOX", &PimdirAction::Remove { seq }, None)
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
         .unwrap();
     let report = stranger.drain().unwrap();
     assert_eq!(
@@ -1123,10 +1215,12 @@ fn a_claim_that_deletes_nothing_is_not_counted_as_applied() {
             &PimdirAction::SetFlags {
                 seq,
                 flags: PimdirFlags::from_iter(["\\Answered"]),
+                base: None,
             },
             None,
         )
-        .unwrap();
+        .unwrap()
+        .id;
 
     // another connection holds the write lock while the drain reads its
     // pending list, then takes the row away before the drain can claim it
@@ -1180,6 +1274,7 @@ fn a_malformed_pending_row_is_skipped_by_the_overlay_and_parked_by_the_drain() {
             &PimdirAction::SetFlags {
                 seq,
                 flags: PimdirFlags::from_iter(["\\Flagged"]),
+                base: None,
             },
             None,
         )
@@ -1272,7 +1367,7 @@ fn a_queued_add_missing_its_body_is_retried_then_parked() {
         object: Some(object.hash.clone()),
         supersedes: None,
     };
-    let id = producer.enqueue("INBOX", &add, Some(&object)).unwrap();
+    let id = producer.enqueue("INBOX", &add, Some(&object)).unwrap().id;
     drop(producer);
     unlink_blob(dir.path(), &object.hash.0);
 
@@ -1403,7 +1498,8 @@ fn a_body_a_policy_overrules_during_a_drain_is_reported() {
                 resolves: None,
             }
         })
-        .unwrap();
+        .unwrap()
+        .id;
     drop(producer);
 
     let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("a");
@@ -1418,4 +1514,364 @@ fn a_body_a_policy_overrules_during_a_drain_is_reported() {
         kept.iter()
             .any(|item| item.link_id == report.overruled[0].link_id)
     );
+}
+
+/// A queued flag change stating the set its producer read is applied as
+/// the change it is (STORAGE §15.3, vectors/sync/141): a flag a sync
+/// landed after the producer read survives the row, and the one the
+/// producer removed goes. Stating no base, the same flags replace the set.
+///
+/// Before draft-10's second batch the payload carried no base and the
+/// owner wrote the set over whatever the item held, erasing the flag
+/// landed since.
+#[test]
+fn a_queued_flag_change_stating_its_base_keeps_a_flag_landed_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+
+    // the producer read `\Seen` and answers the message
+    let change = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Answered"]),
+        base: Some(PimdirFlags::from_iter(["\\Seen"])),
+    };
+    producer.enqueue("INBOX", &change, None).unwrap();
+
+    // a sync lands `\Flagged`, set on another device, before the drain
+    let hash = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
+    store
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
+            "1",
+            "mid:a",
+            hash,
+            &["\\Flagged", "\\Seen"],
+        ))])
+        .unwrap();
+
+    // the overlay folds the change over the set the item shows
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let shown = reader.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(
+        shown.flags,
+        PimdirFlags::from_iter(["\\Answered", "\\Flagged"])
+    );
+
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (1, 0));
+    let item = store.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(
+        item.flags,
+        PimdirFlags::from_iter(["\\Answered", "\\Flagged"]),
+        "the flag landed since survives, the one removed goes"
+    );
+
+    // the same flags stating no base replace the set
+    let replace = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Answered"]),
+        base: None,
+    };
+    producer.enqueue("INBOX", &replace, None).unwrap();
+    store.drain().unwrap();
+    let item = store.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(item.flags, PimdirFlags::from_iter(["\\Answered"]));
+}
+
+/// A queued flag change stating its base parks over an item whose flag
+/// set is unknown (STORAGE §15.2, §15.3, vectors/sync/142): there is no
+/// set to change, and replacing it would write the unread flags as
+/// removed. The overlay folds nothing for it.
+#[test]
+fn a_queued_flag_change_stating_its_base_parks_over_an_unknown_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let hash = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
+    let mut unread = placement("1", "mid:a", hash, &[]);
+    unread.flags = PimdirFlags::Unknown;
+    unread.base.as_mut().unwrap().flags = PimdirFlags::Unknown;
+    store
+        .write(vec![
+            store_object(hash, b"abc"),
+            PimdirWriteOp::UpsertPlacement(unread),
+        ])
+        .unwrap();
+    let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let change = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Seen"]),
+        base: Some(PimdirFlags::default()),
+    };
+    producer.enqueue("INBOX", &change, None).unwrap();
+
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let shown = reader.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(shown.flags, PimdirFlags::Unknown, "folded into nothing");
+
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = store.parked_actions().unwrap();
+    assert!(
+        parked[0].error.contains("unknown flag set"),
+        "{}",
+        parked[0].error
+    );
+    let item = store.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(item.flags, PimdirFlags::Unknown, "the row is as it was");
+
+    // an unknown set is no base a producer may state
+    let unknown = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Seen"]),
+        base: Some(PimdirFlags::Unknown),
+    };
+    assert!(matches!(
+        producer.enqueue("INBOX", &unknown, None),
+        Err(PimdirError::Action(PimdirActionError::Invalid {
+            field: "base",
+            ..
+        }))
+    ));
+}
+
+/// A queued `remove` stating the body it deletes parks once another write
+/// replaced that body, naming both (STORAGE §15.3, vectors/sync/145), and
+/// the overlay leaves the item in. Before draft-10's second batch a
+/// remove stated no body and deleted whatever the item held.
+#[test]
+fn a_queued_remove_stating_its_body_parks_over_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let held = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
+    let other = hash::hash(b"a body the item never held");
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+
+    let stale = PimdirAction::Remove {
+        seq,
+        if_match: Some(other.clone()),
+        resolves: None,
+    };
+    producer.enqueue("INBOX", &stale, None).unwrap();
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    assert!(
+        reader.get_item("INBOX", seq).unwrap().is_some(),
+        "the overlay folds nothing for a row the owner parks"
+    );
+
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = store.parked_actions().unwrap();
+    assert!(
+        parked[0].error.contains(&other.0) && parked[0].error.contains(held),
+        "{}",
+        parked[0].error
+    );
+    assert!(store.get_item("INBOX", seq).unwrap().is_some(), "kept");
+
+    let read = PimdirAction::Remove {
+        seq,
+        if_match: Some(PimdirHash(held.into())),
+        resolves: None,
+    };
+    producer.enqueue("INBOX", &read, None).unwrap();
+    assert!(reader.get_item("INBOX", seq).unwrap().is_none(), "folded");
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (1, 0));
+    assert!(store.get_item("INBOX", seq).unwrap().is_none());
+}
+
+/// A queued `remove` stating a resolution and meeting no conflict parks,
+/// the conflict it was decided over being settled already (STORAGE
+/// §15.3).
+#[test]
+fn a_queued_remove_resolving_no_conflict_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+
+    let resolution = PimdirAction::Remove {
+        seq,
+        if_match: None,
+        resolves: Some(vec![hash::hash(b"a diverging body")]),
+    };
+    producer.enqueue("INBOX", &resolution, None).unwrap();
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    assert!(reader.get_item("INBOX", seq).unwrap().is_some(), "kept in");
+
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = store.parked_actions().unwrap();
+    assert!(
+        parked[0].error.contains("meets no conflict"),
+        "{}",
+        parked[0].error
+    );
+    assert!(store.get_item("INBOX", seq).unwrap().is_some());
+}
+
+/// A payload this owner does not know, its action or its version, is left
+/// pending and untouched, the rows behind it applied, never parked, and a
+/// reader lists it (STORAGE §15.2, §15.4; the standard's "skip" scenario):
+/// a known action at `v` 2 whose members `v` 1 would read, one `v` 1
+/// would refuse, an action the standard does not define and an
+/// application's own.
+///
+/// Before draft-10's second batch a reader left out a row at a later
+/// version, and a known action stating no version was parked.
+#[test]
+fn an_unknown_payload_stays_pending_untouched_and_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+
+    let unknown = [
+        ("remove", format!(r#"{{"v":2,"seq":{seq}}}"#)),
+        ("set-flags", r#"{"v":2,"seq":"5"}"#.to_string()),
+        ("update", r#"{"seq":1}"#.to_string()),
+        (
+            "snooze",
+            r#"{"v":1,"seq":1,"until":"2026-12-01T09:00:00Z"}"#.to_string(),
+        ),
+        ("x-archive", r#"{"v":3}"#.to_string()),
+    ];
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    for (action, payload) in &unknown {
+        conn.execute(
+            sql::ENQUEUE_ACTION,
+            rusqlite::named_params! {
+                ":producer": "later",
+                ":collection": "INBOX",
+                ":action": action,
+                ":payload": payload,
+                ":target_collection": None::<String>,
+                ":object_hash": None::<String>,
+            },
+        )
+        .unwrap();
+    }
+    let rows = |conn: &rusqlite::Connection| -> Vec<(i64, String, String, i64, Option<String>)> {
+        conn.prepare("SELECT id, action, payload, attempts, error FROM queue ORDER BY id")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = rows(&conn);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let flag = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Answered"]),
+        base: None,
+    };
+    producer.enqueue("INBOX", &flag, None).unwrap();
+
+    let report = store.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked, report.skipped),
+        (1, 0, unknown.len())
+    );
+    assert!(store.parked_actions().unwrap().is_empty(), "never parked");
+    assert_eq!(rows(&conn), before, "payload, attempts and error untouched");
+    let item = store.get_item("INBOX", seq).unwrap().unwrap();
+    assert!(item.flags.contains("\\Answered"), "the row behind applied");
+    assert!(
+        store.get_item("INBOX", seq).unwrap().is_some(),
+        "the remove at v 2 was not read as v 1"
+    );
+
+    // a reader lists them, each with its action and its payload, and
+    // folds them into nothing
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let pending = reader.pending_actions("INBOX").unwrap();
+    assert_eq!(pending.len(), unknown.len());
+    for (listed, (action, payload)) in pending.iter().zip(&unknown) {
+        assert_eq!(listed.action.kind(), *action);
+        assert_eq!(
+            &io_pimdir::codec::action_to_payload(&listed.action),
+            payload
+        );
+        assert!(!listed.created_at.is_empty());
+    }
+    assert!(reader.get_item("INBOX", seq).unwrap().is_some());
+
+    // the next drain lists them again, and nothing else
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 5));
+}
+
+/// The enqueue answers a handle, the row's id under the identity of the
+/// store that drew it (STORAGE §4.5, §15.4): it prints and parses back,
+/// follows the row, and reads `Reset` once the store's incarnation moved,
+/// where the bare id still reads whatever row holds it. A cancel given a
+/// handle of another incarnation is refused and removes nothing.
+#[test]
+fn a_handle_follows_its_row_until_the_stores_identity_moves() {
+    use io_pimdir::{client::producer::PimdirActionStatus, codec::PimdirActionHandle};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let flag = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Answered"]),
+        base: None,
+    };
+    let handle = producer.enqueue("INBOX", &flag, None).unwrap();
+
+    let identity = store.change_cursor().unwrap();
+    let stated = handle.store.clone().expect("the store's identity");
+    assert_eq!(stated.store_id, identity.store_id);
+    assert_eq!(stated.incarnation, identity.incarnation);
+    let printed = handle.to_string();
+    assert_eq!(
+        printed,
+        format!(
+            "{}.{}.{}",
+            identity.store_id, identity.incarnation, handle.id
+        )
+    );
+    assert_eq!(printed.parse::<PimdirActionHandle>(), Ok(handle.clone()));
+    assert_eq!(
+        handle.id.to_string().parse::<PimdirActionHandle>(),
+        Ok(PimdirActionHandle::from(handle.id))
+    );
+    assert!("1.2".parse::<PimdirActionHandle>().is_err());
+    assert!("store.x.2".parse::<PimdirActionHandle>().is_err());
+
+    let pending = |status: PimdirActionStatus| matches!(status, PimdirActionStatus::Pending { .. });
+    assert!(pending(producer.action_status(&handle).unwrap()));
+    assert!(pending(producer.action_status(handle.id).unwrap()));
+
+    // a restore raises the incarnation: the handle names no row of this
+    // store any more, whatever row holds its id
+    store.raise_incarnation(None).unwrap();
+    assert_eq!(
+        producer.action_status(&handle).unwrap(),
+        PimdirActionStatus::Reset
+    );
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    assert_eq!(
+        reader.action_status(&handle).unwrap(),
+        PimdirActionStatus::Reset
+    );
+    assert!(
+        pending(producer.action_status(handle.id).unwrap()),
+        "a bare id is followed unchecked"
+    );
+
+    let refused = store.drop_action(&handle).unwrap_err();
+    assert_eq!(refused.code(), "store-reset");
+    assert_eq!(store.list_pending_actions().unwrap().len(), 1, "kept");
+    assert!(store.drop_action(handle.id).unwrap(), "a bare id cancels");
+
+    // a handle answered under the new incarnation follows its row
+    let handle = producer.enqueue("INBOX", &flag, None).unwrap();
+    assert!(pending(producer.action_status(&handle).unwrap()));
+    assert!(store.drop_action(&handle).unwrap());
 }

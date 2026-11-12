@@ -147,6 +147,7 @@ fn each_copy_reconciles_on_its_own() {
             PimdirMutation::SetFlags {
                 handle: PimdirHandle::from("u2"),
                 flags: PimdirFlags::from_iter(["flagged"]),
+                base: None,
             },
         )
         .unwrap();

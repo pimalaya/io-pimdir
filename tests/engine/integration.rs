@@ -109,6 +109,7 @@ fn full_offline_lifecycle() {
             PimdirMutation::SetFlags {
                 handle: PimdirHandle::from("i1"),
                 flags: PimdirFlags::from_iter(["seen"]),
+                base: None,
             },
         )
         .unwrap();
@@ -143,6 +144,7 @@ fn full_offline_lifecycle() {
             PimdirMutation::SetFlags {
                 handle: PimdirHandle::from("i1"),
                 flags: PimdirFlags::from_iter(["draft"]),
+                base: None,
             },
         )
         .unwrap();

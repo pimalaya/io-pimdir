@@ -155,7 +155,10 @@ fn single_source_write_reopen_lookup_and_gc() {
         .lookup_objects(&[PimdirLinkId("mid:a".into())])
         .unwrap();
     assert_eq!(
-        known.get(&PimdirLinkId("mid:a".into())).map(|o| &o.hash),
+        known
+            .get(&PimdirLinkId("mid:a".into()))
+            .and_then(|held| held.first())
+            .map(|held| &held.object.hash),
         Some(&PimdirHash(abc.clone()))
     );
 
@@ -805,7 +808,11 @@ fn a_staged_remove_hides_the_item_but_keeps_it_pending_a_sync() {
     run_mutation(
         &mut store,
         "INBOX",
-        PimdirMutation::Remove(PimdirHandle("1".into())),
+        PimdirMutation::Remove {
+            handle: PimdirHandle("1".into()),
+            if_match: None,
+            resolves: None,
+        },
     );
 
     // gone from the live-only client read surface

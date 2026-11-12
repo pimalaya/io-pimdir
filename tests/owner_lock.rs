@@ -87,8 +87,17 @@ fn a_producer_appends_while_another_process_owns_the_store() {
     // the owner is mid-sync, and the owner drains it when it gets there.
     let id = PimdirProducer::open(dir.path(), "test")
         .unwrap()
-        .enqueue("INBOX", &PimdirAction::Remove { seq: 1 }, None)
-        .unwrap();
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Remove {
+                seq: 1,
+                if_match: None,
+                resolves: None,
+            },
+            None,
+        )
+        .unwrap()
+        .id;
     assert_eq!(id, 1);
 }
 

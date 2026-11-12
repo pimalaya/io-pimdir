@@ -425,6 +425,7 @@ fn evicting_below_a_date_keeps_what_is_owed() {
             PimdirMutation::SetFlags {
                 handle: PimdirHandle::from("2"),
                 flags: PimdirFlags::from_iter(["\\Flagged"]),
+                base: None,
             },
         )
         .unwrap();
@@ -498,6 +499,7 @@ fn releasing_bodies_below_a_date_keeps_the_headers() {
             PimdirMutation::SetFlags {
                 handle: PimdirHandle::from("1"),
                 flags: PimdirFlags::from_iter(["\\Flagged"]),
+                base: None,
             },
         )
         .unwrap();

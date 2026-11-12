@@ -133,6 +133,7 @@ fn a_flag_the_store_cannot_hold_is_refused_at_the_enqueue_and_parked_by_the_drai
     let action = PimdirAction::SetFlags {
         seq,
         flags: PimdirFlags::from_iter(["two words"]),
+        base: None,
     };
     let refused = producer.enqueue("INBOX", &action, None).unwrap_err();
     assert!(matches!(&refused, PimdirError::Flag(flag) if flag == "two words"));

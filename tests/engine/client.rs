@@ -64,7 +64,14 @@ fn coroutine_error_propagates() {
     let mut client = Client::new(MemRemote::default());
 
     let err = client
-        .mutate("inbox", PimdirMutation::Remove(PimdirHandle::from("nope")))
+        .mutate(
+            "inbox",
+            PimdirMutation::Remove {
+                handle: PimdirHandle::from("nope"),
+                if_match: None,
+                resolves: None,
+            },
+        )
         .unwrap_err();
     assert_eq!(
         err,

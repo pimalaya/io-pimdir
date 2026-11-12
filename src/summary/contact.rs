@@ -10,8 +10,8 @@ use alloc::{
 };
 
 use crate::{
-    placement::{PimdirLinkId, PimdirSortKey},
-    summary::{PimdirAddress, PimdirDerivation, PimdirSummary, hash_key, unfold},
+    placement::PimdirSortKey,
+    summary::{PimdirAddress, PimdirDerivation, PimdirSummary, uid_key, unfold},
 };
 
 /// The `contact_summary` row of a card with the emails it carries.
@@ -63,10 +63,7 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
     };
 
     PimdirDerivation {
-        link_id: match &summary.uid {
-            Some(uid) => PimdirLinkId::from_hint(uid.as_str()),
-            None => hash_key(body),
-        },
+        link_id: uid_key(summary.uid.as_deref(), body),
         sort_key: summary.sort_key(),
         summary: Some(PimdirSummary::Contact(summary)),
     }
