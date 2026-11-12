@@ -6,8 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **BREAKING**: Added pimdir sync-draft-09, vendored at pimdir 317768b.
+
+  A store whose sync state an engine of sync-draft-08 wrote is refused (`sync-version`), never migrated, as one of this draft is refused by an engine of the last: a delivered create would read there as a member to push against and to find absent.
+
+- **BREAKING**: Added `PimdirPushResult::relocated`, which a connector sets on an accepted `Remove` carrying `to` that relocated the member rather than deleted it (SYNC §4): only a relocation delivers the destination's create.
+
+- **BREAKING**: Added `PimdirWriteOp::DeliverPlacement`, the write recording a create delivered before any listing named it: an add accepted with no handle, or a relocation into it accepted (pimdir SYNC §2).
+
+  A delivered create derives nothing, is never found absent and lands on the page naming its member, so a delete or a move staged on it is held, then pushed against the listed handle, rather than withdrawn. `PimdirSyncReport::waiting` counts the delivered creates a run holds. A storage applying the write ops matches the new variant (`deliver_binding`).
+
+- Added `PimdirHandle::is_provisional`, `PimdirPlacement::delivered` and `PimdirLinkId::is_landable`.
+
 ### Changed
 
+- Changed the upgrade to fetch no provisional handle: a pending or a delivered create waits for the page that lands it.
 - **BREAKING**: Changed the CLI's lists to print as plain text, with no border, no colour and no truncation.
 
   A wide list prints one record per item, the way `git log` prints commits: a title line with its state words in parentheses, aligned `Label: value` fields, then its free text indented by four spaces, one blank line between items. `collection list` titles each collection by its id, `item list` each item by its seq with its flags as state words and its title as the text, `queue list` each action by its id, `search` and `thread` each hit by its seq with its snippet as the text, `search --threads` each thread by its id with one line per hit as the text, and `tag` each hit by its seq with one field per placement. The collection counts of `store info` print as columns two spaces apart under an uppercase header. The `--json` output is unchanged.

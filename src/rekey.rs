@@ -205,8 +205,17 @@ impl PimdirRekey {
             }
         }
 
+        // NOTE: a delivered create no member resolved to is left as it is,
+        // neither re-staged, which would push its add again, nor dropped:
+        // its handle names no member a rekey could find absent (SYNC §8).
+        let waiting: BTreeSet<PimdirHandle> = old
+            .iter()
+            .filter(|p| p.delivered() && !carried_over.contains(&p.handle))
+            .map(|p| p.handle.clone())
+            .collect();
+
         for placement in &old {
-            if carried_over.contains(&placement.handle) {
+            if carried_over.contains(&placement.handle) || waiting.contains(&placement.handle) {
                 continue;
             }
             let edited = matches!(
@@ -239,7 +248,11 @@ impl PimdirRekey {
         }
         self.report.dropped += old
             .iter()
-            .filter(|p| p.status != PimdirStatus::Clean && !carried_over.contains(&p.handle))
+            .filter(|p| {
+                p.status != PimdirStatus::Clean
+                    && !carried_over.contains(&p.handle)
+                    && !waiting.contains(&p.handle)
+            })
             .count();
 
         // NOTE: every old handle but one carried onto itself is dropped, and
@@ -252,6 +265,9 @@ impl PimdirRekey {
         let mut drops = Vec::new();
         for placement in &old {
             let moved = restaged.contains(&placement.handle);
+            if waiting.contains(&placement.handle) {
+                continue;
+            }
             if in_place.contains(&placement.handle) && !moved {
                 continue;
             }
@@ -410,6 +426,16 @@ impl PimdirRekey {
             }),
             origin: old.origin.clone(),
         };
+
+        // NOTE: a delivered create carried onto its member is landed there,
+        // so an immutable one's base takes the staged body, one identity
+        // being one message (SYNC §6, §8).
+        if old.delivered()
+            && observed.is_none()
+            && let Some(base) = &mut carried.base
+        {
+            base.object = old.object.clone();
+        }
 
         let flags_pending = carried.flags != item.flags;
         match old.status {
@@ -580,7 +606,7 @@ impl PimdirCoroutine for PimdirRekey {
                         let based: BTreeSet<PimdirHandle> = self
                             .old
                             .iter()
-                            .filter(|p| p.base.is_some())
+                            .filter(|p| p.base.is_some() && !p.delivered())
                             .map(|p| p.handle.clone())
                             .collect();
                         let named = !self.items.is_empty();
@@ -1091,6 +1117,62 @@ mod tests {
             PimdirCoroutineState::Complete(Err(PimdirArgError::IncompleteListing)) => {}
             state => panic!("expected IncompleteListing, got {state:?}"),
         }
+    }
+
+    /// A delivered create is carried onto the member resolving to its link
+    /// id, as a page lands it, and one no member resolves to is left as it
+    /// is, neither re-staged, dropped nor counted (SYNC §8).
+    #[test]
+    fn a_delivered_create_is_carried_onto_its_member_or_left() {
+        let delivered = |link: &str| {
+            let mut create = synced(&format!("\u{1}{link}"), link, &["seen"]);
+            create.object = Some(PimdirHash::from("h-1"));
+            create.level = PimdirLevel::Full;
+            create.status = PimdirStatus::Dirty;
+            create.base = Some(PimdirBase {
+                flags: PimdirFlags::Unknown,
+                revision: None,
+                object: None,
+            });
+            create
+        };
+
+        let (writes, report) = run(
+            vec![delivered("msg-a"), delivered("msg-b")],
+            vec![item("v2-0", &[])],
+            vec![fetched("v2-0", "msg-a")],
+        );
+
+        let carried = upserted(&writes, "v2-0").expect("carried onto its member");
+        assert_eq!(carried.link_id, Some(PimdirLinkId::from("msg-a")));
+        assert_eq!(
+            carried.flags,
+            PimdirFlags::from_iter(["seen"]),
+            "the staged flag stays"
+        );
+        let base = carried.base.as_ref().expect("a base");
+        assert_eq!(
+            base.flags,
+            PimdirFlags::default(),
+            "the base takes the listed flags"
+        );
+        assert_eq!(
+            base.object,
+            Some(PimdirHash::from("h-1")),
+            "and the staged body"
+        );
+        assert!(
+            upserted(&writes, "\u{1}msg-b").is_none(),
+            "the unresolved one is not re-staged: {writes:?}",
+        );
+        assert!(
+            !writes.iter().any(|w| matches!(
+                w,
+                PimdirWriteOp::DropPlacement { handle, .. } if handle.as_str() == "\u{1}msg-b"
+            )),
+            "nor dropped: {writes:?}",
+        );
+        assert!(report.parked.is_none());
     }
 
     #[test]

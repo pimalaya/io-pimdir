@@ -53,8 +53,8 @@ use crate::{
     load::{PimdirLoadSelection, PimdirLoaded},
     object::{PimdirHash, PimdirObject},
     placement::{
-        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
-        PimdirStatus, PimdirSuperseded,
+        PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
+        PimdirPlacement, PimdirStatus, PimdirSuperseded,
     },
     remote::{
         PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirHead, PimdirHeads,
@@ -70,7 +70,7 @@ mod join;
 /// The version of SYNC.md this engine follows (SYNC §10), which a store
 /// records in `store_meta.sync_version` with the engine's first write: a
 /// store naming another is refused before any verb runs.
-pub const SYNC_VERSION: &str = "sync-draft-08";
+pub const SYNC_VERSION: &str = "sync-draft-09";
 
 /// Which push kinds a writable source may derive.
 ///
@@ -270,7 +270,8 @@ pub struct PimdirSyncReport {
     pub refreshed: usize,
     /// Pending creates whose add waits for a round whose scope holds their
     /// date (SYNC §5): each may be its own arrival, relocated with its
-    /// `Date` kept, which no page of this scope lists.
+    /// `Date` kept, which no page of this scope lists. Delivered creates
+    /// waiting for the page naming their member count too (SYNC §2, §5).
     pub waiting: usize,
     /// Changes withheld because the body they upload failed its name or
     /// was missing (STORAGE §7): the placement stays as it was.
@@ -844,7 +845,7 @@ impl PimdirSync {
                 true => self
                     .local
                     .values()
-                    .filter(|p| p.base.is_some() && !listed.contains(&p.handle))
+                    .filter(|p| p.base.is_some() && !p.delivered() && !listed.contains(&p.handle))
                     .filter(|p| round.finds_absent(date_of(p)))
                     .map(|p| p.handle.clone())
                     .collect(),
@@ -874,7 +875,7 @@ impl PimdirSync {
             let bound = self
                 .local
                 .values()
-                .filter(|p| p.base.is_some() && round.finds_absent(date_of(p)))
+                .filter(|p| p.base.is_some() && !p.delivered() && round.finds_absent(date_of(p)))
                 .count();
             let named = self.named || !page.items.is_empty() || self.stamped(round, &page);
             let accepted = self.opts.accept_absences;
@@ -1041,7 +1042,7 @@ impl PimdirSync {
 
         self.local
             .values()
-            .filter(|p| p.base.is_some() && round.finds_absent(date_of(p)))
+            .filter(|p| p.base.is_some() && !p.delivered() && round.finds_absent(date_of(p)))
             .filter(|p| provable(p))
             .any(|p| !unstamped.contains(&p.handle))
     }
@@ -1172,13 +1173,14 @@ impl PimdirSync {
 
     /// Takes the pending create of this source holding `hint`, if any.
     ///
-    /// A `Created` placement with no base under a provisional handle is
-    /// the create a listed `hint` delivers (SYNC §6), keyed by the hint or,
-    /// staged beside a copy already holding it, by the key minted over its
-    /// provisional handle (SYNC §7); taken out so a second arrival of the
-    /// same hint in the page is minted instead. A mail member whose summary
-    /// names another message than the create's is another message reusing
-    /// the `Message-ID`, minted rather than joined (SYNC §6).
+    /// A `Created` placement with no base under a provisional handle, or a
+    /// delivered create (SYNC §2), is the create a listed `hint` delivers
+    /// (SYNC §6), keyed by the hint or, staged beside a copy already holding
+    /// it, by the key minted over its provisional handle (SYNC §7); taken
+    /// out so a second arrival of the same hint in the page is minted
+    /// instead. A mail member whose summary names another message than the
+    /// create's is another message reusing the `Message-ID`, minted rather
+    /// than joined (SYNC §6).
     fn take_pending_create(&mut self, item: &PimdirRemoteItem) -> Option<PimdirPlacement> {
         let hint = &item.meta.link_id;
         let arrived = &item.handle;
@@ -1188,8 +1190,8 @@ impl PimdirSync {
             .find_map(|key| {
                 self.local.values().find(|p| {
                     p.link_id.as_ref() == Some(key)
-                        && p.status == PimdirStatus::Created
-                        && p.base.is_none()
+                        && ((p.status == PimdirStatus::Created && p.base.is_none())
+                            || p.delivered())
                         && &p.handle != arrived
                         && summary::same_message(p.summary.as_ref(), item.meta.summary.as_ref())
                 })
@@ -1212,8 +1214,10 @@ impl PimdirSync {
     /// incoming body unknown: nothing read what the server holds at that
     /// revision, so whatever the policy the binding is conflicted there
     /// with no diverging body, its base naming none, which the upgrade
-    /// fetches (SYNC §6). The join drops the provisional handle,
-    /// `Superseded`.
+    /// fetches (SYNC §6). A delivered create tombstoned since lands as a
+    /// tombstone, carrying the destination its load derived, if any, so
+    /// its remove is pushed against the listed handle (SYNC §5, §6). The
+    /// join drops the provisional handle, `Superseded`.
     fn land(&mut self, create: PimdirPlacement, item: &PimdirRemoteItem) -> PimdirPlacement {
         debug!(
             "land the pending create {} under {}",
@@ -1221,6 +1225,7 @@ impl PimdirSync {
             item.handle.as_str(),
         );
 
+        let tombstone = create.status == PimdirStatus::Tombstone;
         let mut landed = create;
         landed.handle = item.handle.clone();
 
@@ -1280,7 +1285,10 @@ impl PimdirSync {
             landed.conflict_revision = item.revision.clone();
             landed.conflict_object = None;
         }
-        landed.origin = None;
+        match tombstone && !unread {
+            true => landed.status = PimdirStatus::Tombstone,
+            false => landed.origin = None,
+        }
 
         landed
     }
@@ -1495,6 +1503,18 @@ impl PimdirSync {
 
         loop {
             let candidate = merge.join.next()?;
+            // NOTE: a delivered create waits for the page naming its member,
+            // whatever a round lists, and is reported while it does (SYNC
+            // §5), as a create waiting for its scope is.
+            if merge.narrowing == Narrowing::Delta
+                && candidate.remote.is_none()
+                && candidate
+                    .local
+                    .as_ref()
+                    .is_some_and(PimdirPlacement::delivered)
+            {
+                self.report.waiting += 1;
+            }
             if let Some(candidate) = merge.narrow(candidate) {
                 return Some(candidate);
             }
@@ -1585,7 +1605,18 @@ impl PimdirSync {
                     return self.refuse_delete(local);
                 }
 
-                self.pending.insert(handle.clone(), Pending::Remove);
+                // NOTE: the relocation delivers the destination only where a
+                // listing can land it: a create keyed by a key minted over
+                // another handle stays pending, no arrival naming it (SYNC §4).
+                let delivered = local.origin.clone().filter(|destination| {
+                    destination
+                        .handle
+                        .as_str()
+                        .strip_prefix('\u{1}')
+                        .is_some_and(|key| PimdirLinkId::from(key).is_landable())
+                });
+                self.pending
+                    .insert(handle.clone(), Pending::Remove(delivered));
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
                 // NOTE: a destination keyed by a minted key held the
                 // identity before the move, so holding it proves no
@@ -2023,19 +2054,46 @@ impl PimdirSync {
             Pending::Content(placement) => {
                 self.rebase_content(&placement, result.revision.clone());
             }
-            Pending::Remove => self.drop(&result.handle, PimdirDropReason::Deleted),
+            Pending::Remove(destination) => {
+                self.drop(&result.handle, PimdirDropReason::Deleted);
+                // NOTE: a relocation the outcome states delivered the create
+                // its destination names, which derives nothing until the
+                // target's listing lands it, so an action on it waits for
+                // that landing rather than withdrawing it (SYNC §4, §5). One
+                // the connector deleted, the target already holding the
+                // identity, delivered nothing: the create stays pending.
+                if let Some(destination) = destination.filter(|_| result.relocated) {
+                    self.writes.push(PimdirWriteOp::DeliverPlacement {
+                        collection: destination.collection,
+                        handle: destination.handle,
+                    });
+                }
+            }
             Pending::Create(placeholder) => match result.assigned.clone() {
                 Some(assigned) => {
                     self.rekey_create(placeholder, assigned.clone(), result.revision.clone());
                     self.emit(PimdirSyncEvent::Created(assigned));
                 }
                 // NOTE: accepted with no handle (an APPEND without UIDPLUS):
-                // nothing names the member yet, so the create stays pending,
+                // nothing names the member yet, so the create is delivered,
                 // unreported, and the page naming it lands it (SYNC §4).
-                None => debug!(
-                    "add {} accepted with no handle, the next listing lands it",
-                    placeholder.handle.as_str(),
-                ),
+                None => {
+                    debug!(
+                        "add {} accepted with no handle, the next listing lands it",
+                        placeholder.handle.as_str(),
+                    );
+                    let landable = placeholder.handle.is_provisional()
+                        && placeholder
+                            .link_id
+                            .as_ref()
+                            .is_some_and(PimdirLinkId::is_landable);
+                    if landable {
+                        self.writes.push(PimdirWriteOp::DeliverPlacement {
+                            collection: placeholder.collection,
+                            handle: placeholder.handle,
+                        });
+                    }
+                }
             },
         }
     }
@@ -2669,8 +2727,9 @@ enum Pending {
     /// A content push: the placement the merge last wrote, to rebase onto
     /// the pushed body and the reported revision.
     Content(PimdirPlacement),
-    /// A delete: the tombstone is dropped once confirmed.
-    Remove,
+    /// A delete: the tombstone is dropped once confirmed, and the create
+    /// its destination names, when it relocated, delivered.
+    Remove(Option<PimdirOrigin>),
     /// A create: the placeholder is superseded by the assigned handle.
     Create(PimdirPlacement),
 }
@@ -2850,9 +2909,14 @@ mod tests {
         let mut pushes = None;
         let writes = match begin(sync, local, Some(Page(snapshot))) {
             PimdirCoroutineState::Yielded(PimdirYield::WantsPush { changes, .. }) => {
+                // NOTE: a connector relocating whatever it is asked to.
                 let results = changes
                     .iter()
                     .map(|change| PimdirPushResult {
+                        relocated: matches!(
+                            &change.kind,
+                            PimdirChangeKind::Remove { to: Some(_), .. }
+                        ),
                         handle: change.handle().clone(),
                         outcome: PimdirPushOutcome::Accepted,
                         assigned: None,
@@ -3034,6 +3098,7 @@ mod tests {
                     let results = changes
                         .iter()
                         .map(|change| PimdirPushResult {
+                            relocated: false,
                             handle: change.handle().clone(),
                             outcome: PimdirPushOutcome::Accepted,
                             assigned: None,
@@ -3079,6 +3144,7 @@ mod tests {
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("1"),
             outcome: PimdirPushOutcome::Rejected,
             assigned: None,
@@ -3101,6 +3167,7 @@ mod tests {
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("1"),
             outcome: PimdirPushOutcome::Accepted,
             assigned: None,
@@ -3130,6 +3197,7 @@ mod tests {
 
     fn accepted(handle: &str) -> PimdirPushResult {
         PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from(handle),
             outcome: PimdirPushOutcome::Accepted,
             assigned: None,
@@ -3139,6 +3207,7 @@ mod tests {
 
     fn rejected(handle: &str) -> PimdirPushResult {
         PimdirPushResult {
+            relocated: false,
             outcome: PimdirPushOutcome::Rejected,
             ..accepted(handle)
         }
@@ -3221,12 +3290,14 @@ mod tests {
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![
             PimdirPushResult {
+                relocated: false,
                 handle: PimdirHandle::from("1"),
                 outcome: PimdirPushOutcome::Accepted,
                 assigned: None,
                 revision: None,
             },
             PimdirPushResult {
+                relocated: false,
                 handle: PimdirHandle::from("2"),
                 outcome: PimdirPushOutcome::Rejected,
                 assigned: None,
@@ -3260,6 +3331,7 @@ mod tests {
 
         let mut first = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("1"),
             outcome: PimdirPushOutcome::Rejected,
             assigned: None,
@@ -3766,6 +3838,7 @@ mod tests {
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("1"),
             outcome: PimdirPushOutcome::Accepted,
             assigned: None,
@@ -3794,6 +3867,7 @@ mod tests {
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("1"),
             outcome: PimdirPushOutcome::Rejected,
             assigned: None,
@@ -4089,6 +4163,7 @@ mod tests {
         local.object = Some(PimdirHash::from("h-1"));
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("tmp-1"),
             outcome: PimdirPushOutcome::Accepted,
             assigned: Some(PimdirHandle::from("42")),
@@ -4116,6 +4191,7 @@ mod tests {
         let local = created("tmp-1");
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("tmp-1"),
             outcome: PimdirPushOutcome::Rejected,
             assigned: None,
@@ -4153,25 +4229,223 @@ mod tests {
         assert_eq!(report.pushed, 1);
     }
 
-    /// Without an assigned handle (no UIDPLUS) the create stays pending,
+    /// Without an assigned handle (no UIDPLUS) the create is delivered,
     /// unreported, for the page naming it to land (SYNC §4).
     #[test]
-    fn an_add_accepted_without_a_handle_stays_pending() {
-        let local = created("tmp-1");
+    fn an_add_accepted_without_a_handle_is_delivered() {
+        let local = pending_create();
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
-            handle: PimdirHandle::from("tmp-1"),
+            relocated: false,
+            handle: PimdirHandle::from("\u{1}m1"),
             outcome: PimdirPushOutcome::Accepted,
             assigned: None,
             revision: None,
         }];
         let (writes, report) = run_push(&mut sync, vec![local], vec![], results);
 
-        assert!(
-            writes.is_empty(),
-            "the create is left as it was: {writes:?}"
+        assert_eq!(
+            writes,
+            [PimdirWriteOp::DeliverPlacement {
+                collection: "inbox".into(),
+                handle: "\u{1}m1".into(),
+            }],
+            "the create is delivered, nothing else written",
         );
         assert!(report.events.is_empty(), "nothing names the member yet");
+    }
+
+    /// A connector deleting rather than relocating, the target already
+    /// holding the identity, delivers nothing: the create stays pending
+    /// (SYNC §4).
+    #[test]
+    fn a_relocation_carried_out_as_a_delete_delivers_nothing() {
+        let mut local = synced("1", &["seen"]);
+        local.status = PimdirStatus::Tombstone;
+        local.origin = Some(PimdirOrigin {
+            collection: "trash".into(),
+            handle: PimdirHandle::from("\u{1}1"),
+        });
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let results = vec![PimdirPushResult {
+            relocated: false,
+            handle: PimdirHandle::from("1"),
+            outcome: PimdirPushOutcome::Accepted,
+            assigned: None,
+            revision: None,
+        }];
+        let (writes, _report) = run_push(
+            &mut sync,
+            vec![local],
+            vec![remote("1", &["seen"])],
+            results,
+        );
+
+        assert!(
+            !writes
+                .iter()
+                .any(|op| matches!(op, PimdirWriteOp::DeliverPlacement { .. })),
+            "the target already held it, the create stays pending: {writes:?}",
+        );
+    }
+
+    /// An accepted relocation delivers the create its destination names,
+    /// which the target's listing lands (SYNC §4, §5).
+    #[test]
+    fn an_accepted_relocation_delivers_its_destination() {
+        let mut local = synced("1", &["seen"]);
+        local.status = PimdirStatus::Tombstone;
+        local.origin = Some(PimdirOrigin {
+            collection: "trash".into(),
+            handle: PimdirHandle::from("\u{1}1"),
+        });
+
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (_pushes, writes, _report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
+
+        assert!(
+            writes.contains(&PimdirWriteOp::DeliverPlacement {
+                collection: "trash".into(),
+                handle: "\u{1}1".into(),
+            }),
+            "the destination's create is delivered: {writes:?}",
+        );
+
+        // NOTE: a create keyed by a key minted over another handle is
+        // landed by no listing, so it stays pending.
+        let mut local = synced("1", &["seen"]);
+        local.status = PimdirStatus::Tombstone;
+        local.origin = Some(PimdirOrigin {
+            collection: "trash".into(),
+            handle: PimdirHandle::from("\u{1}dup:1#u2"),
+        });
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (_pushes, writes, _report) = run(&mut sync, vec![local], vec![remote("1", &["seen"])]);
+        assert!(
+            !writes
+                .iter()
+                .any(|op| matches!(op, PimdirWriteOp::DeliverPlacement { .. })),
+            "no listing lands it: {writes:?}",
+        );
+    }
+
+    /// A create delivered into "inbox" under `m1`, deleted since.
+    fn delivered_tombstone() -> PimdirPlacement {
+        let mut create = pending_create();
+        create.status = PimdirStatus::Tombstone;
+        create.base = Some(PimdirBase {
+            flags: PimdirFlags::Unknown,
+            revision: None,
+            object: None,
+        });
+        create.origin = Some(PimdirOrigin {
+            collection: "archive".into(),
+            handle: PimdirHandle::from("\u{1}m1"),
+        });
+        create
+    }
+
+    /// A delete staged on a delivered create is held while no page names
+    /// its member, never dropped nor pushed (SYNC §5).
+    #[test]
+    fn a_delivered_tombstone_waits_for_its_arrival() {
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (pushes, writes, _report) = run_snapshot(
+            &mut sync,
+            vec![delivered_tombstone()],
+            delta(vec![], vec![]),
+        );
+
+        assert!(pushes.is_none(), "nothing pushed: {pushes:?}");
+        assert!(
+            !writes
+                .iter()
+                .any(|op| matches!(op, PimdirWriteOp::DropPlacement { .. })),
+            "nothing dropped: {writes:?}",
+        );
+
+        let mut delivered = pending_create();
+        delivered.flags = PimdirFlags::from_iter(["seen"]);
+        delivered.status = PimdirStatus::Dirty;
+        delivered.base = delivered_tombstone().base;
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (pushes, writes, _report) =
+            run_snapshot(&mut sync, vec![delivered], delta(vec![], vec![]));
+        assert!(pushes.is_none(), "no add nor flags pushed");
+        assert!(
+            writes
+                .iter()
+                .all(|op| matches!(op, PimdirWriteOp::SetCheckpoint { .. })),
+            "the checkpoint alone written: {writes:?}",
+        );
+    }
+
+    /// A round landing no delivered create proves nothing of it: live or
+    /// tombstoned, it waits, reported, neither dropped nor parking the round
+    /// (SYNC §5).
+    #[test]
+    fn a_round_landing_no_delivered_create_keeps_it_waiting() {
+        let mut delivered = pending_create();
+        delivered.object = None;
+        delivered.level = PimdirLevel::Meta;
+        delivered.status = PimdirStatus::Clean;
+        delivered.base = delivered_tombstone().base;
+        let mut tombstone = delivered_tombstone();
+        tombstone.handle = PimdirHandle::from("\u{1}m2");
+        tombstone.link_id = Some(PimdirLinkId::from("m2"));
+
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (pushes, writes, report) = run(&mut sync, vec![delivered, tombstone], vec![]);
+
+        assert!(pushes.is_none(), "nothing to push: no body, no origin");
+        assert!(report.parked.is_none(), "neither is a based member");
+        assert_eq!(report.waiting, 2, "both reported waiting");
+        assert!(
+            upserted(&writes, "\u{1}m1").is_none() && upserted(&writes, "\u{1}m2").is_none(),
+            "both wait as they were: {writes:?}",
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|op| matches!(op, PimdirWriteOp::DropPlacement { .. })),
+            "nothing dropped: {writes:?}",
+        );
+    }
+
+    /// The page naming the member lands the delivered tombstone and pushes
+    /// its relocation against the listed handle (SYNC §5, §6).
+    #[test]
+    fn a_landed_delivered_tombstone_pushes_its_remove() {
+        let mut arrival = remote("7", &[]);
+        arrival.meta.link_id = PimdirLinkId::from("m1");
+
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let (pushes, writes, report) = run_snapshot(
+            &mut sync,
+            vec![delivered_tombstone()],
+            delta(vec![arrival], vec![]),
+        );
+
+        match &pushes.expect("the held remove")[..] {
+            [change] => match &change.kind {
+                PimdirChangeKind::Remove { handle, to, .. } => {
+                    assert_eq!(handle.as_str(), "7");
+                    assert_eq!(to.as_ref().map(|to| to.as_str()), Some("archive"));
+                }
+                other => panic!("expected a Remove, got {other:?}"),
+            },
+            other => panic!("expected one push, got {other:?}"),
+        }
+        assert!(writes.iter().any(|op| matches!(
+            op,
+            PimdirWriteOp::DropPlacement { handle, reason: PimdirDropReason::Superseded, .. }
+                if handle.as_str() == "\u{1}m1"
+        )));
+        assert!(writes.contains(&PimdirWriteOp::DeliverPlacement {
+            collection: "archive".into(),
+            handle: "\u{1}m1".into(),
+        }));
+        assert_eq!(report.events, [PimdirSyncEvent::Created("7".into())]);
     }
 
     /// The listing a sync asks for over a source's sync state (SYNC §5).
@@ -4731,6 +5005,7 @@ mod tests {
         }
 
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("1"),
             outcome: PimdirPushOutcome::Accepted,
             assigned: None,
@@ -4756,6 +5031,7 @@ mod tests {
 
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("1"),
             outcome: PimdirPushOutcome::Accepted,
             assigned: None,
@@ -5563,6 +5839,7 @@ mod tests {
     fn event_created_on_accepted_create() {
         let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
         let results = vec![PimdirPushResult {
+            relocated: false,
             handle: PimdirHandle::from("tmp"),
             outcome: PimdirPushOutcome::Accepted,
             assigned: Some(PimdirHandle::from("99")),

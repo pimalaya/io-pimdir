@@ -148,6 +148,9 @@ impl PimdirUpgrade {
     fn pending_handles(&self) -> Vec<PimdirHandle> {
         self.handles
             .iter()
+            // NOTE: a provisional handle names no member to fetch: a pending
+            // or a delivered create waits for the page that lands it (SYNC §6).
+            .filter(|h| !h.is_provisional())
             .filter(|h| match self.placements.get(h) {
                 Some(p) => match self.tier {
                     PimdirTier::Meta => p.summary.is_none(),

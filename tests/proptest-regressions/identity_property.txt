@@ -7,3 +7,4 @@
 cc ce849ef78e09910b4ffaf1c3bf9baeed73ae1c01f5d08a1f2d8ca2a12d57d867 # shrinks to ops = [ServerRemove(0)]
 cc 8b0a38ddf8db05fa1d83be88a33d1df7010160c3743b35f5fe10af2ec67fa53d # shrinks to ops = [Copy(8922895000836163228), Copy(13433582686087170241), Add(0, 0)]
 cc be136438b34d5478383a41208a696ccaa9bea84de15bab72912a0dcc4921c7be # shrinks to ops = [ServerRemove(17256837399858472593), Move(3758741912264068558), ServerRemove(2173861505937078131), ServerAdd(0, 0), Sync(false), ServerRemove(0)]
+cc 634511817bd3444083b4af56fb75ffe4189e8a67e4c854cc31af54a0a0d2635e # shrinks to ops = [Hydrate(false), Move(9143288489783788852), Sync(true), Move(0), Copy(0)]

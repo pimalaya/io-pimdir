@@ -273,7 +273,8 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
     every_body_is_held(&client, "after quiescence")?;
 
     // NOTE: a create holding neither an origin nor a body cannot deliver
-    // and stays visibly pending (SYNC §5), so it is no member to mirror
+    // and stays visibly pending (SYNC §5), as a delivered one holding no
+    // body waits, reported, for its arrival: neither is a member to mirror
     for collection in COLLECTIONS {
         let local: BTreeSet<PimdirHandle> = rows(&client, collection)
             .into_iter()
@@ -281,6 +282,7 @@ fn check_identity_model(ops: Vec<IdOp>) -> Result<(), TestCaseError> {
             .filter(|p| {
                 p.status != PimdirStatus::Created || p.object.is_some() || p.origin.is_some()
             })
+            .filter(|p| !(p.delivered() && p.object.is_none()))
             .map(|p| p.handle)
             .collect();
         let server = on_server(&client, collection);

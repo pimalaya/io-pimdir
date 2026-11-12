@@ -503,6 +503,11 @@ pub struct PimdirPushResult {
     ///
     /// `None` when the remote reports none, and for flag and remove pushes.
     pub revision: Option<String>,
+    /// Whether an accepted `Remove` carrying `to` relocated the member into
+    /// it (SYNC §4): only a relocation delivers the destination's create.
+    /// `false` when the connector deleted it, `to` already holding the
+    /// identity, and for every other change.
+    pub relocated: bool,
 }
 
 /// The connector seam (SYNC §4): what a runner asks of IMAP, JMAP or DAV.

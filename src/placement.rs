@@ -33,6 +33,14 @@ crate::pimdir_id! {
     PimdirLinkId, Ord, PartialOrd, Hash,
 }
 
+impl PimdirHandle {
+    /// Whether the handle is a provisional one (SYNC §2): `U+0001` then a
+    /// key, which no protocol hands out, so it names no member.
+    pub fn is_provisional(&self) -> bool {
+        self.0.starts_with('\u{1}')
+    }
+}
+
 impl PimdirLinkId {
     /// The prefixes STORAGE §9 reserves: the five a writer derives keys
     /// under, and the escape.
@@ -78,6 +86,24 @@ impl PimdirLinkId {
         handle.push_str(self.as_str());
 
         PimdirHandle(handle)
+    }
+
+    /// Whether a listing can land a create of this key (SYNC §6): the key
+    /// is a hint a source may state, or one minted over the provisional
+    /// handle that hint derives. A key minted over another handle is a
+    /// hint no source states (STORAGE §9 escapes one beginning `dup:`), so
+    /// no arrival lands a create of it.
+    pub fn is_landable(&self) -> bool {
+        let Some(minted) = self.0.strip_prefix("dup:") else {
+            return true;
+        };
+        // NOTE: the key, `#`, U+0001 and the key again, so the key is cut
+        // out by its length, as origin_for_link reads a minted key.
+        let length = minted.len().saturating_sub(2) / 2;
+        let Some(key) = minted.get(..length) else {
+            return false;
+        };
+        !key.starts_with("dup:") && Self::from(key).minted(&Self::from(key).provisional()) == *self
     }
 
     /// The key a second copy of this identity takes in one collection.
@@ -355,6 +381,14 @@ impl PimdirPlacement {
         (!synced).then_some(object)
     }
 
+    /// Whether the placement is a delivered create (SYNC §2): based under
+    /// its provisional handle, its add or the relocation into it accepted
+    /// before any listing named the member, which derives nothing until
+    /// the page naming it lands it (SYNC §5, §6).
+    pub fn delivered(&self) -> bool {
+        self.base.is_some() && self.handle.is_provisional()
+    }
+
     /// Whether a held body faces a base naming no body (SYNC §5).
     pub fn awaits_base(&self) -> bool {
         self.object.is_some()
@@ -387,6 +421,22 @@ mod tests {
             PimdirLinkId::from("m")
         );
         assert_eq!(PimdirLinkId::from("m").as_str(), "m");
+    }
+
+    /// A listing lands a create keyed by a hint or by the hint minted over
+    /// its provisional handle, never one minted over another handle, which
+    /// no source states (SYNC §6).
+    #[test]
+    fn a_key_minted_over_another_handle_is_landed_by_no_listing() {
+        let hint = PimdirLinkId::from("m@x");
+        assert!(hint.is_landable());
+        assert!(hint.minted(&hint.provisional()).is_landable());
+        assert!(PimdirLinkId::from("alt:a|b").is_landable());
+
+        let minted = hint.minted(&PimdirHandle::from("7"));
+        assert!(!minted.is_landable());
+        assert!(!minted.minted(&minted.provisional()).is_landable());
+        assert!(!PimdirLinkId::from("dup:").is_landable());
     }
 
     /// A connector names the identity a body states, the one `esc:` the

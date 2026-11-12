@@ -76,6 +76,13 @@ impl Merge {
         if local.status == PimdirStatus::Clean {
             return None;
         }
+        // NOTE: a delivered create's handle names no member yet, so it is no
+        // candidate: it derives no change and no drop, a delete or a move
+        // staged on it held, until the page naming its member lands it under
+        // the listed handle (SYNC §5).
+        if local.delivered() {
+            return None;
+        }
 
         // NOTE: a staged create has no base to synthesize a remote from,
         // and is still a candidate: its add is what a listing never names.

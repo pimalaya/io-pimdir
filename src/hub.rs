@@ -371,6 +371,9 @@ impl PimdirHub {
                 PimdirWriteOp::DropPlacement { handle, reason, .. } => {
                     self.absorb_drop(source, handle, *reason)
                 }
+                PimdirWriteOp::DeliverPlacement { handle, .. } => {
+                    self.absorb_delivery(source, handle)
+                }
                 PimdirWriteOp::Overrule { handle, .. } => {
                     self.overruling.insert(handle.clone());
                 }
@@ -762,6 +765,29 @@ impl PimdirHub {
     /// Unbinds the source; a `Deleted` drop also marks the item deleted,
     /// while a licensed one keeps the binding aside for the upsert that
     /// moves it (SYNC §10).
+    /// Records the create bound under the provisional `handle` delivered
+    /// (SYNC §2, §4): its binding gains a base naming nothing while it holds
+    /// none, and one holding a base, or no binding, is left as it is.
+    fn absorb_delivery(&mut self, source: &PimdirSourceId, handle: &PimdirHandle) {
+        if !handle.is_provisional() {
+            return;
+        }
+        let binding = self
+            .items
+            .values_mut()
+            .filter_map(|item| item.sources.get_mut(source))
+            .find(|binding| &binding.handle == handle);
+        if let Some(binding) = binding
+            && binding.base.is_none()
+        {
+            binding.base = Some(PimdirBase {
+                flags: PimdirFlags::Unknown,
+                revision: None,
+                object: None,
+            });
+        }
+    }
+
     fn absorb_drop(
         &mut self,
         source: &PimdirSourceId,
@@ -1019,6 +1045,56 @@ mod tests {
     fn a_missing_item_without_a_body_is_not_projected_no_fetch() {
         let hub = hub_with_left(&["seen"]);
         assert!(placements(&hub, "right").is_empty());
+    }
+
+    /// A delivery bases a binding under a provisional handle while it holds
+    /// none, and leaves a based one, a member's handle and another source's
+    /// binding as they are (SYNC §2, STORAGE §14).
+    #[test]
+    fn a_delivery_bases_a_pending_create_alone() {
+        let mut hub = hub_with_left(&["seen"]);
+        let item = hub.items.get_mut(&PimdirLinkId::from("m1")).unwrap();
+        let left = item.sources.get_mut(&PimdirSourceId::from("left")).unwrap();
+        left.handle = PimdirHandle::from("\u{1}m1");
+        left.base = None;
+        let deliver = |handle: &str| PimdirWriteOp::DeliverPlacement {
+            collection: "inbox".into(),
+            handle: PimdirHandle::from(handle),
+        };
+        let base_of = |hub: &PimdirHub| {
+            hub.items[&PimdirLinkId::from("m1")].sources[&PimdirSourceId::from("left")]
+                .base
+                .clone()
+        };
+
+        hub.absorb(&PimdirSourceId::from("right"), &[deliver("\u{1}m1")]);
+        assert_eq!(
+            base_of(&hub),
+            None,
+            "another source's delivery moves nothing"
+        );
+
+        hub.absorb(&PimdirSourceId::from("left"), &[deliver("\u{1}m1")]);
+        let delivered = PimdirBase {
+            flags: PimdirFlags::Unknown,
+            revision: None,
+            object: None,
+        };
+        assert_eq!(
+            base_of(&hub),
+            Some(delivered.clone()),
+            "a base naming nothing"
+        );
+
+        let item = hub.items.get_mut(&PimdirLinkId::from("m1")).unwrap();
+        let left = item.sources.get_mut(&PimdirSourceId::from("left")).unwrap();
+        left.base = Some(base(&["seen"]));
+        hub.absorb(&PimdirSourceId::from("left"), &[deliver("\u{1}m1")]);
+        assert_eq!(
+            base_of(&hub),
+            Some(base(&["seen"])),
+            "a based binding stays"
+        );
     }
 
     #[test]

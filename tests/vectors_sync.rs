@@ -745,22 +745,25 @@ impl PimdirRemote for Scripted {
         for change in changes {
             self.pushes.push(self.record(&change));
             let handle = change.handle().clone();
-            let scripted = self
+            // NOTE: a push the case feeds no outcome back for is unreported,
+            // which leaves it pending (SYNC §5): read as accepted with no
+            // handle, it would deliver its create (SYNC §4).
+            let Some(scripted) = self
                 .outcomes
                 .iter()
-                .find(|o| o["handle"].as_str() == Some(&handle.0));
+                .find(|o| o["handle"].as_str() == Some(&handle.0))
+            else {
+                continue;
+            };
             results.push(PimdirPushResult {
+                relocated: scripted["relocated"].as_bool().unwrap_or(false),
                 handle,
-                outcome: match scripted.and_then(|o| o["outcome"].as_str()) {
+                outcome: match scripted["outcome"].as_str() {
                     Some("Rejected") => PimdirPushOutcome::Rejected,
                     _ => PimdirPushOutcome::Accepted,
                 },
-                assigned: scripted
-                    .and_then(|o| o["assigned"].as_str())
-                    .map(PimdirHandle::from),
-                revision: scripted
-                    .and_then(|o| o["revision"].as_str())
-                    .map(String::from),
+                assigned: scripted["assigned"].as_str().map(PimdirHandle::from),
+                revision: scripted["revision"].as_str().map(String::from),
             });
         }
         Ok(results)
@@ -1375,7 +1378,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 3, "{label}: the sync format's version");
+        assert_eq!(case["v"], 4, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 

@@ -664,6 +664,7 @@ impl PimdirRemote for MemRemote {
                         rejected(handle)
                     } else {
                         let seq = self.bump();
+                        let mut relocated = false;
                         // NOTE: a missing member is an accept by contract,
                         // the delete having already landed.
                         if let Some(item) = self
@@ -681,9 +682,16 @@ impl PimdirRemote for MemRemote {
                                 let mut item = item;
                                 item.seq = seq;
                                 self.items.entry(target).or_default().insert(moved, item);
+                                relocated = true;
                             }
                         }
-                        accepted(handle, None, None)
+                        // NOTE: the outcome states whether it relocated or
+                        // deleted, which only a relocation delivers by (SYNC
+                        // §4).
+                        PimdirPushResult {
+                            relocated,
+                            ..accepted(handle, None, None)
+                        }
                     }
                 }
                 PimdirChangeKind::Update {
@@ -833,6 +841,7 @@ fn accepted(
     revision: Option<String>,
 ) -> PimdirPushResult {
     PimdirPushResult {
+        relocated: false,
         handle,
         outcome: PimdirPushOutcome::Accepted,
         assigned,
@@ -842,6 +851,7 @@ fn accepted(
 
 fn rejected(handle: PimdirHandle) -> PimdirPushResult {
     PimdirPushResult {
+        relocated: false,
         handle,
         outcome: PimdirPushOutcome::Rejected,
         assigned: None,

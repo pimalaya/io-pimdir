@@ -404,12 +404,27 @@ A round page (`complete`) that is neither `last` nor carries a cursor SHALL comp
 - THEN it completes with `UnresumablePage` and writes nothing, the other binding kept (src/sync.rs `a_page_neither_last_nor_cursored_is_refused`)
 
 ### Requirement: An add accepted without a handle waits for its page
-An `Add` answered `Accepted` with no assigned handle (an IMAP `APPEND` on a server without UIDPLUS) SHALL leave the create pending: its provisional binding, staged body and flags kept, no `Superseded` drop written, no `Created` reported, and no second push in the run; the page naming the member lands it (pimdir SYNC §4, vectors/sync/92).
+An `Add` answered `Accepted` with no assigned handle (an IMAP `APPEND` on a server without UIDPLUS) SHALL record the create delivered with a `PimdirWriteOp::DeliverPlacement` of its provisional handle: its binding gains a base naming nothing, its staged body and flags kept, no `Superseded` drop written, no `Created` reported, and no run pushes it again; the page naming the member lands it (pimdir SYNC §2, §4, vectors/sync/92). A create keyed by a key minted over another handle (`PimdirLinkId::is_landable` false), which no listing lands, stays pending instead.
 
 #### Scenario: An APPEND answered with no UID
 - GIVEN a pending create the remote accepts with no assigned handle
 - WHEN the outcome is settled
-- THEN nothing is written for it and nothing is reported (src/sync.rs `an_add_accepted_without_a_handle_stays_pending`)
+- THEN the one write is its delivery and nothing is reported (src/sync.rs `an_add_accepted_without_a_handle_is_delivered`)
+
+### Requirement: A delivered create waits for its arrival
+An accepted `Remove` carrying `to` whose outcome states it relocated the member (`PimdirPushResult::relocated`) SHALL deliver the create the destination names, a `DeliverPlacement` of its collection and provisional handle in the write recording the outcome, when a listing can land it (pimdir SYNC §4, vectors/sync/20); one the connector carried out as a delete, the target already holding the identity, SHALL leave it pending (vectors/sync/140). A delivered create, `PimdirPlacement::delivered` (based under a provisional handle), SHALL be no merge candidate while no page lists its member: it derives no `Add`, `SetFlags`, `Update` nor `Remove`, is never dropped, never found absent nor counted by a round (its handle left out of the absences and of the mass-absence count, `list_unstamped_bindings`), and no upgrade fetches its handle. The page naming its member SHALL land it as a pending create lands, a tombstone keeping its status and destination, and the run pushes against the listed handle what it owes (pimdir SYNC §5, §6, vectors/sync/136 to 138). A delivered create SHALL wait whatever a round lists, counted in `PimdirSyncReport::waiting` on every delta or last page holding it (pimdir SYNC §5, vectors/sync/139). A delivered create stays the destination of a tombstone of its identity (`destination_for_link`), so an owner recording the delivery before the relocation leaves keeps the tombstone relocating. A rekey SHALL carry it onto the member resolving to its link id, and leave it untouched and uncounted otherwise (pimdir SYNC §8).
+
+The client SHALL fold a `DeliverPlacement` into the collection's hub in the batch's order, basing the binding only while it holds none (`PimdirHub::absorb`), so an earlier upsert of the same binding never undoes it and a create landed or withdrawn since is left alone.
+
+#### Scenario: A move staged on a delivered create
+- GIVEN a delivered tombstone in Trash whose destination is a pending create in INBOX
+- WHEN a delta names its member under 7
+- THEN the relocation is pushed against 7, the Trash row goes and the INBOX create is delivered (vectors/sync/137, src/sync.rs `a_landed_delivered_tombstone_pushes_its_remove`)
+
+#### Scenario: Nothing derives before the arrival
+- GIVEN a delivered create holding a staged flag, and a delivered tombstone
+- WHEN a delta or a round lists neither
+- THEN nothing is pushed, dropped or found absent (vectors/sync/136, src/sync.rs `a_delivered_tombstone_waits_for_its_arrival`)
 
 ### Requirement: Another message under a held Message-ID is minted apart
 A message SHALL agree with any row holding its key, a pending create of this source, a live item other sources or none bind, a tombstone or a retained row, before it is landed, joined or revived: on `subject`, `date` and `sender`, byte for byte, `NULL` matching `NULL`, and with a retained row on `size` too where both state one (`summary::same_message`, `same_retained_message`). One disagreeing SHALL be keyed by the identity minted over its handle, minted again over a held key, never joined, landed nor revived (pimdir STORAGE §9, SYNC §6, vectors/sync/93, 109, 110, 111). An `Add` over a disagreeing tombstone or retained row is minted, over a live one still refused; a `Copy` or a `Move` is minted; a create staged under its key's provisional handle moves to the minted key's. The page's own naming applies it to a pending create it would land; the write applies it to every upsert naming a new handle of a mail collection whichever step named it, against the rows the batch's load reads and the retained row under the key, since a step names its members against this source's holders alone where its load shows no other (pimdir SYNC §10, STORAGE §14).

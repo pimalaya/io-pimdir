@@ -308,6 +308,17 @@ pub enum PimdirWriteOp {
         /// Whether the item itself is gone, or only this row of it.
         reason: PimdirDropReason,
     },
+    /// Record a create delivered (SYNC §2, §4): the binding the source holds
+    /// under the provisional `handle`, whose add was accepted with no handle
+    /// or into which a relocation was accepted, gains a base naming nothing,
+    /// so it derives nothing until the page naming its member lands it. A
+    /// binding holding a base, or none under the handle, is left as it is.
+    DeliverPlacement {
+        /// The collection holding the create, a relocation's destination.
+        collection: PimdirCollectionId,
+        /// The create's provisional handle.
+        handle: PimdirHandle,
+    },
     /// Store an object body.
     ///
     /// Storing takes no reference: the pointing upsert may ride in a later

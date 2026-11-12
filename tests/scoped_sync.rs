@@ -88,6 +88,7 @@ impl PimdirRemote for Paged {
         Ok(changes
             .iter()
             .map(|change| PimdirPushResult {
+                relocated: false,
                 handle: change.handle().clone(),
                 outcome: PimdirPushOutcome::Accepted,
                 assigned: None,

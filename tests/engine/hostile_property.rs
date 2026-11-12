@@ -170,6 +170,7 @@ impl PimdirRemote for HostileRemote {
         }
         if self.chaos.ghost_push {
             results.push(PimdirPushResult {
+                relocated: false,
                 handle: PimdirHandle::from("ghost"),
                 outcome: PimdirPushOutcome::Accepted,
                 assigned: Some(PimdirHandle::from("ghost-assigned")),

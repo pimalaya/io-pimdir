@@ -371,6 +371,14 @@ pub(crate) fn apply(
                     .or_default()
                     .push(PimdirWriteOp::Settle { collection, handle });
             }
+            // NOTE: folded into the hub in the batch's order, so an upsert
+            // of the same binding earlier in the batch never undoes it (§14).
+            PimdirWriteOp::DeliverPlacement { collection, handle } => {
+                hub_ops
+                    .entry(collection.0.clone())
+                    .or_default()
+                    .push(PimdirWriteOp::DeliverPlacement { collection, handle });
+            }
             // NOTE: the bytes landed before the transaction opened
             // (`PimdirBlobs::stage`); writing them again would read the
             // whole body back to verify the name it finds held (§5).
@@ -829,7 +837,8 @@ fn batch_links(
                 }
                 &placement.handle
             }
-            PimdirWriteOp::DropPlacement { handle, .. } => handle,
+            PimdirWriteOp::DropPlacement { handle, .. }
+            | PimdirWriteOp::DeliverPlacement { handle, .. } => handle,
             _ => continue,
         };
         links.extend(link_for_handle(conn, collection, source, handle)?);
