@@ -5,12 +5,38 @@
 //! collapsed, a `<br>` and a closing `</p>` made a line break, and
 //! character references decoded.
 //!
-//! The rules are those of mail-parser 0.11's `html_to_text` (Stalwart
-//! Labs, MIT OR Apache-2.0), its named references included, kept so the
-//! text [`extract`](crate::search::extract) indexes stays what it was.
+//! A tag separates the text on its two sides, as the block it opens or
+//! closes does on a screen: `<td>Order number</td><td>12345</td>` reads
+//! `Order number 12345`. The inline elements of [`INLINE`] alone separate
+//! nothing, so `H<sub>2</sub>O` stays one word; a comment separates
+//! nothing either.
+//!
+//! The other rules are those of mail-parser 0.11's `html_to_text`
+//! (Stalwart Labs, MIT OR Apache-2.0), its named references included.
 
 use alloc::string::String;
 use core::{char::REPLACEMENT_CHARACTER, str};
+
+/// The elements whose tags separate no text (the phrasing elements a
+/// renderer lays out inside a line, less those that draw a box or a break
+/// of their own: `br`, `img`, form controls), sorted for a binary search.
+/// Every other tag, one HTML does not define included, separates.
+static INLINE: [&str; 36] = [
+    "a", "abbr", "acronym", "b", "bdi", "bdo", "big", "cite", "code", "data", "del", "dfn", "em",
+    "font", "i", "ins", "kbd", "mark", "nobr", "q", "rp", "rt", "ruby", "s", "samp", "small",
+    "span", "strike", "strong", "sub", "sup", "time", "tt", "u", "var", "wbr",
+];
+
+/// Whether `name`, a tag's first word, is one of [`INLINE`], whatever its
+/// case.
+fn is_inline(name: &[u8]) -> bool {
+    INLINE
+        .binary_search_by(|inline| {
+            let folded = name.iter().map(u8::to_ascii_lowercase);
+            inline.bytes().cmp(folded)
+        })
+        .is_ok()
+}
 
 /// The text of an HTML document.
 pub(crate) fn to_text(html: &str) -> String {
@@ -33,6 +59,7 @@ pub(crate) fn to_text(html: &str) -> String {
     let mut token_end = 0;
 
     let mut tag_token_pos = 0;
+    let mut tag_name = 0..0;
     let mut comment_pos = 0;
 
     for (pos, ch) in input.iter().enumerate() {
@@ -55,11 +82,17 @@ pub(crate) fn to_text(html: &str) -> String {
         match ch {
             b'<' => {
                 if !in_tag && !hidden && !is_token_start {
-                    push_token(&mut text, &input[token_start..=token_end], is_after_space);
+                    push_token(
+                        &mut text,
+                        &input[token_start..=token_end],
+                        is_after_space && !is_new_line,
+                    );
                     is_after_space = false;
+                    is_new_line = false;
                 }
 
                 tag_token_pos = 0;
+                tag_name = 0..0;
                 in_tag = true;
                 is_token_start = true;
                 is_tag_close = false;
@@ -90,6 +123,9 @@ pub(crate) fn to_text(html: &str) -> String {
                         }
                         _ => (),
                     }
+                }
+                if !is_inline(&input[tag_name.clone()]) {
+                    is_after_space = true;
                 }
 
                 in_tag = false;
@@ -161,9 +197,15 @@ pub(crate) fn to_text(html: &str) -> String {
             is_token_start = false;
             if in_tag {
                 tag_token_pos += 1;
+                if tag_token_pos == 1 {
+                    tag_name = pos..pos;
+                }
             }
         }
         token_end = pos;
+        if in_tag && tag_token_pos == 1 {
+            tag_name.end = pos + 1;
+        }
     }
 
     let hidden = in_head || in_style || in_script || in_template;
@@ -840,8 +882,41 @@ mod tests {
             ),
             (
                 "<div>Hello</div><template><div>Hidden</div><style>.x{}</style></template><div>World</div>",
-                "HelloWorld",
+                "Hello World",
             ),
+        ];
+
+        for (html, text) in cases {
+            assert_eq!(to_text(html), text, "{html:?}");
+        }
+    }
+
+    /// A tag separates the text on its sides unless it is an inline
+    /// element's, so a table's cells are words apart and a formula one.
+    #[test]
+    fn a_tag_separates_unless_inline() {
+        let cases = [
+            (
+                "<table><tr><td>Order number</td><td>12345</td></tr></table>",
+                "Order number 12345",
+            ),
+            ("<ul><li>one</li><li>two</li></ul>", "one two"),
+            ("<h1>Title</h1>text", "Title text"),
+            ("left<img src=x>right", "left right"),
+            ("a<unknown>b</unknown>c", "a b c"),
+            ("H<sub>2</sub>O", "H2O"),
+            ("E=mc<SUP>2</SUP>", "E=mc2"),
+            (
+                "un<b>bel</b>iev<span class=\"x\">able</span>",
+                "unbelievable",
+            ),
+            ("super<wbr>cali<wbr/>fragilistic", "supercalifragilistic"),
+            ("<a href=#>one</a><a href=#>two</a>", "onetwo"),
+            ("one<!-- a comment -->two", "onetwo"),
+            ("<div>&amp;</div><div>&lt;b</div>", "& <b"),
+            ("<div><div>  deep</div></div>", "deep"),
+            ("a<br>b<i>c</i> d e", "a\nbc d e"),
+            ("a<style>p {}</style>b", "a b"),
         ];
 
         for (html, text) in cases {

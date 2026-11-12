@@ -1850,6 +1850,78 @@ fn another_floating_zone_re_expands_every_calendar_item() {
     );
 }
 
+/// A re-expansion that cannot read an item's body keeps the occurrences
+/// the item has and records it missing, for as long as the body stays
+/// unread; the pass that reads it again expands it under the zone in
+/// force, though the index holds that body already, and forgets the
+/// record (SEARCH §4, §7).
+#[test]
+fn a_re_expansion_keeps_the_occurrences_of_an_unread_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//x//EN\r\nBEGIN:VEVENT\r\n\
+        UID:floating\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260801T090000\r\n\
+        DURATION:PT1H\r\nSUMMARY:floating\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        .to_vec();
+    file_as(
+        dir.path(),
+        "local",
+        "Calendar",
+        "text/calendar",
+        body.clone(),
+    );
+    let reader = io_pimdir::client::reader::PimdirReader::open(dir.path()).unwrap();
+    let blob = reader.blobs().path(&reader.blobs().hash(&body)).unwrap();
+    drop(reader);
+
+    let now = unix("2026-08-20T00:00:00Z");
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let mut refresh = |zone: &str| {
+        index
+            .refresh(&PimdirIndexRefreshOptions {
+                now: Some(now),
+                floating_zone: zone.into(),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let starts = |dir: &Path| -> Vec<String> {
+        PimdirIndex::open_query(dir)
+            .unwrap()
+            .occurrences_between("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .map(|occurrence| occurrence.start)
+            .collect()
+    };
+    let missing = |dir: &Path| -> i64 {
+        rusqlite::Connection::open(dir.join("index.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM missing", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    assert_eq!(refresh("UTC").expanded, 1);
+    assert_eq!(starts(dir.path()), ["2026-08-01T09:00:00Z"]);
+    assert_eq!(missing(dir.path()), 0);
+
+    fs::remove_file(&blob).unwrap();
+    for pass in ["the re-expansion", "the next pass"] {
+        assert_eq!(refresh("Europe/Paris").expanded, 0, "{pass}");
+        assert_eq!(starts(dir.path()), ["2026-08-01T09:00:00Z"], "{pass}");
+        assert_eq!(missing(dir.path()), 1, "{pass}");
+    }
+
+    fs::write(&blob, &body).unwrap();
+    let report = refresh("Europe/Paris");
+    assert_eq!(
+        (report.folded, report.indexed, report.expanded),
+        (0, 0, 1),
+        "expanded from the body the index already holds"
+    );
+    assert_eq!(starts(dir.path()), ["2026-08-01T07:00:00Z"]);
+    assert_eq!(missing(dir.path()), 0);
+}
+
 #[test]
 fn a_query_reads_the_index_zone_and_refuses_an_unknown_one() {
     let dir = tempfile::tempdir().unwrap();

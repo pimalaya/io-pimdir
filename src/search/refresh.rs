@@ -356,7 +356,9 @@ impl PimdirIndexRefresh {
     }
 
     /// Asks the next bodies a re-expansion needs, else replaces the
-    /// occurrences of every item it names and records the new horizon.
+    /// occurrences of every item it names and records the new horizon. An
+    /// item whose body could not be read keeps the occurrences it has and
+    /// is recorded missing, so the next pass expands it again (SEARCH §4).
     fn reexpand(&mut self, mut reexpand: Box<Reexpand>) -> Step {
         let take = reexpand.queue.len().min(BODIES_MAX);
         if take > 0 {
@@ -374,8 +376,19 @@ impl PimdirIndexRefresh {
             ..
         } = *reexpand;
         for (key, hash) in items {
-            let derived = hash.and_then(|hash| derived.get(&hash));
-            let op = self.occurrences(&key, derived);
+            let op = match hash {
+                None => self.occurrences(&key, None),
+                Some(hash) => match derived.get(&hash) {
+                    Some(derived) => self.occurrences(&key, Some(derived)),
+                    None => {
+                        debug!(
+                            "body of {}/{} is missing, keeping its occurrences",
+                            key.collection, key.seq
+                        );
+                        PimdirIndexOp::PutMissing(key)
+                    }
+                },
+            };
             self.ops.push(op);
         }
         self.record(new);
@@ -496,6 +509,10 @@ impl PimdirIndexRefresh {
     /// once it has one, its occurrences re-expanded when its body changed
     /// and its flags replaced. A message placed, rebodied, rekeyed or
     /// dropped is touched, to be rethreaded before the run completes.
+    ///
+    /// A calendar row recorded missing is expanded whatever the index
+    /// holds of it, and one whose expansion could not read its body stays
+    /// recorded, keeping the occurrences of that same body.
     fn emit(&mut self, mut fold: Fold) -> Step {
         let mut rows = mem::take(&mut fold.rows);
         for row in &mut rows {
@@ -555,15 +572,31 @@ impl PimdirIndexRefresh {
                     link_id: row.link_id.clone(),
                     hash: hash.clone(),
                 }));
-            match row.indexable().is_some() && hash.is_none() {
-                true => {
+            // NOTE: `None` when the page asked no expansion of the row,
+            // `Some(None)` when its body could not be read for one.
+            let expansion = match row.kind == CALENDAR {
+                true => row.indexable().and_then(|hash| fold.derived.get(hash)),
+                false => None,
+            };
+            let unread = match (row.indexable(), &hash, expansion) {
+                (None, ..) => Some(false),
+                (Some(_), None, _) | (Some(_), Some(_), Some(None)) => Some(true),
+                (Some(_), Some(_), Some(Some(_))) => Some(false),
+                // NOTE: a calendar row the page did not expand may be
+                // recorded for an expansion it still owes: left as it is.
+                (Some(_), Some(_), None) if row.kind == CALENDAR => None,
+                (Some(_), Some(_), None) => Some(false),
+            };
+            match unread {
+                Some(true) => {
                     debug!(
                         "body of {}/{} is missing, recording it",
                         row.collection, row.seq
                     );
                     self.ops.push(PimdirIndexOp::PutMissing(key.clone()));
                 }
-                false => self.ops.push(PimdirIndexOp::DropMissing(key.clone())),
+                Some(false) => self.ops.push(PimdirIndexOp::DropMissing(key.clone())),
+                None => (),
             }
             match &hash {
                 None => {
@@ -580,11 +613,21 @@ impl PimdirIndexRefresh {
                 }),
             }
 
-            if row.kind == CALENDAR && held_hash.flatten() != hash {
-                let derived = hash.as_ref().and_then(|hash| fold.derived.get(hash));
-                let derived = derived.and_then(Option::as_ref);
-                let op = self.occurrences(&key, derived);
-                self.ops.push(op);
+            if row.kind == CALENDAR {
+                let same = held_hash.flatten() == hash;
+                match expansion {
+                    Some(Some(derived)) => {
+                        let op = self.occurrences(&key, Some(derived));
+                        self.ops.push(op);
+                    }
+                    // NOTE: the occurrences held are this body's own.
+                    Some(None) if same => (),
+                    _ if !same => {
+                        let op = self.occurrences(&key, None);
+                        self.ops.push(op);
+                    }
+                    _ => (),
+                }
             }
 
             self.ops.push(PimdirIndexOp::ReplaceFlags {
@@ -936,10 +979,13 @@ pub enum PimdirIndexOp {
         cut: Option<String>,
     },
     /// Records a placement whose body could not be read (`insert_missing`,
-    /// SEARCH §4), indexed bodiless meanwhile.
+    /// SEARCH §4): indexed bodiless meanwhile, or, for a calendar item
+    /// whose body the index holds and an expansion could not read, with
+    /// the occurrences it had.
     PutMissing(PimdirIndexKey),
-    /// Forgets a placement whose body is indexed or that holds none
-    /// (`delete_missing`), if recorded.
+    /// Forgets a placement whose body is indexed, and expanded for a
+    /// calendar item recorded, or that holds none (`delete_missing`), if
+    /// recorded.
     DropMissing(PimdirIndexKey),
     /// Puts a message row (`upsert_message`), its thread row written
     /// before it.
@@ -1411,8 +1457,11 @@ enum Extracted {
 impl Fold {
     /// The bodies the page reads: each one the index holds no object for,
     /// to extract, and each a calendar row holds that is not the one its
-    /// placement was expanded from.
+    /// placement was expanded from, or whatever it was expanded from when
+    /// the row is one recorded missing, which may owe an expansion of the
+    /// body the index holds (SEARCH §4).
     fn plan(&mut self, put: &BTreeSet<PimdirHash>) {
+        let owing = matches!(self.after, After::Missing);
         for row in self.rows.iter().filter(|row| row.is_live()) {
             let Some(hash) = row.indexable() else {
                 continue;
@@ -1424,7 +1473,7 @@ impl Fold {
                     .or_insert_with(|| (row.kind.clone(), key.clone()));
             }
             let held = self.held.get(&key).and_then(|held| held.hash.as_ref());
-            if row.kind == CALENDAR && held != Some(hash) {
+            if row.kind == CALENDAR && (owing || held != Some(hash)) {
                 self.expand.insert(hash.clone());
             }
         }

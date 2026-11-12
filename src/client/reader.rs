@@ -52,6 +52,7 @@ use crate::{
         PimdirAddressRole, PimdirSummary,
         file::{self, PimdirFileSummary},
     },
+    version::PimdirProfile,
 };
 
 /// A pimdir store opened to read: the projection every role shares.
@@ -518,7 +519,7 @@ impl PimdirReader {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
         prepare_connection(&conn)?;
-        schema::check(&conn)?;
+        schema::check(&conn, PimdirProfile::Reader)?;
 
         Self::over(conn, dir.to_path_buf())
     }

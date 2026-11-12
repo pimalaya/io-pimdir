@@ -5,7 +5,10 @@
 
 #![cfg(feature = "client")]
 
-use std::{io::Write, path::Path};
+use std::{
+    io::{ErrorKind, Write},
+    path::Path,
+};
 
 use io_pimdir::{
     client::{
@@ -13,6 +16,7 @@ use io_pimdir::{
         producer::{PimdirActionStatus, PimdirProducer},
     },
     codec::PimdirAction,
+    object::PimdirObject,
     placement::{PimdirFlags, PimdirLinkId},
 };
 
@@ -92,6 +96,66 @@ fn a_streamed_body_holds_the_lock_until_its_commit() {
         Some(BODY)
     );
     assert!(store.collect_garbage().is_ok());
+}
+
+/// An enqueue naming a body this producer did not stage takes the staging
+/// lock and verifies the body under it before a row pins it (STORAGE §5,
+/// §8): one the blob directory does not hold, or failing its name, is
+/// refused, queueing nothing and recreating no object row, and the window
+/// it opened is closed again either way.
+#[test]
+fn an_enqueue_naming_a_body_it_did_not_stage_verifies_it_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let add = |object: &PimdirObject, id: &str| PimdirAction::Add {
+        link_id: Some(link(id)),
+        flags: PimdirFlags::default(),
+        object: Some(object.hash.clone()),
+        supersedes: None,
+    };
+
+    let absent = PimdirObject {
+        hash: store.hash(b"never written"),
+        size: 13,
+    };
+    let Err(PimdirError::Io(err)) =
+        producer.enqueue("INBOX", &add(&absent, "mid:absent@x"), Some(&absent))
+    else {
+        panic!("a body the store does not hold was queued");
+    };
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    assert!(producer.pending_actions("INBOX").unwrap().is_empty());
+    assert!(!store.indexed_hashes().unwrap().contains(&absent.hash.0));
+    assert!(store.collect_garbage().is_ok(), "the window is closed");
+
+    // a body another producer staged, then one a disk fault changed
+    let other = PimdirProducer::open(dir.path(), "other").unwrap();
+    let held = other.stage_body(BODY).unwrap();
+    let failing = other
+        .stage_body(b"Subject: failing\r\n\r\nfailing")
+        .unwrap();
+    let path = store.blobs().path(&failing.hash).unwrap();
+    std::fs::write(&path, b"other bytes").unwrap();
+
+    let Err(PimdirError::Io(err)) =
+        producer.enqueue("INBOX", &add(&failing, "mid:failing@x"), Some(&failing))
+    else {
+        panic!("a body failing its name was queued");
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert!(producer.pending_actions("INBOX").unwrap().is_empty());
+
+    producer
+        .enqueue("INBOX", &add(&held, "mid:new@x"), Some(&held))
+        .unwrap();
+    drop(other);
+    assert!(store.collect_garbage().is_ok(), "the window is closed");
+    assert_eq!(store.drain().unwrap().applied, 1);
+    assert_eq!(
+        store.blobs().get(&held.hash).unwrap().as_deref(),
+        Some(BODY)
+    );
 }
 
 #[test]

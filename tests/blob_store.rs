@@ -6,7 +6,11 @@
 
 #![cfg(feature = "client")]
 
-use std::{fs, io::ErrorKind, path::Path};
+use std::{
+    fs,
+    io::{ErrorKind, Write},
+    path::Path,
+};
 
 use io_pimdir::{
     client::{
@@ -315,9 +319,10 @@ fn a_link_as_a_shard_is_not_followed() {
     assert_eq!(blobs.get(&hash).unwrap().as_deref(), Some(CARD));
 }
 
-/// The collector unlinks only a regular file, by lstat, whose well-formed
-/// name begins with its shard's two characters, the shard a well-formed
-/// directory and no link (§5); anything else is left and reported.
+/// The collector unlinks a regular file, by lstat, whose well-formed name
+/// begins with its shard's two characters, the shard a well-formed
+/// directory and no link, and a period-prefixed one, a temporary no
+/// writer holds under its locks (§5); anything else is left and reported.
 #[test]
 fn the_collector_leaves_what_is_no_body_and_reports_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -339,25 +344,130 @@ fn the_collector_leaves_what_is_no_body_and_reports_it() {
     let odd = name(b"odd shard");
     fs::create_dir_all(objects.join("A1")).unwrap();
     fs::write(objects.join("A1").join(&odd), b"odd shard").unwrap();
-    // a writer's temporary
+    // a temporary a writer killed mid-stream left
     fs::write(objects.join(".tmp-9-9-9"), b"in flight").unwrap();
 
     let report = store.collect_garbage().unwrap();
-    assert_eq!((report.blobs, report.bytes), (1, 6), "the orphan alone");
+    assert_eq!(
+        (report.blobs, report.temporaries, report.bytes),
+        (1, 1, 6 + 9),
+        "the orphan and the temporary"
+    );
     assert!(!store.blobs().path(&orphan).unwrap().exists());
+    assert!(!objects.join(".tmp-9-9-9").exists());
     for kept in [
         &misplaced,
         &two_level.join(&nested),
         &objects.join(&dir_body[..2]).join(&dir_body),
         &objects.join("A1"),
-        &objects.join(".tmp-9-9-9"),
     ] {
         assert!(kept.exists(), "{} is left", kept.display());
     }
-    let kinds: Vec<_> = report.strays.iter().map(|stray| stray.kind).collect();
-    assert_eq!(report.strays.len(), 5, "{:?}", report.strays);
-    assert!(kinds.contains(&PimdirBlobStrayKind::Temporary));
-    assert!(kinds.contains(&PimdirBlobStrayKind::Foreign));
+    assert_eq!(report.strays.len(), 4, "{:?}", report.strays);
+    assert!(
+        report
+            .strays
+            .iter()
+            .all(|stray| stray.kind == PimdirBlobStrayKind::Foreign)
+    );
+}
+
+/// A writer killed between its link and its unlink leaves a second name of
+/// a whole body, and one killed mid-stream a part of one: under its locks
+/// the collector unlinks both, the body staying, and a later check finds
+/// no stray (§5). A link or a directory under a period-prefixed name is
+/// nobody's temporary and stays.
+#[test]
+fn the_collector_unlinks_the_temporaries_a_crash_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    let objects = dir.path().join("objects");
+
+    let pinned = enqueue_add(dir.path(), MAIL).hash;
+    let held = store.blobs().path(&pinned).unwrap();
+    let shard = held.parent().unwrap();
+
+    let linked = shard.join(format!(".{}.9-9-9.tmp", pinned.0));
+    fs::hard_link(&held, &linked).unwrap();
+    let streamed = objects.join(".tmp-9-9-9");
+    fs::write(&streamed, b"part of a body").unwrap();
+    let hidden_dir = shard.join(".kept");
+    fs::create_dir(&hidden_dir).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&held, objects.join(".link")).unwrap();
+
+    let before = store.blobs().scan().unwrap();
+    assert!(
+        before
+            .strays
+            .iter()
+            .any(|stray| stray.kind == PimdirBlobStrayKind::Temporary)
+    );
+
+    let report = store.collect_garbage().unwrap();
+    assert_eq!((report.blobs, report.temporaries), (0, 2), "{report:?}");
+    #[cfg(unix)]
+    assert_eq!(report.bytes, 14, "the second name of a body frees nothing");
+    assert!(!linked.exists() && !streamed.exists());
+    assert_eq!(store.blobs().get(&pinned).unwrap().as_deref(), Some(MAIL));
+    assert!(hidden_dir.is_dir(), "a directory is no temporary");
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(objects.join(".link")).is_ok());
+
+    let after = store.blobs().scan().unwrap();
+    assert!(
+        after
+            .strays
+            .iter()
+            .all(|stray| stray.kind != PimdirBlobStrayKind::Temporary),
+        "{:?}",
+        after.strays
+    );
+    assert_eq!(store.collect_garbage().unwrap().temporaries, 0);
+}
+
+/// A temporary a live writer holds is no crash leftover: a producer inside
+/// its staging window, or a stream of the owner still open, makes the
+/// collection fail and leaves the temporary where it is (§5, §8).
+#[test]
+fn a_live_writer_keeps_its_temporary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    let temporaries = |dir: &Path| -> usize {
+        fs::read_dir(dir.join("objects"))
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                name.to_string_lossy().starts_with('.')
+            })
+            .count()
+    };
+
+    let producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let mut writer = producer.blob_writer().unwrap();
+    writer.write_all(b"streamed by a producer").unwrap();
+    assert!(matches!(
+        store.collect_garbage(),
+        Err(PimdirError::Staging(_))
+    ));
+    assert_eq!(temporaries(dir.path()), 1);
+    let streamed = writer.commit().unwrap();
+    drop(producer);
+    assert!(store.blobs().get(&streamed.hash).unwrap().is_some());
+
+    let mut writer = store.blob_stage().writer().unwrap();
+    writer.write_all(b"streamed by the owner").unwrap();
+    assert!(matches!(
+        store.collect_garbage(),
+        Err(PimdirError::InFlight(_))
+    ));
+    assert_eq!(temporaries(dir.path()), 1);
+    let streamed = writer.commit().unwrap();
+    assert!(store.blobs().get(&streamed.hash).unwrap().is_some());
+
+    let report = store.collect_garbage().unwrap();
+    assert_eq!(report.temporaries, 0, "{report:?}");
+    assert_eq!(report.blobs, 2, "two bodies no row names");
 }
 
 /// A link under objects/, a body's or a shard's, is never unlinked by the

@@ -32,7 +32,7 @@ use crate::{
     change::PimdirWriteOp,
     client::{
         PimdirDuplicate, PimdirError, PimdirSourceStore, PreparedCached, bind_list,
-        blobs::{PimdirBlobCheck, PimdirBlobStage, PimdirBlobWriter, PimdirBlobs},
+        blobs::{self, PimdirBlobCheck, PimdirBlobStage, PimdirBlobWriter, PimdirBlobs},
         busy_or_sql, capability,
         lock::PimdirLock,
         modes, prepare_connection,
@@ -53,6 +53,7 @@ use crate::{
         PimdirStatus,
     },
     sql, summary,
+    version::PimdirProfile,
 };
 
 /// A pimdir store opened as a producer (STORAGE §8, §15.1).
@@ -127,7 +128,7 @@ impl PimdirProducer {
         prepare_connection(&conn)?;
         // NOTE: the journal mode is the owner's, chosen when it created the
         // store (§8): a producer writes no database header.
-        schema::check(&conn)?;
+        schema::check(&conn, PimdirProfile::Producer)?;
 
         Ok(Self {
             conn,
@@ -161,6 +162,14 @@ impl PimdirProducer {
         if staging.unpinned.is_empty() && !staging.streamed {
             staging.lock = None;
         }
+    }
+
+    /// Whether this producer staged the body under `hash` inside the
+    /// window it still holds: staged whole and not pinned yet, or perhaps
+    /// streamed, a stream's hash being its writer's to know.
+    fn staged(&self, hash: &PimdirHash) -> bool {
+        let staging = self.staging.borrow();
+        staging.lock.is_some() && (staging.streamed || staging.unpinned.contains(hash))
     }
 
     /// The write side of the blob directory, holding the staging lock.
@@ -376,7 +385,36 @@ impl PimdirProducer {
     /// the caller has not staged them, is gated in hand and written once
     /// every check passed. Answers the row's id and the partial supports
     /// the gate passed the action with.
+    ///
+    /// The staging lock is held across whatever body the action names
+    /// (§8): a body this producer staged holds it already, one given in
+    /// hand takes it for the write, and one named by its hash alone, which
+    /// the store held when the caller read it, takes it and is verified
+    /// against its name under it before a row pins it, so a collector
+    /// never takes the body between the two. A named body the blob
+    /// directory does not hold is [`PimdirError::Io`], kind
+    /// [`NotFound`](io::ErrorKind::NotFound), one failing its name the
+    /// failure a write meeting it answers
+    /// ([`InvalidData`](io::ErrorKind::InvalidData), naming it), and
+    /// nothing is queued. An append that fails closes a window it alone
+    /// opened.
     fn append(
+        &mut self,
+        collection: &str,
+        action: &PimdirAction,
+        object: Option<&PimdirObject>,
+        body: Option<&[u8]>,
+        fresh: Option<&PimdirLinkId>,
+    ) -> Result<PimdirEnqueued, PimdirError> {
+        let appended = self.append_held(collection, action, object, body, fresh);
+        if appended.is_err() {
+            self.pinned(None);
+        }
+        appended
+    }
+
+    /// [`append`](Self::append), leaving the window open when it fails.
+    fn append_held(
         &mut self,
         collection: &str,
         action: &PimdirAction,
@@ -403,9 +441,23 @@ impl PimdirProducer {
         let hash = action.object_hash().cloned();
         // NOTE: before the transaction, so waiting out a collector never
         // holds the write lock it needs.
-        let _window = match body {
-            Some(_) => Some(self.hold()?),
-            None => None,
+        let _window = match (body, &hash) {
+            (Some(_), _) => Some(self.hold()?),
+            (None, Some(named)) if !self.staged(named) => {
+                let window = self.hold()?;
+                match self.blobs.check(named)? {
+                    PimdirBlobCheck::Sound => Some(window),
+                    PimdirBlobCheck::Failing => return Err(blobs::held(named).into()),
+                    PimdirBlobCheck::Missing => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("Body {} is not in the blob directory", named.0),
+                        )
+                        .into());
+                    }
+                }
+            }
+            (None, _) => None,
         };
 
         let tx = self

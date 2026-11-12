@@ -19,7 +19,11 @@ use io_pimdir::{
         PimdirStatus,
     },
 };
-use io_pimdir::{client::PimdirStore, sql};
+use io_pimdir::{
+    client::PimdirStore,
+    sql,
+    summary::{PimdirSummary, mail::PimdirMailSummary},
+};
 
 fn inbox() -> PimdirCollectionId {
     PimdirCollectionId("INBOX".into())
@@ -157,13 +161,13 @@ fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
     )
     .unwrap();
 
-    // a half-written body belongs to a writer that has not committed, so
-    // the collector leaves it alone
+    // a half-written body no writer holds any more: under the collector's
+    // locks it is what a crash left, taken and counted apart
     fs::write(dir.path().join("objects/.tmp-1-1"), b"in flight").unwrap();
 
     let collected = store.collect_garbage().unwrap();
     assert_eq!((collected.objects, collected.blobs), (0, 1));
-    assert_eq!(collected.bytes, 7);
+    assert_eq!((collected.temporaries, collected.bytes), (1, 7 + 9));
     assert!(
         !shard
             .join("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead")
@@ -177,7 +181,75 @@ fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
         ),
         "the live body is not"
     );
-    assert!(dir.path().join("objects/.tmp-1-1").exists(), "in flight");
+    assert!(!dir.path().join("objects/.tmp-1-1").exists());
+}
+
+/// A purge that removed rows gives the pages they freed back to the
+/// filesystem, so pimdir.db shrinks once checkpointed (STORAGE §4.1): the
+/// store is created with `auto_vacuum = INCREMENTAL`, which frees nothing
+/// until an owner asks.
+#[test]
+fn a_large_purge_gives_its_pages_back_to_the_filesystem() {
+    const ITEMS: usize = 1_500;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let size = || {
+        let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        fs::metadata(dir.path().join("pimdir.db")).unwrap().len()
+    };
+
+    let listed = (0..ITEMS).map(|n| {
+        let summary = PimdirMailSummary {
+            message_id: Some(format!("{n}@x")),
+            in_reply_to: Vec::new(),
+            subject: "subject ".repeat(64),
+            sender: None,
+            sender_name: None,
+            date: None,
+            size: None,
+            attachment: None,
+            invitation: None,
+            from: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+        };
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            object: None,
+            level: PimdirLevel::Meta,
+            summary: Some(PimdirSummary::Mail(summary)),
+            base: Some(PimdirBase {
+                flags: PimdirFlags::default(),
+                revision: None,
+                object: None,
+            }),
+            ..placement(&n.to_string(), &format!("mid:{n}@x"), "")
+        })
+    });
+    store.write(listed.collect()).unwrap();
+    let filled = size();
+
+    let dropped = (0..ITEMS).map(|n| PimdirWriteOp::DropPlacement {
+        collection: inbox(),
+        handle: PimdirHandle(n.to_string()),
+        reason: PimdirDropReason::Deleted,
+    });
+    store.write(dropped.collect()).unwrap();
+    let purged = store
+        .purge_retained_before("2100-01-01T00:00:00.000Z")
+        .unwrap();
+    assert_eq!(purged.items, ITEMS);
+    store.collect_garbage().unwrap();
+
+    let purged = size();
+    assert!(
+        purged < filled / 2,
+        "pimdir.db went from {filled} to {purged} bytes"
+    );
 }
 
 /// A purge retires rows and releases what they pinned; the bytes are the

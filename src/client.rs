@@ -12,7 +12,7 @@
 //! [`PimdirRemote`]: crate::remote::PimdirRemote
 //! [`PimdirProducer`]: crate::client::producer::PimdirProducer
 
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
 
 use std::{
     fmt, fs, io,
@@ -31,7 +31,9 @@ use rusqlite::{
 use crate::{
     capability::{PimdirCapability, PimdirRefusal},
     client::{
-        blobs::{PimdirBlobCheck, PimdirBlobStage, PimdirBlobStray, PimdirBlobs},
+        blobs::{
+            PimdirBlobCheck, PimdirBlobStage, PimdirBlobStray, PimdirBlobStrayKind, PimdirBlobs,
+        },
         lock::PimdirLock,
         reader::{PimdirReader, reference_from_row},
         write::kind_of,
@@ -48,6 +50,7 @@ use crate::{
         file::{self, PimdirFileSummary},
     },
     sync::SYNC_VERSION,
+    version::PimdirProfile,
 };
 
 /// The local time collection's id (§14.3): `U+0001` and `time`, under no
@@ -153,8 +156,14 @@ pub struct PimdirGcReport {
     pub blobs: usize,
     /// The bytes those files freed.
     pub bytes: u64,
+    /// Temporary files unlinked: the period-prefixed regular files of
+    /// objects/ and its shard directories, which under the collector's
+    /// locks are what a writer killed before its unlink left (§5). Their
+    /// bytes are in [`bytes`](Self::bytes) when the file was the last
+    /// name of its content.
+    pub temporaries: usize,
     /// The entries of objects/ that are no body, left in place (§5): a
-    /// link, a writer's temporary, any other name or position.
+    /// link, any other name or position.
     pub strays: Vec<PimdirBlobStray>,
 }
 
@@ -255,7 +264,7 @@ impl PimdirStore {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&db, flags)?;
         prepare_connection(&conn)?;
-        match schema::check(&conn) {
+        match schema::check(&conn, PimdirProfile::Owner) {
             Err(PimdirError::Uncreated) => {
                 return Err(PimdirError::NotCurrent(PimdirNotCurrent::Version {
                     found: 0,
@@ -618,41 +627,43 @@ impl PimdirStore {
             hash: hash::hash(body),
             size: body.len(),
         };
-        let blobs = PimdirBlobs::open(&self.dir);
-        let dir = self.dir.clone();
-        let lock = Arc::clone(&self.lock);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
-        let synced = tx
-            .prepare_cached(sql::COLLECTION_SOURCES)?
-            .exists(named_params! { ":collection": collection })?;
-        if synced {
+        // NOTE: read here too, so a put the transaction below refuses
+        // stages no body.
+        if synced(&self.conn, collection)? {
             return Err(PimdirError::Synced {
                 collection: collection.into(),
             });
         }
-        // NOTE: inside the transaction, so no collector runs between the
-        // blob landing and the row pinning it (§5); a name held by a file
-        // failing it is set aside and the body written again.
-        match blobs.write(&object.hash, body) {
-            Err(err) if blobs::held_name(&err).is_some() => {
-                let Ok(staging) = PimdirLock::collect(&dir) else {
-                    return Err(err.into());
-                };
-                let collecting = lock.collecting();
-                if let Some(target) = blobs.quarantine(&object.hash)? {
-                    warn!(
-                        "body {} fails its name, moved to {}",
-                        object.hash.0,
-                        target.display()
-                    );
+
+        // NOTE: the writer share from the blob landing through the commit
+        // of the row pinning it, as the seam's write holds it, so no
+        // collector of this process runs in between (§5, §8); a name held
+        // by a file failing it is set aside, once, the share let go for
+        // the move, and the body written again.
+        let blobs = PimdirBlobs::open(&self.dir);
+        let lock = Arc::clone(&self.lock);
+        let mut moved = false;
+        let _writing = loop {
+            let writing = lock.writing();
+            match blobs.write(&object.hash, body) {
+                Ok(()) => break writing,
+                Err(err) if !moved && blobs::held_name(&err).is_some() => {
+                    moved = true;
+                    drop(writing);
+                    self.quarantine(&object.hash)?;
                 }
-                drop((collecting, staging));
-                blobs.write(&object.hash, body)?;
+                Err(err) => return Err(err.into()),
             }
-            written => written?,
+        };
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        if synced(&tx, collection)? {
+            return Err(PimdirError::Synced {
+                collection: collection.into(),
+            });
         }
         let link = derivation.link_id.clone();
         let seq = write::put_unbound(&tx, collection, &object, derivation)?;
@@ -866,6 +877,9 @@ impl PimdirStore {
     /// The comparison is textual (§11.2), so the cutoff is written as the
     /// stamps are, UTC with milliseconds (`2026-06-01T00:00:00.000Z`):
     /// anything else is [`PimdirError::Cutoff`] and nothing is purged.
+    ///
+    /// A purge that removed rows gives a bounded number of the pages they
+    /// freed back to the filesystem (§4.1).
     pub fn purge_retained_before(
         &mut self,
         cutoff: &str,
@@ -893,6 +907,9 @@ impl PimdirStore {
                 .flatten(),
         )?;
         tx.commit().map_err(busy_or_sql)?;
+        if items > 0 {
+            vacuum(&self.conn);
+        }
 
         Ok(PimdirPurgeReport { items })
     }
@@ -948,14 +965,18 @@ impl PimdirStore {
     /// later widening lists and names again. The refcounts are recomputed
     /// in the same transaction and the bodies fall to the collector. A
     /// verb of this process between two of its chunks refuses it as
-    /// [`PimdirError::InFlight`] (§5). An owner narrowing a scope records
-    /// the narrower coverage with its next sync, not here.
+    /// [`PimdirError::InFlight`] (§5), tested under the process's writer
+    /// lock held exclusively, so none starts while it runs. An owner
+    /// narrowing a scope records the narrower coverage with its next
+    /// sync, not here.
     pub fn collect_before(
         &mut self,
         collection: impl AsRef<str>,
         before: &str,
     ) -> Result<PimdirCollectReport, PimdirError> {
-        if self.lock.in_flight() {
+        let lock = Arc::clone(&self.lock);
+        let _collecting = lock.collecting();
+        if lock.in_flight() {
             return Err(PimdirError::InFlight(self.dir.clone()));
         }
         let tx = self
@@ -970,6 +991,9 @@ impl PimdirStore {
         )?;
         tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
+        if !seqs.is_empty() {
+            vacuum(&self.conn);
+        }
         Ok(PimdirCollectReport { seqs })
     }
 
@@ -987,13 +1011,16 @@ impl PimdirStore {
     /// links the body again. The refcounts are recomputed in the same
     /// transaction and the bodies fall to the collector. A verb of this
     /// process between two of its chunks refuses it as
-    /// [`PimdirError::InFlight`] (§5).
+    /// [`PimdirError::InFlight`] (§5), tested under the process's writer
+    /// lock held exclusively, so none starts while it runs.
     pub fn release_before(
         &mut self,
         collections: &[impl AsRef<str>],
         until: Option<&str>,
     ) -> Result<PimdirReleaseReport, PimdirError> {
-        if self.lock.in_flight() {
+        let lock = Arc::clone(&self.lock);
+        let _collecting = lock.collecting();
+        if lock.in_flight() {
             return Err(PimdirError::InFlight(self.dir.clone()));
         }
         let tx = self
@@ -1010,6 +1037,9 @@ impl PimdirStore {
         )?;
         tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
+        if !seqs.is_empty() {
+            vacuum(&self.conn);
+        }
         Ok(PimdirReleaseReport { seqs })
     }
 }
@@ -1017,23 +1047,34 @@ impl PimdirStore {
 /// Reclamation and repair (§5, §7): what no write does to the store.
 impl PimdirStore {
     /// Reclaims what nothing references: the object rows at refcount
-    /// zero, their bodies, and the orphan blobs a crash left.
+    /// zero, their bodies, the orphan blobs a crash left, and the
+    /// temporary files a writer killed before its unlink left.
     ///
     /// Takes the staging lock exclusively on an owning handle, and the
     /// process's own writer lock exclusively across the rows and the
     /// walk, so no writer is between a body and the row that pins it
-    /// (§8). A verb of this process between two of its chunks refuses it
-    /// as [`PimdirError::InFlight`], a body it streamed having no pointer
-    /// yet (§5). The counts are recomputed first, so a count a writer left
-    /// behind never decides a delete; the rows go inside a transaction
-    /// and the files after it.
+    /// (§8). A verb of this process between two of its chunks, or a blob
+    /// stream of its owner still open, refuses it as
+    /// [`PimdirError::InFlight`], a body it streamed having no pointer
+    /// yet (§5): tested once both locks are held, so none starts while
+    /// the collection runs. The counts are recomputed first, so a count a
+    /// writer left behind never decides a delete; the rows go inside a
+    /// transaction and the files after it.
+    ///
+    /// Under those locks no writer of any process holds a temporary, so
+    /// every period-prefixed regular file, read by `lstat`, in objects/
+    /// and its shard directories is a crash leftover and is unlinked; a
+    /// link and any other name stay and are reported. Every directory an
+    /// unlink was made in is flushed before the collection answers, and
+    /// a collection that dropped rows gives a bounded number of the pages
+    /// they freed back to the filesystem (§4.1).
     pub fn collect_garbage(&mut self) -> Result<PimdirGcReport, PimdirError> {
-        if self.lock.in_flight() {
-            return Err(PimdirError::InFlight(self.dir.clone()));
-        }
         let _staging = PimdirLock::collect(&self.dir)?;
         let lock = Arc::clone(&self.lock);
         let _collecting = lock.collecting();
+        if lock.in_flight() {
+            return Err(PimdirError::InFlight(self.dir.clone()));
+        }
 
         let tx = self
             .conn
@@ -1049,22 +1090,42 @@ impl PimdirStore {
         };
         // NOTE: the scan reads entries by lstat, so a body is a regular
         // file named well in its own shard, and anything else is a stray
-        // left in place (§5).
-        let scan = self.blobs().scan()?;
+        // (§5).
+        let blobs = self.blobs();
+        let scan = blobs.scan()?;
+        let mut unlinked = BTreeSet::new();
         let mut exists = self.conn.prepare_cached(sql::OBJECT_EXISTS)?;
         for blob in scan.files {
             if exists.exists(named_params! { ":hash": blob.hash })? {
                 continue;
             }
             fs::remove_file(&blob.path)?;
+            unlinked.extend(blob.path.parent().map(Path::to_path_buf));
             report.blobs += 1;
             report.bytes += blob.size;
         }
         drop(exists);
-        for stray in &scan.strays {
-            debug!("leave {:?} {}", stray.kind, stray.path.display());
+        for stray in scan.strays {
+            if stray.kind != PimdirBlobStrayKind::Temporary {
+                debug!("leave {:?} {}", stray.kind, stray.path.display());
+                report.strays.push(stray);
+                continue;
+            }
+            let meta = fs::symlink_metadata(&stray.path)?;
+            debug!("unlink the temporary {}", stray.path.display());
+            fs::remove_file(&stray.path)?;
+            unlinked.extend(stray.path.parent().map(Path::to_path_buf));
+            report.temporaries += 1;
+            // NOTE: a temporary left between its link and its unlink is
+            // a second name of a whole body, whose bytes stay.
+            if last_link(&meta) {
+                report.bytes += meta.len();
+            }
         }
-        report.strays = scan.strays;
+        blobs.flush_unlinks(unlinked.iter().map(PathBuf::as_path))?;
+        if objects > 0 {
+            vacuum(&self.conn);
+        }
 
         Ok(report)
     }
@@ -1433,14 +1494,72 @@ const DURABILITY: &str = "PRAGMA synchronous = FULL; PRAGMA secure_delete = ON;"
 const DURABILITY: &str =
     "PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA secure_delete = ON;";
 
+/// The size a connection lets a checkpointed WAL keep (STORAGE §4.1), in
+/// bytes: just above the 1,000 pages of 4 KiB the default automatic
+/// checkpoint lets it reach, so a WAL in its steady state is reused and
+/// never truncated, while one a large batch grew goes back to this once
+/// checkpointed.
+const JOURNAL_SIZE_LIMIT: i64 = 4 * 1024 * 1024;
+
+/// The most pages one [`vacuum`] gives back to the filesystem: 16 MiB of
+/// 4 KiB pages, each moved page written to the WAL once, so the pause
+/// after a purge or a collection stays bounded and a larger free list
+/// goes over the next ones.
+const VACUUM_PAGES: u32 = 4096;
+
+/// Gives at most [`VACUUM_PAGES`] free pages of pimdir.db back to the
+/// filesystem (`PRAGMA incremental_vacuum`, STORAGE §4.1), after a purge,
+/// a collection or a release removed rows. A store created without
+/// `auto_vacuum = INCREMENTAL` gives none. The rows are committed
+/// already: a failure is logged, never the caller's.
+fn vacuum(conn: &Connection) {
+    // NOTE: the pragma answers one row per page it frees and frees no
+    // more than it is stepped for.
+    let freed = conn
+        .prepare(&format!("PRAGMA incremental_vacuum({VACUUM_PAGES})"))
+        .and_then(|mut vacuum| {
+            let mut pages = vacuum.query([])?;
+            let mut freed = 0;
+            while pages.next()?.is_some() {
+                freed += 1;
+            }
+            Ok(freed)
+        });
+    match freed {
+        Ok(freed) => trace!("gave {freed} free pages back"),
+        Err(err) => warn!("cannot give free pages back: {err}"),
+    }
+}
+
+/// Whether a source syncs `collection` (`collection_sources`).
+fn synced(conn: &Connection, collection: &str) -> Result<bool, PimdirError> {
+    Ok(conn
+        .prepare_cached(sql::COLLECTION_SOURCES)?
+        .exists(named_params! { ":collection": collection })?)
+}
+
+/// Whether a file's name is the last one of its content, so unlinking it
+/// frees its bytes.
+#[cfg(unix)]
+fn last_link(meta: &fs::Metadata) -> bool {
+    std::os::unix::fs::MetadataExt::nlink(meta) <= 1
+}
+
+/// Whether a file's name is the last one of its content: taken as so
+/// where the platform's metadata does not count links.
+#[cfg(not(unix))]
+fn last_link(_meta: &fs::Metadata) -> bool {
+    true
+}
+
 /// The SQLite version `SQLITE_DBCONFIG_DEFENSIVE` arrived in, as
 /// `sqlite3_libversion_number` spells it: an older one has no such flag.
 const DEFENSIVE_MIN: i32 = 3_026_000;
 
 /// Sets up a connection to a store or an index as every role does
-/// (STORAGE §4.1, §4.4): foreign keys on, the durability pragmas, a busy
-/// timeout, and the list parameters' temporary table, which a read-only
-/// connection creates too.
+/// (STORAGE §4.1, §4.4): foreign keys on, the durability pragmas, the
+/// size a checkpointed WAL keeps, a busy timeout, and the list
+/// parameters' temporary table, which a read-only connection creates too.
 ///
 /// Every store is opened as one from elsewhere (§18), whoever created it:
 /// `trusted_schema` off and the defensive flag on, under which the
@@ -1453,6 +1572,7 @@ pub(crate) fn prepare_connection(conn: &Connection) -> rusqlite::Result<()> {
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     }
     conn.execute_batch(DURABILITY)?;
+    conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     conn.execute_batch(sql::CREATE_PARAM)
@@ -2274,9 +2394,57 @@ pub(crate) fn is_stamp(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, thread, time::Duration};
+
     use rusqlite::{Connection, config::DbConfig};
 
-    use crate::client::prepare_connection;
+    use crate::client::{PimdirError, PimdirStore, prepare_connection};
+
+    /// A collection never runs beside a verb it did not see (STORAGE §5):
+    /// the collector reads the in-flight count once it holds the process's
+    /// writer lock, and a verb raises it under that lock, so a body a verb
+    /// streamed while the collector waited for a write to end is not swept
+    /// as an orphan. Read before the lock, the count was passed by a verb
+    /// that started behind it.
+    #[test]
+    fn a_verb_starting_while_the_collector_waits_keeps_its_body() {
+        const WAIT: Duration = Duration::from_millis(200);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PimdirStore::open(dir.path()).unwrap();
+        let mut collector = PimdirStore::open(dir.path()).unwrap();
+        let lock = Arc::clone(&store.lock);
+
+        // NOTE: a write of this process is open, which the collector
+        // waits out.
+        let writing = lock.writing();
+        let collected = thread::spawn(move || match collector.collect_garbage() {
+            Ok(report) => Some(report),
+            Err(PimdirError::InFlight(_)) => None,
+            Err(err) => panic!("the collection failed: {err}"),
+        });
+        thread::sleep(WAIT);
+
+        let stage = store.blob_stage();
+        let verb = thread::spawn({
+            let lock = Arc::clone(&lock);
+            move || {
+                let _running = lock.running();
+                stage.stage_body(b"streamed, no row yet").unwrap()
+            }
+        });
+        thread::sleep(WAIT);
+        drop(writing);
+
+        let streamed = verb.join().unwrap();
+        if let Some(report) = collected.join().unwrap() {
+            assert_eq!(report.blobs, 0, "it ran before the verb, or not at all");
+        }
+        assert!(
+            store.blobs().get(&streamed.hash).unwrap().is_some(),
+            "the verb's body is still there"
+        );
+    }
 
     /// Every connection syncs a commit fully, deletes securely and waits
     /// out a writer (STORAGE §4.1).
@@ -2290,6 +2458,19 @@ mod tests {
         assert_eq!(pragma("synchronous"), 2, "FULL");
         assert_eq!(pragma("secure_delete"), 1);
         assert_eq!(pragma("busy_timeout"), 30_000);
+    }
+
+    /// Every connection bounds the WAL a checkpoint leaves (STORAGE
+    /// §4.1).
+    #[test]
+    fn a_connection_bounds_its_checkpointed_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
+        prepare_connection(&conn).unwrap();
+        let limit: i64 = conn
+            .pragma_query_value(None, "journal_size_limit", |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, 4 * 1024 * 1024);
     }
 
     /// Every connection opens its store as one from elsewhere (STORAGE

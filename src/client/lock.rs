@@ -76,9 +76,12 @@ struct Shared {
     /// exclusively by the collector across its row deletion and its file
     /// walk.
     writers: RwLock<()>,
-    /// How many verbs are between two of their chunks: a body streamed in
-    /// one chunk has no pointer until the next, so the collector does not
-    /// run while any is (STORAGE §5).
+    /// How many verbs are between two of their chunks, and how many of
+    /// the owner's blob streams are open: a body streamed in one chunk
+    /// has no pointer until the next, so the collector does not run while
+    /// any is (STORAGE §5). Raised under `writers` held shared and read
+    /// by the collector under it held exclusively, so none starts while
+    /// a collection runs.
     running: AtomicUsize,
 }
 
@@ -104,6 +107,17 @@ pub struct PimdirRunning<'a>(&'a Shared);
 impl Drop for PimdirRunning<'_> {
     fn drop(&mut self) {
         self.0.running.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A blob stream of the owner's in flight, counted as a verb is until it
+/// drops (STORAGE §5): its temporary file is no crash leftover, and the
+/// body it commits has no pointer yet.
+pub(crate) struct PimdirStreaming(Arc<PimdirLock>);
+
+impl Drop for PimdirStreaming {
+    fn drop(&mut self) {
+        self.0.shared.running.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -234,12 +248,33 @@ impl PimdirLock {
 
     /// Counts a verb in flight until the guard drops, so the collector
     /// knows a body may be streamed with no pointer yet (STORAGE §5).
+    ///
+    /// Waits out a collection of this process: the count is raised under
+    /// the writer lock held shared, so a collector, which reads it under
+    /// that lock held exclusively, never runs beside a verb it did not
+    /// see. A thread holding [`writing`](Self::writing) does not call it.
     pub fn running(&self) -> PimdirRunning<'_> {
-        self.shared.running.fetch_add(1, Ordering::AcqRel);
+        self.count();
         PimdirRunning(&self.shared)
     }
 
-    /// Whether a verb of this process is between two of its chunks.
+    /// Counts a blob stream in flight until the guard drops, as
+    /// [`running`](Self::running) counts a verb.
+    pub(crate) fn streaming(self: &Arc<Self>) -> PimdirStreaming {
+        self.count();
+        PimdirStreaming(Arc::clone(self))
+    }
+
+    /// Raises the in-flight count under the writer lock held shared.
+    fn count(&self) {
+        let _writing = self.writing();
+        self.shared.running.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether a verb of this process is between two of its chunks, or a
+    /// blob stream of its owner open. A collector reads it once it holds
+    /// [`collecting`](Self::collecting): read before, a verb starting in
+    /// between would go unseen.
     pub fn in_flight(&self) -> bool {
         self.shared.running.load(Ordering::Acquire) > 0
     }

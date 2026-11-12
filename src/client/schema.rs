@@ -17,6 +17,7 @@ use crate::{
     hash::HASH_ALGO,
     sql,
     sync::SYNC_VERSION,
+    version::{PimdirFormat, PimdirProfile, PimdirProgram, PimdirStoreVersion},
 };
 
 /// The Annex A revision this crate derives summaries, addresses and sort
@@ -32,7 +33,7 @@ pub(crate) const DERIVATION: i64 = 3;
 /// existing store.
 pub(crate) fn init(conn: &mut Connection) -> Result<(), PimdirError> {
     if user_version(conn)? != 0 || holds_schema(conn)? {
-        return check(conn);
+        return check(conn, PimdirProfile::Owner);
     }
 
     // NOTE: a deferred transaction, the owner lock keeping every other
@@ -57,16 +58,18 @@ pub(crate) fn init(conn: &mut Connection) -> Result<(), PimdirError> {
 }
 
 /// Refuses, writing nothing, an existing database this crate does not
-/// open (STORAGE §6 steps 1 and 2), whatever the profile: in order, a
+/// open as `profile` (STORAGE §6 steps 1 and 2): in order, a
 /// database declaring tables at `user_version` 0 or naming another
 /// `format` ([`PimdirError::Foreign`]), one holding no schema
 /// ([`PimdirError::Uncreated`]), a store whose `format_version` is not
 /// [`sql::FORMAT_VERSION`] or which lacks the column
-/// ([`PimdirError::Version`]), disagreeing schema stamps
+/// ([`PimdirError::Version`], the judgement of
+/// [`PimdirStoreVersion::opens`] for this crate's draft, which no profile
+/// moves), disagreeing schema stamps
 /// ([`PimdirError::VersionMismatch`]), an algorithm other than BLAKE3
 /// ([`PimdirError::HashAlgo`]), then a schema whose text is not the
 /// canonical one ([`PimdirError::Damaged`]).
-pub(crate) fn check(conn: &Connection) -> Result<(), PimdirError> {
+pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), PimdirError> {
     let user_version = user_version(conn)?;
     if user_version == 0 {
         return match holds_schema(conn)? {
@@ -93,11 +96,25 @@ pub(crate) fn check(conn: &Connection) -> Result<(), PimdirError> {
     if !has_column(conn, "store_meta", "format_version")? {
         return Err(PimdirError::Version { found: None });
     }
-    let (version, hash_algo, format_version): (i64, String, String) =
-        conn.query_row_cached(sql::LOAD_STORE_META, [], |r| {
-            Ok((r.get(1)?, r.get(2)?, r.get(8)?))
+    type Meta = (i64, String, String, i64, i64);
+    let (version, hash_algo, format_version, read_version, produce_version): Meta = conn
+        .query_row_cached(sql::LOAD_STORE_META, [], |r| {
+            Ok((r.get(1)?, r.get(2)?, r.get(8)?, r.get(9)?, r.get(10)?))
         })?;
-    if format_version != sql::FORMAT_VERSION {
+    let program = PimdirProgram {
+        profile,
+        version: sql::VERSION,
+        format: PimdirFormat::Draft(sql::FORMAT_VERSION),
+    };
+    let store = PimdirStoreVersion {
+        format_version: Some(&format_version),
+        version,
+        read_version,
+        produce_version,
+    };
+    // NOTE: a draft is refused for its marker alone (§4.2): the floors a
+    // release judges by have no error of their own until one is built.
+    if store.opens(&program).is_err() {
         return Err(PimdirError::Version {
             found: Some(format_version),
         });

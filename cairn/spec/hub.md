@@ -204,6 +204,14 @@ An upsert carrying no body while the item holds one is that pull, and `absorb` S
 - WHEN one absorbs the pull dropping it
 - THEN the other projects `Clean` with no body, its base still naming the body its server holds
 
+### Requirement: Flag sets differ only when both are known
+`PimdirHub::project` SHALL read a bound placement's flags as differing from its base's, and so `Dirty` on the flag axis, only when the item's set and the base's are both known and unequal as sets (SYNC §3 rule 4): an unknown set, the item's or the base's, holds no opinion, neither an addition nor a removal, and an unknown base is no base on the flag axis. The projection compared the two as values before, so a base whose flags no listing had read made every known set owe a push the canonical `list_owing_bindings` does not name.
+
+#### Scenario: An unknown base, an unknown held set
+- GIVEN a bound item holding no body, its flags and its base's each known or unknown
+- WHEN it is projected
+- THEN it is `Clean` whenever either set is unknown, `Dirty` when both are known and differ, `Clean` when they are equal (src/hub.rs `an_unknown_flag_set_owes_nothing`; `Dirty` for an unknown side before)
+
 ### Requirement: A rebuild's drops keep the base the absorb compares against
 A rebuild lists every `Rekeyed` drop before every upsert ([rekey](rekey.md)), so by the time the upsert rebinding a source lands, `absorb` has removed the binding whose base the divergence test reads. `absorb` SHALL keep the binding a `Superseded` or `Rekeyed` drop removes aside, keyed by source and link id, and SHALL hand it back to the first upsert of the same batch that rebinds that source under the link, base and `shared_object` included, clearing what is left when the batch ends. A `Deleted` drop keeps nothing: the item is gone for that source.
 

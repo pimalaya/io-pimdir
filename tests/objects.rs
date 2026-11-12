@@ -134,8 +134,9 @@ fn a_streamed_body_names_what_a_whole_one_names() {
 }
 
 /// The collector owns a file by its position (STORAGE §3, §5): one sitting
-/// at the shard path its name derives is a body, and anything else under
-/// objects/ is a writer's temporary or somebody else's file, left alone.
+/// at the shard path its name derives is a body, a period-prefixed one is
+/// a temporary no writer holds under its locks, and anything else under
+/// objects/ is somebody else's file, left alone.
 #[test]
 fn the_collector_unlinks_only_the_files_at_their_shard_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -164,9 +165,10 @@ fn the_collector_unlinks_only_the_files_at_their_shard_path() {
         "only the orphan is a body"
     );
     let report = store.collect_garbage().unwrap();
-    assert_eq!((report.objects, report.blobs, report.bytes), (0, 1, 6));
-    assert_eq!(report.strays.len(), 3, "the three are reported");
+    assert_eq!((report.objects, report.blobs, report.bytes), (0, 1, 6 + 9));
+    assert_eq!(report.temporaries, 1, "the temporary a crash left");
+    assert_eq!(report.strays.len(), 2, "the two left are reported");
     assert!(!orphan.is_file(), "the orphan is taken");
-    assert!(tmp.is_file(), "a writer's temporary is not");
-    assert!(readme.is_file() && stray.is_file(), "nor a foreign file");
+    assert!(!tmp.is_file(), "and the temporary");
+    assert!(readme.is_file() && stray.is_file(), "not a foreign file");
 }

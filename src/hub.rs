@@ -299,8 +299,14 @@ impl PimdirHub {
         item: &PimdirHubItem,
         binding: &PimdirBinding,
     ) -> PimdirPlacement {
+        // NOTE: the flag sets differ only when both are known (SYNC §3
+        // rule 4): an unknown one holds no opinion.
         let in_sync = binding.base.as_ref().is_some_and(|b| {
-            b.flags == item.flags && (item.object.is_none() || b.object == item.object)
+            let flags = match (b.flags.known(), item.flags.known()) {
+                (Some(base), Some(held)) => base == held,
+                _ => true,
+            };
+            flags && (item.object.is_none() || b.object == item.object)
         });
         let status = if binding.conflicted || item.conflicted {
             PimdirStatus::Conflict
@@ -986,6 +992,34 @@ mod tests {
             assert_ne!(projected[0].level, PimdirLevel::Full);
             assert_eq!(projected[0].object, None, "no body demanded");
         }
+    }
+
+    /// Flag sets differ only when both are known (SYNC §3 rule 4): an
+    /// unknown base, or an unknown held set, holds no opinion and owes no
+    /// push, while two known sets that differ stay dirty.
+    #[test]
+    fn an_unknown_flag_set_owes_nothing() {
+        let status = |held: PimdirFlags, base: PimdirFlags| {
+            let mut hub = hub_with_left(&[]);
+            let item = hub.items.get_mut(&PimdirLinkId::from("m1")).unwrap();
+            item.flags = held;
+            for binding in item.sources.values_mut() {
+                binding.base.as_mut().unwrap().flags = base.clone();
+            }
+            placements(&hub, "left")[0].status
+        };
+        let seen = || PimdirFlags::from_iter(["seen"]);
+        let none = || PimdirFlags::from_iter([] as [&str; 0]);
+
+        assert_eq!(status(seen(), PimdirFlags::Unknown), PimdirStatus::Clean);
+        assert_eq!(status(PimdirFlags::Unknown, seen()), PimdirStatus::Clean);
+        assert_eq!(
+            status(PimdirFlags::Unknown, PimdirFlags::Unknown),
+            PimdirStatus::Clean
+        );
+        assert_eq!(status(seen(), none()), PimdirStatus::Dirty);
+        assert_eq!(status(none(), seen()), PimdirStatus::Dirty);
+        assert_eq!(status(seen(), seen()), PimdirStatus::Clean);
     }
 
     /// A flag left pulled reads dirty against right's base, so right pushes it.

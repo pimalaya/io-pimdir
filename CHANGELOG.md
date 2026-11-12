@@ -19,10 +19,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   A delivered create derives nothing, is never found absent and lands on the page naming its member, so a delete or a move staged on it is held, then pushed against the listed handle, rather than withdrawn. `PimdirSyncReport::waiting` counts the delivered creates a run holds. A storage applying the write ops matches the new variant (`deliver_binding`).
 
 - Added `PimdirHandle::is_provisional`, `PimdirPlacement::delivered` and `PimdirLinkId::is_landable`.
+- Added the `version` module: `PimdirStoreVersion::opens` judges, I/O-free, whether a program of a profile (`PimdirProfile`), a schema version and a draft or released build (`PimdirFormat`, `PimdirProgram`) opens a store stating a `format_version`, a `version`, a `read_version` and a `produce_version`, answering a `PimdirVersionRefusal` otherwise (pimdir STORAGE §4.2).
+
+  The draft rule every open runs goes through it and refuses the same stores as before. The released rule (an owner opens a version it knows, a reader a store whose `read_version` is at most its own, a producer one whose `produce_version` is too, and a release refuses every draft store) is implemented and tested, and run by no open until a release is built.
+
+- **BREAKING**: Added `PimdirGcReport::temporaries` and the `temporaries` member of `pimdir gc --json`: the temporary files the collector unlinked.
+- Added `PRAGMA journal_size_limit`, 4 MiB, on every connection, so a WAL one large write grew is truncated once checkpointed.
+- Added a bounded `PRAGMA incremental_vacuum` after `purge_retained_before`, `collect_before`, `release_before` and `collect_garbage` when they removed rows: at most 4,096 free pages go back to the filesystem per call, where pimdir.db never shrank before.
 
 ### Changed
 
 - Changed the upgrade to fetch no provisional handle: a pending or a delivered create waits for the page that lands it.
+- **BREAKING**: Changed the collector to unlink the temporary files a killed writer left: every period-prefixed regular file of objects/ and its shard directories, which `PimdirGcReport::strays` reported and left before.
+
+  Under the collector's locks no writer holds one. A producer inside its staging window still fails the collection (`store-staging`), and so does a blob stream the owner still holds open (`store-in-flight`), which a collection ran beside before. `pimdir check` no longer fails for ever on such a file: `pimdir gc` removes it.
+
+- Changed a producer's enqueue naming a body it did not stage to take the staging lock and verify the body first: one the blob directory does not hold (`NotFound`) or failing its name (`InvalidData`) is refused as `PimdirError::Io`, where it was queued, its object row recreated, before.
+- Changed `PimdirStore::put_item` to stage its body before its transaction, under the process's writer lock, as `PimdirSourceStore::write` does.
+- Changed `PimdirLock::running` and an owner's `PimdirBlobStage::writer` to wait out a collection of the same process.
+- Changed the HTML reduction of the search index: a tag separates the text on its two sides unless it is an inline element's (`a`, `b`, `em`, `span`, `sub`, `sup` and the like), so the cells of a table are words apart. A body indexed before keeps its text until it is indexed again.
 - **BREAKING**: Changed the CLI's lists to print as plain text, with no border, no colour and no truncation.
 
   A wide list prints one record per item, the way `git log` prints commits: a title line with its state words in parentheses, aligned `Label: value` fields, then its free text indented by four spaces, one blank line between items. `collection list` titles each collection by its id, `item list` each item by its seq with its flags as state words and its title as the text, `queue list` each action by its id, `search` and `thread` each hit by its seq with its snippet as the text, `search --threads` each thread by its id with one line per hit as the text, and `tag` each hit by its seq with one field per placement. The collection counts of `store info` print as columns two spaces apart under an uppercase header. The `--json` output is unchanged.
@@ -37,6 +52,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed a collection running beside a verb or a write it did not see: the in-flight guard of `collect_garbage`, `collect_before` and `release_before` was read before their locks were taken, so a verb starting in between had the body it streamed swept as an orphan.
+- Fixed a blob write keeping a name another writer made without flushing its shard directory, a batch flushing one shard directory once per body, and the collector, so an erase, answering before its unlinks were durable.
+- Fixed the projection reading a known flag set as differing from an unknown base, or an unknown set from a known base: flag sets differ only when both are known (pimdir SYNC §3).
+- Fixed a calendar item leaving every agenda when the index re-expanded it (a horizon roll, another time zone database or floating zone) while its body could not be read: it keeps its occurrences, is recorded missing, and is expanded again by the pass that reads its body.
+- Fixed the HTML reduction joining the last word before a tag with the first after it when a line break preceded them.
 - Fixed control and bidi characters from the store (collection ids and names, titles, flags, link ids, sort keys, summary values, handles, queue payloads and errors) reaching the terminal through the text output of `collection list`, `item list`, `item show`, `queue list` and `store info`.
 - Fixed control and bidi characters from the store (titles, snippets, extracted texts, kinds, collections, link ids, accounts, thread ids, the coverage's media types and dates, and `check`'s hashes, paths, rows and collections) reaching the terminal through the text output of `search`, `thread`, `tag`, `show` and `check`: a crafted subject could write the clipboard through OSC 52 or clear the screen.
 

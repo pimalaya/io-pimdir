@@ -300,6 +300,9 @@ impl fmt::Display for CheckOutput {
                 writeln!(f, " - {path} ({})", stray.kind)?;
             }
             more(f, self.strays.len())?;
+            if self.strays.iter().any(|stray| stray.kind == "temporary") {
+                writeln!(f, "   Remove the temporary ones with `pimdir gc`")?;
+            }
         }
 
         if !self.quarantined.is_empty() {

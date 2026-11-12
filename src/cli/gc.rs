@@ -19,9 +19,9 @@ use crate::cli::{StoreFlags, bytes, error::report};
 /// Reclaim what nothing references any more.
 ///
 /// Drops the object rows at refcount zero, unlinks their bodies, and sweeps
-/// the orphan blob files a crash can leave. Takes the owner role, so it never
-/// runs beside a sync, and waits for any producer that is mid-append. Nothing
-/// a live or retained item still points at is touched.
+/// the orphan blob files and the temporary files a crash can leave. Takes the
+/// owner role, so it never runs beside a sync, and fails while a producer is
+/// mid-append. Nothing a live or retained item still points at is touched.
 #[derive(Debug, Args)]
 pub struct GcCommand;
 
@@ -34,6 +34,7 @@ impl GcCommand {
             objects: collected.objects,
             blobs: collected.blobs,
             bytes: collected.bytes,
+            temporaries: collected.temporaries,
             strays: collected.strays.len(),
         })
     }
@@ -47,8 +48,11 @@ pub struct GcOutput {
     pub objects: usize,
     /// Blob files unlinked.
     pub blobs: usize,
-    /// Bytes they freed.
+    /// Bytes the unlinked files freed.
     pub bytes: u64,
+    /// Temporary files unlinked: what a writer killed before its own
+    /// unlink left under objects/.
+    pub temporaries: usize,
     /// Entries of objects/ that are no body, left in place: `pimdir check`
     /// lists them.
     pub strays: usize,
@@ -56,8 +60,24 @@ pub struct GcOutput {
 
 impl fmt::Display for GcOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.objects == 0 && self.blobs == 0 {
+        if self.objects == 0 && self.blobs == 0 && self.temporaries == 0 {
             writeln!(f, "Nothing to collect: every body is still referenced")?;
+        } else if self.objects == 0 && self.blobs == 0 {
+            writeln!(
+                f,
+                "Collected {} temporary file(s), freeing {}",
+                self.temporaries,
+                bytes(self.bytes)
+            )?;
+        } else if self.temporaries > 0 {
+            writeln!(
+                f,
+                "Collected {} object(s), {} blob file(s) and {} temporary file(s), freeing {}",
+                self.objects,
+                self.blobs,
+                self.temporaries,
+                bytes(self.bytes)
+            )?;
         } else {
             writeln!(
                 f,

@@ -129,6 +129,7 @@ pub mod sync;
 #[cfg(test)]
 mod testlog;
 pub mod upgrade;
+pub mod version;
 
 #[cfg(feature = "client")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client")))]

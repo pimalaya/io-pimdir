@@ -310,10 +310,15 @@ fn a_restored_copy_raises_its_incarnation() {
     let store = PimdirStore::open(dir.path()).unwrap();
     let id = store.change_cursor().unwrap().store_id;
 
-    assert_eq!(store.raise_incarnation(None).unwrap(), 2);
-    assert_eq!(store.raise_incarnation(Some(5)).unwrap(), 6);
+    let created = store.change_cursor().unwrap().incarnation;
+
+    let first = store.raise_incarnation(None).unwrap();
+    assert!(first > created, "above the copy's own");
+    let replaced = first + 3;
+    let second = store.raise_incarnation(Some(replaced)).unwrap();
+    assert!(second > first && second > replaced, "above both");
     let cursor = store.change_cursor().unwrap();
-    assert_eq!((cursor.store_id, cursor.incarnation), (id, 6));
+    assert_eq!((cursor.store_id, cursor.incarnation), (id, second));
 }
 
 /// The engine's first write records its sync version (STORAGE §4.3); a
