@@ -11,7 +11,7 @@
 //!
 //! ```sh
 //! q=queries/storage/owner/list_owing_bindings.sql
-//! git -C ../pimdir show 88a24f9:$q > before/list_owing_bindings.sql
+//! git -C ../pimdir show 234bad2:$q > before/list_owing_bindings.sql
 //! PIMDIR_BEFORE=before cargo test --release --test statement_scale \
 //!     -- --ignored --nocapture
 //! ```

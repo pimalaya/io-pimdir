@@ -6,7 +6,7 @@ landed: 2026-11-12
 
 # The crate follows draft 10, the schema and the statements
 
-spec/ is pimdir at 31da94c, the first batch of storage-draft-10, sync-draft-10 and search-draft-10 (`sql::FORMAT_VERSION`, `sync::SYNC_VERSION`, `sql::search::FORMAT_VERSION` and `FORMAT_DRAFT`, README.md). Its migrations/ and queries/ moved; its vectors/ and payloads/ are those of 317768b byte for byte, the later batches owning them, and a later pass re-vendors those. A store draft-09 wrote is refused by every profile and its index rebuilt, never migrated. The copy was taken from the commit (`git archive 31da94c`), never from the standard's working tree, which was moving.
+spec/ is pimdir at 0cfa8a1, the first batch of storage-draft-10, sync-draft-10 and search-draft-10 (`sql::FORMAT_VERSION`, `sync::SYNC_VERSION`, `sql::search::FORMAT_VERSION` and `FORMAT_DRAFT`, README.md). Its migrations/ and queries/ moved; its vectors/ and payloads/ are those of 317768b byte for byte, the later batches owning them, and a later pass re-vendors those. A store draft-09 wrote is refused by every profile and its index rebuilt, never migrated. The copy was taken from the commit (`git archive 0cfa8a1`), never from the standard's working tree, which was moving.
 
 ## What followed
 

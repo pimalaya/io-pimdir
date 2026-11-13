@@ -6,7 +6,7 @@ landed: 2026-11-13
 
 # The crate follows draft 10, the payloads and identity
 
-spec/ is pimdir at c315220, the second batch of storage-draft-10, sync-draft-10 and search-draft-10: its queries/ (three statement texts, signatures.json), payloads/ (two schemas) and vectors/ (payloads.json at `v` 2, sync/ at `v` 5 with cases 141 to 149, twelve fixtures and twelve summary cases) moved, its migrations/ did not. The copy was taken from the commit (`git archive c315220`), never from the standard's working tree, where a third batch was being written. The draft names, the schema and Annex A's revision do not move, so no store is refused that opened before.
+spec/ is pimdir at e4faa21, the second batch of storage-draft-10, sync-draft-10 and search-draft-10: its queries/ (three statement texts, signatures.json), payloads/ (two schemas) and vectors/ (payloads.json at `v` 2, sync/ at `v` 5 with cases 141 to 149, twelve fixtures and twelve summary cases) moved, its migrations/ did not. The copy was taken from the commit (`git archive e4faa21`), never from the standard's working tree, where a third batch was being written. The draft names, the schema and Annex A's revision do not move, so no store is refused that opened before.
 
 ## What followed
 
