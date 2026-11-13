@@ -98,8 +98,7 @@ impl PimdirSearchCoverage {
     pub fn is_complete(&self) -> bool {
         let reads = &self.local.reads;
         let read = self.local.kinds.iter().all(|(kind, counts)| {
-            (!reads.kinds.contains(kind)
-                || counts.bodiless + counts.missing + counts.unparseable == 0)
+            (!reads.kinds.contains(kind) || counts.missing + counts.unparseable == 0)
                 && (!reads.counts_bodiless(kind) || counts.bodiless == 0)
                 && (!reads.content || counts.encrypted == 0)
         });
@@ -205,10 +204,10 @@ impl PimdirSearchReads {
     }
 
     /// Whether a `bodiless` item of `kind` counts against the answer
-    /// though no term reads a body of the kind: mail's, under
-    /// `has:attachment`.
+    /// (SEARCH §8.2): a term reads a body of the kind, or the kind is
+    /// mail and the query holds `has:attachment`.
     pub fn counts_bodiless(&self, kind: &str) -> bool {
-        self.mark && kind == MAIL
+        self.kinds.contains(kind) || (self.mark && kind == MAIL)
     }
 
     /// Joins what another query's terms read.
@@ -568,6 +567,24 @@ mod tests {
         text.local.kinds.insert("text/vcard".into(), bodiless);
         text.local.reads = PimdirSearchReads::text();
         assert!(!text.is_complete(), "a text term reads a card's body");
+    }
+
+    /// The whole rule, so a caller asks nothing beside it (SEARCH §8.2).
+    #[test]
+    fn a_bodiless_item_counts_under_a_read_of_its_kind_or_mails_mark() {
+        let mut reads = PimdirSearchReads::default();
+        assert!(!reads.counts_bodiless(MAIL), "nothing read");
+
+        reads.mark = true;
+        assert!(reads.counts_bodiless(MAIL), "its mark is a guess");
+        assert!(!reads.counts_bodiless(CARD), "a card never has one");
+
+        reads.kinds = [CARD.to_string()].into();
+        assert!(reads.counts_bodiless(CARD), "a term reads a card's body");
+        assert!(!reads.counts_bodiless(CALENDAR));
+
+        reads.mark = false;
+        assert!(!reads.counts_bodiless(MAIL), "nor a message's");
     }
 
     #[test]

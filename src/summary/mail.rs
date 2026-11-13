@@ -88,22 +88,25 @@ pub struct PimdirMailSummary {
 
 impl PimdirMailSummary {
     /// The key the message is filed under: the `Message-ID`, else `alt:`
-    /// over the subject, the date and the sender (Annex A.1).
+    /// over the subject, the date and the sender (Annex A.1), the date
+    /// the [usable](usable_date) one, empty when the store takes none.
     pub fn link_id(&self) -> PimdirLinkId {
         match &self.message_id {
             Some(id) => PimdirLinkId::from_hint(id.as_str()),
             None => PimdirLinkId(format!(
                 "alt:{}|{}|{}",
                 self.subject,
-                self.date.as_deref().unwrap_or_default(),
+                usable_date(self.date.as_deref()).unwrap_or_default(),
                 self.sender.as_deref().unwrap_or_default(),
             )),
         }
     }
 
-    /// The date column, read descending for a newest-first listing.
+    /// The date column, read descending for a newest-first listing:
+    /// the [usable date](usable_date), empty when the store takes none.
     pub fn sort_key(&self) -> PimdirSortKey {
-        PimdirSortKey(self.date.clone().unwrap_or_default())
+        let date = usable_date(self.date.as_deref());
+        PimdirSortKey(date.unwrap_or_default().into())
     }
 
     /// The whole derivation this summary yields.
@@ -1308,6 +1311,50 @@ mod tests {
         );
         assert_eq!(derivation.sort_key.as_str(), "2026-08-01T10:00:00Z");
     }
+
+    /// A summary a caller states, its date as a connector may hand one.
+    fn stated(date: &str) -> PimdirMailSummary {
+        PimdirMailSummary {
+            subject: "Hi".into(),
+            sender: Some("a@x.y".into()),
+            date: Some(date.into()),
+            ..Default::default()
+        }
+    }
+
+    /// The dates the store takes as none (STORAGE §13).
+    const UNUSABLE: [&str; 5] = [
+        "2026-08-01T10:00:00.5Z",
+        "2026-08-01T12:00:00+02:00",
+        "2026-08-01t10:00:00z",
+        "2026-08-01",
+        "",
+    ];
+
+    /// The key is the `date` column, which holds no such date (Annex A.1).
+    #[test]
+    fn a_date_the_store_takes_as_none_sorts_as_no_date() {
+        let usable = stated("2026-08-01T10:00:00Z");
+        assert_eq!(usable.sort_key().as_str(), "2026-08-01T10:00:00Z");
+
+        for date in UNUSABLE {
+            assert!(stated(date).sort_key().is_unknown(), "{date}");
+        }
+    }
+
+    #[test]
+    fn a_date_the_store_takes_as_none_is_the_empty_part_of_an_alt_key() {
+        let usable = stated("2026-08-01T10:00:00Z");
+        assert_eq!(
+            usable.link_id().as_str(),
+            "alt:Hi|2026-08-01T10:00:00Z|a@x.y"
+        );
+
+        for date in UNUSABLE {
+            assert_eq!(stated(date).link_id().as_str(), "alt:Hi||a@x.y", "{date}");
+        }
+    }
+
     #[test]
     fn a_date_outside_annex_a1s_forms_is_unparseable() {
         let date = |raw: &str| instant(raw);

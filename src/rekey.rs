@@ -64,8 +64,9 @@ pub struct PimdirRekeyReport {
     /// from the new spine.
     pub dropped: usize,
     /// The rekey this run parked rather than wrote, its listing leaving
-    /// most of the source's based bindings with no member (SYNC §8):
-    /// nothing written, the counts above zero.
+    /// most of the source's based bindings with no member, or any of them
+    /// when it names no member or is capped (SYNC §8): nothing written,
+    /// the counts above zero.
     pub parked: Option<PimdirParked>,
 }
 
@@ -77,8 +78,10 @@ pub struct PimdirRekey {
     checkpoint: Option<PimdirCheckpoint>,
     /// What each member's meta resolved, by new handle.
     resolved: BTreeMap<PimdirHandle, Resolved>,
-    /// Whether the caller confirmed the absences the listing leaves, so a
-    /// mass absence is written rather than parked (SYNC §8).
+    /// Whether a page of the listing said the source caps it (SYNC §4).
+    capped: bool,
+    /// Whether the caller confirmed the absences the listing leaves, so
+    /// they are written rather than parked (SYNC §8).
     accept_absences: bool,
     report: PimdirRekeyReport,
     state: State,
@@ -96,6 +99,7 @@ impl PimdirRekey {
             items: Vec::new(),
             checkpoint: None,
             resolved: BTreeMap::new(),
+            capped: false,
             accept_absences: false,
             report: PimdirRekeyReport::default(),
             state: State::Start,
@@ -104,8 +108,9 @@ impl PimdirRekey {
 
     /// Tells the coroutine the caller confirmed the absences its listing
     /// may leave (SYNC §8): a listing leaving more than half of at least
-    /// 20 based bindings with no member is then written, where it parks
-    /// by default. Per run, never stored.
+    /// 20 based bindings with no member, or any of them when it names no
+    /// member or is capped, is then written, where it parks by default.
+    /// Per run, never stored.
     pub fn accept_absences(mut self, accept: bool) -> Self {
         self.accept_absences = accept;
         self
@@ -139,7 +144,10 @@ impl PimdirRekey {
     /// carried when an old placement resolves to the same item and fresh
     /// otherwise. Every drop precedes every upsert (SYNC §8, §10): a new
     /// handle may be an old one another member held.
-    fn rebuild(&mut self) -> Vec<PimdirWriteOp> {
+    ///
+    /// Answers the batch and how many based bindings no member resolved
+    /// to, the ones the batch re-stages as pending creates included.
+    fn rebuild(&mut self) -> (Vec<PimdirWriteOp>, usize) {
         let mut writes = Vec::new();
         let links = mem::take(&mut self.resolved);
 
@@ -204,6 +212,14 @@ impl PimdirRekey {
                 }
             }
         }
+
+        // NOTE: counted before an uncarried edit is re-staged, no member
+        // having resolved to its binding either (SYNC §8).
+        let unresolved = old
+            .iter()
+            .filter(|p| p.base.is_some() && !p.delivered())
+            .filter(|p| !carried_over.contains(&p.handle))
+            .count();
 
         // NOTE: a delivered create no member resolved to is left as it is,
         // neither re-staged, which would push its add again, nor dropped:
@@ -296,7 +312,7 @@ impl PimdirRekey {
             });
         }
 
-        drops
+        (drops, unresolved)
     }
 
     /// The key a rebuilt member takes, and the old placement is found under.
@@ -561,6 +577,7 @@ impl PimdirCoroutine for PimdirRekey {
                 self.items.clear();
                 self.resolved.clear();
                 self.checkpoint = None;
+                self.capped = false;
                 self.enumerate(None)
             }
 
@@ -586,6 +603,9 @@ impl PimdirCoroutine for PimdirRekey {
                 if page.checkpoint.is_some() {
                     self.checkpoint = page.checkpoint;
                 }
+                // NOTE: a cap is the collection's, stated on every page of
+                // its rounds (SYNC §4): one page stating it is enough.
+                self.capped |= page.capped;
                 for item in page.items {
                     self.resolved.insert(
                         item.handle.clone(),
@@ -610,7 +630,7 @@ impl PimdirCoroutine for PimdirRekey {
                             .map(|p| p.handle.clone())
                             .collect();
                         let named = !self.items.is_empty();
-                        let writes = self.rebuild();
+                        let (writes, unresolved) = self.rebuild();
 
                         // NOTE: a based binding the rebuild drops `Deleted`
                         // resolved to no member; a listing leaving most of
@@ -630,9 +650,19 @@ impl PimdirCoroutine for PimdirRekey {
                                 )
                             })
                             .count();
-                        if let Some(parked) =
-                            PimdirParked::guard(absent, based.len(), named, self.accept_absences)
-                        {
+                        // NOTE: a capped listing proves no absence, and an
+                        // old handle names nothing in the new space: any
+                        // based binding no member resolved to parks it,
+                        // dropped or re-staged (SYNC §8).
+                        let accepted = self.accept_absences;
+                        let parked = match self.capped {
+                            true => (unresolved > 0 && !accepted).then_some(PimdirParked {
+                                absent: unresolved,
+                                bound: based.len(),
+                            }),
+                            false => PimdirParked::guard(absent, based.len(), named, accepted),
+                        };
+                        if let Some(parked) = parked {
                             debug!(
                                 "{} of {} bound members absent, park the rekey",
                                 parked.absent, parked.bound,
@@ -1549,5 +1579,194 @@ mod tests {
             ),
             state => panic!("expected the rebuild's write, got {state:?}"),
         }
+    }
+
+    fn three() -> Vec<PimdirPlacement> {
+        vec![
+            synced("1", "m1", &[]),
+            synced("2", "m2", &[]),
+            synced("3", "m3", &[]),
+        ]
+    }
+
+    /// A listed member resolving to `link` under a handle of the new space.
+    fn renumbered(link: &str) -> PimdirRemoteItem {
+        let mut member = item(&format!("v2-{link}"), &[]);
+        member.meta.link_id = PimdirLinkId::from(link);
+        member
+    }
+
+    /// Answers a rekey over `old` with a one-page listing of the members
+    /// resolving to `links`, the source capping it or not.
+    fn relisted(
+        old: Vec<PimdirPlacement>,
+        links: &[&str],
+        capped: bool,
+        accept: bool,
+    ) -> PimdirCoroutineState<PimdirYield, Result<PimdirRekeyReport, PimdirArgError>> {
+        crate::testlog::init();
+        let mut rekey = PimdirRekey::new("inbox").accept_absences(accept);
+        let _ = rekey.resume(None);
+        let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: old,
+            ..Default::default()
+        })));
+
+        let members = links.iter().map(|link| renumbered(link)).collect();
+        let mut page = PimdirRemoteSnapshot::round(members, Some(PimdirCheckpoint(b"v2".to_vec())));
+        page.capped = capped;
+        rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page))))
+    }
+
+    /// The batch a rekey asks to write, as the old handles it drops.
+    fn drops(
+        state: PimdirCoroutineState<PimdirYield, Result<PimdirRekeyReport, PimdirArgError>>,
+    ) -> Vec<(String, PimdirDropReason)> {
+        let writes = match state {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(writes)) => writes,
+            state => panic!("expected the rebuild's write, got {state:?}"),
+        };
+        writes
+            .iter()
+            .filter_map(|op| match op {
+                PimdirWriteOp::DropPlacement { handle, reason, .. } => {
+                    Some((handle.as_str().into(), *reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn parked(
+        state: PimdirCoroutineState<PimdirYield, Result<PimdirRekeyReport, PimdirArgError>>,
+    ) -> PimdirRekeyReport {
+        match state {
+            PimdirCoroutineState::Complete(Ok(report)) => report,
+            state => panic!("expected a parked rekey, got {state:?}"),
+        }
+    }
+
+    /// A capped listing leaves out members the source still holds: one
+    /// based binding of three resolving to no member parks the rekey, far
+    /// under the half of twenty, nothing written (SYNC §8).
+    #[test]
+    fn a_capped_rekey_parks_on_one_absent_member() {
+        let report = parked(relisted(three(), &["m1", "m2"], true, false));
+
+        assert_eq!(
+            report,
+            PimdirRekeyReport {
+                parked: Some(PimdirParked {
+                    absent: 1,
+                    bound: 3
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn a_capped_rekey_whose_absences_are_accepted_is_written() {
+        let dropped = drops(relisted(three(), &["m1", "m2"], true, true));
+
+        assert_eq!(
+            dropped,
+            vec![
+                ("1".into(), PimdirDropReason::Rekeyed),
+                ("2".into(), PimdirDropReason::Rekeyed),
+                ("3".into(), PimdirDropReason::Deleted),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_capped_rekey_every_binding_resolves_in_is_written() {
+        let dropped = drops(relisted(three(), &["m1", "m2", "m3"], true, false));
+
+        assert_eq!(
+            dropped,
+            vec![
+                ("1".into(), PimdirDropReason::Rekeyed),
+                ("2".into(), PimdirDropReason::Rekeyed),
+                ("3".into(), PimdirDropReason::Rekeyed),
+            ],
+        );
+    }
+
+    /// One absent of three is no mass absence: with no cap the listing
+    /// proves it gone (SYNC §8).
+    #[test]
+    fn an_uncapped_rekey_missing_one_member_is_written() {
+        let dropped = drops(relisted(three(), &["m1", "m2"], false, false));
+
+        assert_eq!(
+            dropped,
+            vec![
+                ("1".into(), PimdirDropReason::Rekeyed),
+                ("2".into(), PimdirDropReason::Rekeyed),
+                ("3".into(), PimdirDropReason::Deleted),
+            ],
+        );
+    }
+
+    /// Re-staged, the edit would be added beside the member the cap left
+    /// out, so its binding counts as the dropped ones do (SYNC §8).
+    #[test]
+    fn a_capped_rekey_parks_on_an_edit_no_member_resolves_to() {
+        let mut edited = synced("2", "m2", &[]);
+        edited.object = Some(PimdirHash::from("h2"));
+        edited.level = PimdirLevel::Full;
+        edited.status = PimdirStatus::Dirty;
+        let old = vec![synced("1", "m1", &[]), edited];
+
+        let report = parked(relisted(old.clone(), &["m1"], true, false));
+        assert_eq!(
+            report.parked,
+            Some(PimdirParked {
+                absent: 1,
+                bound: 2
+            }),
+        );
+
+        let dropped = drops(relisted(old, &["m1"], false, false));
+        assert_eq!(
+            dropped,
+            vec![
+                ("1".into(), PimdirDropReason::Rekeyed),
+                ("2".into(), PimdirDropReason::Superseded),
+            ],
+            "with no cap it is re-staged",
+        );
+    }
+
+    /// A cap is the collection's, so the page stating it need not be the
+    /// last (SYNC §4).
+    #[test]
+    fn a_cap_stated_on_any_page_caps_the_rekey() {
+        crate::testlog::init();
+        let mut rekey = PimdirRekey::new("inbox");
+        let _ = rekey.resume(None);
+        let _ = rekey.resume(Some(PimdirArg::Load(PimdirLoaded {
+            placements: three(),
+            ..Default::default()
+        })));
+
+        let mut first = PimdirRemoteSnapshot::page(
+            vec![renumbered("m1")],
+            Some(PimdirCursor(b"p1".to_vec())),
+            Some(PimdirCheckpoint(b"v2".to_vec())),
+        );
+        first.capped = true;
+        let _ = rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(first))));
+        let last = PimdirRemoteSnapshot::page(vec![renumbered("m2")], None, None);
+        let report = parked(rekey.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::Page(last)))));
+
+        assert_eq!(
+            report.parked,
+            Some(PimdirParked {
+                absent: 1,
+                bound: 3
+            }),
+        );
     }
 }

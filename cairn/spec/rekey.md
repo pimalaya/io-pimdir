@@ -111,6 +111,21 @@ The engine emits no op for the epoch bump: a batch carrying a `Rekeyed` drop is 
 ### Requirement: A rekey missing most members, or listing none, parks
 A rekey whose listing leaves more than half of the source's based bindings in the collection with no member, those bindings numbering at least 20, SHALL write nothing (no drop, no upsert, the checkpoint and the generation unmoved) unless `PimdirRekey::accept_absences` is set (`PimdirSourceStore::rekey(collection, accept_absences, remote)`), and `PimdirRekeyReport::parked` carries the counts (pimdir SYNC §8, vectors/sync/89). A rekey whose listing names no member SHALL park the same way while any based binding of the source is absent, whatever their number (src/rekey.rs `an_empty_listing_parks_the_rekey`). The old checkpoint still names the old handle space, so the next run names the rekey again.
 
+### Requirement: A rekey from a capped listing parks on any absence
+A rekey whose listing the source caps, a page of it stating `PimdirRemoteSnapshot::capped` ([seam](seam.md); pimdir SYNC §4), SHALL write nothing (no drop, no upsert, the checkpoint and the generation unmoved) while any based binding of the source in the collection resolves to no member, whatever their number, unless `PimdirRekey::accept_absences` is set, and `PimdirRekeyReport::parked` carries the counts (pimdir SYNC §8, vectors/sync/159). A capped listing leaves out members the source still holds, so such a binding is no absence the listing proves, and its old handle names nothing in the new space: it can be neither dropped as gone nor carried as it is. Accepted, the rekey is written as any other, each such binding dropped `Deleted`, or re-staged where it holds an edit. A capped rekey every based binding resolves in is written.
+
+The bindings counted absent there are every based one no member resolved to, a delivered create aside: those the rebuild would drop `Deleted` and those holding an edit it would re-stage as a pending create, which the next sync would add beside the member the cap left out. The guard of a rekey no cap bounds counts the `Deleted` drops alone, as it did.
+
+One page stating the cap is enough, the last or not: a cap is the collection's, which a connector states on every page of its rounds. A listing restarted over a rejected cursor is read anew.
+
+#### Scenario: One absent of three under a cap
+- GIVEN three based bindings and a capped listing naming two of them under new handles
+- WHEN the collection is rebuilt
+- THEN nothing is written and the run reports 1 absent of 3 bound (src/rekey.rs `a_capped_rekey_parks_on_one_absent_member`, sync vector 159, each failing with the cap unread); under `accept_absences` the two are dropped `Rekeyed` and the third `Deleted` (`a_capped_rekey_whose_absences_are_accepted_is_written`); the listing naming all three is written (`a_capped_rekey_every_binding_resolves_in_is_written`); with no cap one absent of three is written (`an_uncapped_rekey_missing_one_member_is_written`)
+
+#### Scenario: An edit the cap left out
+- src/rekey.rs `a_capped_rekey_parks_on_an_edit_no_member_resolves_to` (fails with the `Deleted` drops alone counted: the edit is re-staged and the rekey written); `a_cap_stated_on_any_page_caps_the_rekey` (fails with the last page alone read)
+
 ### Requirement: A re-staged edit takes a provisional handle
 A rebuild re-staging an edited row no member carries (SYNC §8) SHALL key it under the provisional handle its link id derives, its binding moved there by a `Superseded` drop of the old handle, which is void and may be one the new space gives another member.
 

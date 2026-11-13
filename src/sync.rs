@@ -259,7 +259,9 @@ pub enum PimdirWaitReason {
 
 /// A round or a rekey that would drop more than half of at least
 /// [`MASS_ABSENCE`](PimdirParked::MASS_ABSENCE) based bindings, or any
-/// from a listing naming no member, and so wrote no drop (SYNC §5, §8).
+/// from a listing naming no member, or a rekey any of whose based
+/// bindings a capped listing left out, and so wrote no drop (SYNC §5,
+/// §8).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PimdirParked {
     /// The based bindings the listing left without a member.

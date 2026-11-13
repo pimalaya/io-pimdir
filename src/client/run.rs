@@ -281,8 +281,9 @@ impl PimdirSourceStore {
     /// Rebuilds a collection onto a new handle space, by link id (SYNC §8).
     ///
     /// A listing leaving more than half of at least 20 based bindings with
-    /// no member parks the rekey, nothing written, unless the caller
-    /// confirmed the absences with `accept_absences`
+    /// no member, or any of them when it names no member or is capped,
+    /// parks the rekey, nothing written, unless the caller confirmed the
+    /// absences with `accept_absences`
     /// ([`PimdirRekeyReport::parked`]).
     pub fn rekey<R: PimdirRemote>(
         &mut self,

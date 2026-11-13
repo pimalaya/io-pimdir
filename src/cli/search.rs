@@ -26,7 +26,9 @@ use io_pimdir::{
     },
     placement::PimdirLevel,
     search::{
-        coverage::{PimdirSearchCoverage, PimdirSearchRemote, PimdirSearchTemporal},
+        coverage::{
+            PimdirSearchCoverage, PimdirSearchReads, PimdirSearchRemote, PimdirSearchTemporal,
+        },
         query::PimdirQuery,
         tag::PimdirSearchTagSource,
     },
@@ -1259,14 +1261,12 @@ impl fmt::Display for CoverageRow {
         writeln!(f, "Coverage: partial")?;
         // NOTE: a count the query's terms do not read is left out, as it
         // leaves the answer complete.
+        let reads = PimdirSearchReads::from(&self.local.reads);
         for (kind, counts) in &self.local.kinds {
-            let read = self.local.reads.kinds.contains(kind);
-            // NOTE: a message's mark is a guess while it holds no body,
-            // so `has:attachment` counts the bodiless mail it reads none
-            // of.
-            let marked = self.local.reads.mark && kind == "message/rfc822";
+            let read = reads.kinds.contains(kind);
+            let bodiless = reads.counts_bodiless(kind);
             let kind = sanitize::text(kind);
-            if counts.bodiless > 0 && (read || marked) {
+            if counts.bodiless > 0 && bodiless {
                 writeln!(
                     f,
                     " - {} {kind} item(s) without a body, searched by summary",
@@ -1399,6 +1399,16 @@ pub struct ReadsRow {
     /// Whether the query holds `has:attachment`, which a message holding
     /// no body answers by a guess: mail's bodiless items then count.
     pub mark: bool,
+}
+
+impl From<&ReadsRow> for PimdirSearchReads {
+    fn from(reads: &ReadsRow) -> Self {
+        Self {
+            kinds: reads.kinds.iter().cloned().collect(),
+            content: reads.content,
+            mark: reads.mark,
+        }
+    }
 }
 
 /// The temporal axis.
