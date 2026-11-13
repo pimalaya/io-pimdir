@@ -35,7 +35,9 @@ use alloc::{
 };
 use core::fmt;
 
-use crate::{reference::PimdirReferenceRole, summary::PimdirAddressRole};
+use crate::{
+    reference::PimdirReferenceRole, search::coverage::PimdirSearchReads, summary::PimdirAddressRole,
+};
 
 /// The most Unicode scalar values a query holds (SEARCH §8.3), refused
 /// from the first one past it to the end.
@@ -48,6 +50,14 @@ pub const GROUPS_MAX: usize = 32;
 /// The most terms a query holds (SEARCH §8.3), the first one past it
 /// refused before its own checks.
 pub const TERMS_MAX: usize = 128;
+
+/// The most digits a relative amount holds (`relative`, SEARCH §8.3), a
+/// longer one refused as `invalid-date`.
+pub const RELATIVE_DIGITS_MAX: usize = 6;
+
+/// The most digits a change stamp holds (`stamp`, SEARCH §8.3), every such
+/// stamp fitting an `i64`, a longer one refused as `invalid-value`.
+pub const STAMP_DIGITS_MAX: usize = 18;
 
 /// Every field of SEARCH §8's table, in its order.
 pub const FIELDS: &[&str] = &[
@@ -163,6 +173,10 @@ pub enum PimdirQuery {
     Or(Vec<PimdirQuery>),
     /// The operand does not match.
     Not(Box<PimdirQuery>),
+    /// A parenthesised group, matching as its operand does: kept apart
+    /// since a term inside one rules no collection out of the query's
+    /// (SEARCH §8.2, [`conjuncts`](Self::conjuncts)).
+    Group(Box<PimdirQuery>),
     /// One term.
     Term(PimdirQueryTerm),
 }
@@ -213,12 +227,82 @@ impl PimdirQuery {
                     pending.extend(operands.iter().rev().map(|op| (op, negated)));
                 }
                 Self::Not(operand) => pending.push((operand, !negated)),
+                Self::Group(operand) => pending.push((operand, negated)),
                 Self::Term(term) => terms.push((term, negated)),
             }
         }
         terms
     }
+
+    /// The terms standing as conjuncts of the whole query (SEARCH §8.2):
+    /// the query itself when it is one term, else the terms its top-level
+    /// `and` joins, written or not. A term negated, inside a group or
+    /// beside an `or` is none, so it rules no collection out of the
+    /// query's and bounds no date range of its coverage.
+    pub fn conjuncts(&self) -> Vec<&PimdirQueryTerm> {
+        let operands = match self {
+            Self::And(operands) => operands.as_slice(),
+            query => core::slice::from_ref(query),
+        };
+        operands
+            .iter()
+            .filter_map(|operand| match operand {
+                Self::Term(term) => Some(term),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bodies the query's terms read (SEARCH §8.2), wherever each
+    /// stands, negated or not: what tells whether a body the index could
+    /// not read counts against the answer, which a coverage holding it
+    /// says by its `is_complete`.
+    ///
+    /// A text term reads every kind's, a value holding `@` in an address
+    /// field being a seek of the store and reading none; `date:` and
+    /// `when:` a calendar item's, by its occurrences; `has:attachment` a
+    /// calendar item's; `has:phone`, `has:address`, `has:birthday`,
+    /// `has:photo` and `category:` a card's; `is:encrypted` a message's.
+    /// Free text, `body:`, `attachment:` and `mimetype:` are matched in
+    /// the fields an encrypted body gives none of.
+    pub fn reads(&self) -> PimdirSearchReads {
+        let mut reads = PimdirSearchReads::default();
+        for (term, _) in self.terms() {
+            let kinds: &[&str] = match &term.predicate {
+                PimdirQueryPredicate::Text { field, .. } => {
+                    reads.content |= matches!(
+                        field,
+                        PimdirQueryTextField::Any
+                            | PimdirQueryTextField::Body
+                            | PimdirQueryTextField::Attachment
+                    );
+                    &[MAIL, CARD, CALENDAR]
+                }
+                PimdirQueryPredicate::Address { text, .. } if text.text.contains('@') => &[],
+                PimdirQueryPredicate::Address { .. } | PimdirQueryPredicate::Person(_) => {
+                    &[MAIL, CARD, CALENDAR]
+                }
+                PimdirQueryPredicate::Date(_) | PimdirQueryPredicate::HasAttachment => &[CALENDAR],
+                PimdirQueryPredicate::HasProperty(_) | PimdirQueryPredicate::Category(_) => &[CARD],
+                PimdirQueryPredicate::Encrypted => &[MAIL],
+                _ => &[],
+            };
+            reads
+                .kinds
+                .extend(kinds.iter().map(|kind| String::from(*kind)));
+        }
+        reads
+    }
 }
+
+/// The media type of a mail collection, whose bodies search reads.
+const MAIL: &str = "message/rfc822";
+
+/// The media type of a contact collection.
+const CARD: &str = "text/vcard";
+
+/// The media type of a calendar collection.
+const CALENDAR: &str = "text/calendar";
 
 /// One term and where the query states it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -938,7 +1022,7 @@ impl Parser<'_> {
                 let inner = self.disjunction(None)?;
                 // NOTE: the parentheses balance, so this is the `)`.
                 self.at += 1;
-                Ok(inner)
+                Ok(PimdirQuery::Group(Box::new(inner)))
             }
             TokenKind::Phrase(text) => Ok(term(
                 PimdirQueryPredicate::Text {
@@ -1197,8 +1281,7 @@ fn date_range(value: &str) -> Option<PimdirQueryDateRange> {
 /// Reads a `stamp-value`.
 fn stamp_range(value: &str) -> Option<(Option<i64>, Option<i64>)> {
     range(value, |side| {
-        side.bytes()
-            .all(|b| b.is_ascii_digit())
+        (side.len() <= STAMP_DIGITS_MAX && side.bytes().all(|b| b.is_ascii_digit()))
             .then(|| side.parse().ok())
             .flatten()
     })
@@ -1221,7 +1304,7 @@ fn date(value: &str) -> Option<PimdirQueryDate> {
     };
     if let Some(unit) = unit {
         let amount = &value[..value.len() - 1];
-        if digits(amount) {
+        if digits(amount) && amount.len() <= RELATIVE_DIGITS_MAX {
             return Some(PimdirQueryDate::Relative {
                 amount: amount.parse().ok()?,
                 unit,
@@ -1381,6 +1464,134 @@ mod tests {
         assert_eq!(refusal("date:3m"), ("invalid-date", 5, 7));
         assert_eq!(refusal("changed:1..x"), ("invalid-value", 8, 12));
         assert_eq!(refusal("kind:\"mail\" is:\"x\""), ("invalid-value", 15, 18));
+
+        // NOTE: `relative = 1*6DIGIT` and `stamp = 1*18DIGIT`.
+        assert!(PimdirQuery::parse("date:999999y..000001d").is_ok());
+        assert_eq!(refusal("date:1000000w"), ("invalid-date", 5, 13));
+        assert_eq!(refusal("date:2026..0000001d"), ("invalid-date", 5, 19));
+        assert_eq!(
+            PimdirQuery::parse("changed:..999999999999999999").map(|query| query.terms().len()),
+            Ok(1)
+        );
+        assert_eq!(
+            refusal("changed:1..1000000000000000000"),
+            ("invalid-value", 8, 30)
+        );
+        assert_eq!(
+            refusal("changed:0000000000000000001"),
+            ("invalid-value", 8, 27)
+        );
+    }
+
+    #[test]
+    fn a_term_in_a_group_is_no_conjunct() {
+        let conjuncts = |query: &str| -> Vec<(usize, usize)> {
+            PimdirQuery::parse(query)
+                .unwrap()
+                .conjuncts()
+                .iter()
+                .map(|term| (term.start, term.end))
+                .collect()
+        };
+
+        assert_eq!(conjuncts("kind:mail"), [(0, 9)]);
+        assert_eq!(conjuncts("kind:mail and a b"), [(0, 9), (14, 15), (16, 17)]);
+        assert_eq!(conjuncts("(kind:mail)"), [], "inside a group");
+        assert_eq!(conjuncts("(kind:mail) a"), [(12, 13)]);
+        assert_eq!(conjuncts("(kind:mail a) b"), [(14, 15)]);
+        assert_eq!(conjuncts("kind:mail or a"), [], "beside an or");
+        assert_eq!(conjuncts("kind:mail a or b"), []);
+        assert_eq!(conjuncts("-kind:mail a"), [(11, 12)], "negated");
+        assert_eq!(conjuncts("not kind:mail"), []);
+
+        // NOTE: a group matches as its operand does.
+        let grouped = PimdirQuery::parse("not (a or b)").unwrap();
+        assert!(matches!(
+            &grouped,
+            PimdirQuery::Not(inner) if matches!(&**inner, PimdirQuery::Group(_))
+        ));
+        assert_eq!(
+            grouped
+                .terms()
+                .iter()
+                .map(|(_, negated)| *negated)
+                .collect::<Vec<_>>(),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn a_term_reads_the_bodies_of_its_kinds() {
+        let reads = |query: &str| {
+            let reads = PimdirQuery::parse(query).unwrap().reads();
+            let kinds: Vec<&str> = [MAIL, CARD, CALENDAR]
+                .into_iter()
+                .filter(|kind| reads.kinds.contains(*kind))
+                .collect();
+            (kinds, reads.content)
+        };
+        let every = vec![MAIL, CARD, CALENDAR];
+
+        for query in [
+            "word",
+            "\"a phrase\"",
+            "body:x",
+            "attachment:x",
+            "mimetype:x",
+        ] {
+            assert_eq!(reads(query), (every.clone(), true), "{query}");
+        }
+        for query in [
+            "subject:x",
+            "from:jane",
+            "with:jane",
+            "person:jane",
+            "location:x",
+        ] {
+            assert_eq!(reads(query), (every.clone(), false), "{query}");
+        }
+        for query in ["from:jane@example.org", "with:@example.org"] {
+            assert_eq!(
+                reads(query),
+                (vec![], false),
+                "{query}: a seek of the store"
+            );
+        }
+        for query in ["date:2026", "when:today", "has:attachment"] {
+            assert_eq!(reads(query), (vec![CALENDAR], false), "{query}");
+        }
+        for query in [
+            "has:phone",
+            "has:address",
+            "has:birthday",
+            "has:photo",
+            "category:x",
+        ] {
+            assert_eq!(reads(query), (vec![CARD], false), "{query}");
+        }
+        assert_eq!(reads("is:encrypted"), (vec![MAIL], false));
+        for query in [
+            "is:read",
+            "is:unread",
+            "tag:x",
+            "has:body",
+            "kind:mail",
+            "status:completed",
+            "priority:high",
+            "account:a collection:b",
+            "changed:1..",
+            "thread:a",
+            "id:1",
+            "linked:1",
+        ] {
+            assert_eq!(reads(query), (vec![], false), "{query}");
+        }
+
+        assert_eq!(
+            reads("kind:mail (not body:x or has:phone)"),
+            (every, true),
+            "wherever a term stands, negated or not"
+        );
     }
 
     #[test]

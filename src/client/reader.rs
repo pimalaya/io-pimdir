@@ -1854,7 +1854,7 @@ impl PimdirReader {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         for (kind, count) in bodiless {
-            coverage.local.bodiless.insert(kind, count as u64);
+            coverage.local.kinds.entry(kind).or_default().bodiless = count as u64;
         }
 
         Ok(coverage)

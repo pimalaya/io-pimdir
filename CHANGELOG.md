@@ -8,9 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-10, sync-draft-10 and search-draft-10, vendored at pimdir ff7c883, the three batches of those drafts: the schema and the statements, the payloads and identity, then the text rules.
+- **BREAKING**: Added pimdir storage-draft-10, sync-draft-10 and search-draft-10, vendored at pimdir 3fabace, the four batches of those drafts: the schema and the statements, the payloads and identity, the text rules, then search.
 
-  A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The schema holds the shapes of STORAGE §13 by `CHECK` (a base stated without `base_present`, an empty handle, source, link id, collection id or account, a `seq` below 1, a negative size, a stamp or a scope bound in another shape), so a row in another shape is refused where it was stored. A consumer running the `sql` constants over its own binding follows the renamed parameters (`:before` in `purge_retained_before`, `release_before` and `release_bases_before`; `:hash` in `held_elsewhere`, `held_mail_summary` and `origin_for_link`; `:message_id` in `insert_in_reply_to`), the column `mail_in_reply_to.message_id`, the index `items_deleted`, and may bind `NULL` as the first cursor of every paged read. spec/queries/signatures.json, the specification's listing of every statement's parameters and columns, is vendored with them.
+  A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft, or of an earlier text of this one (`index_meta.extraction` and `extractor`, the index `object_not_ok`), is rebuilt. The schema holds the shapes of STORAGE §13 by `CHECK` (a base stated without `base_present`, an empty handle, source, link id, collection id or account, a `seq` below 1, a negative size, a stamp or a scope bound in another shape), so a row in another shape is refused where it was stored. A consumer running the `sql` constants over its own binding follows the renamed parameters (`:before` in `purge_retained_before`, `release_before` and `release_bases_before`; `:hash` in `held_elsewhere`, `held_mail_summary` and `origin_for_link`; `:message_id` in `insert_in_reply_to`), the column `mail_in_reply_to.message_id`, the index `items_deleted`, and may bind `NULL` as the first cursor of every paged read. spec/queries/signatures.json, the specification's listing of every statement's parameters and columns, is vendored with them.
 
 - **BREAKING**: Added `base` to `PimdirAction::SetFlags` and `PimdirMutation::SetFlags`, the flag set a producer read and changed into `flags` (pimdir STORAGE §15.3, SYNC §7).
 
@@ -36,6 +36,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added `handle` beside `row` in the JSON of `pimdir item restore` and `pimdir tag`.
 - Added `PimdirError::ScopeBound` (`scope-invalid`) and `PimdirScope::malformed_bound`: a scope bound that is not an instant in UTC at seconds precision (`2026-10-01T00:00:00Z`) is refused by `sync`, `prepare_sync` and `write` before anything is listed or written, where it was stored and compared as text.
 - Added `sql::search::HIT` as the read of a hit's placements: the canonical statement, re-signed `(:seq, :account)` and answering every live placement of the hit with its kind and title.
+- Added `search::extract::EXTRACTION` and `EXTRACTOR`, the revision of pimdir SEARCH §6 the crate extracts under and its own revision of what §6 leaves to an indexer (`io-pimdir 1`), both recorded in `index_meta` (pimdir SEARCH §2).
+
+  `PimdirIndex::open` and `refresh` rebuild an index recording another of either, so every body is extracted and every calendar item expanded again; `open_query` answers from one, cutting its snippets from its own chunks. A consumer running the refresh coroutine over its own index compares the two constants with what it recorded and rebuilds or extracts again itself. `sql::search::SET_EXTRACTION` is the canonical statement restating them, which the crate, rebuilding, does not run.
+
+- **BREAKING**: Added `search::coverage::PimdirSearchUnread`, the four counts pimdir SEARCH §8.2's `coverage` answers per kind (`bodiless`, `missing`, `unparseable`, `encrypted`), as `PimdirSearchLocal::kinds`, in place of `PimdirSearchLocal::bodiless`; `PimdirSearchReads` and `PimdirSearchLocal::reads`, the bodies a query's terms read; and `PimdirSearchCoverage::zone_differs`, set when a query states another zone than the index read floating times in and a date term can reach a calendar item.
+- Added `PimdirQuery::conjuncts`, the terms standing as conjuncts of the whole query, which alone rule a collection out of the query's (pimdir SEARCH §8.2), and `PimdirQuery::reads`.
+- Added `search::query::RELATIVE_DIGITS_MAX` (6) and `STAMP_DIGITS_MAX` (18).
 
 - **BREAKING**: Added `PimdirPushResult::relocated`, which a connector sets on an accepted `Remove` carrying `to` that relocated the member rather than deleted it (SYNC §4): only a relocation delivers the destination's create.
 
@@ -93,6 +100,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Changed the CLI's `--help` to print each paragraph on one line, no longer wrapped to the terminal width.
 - Bumped pimalaya-cli to 0.4.
 
+- **BREAKING**: Changed `PimdirSearchCoverage::is_complete` to pimdir SEARCH §8.2's complete answer, the lag included: a consumer no longer adds `local.behind == 0` itself.
+
+  An answer is complete when the index lags the store by nothing, the temporal axis is full, no range left the horizon, no item was cut, no server answer was left partial, no kind counts a bodiless item, no kind counts a `missing` or an `unparseable` placement while a term of the query reads a body of that kind, and no kind counts an `encrypted` one while a text term is matched in the body or the attachment field (free text, `body:`, `attachment:`, `mimetype:`). A mailbox holding encrypted mail thus answers complete to a query of structured terms or of header fields, where a bodiless item still counts against every query. An answer behind the store read complete before; `zone_differs` leaves it complete.
+
+- **BREAKING**: Changed the coverage in the CLI's `--json` output of `search`, `count` and `tag` (and their JSON Schemas): `coverage.local.bodiless` is `coverage.local.kinds`, per media type the four counts, `coverage.local.reads` names what the query's terms read (`kinds`, `content`), `coverage.zoneDiffers` is new, and `coverage.complete` is false while the index is behind the store. The text output prints the counts the query's terms read, and the differing zone under a complete coverage too.
+- **BREAKING**: Changed `PimdirQuery` to keep a parenthesised group as `PimdirQuery::Group`, matching as its operand does: a term inside a group, like one negated or beside an `or`, rules no collection out of the query's, so `(collection:a) x` is covered over every collection where `collection:a x` is over one (pimdir SEARCH §8.2). A consumer matching on the AST adds the arm.
+- **BREAKING**: Changed the query grammar to refuse a relative amount of more than six digits (`invalid-date`) and a change stamp of more than eighteen (`invalid-value`), leading zeros counted (pimdir SEARCH §8.3).
+- Changed a date range to be open on a side no instant of a four-digit year states (pimdir SEARCH §8.1): an end past `9999-12-31T23:59:59Z`, so `date:2026..9999` answers what `date:2026..` does where it answered nothing, and a start before `0000-01-01T00:00:00Z`, which `date:999999d` reaches, where it was clamped to year 0.
+- Changed U+0000 in a text term to separate tokens as a space does (pimdir SEARCH §8.5), where the query failed as unanswerable.
+
 ### Removed
 
 - **BREAKING**: Removed `PimdirProducer::enqueue_with_body_checked`: `enqueue_with_body` answers what it did.
@@ -108,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Fixed the projection reading a known flag set as differing from an unknown base, or an unknown set from a known base: flag sets differ only when both are known (pimdir SYNC §3).
 - Fixed a calendar item leaving every agenda when the index re-expanded it (a horizon roll, another time zone database or floating zone) while its body could not be read: it keeps its occurrences, is recorded missing, and is expanded again by the pass that reads its body.
 - Fixed the HTML reduction joining the last word before a tag with the first after it when a line break preceded them.
+- Fixed the HTML reduction indexing the content of a `head`, `style`, `script` or `template` element whose tag carries attributes: `<style type="text/css">` put the CSS of a styled message in the index. Each is told by its tag's first word (pimdir SEARCH §6); `EXTRACTOR` being recorded from this change on, every index is built again under it.
 - Fixed control and bidi characters from the store (collection ids and names, titles, flags, link ids, sort keys, summary values, handles, queue payloads and errors) reaching the terminal through the text output of `collection list`, `item list`, `item show`, `queue list` and `store info`.
 - Fixed control and bidi characters from the store (titles, snippets, extracted texts, kinds, collections, link ids, accounts, thread ids, the coverage's media types and dates, and `check`'s hashes, paths, rows and collections) reaching the terminal through the text output of `search`, `thread`, `tag`, `show` and `check`: a crafted subject could write the clipboard through OSC 52 or clear the screen.
 

@@ -10,8 +10,15 @@
 //! so a value is never more complete than its least complete part. The
 //! index fills it for every answer, and the store's `LIKE` reads fill it
 //! too (`PimdirReader::search_coverage`), before any index exists.
+//!
+//! [`PimdirSearchCoverage::is_complete`] is SEARCH §8.2's complete
+//! answer, the lag included: one call says whether anything the coverage
+//! reports could have changed the answer.
 
-use alloc::{collections::BTreeMap, string::String};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+};
 
 use crate::collection::PimdirScope;
 
@@ -34,31 +41,58 @@ pub struct PimdirSearchCoverage {
     /// (`cut_before`, SEARCH §8.2): the range does not see all of theirs.
     /// Always zero for the store's own reads.
     pub cut: u64,
+    /// Whether the zone the query stated is another than the one the index
+    /// read floating times and dates in (SEARCH §8.1), compared as names,
+    /// for a query holding a date term with a calendar in scope: its days
+    /// are read in one zone over times placed in another. Reported apart:
+    /// it leaves an answer complete. Always false for the store's own
+    /// reads.
+    pub zone_differs: bool,
 }
 
 impl PimdirSearchCoverage {
     /// Folds another answer's coverage in, keeping the worst of each axis:
-    /// counts add up, the temporal bounds narrow, a non-exhaustive remote
-    /// search wins.
+    /// counts add up, what the terms read is joined, the temporal bounds
+    /// narrow, a non-exhaustive remote search wins.
     pub fn merge(&mut self, other: &Self) {
-        for (kind, count) in &other.local.bodiless {
-            *self.local.bodiless.entry(kind.clone()).or_default() += count;
+        for (kind, counts) in &other.local.kinds {
+            self.local
+                .kinds
+                .entry(kind.clone())
+                .or_default()
+                .add(counts);
         }
+        self.local.reads.merge(&other.local.reads);
         self.local.unindexed += other.local.unindexed;
         self.local.behind = self.local.behind.max(other.local.behind);
         self.temporal.merge(&other.temporal);
         self.remote.merge(&other.remote);
         self.horizon_left |= other.horizon_left;
         self.cut += other.cut;
+        self.zone_differs |= other.zone_differs;
     }
 
-    /// Whether the answer is the whole answer: nothing bodiless or
-    /// unindexed in scope, the range wholly held and inside the horizon,
-    /// no series cut before its end, and no server-side search left
-    /// partial.
+    /// Whether the answer is complete (SEARCH §8.2): nothing its coverage
+    /// reports could have changed it.
+    ///
+    /// The index lags the store by nothing (`behind` and `unindexed` both
+    /// zero), the range is wholly held and inside the horizon, no series
+    /// was cut before its end, no server-side search was left partial, and
+    /// of the bodies out of sight: no kind counts a bodiless item,
+    /// whatever the query; none counts a `missing` or an `unparseable`
+    /// placement while a term reads a body of that kind; and none counts
+    /// an `encrypted` one while a text term is matched in the `body` or
+    /// the `attachment` field. A zone that differs leaves it complete.
     pub fn is_complete(&self) -> bool {
-        self.local.bodiless.values().all(|count| *count == 0)
-            && self.local.unindexed == 0
+        let reads = &self.local.reads;
+        let read = self.local.kinds.iter().all(|(kind, counts)| {
+            counts.bodiless == 0
+                && (!reads.kinds.contains(kind) || counts.missing + counts.unparseable == 0)
+                && (!reads.content || counts.encrypted == 0)
+        });
+
+        read && self.local.unindexed == 0
+            && self.local.behind == 0
             && self.temporal == PimdirSearchTemporal::Full
             && self.remote != PimdirSearchRemote::Augmented { exhaustive: false }
             && !self.horizon_left
@@ -69,10 +103,15 @@ impl PimdirSearchCoverage {
 /// The local axis: items in scope a search cannot read the content of.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirSearchLocal {
-    /// Live items holding no body, per collection kind (media type): a
-    /// search matches their summary alone. Files are never counted: they
-    /// are indexed from their summary whatever they hold (SEARCH §6).
-    pub bodiless: BTreeMap<String, u64>,
+    /// The bodies out of sight among the query's collections, per
+    /// collection kind (media type), a kind counting nothing left out
+    /// (`coverage`, SEARCH §8.2). Files are never counted: they are
+    /// indexed from their summary whatever they hold (SEARCH §6).
+    pub kinds: BTreeMap<String, PimdirSearchUnread>,
+    /// The bodies the query's terms read, which says whether a count of
+    /// `kinds` leaves the answer incomplete. Empty for the store's own
+    /// reads, which match summaries alone.
+    pub reads: PimdirSearchReads,
     /// Live items whose last change the index has not folded in yet, so
     /// what it answers about them may be stale or missing. Always zero for
     /// the store's own reads, which need no index.
@@ -83,6 +122,63 @@ pub struct PimdirSearchLocal {
     /// indexer. Unlike `unindexed` it is not scoped to the query, and it
     /// counts deletions too. Always zero for the store's own reads.
     pub behind: u64,
+}
+
+/// One kind's bodies out of sight among the query's collections (SEARCH
+/// §8.2), the four counts `coverage` answers. A body filed in several
+/// collections counts once per placement, and a placement recorded missing
+/// whose body the index holds unparseable or encrypted counts under both.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirSearchUnread {
+    /// Live items holding no body, read from the store: a search matches
+    /// their summary alone.
+    pub bodiless: u64,
+    /// Placements whose body the indexer could not read (SEARCH §4), read
+    /// from the index: indexed from their summary until it is.
+    pub missing: u64,
+    /// Placements whose body no parser accepted (SEARCH §6), read from
+    /// the index: indexed from their summary.
+    pub unparseable: u64,
+    /// Placements whose body is encrypted (SEARCH §6), read from the
+    /// index: indexed by its headers alone. The store's own reads count
+    /// none, knowing no extraction.
+    pub encrypted: u64,
+}
+
+impl PimdirSearchUnread {
+    /// Whether nothing is counted.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Adds another count in.
+    fn add(&mut self, other: &Self) {
+        self.bodiless += other.bodiless;
+        self.missing += other.missing;
+        self.unparseable += other.unparseable;
+        self.encrypted += other.encrypted;
+    }
+}
+
+/// The bodies a query's terms read (SEARCH §8.2): a term reads a body
+/// when the index answers it from what the extraction recorded of one,
+/// wherever it stands, negated or not. `PimdirQuery::reads` derives it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirSearchReads {
+    /// The collection kinds (media types) whose bodies a term reads.
+    pub kinds: BTreeSet<String>,
+    /// Whether a text term is matched in the `body` or the `attachment`
+    /// field (free text, `body:`, `attachment:`, `mimetype:`), the fields
+    /// an encrypted body gives none of.
+    pub content: bool,
+}
+
+impl PimdirSearchReads {
+    /// Joins what another query's terms read.
+    pub fn merge(&mut self, other: &Self) {
+        self.kinds.extend(other.kinds.iter().cloned());
+        self.content |= other.content;
+    }
 }
 
 /// The temporal axis: whether the store holds every member of the range
@@ -242,7 +338,14 @@ mod tests {
             temporal: bounded(Some("2026-01-01T00:00:00Z"), None, false),
             ..Default::default()
         };
-        mail.local.bodiless.insert("message/rfc822".into(), 2);
+        mail.local.kinds.insert(
+            "message/rfc822".into(),
+            PimdirSearchUnread {
+                bodiless: 2,
+                encrypted: 1,
+                ..Default::default()
+            },
+        );
         coverage.merge(&mail);
 
         let other = PimdirSearchCoverage {
@@ -258,11 +361,20 @@ mod tests {
             remote: PimdirSearchRemote::Augmented { exhaustive: true },
             horizon_left: false,
             cut: 1,
+            zone_differs: true,
         };
         coverage.merge(&other);
         coverage.merge(&mail);
 
-        assert_eq!(coverage.local.bodiless["message/rfc822"], 4);
+        assert_eq!(
+            coverage.local.kinds["message/rfc822"],
+            PimdirSearchUnread {
+                bodiless: 4,
+                encrypted: 2,
+                ..Default::default()
+            }
+        );
+        assert!(coverage.zone_differs);
         assert_eq!(coverage.local.unindexed, 3);
         assert_eq!(coverage.cut, 1);
         assert_eq!(
@@ -330,7 +442,73 @@ mod tests {
         assert!(coverage.is_complete());
 
         let mut coverage = PimdirSearchCoverage::default();
-        coverage.local.bodiless.insert("text/vcard".into(), 0);
+        coverage
+            .local
+            .kinds
+            .insert("text/vcard".into(), PimdirSearchUnread::default());
         assert!(coverage.is_complete(), "a zero count is nothing bodiless");
+    }
+
+    /// One kind counting `counts`, under a query whose terms read `reads`
+    /// and, with `content`, the body or the attachment field.
+    fn unread(counts: PimdirSearchUnread, reads: &[&str], content: bool) -> PimdirSearchCoverage {
+        let mut coverage = PimdirSearchCoverage::default();
+        coverage.local.kinds.insert("message/rfc822".into(), counts);
+        coverage.local.reads.kinds = reads.iter().map(ToString::to_string).collect();
+        coverage.local.reads.content = content;
+        coverage
+    }
+
+    #[test]
+    fn a_body_out_of_sight_counts_only_against_a_term_that_reads_it() {
+        let one = |key: &str| {
+            let mut counts = PimdirSearchUnread::default();
+            match key {
+                "bodiless" => counts.bodiless = 1,
+                "missing" => counts.missing = 1,
+                "unparseable" => counts.unparseable = 1,
+                _ => counts.encrypted = 1,
+            }
+            counts
+        };
+        let mail = &["message/rfc822"][..];
+        let cards = &["text/vcard"][..];
+
+        assert!(
+            !unread(one("bodiless"), &[], false).is_complete(),
+            "a bodiless item counts against every query"
+        );
+        for key in ["missing", "unparseable"] {
+            assert!(unread(one(key), &[], false).is_complete(), "{key}: no read");
+            assert!(
+                unread(one(key), cards, true).is_complete(),
+                "{key}: a term reading another kind's bodies"
+            );
+            assert!(
+                !unread(one(key), mail, false).is_complete(),
+                "{key}: a term reading this kind's"
+            );
+        }
+        assert!(
+            unread(one("encrypted"), mail, false).is_complete(),
+            "the headers of an encrypted body are indexed"
+        );
+        assert!(
+            !unread(one("encrypted"), mail, true).is_complete(),
+            "its body and its attachments are not"
+        );
+    }
+
+    #[test]
+    fn a_lag_is_never_complete_and_another_zone_is() {
+        let mut coverage = PimdirSearchCoverage::default();
+        coverage.local.behind = 1;
+        assert!(!coverage.is_complete(), "the index is behind the store");
+
+        let coverage = PimdirSearchCoverage {
+            zone_differs: true,
+            ..Default::default()
+        };
+        assert!(coverage.is_complete(), "reported apart");
     }
 }

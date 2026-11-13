@@ -1192,14 +1192,33 @@ pub struct CoverageRow {
     /// For a query bounded by date, the calendar items in scope whose
     /// occurrences a bound cut before the range's end.
     pub cut: u64,
+    /// Whether the query's zone is another than the one the index read
+    /// floating times and dates in, a date term reaching a calendar: its
+    /// days are read in one zone over times placed in another. It leaves
+    /// the answer complete.
+    pub zone_differs: bool,
 }
 
 impl From<&PimdirSearchCoverage> for CoverageRow {
     fn from(coverage: &PimdirSearchCoverage) -> Self {
+        let kinds = coverage.local.kinds.iter().map(|(kind, counts)| {
+            let row = UnreadRow {
+                bodiless: counts.bodiless,
+                missing: counts.missing,
+                unparseable: counts.unparseable,
+                encrypted: counts.encrypted,
+            };
+            (kind.clone(), row)
+        });
+
         Self {
             complete: coverage.is_complete(),
             local: LocalRow {
-                bodiless: coverage.local.bodiless.clone(),
+                kinds: kinds.collect(),
+                reads: ReadsRow {
+                    kinds: coverage.local.reads.kinds.iter().cloned().collect(),
+                    content: coverage.local.reads.content,
+                },
                 unindexed: coverage.local.unindexed,
                 behind: coverage.local.behind,
             },
@@ -1221,22 +1240,53 @@ impl From<&PimdirSearchCoverage> for CoverageRow {
             },
             horizon_left: coverage.horizon_left,
             cut: coverage.cut,
+            zone_differs: coverage.zone_differs,
         }
     }
 }
 
 impl fmt::Display for CoverageRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let zone = " - the query's zone is not the one the index read floating times in";
         if self.complete {
-            return writeln!(f, "Coverage: complete");
+            writeln!(f, "Coverage: complete")?;
+            if self.zone_differs {
+                writeln!(f, "{zone}")?;
+            }
+            return Ok(());
         }
         writeln!(f, "Coverage: partial")?;
-        for (kind, count) in &self.local.bodiless {
-            if *count > 0 {
-                let kind = sanitize::text(kind);
+        // NOTE: a count the query's terms do not read is left out, as it
+        // leaves the answer complete.
+        for (kind, counts) in &self.local.kinds {
+            let read = self.local.reads.kinds.contains(kind);
+            let kind = sanitize::text(kind);
+            if counts.bodiless > 0 {
                 writeln!(
                     f,
-                    " - {count} {kind} item(s) without a body, searched by summary"
+                    " - {} {kind} item(s) without a body, searched by summary",
+                    counts.bodiless
+                )?;
+            }
+            if counts.missing > 0 && read {
+                writeln!(
+                    f,
+                    " - {} {kind} item(s) whose body could not be read, searched by summary",
+                    counts.missing
+                )?;
+            }
+            if counts.unparseable > 0 && read {
+                writeln!(
+                    f,
+                    " - {} {kind} item(s) whose body could not be parsed, searched by summary",
+                    counts.unparseable
+                )?;
+            }
+            if counts.encrypted > 0 && self.local.reads.content {
+                writeln!(
+                    f,
+                    " - {} {kind} item(s) encrypted, searched by their headers",
+                    counts.encrypted
                 )?;
             }
         }
@@ -1288,6 +1338,9 @@ impl fmt::Display for CoverageRow {
                 self.cut
             )?;
         }
+        if self.zone_differs {
+            writeln!(f, "{zone}")?;
+        }
         Ok(())
     }
 }
@@ -1296,12 +1349,47 @@ impl fmt::Display for CoverageRow {
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalRow {
-    /// Live items holding no body, per collection media type.
-    pub bodiless: BTreeMap<String, u64>,
+    /// The bodies out of sight among the query's collections, per
+    /// collection media type, a kind counting nothing left out.
+    pub kinds: BTreeMap<String, UnreadRow>,
+    /// The bodies the query's terms read, which says whether a count of
+    /// `kinds` leaves the answer incomplete.
+    pub reads: ReadsRow,
     /// Live items whose last change the index has not folded in yet.
     pub unindexed: u64,
-    /// The store's changes the index has not folded in, store-wide.
+    /// The store's changes the index has not folded in, store-wide; an
+    /// answer behind the store is never complete.
     pub behind: u64,
+}
+
+/// One kind's bodies out of sight, a body filed twice counted once per
+/// placement.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreadRow {
+    /// Live items holding no body, searched by their summary: counted
+    /// against every query.
+    pub bodiless: u64,
+    /// Placements whose body the indexer could not read: counted against
+    /// a query whose terms read a body of the kind.
+    pub missing: u64,
+    /// Placements whose body no parser accepted: counted likewise.
+    pub unparseable: u64,
+    /// Placements whose body is encrypted, searched by their headers:
+    /// counted against a query whose text reaches the body or the
+    /// attachments.
+    pub encrypted: u64,
+}
+
+/// The bodies a query's terms read.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadsRow {
+    /// The collection media types whose bodies a term reads.
+    pub kinds: Vec<String>,
+    /// Whether a text term is matched in the body or the attachment
+    /// field: free text, `body:`, `attachment:` or `mimetype:`.
+    pub content: bool,
 }
 
 /// The temporal axis.
@@ -1473,7 +1561,11 @@ mod tests {
         CoverageRow {
             complete: true,
             local: LocalRow {
-                bodiless: BTreeMap::new(),
+                kinds: BTreeMap::new(),
+                reads: ReadsRow {
+                    kinds: Vec::new(),
+                    content: false,
+                },
                 unindexed: 0,
                 behind: 0,
             },
@@ -1481,7 +1573,56 @@ mod tests {
             remote: RemoteRow::LocalOnly,
             horizon_left: false,
             cut: 0,
+            zone_differs: false,
         }
+    }
+
+    /// One kind's counts.
+    fn unread(bodiless: u64, missing: u64, unparseable: u64, encrypted: u64) -> UnreadRow {
+        UnreadRow {
+            bodiless,
+            missing,
+            unparseable,
+            encrypted,
+        }
+    }
+
+    #[test]
+    fn a_coverage_prints_the_counts_its_query_reads() {
+        let mail = String::from("message/rfc822");
+        let mut coverage = complete();
+        coverage
+            .local
+            .kinds
+            .insert(mail.clone(), unread(0, 2, 1, 3));
+        coverage.zone_differs = true;
+        assert_eq!(
+            coverage.to_string(),
+            "Coverage: complete\n \
+             - the query's zone is not the one the index read floating times in\n",
+            "counts no term reads, and a zone reported apart"
+        );
+
+        coverage.complete = false;
+        coverage.zone_differs = false;
+        coverage.local.reads.kinds = vec![mail];
+        assert_eq!(
+            coverage.to_string(),
+            "Coverage: partial\n \
+             - 2 message/rfc822 item(s) whose body could not be read, searched by summary\n \
+             - 1 message/rfc822 item(s) whose body could not be parsed, searched by summary\n"
+        );
+
+        coverage.local.reads.content = true;
+        coverage.local.behind = 4;
+        assert_eq!(
+            coverage.to_string(),
+            "Coverage: partial\n \
+             - 2 message/rfc822 item(s) whose body could not be read, searched by summary\n \
+             - 1 message/rfc822 item(s) whose body could not be parsed, searched by summary\n \
+             - 3 message/rfc822 item(s) encrypted, searched by their headers\n \
+             - the index is 4 change(s) behind the store\n"
+        );
     }
 
     /// The placement of an item in `collection`.
@@ -1528,8 +1669,8 @@ mod tests {
         coverage.complete = false;
         coverage
             .local
-            .bodiless
-            .insert(String::from("text/vcard\u{1b}[2J"), 1);
+            .kinds
+            .insert(String::from("text/vcard\u{1b}[2J"), unread(1, 0, 0, 0));
 
         let output = SearchOutput {
             query: String::from("invoice"),

@@ -12,6 +12,7 @@
 
 use std::{
     collections::BTreeMap,
+    fs,
     path::Path,
     process::Command,
     sync::{Mutex, PoisonError},
@@ -19,7 +20,7 @@ use std::{
 
 use io_pimdir::{
     change::PimdirWriteOp,
-    client::PimdirStore,
+    client::{PimdirStore, reader::PimdirReader},
     collection::PimdirCollectionId,
     object::PimdirObject,
     placement::{
@@ -310,4 +311,74 @@ fn a_query_reads_its_days_in_its_zone() {
     );
     let (status, _, code) = count(&["--zone", "Mars/Olympus"]);
     assert_eq!((status, code.as_str()), (1, Some("index-zone-unknown")));
+}
+
+/// An answer's coverage in JSON (SEARCH §8.2): per kind the four counts,
+/// what the query's terms read, and one `complete` that holds the lag.
+#[test]
+fn a_search_prints_the_four_counts_and_whether_it_is_complete() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    file_message(dir, "INBOX", "lost@x", 9, &[]);
+    file_message(dir, "Archive", "kept@x", 10, &[]);
+    let hash = PimdirStore::open(dir)
+        .unwrap()
+        .get_item("INBOX", 1)
+        .unwrap()
+        .unwrap()
+        .object
+        .unwrap();
+    let blob = PimdirReader::open(dir)
+        .unwrap()
+        .blobs()
+        .path(&hash)
+        .unwrap();
+    fs::remove_file(blob).unwrap();
+
+    let coverage = |args: &[&str]| {
+        let (status, output) = pimdir(dir, &[&["search"], args].concat());
+        assert_eq!(status, 0, "{output}");
+        output["coverage"].clone()
+    };
+
+    let text = coverage(&["collection:INBOX subject:lost"]);
+    assert_eq!(text["complete"], false, "{text}");
+    assert_eq!(
+        text["local"],
+        serde_json::json!({
+            "kinds": {
+                "message/rfc822": {
+                    "bodiless": 0,
+                    "missing": 1,
+                    "unparseable": 0,
+                    "encrypted": 0,
+                },
+            },
+            "reads": {
+                "kinds": ["message/rfc822", "text/calendar", "text/vcard"],
+                "content": false,
+            },
+            "unindexed": 0,
+            "behind": 0,
+        })
+    );
+    assert_eq!(text["zoneDiffers"], false);
+
+    let structured = coverage(&["collection:INBOX is:unread"]);
+    assert_eq!(structured["complete"], true, "no term reads a body");
+    assert_eq!(structured["local"]["kinds"], text["local"]["kinds"]);
+    assert_eq!(
+        coverage(&["collection:Archive kept"])["local"]["kinds"],
+        serde_json::json!({}),
+        "a kind counting nothing is left out"
+    );
+
+    // NOTE: an answer that could not fold the store's last changes is not
+    // complete, by the same key.
+    file_message(dir, "Archive", "late@x", 11, &[]);
+    let behind = coverage(&["--refresh-timeout", "0s", "collection:INBOX is:unread"]);
+    assert_eq!(behind["complete"], false, "{behind}");
+    assert_eq!(behind["local"]["unindexed"], 0);
+    assert!(behind["local"]["behind"].as_u64().unwrap() > 0);
 }

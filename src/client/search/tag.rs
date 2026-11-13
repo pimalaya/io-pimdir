@@ -208,7 +208,7 @@ impl PimdirIndex {
             add,
             remove,
             hits,
-            coverage: self.coverage(query, now, &zone)?,
+            coverage: self.coverage(query, now, clock, &zone)?,
         })
     }
 }

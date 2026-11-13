@@ -28,6 +28,13 @@
 //! completes with the cursor it recorded and whether the feed was
 //! exhausted, so a caller runs again or stops within its deadline.
 //!
+//! A run reads neither the index's version nor the revisions of its
+//! extraction (SEARCH §2): before it runs one, a consumer compares what
+//! its index records with [`EXTRACTION`](crate::search::extract::EXTRACTION)
+//! and [`EXTRACTOR`](crate::search::extract::EXTRACTOR), and one recording
+//! another of either is rebuilt, or every body it holds extracted and
+//! every calendar item expanded again, whatever its shape.
+//!
 //! [`WantsIndexState`]: PimdirIndexRefreshYield::WantsIndexState
 //! [`WantsReexpand`]: PimdirIndexRefreshYield::WantsReexpand
 //! [`WantsFeed`]: PimdirIndexRefreshYield::WantsFeed

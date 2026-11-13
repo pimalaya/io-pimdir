@@ -68,8 +68,8 @@ use crate::{
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
     search::{
-        coverage::PimdirSearchCoverage,
-        extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
+        coverage::{PimdirSearchCoverage, PimdirSearchUnread},
+        extract::{self, PimdirChunk, PimdirExtract, PimdirExtractStatus},
         fold, occurrence,
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
         refresh::PimdirIndexRefresh,
@@ -95,6 +95,10 @@ pub struct PimdirIndex {
     /// Opened by [`open_query`](PimdirIndex::open_query): index.db read
     /// only, never refreshed.
     query_only: bool,
+    /// Whether the index stands under this build's extraction (SEARCH §2,
+    /// §6), so the chunk offsets it stores index the text this build
+    /// extracts; a query client re-chunks its own text otherwise.
+    own_extraction: bool,
 }
 
 /// How far one refresh goes.
@@ -380,7 +384,10 @@ struct Found {
 impl PimdirIndex {
     /// Opens the index of the store rooted at `dir`, creating index.db
     /// when absent and rebuilding it when its version, tokenizer or shape is
-    /// not this build's (SEARCH §2).
+    /// not this build's, or when it stands under another revision of the
+    /// extraction than [`EXTRACTION`](extract::EXTRACTION) and
+    /// [`EXTRACTOR`](extract::EXTRACTOR), so every body is extracted and
+    /// every calendar item expanded again (SEARCH §2).
     ///
     /// The store must exist ([`PimdirError::Uncreated`]). A SQLite without
     /// FTS5 or older than 3.43 is [`PimdirError::Fts5`]; another indexer
@@ -416,6 +423,7 @@ impl PimdirIndex {
             reader,
             dir: dir.to_path_buf(),
             query_only: false,
+            own_extraction: true,
         })
     }
 
@@ -428,7 +436,11 @@ impl PimdirIndex {
     /// absent, or holding no schema, is [`PimdirError::IndexMissing`]; one
     /// at another schema version, tokenizer or shape, which
     /// [`open`](Self::open) would rebuild, is
-    /// [`PimdirError::IndexOutdated`]: either way, run the indexer.
+    /// [`PimdirError::IndexOutdated`]: either way, run the indexer. One
+    /// standing under another revision of the extraction or another
+    /// indexer's own (`index_meta.extraction`, `extractor`, SEARCH §2) is
+    /// answered from, its snippets cut from this build's own chunks
+    /// rather than the stored offsets (SEARCH §6).
     /// [`refresh`](Self::refresh) on such a handle is
     /// [`PimdirError::IndexQueryOnly`], and every answer says in its
     /// coverage how far the index is behind the store
@@ -449,8 +461,9 @@ impl PimdirIndex {
             return Err(PimdirError::IndexMissing(path));
         }
         let conn = connect(dir, true)?;
-        match held(&conn, dir)? {
-            PimdirIndexHeld::Current => (),
+        let held = held(&conn, dir)?;
+        match held {
+            PimdirIndexHeld::Current | PimdirIndexHeld::Extracted => (),
             PimdirIndexHeld::Empty => return Err(PimdirError::IndexMissing(path)),
             PimdirIndexHeld::Earlier { version, shape } => {
                 return Err(PimdirError::IndexVersion {
@@ -467,6 +480,7 @@ impl PimdirIndex {
             reader,
             dir: dir.to_path_buf(),
             query_only: true,
+            own_extraction: held == PimdirIndexHeld::Current,
         })
     }
 
@@ -655,7 +669,7 @@ impl PimdirIndex {
         Ok(PimdirSearchOutput {
             hits,
             more,
-            coverage: self.coverage(query, now, &zone)?,
+            coverage: self.coverage(query, now, &options.clock, &zone)?,
         })
     }
 
@@ -728,7 +742,7 @@ impl PimdirIndex {
         Ok(PimdirSearchThreadsOutput {
             threads,
             more,
-            coverage: self.coverage(query, now, &zone)?,
+            coverage: self.coverage(query, now, &options.clock, &zone)?,
         })
     }
 
@@ -866,7 +880,7 @@ impl PimdirIndex {
 
         Ok(PimdirSearchCountOutput {
             count: count as u64,
-            coverage: self.coverage(query, now, &zone)?,
+            coverage: self.coverage(query, now, clock, &zone)?,
         })
     }
 
@@ -1182,7 +1196,7 @@ impl PimdirIndex {
                 ))
             },
         )?;
-        if chunks.is_empty() {
+        if chunks.is_empty() && self.own_extraction {
             return Ok(None);
         }
         let Some(blob) = self.reader.blobs().get(hash)? else {
@@ -1195,6 +1209,16 @@ impl PimdirIndex {
         };
         let Some(extract) = PimdirExtract::body(media_type, &blob) else {
             return Ok(None);
+        };
+        // NOTE: the stored offsets index the text of the indexer's own
+        // extraction (SEARCH §6): under another, this one's is cut again.
+        let chunks = match self.own_extraction {
+            true => chunks,
+            false => extract
+                .chunks()
+                .into_iter()
+                .map(|chunk| (chunk.field.into(), chunk.range.start, chunk.range.end))
+                .collect(),
         };
         let words: Vec<String> = words.iter().map(|word| fold::text(word)).collect();
         let texts: Vec<&str> = chunks
@@ -1216,30 +1240,27 @@ impl PimdirIndex {
         Ok(texts.first().map(|text| trim(text, 0)))
     }
 
-    /// What an answer to a query could not see: the coverage of the
-    /// collections its top-level conjunction narrows to, over the date
-    /// range it narrows to: the live items there holding no body
-    /// (`coverage`) and those the index has not folded in yet, and for a
-    /// query bounded by date the calendar items cut before its end
-    /// (`cut_before`, SEARCH §8.2).
+    /// What an answer to a query could not see (SEARCH §8.2), over the
+    /// query's collections, those its conjuncts leave
+    /// ([`PimdirQuery::conjuncts`]), and the date range they narrow to:
+    /// per kind the four counts of the bodies out of sight (`coverage`)
+    /// with what the query's terms read of them, the items the index has
+    /// not folded in yet and its lag, whether the range left the horizon,
+    /// for a query bounded by date the calendar items cut before its end
+    /// (`cut_before`), and whether `clock` states another zone than the
+    /// index's where a date term can reach a calendar item. Its dates
+    /// resolve against `now` in `zone`, as the query's did.
     fn coverage(
         &self,
         query: &PimdirQuery,
         now: i64,
+        clock: &PimdirSearchClock,
         zone: &TimeZone,
     ) -> Result<PimdirSearchCoverage, PimdirError> {
-        let conjuncts = match query {
-            PimdirQuery::And(operands) => operands.iter().collect(),
-            query => vec![query],
-        };
-
         let mut collections = self.reader.list_collections()?;
         let mut since: Option<String> = None;
         let mut until: Option<String> = None;
-        for conjunct in conjuncts {
-            let PimdirQuery::Term(term) = conjunct else {
-                continue;
-            };
+        for term in query.conjuncts() {
             match &term.predicate {
                 PimdirQueryPredicate::Account(account) => {
                     collections.retain(|c| c.account.as_deref() == Some(account.as_str()))
@@ -1272,12 +1293,20 @@ impl PimdirIndex {
         };
 
         bind_list(&self.conn, "collections", &ids)?;
-        let bodiless = rows(&self.conn, search::COVERAGE, [], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        let kinds = rows(&self.conn, search::COVERAGE, [], |r| {
+            let count = |column| r.get::<_, i64>(column).map(|count| count.max(0) as u64);
+            Ok((
+                r.get::<_, String>(0)?,
+                PimdirSearchUnread {
+                    bodiless: count(1)?,
+                    missing: count(2)?,
+                    unparseable: count(3)?,
+                    encrypted: count(4)?,
+                },
+            ))
         })?;
-        for (kind, count) in bodiless {
-            coverage.local.bodiless.insert(kind, count as u64);
-        }
+        coverage.local.kinds = kinds.into_iter().collect();
+        coverage.local.reads = query.reads();
         let unindexed: i64 = self.conn.query_row_cached(
             search::COUNT_UNINDEXED,
             named_params! { ":since": self.cursor()? },
@@ -1297,25 +1326,31 @@ impl PimdirIndex {
             .into_iter()
             .any(|(term, _)| matches!(term.predicate, PimdirQueryPredicate::Date(_)));
         let calendar = collections.iter().any(|c| c.kind == "text/calendar");
-        if dated && calendar {
-            let cut: i64 = self.conn.query_row_cached(
-                search::CUT_BEFORE,
-                named_params! { ":end": until },
-                |r| r.get(0),
-            )?;
-            coverage.cut = cut as u64;
+        if !(dated && calendar) {
+            return Ok(coverage);
         }
-        let (start, end): (String, String) =
+
+        let cut: i64 = self.conn.query_row_cached(
+            search::CUT_BEFORE,
+            named_params! { ":end": until },
+            |r| r.get(0),
+        )?;
+        coverage.cut = cut as u64;
+        let (start, end, floating): (String, String, String) =
             self.conn
-                .query_row_cached(search::LOAD_INDEX_META, [], |r| Ok((r.get(4)?, r.get(5)?)))?;
-        coverage.horizon_left = dated
-            && calendar
-            && (since
+                .query_row_cached(search::LOAD_INDEX_META, [], |r| {
+                    Ok((r.get(4)?, r.get(5)?, r.get(11)?))
+                })?;
+        coverage.horizon_left = since
+            .as_ref()
+            .is_none_or(|since| since.as_str() < start.as_str())
+            || until
                 .as_ref()
-                .is_none_or(|since| since.as_str() < start.as_str())
-                || until
-                    .as_ref()
-                    .is_none_or(|until| until.as_str() > end.as_str()));
+                .is_none_or(|until| until.as_str() > end.as_str());
+        // NOTE: compared as names, a client stating none stating `UTC`
+        // (SEARCH §8.1).
+        let stated = clock.zone.as_deref().unwrap_or(occurrence::FLOATING_ZONE);
+        coverage.zone_differs = stated != floating;
         Ok(coverage)
     }
 }
@@ -1367,6 +1402,12 @@ enum PimdirIndexHeld {
     /// or holding a cursor above the store's last stamp: the indexer
     /// rebuilds it.
     Stale,
+    /// What this crate builds, from this store, under another revision of
+    /// SEARCH §6 or another indexer's own extraction (`index_meta`'s
+    /// `extraction` and `extractor`, SEARCH §2): the indexer rebuilds it,
+    /// which extracts every body and expands every calendar item again; a
+    /// query client answers from it.
+    Extracted,
     /// What this crate builds, from this store.
     Current,
 }
@@ -1379,7 +1420,8 @@ enum PimdirIndexHeld {
 /// `sqlite_schema` text, comments removed and whitespace collapsed (the
 /// shadow tables FTS5 creates, and any other table, left out), then the
 /// store it was built from and the cursor it folded, against the store's
-/// own (STORAGE §4.5).
+/// own (STORAGE §4.5), then the revisions of its extraction against this
+/// build's.
 fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     let objects: i64 =
         conn.query_row_cached("SELECT count(*) FROM main.sqlite_schema", [], |r| r.get(0))?;
@@ -1443,14 +1485,9 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     if version != search::VERSION {
         return Ok(PimdirIndexHeld::Stale);
     }
-    let (version, tokenizer, change, id, incarnation): (i64, String, i64, String, i64) = conn
-        .query_row_cached(search::LOAD_INDEX_META, [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(7)?, r.get(8)?))
-        })?;
-    if version != search::VERSION || tokenizer != search::TOKENIZER {
-        return Ok(PimdirIndexHeld::Stale);
-    }
 
+    // NOTE: before `load_index_meta`, which names columns an index of an
+    // earlier schema text may lack.
     let canonical = Connection::open_in_memory()?;
     for migration in search::MIGRATIONS {
         canonical.execute_batch(migration)?;
@@ -1464,6 +1501,23 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
         return Ok(PimdirIndexHeld::Stale);
     }
 
+    type Meta = (i64, String, i64, String, i64, i64, String);
+    let (version, tokenizer, change, id, incarnation, extraction, extractor): Meta = conn
+        .query_row_cached(search::LOAD_INDEX_META, [], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(12)?,
+                r.get(13)?,
+            ))
+        })?;
+    if version != search::VERSION || tokenizer != search::TOKENIZER {
+        return Ok(PimdirIndexHeld::Stale);
+    }
+
     let (head, store_id, store_incarnation): (i64, String, i64) =
         conn.query_row_cached(sql::LOAD_CHANGE_CURSOR, [], |r| {
             Ok((r.get(0)?, r.get(2)?, r.get(3)?))
@@ -1471,6 +1525,10 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     if id != store_id || incarnation != store_incarnation || change > head {
         debug!("search index was built from another store or copy of it");
         return Ok(PimdirIndexHeld::Stale);
+    }
+    if extraction != extract::EXTRACTION || extractor != extract::EXTRACTOR {
+        debug!("search index stands under extraction {extraction} by {extractor:?}");
+        return Ok(PimdirIndexHeld::Extracted);
     }
 
     Ok(PimdirIndexHeld::Current)
@@ -1550,7 +1608,12 @@ fn init(conn: &mut Connection) -> Result<(), PimdirError> {
     tx.pragma_update(Some("main"), "user_version", search::VERSION)?;
     tx.execute_cached(
         search::INIT_INDEX_META,
-        named_params! { ":version": search::VERSION, ":tokenizer": search::TOKENIZER },
+        named_params! {
+            ":version": search::VERSION,
+            ":tokenizer": search::TOKENIZER,
+            ":extraction": extract::EXTRACTION,
+            ":extractor": extract::EXTRACTOR,
+        },
     )?;
     tx.commit()?;
     Ok(())

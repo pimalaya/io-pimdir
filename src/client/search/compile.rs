@@ -252,6 +252,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             PimdirQuery::Not(operand) => {
                 format!("(NOT {})", self.node(operand, !negated, undated))
             }
+            PimdirQuery::Group(operand) => self.node(operand, negated, undated),
             PimdirQuery::Term(term) => self.term(term, negated, undated),
         }
     }
@@ -631,6 +632,9 @@ const DAY: i64 = 86_400;
 /// `0000-01-01T00:00:00Z`.
 const YEAR_ZERO: i64 = -62_167_219_200;
 
+/// The last instant a four-digit year states: `9999-12-31T23:59:59Z`.
+const YEAR_LAST: i64 = 253_402_300_799;
+
 /// The collection media type of a kind.
 pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
     match kind {
@@ -650,6 +654,11 @@ pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
 /// (Unix seconds), and a relative amount the instant that long before
 /// `now`, its span alone running from that instant to `now`.
 ///
+/// A bound no instant of a four-digit year states is open: a start before
+/// `0000-01-01T00:00:00Z`, which a relative amount reaches, and an end
+/// past `9999-12-31T23:59:59Z`, which the year 9999 does. An end before
+/// year 0 is its first instant, the range then holding nothing.
+///
 /// A single point is parsed as a range from it to itself, so `2w..2w`
 /// reads as `2w` alone.
 pub(crate) fn bounds(
@@ -663,11 +672,17 @@ pub(crate) fn bounds(
         PimdirQueryDate::Relative { .. } if single => now,
         point => span(point, now, zone).1,
     });
-    (since.map(time::rfc3339), until.map(time::rfc3339))
+    let since = since.filter(|since| *since >= YEAR_ZERO);
+    let until = until.filter(|until| *until <= YEAR_LAST);
+    (
+        since.map(time::rfc3339),
+        until.map(|until| time::rfc3339(until.max(YEAR_ZERO))),
+    )
 }
 
 /// The span of one date point, `[start, end)` in Unix seconds, its days
-/// read in `zone`; a relative amount spans its instant, never before year 0.
+/// read in `zone`; a relative amount spans its instant, which may lie
+/// before year 0.
 fn span(point: &PimdirQueryDate, now: i64, zone: &TimeZone) -> (i64, i64) {
     let day = |year: u16, month: u8, day: u8| {
         time::days_from_civil(i32::from(year), u32::from(month), u32::from(day))
@@ -714,11 +729,10 @@ fn span(point: &PimdirQueryDate, now: i64, zone: &TimeZone) -> (i64, i64) {
                             let date = date.min(time::days_in_month(year, month));
                             time::days_from_civil(year, month, date) * DAY + now.rem_euclid(DAY)
                         }
-                        _ => YEAR_ZERO,
+                        _ => YEAR_ZERO - 1,
                     }
                 }
             };
-            let instant = instant.max(YEAR_ZERO);
             (instant, instant)
         }
     }
@@ -746,7 +760,9 @@ fn fts(column: Option<&str>, text: &PimdirQueryText) -> Option<String> {
         return None;
     }
 
-    let folded = fold::text(&text.text);
+    // NOTE: U+0000 separates tokens as any character the tokenizer keeps
+    // in none, and FTS5 reads no expression past one (SEARCH §8.5).
+    let folded = fold::text(&text.text).replace('\0', " ");
     let mut expression = format!("\"{}\"", folded.replace('"', "\"\""));
     if text.prefix {
         expression += " *";
@@ -822,10 +838,67 @@ mod tests {
             bounds_of("..2w", now),
             (None, Some("2028-02-15T15:30:00Z".into()))
         );
+    }
+
+    #[test]
+    fn a_bound_no_four_digit_year_states_is_open() {
+        let now = time::unix(2026, 8, 20, 12, 0, 0);
+        let at = |instant: &str| Some(String::from(instant));
+
         assert_eq!(
-            bounds_of("99999y", now).0.as_deref(),
-            Some("0000-01-01T00:00:00Z"),
-            "nothing before year 0"
+            bounds_of("99999y", now),
+            (None, at("2026-08-20T12:00:00Z")),
+            "a start before year 0 is open"
+        );
+        assert_eq!(bounds_of("999999d", now).0, None);
+        assert_eq!(bounds_of("999999w..2026", now).0, None);
+        assert_eq!(
+            bounds_of("2026y", now).0,
+            at("0000-08-20T12:00:00Z"),
+            "year 0 is stated"
+        );
+        assert_eq!(
+            bounds_of("..999999d", now),
+            (None, at("0000-01-01T00:00:00Z")),
+            "an end before year 0 holds nothing"
+        );
+
+        assert_eq!(
+            bounds_of("2026..9999", now),
+            (at("2026-01-01T00:00:00Z"), None),
+            "the year 9999 ends past the last instant four digits state"
+        );
+        assert_eq!(bounds_of("..9999-12", now), (None, None));
+        assert_eq!(bounds_of("9999-12-31", now).1, None);
+        assert_eq!(
+            bounds_of("9999-12-30", now),
+            (at("9999-12-30T00:00:00Z"), at("9999-12-31T00:00:00Z")),
+            "the day before ends on an instant"
+        );
+        assert_eq!(
+            bounds_in("0000-01-01", now, "Europe/Paris").0,
+            None,
+            "a day begun before year 0 in UTC"
+        );
+        assert_eq!(
+            bounds_in("9999-12-31", now, "America/New_York").1,
+            None,
+            "a day ending in the year after 9999 in UTC"
+        );
+    }
+
+    /// FTS5 reads no expression past U+0000, which the grammar admits in a
+    /// term (SEARCH §8.5).
+    #[test]
+    fn a_nul_in_a_text_term_is_written_as_a_space() {
+        let text = PimdirQueryText {
+            text: "weekly\0sync \"x\"".into(),
+            phrase: false,
+            prefix: true,
+        };
+        assert_eq!(
+            fts(Some("title"), &text).as_deref(),
+            Some("{title} : \"weekly sync \"\"x\"\"\" *")
         );
     }
 

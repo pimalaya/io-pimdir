@@ -109,22 +109,22 @@ pub(crate) fn to_text(html: &str) -> String {
                             is_after_space = false;
                             is_new_line = true;
                         }
-                        Some(tag) if tag.eq_ignore_ascii_case(b"head") => {
-                            in_head = !is_tag_close;
-                        }
-                        Some(tag) if tag.eq_ignore_ascii_case(b"style") => {
-                            in_style = !is_tag_close;
-                        }
-                        Some(tag) if tag.eq_ignore_ascii_case(b"script") => {
-                            in_script = !is_tag_close;
-                        }
-                        Some(tag) if tag.eq_ignore_ascii_case(b"template") => {
-                            in_template = !is_tag_close;
-                        }
                         _ => (),
                     }
                 }
-                if !is_inline(&input[tag_name.clone()]) {
+                // NOTE: by the tag's first word, whatever attributes follow
+                // it, so `<style type="text/css">` hides its content.
+                let name = &input[tag_name.clone()];
+                if name.eq_ignore_ascii_case(b"head") {
+                    in_head = !is_tag_close;
+                } else if name.eq_ignore_ascii_case(b"style") {
+                    in_style = !is_tag_close;
+                } else if name.eq_ignore_ascii_case(b"script") {
+                    in_script = !is_tag_close;
+                } else if name.eq_ignore_ascii_case(b"template") {
+                    in_template = !is_tag_close;
+                }
+                if !is_inline(name) {
                     is_after_space = true;
                 }
 
@@ -917,6 +917,43 @@ mod tests {
             ("<div><div>  deep</div></div>", "deep"),
             ("a<br>b<i>c</i> d e", "a\nbc d e"),
             ("a<style>p {}</style>b", "a b"),
+        ];
+
+        for (html, text) in cases {
+            assert_eq!(to_text(html), text, "{html:?}");
+        }
+    }
+
+    /// The head, a style, a script and a template are skipped whatever
+    /// attributes their tag carries (SEARCH §6).
+    #[test]
+    fn a_hidden_element_is_skipped_whatever_its_attributes() {
+        let cases = [
+            (
+                "<style type=\"text/css\">p { color: red; }</style><p>Hello</p>",
+                "Hello\n",
+            ),
+            (
+                "a<STYLE media=screen>.x{}</STYLE >b<style\ntype=text/css>.y{}</style>c",
+                "a b c",
+            ),
+            (
+                "<script type=\"text/javascript\">var hidden = 1;</script>seen",
+                "seen",
+            ),
+            (
+                "<script async src=x></script><div>one</div><script defer>two()</script>",
+                "one",
+            ),
+            (
+                "<head profile=\"x\"><title>ignored</title></head><body>shown</body>",
+                "shown",
+            ),
+            (
+                "<template id=row shadowrootmode=open><td>cell</td></template>after",
+                "after",
+            ),
+            ("<styled>kept</styled>", "kept"),
         ];
 
         for (html, text) in cases {

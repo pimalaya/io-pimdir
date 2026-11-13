@@ -38,6 +38,24 @@ use crate::{
     },
 };
 
+/// The revision of SEARCH §6 this module extracts under and `occurrence`
+/// expands under (SEARCH §2, §6), recorded in `index_meta.extraction`: the
+/// standard bumps it when what §6 extracts or §7 expands changes, and
+/// this constant follows the text vendored.
+pub const EXTRACTION: i64 = 1;
+
+/// This crate's own revision of what SEARCH §6 leaves to an indexer
+/// (SEARCH §2), recorded in `index_meta.extractor` and compared byte for
+/// byte: an index recording another is extracted again.
+///
+/// Bump it in the change that alters what [`PimdirExtract::body`] or the
+/// expansion yields for any body under one [`EXTRACTION`]: the reduction
+/// of `text/html` (`html`), the charsets decoded and how, what a field
+/// holds, and a bump of mime-rs, vcard-rs, ical-rs or encoding_rs that
+/// reads a body otherwise. Revision 1 is the first recorded: tags
+/// separating words, and the hidden elements told by their first word.
+pub const EXTRACTOR: &str = "io-pimdir 1";
+
 /// A body's text by field (SEARCH §6): the seven fields, then one per
 /// address role (STORAGE Annex A.6).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

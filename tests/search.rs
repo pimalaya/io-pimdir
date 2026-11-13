@@ -25,6 +25,7 @@ use io_pimdir::{
     client::{
         PimdirError, PimdirStore,
         producer::PimdirProducer,
+        reader::PimdirReader,
         search::{
             PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchMatched,
             PimdirSearchOptions, PimdirSearchSort,
@@ -39,7 +40,8 @@ use io_pimdir::{
     reference::{PimdirEndpoint, PimdirReferenceOrigin, PimdirReferenceRole},
     search::{
         chunk,
-        coverage::PimdirSearchTemporal,
+        coverage::{PimdirSearchTemporal, PimdirSearchUnread},
+        extract,
         query::{PimdirQuery, PimdirQueryPredicate},
         tag::{PimdirSearchTagError, PimdirSearchTagPlan},
     },
@@ -132,9 +134,12 @@ fn mail_summary(row: &Value, addresses: &[Value]) -> PimdirSummary {
 }
 
 /// Builds the fixture store at `dir` through the owner, checking every
-/// item draws the seq the vector names.
+/// item draws the seq the vector names, then takes out of the blob
+/// directory the body of each item stating `unreadable` (SEARCH §11).
 fn build(spec: &Path, dir: &Path) {
     let store = json(&spec.join("vectors/search/store.json"));
+    assert_eq!(store["v"], 2, "store.json at another version");
+    let mut unreadable = Vec::new();
 
     let mut kinds = BTreeMap::new();
     let mut stand_ins = BTreeSet::new();
@@ -198,6 +203,9 @@ fn build(spec: &Path, dir: &Path) {
             let derived = summary::derive(kind, &body).unwrap();
             assert_eq!(derived.link_id.as_str(), link_id, "{fixture}: link id");
             let hash = store_handle.hash(&body);
+            if item["unreadable"].as_bool() == Some(true) {
+                unreadable.push(hash.clone());
+            }
             store_handle
                 .write(vec![
                     PimdirWriteOp::StoreObject {
@@ -270,6 +278,12 @@ fn build(spec: &Path, dir: &Path) {
             .unwrap()
             .expect("the reference links");
     }
+    drop(store_handle);
+
+    let blobs = PimdirReader::open(dir).unwrap().blobs();
+    for hash in unreadable {
+        fs::remove_file(blobs.path(&hash).unwrap()).unwrap();
+    }
 }
 
 /// A hit list as `(account, seq)` pairs.
@@ -292,7 +306,7 @@ fn every_search_vector_answers() {
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
     let vectors = json(&spec.join("vectors/search/queries.json"));
-    assert_eq!(vectors["v"], 3, "queries.json at another version");
+    assert_eq!(vectors["v"], 4, "queries.json at another version");
 
     // NOTE: the horizon is drawn around the vectors' now (SEARCH §11).
     let now = unix(vectors["now"].as_str().unwrap());
@@ -304,17 +318,22 @@ fn every_search_vector_answers() {
         })
         .unwrap();
     assert!(report.is_current(), "one pass folds the whole feed");
-    let coverage: BTreeMap<String, u64> = vectors["coverage"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(kind, count)| (kind.clone(), count.as_u64().unwrap()))
-        .collect();
     let store = json(&spec.join("vectors/search/store.json"));
+    let whole = PimdirQuery::parse("changed:0..").unwrap();
     assert_eq!(
-        bodiless(&store, &PimdirQuery::parse("changed:0..").unwrap()),
-        coverage,
+        unread(&spec, &store, &whole),
+        counts(&vectors["coverage"]),
         "the store-wide coverage the vectors state"
+    );
+    assert_eq!(
+        index
+            .count(&whole, &PimdirSearchClock::default())
+            .unwrap()
+            .coverage
+            .local
+            .kinds,
+        counts(&vectors["coverage"]),
+        "the store-wide coverage the index answers"
     );
     // NOTE: an agenda's windows (SEARCH §7), one row per occurrence in
     // the order occurrences_between answers.
@@ -341,45 +360,66 @@ fn every_search_vector_answers() {
     let mut zones: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
     for case in cases {
         if let Some(zone) = case["zone"].as_str() {
-            zones.entry(zone).or_default().push(case);
+            let index_zone = case["index_zone"].as_str().unwrap_or(zone);
+            zones.entry(index_zone).or_default().push(case);
             continue;
         }
-        let clock = clock_of(case, now, None);
-        let outcome = pending::check(|| answers(&index, &store, &clock, case));
+        let clock = clock_of(case, now);
+        let outcome = pending::check(|| answers(&index, &spec, &store, &clock, case));
         outcomes.push((case_name(case), outcome));
     }
 
-    // NOTE: a zoned case needs an index refreshed in its zone (SEARCH §11).
-    for (zone, cases) in zones {
+    // NOTE: a zoned case needs an index refreshed in its zone, or in the
+    // `index_zone` it names where the two differ (SEARCH §11).
+    for (index_zone, cases) in zones {
         index
             .refresh(&PimdirIndexRefreshOptions {
                 now: Some(now),
-                floating_zone: zone.into(),
+                floating_zone: index_zone.into(),
                 ..Default::default()
             })
             .unwrap();
         let query_index = PimdirIndex::open_query(dir.path()).unwrap();
-        assert_eq!(query_index.floating_zone().unwrap(), zone);
+        assert_eq!(query_index.floating_zone().unwrap(), index_zone);
         for case in cases {
-            let clock = clock_of(case, now, Some(query_index.floating_zone().unwrap()));
-            let outcome = pending::check(|| answers(&query_index, &store, &clock, case));
+            let clock = clock_of(case, now);
+            let outcome = pending::check(|| answers(&query_index, &spec, &store, &clock, case));
             outcomes.push((case_name(case), outcome));
         }
     }
     pending::settle("queries", outcomes);
 }
 
-/// A case's clock: its own `now` or the file's, in `zone`.
-fn clock_of(case: &Value, now: i64, zone: Option<String>) -> PimdirSearchClock {
+/// A coverage as the vectors state one: per kind its four counts.
+fn counts(coverage: &Value) -> BTreeMap<String, PimdirSearchUnread> {
+    coverage
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(kind, row)| {
+            let count = |key: &str| row[key].as_u64().unwrap();
+            let row = PimdirSearchUnread {
+                bodiless: count("bodiless"),
+                missing: count("missing"),
+                unparseable: count("unparseable"),
+                encrypted: count("encrypted"),
+            };
+            (kind.clone(), row)
+        })
+        .collect()
+}
+
+/// A case's clock: its own `now` or the file's, in the zone it states.
+fn clock_of(case: &Value, now: i64) -> PimdirSearchClock {
     PimdirSearchClock {
         now: Some(case["now"].as_str().map_or(now, unix)),
-        zone,
+        zone: case["zone"].as_str().map(Into::into),
     }
 }
 
 /// A case's name on the pending list: its query quoted, a long one cut to
-/// its first 40 characters and the count of the rest, then its zone and
-/// now where it states them.
+/// its first 40 characters and the count of the rest, then its zone, its
+/// index's zone and its now where it states them.
 fn case_name(case: &Value) -> String {
     let query = case["query"].as_str().unwrap();
     let length = query.chars().count();
@@ -392,6 +432,9 @@ fn case_name(case: &Value) -> String {
     };
     if let Some(zone) = case["zone"].as_str() {
         name += &format!(" in {zone}");
+    }
+    if let Some(zone) = case["index_zone"].as_str() {
+        name += &format!(" on an index in {zone}");
     }
     if let Some(now) = case["now"].as_str() {
         name += &format!(" at {now}");
@@ -433,7 +476,13 @@ fn occurs(index: &PimdirIndex, window: &Value) {
 }
 
 /// One case answers the hits, the coverage and the refusal it states.
-fn answers(index: &PimdirIndex, store: &Value, clock: &PimdirSearchClock, case: &Value) {
+fn answers(
+    index: &PimdirIndex,
+    spec: &Path,
+    store: &Value,
+    clock: &PimdirSearchClock,
+    case: &Value,
+) {
     let query = case["query"].as_str().unwrap();
 
     if let Some(error) = case.get("error") {
@@ -527,12 +576,31 @@ fn answers(index: &PimdirIndex, store: &Value, clock: &PimdirSearchClock, case: 
     let count = index.count(&parsed, clock).unwrap();
     assert_eq!(count.count as usize, want.len(), "{query:?}: count");
 
-    let expected = bodiless(store, &parsed);
-    assert_eq!(
-        answer.coverage.local.bodiless, expected,
-        "{query:?}: coverage"
-    );
+    let expected = unread(spec, store, &parsed);
+    assert_eq!(answer.coverage.local.kinds, expected, "{query:?}: coverage");
+    assert_eq!(count.coverage, answer.coverage, "{query:?}: a count's");
+    if let Some(stated) = case.get("coverage") {
+        assert_eq!(
+            answer.coverage.local.kinds,
+            counts(stated),
+            "{query:?}: the coverage the case states"
+        );
+    }
     assert_eq!(answer.coverage.local.unindexed, 0, "{query:?}: unindexed");
+    assert_eq!(answer.coverage.local.behind, 0, "{query:?}: behind");
+    if let Some(complete) = case.get("complete") {
+        assert_eq!(
+            Some(answer.coverage.is_complete()),
+            complete.as_bool(),
+            "{query:?}: complete, over {:?}",
+            answer.coverage
+        );
+    }
+    assert_eq!(
+        answer.coverage.zone_differs,
+        case["zone_differs"].as_bool().unwrap_or(false),
+        "{query:?}: zone_differs"
+    );
     if let Some(temporal) = case.get("temporal") {
         let expected = match temporal.as_str() {
             Some("full") => PimdirSearchTemporal::Full,
@@ -852,11 +920,14 @@ fn an_index_built_otherwise_is_rebuilt_and_a_held_lock_skips_the_refresh() {
     assert_eq!(hits(&index, "alpha").len(), 1);
 }
 
-/// The bodiless live items per kind a query's coverage counts, from the
-/// vector store: those no file collection holds (SEARCH §8.2), in the
-/// collections its top-level `account:`, `collection:` and `kind:` terms
-/// narrow to.
-fn bodiless(store: &Value, query: &PimdirQuery) -> BTreeMap<String, u64> {
+/// What a query's coverage counts per kind (SEARCH §8.2), from the
+/// vector store alone: among the collections its top-level conjuncts
+/// leave, a term inside a group ruling none out, the items stating no
+/// fixture (bodiless), those stating `unreadable` (missing) and the
+/// placements of a message whose fixture is encrypted, read off its
+/// `Content-Type`; none is unparseable, a file never counts and a kind
+/// counting nothing is left out.
+fn unread(spec: &Path, store: &Value, query: &PimdirQuery) -> BTreeMap<String, PimdirSearchUnread> {
     let conjuncts = match query {
         PimdirQuery::And(operands) => operands.iter().collect(),
         query => vec![query],
@@ -884,18 +955,38 @@ fn bodiless(store: &Value, query: &PimdirQuery) -> BTreeMap<String, u64> {
         })
     };
 
-    let mut counts = BTreeMap::new();
+    let mut counts: BTreeMap<String, PimdirSearchUnread> = BTreeMap::new();
     for item in store["items"].as_array().unwrap() {
         let collection = collections
             .iter()
             .find(|c| c["id"] == item["collection"])
             .unwrap();
         let kind = collection["kind"].as_str().unwrap();
-        if item.get("fixture").is_none()
-            && kind != "application/octet-stream"
-            && in_scope(collection)
-        {
-            *counts.entry(kind.to_string()).or_default() += 1;
+        if kind == "application/octet-stream" || !in_scope(collection) {
+            continue;
+        }
+        let mut one = PimdirSearchUnread::default();
+        match item["fixture"].as_str() {
+            None => one.bodiless = 1,
+            Some(_) if item["unreadable"].as_bool() == Some(true) => one.missing = 1,
+            Some(fixture) => {
+                let body = fs::read(spec.join("vectors").join(fixture)).unwrap();
+                let sealed = String::from_utf8_lossy(&body)
+                    .lines()
+                    .take_while(|line| !line.is_empty())
+                    .any(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.starts_with("content-type: multipart/encrypted")
+                            || line.starts_with("content-type: application/pkcs7-mime")
+                    });
+                one.encrypted = u64::from(kind == "message/rfc822" && sealed);
+            }
+        }
+        if !one.is_empty() {
+            let row = counts.entry(kind.to_string()).or_default();
+            row.bodiless += one.bodiless;
+            row.missing += one.missing;
+            row.encrypted += one.encrypted;
         }
     }
     counts
@@ -1764,6 +1855,252 @@ fn an_index_built_from_another_store_or_copy_is_rebuilt() {
     assert_eq!(hits(&index, "alpha").len(), 1);
 }
 
+/// An index standing under another revision of SEARCH §6, or under
+/// another indexer's own extraction, is answered from by a query client
+/// and rebuilt by the indexer, which extracts every body and expands every
+/// calendar item again and records its own revisions (SEARCH §2).
+#[test]
+fn an_index_under_another_extraction_is_rebuilt_and_every_body_indexed_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    file_message(dir, "INBOX", message("a@x", "Alpha", "zanzibar body"), &[]);
+    file_message(dir, "INBOX", message("b@x", "Beta", "second body"), &[]);
+    file_message(dir, "Archive", message("c@x", "Gamma", "third body"), &[]);
+    let event = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//x//EN\r\nBEGIN:VEVENT\r\n\
+        UID:e@x\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260801T120000Z\r\nDURATION:PT1H\r\n\
+        SUMMARY:Delta\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    file_as(dir, "local", "Calendar", "text/calendar", event.to_vec());
+
+    let options = PimdirIndexRefreshOptions {
+        now: Some(unix("2026-08-20T00:00:00Z")),
+        ..Default::default()
+    };
+    let mut index = PimdirIndex::open(dir).unwrap();
+    let first = index.refresh(&options).unwrap();
+    assert_eq!((first.indexed, first.expanded), (4, 1));
+    drop(index);
+
+    let recorded = |dir: &Path| (index_meta(dir, "extraction"), index_meta(dir, "extractor"));
+    let own = (
+        rusqlite::types::Value::Integer(extract::EXTRACTION),
+        rusqlite::types::Value::Text(extract::EXTRACTOR.into()),
+    );
+    assert_eq!(recorded(dir), own, "init_index_meta records both");
+
+    for restated in ["extractor = 'another 7'", "extraction = 2"] {
+        alter_index(dir, &format!("UPDATE index_meta SET {restated}"));
+        assert_ne!(recorded(dir), own);
+
+        let query = PimdirIndex::open_query(dir).unwrap();
+        let answer = query
+            .search(
+                &PimdirQuery::parse("zanzibar").unwrap(),
+                &PimdirSearchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(answer.hits.len(), 1, "{restated}: a query client answers");
+        assert_eq!(
+            answer.hits[0].snippet.as_deref(),
+            Some("zanzibar body"),
+            "{restated}: a snippet cut from its own chunks"
+        );
+        assert_ne!(recorded(dir), own, "{restated}: and writes nothing");
+        drop(query);
+
+        let mut index = PimdirIndex::open(dir).unwrap();
+        assert_eq!(index.cursor().unwrap(), 0, "{restated}: rebuilt");
+        let report = index.refresh(&options).unwrap();
+        assert_eq!(
+            (report.indexed, report.expanded),
+            (4, 1),
+            "{restated}: every body extracted, the event expanded again"
+        );
+        assert_eq!(recorded(dir), own, "{restated}: its own recorded");
+        assert_eq!(hits(&index, "zanzibar").len(), 1);
+    }
+
+    // NOTE: a refresh makes the same check under index.lock.
+    let mut index = PimdirIndex::open(dir).unwrap();
+    assert_eq!(index.refresh(&options).unwrap().indexed, 0, "at rest");
+    alter_index(dir, "UPDATE index_meta SET extractor = 'another 7'");
+    let report = index.refresh(&options).unwrap();
+    assert_eq!((report.indexed, report.expanded), (4, 1));
+    assert_eq!(recorded(dir), own);
+    assert_eq!(
+        index
+            .occurrences_between("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// An index the first batches of draft-10 wrote names the draft and lacks
+/// the columns `load_index_meta` reads: it is rebuilt by its schema text,
+/// never read (SEARCH §2).
+#[test]
+fn an_index_of_the_earlier_draft_10_text_is_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    indexed(dir.path());
+    alter_index(
+        dir.path(),
+        "DROP INDEX object_not_ok; ALTER TABLE index_meta DROP COLUMN extractor;",
+    );
+
+    let Err(err) = PimdirIndex::open_query(dir.path()) else {
+        panic!("an index of the earlier text opens for queries");
+    };
+    assert_eq!(err.code(), "index-outdated");
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(index.cursor().unwrap(), 0, "rebuilt, not migrated");
+    let report = index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(report.indexed, 1);
+    assert_eq!(
+        index_meta(dir.path(), "extractor"),
+        rusqlite::types::Value::Text(extract::EXTRACTOR.into())
+    );
+}
+
+/// Coverage counts, per kind among the query's collections, the items
+/// holding no body and the placements whose body the index could not
+/// read, could not parse or found encrypted, and an answer is complete by
+/// what its terms read of them (SEARCH §8.2).
+#[test]
+fn a_coverage_counts_what_the_index_could_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let sealed = fs::read(spec_dir().join("vectors/fixtures/mail-encrypted.eml")).unwrap();
+    file_message(dir, "INBOX", sealed.clone(), &[]);
+    file_message(dir, "Archive", sealed, &[]);
+    file_message(dir, "Archive", message("a@x", "Alpha", "first body"), &[]);
+
+    // NOTE: a body no header field opens and no blank line ends, which no
+    // parser accepts, under a summary a listing gave.
+    let garbled = b"no field and no blank line".to_vec();
+    let lost = message("l@x", "Lost", "vault body");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let garbled_hash = store.hash(&garbled);
+    let lost_hash = store.hash(&lost);
+    let row = serde_json::json!({ "message_id": "g@x", "subject": "Garbled" });
+    store
+        .write(vec![
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: garbled_hash.clone(),
+                    size: garbled.len(),
+                },
+                body: Some(garbled),
+            },
+            PimdirWriteOp::UpsertPlacement(placement(
+                "INBOX",
+                "g@x",
+                "g@x",
+                Some(garbled_hash),
+                mail_summary(&row, &[]),
+                "2026-08-01T12:00:00Z",
+                PimdirFlags::default(),
+            )),
+        ])
+        .unwrap();
+    drop(store);
+    file_message(dir, "INBOX", lost.clone(), &[]);
+    let blob = PimdirReader::open(dir)
+        .unwrap()
+        .blobs()
+        .path(&lost_hash)
+        .unwrap();
+    fs::remove_file(&blob).unwrap();
+
+    let mut index = PimdirIndex::open(dir).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let coverage = |index: &PimdirIndex, query: &str| {
+        index
+            .count(
+                &PimdirQuery::parse(query).unwrap(),
+                &PimdirSearchClock::default(),
+            )
+            .unwrap()
+            .coverage
+    };
+    let mail = |index: &PimdirIndex, query: &str| {
+        coverage(index, query)
+            .local
+            .kinds
+            .get("message/rfc822")
+            .copied()
+            .unwrap_or_default()
+    };
+    let counts = |missing, unparseable, encrypted| PimdirSearchUnread {
+        bodiless: 0,
+        missing,
+        unparseable,
+        encrypted,
+    };
+
+    assert_eq!(mail(&index, "is:read"), counts(1, 1, 2), "the whole store");
+    assert_eq!(mail(&index, "collection:INBOX is:read"), counts(1, 1, 1));
+    assert_eq!(
+        mail(&index, "collection:Archive is:read"),
+        counts(0, 0, 1),
+        "a body filed twice counts once per placement"
+    );
+    assert_eq!(
+        mail(&index, "(collection:Archive) is:read"),
+        counts(1, 1, 2),
+        "a term inside a group rules no collection out"
+    );
+    assert_eq!(
+        mail(&index, "collection:Archive or is:read"),
+        counts(1, 1, 2),
+        "nor does one beside an or"
+    );
+    assert_eq!(
+        mail(&index, "-collection:Archive is:read"),
+        counts(1, 1, 2),
+        "nor a negated one"
+    );
+
+    let complete = |index: &PimdirIndex, query: &str| coverage(index, query).is_complete();
+    assert!(complete(&index, "is:read"), "no term reads a body");
+    assert!(
+        !complete(&index, "collection:INBOX subject:lost"),
+        "a text term reads the bodies the index could not"
+    );
+    assert!(complete(&index, "collection:Archive subject:roadmap"));
+    assert!(complete(&index, "collection:Archive from:a@example.org"));
+    assert!(
+        !complete(&index, "collection:Archive roadmap"),
+        "free text reaches the body an encrypted message hides"
+    );
+    assert!(!complete(&index, "collection:Archive -attachment:pdf"));
+    assert!(
+        complete(&index, "collection:INBOX has:phone"),
+        "a card's body, where the bodies out of sight are messages'"
+    );
+    assert!(!complete(&index, "collection:INBOX is:encrypted"));
+
+    // NOTE: the body read at last leaves the count (SEARCH §4).
+    fs::write(&blob, &lost).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(mail(&index, "is:read"), counts(0, 1, 2));
+
+    // NOTE: an answer behind the store is never complete, one call
+    // saying so.
+    assert!(complete(&index, "collection:Archive subject:roadmap"));
+    file_message(dir, "Elsewhere", message("z@x", "Zeta", "late body"), &[]);
+    let behind = coverage(&index, "collection:Archive subject:roadmap");
+    assert_eq!(behind.local.unindexed, 0, "nothing of its collections");
+    assert!(behind.local.behind > 0);
+    assert!(!behind.is_complete(), "the lag is store-wide");
+}
+
 /// Floating times are read in the zone the indexer states, `UTC` unless
 /// it states another, which re-expands every live calendar item once and
 /// is recorded (SEARCH §7); a zone the IANA database does not name is
@@ -1920,6 +2257,93 @@ fn a_re_expansion_keeps_the_occurrences_of_an_unread_body() {
         "expanded from the body the index already holds"
     );
     assert_eq!(starts(dir.path()), ["2026-08-01T07:00:00Z"]);
+    assert_eq!(missing(dir.path()), 0);
+}
+
+/// The same over a rolled horizon (SEARCH §4, §7): a series whose body
+/// cannot be read when the roll expands it keeps the occurrences of the
+/// horizon it was read under and stays recorded, the new horizon recorded
+/// for every other item; the pass reading its body expands it, though the
+/// horizon no longer moves.
+#[test]
+fn a_roll_keeps_the_occurrences_of_an_unread_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//x//EN\r\nBEGIN:VEVENT\r\n\
+        UID:yearly\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260105T090000Z\r\n\
+        DURATION:PT1H\r\nRRULE:FREQ=YEARLY\r\nSUMMARY:yearly\r\nEND:VEVENT\r\n\
+        END:VCALENDAR\r\n"
+        .to_vec();
+    file_as(
+        dir.path(),
+        "local",
+        "Calendar",
+        "text/calendar",
+        body.clone(),
+    );
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let blob = reader.blobs().path(&reader.blobs().hash(&body)).unwrap();
+    drop(reader);
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let mut refresh = |now: &str| {
+        index
+            .refresh(&PimdirIndexRefreshOptions {
+                now: Some(unix(now)),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let starts = |dir: &Path| -> Vec<String> {
+        PimdirIndex::open_query(dir)
+            .unwrap()
+            .occurrences_between("2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .map(|occurrence| occurrence.start)
+            .collect()
+    };
+    let missing = |dir: &Path| -> i64 {
+        rusqlite::Connection::open(dir.join("index.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM missing", [], |r| r.get(0))
+            .unwrap()
+    };
+    let read = [
+        "2026-01-05T09:00:00Z",
+        "2027-01-05T09:00:00Z",
+        "2028-01-05T09:00:00Z",
+    ];
+
+    assert_eq!(refresh("2026-08-20T00:00:00Z").expanded, 1);
+    assert_eq!(starts(dir.path()), read);
+
+    fs::remove_file(&blob).unwrap();
+    for pass in ["the roll", "the next pass"] {
+        assert_eq!(refresh("2027-09-24T00:00:00Z").expanded, 0, "{pass}");
+        assert_eq!(starts(dir.path()), read, "{pass}: kept, never none");
+        assert_eq!(missing(dir.path()), 1, "{pass}");
+    }
+    assert_eq!(
+        index_meta(dir.path(), "horizon_start"),
+        rusqlite::types::Value::Text("2026-09-24T00:00:00Z".into()),
+        "the new horizon stands for every item but the one recorded"
+    );
+
+    fs::write(&blob, &body).unwrap();
+    let report = refresh("2027-09-24T00:00:00Z");
+    assert_eq!(
+        (report.folded, report.indexed, report.expanded),
+        (0, 0, 1),
+        "expanded though the horizon did not move"
+    );
+    assert_eq!(
+        starts(dir.path()),
+        [
+            "2027-01-05T09:00:00Z",
+            "2028-01-05T09:00:00Z",
+            "2029-01-05T09:00:00Z"
+        ]
+    );
     assert_eq!(missing(dir.path()), 0);
 }
 
@@ -3188,13 +3612,20 @@ mod memory {
         fs::remove_file(&blob).unwrap();
         index.refresh(&options).unwrap();
         memory.refresh(later, 4, "UTC");
-        assert_eq!(memory.missing.len(), 1);
+        // NOTE: beside the item the vectors state unreadable, recorded
+        // from the first pass on.
+        assert_eq!(memory.missing.len(), 2);
         agree(dir.path(), &memory);
 
         fs::write(&blob, &body).unwrap();
         index.refresh(&options).unwrap();
         memory.refresh(later, 4, "UTC");
-        assert!(memory.missing.is_empty());
+        let lost: Vec<(&str, i64)> = memory
+            .missing
+            .iter()
+            .map(|(collection, seq)| (collection.as_str(), *seq))
+            .collect();
+        assert_eq!(lost, [("home/Lost", 34)]);
         agree(dir.path(), &memory);
     }
 }
