@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-13
+
 ### Added
 
 - **BREAKING**: Added pimdir storage-draft-11, sync-draft-11 and search-draft-11, vendored at the commit their tags name (pimdir 83102f0).
@@ -1134,7 +1136,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.11.0..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.12.0..HEAD
+[0.12.0]: https://github.com/pimalaya/io-pimdir/compare/v0.11.0..v0.12.0
 [0.11.0]: https://github.com/pimalaya/io-pimdir/compare/v0.10.0..v0.11.0
 [0.10.0]: https://github.com/pimalaya/io-pimdir/compare/v0.9.0..v0.10.0
 [0.9.0]: https://github.com/pimalaya/io-pimdir/compare/v0.8.0..v0.9.0

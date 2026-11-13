@@ -35,7 +35,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
   inherit buildNoDefaultFeatures;
 
   pname = "pimdir";
-  version = "0.11.0";
+  version = "0.12.0";
   cargoHash = "";
 
   src = fetchFromGitHub {

@@ -174,7 +174,7 @@ Every data command SHALL hand the printer one output type deriving `Display`, `S
 #### Scenario: A caller reads a failure against its schema
 - GIVEN `pimdir json-schema pimdir-error`
 - WHEN it runs
-- THEN the schema of the JSON failure object is printed, its `$id` being `https://pimalaya.org/schemas/pimdir/v0.11/pimdir-error.json`
+- THEN the schema of the JSON failure object is printed, its `$id` being `https://pimalaya.org/schemas/pimdir/v0.12/pimdir-error.json`
 
 ### Requirement: The JSON follows pimalaya-cli's contract
 The `--json` output SHALL follow pimalaya-cli's output and error specs, as every Pimalaya binary does. A value pimdir defines (a status, a coverage kind) SHALL be kebab-case. Every key of pimdir's own types SHALL be printed, `null` when the value is absent; a collection's undeclared `kind` is `null`, not an empty string. A queue row's id SHALL print as `row` wherever it appears (`queue list`, `queue status`, `queue cancel`, `item restore`, `tag`). A collection row SHALL carry the shared `{id, name, description, color, default}`, `default` being whether its source states the `default` role (STORAGE §14), beside the store's own columns. A queue row SHALL print its `payload` as the queue stores it, never a summary the CLI composed. The item's public id stays `seq`, the pimdir drafts' name for it, wherever a receipt names the item.
