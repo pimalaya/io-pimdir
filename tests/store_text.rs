@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use io_pimdir::{
@@ -310,6 +310,13 @@ fn a_backup_taken_under_a_running_producer_is_consistent() {
         assert_eq!((copied.quarantined, copied.local, copied.kept), (1, 1, 0));
         assert!(copied.skipped.is_empty(), "{:?}", copied.skipped);
         backups.push(target);
+        // NOTE: the producer keeps its own pace, so a round waits for a row
+        // of it before draining.
+        let waiting = Instant::now();
+        while store.list_pending_actions().unwrap().is_empty() {
+            assert!(waiting.elapsed() < Duration::from_secs(10), "no row queued");
+            thread::sleep(Duration::from_millis(1));
+        }
         assert!(store.drain().unwrap().applied > 0);
         // NOTE: refused while the producer stages, which is its right.
         let _ = store.collect_garbage();
@@ -457,6 +464,152 @@ fn a_restore_answers_a_new_incarnation() {
             .unwrap()
             .incarnation,
         second.incarnation
+    );
+}
+
+/// A restore merges the bodies and replaces local/ and the database
+/// alone (STORAGE §8). A body the store holds under its name keeps the
+/// file it has, and one the replaced store alone named stays where it
+/// is, an orphan the collector removes: the restore unlinks none.
+/// index.db stays as it is. The restored database takes the journal mode
+/// of the store it replaces, the copy `VACUUM INTO` wrote carrying none
+/// of its own, and WAL where it replaces none. No producer stages a body
+/// under it: it is refused while one does, nothing touched.
+#[test]
+fn a_restore_merges_bodies_and_keeps_the_index_and_the_journal_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let backup = scratch.path().join("backup");
+    let journal = |dir: &Path| -> String {
+        rusqlite::Connection::open(dir.join("pimdir.db"))
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    let mut store = populated(dir.path(), &["a@x"]);
+    store.backup(&backup).unwrap();
+    let held = store.blobs().path(&store.hash(&mail("a@x"))).unwrap();
+    let held_inode = fs::metadata(&held).unwrap().ino();
+
+    // the store moves on after the backup, into a rollback journal mode
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    producer
+        .enqueue_with_body("INBOX", &mail("later@x"), add)
+        .unwrap();
+    drop(producer);
+    assert_eq!(store.drain().unwrap().applied, 1);
+    let later = store.blobs().path(&store.hash(&mail("later@x"))).unwrap();
+    drop(store);
+    let rollback: String = rusqlite::Connection::open(dir.path().join("pimdir.db"))
+        .unwrap()
+        .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rollback, "delete");
+    fs::write(dir.path().join("index.db"), b"an index").unwrap();
+
+    // a producer inside its staging window: nothing is replaced under it
+    let producer = PimdirProducer::open(dir.path(), "busy").unwrap();
+    let staging = producer.blob_writer().unwrap();
+    assert!(matches!(
+        PimdirStore::restore(dir.path(), &backup),
+        Err(PimdirError::Staging(_))
+    ));
+    assert_eq!(
+        PimdirReader::open(dir.path())
+            .unwrap()
+            .count_items("INBOX")
+            .unwrap(),
+        2,
+        "the store as it stood"
+    );
+    drop(staging);
+    drop(producer);
+
+    let report = PimdirStore::restore(dir.path(), &backup).unwrap();
+    assert_eq!(
+        (report.copied.objects, report.copied.kept),
+        (0, 1),
+        "the one body both hold is kept"
+    );
+    assert_eq!(
+        fs::metadata(&held).unwrap().ino(),
+        held_inode,
+        "a file is never replaced"
+    );
+    assert!(later.exists(), "a restore unlinks no body");
+    assert_eq!(
+        fs::read(dir.path().join("index.db")).unwrap(),
+        b"an index",
+        "the index stays as it is"
+    );
+    assert_eq!(
+        journal(dir.path()),
+        "delete",
+        "the mode of the store replaced"
+    );
+
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    assert_eq!(store.count_items("INBOX").unwrap(), 1, "as backed up");
+    assert_eq!(
+        store.collect_garbage().unwrap().blobs,
+        1,
+        "the body the replaced store alone named, the collector's to remove"
+    );
+    assert!(!later.exists());
+    assert!(held.exists());
+
+    // replacing none, the mode an owner creates a store in
+    let elsewhere = scratch.path().join("elsewhere");
+    PimdirStore::restore(&elsewhere, &backup).unwrap();
+    assert_eq!(journal(&elsewhere), "wal");
+}
+
+/// A restore stopped while it merges the bodies leaves the store it found
+/// (STORAGE §8): its database and its local/ as they stood, nothing of
+/// the backup's but bodies put in. The database goes, and local/ after
+/// it, only once every body is in and the new one is ready.
+#[test]
+fn a_restore_stopped_at_the_bodies_leaves_the_store_it_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let backup = scratch.path().join("backup");
+
+    let source = populated(scratch.path().join("source").as_path(), &["a@x"]);
+    fs::write(source.local_dir().unwrap().join("state"), b"the backup's").unwrap();
+    source.backup(&backup).unwrap();
+    drop(source);
+
+    let store = populated(dir.path(), &[]);
+    fs::write(store.local_dir().unwrap().join("state"), b"found").unwrap();
+    let found = store.change_cursor().unwrap();
+    drop(store);
+
+    // the body the backup brings cannot be put in: no shard is created
+    let objects = dir.path().join("objects");
+    let mode = fs::metadata(&objects).unwrap().permissions();
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o500)).unwrap();
+    let stopped = PimdirStore::restore(dir.path(), &backup);
+    fs::set_permissions(&objects, mode).unwrap();
+    assert!(stopped.is_err(), "{stopped:?}");
+
+    let store = PimdirStore::open(dir.path()).unwrap();
+    assert_eq!(store.change_cursor().unwrap(), found, "the store found");
+    assert_eq!(
+        fs::read(store.local_dir().unwrap().join("state")).unwrap(),
+        b"found",
+        "its local/ as it stood"
+    );
+    drop(store);
+
+    // run again, it goes through
+    let report = PimdirStore::restore(dir.path(), &backup).unwrap();
+    assert_eq!(report.replaced, Some(found.incarnation));
+    let store = PimdirStore::open(dir.path()).unwrap();
+    assert_eq!(store.count_items("INBOX").unwrap(), 1);
+    assert_eq!(
+        fs::read(store.local_dir().unwrap().join("state")).unwrap(),
+        b"the backup's"
     );
 }
 

@@ -1387,21 +1387,23 @@ impl PimdirStore {
     /// The text is free save the one reserved prefix (§13): a failure is
     /// never an unknown outcome, so a text beginning with `unconfirmed: `,
     /// a server's error relayed as it came say, is recorded behind
-    /// `failed: `, whole, and the row reads parked. No caller's string
-    /// writes the prefix: an intent whose outcome is unknown is
+    /// `failed: `, whole, and the row reads parked, which `park_action`
+    /// holds (§15.2). No caller's string writes the prefix: an intent
+    /// whose outcome is unknown is
     /// [`unconfirm_action`](Self::unconfirm_action)'s, which alone does.
     pub fn fail_action(&self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
         self.lock.verify()?;
         record_failure(&self.conn, id, error)
     }
 
-    /// Parks the intent `id` as one whose outcome is unknown (§15.2): its
-    /// performer sent the request and cannot tell whether it took effect,
-    /// a submission whose connection dropped once the message was handed
-    /// over. The row's error is the reserved prefix `unconfirmed: `,
-    /// written here, then `detail`, free text
-    /// [scrubbed](security::scrub) as a failure's is; the attempt is
-    /// counted. Reports whether a row had that id.
+    /// Parks the intent `id` as one whose outcome is unknown
+    /// (`unconfirm_action`, §15.2): its performer sent the request and
+    /// cannot tell whether it took effect, a submission whose connection
+    /// dropped once the message was handed over. The row's error is the
+    /// reserved prefix `unconfirmed: `, which the statement alone writes,
+    /// then `detail`, free text [scrubbed](security::scrub) as a
+    /// failure's is; the attempt is counted. Reports whether a row had
+    /// that id.
     ///
     /// No drain lists a parked row, so nothing performs it again of its
     /// own accord. It leaves the state in three ways only (§15.5):
@@ -1414,28 +1416,31 @@ impl PimdirStore {
     /// [`Unconfirmed`](producer::PimdirActionStatus::Unconfirmed) status.
     ///
     /// An action the owner applies itself is never one: its apply is a
-    /// transaction of the store, which commits or does not. A row of such
-    /// an action, a kind [`PimdirAction`] reads as a store action or a
-    /// `set-performer`, is refused as [`PimdirError::NotIntent`], nothing
-    /// written.
+    /// transaction of the store, which commits or does not. The statement
+    /// writes nothing over a row of such an action, a store action or a
+    /// `set-performer`, which is refused as [`PimdirError::NotIntent`].
     pub fn unconfirm_action(&mut self, id: i64, detail: &str) -> Result<bool, PimdirError> {
         let tx = begin(&mut self.reader.conn, &self.lock)?;
 
-        let kind: Option<String> = tx
-            .query_row_cached(sql::LOAD_ACTION, named_params! { ":id": id }, |r| r.get(4))
+        let parked: Option<i64> = tx
+            .query_row_cached(
+                sql::UNCONFIRM_ACTION,
+                named_params! { ":id": id, ":detail": security::scrub(detail) },
+                |r| r.get(0),
+            )
             .optional()?;
-        let Some(kind) = kind else {
-            return Ok(false);
-        };
-        if codec::applied_by_owner(&kind) {
-            return Err(PimdirError::NotIntent { id, kind });
+        if parked.is_none() {
+            // NOTE: the statement answers nothing for a row that is gone
+            // and for an action the owner applies itself: told apart here.
+            let kind: Option<String> = tx
+                .query_row_cached(sql::LOAD_ACTION, named_params! { ":id": id }, |r| r.get(4))
+                .optional()?;
+            return match kind {
+                Some(kind) => Err(PimdirError::NotIntent { id, kind }),
+                None => Ok(false),
+            };
         }
 
-        let error = format!("{}{}", codec::UNCONFIRMED, security::scrub(detail));
-        tx.execute_cached(
-            sql::PARK_ACTION,
-            named_params! { ":id": id, ":error": error },
-        )?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(true)
     }
@@ -1710,7 +1715,8 @@ pub(crate) fn checkpoint(conn: &Connection) -> Result<(), PimdirError> {
 /// Records a failed apply of the queue row `id` on `conn`
 /// ([`PimdirStore::fail_action`], §15.2): `None` bumps its attempts,
 /// `Some(error)` parks it under the text, scrubbed, and never under the
-/// reserved prefix, a text beginning with it recorded behind `failed: `.
+/// reserved prefix, a text beginning with it recorded behind `failed: `
+/// by `park_action` itself.
 pub(crate) fn record_failure(
     conn: &Connection,
     id: i64,
@@ -1722,13 +1728,9 @@ pub(crate) fn record_failure(
         return Ok(());
     };
 
-    let mut error = security::scrub(error);
-    if codec::unconfirmed(&error).is_some() {
-        error.insert_str(0, "failed: ");
-    }
     conn.execute_cached(
         sql::PARK_ACTION,
-        named_params! { ":id": id, ":error": error },
+        named_params! { ":id": id, ":error": security::scrub(error) },
     )
     .map_err(busy_or_sql)?;
     Ok(())

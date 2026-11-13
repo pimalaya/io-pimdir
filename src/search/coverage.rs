@@ -22,6 +22,15 @@ use alloc::{
 
 use crate::collection::PimdirScope;
 
+/// The media type of a mail collection, whose bodies search reads.
+const MAIL: &str = "message/rfc822";
+
+/// The media type of a contact collection.
+const CARD: &str = "text/vcard";
+
+/// The media type of a calendar collection.
+const CALENDAR: &str = "text/calendar";
+
 /// What a search answer could not see, on three axes (SEARCH §8.2).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirSearchCoverage {
@@ -78,16 +87,20 @@ impl PimdirSearchCoverage {
     /// The index lags the store by nothing (`behind` and `unindexed` both
     /// zero), the range is wholly held and inside the horizon, no series
     /// was cut before its end, no server-side search was left partial, and
-    /// of the bodies out of sight: no kind counts a bodiless item,
-    /// whatever the query; none counts a `missing` or an `unparseable`
-    /// placement while a term reads a body of that kind; and none counts
-    /// an `encrypted` one while a text term is matched in the `body` or
-    /// the `attachment` field. A zone that differs leaves it complete.
+    /// of the bodies out of sight: no kind counts a `bodiless` item, a
+    /// `missing` or an `unparseable` placement while a term reads a body
+    /// of that kind; mail counts no `bodiless` item while the query holds
+    /// `has:attachment`; and no kind counts an `encrypted` placement
+    /// while a text term is matched in the `body` or the `attachment`
+    /// field. A zone that differs leaves it complete, as does a mailbox
+    /// listed and not fetched under a query none of whose terms reads a
+    /// message's body.
     pub fn is_complete(&self) -> bool {
         let reads = &self.local.reads;
         let read = self.local.kinds.iter().all(|(kind, counts)| {
-            counts.bodiless == 0
-                && (!reads.kinds.contains(kind) || counts.missing + counts.unparseable == 0)
+            (!reads.kinds.contains(kind)
+                || counts.bodiless + counts.missing + counts.unparseable == 0)
+                && (!reads.counts_bodiless(kind) || counts.bodiless == 0)
                 && (!reads.content || counts.encrypted == 0)
         });
 
@@ -109,8 +122,9 @@ pub struct PimdirSearchLocal {
     /// indexed from their summary whatever they hold (SEARCH §6).
     pub kinds: BTreeMap<String, PimdirSearchUnread>,
     /// The bodies the query's terms read, which says whether a count of
-    /// `kinds` leaves the answer incomplete. Empty for the store's own
-    /// reads, which match summaries alone.
+    /// `kinds` leaves the answer incomplete. A text term's for the
+    /// store's own reads ([`PimdirSearchReads::text`]), which search a
+    /// text in summaries alone.
     pub reads: PimdirSearchReads,
     /// Live items whose last change the index has not folded in yet, so
     /// what it answers about them may be stale or missing. Always zero for
@@ -131,7 +145,9 @@ pub struct PimdirSearchLocal {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirSearchUnread {
     /// Live items holding no body, read from the store: a search matches
-    /// their summary alone.
+    /// their summary alone. Counted against a query whose terms read a
+    /// body of the kind and, for mail, against one holding
+    /// `has:attachment`.
     pub bodiless: u64,
     /// Placements whose body the indexer could not read (SEARCH §4), read
     /// from the index: indexed from their summary until it is.
@@ -171,13 +187,35 @@ pub struct PimdirSearchReads {
     /// field (free text, `body:`, `attachment:`, `mimetype:`), the fields
     /// an encrypted body gives none of.
     pub content: bool,
+    /// Whether the query holds `has:attachment`: a message holding no
+    /// body answers it by a mark read without the body, a guess its body
+    /// corrects (STORAGE Annex A.1), so mail's `bodiless` items count
+    /// against the answer though the term reads no message's body.
+    pub mark: bool,
 }
 
 impl PimdirSearchReads {
+    /// What a text term reads (SEARCH §8.2): the bodies of mail, contacts
+    /// and calendars.
+    pub fn text() -> Self {
+        Self {
+            kinds: [MAIL, CARD, CALENDAR].map(String::from).into(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether a `bodiless` item of `kind` counts against the answer
+    /// though no term reads a body of the kind: mail's, under
+    /// `has:attachment`.
+    pub fn counts_bodiless(&self, kind: &str) -> bool {
+        self.mark && kind == MAIL
+    }
+
     /// Joins what another query's terms read.
     pub fn merge(&mut self, other: &Self) {
         self.kinds.extend(other.kinds.iter().cloned());
         self.content |= other.content;
+        self.mark |= other.mark;
     }
 }
 
@@ -474,11 +512,7 @@ mod tests {
         let mail = &["message/rfc822"][..];
         let cards = &["text/vcard"][..];
 
-        assert!(
-            !unread(one("bodiless"), &[], false).is_complete(),
-            "a bodiless item counts against every query"
-        );
-        for key in ["missing", "unparseable"] {
+        for key in ["bodiless", "missing", "unparseable"] {
             assert!(unread(one(key), &[], false).is_complete(), "{key}: no read");
             assert!(
                 unread(one(key), cards, true).is_complete(),
@@ -497,6 +531,43 @@ mod tests {
             !unread(one("encrypted"), mail, true).is_complete(),
             "its body and its attachments are not"
         );
+    }
+
+    /// `has:attachment` reads no message's body, and a message holding
+    /// none still counts against it: its mark was read without its body,
+    /// a guess the body corrects (SEARCH §8.2).
+    #[test]
+    fn a_bodiless_message_counts_against_its_attachment_mark() {
+        let marked = |kind: &str, counts: PimdirSearchUnread| {
+            let mut coverage = PimdirSearchCoverage::default();
+            coverage.local.kinds.insert(kind.into(), counts);
+            coverage.local.reads.kinds = ["text/calendar".to_string()].into();
+            coverage.local.reads.mark = true;
+            coverage
+        };
+        let bodiless = PimdirSearchUnread {
+            bodiless: 1,
+            ..Default::default()
+        };
+        let missing = PimdirSearchUnread {
+            missing: 1,
+            ..Default::default()
+        };
+
+        assert!(!marked("message/rfc822", bodiless).is_complete());
+        assert!(
+            marked("message/rfc822", missing).is_complete(),
+            "the mark of a body held is the store's"
+        );
+        assert!(
+            marked("text/vcard", bodiless).is_complete(),
+            "a card never has one"
+        );
+
+        let mut text = PimdirSearchCoverage::default();
+        text.local.kinds.insert("text/vcard".into(), bodiless);
+        text.local.reads = PimdirSearchReads::text();
+        assert!(!text.is_complete(), "a text term reads a card's body");
     }
 
     #[test]

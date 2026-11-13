@@ -16,7 +16,7 @@
 use std::path::Path;
 
 use io_pimdir::client::{
-    PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
+    PimdirRunError, PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
 };
 use io_pimdir::{
     change::PimdirWriteOp,
@@ -25,7 +25,7 @@ use io_pimdir::{
     hash,
     hub::PimdirSourceId,
     load::PimdirLoadSelection,
-    mutate::PimdirMutation,
+    mutate::{PimdirMutateError, PimdirMutation},
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -533,40 +533,110 @@ fn a_queued_remove_settles_only_the_conflict_it_resolves() {
     assert_eq!(status(&phone), PimdirStatus::Tombstone);
 }
 
-/// A tombstone settles the item's conflict only when a `Settle` precedes
-/// it (STORAGE §14, SYNC §7): a `Move` meeting one, which the standard
-/// leaves open, stages its tombstone and its create as it always did, and
-/// the conflict stands under the deleted item with its diverging body
-/// pinned, where the write cleared it and released the body before.
+/// A `Move` meeting the item's conflict is refused, staging nothing in
+/// either collection, and a queued `move` parks naming the conflict (SYNC
+/// §7; STORAGE §15.2, §15.3; vectors/sync 155, 156). It states no
+/// resolution: its tombstone would leave the conflict standing, the
+/// diverging body pinned under a placement no listing shows. A reader's
+/// overlay folds nothing for it, in the collection it leaves and in the
+/// one it names (§15.4). A `copy` meets no conflict, and the move applies
+/// once a person's resolution settled it.
 #[test]
-fn a_move_over_a_conflicted_item_keeps_the_diverging_body() {
+fn a_move_over_a_conflicted_item_is_refused_and_parks() {
     let dir = tempfile::tempdir().unwrap();
     let (mut phone, _server) = diverged(dir.path());
     phone.ensure_collection("archive", "text/vcard").unwrap();
+    phone.ensure_collection("kept", "text/vcard").unwrap();
+    let archive = PimdirCollectionId("archive".into());
+    let seq = seq(&phone);
     let server_body = phone.hash(SERVER);
+    let standing = |phone: &PimdirSourceStore| {
+        let hub = phone.load_hub(CONTACTS).unwrap();
+        let item = &hub.items[&PimdirLinkId(LINK.into())];
+        assert!(!item.deleted, "the card stays where it stood");
+        assert!(item.conflicted, "the conflict stands");
+        assert_eq!(item.conflict_object, Some(server_body.clone()));
+        assert_eq!(refcount(dir.path(), &server_body), 2, "both bodies kept");
+        assert!(phone.load_hub("archive").unwrap().items.is_empty());
+    };
 
-    phone
-        .mutate(
-            CONTACTS,
-            PimdirMutation::Move {
-                handle: PimdirHandle("1".into()),
-                target: PimdirCollectionId("archive".into()),
-            },
-        )
-        .unwrap();
+    let refused = phone.mutate(
+        CONTACTS,
+        PimdirMutation::Move {
+            handle: PimdirHandle("1".into()),
+            target: archive.clone(),
+        },
+    );
+    let Err(PimdirRunError::Coroutine(refused)) = refused else {
+        panic!("a move over a conflict staged: {refused:?}");
+    };
+    assert_eq!(refused.code(), "conflict-unresolved");
+    let PimdirMutateError::Unresolved { met, resolves, .. } = refused else {
+        panic!("expected Unresolved, got {refused:?}");
+    };
+    assert_eq!(met, [Some(server_body.clone())]);
+    assert_eq!(resolves, None, "a move states none");
+    standing(&phone);
 
+    let reader = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let queue = |action: &PimdirAction| {
+        let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+        producer.enqueue(CONTACTS, action, None).unwrap();
+    };
+    queue(&PimdirAction::Move {
+        seq,
+        to: archive.clone(),
+    });
+    assert!(
+        listed(dir.path(), seq),
+        "not folded: the card is not taken out"
+    );
+    assert!(reader.get_item("archive", seq).unwrap().is_none(), "nor in");
+    assert_eq!(reader.count_items("archive").unwrap(), 0);
+    assert!(reader.list_items("archive", None, 10).unwrap().is_empty());
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = phone.parked_actions().unwrap();
+    assert_eq!(parked[0].action, "move");
+    assert!(
+        parked[0].error.contains(&server_body.0),
+        "{}",
+        parked[0].error
+    );
+    standing(&phone);
+
+    // a copy tombstones nothing and meets no conflict
+    queue(&PimdirAction::Copy {
+        seq,
+        to: PimdirCollectionId("kept".into()),
+    });
+    assert!(reader.get_item("kept", seq).unwrap().is_some(), "folded");
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (1, 0));
+    assert_eq!(phone.load_hub("kept").unwrap().items.len(), 1);
+    standing(&phone);
+
+    // settled by a person, then moved: both rows fold and apply
+    queue_update(dir.path(), seq, MERGED, Some(&[SERVER]));
+    queue(&PimdirAction::Move {
+        seq,
+        to: archive.clone(),
+    });
+    assert!(!listed(dir.path(), seq), "folded: taken out");
+    let arrived = reader.get_item("archive", seq).unwrap();
+    assert!(arrived.is_some(), "folded: brought in");
+    assert_eq!(reader.count_items("archive").unwrap(), 1);
+    let report = phone.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked),
+        (2, 0),
+        "{:?}",
+        phone.parked_actions()
+    );
     let hub = phone.load_hub(CONTACTS).unwrap();
     let item = &hub.items[&PimdirLinkId(LINK.into())];
-    assert!(item.deleted, "the source is tombstoned");
-    assert!(item.conflicted, "no resolution: the conflict stands");
-    assert_eq!(item.conflict_object, Some(server_body.clone()));
-    assert_eq!(
-        refcount(dir.path(), &server_body),
-        2,
-        "the item still pins the diverging body beside the server's base"
-    );
-    let moved = phone.load_hub("archive").unwrap();
-    assert_eq!(moved.items.len(), 1, "the create is staged in the target");
+    assert!(item.deleted && !item.conflicted, "moved once settled");
+    assert_eq!(phone.load_hub("archive").unwrap().items.len(), 1);
     assert!(phone.refcount_drift().unwrap().is_empty());
 }
 

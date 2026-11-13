@@ -142,12 +142,6 @@ struct Frame {
     prefix: String,
     /// The children numbered so far.
     children: usize,
-    /// Where the summaries of the child under way start, `None` before
-    /// the first delimiter: a child no delimiter ends is no part.
-    child_start: Option<usize>,
-    /// Whether the invitation was read before the child under way began,
-    /// so a child cut short takes back only one it gave.
-    invited_before: bool,
     /// The multipart's media type, as the attachment mark reads it, which
     /// tells whether its children are RFC 1847 protocol parts.
     media: String,
@@ -260,18 +254,12 @@ impl PimdirAttachmentWalk {
         if matches!(self.mode, Mode::Header { .. }) {
             self.end_headers();
         }
-        self.close_leaf(true);
-        // NOTE: a child the outermost level never ended is no part, as
-        // the walk for the mark slices them (Annex A.1), so neither its
-        // attachments nor its invitation count.
-        if let Some(frame) = self.frames.first()
-            && let Some(start) = frame.child_start
-        {
-            self.found.truncate(start);
-            if !frame.invited_before {
-                self.invitation = None;
-            }
-        }
+        // NOTE: the end of the message closes a multipart no delimiter
+        // closed, as a closing delimiter standing there would (Annex
+        // A.1): the child under way is its last part, and the line break
+        // the message ends with is the missing delimiter's, so it counts
+        // only for a part no multipart holds.
+        self.close_leaf(self.frames.is_empty());
         let attachment = !self.found.is_empty();
         PimdirParts {
             attachments: self.found,
@@ -444,17 +432,10 @@ impl PimdirAttachmentWalk {
         }
         self.close_leaf(false);
 
-        // NOTE: a level inside the part ending here has its own child
-        // under way cut short, which is no part either.
-        if let Some(inner) = self.frames.get(level + 1) {
-            if let Some(start) = inner.child_start {
-                self.found.truncate(start);
-                if !inner.invited_before {
-                    self.invitation = None;
-                }
-            }
-            self.frames.truncate(level + 1);
-        }
+        // NOTE: a level inside the part ending here was never closed: the
+        // end of its entity closes it, its child under way its last part
+        // (Annex A.1).
+        self.frames.truncate(level + 1);
 
         if close {
             self.frames.truncate(level);
@@ -462,15 +443,11 @@ impl PimdirAttachmentWalk {
             return;
         }
 
-        let found = self.found.len();
-        let invited = self.invitation.is_some();
         let frame = &mut self.frames[level];
         frame.children += 1;
-        frame.child_start = Some(found);
-        frame.invited_before = invited;
 
-        // NOTE: a part past the bound is no entity read, but the levels
-        // stay open: a part they never end is still no part.
+        // NOTE: a part past the bound is no entity read; the levels stay
+        // open, whose delimiters are still told from content.
         if self.read >= MIME_ENTITIES_MAX {
             self.mode = Mode::Skip;
             return;
@@ -540,8 +517,6 @@ impl PimdirAttachmentWalk {
                     delimiter: format!("--{boundary}").into_bytes(),
                     prefix: section.map(|section| section + ".").unwrap_or_default(),
                     children: 0,
-                    child_start: None,
-                    invited_before: false,
                     media,
                 });
                 self.mode = Mode::Skip;
@@ -564,9 +539,11 @@ impl PimdirAttachmentWalk {
     }
 
     /// Ends the attachment being counted, its size set; a pending line
-    /// break counts only at the end of the message, any other belonging
-    /// to the delimiter that follows (RFC 2046 §5.1.1). A calendar part
-    /// ends too, its `UID`, if it read one, the invitation.
+    /// break counts only for a part no multipart holds, ending with the
+    /// message (`at_end`), any other belonging to the delimiter that
+    /// follows, or to the one a multipart nothing closes lacks (RFC 2046
+    /// §5.1.1, Annex A.1). A calendar part ends too, its `UID`, if it
+    /// read one, the invitation.
     fn close_leaf(&mut self, at_end: bool) {
         if let Mode::Leaf(Some((index, counter))) = &mut self.mode {
             let size = counter.size(at_end);
@@ -1305,15 +1282,35 @@ Content-Disposition: attachment\r\n\r\n\
         assert!(walk.done(), "the message's level closed");
     }
 
+    /// The end of the message closes a multipart no delimiter closed
+    /// (Annex A.1): what follows its last delimiter line is its last
+    /// part, measured without the line break the message ends with, the
+    /// missing delimiter's, whether it is there or not.
     #[test]
-    fn a_part_no_delimiter_ends_is_no_attachment() {
-        let body = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Disposition: attachment; filename=a\r\n\r\nA\r\n--b\r\nContent-Disposition: attachment; filename=b\r\n\r\nB\r\n";
+    fn a_part_the_end_of_the_message_ends_is_an_attachment() {
+        let cut = |end: &str| {
+            let body = format!(
+                "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Disposition: attachment; filename=a\r\n\r\nA\r\n--b\r\nContent-Disposition: attachment; filename=b\r\n\r\nB{end}"
+            );
+            walked(body.as_bytes())
+        };
 
-        assert_eq!(walked(body), vec![summary("a", None, 1, "1")]);
+        let first = summary("a", None, 1, "1");
+        assert_eq!(cut("\r\n"), vec![first.clone(), summary("b", None, 1, "2")]);
+        assert_eq!(cut(""), vec![first.clone(), summary("b", None, 1, "2")]);
+        assert_eq!(cut("\n\n"), vec![first.clone(), summary("b", None, 2, "2")]);
+
+        // NOTE: a delimiter line ending the message starts a part holding
+        // nothing, which makes no mark.
+        let body = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Disposition: attachment; filename=a\r\n\r\nA\r\n--b\r\n";
+        assert_eq!(walked(body), vec![first]);
     }
 
+    /// The end of its entity closes an inner multipart no delimiter
+    /// closed (Annex A.1): the outer delimiter ends its last part, which
+    /// is a part as any other.
     #[test]
-    fn an_outer_delimiter_cuts_an_inner_part_short() {
+    fn an_outer_delimiter_ends_the_last_part_of_an_inner_multipart() {
         let body = b"Content-Type: multipart/mixed; boundary=out\r\n\r\n\
 --out\r\nContent-Type: multipart/mixed; boundary=in\r\n\r\n\
 --in\r\nContent-Disposition: attachment; filename=kept\r\n\r\nK\r\n\
@@ -1324,6 +1321,7 @@ Content-Disposition: attachment\r\n\r\n\
             walked(body),
             vec![
                 summary("kept", None, 1, "1.1"),
+                summary("cut", None, 1, "1.2"),
                 summary("last", None, 1, "2")
             ]
         );

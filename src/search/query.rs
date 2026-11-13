@@ -97,7 +97,7 @@ pub const FIELDS: &[&str] = &[
 ];
 
 /// The fields whose value is text, so takes a trailing wildcard unless it
-/// holds an `@` (SEARCH §8.3).
+/// is an address (SEARCH §8.3, [`ADDRESS_FIELDS`]).
 const TEXT_FIELDS: &[&str] = &[
     "subject",
     "title",
@@ -115,6 +115,20 @@ const TEXT_FIELDS: &[&str] = &[
     "attachment",
     "mimetype",
     "location",
+];
+
+/// The role fields and `with:`, whose value holding an `@` is an address,
+/// not text (SEARCH §8.3): in any other text field an `@` is a character
+/// as another.
+const ADDRESS_FIELDS: &[&str] = &[
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "attendee",
+    "organizer",
+    "email",
+    "with",
 ];
 
 /// `is-value` (SEARCH §8.3).
@@ -173,9 +187,10 @@ pub enum PimdirQuery {
     Or(Vec<PimdirQuery>),
     /// The operand does not match.
     Not(Box<PimdirQuery>),
-    /// A parenthesised group, matching as its operand does: kept apart
-    /// since a term inside one rules no collection out of the query's
-    /// (SEARCH §8.2, [`conjuncts`](Self::conjuncts)).
+    /// A parenthesised group, matching as its operand does. One that is
+    /// itself a conjunct of the whole query is read through, a negated
+    /// one or one beside an `or` is not (SEARCH §8.2,
+    /// [`conjuncts`](Self::conjuncts)).
     Group(Box<PimdirQuery>),
     /// One term.
     Term(PimdirQueryTerm),
@@ -236,38 +251,47 @@ impl PimdirQuery {
 
     /// The terms standing as conjuncts of the whole query (SEARCH §8.2):
     /// the query itself when it is one term, else the terms its top-level
-    /// `and` joins, written or not. A term negated, inside a group or
-    /// beside an `or` is none, so it rules no collection out of the
-    /// query's and bounds no date range of its coverage.
+    /// `and` joins, written or not, in reading order. A group is read
+    /// through: one that is itself such a conjunct lends the query its
+    /// own conjuncts, at any depth, so `(collection:a) x` and
+    /// `collection:a x` have one scope. A term negated, beside an `or`,
+    /// or inside a group that is negated or stands beside an `or`, is
+    /// none, so it rules no collection out of the query's and bounds no
+    /// date range of its coverage.
     pub fn conjuncts(&self) -> Vec<&PimdirQueryTerm> {
-        let operands = match self {
-            Self::And(operands) => operands.as_slice(),
-            query => core::slice::from_ref(query),
-        };
-        operands
-            .iter()
-            .filter_map(|operand| match operand {
-                Self::Term(term) => Some(term),
-                _ => None,
-            })
-            .collect()
+        let mut terms = Vec::new();
+        let mut pending = vec![self];
+        while let Some(node) = pending.pop() {
+            match node {
+                Self::And(operands) => pending.extend(operands.iter().rev()),
+                Self::Group(operand) => pending.push(operand),
+                Self::Term(term) => terms.push(term),
+                Self::Or(_) | Self::Not(_) => {}
+            }
+        }
+        terms
     }
 
     /// The bodies the query's terms read (SEARCH §8.2), wherever each
-    /// stands, negated or not: what tells whether a body the index could
-    /// not read counts against the answer, which a coverage holding it
-    /// says by its `is_complete`.
+    /// stands, negated or not: what tells whether a body out of sight
+    /// counts against the answer, which a coverage holding it says by
+    /// its `is_complete`.
     ///
-    /// A text term reads every kind's, a value holding `@` in an address
-    /// field being a seek of the store and reading none; `date:` and
-    /// `when:` a calendar item's, by its occurrences; `has:attachment` a
-    /// calendar item's; `has:phone`, `has:address`, `has:birthday`,
-    /// `has:photo` and `category:` a card's; `is:encrypted` a message's.
-    /// Free text, `body:`, `attachment:` and `mimetype:` are matched in
-    /// the fields an encrypted body gives none of.
+    /// A text term reads every kind's, the value of a role field or of
+    /// `with:` holding `@` being an address, a seek of the store reading
+    /// none; `date:` and `when:` a calendar item's, by its occurrences;
+    /// `has:attachment` a calendar item's, a message's mark being the
+    /// store's, a guess while the message holds no body
+    /// ([`mark`](PimdirSearchReads::mark)); `thread:` a message's, whose
+    /// `References` name its thread where its summary names a parent
+    /// alone; `has:phone`, `has:address`, `has:birthday`, `has:photo` and
+    /// `category:` a card's; `is:encrypted` a message's. Free text,
+    /// `body:`, `attachment:` and `mimetype:` are matched in the fields
+    /// an encrypted body gives none of.
     pub fn reads(&self) -> PimdirSearchReads {
         let mut reads = PimdirSearchReads::default();
         for (term, _) in self.terms() {
+            reads.mark |= term.predicate == PimdirQueryPredicate::HasAttachment;
             let kinds: &[&str] = match &term.predicate {
                 PimdirQueryPredicate::Text { field, .. } => {
                     reads.content |= matches!(
@@ -284,7 +308,7 @@ impl PimdirQuery {
                 }
                 PimdirQueryPredicate::Date(_) | PimdirQueryPredicate::HasAttachment => &[CALENDAR],
                 PimdirQueryPredicate::HasProperty(_) | PimdirQueryPredicate::Category(_) => &[CARD],
-                PimdirQueryPredicate::Encrypted => &[MAIL],
+                PimdirQueryPredicate::Encrypted | PimdirQueryPredicate::Thread(_) => &[MAIL],
                 _ => &[],
             };
             reads
@@ -1129,10 +1153,10 @@ fn field(
         ));
     }
 
-    let text_field = TEXT_FIELDS.contains(&name);
+    let address = ADDRESS_FIELDS.contains(&name) && value.contains('@');
     let (stem, prefix) = match phrase {
         true => (value.as_str(), false),
-        false => wildcard(&value, value_start, text_field && !value.contains('@'))?,
+        false => wildcard(&value, value_start, TEXT_FIELDS.contains(&name) && !address)?,
     };
     let text = PimdirQueryText {
         text: stem.into(),
@@ -1484,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn a_term_in_a_group_is_no_conjunct() {
+    fn a_group_that_is_a_conjunct_is_read_through() {
         let conjuncts = |query: &str| -> Vec<(usize, usize)> {
             PimdirQuery::parse(query)
                 .unwrap()
@@ -1496,12 +1520,21 @@ mod tests {
 
         assert_eq!(conjuncts("kind:mail"), [(0, 9)]);
         assert_eq!(conjuncts("kind:mail and a b"), [(0, 9), (14, 15), (16, 17)]);
-        assert_eq!(conjuncts("(kind:mail)"), [], "inside a group");
-        assert_eq!(conjuncts("(kind:mail) a"), [(12, 13)]);
-        assert_eq!(conjuncts("(kind:mail a) b"), [(14, 15)]);
+        assert_eq!(conjuncts("(kind:mail)"), [(1, 10)], "the whole query");
+        assert_eq!(conjuncts("(kind:mail) a"), [(1, 10), (12, 13)]);
+        assert_eq!(conjuncts("(kind:mail a) b"), [(1, 10), (11, 12), (14, 15)]);
+        assert_eq!(
+            conjuncts("((kind:mail) (a and (b)))"),
+            [(2, 11), (14, 15), (21, 22)],
+            "at any depth, in reading order"
+        );
         assert_eq!(conjuncts("kind:mail or a"), [], "beside an or");
         assert_eq!(conjuncts("kind:mail a or b"), []);
+        assert_eq!(conjuncts("(kind:mail or a) b"), [(17, 18)]);
+        assert_eq!(conjuncts("(kind:mail) or a"), [], "a group beside an or");
         assert_eq!(conjuncts("-kind:mail a"), [(11, 12)], "negated");
+        assert_eq!(conjuncts("-(kind:mail) a"), [(13, 14)], "a negated group");
+        assert_eq!(conjuncts("(-kind:mail a) b"), [(12, 13), (15, 16)]);
         assert_eq!(conjuncts("not kind:mail"), []);
 
         // NOTE: a group matches as its operand does.
@@ -1528,6 +1561,7 @@ mod tests {
                 .into_iter()
                 .filter(|kind| reads.kinds.contains(*kind))
                 .collect();
+            assert_eq!(reads.mark, query.contains("has:attachment"), "{query}");
             (kinds, reads.content)
         };
         let every = vec![MAIL, CARD, CALENDAR];
@@ -1547,6 +1581,9 @@ mod tests {
             "with:jane",
             "person:jane",
             "location:x",
+            "subject:jane@example.org",
+            "person:jane@example.org",
+            "location:jane@example.org",
         ] {
             assert_eq!(reads(query), (every.clone(), false), "{query}");
         }
@@ -1569,7 +1606,9 @@ mod tests {
         ] {
             assert_eq!(reads(query), (vec![CARD], false), "{query}");
         }
-        assert_eq!(reads("is:encrypted"), (vec![MAIL], false));
+        for query in ["is:encrypted", "thread:a", "-thread:a"] {
+            assert_eq!(reads(query), (vec![MAIL], false), "{query}");
+        }
         for query in [
             "is:read",
             "is:unread",
@@ -1580,7 +1619,6 @@ mod tests {
             "priority:high",
             "account:a collection:b",
             "changed:1..",
-            "thread:a",
             "id:1",
             "linked:1",
         ] {
@@ -1592,6 +1630,50 @@ mod tests {
             (every, true),
             "wherever a term stands, negated or not"
         );
+    }
+
+    /// An `@` makes an address of the value of a role field or of `with:`
+    /// alone (SEARCH §8.3): in any other text field it is a character, so
+    /// the value is a text term and may end with the wildcard.
+    #[test]
+    fn an_at_sign_is_an_address_in_a_role_field_alone() {
+        let prefix = |query: &str| match PimdirQuery::parse(query).unwrap() {
+            PimdirQuery::Term(term) => match term.predicate {
+                PimdirQueryPredicate::Text { text, .. } | PimdirQueryPredicate::Person(text) => {
+                    (text.text, text.prefix)
+                }
+                predicate => panic!("{query}: a text term, got {predicate:?}"),
+            },
+            parsed => panic!("{query}: one term, got {parsed:?}"),
+        };
+
+        for field in [
+            "subject",
+            "title",
+            "summary",
+            "body",
+            "person",
+            "attachment",
+            "mimetype",
+            "location",
+        ] {
+            let query = format!("{field}:ledger@exa*");
+            assert_eq!(prefix(&query), ("ledger@exa".into(), true), "{query}");
+        }
+        for field in [
+            "from",
+            "to",
+            "cc",
+            "bcc",
+            "attendee",
+            "organizer",
+            "email",
+            "with",
+        ] {
+            let query = format!("{field}:ledger@exa*");
+            let at = query.chars().count() - 1;
+            assert_eq!(refusal(&query), ("invalid-wildcard", at, at + 1), "{query}");
+        }
     }
 
     #[test]

@@ -9,7 +9,10 @@
 //! same key in the account (a move, a copy, a second label) enters
 //! nothing, so neither does a body held before the rule ran: nothing is
 //! walked twice, nothing is backfilled, and a stand-in once recorded is
-//! never recomputed.
+//! never recomputed. A key stands for one message: a body entering under
+//! one another row of the account holds another body under, a message it
+//! does not agree with on `subject`, `date` and `sender` (§9), records no
+//! stand-in and no reference, the keys being that message's.
 //!
 //! The same walk gives the columns of the row that only the body gives
 //! (Annex A.1), the attachment mark and the invitation, which the write
@@ -38,8 +41,8 @@ use crate::{
         schema,
         write::{kind_of, stated_size},
     },
-    hub::PimdirHub,
-    object::PimdirHash,
+    hub::{PimdirHub, PimdirHubItem},
+    object::{PimdirHash, PimdirHeldObject, PimdirObject},
     placement::PimdirLinkId,
     sql,
     summary::{
@@ -119,26 +122,38 @@ pub(crate) fn gaining(
     // a writer-derived key never matches, so its body is always read.
     bind_list(conn, "links", bodies.iter().map(|(link, _)| link.as_str()))?;
     let mut stmt = conn.prepare_cached(sql::LOOKUP_OBJECTS)?;
-    let held: BTreeMap<(String, String), i64> = stmt
-        .query_map(named_params! { ":account": account.as_deref() }, |row| {
-            Ok((
-                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<Result<_, _>>()?;
+    let mut held: BTreeMap<String, Vec<PimdirHeldObject>> = BTreeMap::new();
+    let holders = stmt.query_map(named_params! { ":account": account.as_deref() }, |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            PimdirHeldObject {
+                object: PimdirObject {
+                    hash: PimdirHash(row.get(1)?),
+                    size: row.get::<_, i64>(2)?.max(0) as usize,
+                },
+                subject: row.get(3)?,
+                date: row.get(4)?,
+                sender: row.get(5)?,
+            },
+        ))
+    })?;
+    for holder in holders {
+        let (link, holder) = holder?;
+        held.entry(link).or_default().push(holder);
+    }
 
     let mut entering = Vec::new();
     for (link, hash) in bodies {
-        let found = match held.get(&(link.0.clone(), hash.0.clone())) {
-            Some(size) => {
+        let holders = held.get(link.as_str()).map_or(&[][..], Vec::as_slice);
+        let found = match holders.iter().find(|holder| holder.object.hash == hash) {
+            Some(holder) => {
                 let (mark, invitation) = held_columns(conn, &link, &hash, account.as_deref())?;
                 Body::Held(
                     match mark {
                         Some(_) => (mark, invitation),
                         None => walked_columns(blobs, &link, &hash, collection, invitation)?,
                     },
-                    *size,
+                    holder.object.size,
                 )
             }
             None => match walk(blobs, &hash)? {
@@ -162,7 +177,7 @@ pub(crate) fn gaining(
         if let Some(PimdirSummary::Mail(mail)) = summary {
             match &found {
                 Body::Held((attachment, invitation), size) => {
-                    mail.size = Some((*size).max(0) as u64);
+                    mail.size = Some(*size as u64);
                     if attachment.is_some() {
                         mail.attachment = *attachment;
                     }
@@ -179,9 +194,14 @@ pub(crate) fn gaining(
             }
         }
 
+        // NOTE: a `part:` key is built over the `Message-ID` alone, so it
+        // stands for one message of the account (§14.3): the parts of
+        // another one reusing the id are neither recorded under the keys
+        // of the first nor referenced from it.
         if let Body::Read(parts) = found
             && !parts.attachments.is_empty()
             && !link.is_derived()
+            && !another_message(holders, old.items.get(&link), new.items.get(&link))
         {
             entering.push((link, parts.attachments));
         }
@@ -198,9 +218,34 @@ pub(crate) fn gaining(
 enum Body {
     /// Held by a row of the account: that row's mark and invitation, a
     /// walk's when it states no mark, and the body's size.
-    Held((Option<bool>, Option<String>), i64),
+    Held((Option<bool>, Option<String>), usize),
     /// Read now, entering the store.
     Read(PimdirParts),
+}
+
+/// Whether a body entering a row under a key meets another message's
+/// (§14.3): among `holders`, the rows of the account holding another body
+/// under the key, one states a message the entering row's summary does
+/// not agree with on `subject`, `date` and `sender` (§9). The row the
+/// body enters is no other row: the body it held before the batch
+/// (`prev`), which the lookup still answers, is left out.
+fn another_message(
+    holders: &[PimdirHeldObject],
+    prev: Option<&PimdirHubItem>,
+    entering: Option<&PimdirHubItem>,
+) -> bool {
+    let own = prev.and_then(|prev| {
+        let object = prev.object.as_ref()?;
+        holders.iter().position(|holder| {
+            &holder.object.hash == object && holder.agrees(prev.summary.as_ref())
+        })
+    });
+    let summary = entering.and_then(|item| item.summary.as_ref());
+
+    holders
+        .iter()
+        .enumerate()
+        .any(|(at, holder)| Some(at) != own && !holder.agrees(summary))
 }
 
 /// The mark and invitation a row of the account holding `hash` under

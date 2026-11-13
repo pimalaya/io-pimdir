@@ -7,7 +7,10 @@
 //! Mail goes through mime-rs: the MIME tree, transfer encodings, charsets,
 //! RFC 2047 and RFC 2231, `text/plain` preferred within an alternative and
 //! `text/html` reduced to text (`html`), under the bounds the summaries
-//! keep ([`MIME_DEPTH_MAX`], [`MIME_ENTITIES_MAX`]). A vCard goes through
+//! keep ([`MIME_DEPTH_MAX`], [`MIME_ENTITIES_MAX`]). It walks the parts
+//! the summaries walk and reads an entity's fields from the occurrence
+//! they read, the first (STORAGE Annex A.1): a message stating one twice
+//! is parsed from [`mail::first_occurrences`]. A vCard goes through
 //! vcard-rs and an iCalendar resource through ical-rs. A file, a placement
 //! holding no body and a body no parser accepts are read from their
 //! summary and address rows.
@@ -34,7 +37,7 @@ use crate::{
     search::{chunk, fold, html},
     summary::{
         PimdirAddress, PimdirAddressRole, PimdirSummary,
-        mail::{MIME_DEPTH_MAX, MIME_ENTITIES_MAX, attachments},
+        mail::{self, MIME_DEPTH_MAX, MIME_ENTITIES_MAX, attachments},
     },
 };
 
@@ -142,15 +145,21 @@ impl PimdirExtract {
     /// [`Unparseable`](PimdirExtractStatus::Unparseable) with every field
     /// empty, which the caller fills from the summary.
     pub fn mail(body: &[u8]) -> Self {
-        // NOTE: the walk bounds the entities it reads, the parse none, so
-        // a multipart holding the 10,000th entity is still split.
-        let opts = MimeParseOptions {
-            max_entities: Some(usize::MAX),
-            ..Default::default()
-        };
-        let cst = MimeCst::parse_with(body, opts);
-        let root = &cst.root;
+        let cst = parse(body);
+        if !restates(&cst.root) {
+            return Self::parsed(body, &cst.root);
+        }
 
+        // NOTE: mime-rs reads the fields an entity is split and decoded by
+        // from their last occurrence, Annex A.1 from their first, so a
+        // message stating one twice is parsed again with the later ones
+        // cut out: the same parts, read as the summary reads them.
+        let once = mail::first_occurrences(body);
+        Self::parsed(body, &parse(&once).root)
+    }
+
+    /// The extraction of the message `body` parsed to `root`.
+    fn parsed(body: &[u8], root: &MimeEntity) -> Self {
         let mut extract = if root.header.fields().next().is_none() {
             let Some(text) = headless(body) else {
                 return Self {
@@ -549,6 +558,48 @@ impl<'t, 'a> Walk<'t, 'a> {
             _ => false,
         }
     }
+}
+
+/// The tree of a message.
+fn parse(body: &[u8]) -> MimeCst<'_> {
+    // NOTE: the walk bounds the entities it reads, the parse none, so a
+    // multipart holding the 10,000th entity is still split.
+    let opts = MimeParseOptions {
+        max_entities: Some(usize::MAX),
+        ..Default::default()
+    };
+    MimeCst::parse_with(body, opts)
+}
+
+/// Whether an entity of the tree states twice a field the tree is split
+/// or decoded by: `Content-Type`, `Content-Transfer-Encoding` or
+/// `Content-Disposition`, named as the summaries name a field, its name
+/// trimmed and lowercased. The parts of a `message/rfc822` part, which
+/// the walk does not open, are not looked at.
+fn restates(root: &MimeEntity) -> bool {
+    let mut pending = vec![root];
+    while let Some(entity) = pending.pop() {
+        let mut stated = [0usize; 3];
+        for field in entity.header.fields() {
+            let name = field.name_str().trim().to_lowercase();
+            let fields = [
+                "content-type",
+                "content-transfer-encoding",
+                "content-disposition",
+            ];
+            if let Some(at) = fields.iter().position(|field| *field == name) {
+                stated[at] += 1;
+            }
+        }
+        if stated.iter().any(|count| *count > 1) {
+            return true;
+        }
+
+        if let MimeBodyNode::Multipart(multipart) = &entity.body {
+            pending.extend(multipart.parts.iter().map(|part| &part.entity));
+        }
+    }
+    false
 }
 
 /// The first field the marker names, in document order, read in its

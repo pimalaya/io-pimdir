@@ -5,9 +5,10 @@
 //!
 //! A table pins the cases the format names (base64, quoted-printable,
 //! folded `UID` lines, nested multiparts, a calendar part disposed as an
-//! attachment or inline, a truncated message, one cut inside a line
-//! break, a header line holding a `\r`, no `UID`); a property then builds
-//! messages from those pieces at random, cut anywhere.
+//! attachment or inline, a multipart no closing delimiter ends, one cut
+//! inside a line break, a header line holding a `\r`, no `UID`, an entity
+//! stating its fields twice); a property then builds messages from those
+//! pieces at random, cut anywhere.
 
 use io_pimdir::summary::{
     PimdirSummary,
@@ -132,16 +133,36 @@ fn the_walk_reads_the_invitation_the_derivation_reads() {
 --b--\r\n";
     assert_eq!(agrees(attached, 60).as_deref(), Some("second"));
 
+    // NOTE: the end of its entity closes a multipart no delimiter closed,
+    // its last child a part as any other (Annex A.1).
     let truncated = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
 --b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
 --b\r\nContent-Type: text/calendar\r\n\r\nUID:cut\r\n";
-    assert_eq!(agrees(truncated, 70), None, "a part no delimiter ends");
+    assert_eq!(
+        agrees(truncated, 70).as_deref(),
+        Some("cut"),
+        "a part the end of the message ends"
+    );
 
     let cut_inner = b"Content-Type: multipart/mixed; boundary=out\r\n\r\n\
 --out\r\nContent-Type: multipart/mixed; boundary=in\r\n\r\n\
 --in\r\nContent-Type: text/calendar\r\n\r\nUID:cut-inner\r\n\
 --out\r\nContent-Type: text/calendar\r\n\r\nUID:after\r\n--out--\r\n";
-    assert_eq!(agrees(cut_inner, 90).as_deref(), Some("after"));
+    assert_eq!(
+        agrees(cut_inner, 90).as_deref(),
+        Some("cut-inner"),
+        "a part an outer delimiter ends"
+    );
+
+    // NOTE: an entity's fields are read from their first occurrence.
+    let restated = b"Content-Type: multipart/mixed; boundary=b\r\nContent-Type: text/plain\r\n\r\n\
+--b\r\nContent-Type: text/calendar\r\nContent-Type: text/plain\r\n\
+Content-Transfer-Encoding: quoted-printable\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+UID:first=2D1\r\n\
+--b\r\nContent-Type: text/plain\r\n\
+Content-Disposition: attachment\r\nContent-Disposition: inline\r\n\r\nfile\r\n--b--\r\n";
+    assert!(derived(restated).0);
+    assert_eq!(agrees(restated, 120).as_deref(), Some("first-1"));
 
     let cut_line_feed = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
 --b\r\nContent-Type: text/calendar\r\nContent-Disposition: attachment\r\n\r\nUID:last\r\n\
@@ -210,6 +231,13 @@ fn a_uid_past_the_line_bound_is_not_read() {
 struct Builder {
     state: u64,
     eol: &'static str,
+    /// Whether every entity states its fields twice, the second
+    /// occurrence saying otherwise.
+    restate: bool,
+    /// The fields stated twice so far, which alternates what the second
+    /// occurrence says. It draws nothing, so a seed builds the same
+    /// message but for the lines added.
+    restated: usize,
 }
 
 impl Builder {
@@ -218,6 +246,21 @@ impl Builder {
         self.state ^= self.state >> 7;
         self.state ^= self.state << 17;
         self.state % below.max(1)
+    }
+
+    /// The header lines of `field` stating `value`, and, when the builder
+    /// restates, `other` too: after it, or before it every other time,
+    /// so the first occurrence is now what was drawn, now the other.
+    fn stated(&mut self, field: &str, value: &str, other: &str) -> String {
+        let eol = self.eol;
+        if !self.restate {
+            return format!("{field}: {value}{eol}");
+        }
+        self.restated += 1;
+        match self.restated % 2 {
+            0 => format!("{field}: {other}{eol}{field}: {value}{eol}"),
+            _ => format!("{field}: {value}{eol}{field}: {other}{eol}"),
+        }
     }
 
     fn calendar(&mut self) -> Vec<u8> {
@@ -256,13 +299,21 @@ impl Builder {
             1 => ("application/pdf", b"%PDF-1.4".to_vec()),
             _ => ("text/calendar; method=REQUEST", self.calendar()),
         };
-        let mut headers = format!("Content-Type: {media}{eol}");
+        let other = match media.starts_with("text/") {
+            true => "application/x-other",
+            false => "text/plain",
+        };
+        let mut headers = self.stated("Content-Type", media, other);
         if self.next(3) == 0 {
-            headers += &format!("Content-Disposition: attachment; filename=f{eol}");
+            headers += &self.stated(
+                "Content-Disposition",
+                "attachment; filename=f",
+                "inline; filename=g",
+            );
         }
         let body = match self.next(3) {
             0 => {
-                headers += &format!("Content-Transfer-Encoding: base64{eol}");
+                headers += &self.stated("Content-Transfer-Encoding", "base64", "7bit");
                 let mut text = wrapped(&base64(&raw), [4, 8, 76][self.next(3) as usize], eol);
                 if self.next(8) == 0 {
                     text.insert(0, '*');
@@ -270,7 +321,7 @@ impl Builder {
                 text.into_bytes()
             }
             1 => {
-                headers += &format!("Content-Transfer-Encoding: Quoted-Printable{eol}");
+                headers += &self.stated("Content-Transfer-Encoding", "Quoted-Printable", "base64");
                 let mut out = Vec::new();
                 for byte in &raw {
                     match self.next(6) {
@@ -299,11 +350,12 @@ impl Builder {
         let eol = self.eol;
         if depth < 3 && self.next(3) != 0 {
             let boundary = format!("b{depth}{}", self.next(100));
-            let mut out = format!(
-                "Content-Type: multipart/{}; boundary=\"{boundary}\"{eol}{eol}",
+            let media = format!(
+                "multipart/{}; boundary=\"{boundary}\"",
                 ["mixed", "alternative", "related"][self.next(3) as usize]
-            )
-            .into_bytes();
+            );
+            let mut out =
+                (self.stated("Content-Type", &media, "application/zip") + eol).into_bytes();
             if self.next(3) == 0 {
                 out.extend_from_slice(format!("preamble UID:no{eol}").as_bytes());
             }
@@ -327,9 +379,16 @@ impl Builder {
 
 /// The message the property built from `seed`, cut at `truncate`.
 fn built(seed: u64, crlf: bool, truncate: Option<usize>) -> Vec<u8> {
+    built_with(seed, crlf, truncate, false)
+}
+
+/// [`built`], every entity stating its fields twice when `restate`.
+fn built_with(seed: u64, crlf: bool, truncate: Option<usize>, restate: bool) -> Vec<u8> {
     let mut builder = Builder {
         state: seed,
         eol: if crlf { "\r\n" } else { "\n" },
+        restate,
+        restated: 0,
     };
     let mut body = format!("Subject: built{0}Message-ID: <m@x>{0}", builder.eol).into_bytes();
     body.extend(builder.entity(0));
@@ -361,6 +420,18 @@ proptest! {
     ) {
         agrees(&built(seed, crlf, truncate), cut);
     }
+
+    /// The same over messages whose every entity states its fields
+    /// twice, the first occurrence being the one read (Annex A.1).
+    #[test]
+    fn a_built_message_stating_its_fields_twice_reads_alike(
+        seed in 1u64..,
+        crlf in any::<bool>(),
+        truncate in proptest::option::of(0usize..4096),
+        cut in 0usize..4096,
+    ) {
+        agrees(&built_with(seed, crlf, truncate, true), cut);
+    }
 }
 
 /// The streamed walk against mime-rs's tree, the third reading of a
@@ -369,14 +440,15 @@ proptest! {
 /// does not have, so their agreement is measured here, on the entities
 /// that make the attachment mark.
 ///
-/// They part on one case, which Annex A.1 does not state: the last child
-/// of a multipart never closed, ended by an outer delimiter or by the end
-/// of the message. The summaries' walk reads it as no part (a child no
-/// delimiter ends), mime-rs as one. The property compares the two under
-/// the walk's reading, and a case of its own pins the difference.
+/// The tree is read as the extraction reads it, parsed from the message
+/// with every field an entity is read by stated once
+/// (`first_occurrences`): mime-rs reads such a field from its last
+/// occurrence, Annex A.1 from its first. The last child of a multipart
+/// no closing delimiter ends, ended by an outer delimiter or by the end
+/// of the message, is a part of both.
 #[cfg(feature = "search")]
 mod tree {
-    use io_pimdir::summary::mail::attachments;
+    use io_pimdir::summary::mail::{self, attachments};
     use mime::tree::{
         body::MimeBodyNode, cst::MimeCst, entity::MimeEntity, parse::MimeParseOptions,
     };
@@ -423,15 +495,14 @@ mod tree {
     /// each by its section (RFC 3501 §6.4.5) and its media type: the
     /// message's own entity makes none when it is a multipart, nor does a
     /// child of a `multipart/encrypted`, nor a child but the first of a
-    /// `multipart/signed`. With `ended`, the last child of a multipart
-    /// never closed is no part, nor is anything under it, as the
-    /// summaries' walk reads one no delimiter ends.
-    fn marked(body: &[u8], ended: bool) -> Vec<(String, String)> {
+    /// `multipart/signed`.
+    fn marked(body: &[u8]) -> Vec<(String, String)> {
         let opts = MimeParseOptions {
             max_entities: Some(usize::MAX),
             ..Default::default()
         };
-        let cst = MimeCst::parse_with(body, opts);
+        let once = mail::first_occurrences(body);
+        let cst = MimeCst::parse_with(&once, opts);
 
         let mut found = Vec::new();
         let mut pending = vec![(&cst.root, String::new(), true)];
@@ -442,11 +513,7 @@ mod tree {
                     if !section.is_empty() && eligible && marks(entity) {
                         found.push((section.clone(), media.clone()));
                     }
-                    let read = match ended && multipart.close.is_empty() {
-                        true => multipart.parts.len().saturating_sub(1),
-                        false => multipart.parts.len(),
-                    };
-                    for (index, part) in multipart.parts.iter().enumerate().take(read).rev() {
+                    for (index, part) in multipart.parts.iter().enumerate().rev() {
                         let child = match section.is_empty() {
                             true => format!("{}", index + 1),
                             false => format!("{section}.{}", index + 1),
@@ -501,28 +568,62 @@ mod tree {
             (String::from("1.2"), String::from("text/html")),
             (String::from("2"), String::from("application/pdf")),
         ];
-        assert_eq!(marked(body, true), expected);
-        assert_eq!(marked(body, false), expected);
+        assert_eq!(marked(body), expected);
         assert_eq!(walked(body), expected);
         assert!(attachments::parts(body).attachment);
     }
 
-    /// Where the two readings part: a multipart never closed. Its last
-    /// child, which no delimiter of its own ends, is a part of mime-rs's
-    /// tree and none of the summaries' walk, so the search extraction
-    /// reads a text the summary's mark and stand-ins leave unread. Annex
-    /// A.1 states neither reading.
+    /// A multipart no closing delimiter ends is closed by the end of its
+    /// entity (Annex A.1): its last child, which the end of the message
+    /// or an outer delimiter ends, is a part of the tree and of the
+    /// summaries' walk alike, so the search extraction reads no text the
+    /// summary's mark and stand-ins leave unread.
     #[test]
-    fn a_child_no_delimiter_ends_is_a_part_of_the_tree_alone() {
+    fn a_child_the_end_of_its_entity_ends_is_a_part_of_both() {
         let body = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
 --b\r\nContent-Type: application/pdf\r\n\r\n%PDF\r\n\
 --b\r\nContent-Type: application/zip\r\n\r\nPK\r\n";
-        let first = (String::from("1"), String::from("application/pdf"));
-        let last = (String::from("2"), String::from("application/zip"));
+        let expected = vec![
+            (String::from("1"), String::from("application/pdf")),
+            (String::from("2"), String::from("application/zip")),
+        ];
+        assert_eq!(walked(body), expected);
+        assert_eq!(marked(body), expected);
 
-        assert_eq!(walked(body), vec![first.clone()]);
-        assert_eq!(marked(body, true), vec![first.clone()]);
-        assert_eq!(marked(body, false), vec![first, last]);
+        let nested = b"Content-Type: multipart/mixed; boundary=out\r\n\r\n\
+--out\r\nContent-Type: multipart/mixed; boundary=in\r\n\r\n\
+--in\r\nContent-Type: application/pdf\r\n\r\n%PDF\r\n\
+--out\r\nContent-Type: application/zip\r\n\r\nPK\r\n";
+        let expected = vec![
+            (String::from("1.1"), String::from("application/pdf")),
+            (String::from("2"), String::from("application/zip")),
+        ];
+        assert_eq!(walked(nested), expected);
+        assert_eq!(marked(nested), expected);
+    }
+
+    /// The standard's two fixtures (vectors/summaries.json): the walk
+    /// and the tree name the attachment the summary case states, under
+    /// its section and its media type.
+    #[test]
+    fn the_tree_and_the_walk_agree_on_the_fixtures_of_annex_a1() {
+        let fixture = |name: &str| {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("spec/vectors/fixtures")
+                .join(name);
+            std::fs::read(path).unwrap()
+        };
+
+        for (name, media) in [
+            ("mail-unclosed-multipart.eml", "text/plain"),
+            ("mail-repeated-part-fields.eml", "text/csv"),
+        ] {
+            let body = fixture(name);
+            let expected = vec![(String::from("2"), String::from(media))];
+            assert_eq!(walked(&body), expected, "{name}");
+            assert_eq!(marked(&body), expected, "{name}");
+            super::agrees(&body, body.len() / 2);
+        }
     }
 
     proptest! {
@@ -531,7 +632,8 @@ mod tree {
         /// On every message the generator builds, cut anywhere or whole,
         /// the streamed walk stands for exactly the parts of mime-rs's
         /// tree that make the mark, under the same sections and media
-        /// types, a child no delimiter ends being no part.
+        /// types, the last child of a multipart nothing closes among
+        /// them.
         #[test]
         fn a_built_message_has_the_attachments_its_tree_has(
             seed in 1u64..,
@@ -539,7 +641,22 @@ mod tree {
             truncate in proptest::option::of(0usize..4096),
         ) {
             let body = super::built(seed, crlf, truncate);
-            let tree = marked(&body, true);
+            let tree = marked(&body);
+            prop_assert_eq!(&walked(&body), &tree, "{:?}", String::from_utf8_lossy(&body));
+            prop_assert_eq!(attachments::parts(&body).attachment, !tree.is_empty());
+        }
+
+        /// The same over messages whose every entity states its fields
+        /// twice: the tree parsed from the first occurrences names the
+        /// parts the walk names.
+        #[test]
+        fn a_built_message_stating_its_fields_twice_has_the_attachments_its_tree_has(
+            seed in 1u64..,
+            crlf in any::<bool>(),
+            truncate in proptest::option::of(0usize..4096),
+        ) {
+            let body = super::built_with(seed, crlf, truncate, true);
+            let tree = marked(&body);
             prop_assert_eq!(&walked(&body), &tree, "{:?}", String::from_utf8_lossy(&body));
             prop_assert_eq!(attachments::parts(&body).attachment, !tree.is_empty());
         }

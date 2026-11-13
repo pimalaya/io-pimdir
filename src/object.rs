@@ -9,6 +9,8 @@
 
 use alloc::string::String;
 
+use crate::summary::{PimdirSummary, mail};
+
 crate::pimdir_id! {
     /// The content hash naming an object in the object store (STORAGE §5).
     ///
@@ -70,6 +72,27 @@ pub struct PimdirHeldObject {
     pub date: Option<String>,
     /// The `sender` the row's mail summary states.
     pub sender: Option<String>,
+}
+
+impl PimdirHeldObject {
+    /// Whether the row holding this body is the message `summary` names
+    /// (STORAGE §9): the same `subject`, `date` and `sender`, byte for
+    /// byte, an absent one matching an absent one and a date no store
+    /// takes read as absent. A row holding no mail summary agrees with no
+    /// message, and a message nobody summarised with none; a summary of
+    /// another kind agrees with anything.
+    pub fn agrees(&self, summary: Option<&PimdirSummary>) -> bool {
+        match summary {
+            Some(PimdirSummary::Mail(stated)) => {
+                self.subject.as_deref() == Some(stated.subject.as_str())
+                    && mail::usable_date(self.date.as_deref())
+                        == mail::usable_date(stated.date.as_deref())
+                    && self.sender == stated.sender
+            }
+            Some(_) => true,
+            None => self.subject.is_none(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -921,17 +921,23 @@ fn an_index_built_otherwise_is_rebuilt_and_a_held_lock_skips_the_refresh() {
 }
 
 /// What a query's coverage counts per kind (SEARCH §8.2), from the
-/// vector store alone: among the collections its top-level conjuncts
-/// leave, a term inside a group ruling none out, the items stating no
-/// fixture (bodiless), those stating `unreadable` (missing) and the
-/// placements of a message whose fixture is encrypted, read off its
-/// `Content-Type`; none is unparseable, a file never counts and a kind
-/// counting nothing is left out.
+/// vector store alone: among the collections its conjuncts leave, a
+/// group that is one read through at any depth, a term negated or beside
+/// an `or` ruling none out, the items stating no fixture (bodiless),
+/// those stating `unreadable` (missing) and the placements of a message
+/// whose fixture is encrypted, read off its `Content-Type`; none is
+/// unparseable, a file never counts and a kind counting nothing is left
+/// out.
 fn unread(spec: &Path, store: &Value, query: &PimdirQuery) -> BTreeMap<String, PimdirSearchUnread> {
-    let conjuncts = match query {
-        PimdirQuery::And(operands) => operands.iter().collect(),
-        query => vec![query],
-    };
+    let mut conjuncts = Vec::new();
+    let mut pending = vec![query];
+    while let Some(node) = pending.pop() {
+        match node {
+            PimdirQuery::And(operands) => pending.extend(operands),
+            PimdirQuery::Group(operand) => pending.push(operand),
+            node => conjuncts.push(node),
+        }
+    }
     let collections = store["collections"].as_array().unwrap();
     let in_scope = |collection: &Value| {
         conjuncts.iter().all(|conjunct| {
@@ -1730,12 +1736,12 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
     for (altered, version, shape) in [
         (
             "UPDATE index_meta SET shape = 'fts4'",
-            Some("search-draft-10"),
+            Some("search-draft-11"),
             Some("fts4"),
         ),
         (
-            "UPDATE index_meta SET format_version = 'search-draft-11'",
-            Some("search-draft-11"),
+            "UPDATE index_meta SET format_version = 'search-draft-12'",
+            Some("search-draft-12"),
             Some("canonical"),
         ),
         (
@@ -1785,6 +1791,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
     for altered in [
         "UPDATE index_meta SET format_version = 'search-draft-07'",
         "UPDATE index_meta SET format_version = 'search-draft-09'",
+        "UPDATE index_meta SET format_version = 'search-draft-10'",
         "ALTER TABLE index_meta DROP COLUMN format_version",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1801,7 +1808,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         drop(index);
         assert_eq!(
             index_meta(dir.path(), "format_version"),
-            rusqlite::types::Value::Text("search-draft-10".into()),
+            rusqlite::types::Value::Text("search-draft-11".into()),
             "{altered}"
         );
     }
@@ -2051,18 +2058,33 @@ fn a_coverage_counts_what_the_index_could_not_read() {
     );
     assert_eq!(
         mail(&index, "(collection:Archive) is:read"),
-        counts(1, 1, 2),
-        "a term inside a group rules no collection out"
+        counts(0, 0, 1),
+        "a group that is a conjunct is read through"
+    );
+    assert_eq!(
+        mail(&index, "((collection:Archive) (is:read))"),
+        counts(0, 0, 1),
+        "at any depth"
     );
     assert_eq!(
         mail(&index, "collection:Archive or is:read"),
         counts(1, 1, 2),
-        "nor does one beside an or"
+        "a term beside an or rules no collection out"
+    );
+    assert_eq!(
+        mail(&index, "(collection:Archive or is:flagged) is:read"),
+        counts(1, 1, 2),
+        "nor one in a group holding the or"
     );
     assert_eq!(
         mail(&index, "-collection:Archive is:read"),
         counts(1, 1, 2),
         "nor a negated one"
+    );
+    assert_eq!(
+        mail(&index, "-(collection:Archive) is:read"),
+        counts(1, 1, 2),
+        "nor one in a negated group"
     );
 
     let complete = |index: &PimdirIndex, query: &str| coverage(index, query).is_complete();
@@ -2099,6 +2121,80 @@ fn a_coverage_counts_what_the_index_could_not_read() {
     assert_eq!(behind.local.unindexed, 0, "nothing of its collections");
     assert!(behind.local.behind > 0);
     assert!(!behind.is_complete(), "the lag is store-wide");
+}
+
+/// A mailbox listed and not yet fetched answers complete to a query none
+/// of whose terms reads a message's body, the store answering such a term
+/// whole (SEARCH §8.2): a `bodiless` item counts against an answer only
+/// while a term reads a body of its kind, as a `missing` one does, and
+/// against `has:attachment`, its mark being a guess until its body is
+/// read.
+#[test]
+fn a_message_held_without_its_body_counts_only_against_what_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let row = serde_json::json!({
+        "message_id": "m@x",
+        "subject": "Listed",
+        "sender": "ann@example.org",
+        "date": "2026-08-01T12:00:00Z",
+        "attachment": 0,
+    });
+    let from = serde_json::json!({ "role": "from", "address": "ann@example.org", "name": "Ann" });
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    store
+        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
+            "INBOX",
+            "1",
+            "m@x",
+            None,
+            mail_summary(&row, &[from]),
+            "2026-08-01T12:00:00Z",
+            PimdirFlags::default(),
+        ))])
+        .unwrap();
+    drop(store);
+
+    let mut index = PimdirIndex::open(dir).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let coverage = |query: &str| {
+        let query = PimdirQuery::parse(query).unwrap();
+        let clock = PimdirSearchClock::default();
+        index.count(&query, &clock).unwrap().coverage
+    };
+    assert_eq!(
+        coverage("is:unread").local.kinds["message/rfc822"].bodiless,
+        1,
+        "counted whatever the query"
+    );
+
+    for query in [
+        "is:unread",
+        "-is:flagged",
+        "tag:todo",
+        "date:2026-08",
+        "from:ann@example.org",
+        "kind:mail has:phone",
+        "id:m@x",
+    ] {
+        assert!(coverage(query).is_complete(), "{query}: reads no message");
+    }
+    for query in [
+        "listed",
+        "subject:listed",
+        "from:ann",
+        "-body:x",
+        "has:attachment",
+        "-has:attachment",
+        "thread:m@x",
+        "is:encrypted",
+    ] {
+        assert!(!coverage(query).is_complete(), "{query}: its body may tell");
+    }
+    assert_eq!(hits(&index, "is:unread").len(), 1, "a hit itself");
 }
 
 /// Floating times are read in the zone the indexer states, `UTC` unless

@@ -254,12 +254,14 @@ impl PimdirStore {
     ///
     /// A body the store holds already under its name is kept, never
     /// replaced (§5), and the bodies the replaced store alone named stay
-    /// as orphans for the collector. The database is replaced last: the
-    /// old one, its WAL and its journal are removed only once every file
-    /// is in place and the new one is ready, flushed, under local/, then
-    /// renamed onto pimdir.db. A restore interrupted in between leaves a
-    /// directory holding no pimdir.db, which no program opens as a store,
-    /// and is run again. The restored database takes the journal mode of
+    /// as orphans for the collector. The old database, its WAL and its
+    /// journal are removed only once every body is in place and the new
+    /// one is ready, flushed, under local/; what local/ holds is replaced
+    /// after that, and the new database renamed onto pimdir.db last. A
+    /// restore stopped before the removal leaves the store it found,
+    /// beside bodies put in; stopped after, a directory holding no
+    /// pimdir.db, which no program opens as a store. Either is run
+    /// again. The restored database takes the journal mode of
     /// the store it replaces, WAL when there was none to read.
     ///
     /// The search index is left as it is: its indexer finds another
@@ -301,30 +303,38 @@ impl PimdirStore {
         let replaced = replaced.as_ref().map(|(incarnation, _)| *incarnation);
         debug!("restore over incarnation {replaced:?}");
 
-        // NOTE: local/ is the backup's, whole (§3, §8): the state an
-        // owner kept beside the replaced store followed that store.
-        let local = dir.join(modes::LOCAL);
-        match fs::symlink_metadata(&local) {
-            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&local)?,
-            Ok(_) => fs::remove_file(&local)?,
-            Err(err) if err.kind() == ErrorKind::NotFound => (),
-            Err(err) => return Err(err.into()),
-        }
-        let copied = copy_files(backup, dir)?;
-
-        // NOTE: the incarnation rises before the database takes its
-        // name, so the store never exists under the backup's own.
-        let staged = modes::local(dir)?.join(STAGED);
-        if copy_file(&source, &staged)?.is_none() {
+        let held = backup.join(modes::LOCAL).join(STAGED);
+        if fs::symlink_metadata(&held).is_ok() {
             return Err(io::Error::new(
                 ErrorKind::AlreadyExists,
-                format!("Backup holds a file under {}", staged.display()),
+                format!("Backup holds a file under {}", held.display()),
             )
             .into());
         }
+
+        // NOTE: the bodies first, which replaces nothing: interrupted
+        // here, the store found stands whole, beside orphans (§8).
+        let mut copied = PimdirCopyReport::default();
+        copy_bodies(backup, dir, &mut copied)?;
+
+        // NOTE: the incarnation rises before the database takes its
+        // name, so the store never exists under the backup's own.
+        let local = dir.join(modes::LOCAL);
+        if fs::symlink_metadata(&local).is_ok_and(|meta| !meta.is_dir()) {
+            fs::remove_file(&local)?;
+        }
+        let staged = modes::local(dir)?.join(STAGED);
+        match fs::remove_file(&staged) {
+            Ok(()) => (),
+            Err(err) if err.kind() == ErrorKind::NotFound => (),
+            Err(err) => return Err(err.into()),
+        }
+        copy_file(&source, &staged)?;
         let incarnation = raise(&staged, replaced)?;
         fs::File::open(&staged)?.sync_all()?;
 
+        // NOTE: from here no pimdir.db stands until the staged one takes
+        // the name, so no program opens what is left as a store.
         for suffix in ["-wal", "-shm", "-journal", ""] {
             let stale = dir.join(format!("{DATABASE}{suffix}"));
             match fs::remove_file(&stale) {
@@ -334,6 +344,24 @@ impl PimdirStore {
             }
         }
         sync_dir(dir)?;
+
+        // NOTE: local/ is the backup's, whole (§3, §8): the state an
+        // owner kept beside the replaced store followed that store.
+        for entry in sorted(&local)? {
+            if entry == staged {
+                continue;
+            }
+            if fs::symlink_metadata(&entry)?.is_dir() {
+                fs::remove_dir_all(&entry)?;
+            } else {
+                fs::remove_file(&entry)?;
+            }
+        }
+        let theirs = backup.join(modes::LOCAL);
+        if fs::symlink_metadata(&theirs).is_ok_and(|meta| meta.is_dir()) {
+            copy_tree(&theirs, &local, &mut copied)?;
+        }
+
         fs::rename(&staged, &db)?;
         sync_dir(dir)?;
         sync_dir(&local)?;
@@ -414,7 +442,23 @@ fn raise(path: &Path, replaced: Option<i64>) -> Result<i64, PimdirError> {
 /// every file copied is flushed, and every directory after its files.
 fn copy_files(from: &Path, to: &Path) -> Result<PimdirCopyReport, PimdirError> {
     let mut report = PimdirCopyReport::default();
+    copy_bodies(from, to, &mut report)?;
 
+    let local = from.join(modes::LOCAL);
+    if fs::symlink_metadata(&local).is_ok_and(|meta| meta.is_dir()) {
+        copy_tree(&local, &to.join(modes::LOCAL), &mut report)?;
+    }
+    sync_dir(to)?;
+
+    Ok(report)
+}
+
+/// Copies the bodies of the store rooted at `from` into the one rooted
+/// at `to` (§8): those of objects/, each under its shard, and the files
+/// of quarantine/. A file `to` holds already is kept, so nothing `to`
+/// held is replaced; every file copied is flushed, and every directory
+/// after its files.
+fn copy_bodies(from: &Path, to: &Path, report: &mut PimdirCopyReport) -> Result<(), PimdirError> {
     let scan = PimdirBlobs::open(from).scan()?;
     let objects = to.join("objects");
     modes::create_dir_all(&objects)?;
@@ -470,14 +514,9 @@ fn copy_files(from: &Path, to: &Path) -> Result<PimdirCopyReport, PimdirError> {
         }
         sync_dir(&target)?;
     }
-
-    let local = from.join(modes::LOCAL);
-    if fs::symlink_metadata(&local).is_ok_and(|meta| meta.is_dir()) {
-        copy_tree(&local, &to.join(modes::LOCAL), &mut report)?;
-    }
     sync_dir(to)?;
 
-    Ok(report)
+    Ok(())
 }
 
 /// Copies the directory `from` into `to`, every directory under it and

@@ -171,6 +171,16 @@ pub enum PimdirMutation {
     /// tombstone's destination is the pending create the store derives
     /// it from (SYNC §3). A held identity is minted, and the create is
     /// staged under the provisional handle its key derives.
+    ///
+    /// It states no resolution, so it settles no conflict: meeting one,
+    /// the item's or its binding's, it is refused, staging nothing in
+    /// either collection ([`PimdirMutateError::Unresolved`], SYNC §7).
+    /// Its tombstone would leave the conflict standing, the diverging
+    /// body pinned under a placement no listing shows, and its create
+    /// would carry the item's body as though nothing diverged from it.
+    /// The conflict is settled first, by an [`Edit`](Self::Edit) or a
+    /// [`Remove`](Self::Remove) stating `resolves`, and the item moved
+    /// after. A [`Copy`](Self::Copy) meets none: it tombstones nothing.
     Move {
         /// The source placement to move.
         handle: PimdirHandle,
@@ -279,16 +289,16 @@ pub enum PimdirMutateError {
     /// An `Edit` stating no `overrule`, or a `Remove`, meets a conflict
     /// its `resolves` does not name, or states `resolves` and meets none
     /// (SYNC §7): settling it would discard a diverging body nobody
-    /// decided over.
+    /// decided over. A `Move` meets any conflict so, stating none.
     Unresolved {
-        /// The handle edited or removed.
+        /// The handle edited, removed or moved.
         handle: String,
         /// The diverging body of each conflict the mutation meets, the
         /// item's then its binding's, `None` for one nobody has read;
         /// empty when it meets none.
         met: Vec<Option<PimdirHash>>,
         /// The bodies the resolution names, `None` for an ordinary edit
-        /// or remove.
+        /// or remove, and for a move.
         resolves: Option<Vec<PimdirHash>>,
     },
     /// A `SetFlags` carrying `base` names a placement whose flags are
@@ -430,9 +440,10 @@ pub(crate) fn names<'a>(bodies: impl Iterator<Item = Option<&'a PimdirHash>>) ->
         .join(", ")
 }
 
-/// The diverging bodies of the conflicts an `Edit` of `placement` meets
-/// (SYNC §7): its item's when `item` names one, `Some(None)` when nobody
-/// has read it, then its binding's while the placement carries one.
+/// The diverging bodies of the conflicts an `Edit`, a `Remove` or a
+/// `Move` of `placement` meets (SYNC §7): its item's when `item` names
+/// one, `Some(None)` when nobody has read it, then its binding's while
+/// the placement carries one.
 fn conflicts_met(
     placement: &PimdirPlacement,
     item: Option<Option<PimdirHash>>,
@@ -444,10 +455,11 @@ fn conflicts_met(
     item.into_iter().chain(binding).collect()
 }
 
-/// Whether an `Edit` stating `resolves` may settle the conflicts it
-/// `met` (SYNC §7): an ordinary edit only when it meets none, a
-/// resolution only when it names the diverging body of each one it
-/// meets, and meets one; a body nobody has read is named by none.
+/// Whether an `Edit` or a `Remove` stating `resolves` may settle the
+/// conflicts it `met` (SYNC §7): an ordinary one only when it meets
+/// none, as a `Move`, which states none; a resolution only when it names
+/// the diverging body of each one it meets, and meets one; a body nobody
+/// has read is named by none.
 pub(crate) fn resolved(met: &[Option<PimdirHash>], resolves: Option<&Vec<PimdirHash>>) -> bool {
     match resolves {
         None => met.is_empty(),
@@ -819,17 +831,22 @@ impl PimdirCoroutine for PimdirMutate {
                     }
                     // NOTE: a conflict is settled by an overrule or by a
                     // person's resolution naming it, an edit's or a
-                    // remove's (SYNC §7). A storage stating no item
-                    // conflict for a placement it projects `Conflict` with
-                    // no binding conflict reads as one nobody has read,
-                    // never as none.
-                    if let PimdirMutation::Edit {
-                        overrule: false,
-                        resolves,
-                        ..
-                    }
-                    | PimdirMutation::Remove { resolves, .. } = &self.mutation
-                    {
+                    // remove's (SYNC §7). A move states none, so it is
+                    // refused over any conflict it meets. A storage
+                    // stating no item conflict for a placement it projects
+                    // `Conflict` with no binding conflict reads as one
+                    // nobody has read, never as none.
+                    let stated = match &self.mutation {
+                        PimdirMutation::Edit {
+                            overrule: false,
+                            resolves,
+                            ..
+                        }
+                        | PimdirMutation::Remove { resolves, .. } => Some(resolves.as_ref()),
+                        PimdirMutation::Move { .. } => Some(None),
+                        _ => None,
+                    };
+                    if let Some(resolves) = stated {
                         let item = loaded
                             .conflicted
                             .iter()
@@ -842,11 +859,11 @@ impl PimdirCoroutine for PimdirMutate {
                             });
                         self.item_conflicted = item.is_some();
                         let met = conflicts_met(&placement, item);
-                        if !resolved(&met, resolves.as_ref()) {
+                        if !resolved(&met, resolves) {
                             let err = PimdirMutateError::Unresolved {
                                 handle: handle.as_str().into(),
                                 met,
-                                resolves: resolves.clone(),
+                                resolves: resolves.cloned(),
                             };
                             return PimdirCoroutineState::Complete(Err(err));
                         }
@@ -1883,6 +1900,58 @@ mod tests {
                 .as_str(),
             "archive",
         );
+    }
+
+    /// A move states no resolution, so it is refused over any conflict it
+    /// meets, the item's or its binding's, before it reads its target and
+    /// staging nothing (SYNC §7, vectors/sync/155, 156). A copy meets
+    /// none: it tombstones nothing.
+    #[test]
+    fn a_move_meeting_a_conflict_is_refused_and_a_copy_is_not() {
+        let diverged = || {
+            let mut loaded = loaded("1");
+            loaded.placements[0].status = PimdirStatus::Conflict;
+            loaded.placements[0].conflict_revision = Some("r2".into());
+            loaded.placements[0].conflict_object = Some(PimdirHash::from("theirs"));
+            loaded
+        };
+        let cases = [
+            (diverged(), vec![Some(PimdirHash::from("theirs"))]),
+            (
+                item_conflicted(PimdirStatus::Clean, Some("other")),
+                vec![Some(PimdirHash::from("other"))],
+            ),
+            (item_conflicted(PimdirStatus::Conflict, None), vec![None]),
+        ];
+
+        for (loaded, conflicts) in cases {
+            let mutation = PimdirMutation::Move {
+                handle: PimdirHandle::from("1"),
+                target: "archive".into(),
+            };
+            let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
+            let _ = mutate.resume(None);
+            match mutate.resume(Some(PimdirArg::Load(loaded.clone()))) {
+                PimdirCoroutineState::Complete(Err(PimdirMutateError::Unresolved {
+                    met,
+                    resolves,
+                    ..
+                })) => {
+                    assert_eq!(met, conflicts);
+                    assert_eq!(resolves, None);
+                }
+                state => panic!("expected Unresolved, got {state:?}"),
+            }
+
+            let mutation = PimdirMutation::Copy {
+                handle: PimdirHandle::from("1"),
+                target: "archive".into(),
+            };
+            let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
+            let _ = mutate.resume(None);
+            let _ = mutate.resume(Some(PimdirArg::Load(loaded)));
+            assert_eq!(stage(&mut mutate, Vec::new()).len(), 1, "the create alone");
+        }
     }
 
     /// The copy lands beside the held identity as the second resource it is.

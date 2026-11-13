@@ -863,25 +863,17 @@ fn is_mutable(placement: &PimdirPlacement) -> bool {
 
 /// Whether a body may be linked from the row `held` (SYNC §6, STORAGE
 /// §9): a message's only from a row agreeing with the summary the source
-/// served on `subject`, `date` and `sender`, byte for byte, an absent one
-/// matching an absent one, and on the size where the placement states
-/// one, against the body's octets. A row holding no mail summary agrees
-/// with no message, and a message whose summary nobody served with none;
-/// a placement of another kind agrees with anything.
+/// served ([`PimdirHeldObject::agrees`]), and on the size where the
+/// placement states one, against the body's octets.
 fn agrees(placement: &PimdirPlacement, held: &PimdirHeldObject) -> bool {
-    let date = |date: &Option<String>| date.clone().filter(|date| !date.is_empty());
-    match &placement.summary {
-        Some(PimdirSummary::Mail(mail)) => {
-            held.subject.as_deref() == Some(mail.subject.as_str())
-                && date(&held.date) == date(&mail.date)
-                && held.sender == mail.sender
-                && mail
-                    .size
-                    .is_none_or(|served| served == held.object.size as u64)
-        }
-        Some(_) => true,
-        None => held.subject.is_none(),
-    }
+    let sized = match &placement.summary {
+        Some(PimdirSummary::Mail(mail)) => mail
+            .size
+            .is_none_or(|served| served == held.object.size as u64),
+        _ => true,
+    };
+
+    held.agrees(placement.summary.as_ref()) && sized
 }
 
 /// What the coroutine is doing while it waits for the caller.

@@ -15,10 +15,12 @@
 pub mod attachments;
 
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
     vec::Vec,
 };
+use core::ops::Range;
 
 use crate::{
     placement::{PimdirLinkId, PimdirSortKey},
@@ -39,6 +41,16 @@ pub const MIME_DEPTH_MAX: usize = 64;
 /// under it, makes no mark, no invitation, no stand-in and no extracted
 /// text. Dovecot's default `max_total_mime_parts`.
 pub const MIME_ENTITIES_MAX: usize = 10_000;
+
+/// The fields an entity is read by, each from its first occurrence when
+/// the entity states it twice (Annex A.1), as [`header_fields`] names
+/// them.
+const ENTITY_FIELDS: [&str; 4] = [
+    "content-type",
+    "content-disposition",
+    "content-transfer-encoding",
+    "content-id",
+];
 
 /// The `mail_summary` row of a message with the people it names.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -148,6 +160,32 @@ pub fn meta_attachment(content_type: Option<&str>) -> bool {
     content_type
         .and_then(|value| value.split(';').next())
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("multipart/mixed"))
+}
+
+/// The message with every field an entity is read by stated once (Annex
+/// A.1): the later occurrences of `Content-Type`, `Content-Disposition`,
+/// `Content-Transfer-Encoding` and `Content-ID` cut out of the header
+/// block of each entity the walk of the parts reads, every other octet as
+/// it was. Borrowed when no entity states one twice.
+///
+/// What a reader hands a parser reading such a field from its last
+/// occurrence, so that the parts it splits and the fields it reads are
+/// those the derivation reads, from the first (SEARCH §6).
+pub fn first_occurrences(body: &[u8]) -> Cow<'_, [u8]> {
+    let mut cuts = Vec::new();
+    restated(body, 0, 0, &mut 0, &mut cuts);
+    if cuts.is_empty() {
+        return Cow::Borrowed(body);
+    }
+
+    let mut once = Vec::with_capacity(body.len());
+    let mut at = 0;
+    for cut in cuts {
+        once.extend_from_slice(&body[at..cut.start]);
+        at = cut.end;
+    }
+    once.extend_from_slice(&body[at..]);
+    Cow::Owned(once)
 }
 
 /// The summary a header block names, the attachment mark given.
@@ -660,6 +698,15 @@ pub fn instant(raw: &str) -> Option<String> {
     (instant < time::unix(10_000, 1, 1, 0, 0, 0)).then(|| time::rfc3339(instant))
 }
 
+/// A message's `date` when it is one the store takes (STORAGE §13, Annex
+/// A.0): an instant in UTC at seconds precision under the `Z` designator
+/// (`2026-08-01T10:00:00Z`), digit for digit, as [`instant`] writes one.
+/// Any other text, an empty one, a fraction of a second and an offset
+/// included, is no usable date: `None`, as an unparseable `Date` is.
+pub fn usable_date(date: Option<&str>) -> Option<&str> {
+    date.filter(|date| time::is_instant(date))
+}
+
 /// The month a `date-time`'s three-letter name stands for, in any case.
 fn month(name: &str) -> Option<u32> {
     const MONTHS: [&str; 12] = [
@@ -845,6 +892,79 @@ fn field<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+/// The fields of a header block as the octets holding each, its folded
+/// lines and their line breaks included, under the name [`header_fields`]
+/// reads it by. A line holding no colon is none.
+fn field_spans(block: &[u8]) -> Vec<(String, Range<usize>)> {
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    let mut at = 0;
+    for line in block.split_inclusive(|byte| *byte == b'\n') {
+        let end = at + line.len();
+        match (line.first(), spans.last_mut()) {
+            (Some(b' ' | b'\t'), Some(last)) => last.end = end,
+            _ => spans.push(at..end),
+        }
+        at = end;
+    }
+
+    spans
+        .into_iter()
+        .filter_map(|span| {
+            let line = unfold(&block[span.clone()], true).into_iter().next()?;
+            let (name, _) = line.split_once(':')?;
+            Some((name.trim().to_lowercase(), span))
+        })
+        .collect()
+}
+
+/// Adds to `cuts` where the message holds a later occurrence of a field
+/// an entity is read by ([`ENTITY_FIELDS`]), in the header block of
+/// `entity`, which the message holds at `base`, then in the parts under
+/// it, walked and bounded as [`has_attachment`] walks them, `read`
+/// counting the entities, this one included.
+fn restated(
+    entity: &[u8],
+    base: usize,
+    depth: usize,
+    read: &mut usize,
+    cuts: &mut Vec<Range<usize>>,
+) {
+    *read += 1;
+    let (block, body) = split_headers(entity);
+    let mut stated = [false; ENTITY_FIELDS.len()];
+    for (name, span) in field_spans(block) {
+        let Some(at) = ENTITY_FIELDS.iter().position(|field| *field == name) else {
+            continue;
+        };
+        if core::mem::replace(&mut stated[at], true) {
+            cuts.push(base + span.start..base + span.end);
+        }
+    }
+
+    if depth >= MIME_DEPTH_MAX {
+        return;
+    }
+
+    let headers = header_fields(block);
+    let Some(boundary) = field(&headers, "content-type").and_then(boundary) else {
+        return;
+    };
+
+    let base = base + entity.len() - body.len();
+    for part in part_spans(body, &boundary) {
+        if *read >= MIME_ENTITIES_MAX {
+            break;
+        }
+        restated(
+            &body[part.clone()],
+            base + part.start,
+            depth + 1,
+            read,
+            cuts,
+        );
+    }
+}
+
 /// Whether the entity, nested `depth` multipart levels down, or a part under
 /// it, makes the attachment mark ([`makes_mark`]), walking multipart bodies
 /// by their boundary down to [`MIME_DEPTH_MAX`] and through
@@ -999,8 +1119,19 @@ fn boundary(content_type: &str) -> Option<String> {
     })
 }
 
-/// The parts of a multipart body, the preamble and epilogue dropped.
+/// The parts of a multipart body, the preamble and epilogue dropped, each
+/// with the line break before the delimiter ending it. A body no closing
+/// delimiter ends is closed by its end, as one standing there would close
+/// it (Annex A.1): what follows its last delimiter line is its last part.
 fn parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
+    part_spans(body, boundary)
+        .into_iter()
+        .map(|part| &body[part])
+        .collect()
+}
+
+/// Where a multipart body holds each of its [`parts`].
+fn part_spans(body: &[u8], boundary: &str) -> Vec<Range<usize>> {
     let delimiter = format!("--{boundary}");
     let mut parts = Vec::new();
     let mut start: Option<usize> = None;
@@ -1014,8 +1145,8 @@ fn parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
         let line = &body[at..end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if let Some(close) = delimits(line, delimiter.as_bytes()) {
-            if let Some(from) = start {
-                parts.push(&body[from..at]);
+            if let Some(from) = start.take() {
+                parts.push(from..at);
             }
             if close {
                 break;
@@ -1023,6 +1154,11 @@ fn parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
             start = Some(end + 1);
         }
         at = end + 1;
+    }
+    // NOTE: a delimiter line ending the body starts a last part holding
+    // nothing, as it does before a closing delimiter.
+    if let Some(from) = start {
+        parts.push(from.min(body.len())..body.len());
     }
 
     parts
@@ -1305,6 +1441,23 @@ mod tests {
         assert_eq!(mail.attachment, Some(false), "the 10,001st entity unread");
         assert_eq!(mail.invitation, None);
         assert!(attachments::attachments(&body).is_empty());
+
+        // NOTE: a part the end of the message ends is counted as one a
+        // delimiter ends, by both walks: read as the 10,000th entity,
+        // unread as the 10,001st.
+        let cut = |parts: usize| {
+            let mut body = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n".to_vec();
+            for _ in 0..parts {
+                body.extend_from_slice(b"--b\r\n\r\nx\r\n");
+            }
+            body.extend_from_slice(b"--b\r\nContent-Disposition: attachment\r\n\r\nx\r\n");
+            let Some(PimdirSummary::Mail(mail)) = derive(&body).summary else {
+                unreachable!("a message derives a mail summary");
+            };
+            (mail.attachment, attachments::parts(&body).attachment)
+        };
+        assert_eq!(cut(MIME_ENTITIES_MAX - 2), (Some(true), true));
+        assert_eq!(cut(MIME_ENTITIES_MAX - 1), (Some(false), false));
     }
 
     #[test]

@@ -727,3 +727,116 @@ fn a_body_failing_its_name_past_the_walk_stands_for_nothing() {
 
     assert!(stand_ins(&store, LINK).is_empty());
 }
+
+/// Another message reusing the `Message-ID` of [`BODY`]: another subject,
+/// sender and date, and one attachment, at section 4.
+const REUSED: &[u8] = b"Message-ID: <invoice-7@example.org>\r\n\
+From: Dan <dan@example.net>\r\n\
+To: bob@example.org\r\n\
+Subject: Invoice, second edition\r\n\
+Date: Wed, 04 Nov 2026 09:00:00 +0000\r\n\
+Content-Type: multipart/mixed; boundary=\"again\"\r\n\
+\r\n\
+--again\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+A new edition under the old id.\r\n\
+--again\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+See below.\r\n\
+--again\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+And below.\r\n\
+--again\r\n\
+Content-Type: text/plain; name=\"errata.txt\"\r\n\
+Content-Disposition: attachment; filename=\"errata.txt\"\r\n\
+\r\n\
+Errata.\r\n\
+--again--\r\n";
+
+/// The key the fourth part of a message under [`LINK`] stands under.
+const FOURTH: &str = "part:invoice-7@example.org#4";
+
+/// The keys the `attachment` references of the message name, in order.
+fn attached(store: &PimdirSourceStore) -> Vec<String> {
+    let message = PimdirEndpoint {
+        kind: MAIL.into(),
+        link_id: PimdirLinkId(LINK.into()),
+    };
+    store
+        .references_from(&message)
+        .unwrap()
+        .into_iter()
+        .filter(|reference| reference.role == PimdirReferenceRole::Attachment)
+        .map(|reference| reference.to.link_id.0)
+        .collect()
+}
+
+/// A `part:` key is built over the `Message-ID` alone, so it stands for
+/// one message of the account (STORAGE §14.3, vectors/sync/158): a body
+/// entering under a key another row holds another body under, a message
+/// it does not agree with on its subject, date and sender, records no
+/// stand-in and no reference, those of the first standing as they were,
+/// neither replaced nor joined. Its own row still reads its mark off its
+/// body.
+#[test]
+fn a_body_under_another_messages_key_stands_for_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    stored(&mut store, "INBOX", "1", LINK, BODY);
+    let before = collection_rows(&store);
+    let references = attached(&store);
+    assert_eq!(references.len(), 2);
+
+    stored(&mut store, "Archive", "9", LINK, REUSED);
+
+    assert_eq!(collection_rows(&store), before, "no stand-in of its own");
+    assert_eq!(attached(&store), references, "no reference of its own");
+    assert_eq!(stand_ins(&store, LINK).len(), 2);
+    assert_eq!(
+        columns(&mut store, "Archive", LINK),
+        (Some(REUSED.len() as u64), Some(true), None),
+        "the mark is its body's all the same"
+    );
+    let seqs: Vec<i64> = ["INBOX", "Archive"]
+        .iter()
+        .map(|collection| store.list_items(collection, None, 10).unwrap()[0].seq)
+        .collect();
+    assert_ne!(seqs[0], seqs[1], "two messages, two public ids");
+}
+
+/// What makes a body another message's is the agreement of STORAGE §9,
+/// read against another row: the same message under another body, a copy
+/// a relay rewrote, records the parts the first lacks, and a row whose own
+/// body is replaced, a draft edited down to its subject, is no other row
+/// to itself.
+#[test]
+fn the_same_message_and_a_row_replacing_its_body_record_their_parts() {
+    // NOTE: the message of BODY carrying a fourth part.
+    let relayed = [
+        BODY.strip_suffix(b"--outer--\r\n").unwrap(),
+        b"--outer\r\nContent-Disposition: attachment; filename=\"late.txt\"\r\n\r\nlate\r\n--outer--\r\n",
+    ]
+    .concat();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    stored(&mut store, "INBOX", "1", LINK, BODY);
+    stored(&mut store, "Archive", "9", LINK, &relayed);
+    let found = stand_ins(&store, LINK);
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert_eq!(found[2].0, FOURTH);
+    assert_eq!(found[2].2.name, "late.txt");
+    assert_eq!(attached(&store).len(), 3);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    stored(&mut store, "INBOX", "1", LINK, BODY);
+    stored(&mut store, "INBOX", "1", LINK, REUSED);
+    let found = stand_ins(&store, LINK);
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert_eq!(found[2].0, FOURTH);
+    assert_eq!(found[2].2.name, "errata.txt");
+}

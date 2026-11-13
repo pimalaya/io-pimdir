@@ -249,3 +249,63 @@ fn the_extraction_and_the_summary_read_one_field() {
         extract.from
     );
 }
+
+/// The extraction walks the parts the summary walks and reads an
+/// entity's fields from the occurrence it reads (SEARCH §6, STORAGE Annex
+/// A.1), on the standard's two fixtures: the last child of a multipart no
+/// closing delimiter ends is a part, and an entity stating its
+/// `Content-Type`, its `Content-Disposition` or its
+/// `Content-Transfer-Encoding` twice is read from the first, so the index
+/// holds no text the mark and the stand-ins leave unread, and none of
+/// what they read is missing.
+#[test]
+fn the_extraction_walks_the_parts_the_summary_walks() {
+    let fixture = |name: &str| {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("spec/vectors/fixtures")
+            .join(name);
+        std::fs::read(path).unwrap()
+    };
+
+    let extract = PimdirExtract::mail(&fixture("mail-unclosed-multipart.eml"));
+    assert_eq!(extract.status, PimdirExtractStatus::Ok);
+    assert_eq!(
+        extract.body.trim(),
+        "Attached.",
+        "the attachment is no text"
+    );
+    assert_eq!(extract.attachment, "notes.txt\ntext/plain");
+
+    // NOTE: read from the last occurrence, the message is one text part
+    // holding its own delimiters, and its second part an inline pdf.
+    let extract = PimdirExtract::mail(&fixture("mail-repeated-part-fields.eml"));
+    assert_eq!(extract.status, PimdirExtractStatus::Ok);
+    assert_eq!(extract.title, "Stated twice");
+    assert_eq!(extract.body.trim(), "See the file.");
+    assert_eq!(extract.attachment, "first.csv\ntext/csv");
+
+    // NOTE: a part stating its encoding twice is decoded by the first.
+    let body = b"Content-Type: text/plain\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Transfer-Encoding: 7bit\r\n\
+\r\n\
+ZGVjb2RlZA==\r\n";
+    assert_eq!(PimdirExtract::mail(body).body.trim(), "decoded");
+
+    // NOTE: and one disposed twice is the attachment its first
+    // disposition makes it, whose text is none of the body's.
+    let body = b"Content-Type: multipart/mixed; boundary=b\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+shown\r\n\
+--b\r\n\
+Content-Type: text/plain\r\n\
+Content-Disposition: attachment\r\n\
+Content-Disposition: inline\r\n\
+\r\n\
+filed\r\n\
+--b--\r\n";
+    assert_eq!(PimdirExtract::mail(body).body.trim(), "shown");
+}

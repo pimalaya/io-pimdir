@@ -20,11 +20,11 @@ pub const TOKENIZER: &str = "unicode61 remove_diacritics 0";
 /// `init_index_meta` writes in `index_meta.format_version`: this draft's
 /// name. An index of the canonical shape at an earlier version, or naming
 /// none, is rebuilt; one at a later version is refused.
-pub const FORMAT_VERSION: &str = "search-draft-10";
+pub const FORMAT_VERSION: &str = "search-draft-11";
 
 /// The draft number of [`FORMAT_VERSION`], versions being ordered by it
 /// below every release (SEARCH §2).
-pub const FORMAT_DRAFT: u32 = 10;
+pub const FORMAT_DRAFT: u32 = 11;
 
 /// The index shape this crate builds and reads (SEARCH §2), which
 /// `init_index_meta` writes in `index_meta.shape`.

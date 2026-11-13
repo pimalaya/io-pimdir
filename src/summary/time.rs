@@ -57,6 +57,21 @@ pub fn rfc3339(timestamp: i64) -> String {
     )
 }
 
+/// Whether `value` is written as `%Y-%m-%dT%H:%M:%SZ`, digit for digit:
+/// the shape [`rfc3339`] writes and the one the store holds an instant in
+/// (STORAGE §13, Annex A.0).
+pub fn is_instant(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && bytes.iter().enumerate().all(|(at, byte)| match at {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
 /// The day of the week, Sunday 0 through Saturday 6, of a day count.
 pub fn weekday(days: i64) -> u32 {
     (days + 4).rem_euclid(7) as u32

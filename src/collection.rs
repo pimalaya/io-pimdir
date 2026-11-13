@@ -7,6 +7,8 @@
 
 use alloc::{string::String, vec::Vec};
 
+use crate::summary::{mail, time};
+
 crate::pimdir_id! {
     /// The account-scoped identity of a collection.
     PimdirCollectionId, Ord, PartialOrd, Hash,
@@ -90,9 +92,10 @@ impl PimdirScope {
     }
 
     /// Whether a message dated `date` is in scope: `since <= date <
-    /// until`, or no usable date at all, which is in every scope.
+    /// until`, or no [usable date](mail::usable_date) at all, which is in
+    /// every scope.
     pub fn contains(&self, date: Option<&str>) -> bool {
-        let Some(date) = date.filter(|date| !date.is_empty()) else {
+        let Some(date) = mail::usable_date(date) else {
             return true;
         };
 
@@ -109,7 +112,7 @@ impl PimdirScope {
             .into_iter()
             .flatten()
             .map(String::as_str)
-            .find(|bound| !is_instant(bound))
+            .find(|bound| !time::is_instant(bound))
     }
 
     /// Whether `other` lies inside this scope, bounds included: a
@@ -192,19 +195,6 @@ impl PimdirScope {
     }
 }
 
-/// Whether `value` is written as `%Y-%m-%dT%H:%M:%SZ`, digit for digit.
-fn is_instant(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 20
-        && bytes.iter().enumerate().all(|(at, byte)| match at {
-            4 | 7 => *byte == b'-',
-            10 => *byte == b'T',
-            13 | 16 => *byte == b':',
-            19 => *byte == b'Z',
-            _ => byte.is_ascii_digit(),
-        })
-}
-
 /// What one source's last closed round covered (STORAGE §4.3): the store
 /// holds every member of the collection the source has in `scope`, and
 /// the checkpoint serves it.
@@ -262,6 +252,10 @@ mod tests {
         assert!(!september.contains(Some("2026-08-31T23:59:59Z")));
         assert!(september.contains(None));
         assert!(september.contains(Some("")));
+        // NOTE: a date the store takes in no column is no usable one,
+        // which a scope compared as text would have left out.
+        assert!(september.contains(Some("2026-08-31T23:59:59.5Z")));
+        assert!(september.contains(Some("2026-10-01T02:00:00+02:00")));
         assert!(PimdirScope::unbounded().contains(Some("1970-01-01T00:00:00Z")));
     }
 

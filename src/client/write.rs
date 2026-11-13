@@ -1766,7 +1766,7 @@ fn insert_item(
     let (subject, date, sender) = match &item.summary {
         Some(PimdirSummary::Mail(mail)) => (
             Some(mail.subject.as_str()),
-            mail.date.as_deref().filter(|date| !date.is_empty()),
+            summary::mail::usable_date(mail.date.as_deref()),
             mail.sender.as_deref(),
         ),
         _ => (None, None, None),

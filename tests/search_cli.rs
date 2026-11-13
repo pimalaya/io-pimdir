@@ -358,12 +358,18 @@ fn a_search_prints_the_four_counts_and_whether_it_is_complete() {
             "reads": {
                 "kinds": ["message/rfc822", "text/calendar", "text/vcard"],
                 "content": false,
+                "mark": false,
             },
             "unindexed": 0,
             "behind": 0,
         })
     );
     assert_eq!(text["zoneDiffers"], false);
+    let marked = coverage(&["collection:INBOX has:attachment"]);
+    assert_eq!(
+        marked["local"]["reads"],
+        serde_json::json!({ "kinds": ["text/calendar"], "content": false, "mark": true }),
+    );
 
     let structured = coverage(&["collection:INBOX is:unread"]);
     assert_eq!(structured["complete"], true, "no term reads a body");

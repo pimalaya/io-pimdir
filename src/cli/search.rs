@@ -1218,6 +1218,7 @@ impl From<&PimdirSearchCoverage> for CoverageRow {
                 reads: ReadsRow {
                     kinds: coverage.local.reads.kinds.iter().cloned().collect(),
                     content: coverage.local.reads.content,
+                    mark: coverage.local.reads.mark,
                 },
                 unindexed: coverage.local.unindexed,
                 behind: coverage.local.behind,
@@ -1260,8 +1261,12 @@ impl fmt::Display for CoverageRow {
         // leaves the answer complete.
         for (kind, counts) in &self.local.kinds {
             let read = self.local.reads.kinds.contains(kind);
+            // NOTE: a message's mark is a guess while it holds no body,
+            // so `has:attachment` counts the bodiless mail it reads none
+            // of.
+            let marked = self.local.reads.mark && kind == "message/rfc822";
             let kind = sanitize::text(kind);
-            if counts.bodiless > 0 {
+            if counts.bodiless > 0 && (read || marked) {
                 writeln!(
                     f,
                     " - {} {kind} item(s) without a body, searched by summary",
@@ -1368,7 +1373,8 @@ pub struct LocalRow {
 #[serde(rename_all = "camelCase")]
 pub struct UnreadRow {
     /// Live items holding no body, searched by their summary: counted
-    /// against every query.
+    /// against a query whose terms read a body of the kind and, for
+    /// mail, against one holding `has:attachment`.
     pub bodiless: u64,
     /// Placements whose body the indexer could not read: counted against
     /// a query whose terms read a body of the kind.
@@ -1390,6 +1396,9 @@ pub struct ReadsRow {
     /// Whether a text term is matched in the body or the attachment
     /// field: free text, `body:`, `attachment:` or `mimetype:`.
     pub content: bool,
+    /// Whether the query holds `has:attachment`, which a message holding
+    /// no body answers by a guess: mail's bodiless items then count.
+    pub mark: bool,
 }
 
 /// The temporal axis.
@@ -1565,6 +1574,7 @@ mod tests {
                 reads: ReadsRow {
                     kinds: Vec::new(),
                     content: false,
+                    mark: false,
                 },
                 unindexed: 0,
                 behind: 0,
@@ -1594,7 +1604,7 @@ mod tests {
         coverage
             .local
             .kinds
-            .insert(mail.clone(), unread(0, 2, 1, 3));
+            .insert(mail.clone(), unread(5, 2, 1, 3));
         coverage.zone_differs = true;
         assert_eq!(
             coverage.to_string(),
@@ -1603,12 +1613,23 @@ mod tests {
             "counts no term reads, and a zone reported apart"
         );
 
+        // NOTE: `has:attachment` reads no message's body and still counts
+        // the messages holding none, their mark being a guess.
         coverage.complete = false;
         coverage.zone_differs = false;
+        coverage.local.reads.mark = true;
+        assert_eq!(
+            coverage.to_string(),
+            "Coverage: partial\n \
+             - 5 message/rfc822 item(s) without a body, searched by summary\n"
+        );
+
+        coverage.local.reads.mark = false;
         coverage.local.reads.kinds = vec![mail];
         assert_eq!(
             coverage.to_string(),
             "Coverage: partial\n \
+             - 5 message/rfc822 item(s) without a body, searched by summary\n \
              - 2 message/rfc822 item(s) whose body could not be read, searched by summary\n \
              - 1 message/rfc822 item(s) whose body could not be parsed, searched by summary\n"
         );
@@ -1618,6 +1639,7 @@ mod tests {
         assert_eq!(
             coverage.to_string(),
             "Coverage: partial\n \
+             - 5 message/rfc822 item(s) without a body, searched by summary\n \
              - 2 message/rfc822 item(s) whose body could not be read, searched by summary\n \
              - 1 message/rfc822 item(s) whose body could not be parsed, searched by summary\n \
              - 3 message/rfc822 item(s) encrypted, searched by their headers\n \
@@ -1665,12 +1687,12 @@ mod tests {
         alice.sort_key = String::from("alice");
         alice.placements = vec![placement("contacts")];
 
+        // NOTE: a kind the query's text term reads, so its count prints.
+        let kind = String::from("text/vcard\u{1b}[2J");
         let mut coverage = complete();
         coverage.complete = false;
-        coverage
-            .local
-            .kinds
-            .insert(String::from("text/vcard\u{1b}[2J"), unread(1, 0, 0, 0));
+        coverage.local.reads.kinds = vec![kind.clone()];
+        coverage.local.kinds.insert(kind, unread(1, 0, 0, 0));
 
         let output = SearchOutput {
             query: String::from("invoice"),

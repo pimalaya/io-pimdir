@@ -557,17 +557,6 @@ const KNOWN_ACTIONS: [&str; 13] = [
     intent::COLLECTION_DELETE,
 ];
 
-/// Whether `kind` is an action the owner applies to the store itself
-/// (STORAGE §15.3), a store action or `set-performer`, where an intent
-/// is performed outside it by the source it names (Annex B.2).
-#[cfg(feature = "client")]
-pub(crate) fn applied_by_owner(kind: &str) -> bool {
-    matches!(
-        kind,
-        "add" | "set-flags" | "remove" | "move" | "copy" | "update" | "set-performer"
-    )
-}
-
 /// What a payload is to this crate (STORAGE §15.3): one of three, which
 /// an owner applies, parks or leaves untouched, and a reader folds or
 /// lists.
@@ -606,9 +595,10 @@ pub fn payload_outcome(kind: &str, payload: &str) -> PimdirPayloadOutcome {
 /// that is no integer (a string, a fraction, a boolean, `null`) is
 /// malformed: it names no version a later owner would know.
 ///
-/// An integer is what serde_json reads as one: `1.0` and `1e0` are
-/// floats to it, so malformed, where JSON Schema takes both for the
-/// integer 1; the standard leaves that spelling open.
+/// An integer is one as JSON writes it (RFC 8259 §6), digits with
+/// neither a fraction nor an exponent, which is what serde_json reads as
+/// one: `1.0` and `1e0` are floats to it, so malformed, where a JSON
+/// Schema validator takes both for the integer 1.
 fn unknown(kind: &str, payload: &str) -> Result<bool, PimdirActionError> {
     if !KNOWN_ACTIONS.contains(&kind) {
         return Ok(true);
@@ -1298,8 +1288,8 @@ mod tests {
 
     /// A known action stating no `v`, or one that is no integer, states
     /// no version an owner could wait to know: malformed, never unknown
-    /// (STORAGE §15.3). `1.0` is serde_json's float, the spelling the
-    /// standard leaves open.
+    /// (STORAGE §15.3). An integer is written with neither a fraction nor
+    /// an exponent, so `1.0` and `1e0` are none.
     #[test]
     fn a_known_action_stating_no_usable_version_is_malformed() {
         let cases = [
@@ -1307,6 +1297,8 @@ mod tests {
             ("remove", r#"{"v":"1","seq":1}"#),
             ("remove", r#"{"v":1.5,"seq":1}"#),
             ("remove", r#"{"v":1.0,"seq":1}"#),
+            ("remove", r#"{"v":1e0,"seq":1}"#),
+            ("remove", r#"{"v":1E+0,"seq":1}"#),
             ("remove", r#"{"v":null,"seq":1}"#),
             ("remove", r#"{"v":true,"seq":1}"#),
             ("submit", r#"{"v":"2"}"#),

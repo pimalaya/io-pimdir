@@ -60,12 +60,16 @@ impl PimdirSummary {
         }
     }
 
-    /// The summary as the store keeps it (Annex A.1): a mail `date` left
-    /// empty is no usable date, `NULL` as an unparseable one, so a scope
-    /// reads it in every scope on every path (SYNC §5).
+    /// The summary as the store keeps it (Annex A.1): a mail `date` that
+    /// is no instant as Annex A.0 writes one, an empty one, a fraction of
+    /// a second and an offset included, is no
+    /// [usable date](mail::usable_date), `NULL` as an unparseable one. The
+    /// schema takes no other shape (STORAGE §13), and a scope reads such
+    /// a message in every scope on every path (SYNC §5).
     pub fn stored(mut self) -> Self {
         if let Self::Mail(mail) = &mut self
-            && mail.date.as_deref() == Some("")
+            && mail.date.is_some()
+            && mail::usable_date(mail.date.as_deref()).is_none()
         {
             mail.date = None;
         }

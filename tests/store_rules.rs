@@ -130,6 +130,106 @@ fn a_stated_size_no_integer_holds_is_unknown() {
     assert_eq!(size("edge@example.org"), Some(i64::MAX as u64));
 }
 
+/// A message's `date` is held to the shape Annex A.0 writes an instant in
+/// by the schema (STORAGE §13): a listing stating another text, a
+/// fraction of a second and an offset included, lands all the same, its
+/// date written as none, as an unparseable one is, and such a message is
+/// in every scope (SYNC §5). The date and the two other witnesses of §9
+/// still say which rows are one message.
+#[test]
+fn a_stated_date_of_another_shape_is_no_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    store
+        .ensure_collection("Archive", "message/rfc822")
+        .unwrap();
+
+    let member = |collection: &str, handle: &str, id: &str, date: &str| {
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            sort_key: Default::default(),
+            collection: PimdirCollectionId(collection.into()),
+            handle: PimdirHandle(handle.into()),
+            link_id: Some(PimdirLinkId(id.into())),
+            object: None,
+            level: PimdirLevel::Meta,
+            summary: Some(PimdirSummary::Mail(PimdirMailSummary {
+                message_id: Some(id.into()),
+                subject: "Dated".into(),
+                date: Some(date.into()),
+                ..Default::default()
+            })),
+            flags: PimdirFlags::default(),
+            status: PimdirStatus::Clean,
+            conflict_revision: None,
+            conflict_object: None,
+            base: Some(PimdirBase {
+                flags: PimdirFlags::default(),
+                revision: None,
+                object: None,
+            }),
+            origin: None,
+        })
+    };
+    let stated = [
+        ("1", "instant@example.org", "2026-08-01T10:00:00Z"),
+        ("2", "fraction@example.org", "2026-08-01T10:00:00.5Z"),
+        ("3", "offset@example.org", "2026-08-01T12:00:00+02:00"),
+        ("4", "lowercase@example.org", "2026-08-01t10:00:00z"),
+        ("5", "day@example.org", "2026-08-01"),
+        ("6", "text@example.org", "Sat, 1 Aug 2026 10:00:00 +0000"),
+        ("7", "empty@example.org", ""),
+    ];
+    for (handle, id, date) in stated {
+        store
+            .write(vec![member("INBOX", handle, id, date)])
+            .unwrap_or_else(|err| panic!("{date:?}: {err}"));
+    }
+
+    let item = |store: &PimdirSourceStore, collection: &str, id: &str| {
+        let seq = store.seq_for_link(collection, id).unwrap().unwrap();
+        store.get_item(collection, seq).unwrap().unwrap()
+    };
+    let date = |id: &str| match item(&store, "INBOX", id).summary {
+        Some(PimdirSummary::Mail(mail)) => mail.date,
+        other => panic!("{id}: no mail summary, {other:?}"),
+    };
+    assert_eq!(
+        date("instant@example.org").as_deref(),
+        Some("2026-08-01T10:00:00Z")
+    );
+    for (_, id, stated) in &stated[1..] {
+        assert_eq!(date(id), None, "{stated:?}");
+    }
+
+    // NOTE: the same member in another mailbox, its date stated as the
+    // row holds none, is the same message and shares its public id.
+    store
+        .write(vec![member(
+            "Archive",
+            "9",
+            "offset@example.org",
+            "2026-08-01T12:00:00+02:00",
+        )])
+        .unwrap();
+    assert_eq!(
+        item(&store, "Archive", "offset@example.org").seq,
+        item(&store, "INBOX", "offset@example.org").seq
+    );
+    store
+        .write(vec![member(
+            "Archive",
+            "8",
+            "instant@example.org",
+            "2026-08-02T10:00:00Z",
+        )])
+        .unwrap();
+    assert_ne!(
+        item(&store, "Archive", "instant@example.org").seq,
+        item(&store, "INBOX", "instant@example.org").seq,
+        "another date, another message"
+    );
+}
+
 /// A domain is compared, never matched as a pattern (STORAGE §14.1,
 /// `list_domain_placements`): a `_` or a `%` in it stands for itself, and
 /// its ASCII letters compare in either case.

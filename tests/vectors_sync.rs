@@ -391,6 +391,24 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             }
         }
     }
+    // NOTE: the references an owner recorded before the run (STORAGE
+    // §14.2), through the canonical statement, which answers no row for
+    // an end the store states no item of.
+    for reference in store["references"].as_array().into_iter().flatten() {
+        conn.query_row(
+            sql::ADD_REFERENCE,
+            named_params! {
+                ":from_kind": reference["from_kind"].as_str().unwrap(),
+                ":from_link_id": reference["from_link_id"].as_str().unwrap(),
+                ":to_kind": reference["to_kind"].as_str().unwrap(),
+                ":to_link_id": reference["to_link_id"].as_str().unwrap(),
+                ":role": reference["role"].as_str().unwrap(),
+                ":origin": reference["origin"].as_str().unwrap(),
+            },
+            |_| Ok(()),
+        )
+        .expect("a reference between two items the store states");
+    }
     for source in store["sources"].as_array().unwrap() {
         conn.execute(
             sql::UPSERT_CHECKPOINT,

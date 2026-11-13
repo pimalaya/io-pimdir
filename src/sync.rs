@@ -70,7 +70,7 @@ mod join;
 /// The version of SYNC.md this engine follows (SYNC §10), which a store
 /// records in `store_meta.sync_version` with the engine's first write: a
 /// store naming another is refused before any verb runs.
-pub const SYNC_VERSION: &str = "sync-draft-10";
+pub const SYNC_VERSION: &str = "sync-draft-11";
 
 /// Which push kinds a writable source may derive.
 ///
@@ -1097,8 +1097,7 @@ impl PimdirSync {
             .as_ref()
             .map(|handles| handles.iter().collect());
         let provable = |p: &PimdirPlacement| {
-            let dated =
-                date_of(p).is_some_and(|date| !date.is_empty() && date < started_at.as_str());
+            let dated = date_of(p).is_some_and(|date| date < started_at.as_str());
             let unlisted = enumerated
                 .as_ref()
                 .is_some_and(|handles| !handles.contains(&p.handle));
@@ -2635,10 +2634,10 @@ fn holds_local_edit(local: &PimdirPlacement) -> bool {
 }
 
 /// The summary `date` a scope reads a placement by, `None` when it has
-/// none, which is in every scope (SYNC §5).
+/// no usable one, which is in every scope (SYNC §5).
 fn date_of(placement: &PimdirPlacement) -> Option<&str> {
     match &placement.summary {
-        Some(PimdirSummary::Mail(mail)) => mail.date.as_deref(),
+        Some(PimdirSummary::Mail(mail)) => summary::mail::usable_date(mail.date.as_deref()),
         _ => None,
     }
 }
@@ -2727,7 +2726,7 @@ impl RoundPlan {
     /// its whole scope, a band's date filter never returning undated
     /// mail.
     fn finds_absent(&self, date: Option<&str>) -> bool {
-        match date.filter(|date| !date.is_empty()) {
+        match summary::mail::usable_date(date) {
             Some(date) => self.scope.contains(Some(date)),
             None => !self.band,
         }
