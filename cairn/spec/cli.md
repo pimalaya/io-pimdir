@@ -90,8 +90,8 @@ The CLI's owner role SHALL open the store through `open_current`: the CLI is nev
 - THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`, `a_restore_over_a_store_of_another_draft_is_refused`, its error naming `storage-draft-11`)
 
 ### Requirement: Destroying data is confirmed
-`item purge`, `item erase`, `quarantine empty` and `queue cancel` SHALL confirm interactively before destroying
-anything, stating what will be destroyed (how many items, how many bytes)
+`item purge`, `item erase`, `quarantine empty`, `queue cancel`, `store restore` over a directory holding a store, and `queue retry` of an unconfirmed intent, which may perform it a second time, SHALL confirm interactively before destroying
+anything or doing what cannot be undone, stating what will be destroyed (how many items, how many bytes)
 whenever the store can tell. `--yes` SHALL skip the confirmation. When the output
 is not a terminal, or `--json` is set, the CLI SHALL refuse to proceed without
 `--yes` rather than prompt into a pipe.
@@ -129,13 +129,14 @@ The CLI SHALL expose, at minimum:
   human duration, or all of them. A live item SHALL be refused: purge empties
   the trash, it does not delete synced data.
 - `item erase`: erase one item's bytes from the store's files (STORAGE §11.5): `PimdirStore::erase` (the purge of a retained item, or the delete of a live one no source binds, the collector, a `TRUNCATE` checkpoint of pimdir.db), then, when index.db exists, `PimdirIndex::erase` (the refresh with its thread prune, `optimize_text`, a `TRUNCATE` checkpoint of index.db), reporting the blob files unlinked and whether the index was erased (`pimdir-item-erase`). A live item a source binds SHALL be refused: remove it first.
-- `queue list`: pending actions, or parked ones with `--parked`.
+- `queue list`: pending actions, or parked ones with `--parked`, each row stating `unconfirmed`, true for a parked intent whose outcome is unknown (STORAGE §15.2), which the text prints as the record's state word.
+- `queue retry`: put one parked row back among the pending ones (`PimdirStore::retry_action`, STORAGE §15.5), by id or by handle, answering `row` and `unconfirmed` (`pimdir-queue-retry`); a row pending or gone fails with `row-not-found`. An unconfirmed intent is confirmed first, or takes `--yes`.
 - `queue cancel`: drop one queue row by id, or by the handle its enqueue
   answered (the store id, the incarnation and the id joined by periods), which
   is refused as `store-reset` when the store is no longer the one that answered
   it.
 - `queue status`: where one queue row stands by id or by handle: pending,
-  parked with its error, applied with the item an add created, unknown, or
+  parked with its error, `unconfirmed` with what its performer recorded as `error`, applied with the item an add created, unknown, or
   `reset` for a handle another store or incarnation answered. `item restore`
   and `tag` print the handle of each row they queue, `handle` beside `row` in
   their JSON. `queue list` prints a `set-flags` stating its base as the set
@@ -148,6 +149,9 @@ The CLI SHALL expose, at minimum:
   and the purge count (`StoreInfoOutput`: `storeId`, `incarnation`,
   `formatVersion`, `schemaVersion`, `readVersion`, `produceVersion`,
   `derivation`, `syncVersion`).
+- `store backup DIR`: copy the store into a directory absent or empty (`PimdirReader::backup`, STORAGE §8), the reader role, usable beside a running sync, answering `path`, `objects`, `quarantined`, `local`, `bytes`, `kept` and `skipped`, with `incarnation` and `replaced` `null` (`pimdir-store-backup`).
+- `store restore DIR`: put the backup at DIR back as the store at `--store` (`PimdirStore::restore`), answering the same keys with the new `incarnation` and the `replaced` one, `null` when no store was there or it could not be read (`pimdir-store-restore`). It creates the store directory when there is none, the one verb that does. Both exit 2 when `skipped` names an entry left out.
+- `check --deep`: the store's self-check (`PimdirReader::check_deep`, STORAGE §7) beside the plain one, under `deep` (`integrity`, `foreignKeys`, `hashed`, `failing`), `null` without the flag; a problem it finds counts as one `--fix` does not repair, and it moves nothing.
 - `check`: object rows whose body is missing, refcount drift, dangling
   references and orphan blob files, with `--fix` repairing the drift and the
   dangling bindings, plus an informational count of the minted keys each
@@ -179,7 +183,7 @@ A write SHALL answer a receipt: `item restore` its `seq`, `collection`, `linkId`
 
 Every failure SHALL print pimalaya-cli's failure object with a kebab-case `code`, `null` when none applies: a store failure carries io-pimdir's `PimdirError::code` by its spelling, and the CLI's own failures carry `item-not-found`, `collection-required`, `item-live`, `body-absent`, `body-missing`, `row-not-found`, `source-required`, `confirmation-required`, `cancelled`, `page-token-invalid` or `dump-exists`. A refused query SHALL fail with `query-refused`, its message naming the fault, where it lies, and what would be valid there.
 
-A command that ran to its end short of full success SHALL print its result, then exit 2, its `--help` saying when: `check` leaving a problem `--fix` does not repair, `item restore` whose drain left the item retained, `tag` with a placement neither planned, unchanged, applied nor queued, `export` leaving a body out, `quarantine empty` leaving an entry in place.
+A command that ran to its end short of full success SHALL print its result, then exit 2, its `--help` saying when: `check` leaving a problem `--fix` does not repair, `store backup` and `store restore` leaving an entry out, `item restore` whose drain left the item retained, `tag` with a placement neither planned, unchanged, applied nor queued, `export` leaving a body out, `quarantine empty` leaving an entry in place.
 
 #### Scenario: A body exported under JSON
 - GIVEN a mail item holding its body
@@ -305,3 +309,9 @@ it.
 A tag SHALL produce a `pimdir` binary per released platform, carrying its manual pages, completion scripts and JSON Schemas, and SHALL publish the crate. The shared pimalaya/nix workflows do both, so the flake SHALL expose the `cross-<target>` outputs they build and the derivation SHALL leave `result/bin/pimdir` and `result/share` where they collect them. The workflow's project name is the binary's, `pimdir`, not the crate's.
 
 A released binary SHALL be built with `cli` and `vendored`: the binary is behind a feature that is deliberately not a default, and it carries its own SQLite so it depends on no library where it lands. A build asked for `cli` alone SHALL still run, which under nix means an explicit rpath onto the system SQLite through `NIX_LDFLAGS`, pkg-config handing the linker the library and no rpath.
+
+### Requirement: The copies and the deep check have a verb each
+The tools STORAGE §7 and §8 specify SHALL each be a verb over a library function, with a schema: `store backup`, `store restore` and `check --deep` (the audit's line T4), and `queue retry` beside `queue cancel`.
+
+#### Scenario: A backup restored, a flipped byte, a retry
+- tests/cli_copies.rs `a_store_is_backed_up_and_restored_under_a_new_incarnation`, `a_deep_check_reports_a_flipped_byte` (the plain `check` exits 0 on the same store, hashing nothing), `a_parked_row_is_retried_and_an_unconfirmed_one_shown`

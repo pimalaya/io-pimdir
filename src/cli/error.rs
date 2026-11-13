@@ -103,6 +103,14 @@ pub enum ErrorCode {
     /// The store is not the one that answered the action's handle: a copy
     /// restored since.
     StoreReset,
+    /// The queue row is an action the owner applies itself, never an
+    /// intent whose outcome is unknown.
+    ActionNotIntent,
+    /// The owner's lock file was removed or replaced under it: nothing
+    /// more is written.
+    LockReplaced,
+    /// The backup directory holds something already.
+    BackupOccupied,
     /// A source of the store does not support the write.
     Unsupported,
     /// No source of the store can perform the intent.
@@ -168,6 +176,9 @@ const PIMDIR_CODES: &[(&str, ErrorCode)] = &[
     ("store-in-flight", ErrorCode::StoreInFlight),
     ("store-exposed", ErrorCode::StoreExposed),
     ("store-reset", ErrorCode::StoreReset),
+    ("action-not-intent", ErrorCode::ActionNotIntent),
+    ("lock-replaced", ErrorCode::LockReplaced),
+    ("backup-occupied", ErrorCode::BackupOccupied),
     ("unsupported", ErrorCode::Unsupported),
     ("no-performer", ErrorCode::NoPerformer),
     ("ambiguous-performer", ErrorCode::AmbiguousPerformer),

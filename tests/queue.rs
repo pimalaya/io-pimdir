@@ -712,6 +712,7 @@ fn an_unknown_kind_is_skipped_and_never_blocks_the_queue() {
     let id = producer
         .enqueue("INBOX", &submit, Some(&object))
         .unwrap()
+        .handle
         .id;
     producer
         .enqueue(
@@ -773,6 +774,7 @@ fn an_acknowledged_action_releases_its_queued_body() {
             Some(&object),
         )
         .unwrap()
+        .handle
         .id;
     assert!(blob_exists(dir.path(), &object.hash.0));
 
@@ -810,6 +812,7 @@ fn a_failed_action_retries_until_it_is_parked() {
             None,
         )
         .unwrap()
+        .handle
         .id;
 
     store.fail_action(id, None).unwrap();
@@ -851,6 +854,7 @@ fn a_parked_error_is_recorded_without_its_credentials() {
             None,
         )
         .unwrap()
+        .handle
         .id;
 
     store
@@ -1220,6 +1224,7 @@ fn a_claim_that_deletes_nothing_is_not_counted_as_applied() {
             None,
         )
         .unwrap()
+        .handle
         .id;
 
     // another connection holds the write lock while the drain reads its
@@ -1367,7 +1372,11 @@ fn a_queued_add_missing_its_body_is_retried_then_parked() {
         object: Some(object.hash.clone()),
         supersedes: None,
     };
-    let id = producer.enqueue("INBOX", &add, Some(&object)).unwrap().id;
+    let id = producer
+        .enqueue("INBOX", &add, Some(&object))
+        .unwrap()
+        .handle
+        .id;
     drop(producer);
     unlink_blob(dir.path(), &object.hash.0);
 
@@ -1499,6 +1508,7 @@ fn a_body_a_policy_overrules_during_a_drain_is_reported() {
             }
         })
         .unwrap()
+        .handle
         .id;
     drop(producer);
 
@@ -1729,7 +1739,8 @@ fn an_unknown_payload_stays_pending_untouched_and_listed() {
     let unknown = [
         ("remove", format!(r#"{{"v":2,"seq":{seq}}}"#)),
         ("set-flags", r#"{"v":2,"seq":"5"}"#.to_string()),
-        ("update", r#"{"seq":1}"#.to_string()),
+        ("update", r#"{"v":3,"seq":1}"#.to_string()),
+        ("snooze", r#"{"seq":1}"#.to_string()),
         (
             "snooze",
             r#"{"v":1,"seq":1,"until":"2026-12-01T09:00:00Z"}"#.to_string(),
@@ -1802,7 +1813,64 @@ fn an_unknown_payload_stays_pending_untouched_and_listed() {
 
     // the next drain lists them again, and nothing else
     let report = store.drain().unwrap();
-    assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 5));
+    assert_eq!((report.applied, report.parked, report.skipped), (0, 0, 6));
+}
+
+/// A payload of a known action stating no `v`, or one that is no integer,
+/// is malformed (STORAGE §15.3): it states no version an owner could come
+/// to know, so the drain parks it rather than leave it pending for ever,
+/// and the row behind it applies.
+#[test]
+fn a_known_action_stating_no_usable_version_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, seq) = seeded(dir.path());
+
+    let malformed = [
+        ("remove", format!(r#"{{"seq":{seq}}}"#)),
+        ("remove", format!(r#"{{"v":"1","seq":{seq}}}"#)),
+        ("remove", format!(r#"{{"v":1.5,"seq":{seq}}}"#)),
+        ("remove", format!(r#"{{"v":null,"seq":{seq}}}"#)),
+        ("remove", format!(r#"{{"v":true,"seq":{seq}}}"#)),
+    ];
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    for (action, payload) in &malformed {
+        conn.execute(
+            sql::ENQUEUE_ACTION,
+            rusqlite::named_params! {
+                ":producer": "careless",
+                ":collection": "INBOX",
+                ":action": action,
+                ":payload": payload,
+                ":target_collection": None::<String>,
+                ":object_hash": None::<String>,
+            },
+        )
+        .unwrap();
+    }
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let flag = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Answered"]),
+        base: None,
+    };
+    producer.enqueue("INBOX", &flag, None).unwrap();
+
+    let report = store.drain().unwrap();
+    assert_eq!(
+        (report.applied, report.parked, report.skipped),
+        (1, malformed.len(), 0)
+    );
+    let parked = store.parked_actions().unwrap();
+    assert_eq!(parked.len(), malformed.len());
+    for row in &parked {
+        assert!(row.error.contains("version"), "{}", row.error);
+        assert_eq!(row.attempts, 1);
+    }
+    let item = store
+        .get_item("INBOX", seq)
+        .unwrap()
+        .expect("never removed");
+    assert!(item.flags.contains("\\Answered"), "the row behind applied");
 }
 
 /// The enqueue answers a handle, the row's id under the identity of the
@@ -1822,7 +1890,7 @@ fn a_handle_follows_its_row_until_the_stores_identity_moves() {
         flags: PimdirFlags::from_iter(["\\Answered"]),
         base: None,
     };
-    let handle = producer.enqueue("INBOX", &flag, None).unwrap();
+    let handle = producer.enqueue("INBOX", &flag, None).unwrap().handle;
 
     let identity = store.change_cursor().unwrap();
     let stated = handle.store.clone().expect("the store's identity");
@@ -1871,7 +1939,7 @@ fn a_handle_follows_its_row_until_the_stores_identity_moves() {
     assert!(store.drop_action(handle.id).unwrap(), "a bare id cancels");
 
     // a handle answered under the new incarnation follows its row
-    let handle = producer.enqueue("INBOX", &flag, None).unwrap();
+    let handle = producer.enqueue("INBOX", &flag, None).unwrap().handle;
     assert!(pending(producer.action_status(&handle).unwrap()));
     assert!(store.drop_action(&handle).unwrap());
 }

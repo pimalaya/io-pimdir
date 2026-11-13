@@ -893,6 +893,8 @@ fn mutation(
                 body,
             }
         }
+        // NOTE: the delivered create a person gives up (SYNC §7, §11).
+        "Abandon" => PimdirMutation::Abandon { handle: handle() },
         kind => panic!("unsupported mutation {kind}"),
     })
 }
@@ -915,6 +917,7 @@ fn event_json(event: &PimdirSyncEvent) -> Value {
         PimdirSyncEvent::Vanished(h) => ("Vanished", h),
         PimdirSyncEvent::Conflicted(h) => ("Conflicted", h),
         PimdirSyncEvent::Created(h) => ("Created", h),
+        PimdirSyncEvent::Abandoned(h) => ("Abandoned", h),
         PimdirSyncEvent::Overruled { handle, link_id } => {
             return json!({ "kind": "Overruled", "handle": handle.0, "link_id": link_id.0 });
         }
@@ -1391,7 +1394,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 5, "{label}: the sync format's version");
+        assert_eq!(case["v"], 6, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 

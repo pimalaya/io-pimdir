@@ -14,12 +14,12 @@ use std::{
     sync::Arc,
 };
 
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, named_params};
+use rusqlite::{Connection, OptionalExtension, Row, named_params};
 
 use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
-        PimdirError, PimdirSourceStore, PreparedCached, attachments, bind_list,
+        PimdirError, PimdirSourceStore, PreparedCached, attachments, begin, bind_list,
         blobs::{self, PimdirBlobCheck, PimdirBlobs},
         busy_or_sql, release_pins, rows, schema,
     },
@@ -298,6 +298,9 @@ impl PimdirSourceStore {
     pub fn write(&mut self, ops: Vec<PimdirWriteOp>) -> Result<PimdirWritten, PimdirError> {
         let blobs = self.store.reader.blobs();
         let lock = Arc::clone(&self.store.lock);
+        // NOTE: before the bodies land, so an owner whose lock file was
+        // replaced writes no file either (§8).
+        lock.verify()?;
         let mut moved = BTreeSet::new();
         let _writing = loop {
             let writing = lock.writing();
@@ -317,12 +320,7 @@ impl PimdirSourceStore {
             }
         };
 
-        let tx = self
-            .store
-            .reader
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.store.reader.conn, &self.store.lock)?;
         // NOTE: the engine's first write records its version (STORAGE
         // §4.3), and one of another version refuses the batch whole.
         if schema::sync_version(&tx)?.is_none() {
@@ -368,6 +366,17 @@ pub(crate) fn apply(
     let mut dropped: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
     let mut rekeyed: BTreeSet<String> = BTreeSet::new();
     let mut stamps: Vec<(PimdirCollectionId, Vec<PimdirHandle>)> = Vec::new();
+    // NOTE: each collection is ensured once per batch, and the link an
+    // upsert's handle is bound to is read once, before any binding of
+    // the batch is written, then handed to the hub's read below.
+    let mut ensured: BTreeSet<String> = BTreeSet::new();
+    let mut bound_links: BTreeMap<(String, PimdirHandle), Option<String>> = BTreeMap::new();
+    let mut ensure = |collection: &str| -> rusqlite::Result<()> {
+        if ensured.insert(String::from(collection)) {
+            ensure_collection(tx, collection, account)?;
+        }
+        Ok(())
+    };
 
     for op in ops {
         match op {
@@ -404,7 +413,7 @@ pub(crate) fn apply(
                 collection,
                 checkpoint,
             } => {
-                ensure_collection(tx, &collection.0, account)?;
+                ensure(&collection.0)?;
                 tx.execute_cached(
                     sql::UPSERT_CHECKPOINT,
                     named_params! {
@@ -420,7 +429,7 @@ pub(crate) fn apply(
                 band,
             } => {
                 shaped(&scope)?;
-                ensure_collection(tx, &collection.0, account)?;
+                ensure(&collection.0)?;
                 tx.execute_cached(
                     sql::OPEN_ROUND,
                     named_params! {
@@ -481,10 +490,22 @@ pub(crate) fn apply(
                 )?;
             }
             PimdirWriteOp::UpsertPlacement(mut placement) => {
-                ensure_collection(tx, &placement.collection.0, account)?;
-                let bound =
-                    link_for_handle(tx, &placement.collection.0, source, &placement.handle)?
-                        .map(PimdirLinkId);
+                ensure(&placement.collection.0)?;
+                let key = (placement.collection.0.clone(), placement.handle.clone());
+                let bound = match bound_links.get(&key) {
+                    Some(bound) => bound.clone(),
+                    None => {
+                        let bound = link_for_handle(
+                            tx,
+                            &placement.collection.0,
+                            source,
+                            &placement.handle,
+                        )?;
+                        bound_links.insert(key, bound.clone());
+                        bound
+                    }
+                }
+                .map(PimdirLinkId);
                 if placement.link_id.is_none() {
                     placement.link_id = bound.clone();
                 }
@@ -540,7 +561,7 @@ pub(crate) fn apply(
 
     for (collection, mut ops) in hub_ops {
         refuse_colliding_upserts(&collection, source, &ops)?;
-        let links = batch_links(tx, &collection, source, &ops)?;
+        let links = batch_links(tx, &collection, source, &ops, &bound_links)?;
         let old = read_hub(tx, &collection, Some(&links))?;
         mint_other_messages(tx, &collection, source, &old, &mut ops)?;
         refuse_unread_overrule(&collection, source, &old, &ops)?;
@@ -845,11 +866,15 @@ fn destination_for(
 
 /// The link ids one batch touches: its upserts' and the ones its drops
 /// and upserted handles resolve to; a handle nothing binds is left out.
+/// `bound` holds the link each upserted handle was found bound to when
+/// the batch was read, no binding written since, so only a handle it
+/// lacks is looked up.
 fn batch_links(
     conn: &Connection,
     collection: &str,
     source: &PimdirSourceId,
     ops: &[PimdirWriteOp],
+    bound: &BTreeMap<(String, PimdirHandle), Option<String>>,
 ) -> rusqlite::Result<Vec<String>> {
     let mut links: BTreeSet<String> = BTreeSet::new();
 
@@ -865,7 +890,10 @@ fn batch_links(
             | PimdirWriteOp::DeliverPlacement { handle, .. } => handle,
             _ => continue,
         };
-        links.extend(link_for_handle(conn, collection, source, handle)?);
+        match bound.get(&(String::from(collection), handle.clone())) {
+            Some(link) => links.extend(link.clone()),
+            None => links.extend(link_for_handle(conn, collection, source, handle)?),
+        }
     }
 
     Ok(links.into_iter().collect())

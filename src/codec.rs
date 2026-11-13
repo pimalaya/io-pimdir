@@ -133,6 +133,19 @@ pub struct PimdirStoreIdentity {
     pub incarnation: i64,
 }
 
+/// The one reserved prefix of `queue.error` (STORAGE §13, §15.2): the
+/// word, a colon and one space. A parked row whose error begins with it
+/// is an intent whose outcome is unknown, neither performed nor failed,
+/// and no other row's error begins so.
+pub const UNCONFIRMED: &str = "unconfirmed: ";
+
+/// The text a parked row's error states after the reserved prefix when
+/// the row is an intent whose outcome is unknown (STORAGE §15.2, §15.4),
+/// `None` for any other parked row.
+pub fn unconfirmed(error: &str) -> Option<&str> {
+    error.strip_prefix(UNCONFIRMED)
+}
+
 /// The handle of a queue row (STORAGE §4.5, §15.4): the id its enqueue
 /// answered, under the identity of the store that drew it, which a
 /// producer records with the id and checks when it follows or cancels
@@ -392,7 +405,8 @@ impl PimdirAction {
 pub enum PimdirActionError {
     /// The payload is not a JSON object.
     Json,
-    /// The payload's leading `v` is missing or unsupported.
+    /// The payload's leading `v` is another version than the one read,
+    /// or, as `None`, missing or no integer.
     UnknownVersion(Option<i64>),
     /// A member the payload's schema requires is missing.
     MissingField(&'static str),
@@ -414,7 +428,9 @@ impl fmt::Display for PimdirActionError {
         match self {
             Self::Json => write!(f, "Pimdir action payload is not a JSON object"),
             Self::UnknownVersion(Some(v)) => write!(f, "Unknown pimdir action version: {v}"),
-            Self::UnknownVersion(None) => write!(f, "Pimdir action payload misses its version"),
+            Self::UnknownVersion(None) => {
+                write!(f, "Pimdir action payload states no integer version")
+            }
             Self::MissingField(field) => {
                 write!(f, "Pimdir action payload misses field: {field}")
             }
@@ -541,6 +557,17 @@ const KNOWN_ACTIONS: [&str; 13] = [
     intent::COLLECTION_DELETE,
 ];
 
+/// Whether `kind` is an action the owner applies to the store itself
+/// (STORAGE §15.3), a store action or `set-performer`, where an intent
+/// is performed outside it by the source it names (Annex B.2).
+#[cfg(feature = "client")]
+pub(crate) fn applied_by_owner(kind: &str) -> bool {
+    matches!(
+        kind,
+        "add" | "set-flags" | "remove" | "move" | "copy" | "update" | "set-performer"
+    )
+}
+
 /// What a payload is to this crate (STORAGE §15.3): one of three, which
 /// an owner applies, parks or leaves untouched, and a reader folds or
 /// lists.
@@ -548,20 +575,23 @@ const KNOWN_ACTIONS: [&str; 13] = [
 pub enum PimdirPayloadOutcome {
     /// Its action and `v` name a schema, which accepts it.
     Valid,
-    /// Its action and `v` name a schema, which refuses it: never enqueued
-    /// by a producer, parked by an owner.
+    /// Its action and `v` name a schema, which refuses it, or its action
+    /// is one this crate knows and it states no `v`, or one that is no
+    /// integer: never enqueued by a producer, parked by an owner.
     Malformed,
-    /// Its action, or its `v` for an action this crate knows, names no
-    /// schema here, an application's own action included: read no
-    /// further, left pending and untouched by an owner, listed by a
-    /// reader, never parked.
+    /// Its action, or the integer `v` it states for an action this crate
+    /// knows, names no schema here, an application's own action
+    /// included: read no further, left pending and untouched by an
+    /// owner, listed by a reader, never parked.
     Unknown,
 }
 
 /// Judges a kind and its payload (STORAGE §15.3): unknown when the kind is
-/// not one this crate holds a schema for or the payload states another
-/// `v` than 1, none included, whatever its other members hold; else valid
-/// or malformed as [`action_from_payload`] reads it.
+/// not one this crate holds a schema for, whatever the payload holds, or
+/// when the payload of a known kind states an integer `v` other than 1;
+/// malformed when a known kind's payload states no `v` or one that is no
+/// integer, there being no version an owner could come to know; else
+/// valid or malformed as [`action_from_payload`] reads it.
 pub fn payload_outcome(kind: &str, payload: &str) -> PimdirPayloadOutcome {
     match unknown(kind, payload) {
         Ok(true) => PimdirPayloadOutcome::Unknown,
@@ -571,8 +601,14 @@ pub fn payload_outcome(kind: &str, payload: &str) -> PimdirPayloadOutcome {
 }
 
 /// Whether a payload is unknown to this crate (STORAGE §15.3): its kind
-/// names no schema here, or its `v` is not 1. A payload of a known kind
-/// that is no JSON object is malformed, there being no `v` to read.
+/// names no schema here, or its `v` is an integer other than 1. A payload
+/// of a known kind that is no JSON object, states no `v` or states one
+/// that is no integer (a string, a fraction, a boolean, `null`) is
+/// malformed: it names no version a later owner would know.
+///
+/// An integer is what serde_json reads as one: `1.0` and `1e0` are
+/// floats to it, so malformed, where JSON Schema takes both for the
+/// integer 1; the standard leaves that spelling open.
 fn unknown(kind: &str, payload: &str) -> Result<bool, PimdirActionError> {
     if !KNOWN_ACTIONS.contains(&kind) {
         return Ok(true);
@@ -582,7 +618,10 @@ fn unknown(kind: &str, payload: &str) -> Result<bool, PimdirActionError> {
         return Err(PimdirActionError::Json);
     };
 
-    Ok(map.get("v").and_then(Value::as_i64) != Some(1))
+    match map.get("v") {
+        Some(Value::Number(v)) if v.is_i64() || v.is_u64() => Ok(v.as_i64() != Some(1)),
+        _ => Err(PimdirActionError::UnknownVersion(None)),
+    }
 }
 
 /// Decodes a kind and its payload strictly, as payloads/ types it at
@@ -591,7 +630,8 @@ fn unknown(kind: &str, payload: &str) -> Result<bool, PimdirActionError> {
 /// with and a producer refuses at the enqueue.
 ///
 /// A payload unknown to this crate ([`payload_outcome`]), a kind it holds
-/// no schema for or a known one at another `v`, is no error: it is read
+/// no schema for or a known one at another integer `v`, is no error: it
+/// is read
 /// no further and kept verbatim as [`PimdirAction::Unknown`], which an
 /// owner skips and a reader lists. An intent of Annex B.2 is read whole
 /// by its type in [`crate::intent`] and kept as [`PimdirAction::Unknown`]
@@ -1217,13 +1257,14 @@ mod tests {
     #[test]
     fn a_payload_this_crate_does_not_know_is_kept_never_refused() {
         let cases = [
-            ("remove", r#"{"seq":1}"#),
             ("remove", r#"{"v":2,"seq":1}"#),
-            ("remove", r#"{"v":"1","seq":1}"#),
+            ("remove", r#"{"v":18446744073709551615,"seq":1}"#),
             ("set-flags", r#"{"v":2,"seq":"5"}"#),
             ("submit", r#"{"v":2}"#),
             ("snooze", r#"{"v":1,"seq":5}"#),
+            ("snooze", r#"{"seq":5}"#),
             ("x-fax-send", r#"{"to":"+33"}"#),
+            ("x-fax-send", r#"{"v":"one"}"#),
             ("x-fax-send", "not json"),
         ];
         for (kind, payload) in cases {
@@ -1253,6 +1294,35 @@ mod tests {
             PimdirPayloadOutcome::Malformed,
             "a known action whose payload states no v to read"
         );
+    }
+
+    /// A known action stating no `v`, or one that is no integer, states
+    /// no version an owner could wait to know: malformed, never unknown
+    /// (STORAGE §15.3). `1.0` is serde_json's float, the spelling the
+    /// standard leaves open.
+    #[test]
+    fn a_known_action_stating_no_usable_version_is_malformed() {
+        let cases = [
+            ("remove", r#"{"seq":1}"#),
+            ("remove", r#"{"v":"1","seq":1}"#),
+            ("remove", r#"{"v":1.5,"seq":1}"#),
+            ("remove", r#"{"v":1.0,"seq":1}"#),
+            ("remove", r#"{"v":null,"seq":1}"#),
+            ("remove", r#"{"v":true,"seq":1}"#),
+            ("submit", r#"{"v":"2"}"#),
+        ];
+        for (kind, payload) in cases {
+            assert_eq!(
+                payload_outcome(kind, payload),
+                PimdirPayloadOutcome::Malformed,
+                "{kind} {payload}"
+            );
+            assert_eq!(
+                action_from_payload(kind, payload),
+                Err(PimdirActionError::UnknownVersion(None)),
+                "{kind} {payload}"
+            );
+        }
     }
 
     #[test]

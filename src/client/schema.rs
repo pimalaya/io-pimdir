@@ -105,15 +105,20 @@ pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), Pim
         profile,
         version: sql::VERSION,
         format: PimdirFormat::Draft(sql::FORMAT_VERSION),
+        hash_algos: &[HASH_ALGO],
     };
     let store = PimdirStoreVersion {
+        format: format.as_deref(),
         format_version: Some(&format_version),
         version,
+        user_version,
         read_version,
         produce_version,
+        hash_algo: &hash_algo,
     };
-    // NOTE: a draft is refused for its marker alone (§4.2): the floors a
-    // release judges by have no error of their own until one is built.
+    // NOTE: a draft is refused for its marker alone (§4.2): the six
+    // columns a release judges by have no error of their own until one is
+    // built, and the checks below are a draft opener's own.
     if store.opens(&program).is_err() {
         return Err(PimdirError::Version {
             found: Some(format_version),

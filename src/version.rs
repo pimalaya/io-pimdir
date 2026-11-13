@@ -5,15 +5,20 @@
 //! and an owner holding its own SQLite, asks one judgement.
 //!
 //! A draft's store opens under that draft alone, its `format_version`
-//! compared to the word. Once the storage part is released, the three
-//! numbers of `store_meta` govern: an owner opens a store whose `version`
-//! it knows, a reader one whose `read_version` is at most its own schema
-//! version, a producer one whose `read_version` and `produce_version` both
-//! are; a release refuses every draft store.
+//! compared to the word; the two schema stamps agreeing, the algorithm
+//! and the schema's text are then the opener's to check beside it
+//! (STORAGE §6).
 //!
-//! The judgement reads the stamps alone: the two schema stamps agreeing,
-//! the algorithm and the schema's text are the opener's to check beside
-//! it (STORAGE §6).
+//! Once the storage part is released, a store is judged by six columns of
+//! `store_meta` and by nothing else of the schema, one above the
+//! program's version included (STORAGE §4.2): `format` is `pimdir`;
+//! `format_version` is `storage-v` followed by `version`, a draft's name
+//! refused; `version` equals `PRAGMA user_version`; `read_version`, and
+//! for a producer `produce_version` too, is at most the program's own; an
+//! owner opens a `version` it knows; `hash_algo` is one the program
+//! knows. A table, a column, an index, a trigger or a view the program
+//! does not know is a later version's, never damage: the schema's text is
+//! compared against a version the program knows alone (§18).
 
 use alloc::string::{String, ToString};
 use core::fmt;
@@ -52,22 +57,35 @@ pub struct PimdirProgram<'a> {
     pub version: i64,
     /// Whether it is built from a draft or a release.
     pub format: PimdirFormat<'a>,
+    /// The hash algorithms it knows, by their `store_meta.hash_algo`
+    /// name (STORAGE §5).
+    pub hash_algos: &'a [&'a str],
 }
 
-/// The versions a store states (`load_store_meta`, STORAGE §4.2).
+/// What a store states of itself: the six columns of `store_meta` a
+/// program judges it by (`load_store_meta`, STORAGE §4.2), which keep
+/// their name, type and meaning in every version, beside the
+/// `PRAGMA user_version` the schema version is compared with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PimdirStoreVersion<'a> {
+    /// `store_meta.format`, `None` for a database lacking the column.
+    pub format: Option<&'a str>,
     /// `store_meta.format_version`, `None` for a store lacking the
     /// column, which a draft before storage-draft-08 wrote.
     pub format_version: Option<&'a str>,
     /// `store_meta.version`, the schema version.
     pub version: i64,
+    /// `PRAGMA user_version`, which a sound store states equal to
+    /// `version`.
+    pub user_version: i64,
     /// `store_meta.read_version`, the lowest schema version a program
     /// must implement to read the store.
     pub read_version: i64,
     /// `store_meta.produce_version`, the lowest it must implement to
     /// enqueue into it.
     pub produce_version: i64,
+    /// `store_meta.hash_algo`, the algorithm naming its bodies.
+    pub hash_algo: &'a str,
 }
 
 impl PimdirStoreVersion<'_> {
@@ -75,12 +93,17 @@ impl PimdirStoreVersion<'_> {
     /// why when it does not.
     ///
     /// A draft program opens the store of its own draft and no other,
-    /// whatever its profile and the three numbers. A released one refuses
-    /// a draft store and one lacking the marker, then judges by its
-    /// profile: an owner opens a `version` from 1 to its own, the store
-    /// below its own being its to migrate; a reader opens a
-    /// `read_version` at most its own; a producer needs `produce_version`
-    /// at most its own as well.
+    /// whatever its profile and the other columns, which its opener
+    /// checks beside. A released one judges by the six columns, in this
+    /// order: a `format` other than `pimdir` is no store; a draft store,
+    /// one lacking the marker and one whose marker is not `storage-v`
+    /// followed by its `version` are refused; then a `version` other
+    /// than `user_version`; then its profile, an owner opening a
+    /// `version` from 1 to its own, the store below its own being its to
+    /// migrate, a reader a `read_version` at most its own, a producer
+    /// needing `produce_version` at most its own as well; then an
+    /// algorithm it does not know. A `version` above a reader's or a
+    /// producer's own refuses nothing by itself.
     pub fn opens(&self, program: &PimdirProgram<'_>) -> Result<(), PimdirVersionRefusal> {
         let format = || PimdirVersionRefusal::Format {
             found: self.format_version.map(ToString::to_string),
@@ -93,8 +116,24 @@ impl PimdirStoreVersion<'_> {
                     false => Err(format()),
                 };
             }
-            PimdirFormat::Release if !self.is_released() => return Err(format()),
+            PimdirFormat::Release if self.format != Some("pimdir") => {
+                return Err(PimdirVersionRefusal::Foreign {
+                    found: self.format.map(ToString::to_string),
+                });
+            }
             PimdirFormat::Release => (),
+        }
+        // NOTE: the marker names the schema version, `storage-v1` for
+        // version 1, so a draft's name and a marker left behind by a
+        // migration are refused alike.
+        if self.released() != Some(self.version) {
+            return Err(format());
+        }
+        if self.version != self.user_version {
+            return Err(PimdirVersionRefusal::Mismatch {
+                user_version: self.user_version,
+                version: self.version,
+            });
         }
 
         let own = program.version;
@@ -108,29 +147,38 @@ impl PimdirStoreVersion<'_> {
 
         match program.profile {
             PimdirProfile::Owner if self.version < 1 || self.version > own => {
-                Err(PimdirVersionRefusal::Unknown {
+                return Err(PimdirVersionRefusal::Unknown {
                     found: self.version,
                     own,
-                })
+                });
             }
-            PimdirProfile::Owner => Ok(()),
-            PimdirProfile::Reader => read,
+            PimdirProfile::Owner => (),
+            PimdirProfile::Reader => read?,
             PimdirProfile::Producer if self.produce_version > own => {
-                read.and(Err(PimdirVersionRefusal::Produce {
+                read?;
+                return Err(PimdirVersionRefusal::Produce {
                     found: self.produce_version,
                     own,
-                }))
+                });
             }
-            PimdirProfile::Producer => read,
+            PimdirProfile::Producer => read?,
+        }
+
+        match program.hash_algos.contains(&self.hash_algo) {
+            true => Ok(()),
+            false => Err(PimdirVersionRefusal::HashAlgo {
+                found: self.hash_algo.to_string(),
+            }),
         }
     }
 
-    /// Whether the store names a released storage part: the prefix, then
-    /// a major of digits alone.
-    fn is_released(&self) -> bool {
-        self.format_version
-            .and_then(|format| format.strip_prefix(RELEASED))
-            .is_some_and(|major| !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()))
+    /// The major the store's marker names when it is a released storage
+    /// part's: the prefix, then digits alone, no sign and no leading
+    /// zero, so one schema version has one marker.
+    fn released(&self) -> Option<i64> {
+        let major = self.format_version?.strip_prefix(RELEASED)?;
+        let canonical = major.bytes().all(|b| b.is_ascii_digit()) && !major.starts_with('0');
+        canonical.then(|| major.parse().ok()).flatten()
     }
 }
 
@@ -138,12 +186,33 @@ impl PimdirStoreVersion<'_> {
 /// never reconciled, migrated, rebuilt, written nor deleted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirVersionRefusal {
+    /// The store's `format` is not `pimdir`: another program's database,
+    /// to a released program.
+    Foreign {
+        /// The store's `format`, `None` when it lacks the column.
+        found: Option<String>,
+    },
     /// The store's `format_version` is not one the program opens: another
-    /// draft's or a release's for a draft program, a draft's for a
-    /// released one, or none at all.
+    /// draft's or a release's for a draft program; for a released one a
+    /// draft's, one that is not `storage-v` followed by the store's
+    /// `version`, or none at all.
     Format {
         /// The store's `format_version`, `None` when it lacks the column.
         found: Option<String>,
+    },
+    /// The store's `version` is not its `PRAGMA user_version`, to a
+    /// released program.
+    Mismatch {
+        /// The database's `PRAGMA user_version`.
+        user_version: i64,
+        /// The store's `version`.
+        version: i64,
+    },
+    /// The store names its bodies by an algorithm a released program does
+    /// not know.
+    HashAlgo {
+        /// The store's `hash_algo`.
+        found: String,
     },
     /// An owner does not know the store's schema version: above its own.
     Unknown {
@@ -179,6 +248,20 @@ impl fmt::Display for PimdirVersionRefusal {
                 )
             }
             Self::Format { found: None } => write!(f, "Store states no format version"),
+            Self::Foreign { found: Some(found) } => {
+                write!(f, "Database of format {found} is no pimdir store")
+            }
+            Self::Foreign { found: None } => write!(f, "Database states no format"),
+            Self::Mismatch {
+                user_version,
+                version,
+            } => write!(
+                f,
+                "Store schema version {version} is not its user_version {user_version}"
+            ),
+            Self::HashAlgo { found } => {
+                write!(f, "Store hash algorithm {found} is unknown to this program")
+            }
             Self::Unknown { found, own } => write!(
                 f,
                 "Store schema version {found} is unknown to an owner at version {own}"
@@ -212,10 +295,13 @@ mod tests {
         (version, read_version, produce_version): (i64, i64, i64),
     ) -> PimdirStoreVersion<'_> {
         PimdirStoreVersion {
+            format: Some("pimdir"),
             format_version: Some(format_version),
             version,
+            user_version: version,
             read_version,
             produce_version,
+            hash_algo: "blake3",
         }
     }
 
@@ -224,6 +310,71 @@ mod tests {
             profile,
             version,
             format: PimdirFormat::Release,
+            hash_algos: &["blake3"],
+        }
+    }
+
+    /// A release judges a store by the six columns (STORAGE §4.2): each
+    /// one off refuses it under every profile, a version 1 program on a
+    /// version 2 store that raised no floor included, and nothing else
+    /// of that store does.
+    #[test]
+    fn a_release_judges_a_store_by_six_columns() {
+        use PimdirVersionRefusal::*;
+
+        let sound = store("storage-v2", (2, 1, 1));
+        for profile in [PimdirProfile::Reader, PimdirProfile::Producer] {
+            let program = release(profile, 1);
+            assert_eq!(sound.opens(&program), Ok(()));
+
+            let foreign = PimdirStoreVersion {
+                format: Some("other"),
+                ..sound
+            };
+            assert_eq!(
+                foreign.opens(&program),
+                Err(Foreign {
+                    found: Some("other".into())
+                })
+            );
+
+            // NOTE: the marker is `storage-v` followed by `version`: one a
+            // migration left behind, or ahead, is refused.
+            for marker in ["storage-v1", "storage-v3", "storage-v02", "storage-v+2"] {
+                let stale = PimdirStoreVersion {
+                    format_version: Some(marker),
+                    ..sound
+                };
+                assert_eq!(
+                    stale.opens(&program),
+                    Err(Format {
+                        found: Some(marker.into())
+                    })
+                );
+            }
+
+            let disagreeing = PimdirStoreVersion {
+                user_version: 1,
+                ..sound
+            };
+            assert_eq!(
+                disagreeing.opens(&program),
+                Err(Mismatch {
+                    user_version: 1,
+                    version: 2
+                })
+            );
+
+            let hashed = PimdirStoreVersion {
+                hash_algo: "sha256",
+                ..sound
+            };
+            assert_eq!(
+                hashed.opens(&program),
+                Err(HashAlgo {
+                    found: "sha256".into()
+                })
+            );
         }
     }
 
@@ -324,6 +475,7 @@ mod tests {
                 profile,
                 version: 1,
                 format: PimdirFormat::Draft("storage-draft-10"),
+                hash_algos: &["blake3"],
             };
 
             assert_eq!(store("storage-draft-10", (1, 1, 1)).opens(&draft), Ok(()));
@@ -336,6 +488,16 @@ mod tests {
                     })
                 );
             }
+
+            // NOTE: a draft reads the marker alone, the other columns
+            // being its opener's to check (STORAGE §6).
+            let other = PimdirStoreVersion {
+                format: None,
+                user_version: 7,
+                hash_algo: "sha256",
+                ..store("storage-draft-10", (1, 1, 1))
+            };
+            assert_eq!(other.opens(&draft), Ok(()));
         }
     }
 }

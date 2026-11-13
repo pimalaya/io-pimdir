@@ -26,12 +26,12 @@ use crate::cli::{
         ItemsOutput,
     },
     quarantine::QuarantineEmptyOutput,
-    queue::{QueueCancelOutput, QueueOutput, QueueStatusOutput},
+    queue::{QueueCancelOutput, QueueOutput, QueueRetryOutput, QueueStatusOutput},
     search::{
         CountOutput, IndexOutput, SearchOutput, SearchThreadsOutput, ShowOutput, TagOutput,
         ThreadRow,
     },
-    store::StoreInfoOutput,
+    store::{StoreCopyOutput, StoreInfoOutput},
 };
 
 /// Builds the command-to-schema registry consumed by `json-schema`.
@@ -51,8 +51,11 @@ pub fn registry() -> JsonSchemaRegistry {
     registry.insert::<ItemEraseOutput>("pimdir-item-erase");
     registry.insert::<QueueOutput>("pimdir-queue-list");
     registry.insert::<QueueCancelOutput>("pimdir-queue-cancel");
+    registry.insert::<QueueRetryOutput>("pimdir-queue-retry");
     registry.insert::<QueueStatusOutput>("pimdir-queue-status");
     registry.insert::<StoreInfoOutput>("pimdir-store-info");
+    registry.insert::<StoreCopyOutput>("pimdir-store-backup");
+    registry.insert::<StoreCopyOutput>("pimdir-store-restore");
     registry.insert::<CheckOutput>("pimdir-check");
     registry.insert::<GcOutput>("pimdir-gc");
     registry.insert::<QuarantineEmptyOutput>("pimdir-quarantine-empty");

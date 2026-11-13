@@ -19,7 +19,7 @@ use crate::{
     capability::{self, PimdirSourceCapabilities, PimdirSupport},
     client::{
         PimdirError,
-        producer::{PimdirPendingAction, PimdirProducer},
+        producer::{PimdirEnqueue, PimdirPendingAction, PimdirProducer},
         search::{Found, PimdirIndex, PimdirSearchClock, PimdirSearchSort},
     },
     codec::PimdirAction,
@@ -218,11 +218,11 @@ impl PimdirSearchTagPlan {
     /// resolves a source for and finds no capability `missing` for,
     /// through `producer` (STORAGE §15), answering them in plan order.
     ///
-    /// Every action passes the capability gate before any is appended, so
-    /// one a source refuses ([`PimdirError::Unsupported`]), a declaration
-    /// changed since the plan, leaves the queue as it was. A placement
-    /// whose flags were never read is left out, as is one the change leaves
-    /// as it is.
+    /// The actions are one batch, one transaction (§15.1): each passes the
+    /// capability gate once, and one a source refuses
+    /// ([`PimdirError::Unsupported`]), a declaration changed since the
+    /// plan, leaves the queue as it was. A placement whose flags were
+    /// never read is left out, as is one the change leaves as it is.
     pub fn stage(
         &self,
         producer: &mut PimdirProducer,
@@ -245,7 +245,6 @@ impl PimdirSearchTagPlan {
                     flags: flags.iter().collect(),
                     base: Some(placement.flags.clone()),
                 };
-                producer.check(&placement.collection, &action)?;
                 staged.push((
                     placement.collection.clone(),
                     hit.seq,
@@ -257,9 +256,16 @@ impl PimdirSearchTagPlan {
         }
         debug!("staging {} set-flags action(s)", staged.len());
 
+        let batch: Vec<PimdirEnqueue<'_>> = staged
+            .iter()
+            .map(|(collection, _, _, _, action)| PimdirEnqueue::new(collection, action.clone()))
+            .collect();
+        let enqueued = producer.enqueue_batch(&batch)?;
+        drop(batch);
+
         let mut actions = Vec::new();
-        for (collection, seq, source, flags, action) in staged {
-            let id = producer.enqueue(&collection, &action, None)?;
+        for ((collection, seq, source, flags, _), enqueued) in staged.into_iter().zip(enqueued) {
+            let id = enqueued.handle;
             trace!("staged action {id} on {collection} seq {seq}");
             actions.push(PimdirSearchTagAction {
                 collection,

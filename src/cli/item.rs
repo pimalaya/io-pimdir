@@ -372,7 +372,8 @@ impl ItemRestoreCommand {
         let id = store
             .producer()?
             .enqueue(&found.collection, &action, None)
-            .map_err(report)?;
+            .map_err(report)?
+            .handle;
 
         // NOTE: the drain reports what it did to the whole collection's
         // queue, so the item itself is the only trustworthy proof that

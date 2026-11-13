@@ -8,6 +8,12 @@
 //! orphan blob is the benign one, a file no row references, and `pimdir
 //! gc` is what takes it: this verb reclaims nothing.
 //!
+//! `--deep` adds the store's self-check (STORAGE §7): SQLite's own
+//! `integrity_check` and `foreign_key_check`, and every body an object
+//! row names hashed against its name. It costs a read of the whole
+//! store, and it only reports: a body failing its name is an owner's
+//! read to move into quarantine/.
+//!
 //! `--fix` repairs, which is not reclaiming: it recomputes the drifted
 //! refcounts from the pointers that justify them, and clears the
 //! bindings whose item is gone. Both recover a fact the store already
@@ -45,6 +51,15 @@ const SHOWN: usize = 20;
 /// repairs.
 #[derive(Debug, Args)]
 pub struct CheckCommand {
+    /// Check the database and every body too.
+    ///
+    /// Runs SQLite's integrity check and foreign key check, and hashes
+    /// the body of every object row against its name. It reads the whole
+    /// store, so it takes as long as the store is large. It reports and
+    /// moves nothing.
+    #[arg(long)]
+    pub deep: bool,
+
     /// Repair what can be repaired from what the store already holds.
     ///
     /// Recomputes the drifted refcounts from the pointers that justify them,
@@ -111,6 +126,27 @@ impl CheckCommand {
             })
             .collect();
 
+        let deep = match self.deep {
+            true => {
+                let found = read.check_deep().map_err(report)?;
+                Some(DeepCheck {
+                    integrity: found.integrity,
+                    foreign_keys: found
+                        .foreign_keys
+                        .into_iter()
+                        .map(|violation| ForeignKeyViolation {
+                            table: violation.table,
+                            rowid: violation.rowid,
+                            parent: violation.parent,
+                        })
+                        .collect(),
+                    hashed: found.objects - found.missing.len(),
+                    failing: found.failing.into_iter().map(|hash| hash.0).collect(),
+                })
+            }
+            false => None,
+        };
+
         let mut repaired = 0;
         let mut cleared = 0;
 
@@ -130,6 +166,7 @@ impl CheckCommand {
             || !scan.strays.is_empty()
             || !quarantined.is_empty()
             || !missing.is_empty()
+            || deep.as_ref().is_some_and(|deep| deep.problems() > 0)
             || (!self.fix && (!drift.is_empty() || !dangling.is_empty()));
 
         printer.out(CheckOutput {
@@ -155,6 +192,7 @@ impl CheckCommand {
             drift,
             dangling,
             minted,
+            deep,
             repaired,
             cleared,
         })?;
@@ -223,6 +261,41 @@ pub struct MintedKeys {
     pub items: i64,
 }
 
+/// One reference naming no parent, as SQLite's foreign key check answers
+/// it.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignKeyViolation {
+    /// The table holding the reference.
+    pub table: String,
+    /// The row holding it, `null` in a table without rowids.
+    pub rowid: Option<i64>,
+    /// The table it names.
+    pub parent: String,
+}
+
+/// What `--deep` found.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepCheck {
+    /// What SQLite's integrity check answered beside `ok`.
+    pub integrity: Vec<String>,
+    /// What its foreign key check answered.
+    pub foreign_keys: Vec<ForeignKeyViolation>,
+    /// How many bodies were hashed against their name.
+    pub hashed: usize,
+    /// The bodies that do not hash to their name, or are a link, left
+    /// where they are.
+    pub failing: Vec<String>,
+}
+
+impl DeepCheck {
+    /// How many problems the deep check found.
+    fn problems(&self) -> usize {
+        self.integrity.len() + self.foreign_keys.len() + self.failing.len()
+    }
+}
+
 /// The `check` output.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -246,6 +319,8 @@ pub struct CheckOutput {
     /// Minted keys per collection, the second copies of an identity a
     /// source holds twice. Informational, never a defect.
     pub minted: Vec<MintedKeys>,
+    /// What `--deep` found, `null` without it.
+    pub deep: Option<DeepCheck>,
     /// Refcounts `--fix` recomputed from the pointers justifying them.
     pub repaired: usize,
     /// Dangling bindings `--fix` cleared.
@@ -261,6 +336,7 @@ impl CheckOutput {
             + self.missing.len()
             + self.drift.len()
             + self.dangling.len()
+            + self.deep.as_ref().map_or(0, DeepCheck::problems)
     }
 }
 
@@ -271,6 +347,61 @@ impl fmt::Display for CheckOutput {
                 f,
                 "This store is consistent: no orphan blob, no refcount drift, no dangling row"
             )?;
+        }
+
+        if let Some(deep) = &self.deep {
+            if deep.problems() == 0 {
+                writeln!(
+                    f,
+                    "The database passes its integrity and foreign key checks, and {} body(ies) hash to their name",
+                    deep.hashed
+                )?;
+            }
+
+            if !deep.integrity.is_empty() {
+                writeln!(
+                    f,
+                    "{} problem(s) found by the database integrity check:",
+                    deep.integrity.len()
+                )?;
+                for line in deep.integrity.iter().take(SHOWN) {
+                    writeln!(f, " - {}", sanitize::text(line))?;
+                }
+                more(f, deep.integrity.len())?;
+            }
+
+            if !deep.foreign_keys.is_empty() {
+                writeln!(
+                    f,
+                    "{} row(s) referencing a missing row:",
+                    deep.foreign_keys.len()
+                )?;
+                for violation in deep.foreign_keys.iter().take(SHOWN) {
+                    let table = sanitize::text(&violation.table);
+                    let parent = sanitize::text(&violation.parent);
+                    match violation.rowid {
+                        Some(rowid) => writeln!(f, " - {table} row {rowid} names no {parent}")?,
+                        None => writeln!(f, " - a row of {table} names no {parent}")?,
+                    }
+                }
+                more(f, deep.foreign_keys.len())?;
+            }
+
+            if !deep.failing.is_empty() {
+                writeln!(
+                    f,
+                    "{} body(ies) that do not hash to their name:",
+                    deep.failing.len()
+                )?;
+                for hash in deep.failing.iter().take(SHOWN) {
+                    writeln!(f, " - {}", sanitize::text(hash))?;
+                }
+                more(f, deep.failing.len())?;
+                writeln!(
+                    f,
+                    "   The owner sets each aside into quarantine/ when it next reads it; a sync fetches it again"
+                )?;
+            }
         }
 
         if !self.orphans.is_empty() {
@@ -437,6 +568,7 @@ mod tests {
                 collection: String::from("INBOX\u{202e}"),
                 items: 2,
             }],
+            deep: None,
             repaired: 0,
             cleared: 0,
         };

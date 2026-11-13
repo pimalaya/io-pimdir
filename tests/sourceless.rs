@@ -89,6 +89,7 @@ fn a_source_less_handle_reads_purges_and_cancels() {
             None,
         )
         .unwrap()
+        .handle
         .id;
 
     let mut store = PimdirStore::open(dir.path()).unwrap();

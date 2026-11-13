@@ -191,7 +191,7 @@ fn a_create_naming_a_live_or_pending_link_id_is_refused() {
         Err(PimdirError::Duplicate {
             existing: PimdirDuplicate::Pending(id),
             ..
-        }) if id == pending.id
+        }) if id == pending.handle.id
     ));
     assert_eq!(producer.pending_actions("INBOX").unwrap().len(), 1);
 

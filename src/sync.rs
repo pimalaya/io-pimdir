@@ -224,6 +224,11 @@ pub enum PimdirSyncEvent {
         /// The key of the retained item keeping the body.
         link_id: PimdirLinkId,
     },
+    /// A delivered create an `Abandon` gave up on a person's request
+    /// (SYNC §5, §7), named by its provisional handle: its binding
+    /// dropped, the item retained. Reported by the mutation, never by a
+    /// sync, which gives no delivered create up.
+    Abandoned(PimdirHandle),
 }
 
 /// A create a sync left waiting (SYNC §5).

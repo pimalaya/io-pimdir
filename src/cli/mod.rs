@@ -154,7 +154,8 @@ impl StoreFlags {
     }
 }
 
-/// Asks before destroying data, unless `--yes` was passed.
+/// Asks before destroying data, or doing what cannot be undone, unless
+/// `--yes` was passed.
 ///
 /// Refuses rather than prompts when the output is JSON or not a terminal: a
 /// confirmation written into a pipe is not a confirmation.
@@ -165,7 +166,7 @@ pub fn confirm(printer: &impl Printer, yes: bool, question: &str) -> Result<()> 
 
     if printer.is_json() || !stdout().is_terminal() || !stdin().is_terminal() {
         return Err(ErrorCode::ConfirmationRequired
-            .error("refusing to destroy data without a confirmation: pass --yes to proceed"));
+            .error("refusing to proceed without a confirmation: pass --yes to proceed"));
     }
 
     if !prompt::bool(question, false)? {

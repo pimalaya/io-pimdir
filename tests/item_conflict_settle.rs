@@ -276,6 +276,7 @@ fn queue_update(dir: &Path, seq: i64, bytes: &[u8], resolves: Option<&[&[u8]]>) 
             resolves,
         })
         .unwrap()
+        .handle
         .id
 }
 
@@ -599,6 +600,81 @@ fn an_add_superseding_a_conflicted_item_parks_whole() {
     assert!(
         phone.load_hub("archive").unwrap().items.is_empty(),
         "the add was not applied alone"
+    );
+    let hub = phone.load_hub(CONTACTS).unwrap();
+    let item = &hub.items[&PimdirLinkId(LINK.into())];
+    assert!(!item.deleted && item.conflicted, "left as it stood");
+}
+
+/// A run of actions is one transaction, a savepoint per action (STORAGE
+/// §15.2): the superseding add above writes its item, then fails on the
+/// remove it implies. Rolled back to its savepoint, what it wrote is
+/// undone and its row restored and parked, while the adds queued around
+/// it, applied in the same transaction, stand with their receipts.
+#[test]
+fn an_action_parking_after_it_wrote_is_undone_alone_in_its_run() {
+    use io_pimdir::client::producer::PimdirActionStatus;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut phone, _server) = diverged(dir.path());
+    phone.ensure_collection("archive", "text/vcard").unwrap();
+    let seq = seq(&phone);
+    let card = |uid: &str| {
+        format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:urn:uuid:{uid}\r\nFN:{uid}\r\nEND:VCARD\r\n")
+    };
+    let add = |supersedes| {
+        move |object| PimdirAction::Add {
+            link_id: None,
+            flags: PimdirFlags::default(),
+            object: Some(object),
+            supersedes,
+        }
+    };
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let before = producer
+        .enqueue_with_body("archive", card("before").as_bytes(), add(None))
+        .unwrap()
+        .handle;
+    let superseding = io_pimdir::codec::PimdirSupersedes {
+        collection: PimdirCollectionId(CONTACTS.into()),
+        seq,
+    };
+    let parking = producer
+        .enqueue_with_body("archive", MERGED, add(Some(superseding)))
+        .unwrap()
+        .handle;
+    let after = producer
+        .enqueue_with_body("archive", card("after").as_bytes(), add(None))
+        .unwrap()
+        .handle;
+
+    let report = phone.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (2, 1));
+
+    let archived: Vec<String> = phone
+        .load_hub("archive")
+        .unwrap()
+        .items
+        .into_keys()
+        .map(|link| link.0)
+        .collect();
+    assert_eq!(
+        archived,
+        vec!["urn:uuid:after", "urn:uuid:before"],
+        "the add that parked left no item"
+    );
+    for applied in [&before, &after] {
+        let status = producer.action_status(applied).unwrap();
+        assert!(
+            matches!(status, PimdirActionStatus::Applied { seq: Some(_), .. }),
+            "{status:?}"
+        );
+    }
+    let status = producer.action_status(&parking).unwrap();
+    assert!(
+        matches!(status, PimdirActionStatus::Parked { attempts: 1, .. }),
+        "the claimed row restored, then parked: {status:?}"
     );
     let hub = phone.load_hub(CONTACTS).unwrap();
     let item = &hub.items[&PimdirLinkId(LINK.into())];

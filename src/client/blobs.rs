@@ -343,6 +343,14 @@ impl PimdirBlobs {
         Ok(())
     }
 
+    /// Flushes the shard directory of the body under `hash`, found held
+    /// and kept without a write (§5): the entry may be another writer's,
+    /// moved and not flushed yet, and a row is about to name it.
+    pub(crate) fn flush_held(&self, hash: &PimdirHash) -> io::Result<()> {
+        let (shard, _) = self.locate(hash)?;
+        sync_dir(&shard)
+    }
+
     /// Flushes directories of the tree after unlinks in them, then
     /// objects/ when any was (§5): an unlink is durable once its
     /// directory is.
@@ -977,12 +985,12 @@ fn open_unfollowed(shard: &Path, name: &str) -> io::Result<fs::File> {
 /// loss: syncing a file makes its bytes durable and says nothing about the
 /// name that reaches them (§5). On macOS std's `sync_all` is `F_FULLFSYNC`.
 #[cfg(not(windows))]
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
 /// A directory cannot be flushed on Windows (§5): nothing to do.
 #[cfg(windows)]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }

@@ -8,6 +8,11 @@
 //! can read or write is refused by every profile as
 //! [`PimdirError::Exposed`], and the user restricts it.
 //!
+//! The subdirectory local/ is the owner's own (§3): created `0700` when
+//! the owner first asks for it, never defined by the format, refused by
+//! the owner's open when another user can reach it, and ignored by a
+//! reader and a producer.
+//!
 //! On Unix through the permission bits; elsewhere a directory and a file
 //! take the access list their parent directory hands down, and nothing is
 //! refused. The lock files are opened by the locks themselves, without
@@ -16,7 +21,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::client::PimdirError;
@@ -24,6 +29,10 @@ use crate::client::PimdirError;
 /// The mode of every directory of a store.
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
+
+/// The subdirectory of a store reserved for its owner's own state
+/// (STORAGE §3).
+pub(crate) const LOCAL: &str = "local";
 
 /// The mode of every file of a store.
 #[cfg(unix)]
@@ -142,4 +151,37 @@ pub(crate) fn check(dir: &Path) -> Result<(), PimdirError> {
     }
 
     Ok(())
+}
+
+/// Refuses the store rooted at `dir` for its owner when its local/
+/// exists and is not the owner's alone (STORAGE §3, §18): a link or a
+/// file where the directory belongs, or a directory another user can
+/// read or write. One that does not exist yet refuses nothing.
+pub(crate) fn check_local(dir: &Path) -> Result<(), PimdirError> {
+    let path = dir.join(LOCAL);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if !meta.is_dir() || exposed(&path)? {
+        return Err(PimdirError::Exposed(path));
+    }
+
+    Ok(())
+}
+
+/// The local/ of the store rooted at `dir`, created `0700` when absent
+/// (STORAGE §3, §18), answering its path; one that is not the owner's
+/// alone is [`PimdirError::Exposed`], as [`check_local`] refuses it.
+pub(crate) fn local(dir: &Path) -> Result<PathBuf, PimdirError> {
+    let path = dir.join(LOCAL);
+    match create_dir(&path) {
+        Ok(()) => (),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => (),
+        Err(err) => return Err(err.into()),
+    }
+    check_local(dir)?;
+
+    Ok(path)
 }

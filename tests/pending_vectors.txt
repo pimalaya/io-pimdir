@@ -9,13 +9,3 @@
 # Suites: objects (vectors/objects.json), summaries (vectors/summaries.json),
 # payloads (vectors/payloads.json), sync (vectors/sync/, by file stem),
 # queries and chunks (vectors/search/).
-#
-# Sync case 48 is the standard's to fix, not a phase of this crate's (the
-# number below is the standard's batch that may restate it). Its store
-# states no mail_summary row for Trash's basic-1@example.org, and expects
-# INBOX's bodiless row purged as held elsewhere. Under held_elsewhere at
-# pimdir c315220 a bodiless message is held only by a row whose summary
-# agrees with its own, a row holding no summary agreeing with none
-# (STORAGE §9, §11.1), so the row is retained. The case needs the summary
-# of fixtures/mail-basic.eml stated on Trash's row.
-3 sync: 48-a-move-beside-a-held-copy-relocates

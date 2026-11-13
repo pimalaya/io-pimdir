@@ -48,6 +48,7 @@ fn a_collection_holding_a_queued_action_is_not_deleted() {
             None,
         )
         .unwrap()
+        .handle
         .id;
     drop(producer);
 

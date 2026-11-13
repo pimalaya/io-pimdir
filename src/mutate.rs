@@ -36,8 +36,9 @@ use crate::{
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirMutateReport {
     /// The bodies its write kept that a policy did not adopt, each a
-    /// [`PimdirSyncEvent::Overruled`], once the write committed (SYNC §5,
-    /// §9): the only event a mutation reports.
+    /// [`PimdirSyncEvent::Overruled`], and the delivered create an
+    /// `Abandon` gave up, a [`PimdirSyncEvent::Abandoned`], once the
+    /// write committed (SYNC §5, §9): the only events a mutation reports.
     pub events: Vec<PimdirSyncEvent>,
 }
 
@@ -176,6 +177,24 @@ pub enum PimdirMutation {
         /// The collection to move it into.
         target: PimdirCollectionId,
     },
+    /// Give up a delivered create whose member never arrived, on a
+    /// person's request and never by a rule of the engine's or a
+    /// connector's (SYNC §5, §7). It has no queue action.
+    ///
+    /// Refused, staging nothing, on any placement but a delivered create
+    /// of the run's source ([`PimdirMutateError::NotDelivered`]): a
+    /// pending create is withdrawn by a [`Remove`](Self::Remove), and a
+    /// member a listing named is removed by one. It writes a
+    /// [`Deleted`](PimdirDropReason::Deleted) drop of the provisional
+    /// handle and nothing else: the item is marked deleted and, no other
+    /// source binding it, retained with its body, its summary and the
+    /// flags staged on it, a `Remove` or a relocation held on it given up
+    /// with the binding. Nothing is pushed, and the report carries
+    /// [`Abandoned`](PimdirSyncEvent::Abandoned), naming that handle.
+    Abandon {
+        /// The delivered create's provisional handle.
+        handle: PimdirHandle,
+    },
     /// Create a locally-authored item with no remote origin (compose, import).
     ///
     /// Stages a pending create the next sync pushes as an append,
@@ -206,6 +225,7 @@ impl PimdirMutation {
             Self::Edit { handle, .. } => Some(handle),
             Self::Copy { handle, .. } => Some(handle),
             Self::Move { handle, .. } => Some(handle),
+            Self::Abandon { handle } => Some(handle),
             Self::Add { .. } => None,
         }
     }
@@ -229,7 +249,8 @@ impl PimdirMutation {
             | Self::Remove { handle, .. }
             | Self::Edit { handle, .. }
             | Self::Copy { handle, .. }
-            | Self::Move { handle, .. } => PimdirLoadSelection::Handles(vec![handle.clone()]),
+            | Self::Move { handle, .. }
+            | Self::Abandon { handle } => PimdirLoadSelection::Handles(vec![handle.clone()]),
         }
     }
 }
@@ -277,6 +298,10 @@ pub enum PimdirMutateError {
     /// A `Copy` or a `Move` names a placement with neither a body nor a
     /// based binding, which no create could deliver (SYNC §7).
     Undeliverable(String),
+    /// An `Abandon` names a placement that is no delivered create of the
+    /// run's source (SYNC §7): a pending create, which a `Remove`
+    /// withdraws, or a member a listing named, which one removes.
+    NotDelivered(String),
     /// The caller broke the coroutine contract.
     Arg(PimdirArgError),
 }
@@ -296,6 +321,7 @@ impl PimdirMutateError {
     /// | `conflict-unresolved` | [`Unresolved`](Self::Unresolved) |
     /// | `flags-unknown` | [`UnknownFlags`](Self::UnknownFlags) |
     /// | `placement-undeliverable` | [`Undeliverable`](Self::Undeliverable) |
+    /// | `create-not-delivered` | [`NotDelivered`](Self::NotDelivered) |
     /// | `coroutine-arg` | [`Arg`](Self::Arg) |
     pub fn code(&self) -> &'static str {
         match self {
@@ -306,6 +332,7 @@ impl PimdirMutateError {
             Self::Unresolved { .. } => "conflict-unresolved",
             Self::UnknownFlags(_) => "flags-unknown",
             Self::Undeliverable(_) => "placement-undeliverable",
+            Self::NotDelivered(_) => "create-not-delivered",
             Self::Arg(_) => "coroutine-arg",
         }
     }
@@ -333,6 +360,12 @@ impl fmt::Display for PimdirMutateError {
                 write!(
                     f,
                     "Pimdir MUTATE failed: handle {handle} holds neither a body nor a base to copy from"
+                )
+            }
+            Self::NotDelivered(handle) => {
+                write!(
+                    f,
+                    "Pimdir MUTATE failed: handle {handle} is no delivered create, which alone is abandoned"
                 )
             }
             Self::UnknownFlags(handle) => {
@@ -619,6 +652,14 @@ impl PimdirMutate {
                     PimdirWriteOp::UpsertPlacement(source),
                 ]
             }
+            // NOTE: the drop alone (SYNC §10): the write marks the item
+            // deleted and retains it once no binding is left, as for a
+            // removal the source states.
+            PimdirMutation::Abandon { .. } => vec![PimdirWriteOp::DropPlacement {
+                collection: source.collection.clone(),
+                handle: source.handle.clone(),
+                reason: PimdirDropReason::Deleted,
+            }],
             PimdirMutation::Add { .. } => self.create_writes(),
         }
     }
@@ -737,6 +778,14 @@ impl PimdirCoroutine for PimdirMutate {
                     };
                     if placement.link_id.is_none() {
                         let err = PimdirMutateError::Unnamed(handle.as_str().into());
+                        return PimdirCoroutineState::Complete(Err(err));
+                    }
+                    // NOTE: only a delivered create is given up (SYNC §7): a
+                    // pending one is withdrawn, a listed member removed.
+                    if let PimdirMutation::Abandon { .. } = &self.mutation
+                        && !placement.delivered()
+                    {
+                        let err = PimdirMutateError::NotDelivered(handle.as_str().into());
                         return PimdirCoroutineState::Complete(Err(err));
                     }
                     // NOTE: a change stating the set it read has no set to
@@ -861,6 +910,11 @@ impl PimdirCoroutine for PimdirMutate {
             (State::Writing, Some(arg @ (PimdirArg::Write | PimdirArg::Written(_)))) => {
                 debug!("local change written");
                 let mut report = PimdirMutateReport::default();
+                if let PimdirMutation::Abandon { handle } = &self.mutation {
+                    report
+                        .events
+                        .push(PimdirSyncEvent::Abandoned(handle.clone()));
+                }
                 if let PimdirArg::Written(written) = arg {
                     for (handle, link_id) in written.overruled {
                         report

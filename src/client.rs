@@ -24,8 +24,8 @@ use std::{
 
 use log::{debug, trace, warn};
 use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Params, Row, ToSql, TransactionBehavior,
-    config::DbConfig, named_params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Params, Row, ToSql, Transaction,
+    TransactionBehavior, config::DbConfig, named_params,
 };
 
 use crate::{
@@ -58,6 +58,7 @@ use crate::{
 /// finds the same one.
 pub const TIME_COLLECTION: &str = "\u{1}time";
 
+pub mod backup;
 pub mod blobs;
 mod capability;
 pub mod diagnostics;
@@ -218,6 +219,7 @@ impl PimdirStore {
             modes::restrict(dir)?;
         }
         modes::check(dir)?;
+        modes::check_local(dir)?;
         modes::create_dir_all(&dir.join("objects"))?;
 
         let lock = PimdirLock::own(dir)?;
@@ -257,6 +259,7 @@ impl PimdirStore {
         }
 
         modes::check(dir)?;
+        modes::check_local(dir)?;
         let lock = PimdirLock::own(dir)?;
 
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -334,10 +337,7 @@ impl PimdirStore {
                     }
                 }
 
-                let tx = self
-                    .conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(busy_or_sql)?;
+                let tx = begin(&mut self.reader.conn, &self.lock)?;
                 for (collection, link, derivation) in &derived {
                     let link = PimdirLinkId((*link).clone());
                     let hub =
@@ -385,6 +385,25 @@ impl PimdirStore {
         self.account.as_deref()
     }
 
+    /// The store's local/ (§3), created when absent, answering its path:
+    /// the one subdirectory reserved for the state an owner keeps of its
+    /// own beside the store, its configuration, a lock of its own, a mark
+    /// of work under way. The format never defines what it holds: a
+    /// reader and a producer ignore it, the collector never walks it, and
+    /// a backup copies it with the store (§8). An owner keeps its state
+    /// there or outside the store directory, and no other file of its own
+    /// beside the store's.
+    ///
+    /// Created `0700`; what the owner writes in it is the owner's to
+    /// create `0600` (§18). One another user can read or write, or a link
+    /// or a file under the name, is [`PimdirError::Exposed`], as the
+    /// owner's open refuses it. State kept there that follows the store
+    /// is checked against the store's id and incarnation (§4.5): a
+    /// restore puts the backup's local/ back with the rest.
+    pub fn local_dir(&self) -> Result<PathBuf, PimdirError> {
+        modes::local(&self.dir)
+    }
+
     /// The write side of the blob directory (§5), holding the owner lock
     /// while it lives: what a connector streams a fetched body through
     /// before the byteless `StoreObject` that indexes it (§14).
@@ -412,6 +431,7 @@ impl PimdirStore {
         collection: impl AsRef<str>,
         kind: &str,
     ) -> Result<(), PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(
                 sql::SET_COLLECTION_KIND,
@@ -437,6 +457,7 @@ impl PimdirStore {
         collection: impl AsRef<str>,
         name: &str,
     ) -> Result<(), PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(
                 sql::SET_COLLECTION_NAME,
@@ -474,6 +495,7 @@ impl PimdirStore {
                 role: String::from(role),
             });
         }
+        self.lock.verify()?;
         self.conn
             .execute_cached(
                 sql::SET_COLLECTION_ROLE,
@@ -564,10 +586,7 @@ impl PimdirStore {
                 kind,
             });
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         let key = named_params! { ":collection": collection, ":link_id": link_id.as_str() };
         let held: Option<i64> = tx
             .query_row_cached(sql::SEQ_BY_LINK, key, |row| row.get(0))
@@ -656,10 +675,7 @@ impl PimdirStore {
             }
         };
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         if synced(&tx, collection)? {
             return Err(PimdirError::Synced {
                 collection: collection.into(),
@@ -677,10 +693,7 @@ impl PimdirStore {
     /// [`put_item`](Self::put_item). A reader finds it by the id alone,
     /// declaring nothing.
     pub fn ensure_time_collection(&mut self) -> Result<&'static str, PimdirError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         tx.execute_cached(
             sql::SET_COLLECTION_KIND,
             named_params! {
@@ -707,6 +720,7 @@ impl PimdirStore {
         collection: impl AsRef<str>,
         account: Option<&str>,
     ) -> Result<(), PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(
                 sql::SET_COLLECTION_ACCOUNT,
@@ -722,6 +736,7 @@ impl PimdirStore {
         collection: impl AsRef<str>,
         policy: PimdirHubConflict,
     ) -> Result<(), PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(
                 sql::SET_CONFLICT,
@@ -741,6 +756,7 @@ impl PimdirStore {
         link_id: &str,
         sort_key: &str,
     ) -> Result<(), PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(
                 sql::SET_SORT_KEY,
@@ -763,10 +779,7 @@ impl PimdirStore {
         collection: impl AsRef<str>,
         new_id: &str,
     ) -> Result<(), PimdirError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         tx.execute_cached(
             sql::RENAME_QUEUE_TARGETS,
             named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
@@ -789,10 +802,7 @@ impl PimdirStore {
     /// action with no receipt (`collections_keep_queued`).
     pub fn delete_collection(&mut self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
         let collection = collection.as_ref();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         let key = named_params! { ":collection": collection };
         let pins: bool =
             tx.query_row_cached(sql::COLLECTION_HOLDS_OBJECTS, key, |row| row.get(0))?;
@@ -827,10 +837,7 @@ impl PimdirStore {
         collection: impl AsRef<str>,
         link_id: &PimdirLinkId,
     ) -> Result<bool, PimdirError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         let pinned: Option<(Option<String>, Option<String>)> = tx
             .prepare_cached(sql::DELETE_UNBOUND_ITEM)?
             .query_row(
@@ -850,10 +857,7 @@ impl PimdirStore {
     /// Purges one retained item by its public id, reporting whether there
     /// was one; a live item is never reached.
     pub fn purge(&mut self, collection: impl AsRef<str>, seq: i64) -> Result<bool, PimdirError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
 
         let pinned: Option<(Option<String>, Option<String>)> = tx
             .prepare_cached(sql::PURGE_ITEM)?
@@ -887,10 +891,7 @@ impl PimdirStore {
         if !is_stamp(cutoff) {
             return Err(PimdirError::Cutoff(cutoff.into()));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
 
         let pinned: Vec<(Option<String>, Option<String>)> = rows(
             &tx,
@@ -979,10 +980,7 @@ impl PimdirStore {
         if lock.in_flight() {
             return Err(PimdirError::InFlight(self.dir.clone()));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         let seqs: Vec<i64> = rows(
             &tx,
             sql::EVICT_BEFORE,
@@ -1023,10 +1021,7 @@ impl PimdirStore {
         if lock.in_flight() {
             return Err(PimdirError::InFlight(self.dir.clone()));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         bind_list(&tx, "collections", collections.iter().map(AsRef::as_ref))?;
         tx.execute_cached(
             sql::RELEASE_BASES_BEFORE,
@@ -1079,10 +1074,7 @@ impl PimdirStore {
             return Err(PimdirError::InFlight(self.dir.clone()));
         }
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
         let objects = tx.execute_cached(sql::DELETE_GARBAGE_OBJECTS, [])?;
         tx.commit().map_err(busy_or_sql)?;
@@ -1206,6 +1198,7 @@ impl PimdirStore {
     /// Recomputes every refcount from the five pointer columns (§7),
     /// returning how many rows disagreed.
     pub fn recompute_refcounts(&self) -> Result<usize, PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(sql::RECOMPUTE_REFCOUNTS, [])
             .map_err(busy_or_sql)
@@ -1214,6 +1207,7 @@ impl PimdirStore {
     /// Deletes the bindings whose item is gone, returning how many: the
     /// one dangling row a repair clears without guessing.
     pub fn clear_dangling_bindings(&self) -> Result<usize, PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(sql::DELETE_DANGLING_BINDINGS, [])
             .map_err(busy_or_sql)
@@ -1228,6 +1222,7 @@ impl PimdirStore {
     /// integer: two restores of one backup answer two incarnations, and a
     /// consumer compares for equality, reading no order in it.
     pub fn raise_incarnation(&self, replaced: Option<i64>) -> Result<i64, PimdirError> {
+        self.lock.verify()?;
         self.conn
             .execute_cached(
                 sql::RAISE_INCARNATION,
@@ -1250,10 +1245,7 @@ impl PimdirStore {
         capabilities: &[PimdirCapability],
     ) -> Result<(), PimdirError> {
         let account = self.account.clone();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
         capability::declare(&tx, account.as_deref(), source, capabilities)?;
         tx.commit().map_err(busy_or_sql)
     }
@@ -1292,10 +1284,7 @@ impl PimdirStore {
         action: impl Into<PimdirActionHandle>,
     ) -> Result<bool, PimdirError> {
         let action = action.into();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
 
         let store = producer::store_identity(&tx)?;
         if !action.names(&store) {
@@ -1325,10 +1314,7 @@ impl PimdirStore {
     /// with a later sync). Reports whether the row existed; when it did
     /// not, nothing is recorded.
     pub fn acknowledge_action(&mut self, id: i64, seq: Option<i64>) -> Result<bool, PimdirError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
 
         let Some(collection) = queued_collection(&tx, id)? else {
             return Ok(false);
@@ -1359,10 +1345,7 @@ impl PimdirStore {
         collection: &str,
         action: &PimdirAction,
     ) -> Result<bool, PimdirError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
 
         let Some(queued) = queued_collection(&tx, id)? else {
             return Ok(false);
@@ -1400,22 +1383,102 @@ impl PimdirStore {
     /// leaves the row pending, `Some(error)` parks it, the attempt counted,
     /// its text recorded once [scrubbed](security::scrub) of the
     /// credentials a connector's error may carry (§18).
+    ///
+    /// The text is free save the one reserved prefix (§13): a failure is
+    /// never an unknown outcome, so a text beginning with `unconfirmed: `,
+    /// a server's error relayed as it came say, is recorded behind
+    /// `failed: `, whole, and the row reads parked. No caller's string
+    /// writes the prefix: an intent whose outcome is unknown is
+    /// [`unconfirm_action`](Self::unconfirm_action)'s, which alone does.
     pub fn fail_action(&self, id: i64, error: Option<&str>) -> Result<(), PimdirError> {
-        let Some(error) = error else {
-            self.conn
-                .execute_cached(sql::BUMP_ATTEMPTS, named_params! { ":id": id })
-                .map_err(busy_or_sql)?;
-            return Ok(());
-        };
+        self.lock.verify()?;
+        record_failure(&self.conn, id, error)
+    }
 
-        let error = security::scrub(error);
-        self.conn
-            .execute_cached(
-                sql::PARK_ACTION,
-                named_params! { ":id": id, ":error": error },
-            )
-            .map_err(busy_or_sql)?;
-        Ok(())
+    /// Parks the intent `id` as one whose outcome is unknown (§15.2): its
+    /// performer sent the request and cannot tell whether it took effect,
+    /// a submission whose connection dropped once the message was handed
+    /// over. The row's error is the reserved prefix `unconfirmed: `,
+    /// written here, then `detail`, free text
+    /// [scrubbed](security::scrub) as a failure's is; the attempt is
+    /// counted. Reports whether a row had that id.
+    ///
+    /// No drain lists a parked row, so nothing performs it again of its
+    /// own accord. It leaves the state in three ways only (§15.5):
+    /// confirmed by its performer, which
+    /// [acknowledges](Self::acknowledge_action) it with its receipt once
+    /// it learns the effect was made; retried on a person's request
+    /// ([`retry_action`](Self::retry_action)), who accepts that it may be
+    /// performed twice; or withdrawn ([`drop_action`](Self::drop_action)).
+    /// A producer reads it as an
+    /// [`Unconfirmed`](producer::PimdirActionStatus::Unconfirmed) status.
+    ///
+    /// An action the owner applies itself is never one: its apply is a
+    /// transaction of the store, which commits or does not. A row of such
+    /// an action, a kind [`PimdirAction`] reads as a store action or a
+    /// `set-performer`, is refused as [`PimdirError::NotIntent`], nothing
+    /// written.
+    pub fn unconfirm_action(&mut self, id: i64, detail: &str) -> Result<bool, PimdirError> {
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
+
+        let kind: Option<String> = tx
+            .query_row_cached(sql::LOAD_ACTION, named_params! { ":id": id }, |r| r.get(4))
+            .optional()?;
+        let Some(kind) = kind else {
+            return Ok(false);
+        };
+        if codec::applied_by_owner(&kind) {
+            return Err(PimdirError::NotIntent { id, kind });
+        }
+
+        let error = format!("{}{}", codec::UNCONFIRMED, security::scrub(detail));
+        tx.execute_cached(
+            sql::PARK_ACTION,
+            named_params! { ":id": id, ":error": error },
+        )?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(true)
+    }
+
+    /// Puts a parked row back among the pending ones (`retry_action`,
+    /// §15.5), on a person's request and never of the owner's own accord:
+    /// its error cleared, its id and its attempts kept, so the next drain
+    /// lists it in its place in the append order and it is applied or
+    /// performed as any pending row is. Reports whether a row was put
+    /// back: `false` for one that is pending or gone.
+    ///
+    /// The one way an intent parked `unconfirmed: ` is performed again
+    /// (§15.2), by somebody accepting that it may be performed twice. Any
+    /// parked row is put back, not an unconfirmed one alone: one parked
+    /// for a failure of the store parks again at the next drain.
+    ///
+    /// The row is named as [`drop_action`](Self::drop_action) names it: a
+    /// handle answered by another store, or another incarnation of this
+    /// one, is refused as [`PimdirError::Reset`], and a bare id is taken
+    /// unchecked.
+    pub fn retry_action(
+        &mut self,
+        action: impl Into<PimdirActionHandle>,
+    ) -> Result<bool, PimdirError> {
+        let action = action.into();
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
+
+        let store = producer::store_identity(&tx)?;
+        if !action.names(&store) {
+            return Err(PimdirError::Reset {
+                action,
+                store_id: store.store_id,
+                incarnation: store.incarnation,
+            });
+        }
+
+        let retried = tx
+            .query_row_cached(sql::RETRY_ACTION, named_params! { ":id": action.id }, |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(retried.is_some())
     }
 }
 
@@ -1430,6 +1493,22 @@ impl PimdirSourceStore {
         self.store = self.store.for_account(account);
         self
     }
+}
+
+/// Opens a write transaction of the owner's, `BEGIN IMMEDIATE`, once
+/// `lock` is seen to hold the file still at its path (STORAGE §8): an
+/// owner whose lock file was removed or replaced is refused as
+/// [`PimdirError::LockReplaced`] before anything is written, another
+/// process perhaps owning the store through the new file. A write lock
+/// another connection holds past the busy timeout is
+/// [`PimdirError::Busy`].
+pub(crate) fn begin<'conn>(
+    conn: &'conn mut Connection,
+    lock: &PimdirLock,
+) -> Result<Transaction<'conn>, PimdirError> {
+    lock.verify()?;
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(busy_or_sql)
 }
 
 /// Runs one statement and collects every row through `map`, the statement
@@ -1626,6 +1705,33 @@ pub(crate) fn checkpoint(conn: &Connection) -> Result<(), PimdirError> {
     }
 
     Err(PimdirError::Busy)
+}
+
+/// Records a failed apply of the queue row `id` on `conn`
+/// ([`PimdirStore::fail_action`], §15.2): `None` bumps its attempts,
+/// `Some(error)` parks it under the text, scrubbed, and never under the
+/// reserved prefix, a text beginning with it recorded behind `failed: `.
+pub(crate) fn record_failure(
+    conn: &Connection,
+    id: i64,
+    error: Option<&str>,
+) -> Result<(), PimdirError> {
+    let Some(error) = error else {
+        conn.execute_cached(sql::BUMP_ATTEMPTS, named_params! { ":id": id })
+            .map_err(busy_or_sql)?;
+        return Ok(());
+    };
+
+    let mut error = security::scrub(error);
+    if codec::unconfirmed(&error).is_some() {
+        error.insert_str(0, "failed: ");
+    }
+    conn.execute_cached(
+        sql::PARK_ACTION,
+        named_params! { ":id": id, ":error": error },
+    )
+    .map_err(busy_or_sql)?;
+    Ok(())
 }
 
 /// Deletes one queue row by id (`cancel_action`, §15.5), answering the
@@ -1929,8 +2035,9 @@ pub enum PimdirError {
     /// collector cannot run; retry once it has returned.
     InFlight(PathBuf),
     /// A path of the store is not its user's alone (§18): its directory or
-    /// pimdir.db another user can read or write, or a link where a lock
-    /// file belongs. Nothing in it is opened.
+    /// pimdir.db another user can read or write, a link where a lock
+    /// file belongs, or, to its owner, a local/ that is not a directory
+    /// of its user's alone (§3). Nothing in it is opened.
     Exposed(PathBuf),
     /// A declared source does not support a capability the action needs
     /// (§15.6), so it is not enqueued, or the owner parks it.
@@ -2017,6 +2124,24 @@ pub enum PimdirError {
         /// Its incarnation.
         incarnation: i64,
     },
+    /// A queue row was marked as an intent whose outcome is unknown and
+    /// is an action the owner applies itself (§15.2): its apply is a
+    /// transaction of the store, which commits or does not, so nothing
+    /// was written.
+    NotIntent {
+        /// The row.
+        id: i64,
+        /// Its action.
+        kind: String,
+    },
+    /// The lock file this owner holds locked is no longer the one at its
+    /// path (§8): removed, renamed or replaced, so another process may
+    /// own the store through the new file. Refused before the write
+    /// transaction, nothing written; the handle writes nothing more.
+    LockReplaced(PathBuf),
+    /// A backup was asked into a directory that holds something already
+    /// (§8): nothing was copied.
+    Occupied(PathBuf),
     /// A refresh was asked of an index opened for queries alone (SEARCH
     /// §3).
     #[cfg(feature = "search")]
@@ -2077,6 +2202,9 @@ impl PimdirError {
     /// | `index-version` | `IndexVersion` (feature `search`) |
     /// | `index-zone-unknown` | `IndexZone` (feature `search`) |
     /// | `store-reset` | `Reset` |
+    /// | `action-not-intent` | [`NotIntent`](Self::NotIntent) |
+    /// | `lock-replaced` | [`LockReplaced`](Self::LockReplaced) |
+    /// | `backup-occupied` | [`Occupied`](Self::Occupied) |
     /// | `index-query-only` | `IndexQueryOnly` (feature `search`) |
     /// | `index-refresh-broken` | `Refresh` (feature `search`) |
     pub fn code(&self) -> &'static str {
@@ -2133,6 +2261,9 @@ impl PimdirError {
             #[cfg(feature = "search")]
             Self::IndexZone(_) => "index-zone-unknown",
             Self::Reset { .. } => "store-reset",
+            Self::NotIntent { .. } => "action-not-intent",
+            Self::LockReplaced(_) => "lock-replaced",
+            Self::Occupied(_) => "backup-occupied",
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(_) => "index-query-only",
             #[cfg(feature = "search")]
@@ -2359,6 +2490,20 @@ impl fmt::Display for PimdirError {
             } => write!(
                 f,
                 "Pimdir store is not the one action {action} was queued in: it is {store_id} at incarnation {incarnation}, a restored copy"
+            ),
+            Self::NotIntent { id, kind } => write!(
+                f,
+                "Pimdir action {id} is a {kind} the owner applies itself, never an intent whose outcome is unknown"
+            ),
+            Self::LockReplaced(lock) => write!(
+                f,
+                "Pimdir lock file {} is no longer the one this owner holds: another process may own the store, nothing more is written",
+                lock.display()
+            ),
+            Self::Occupied(target) => write!(
+                f,
+                "Pimdir backup directory {} is not empty",
+                target.display()
             ),
             #[cfg(feature = "search")]
             Self::IndexQueryOnly(index) => write!(

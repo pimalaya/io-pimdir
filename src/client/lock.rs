@@ -11,13 +11,20 @@
 //! - `objects.lock`, held shared by every producer, so a body is never between
 //!   the blob tree and the queue row that pins it while a collector runs.
 //!
+//! A lock file, once created, is never removed, renamed nor replaced
+//! while the store exists (§8): the lock belongs to the open file, so a
+//! process opening a new file at the path would take a lock the holder
+//! of the old one does not exclude. A holder checks, before it writes,
+//! that the file it holds locked is still the one at the path
+//! ([`PimdirLock::verify`]), and gives the store up when it is not.
+//!
 //! The lock lives on the open file description, which is what makes a
 //! crashed owner harmless: the kernel releases it with the process,
 //! leaving a lock file that locks nothing. An `O_EXCL` lock file cannot
 //! promise that, and the escape hatch it needs for a stale one turns
 //! fail-fast into fail-always.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use std::{
     collections::HashMap,
@@ -62,7 +69,7 @@ struct Owned {
     /// The locked description. Closing it is what releases the lock, so
     /// it is dropped inside the registry's critical section and never
     /// merely unreferenced.
-    _file: File,
+    file: File,
     handles: usize,
     /// What the process's own writers, verbs and collector serialise on.
     shared: Arc<Shared>,
@@ -83,6 +90,10 @@ struct Shared {
     /// by the collector under it held exclusively, so none starts while
     /// a collection runs.
     running: AtomicUsize,
+    /// Set once the locked file was found replaced at its path (§8): the
+    /// holder gave the store up, and every later check fails without
+    /// looking, the file put back or not.
+    lost: AtomicBool,
 }
 
 /// An advisory lock on a store directory, held for as long as it lives.
@@ -93,7 +104,9 @@ pub struct PimdirLock {
     ///
     /// `None` for an owner lock, whose description belongs to [`OWNED`].
     /// Exactly one of this and `registered` is set.
-    _file: Option<File>,
+    file: Option<File>,
+    /// The path the locked file was opened at.
+    path: PathBuf,
     /// The [`OWNED`] key whose count to drop on release.
     registered: Option<PathBuf>,
     /// What the handles sharing an owner lock serialise on. Unused on a
@@ -130,6 +143,7 @@ impl PimdirLock {
     /// the program on top can pick.
     pub fn own(dir: &Path) -> Result<Arc<Self>, PimdirError> {
         let key = dir.canonicalize()?;
+        let path = dir.join(OWNER);
         let mut owned = OWNED.lock().unwrap_or_else(PoisonError::into_inner);
 
         let shared = match owned.get_mut(&key) {
@@ -138,13 +152,13 @@ impl PimdirLock {
                 Arc::clone(&entry.shared)
             }
             None => {
-                let file = open(&dir.join(OWNER))?;
+                let file = open(&path)?;
                 FileExt::try_lock(&file).map_err(|_| PimdirError::Owned(dir.to_path_buf()))?;
                 let shared = Arc::default();
                 owned.insert(
                     key.clone(),
                     Owned {
-                        _file: file,
+                        file,
                         handles: 1,
                         shared: Arc::clone(&shared),
                     },
@@ -154,10 +168,58 @@ impl PimdirLock {
         };
 
         Ok(Arc::new(Self {
-            _file: None,
+            file: None,
+            path,
             registered: Some(key),
             shared,
         }))
+    }
+
+    /// Checks that the file this lock holds locked is still the one at
+    /// its path (§8), before a write: on Unix, `fstat` on the held
+    /// description and `lstat` on the path answering one device and one
+    /// inode. A file removed, renamed or replaced is
+    /// [`PimdirError::LockReplaced`], naming the path: a process opening
+    /// the new file takes a lock this one does not exclude, so the holder
+    /// gives the store up, and every later check fails the same way,
+    /// whatever the path holds by then. Elsewhere a locked file cannot be
+    /// replaced under its holder, and the check passes.
+    pub fn verify(&self) -> Result<(), PimdirError> {
+        let replaced = || PimdirError::LockReplaced(self.path.clone());
+        if self.shared.lost.load(Ordering::Acquire) {
+            return Err(replaced());
+        }
+
+        let same = match (&self.file, &self.registered) {
+            (Some(file), _) => same_file(file, &self.path),
+            (None, Some(key)) => OWNED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(key)
+                .is_some_and(|owned| same_file(&owned.file, &self.path)),
+            (None, None) => false,
+        };
+        if !same {
+            self.shared.lost.store(true, Ordering::Release);
+            return Err(replaced());
+        }
+
+        Ok(())
+    }
+
+    /// Whether this handle is the only one of its process holding the
+    /// owner lock: what replacing a store's files asks, no other handle
+    /// keeping a connection to the files replaced.
+    pub(crate) fn sole(&self) -> bool {
+        let Some(key) = &self.registered else {
+            return false;
+        };
+
+        OWNED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|owned| owned.handles == 1)
     }
 
     /// Takes the store's staging lock exclusively: the collector's half of the
@@ -169,10 +231,12 @@ impl PimdirLock {
     /// The owner side needs no separate acquisition, a collector running
     /// on a handle that already holds the owner lock.
     pub fn collect(dir: &Path) -> Result<Self, PimdirError> {
-        let file = open(&dir.join(OBJECTS))?;
+        let path = dir.join(OBJECTS);
+        let file = open(&path)?;
         FileExt::try_lock(&file).map_err(|_| PimdirError::Staging(dir.to_path_buf()))?;
         Ok(Self {
-            _file: Some(file),
+            file: Some(file),
+            path,
             registered: None,
             shared: Arc::default(),
         })
@@ -189,10 +253,12 @@ impl PimdirLock {
     /// rather than failing: the only thing it waits for is a collector,
     /// whose work is bounded.
     pub fn stage(dir: &Path) -> Result<Self, PimdirError> {
-        let file = open(&dir.join(OBJECTS))?;
+        let path = dir.join(OBJECTS);
+        let file = open(&path)?;
         FileExt::lock_shared(&file)?;
         Ok(Self {
-            _file: Some(file),
+            file: Some(file),
+            path,
             registered: None,
             shared: Arc::default(),
         })
@@ -202,10 +268,12 @@ impl PimdirLock {
     /// holding it exclusively is [`PimdirError::Busy`], reported at once. What
     /// a producer's probe takes and releases.
     pub fn try_stage(dir: &Path) -> Result<Self, PimdirError> {
-        let file = open(&dir.join(OBJECTS))?;
+        let path = dir.join(OBJECTS);
+        let file = open(&path)?;
         FileExt::try_lock_shared(&file).map_err(|_| PimdirError::Busy)?;
         Ok(Self {
-            _file: Some(file),
+            file: Some(file),
+            path,
             registered: None,
             shared: Arc::default(),
         })
@@ -357,6 +425,25 @@ pub(crate) fn open(path: &Path) -> Result<File, PimdirError> {
         .write(true)
         .truncate(false)
         .open(path)?)
+}
+
+/// Whether `file`, held open, is the file at `path`, read without
+/// following a link: one device and one inode (STORAGE §8).
+#[cfg(unix)]
+fn same_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(held), Ok(at)) => held.dev() == at.dev() && held.ino() == at.ino(),
+        _ => false,
+    }
+}
+
+/// Whether `file`, held open, is the file at `path`: taken as so where a
+/// locked file cannot be removed nor replaced under its holder.
+#[cfg(not(unix))]
+fn same_file(_file: &File, _path: &Path) -> bool {
+    true
 }
 
 /// Whether a symbolic link sits at `path`.

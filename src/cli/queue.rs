@@ -37,6 +37,8 @@ pub enum QueueCommand {
     List(QueueListCommand),
     /// Drop one queued action by its id.
     Cancel(QueueCancelCommand),
+    /// Put one parked action back among the pending ones.
+    Retry(QueueRetryCommand),
     /// Show where one action stands, by the id its enqueue answered.
     Status(QueueStatusCommand),
 }
@@ -47,6 +49,7 @@ impl QueueCommand {
         match self {
             Self::List(cmd) => cmd.execute(printer, store),
             Self::Cancel(cmd) => cmd.execute(printer, store),
+            Self::Retry(cmd) => cmd.execute(printer, store),
             Self::Status(cmd) => cmd.execute(printer, store),
         }
     }
@@ -56,7 +59,9 @@ impl QueueCommand {
 ///
 /// Pending actions are the ones the owner will apply at its next drain.
 /// `--parked` shows the ones it refused instead: each carries the failure that
-/// parked it, and none of them will ever be applied without an operator.
+/// parked it, and none of them will ever be applied without an operator. A
+/// parked intent whose outcome is unknown, sent and never confirmed, is marked
+/// unconfirmed: it may have taken effect.
 #[derive(Debug, Args)]
 pub struct QueueListCommand {
     /// List the parked actions instead of the pending ones.
@@ -73,6 +78,7 @@ impl QueueListCommand {
 
         if self.parked {
             for action in store.parked_actions().map_err(report)? {
+                let unconfirmed = action.unconfirmed().is_some();
                 rows.push(QueueRow {
                     row: action.id,
                     created_at: action.created_at,
@@ -82,6 +88,7 @@ impl QueueListCommand {
                     target: action.payload.clone(),
                     payload: action.payload,
                     attempts: action.attempts,
+                    unconfirmed,
                     error: Some(action.error),
                 });
             }
@@ -100,6 +107,7 @@ impl QueueListCommand {
                                 target: summary(&action.action),
                                 payload: action_to_payload(&action.action),
                                 attempts: action.attempts,
+                                unconfirmed: false,
                                 error: None,
                             });
                         }
@@ -163,10 +171,59 @@ impl QueueCancelCommand {
     }
 }
 
+/// Put one parked action back among the pending ones, by the id `queue
+/// list --parked` prints or the handle its enqueue answered.
+///
+/// The next drain applies or performs it in its place in the append order.
+/// Nothing retries a parked action otherwise. An action parked for a
+/// failure that still stands parks again. An intent parked unconfirmed was
+/// sent and may have taken effect: retrying it may perform it twice (a
+/// message sent twice), so it asks first unless `--yes` is passed.
+#[derive(Debug, Args)]
+pub struct QueueRetryCommand {
+    /// Id of the parked action to retry, or its handle (the store id, the
+    /// incarnation and the id joined by periods): a handle is refused when
+    /// the store is no longer the one that answered it.
+    #[arg(value_name = "ACTION")]
+    pub action: PimdirActionHandle,
+
+    /// Do not ask for confirmation.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+impl QueueRetryCommand {
+    /// Puts the action back.
+    pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
+        let id = self.action.id;
+        let mut owner = store.owner()?;
+
+        let status = owner.action_status(&self.action).map_err(report)?;
+        let unconfirmed = matches!(status, PimdirActionStatus::Unconfirmed { .. });
+        if unconfirmed {
+            confirm(
+                printer,
+                self.yes,
+                &format!("Action {id} may have taken effect already. Perform it again?"),
+            )?;
+        }
+
+        if !owner.retry_action(self.action).map_err(report)? {
+            return Err(ErrorCode::RowNotFound.error(format!("no parked action with id {id}")));
+        }
+
+        printer.out(QueueRetryOutput {
+            row: id,
+            unconfirmed,
+        })
+    }
+}
+
 /// Show where one action stands, by the handle or the id its enqueue
 /// answered.
 ///
-/// Pending or parked while its row is queued; once the owner applied it,
+/// Pending or parked while its row is queued, unconfirmed when it is an
+/// intent sent whose outcome nobody knows; once the owner applied it,
 /// or performed and acknowledged an intent, its receipt says so and, for
 /// an add, names the seq of the item it created. A receipt is kept a week
 /// at least; an id found nowhere was cancelled, or applied before that. A
@@ -218,6 +275,18 @@ impl QueueStatusCommand {
                 output.attempts = Some(attempts);
                 output.error = Some(error);
             }
+            PimdirActionStatus::Unconfirmed {
+                collection,
+                kind,
+                attempts,
+                detail,
+            } => {
+                output.status = QueueStatus::Unconfirmed;
+                output.collection = Some(collection);
+                output.kind = Some(kind);
+                output.attempts = Some(attempts);
+                output.error = Some(detail);
+            }
             PimdirActionStatus::Applied {
                 applied_at,
                 collection,
@@ -244,6 +313,10 @@ pub enum QueueStatus {
     Pending,
     /// Queued, refused by the owner until an operator acts.
     Parked,
+    /// Queued and parked, an intent sent whose outcome is unknown: it may
+    /// have taken effect, and waits for its performer to confirm it, or
+    /// for an operator to retry or cancel it.
+    Unconfirmed,
     /// Applied, its receipt still kept.
     Applied,
     /// Found nowhere: cancelled, or applied before its receipt was pruned.
@@ -268,7 +341,8 @@ pub struct QueueStatusOutput {
     pub kind: Option<String>,
     /// Apply attempts so far, while queued.
     pub attempts: Option<i64>,
-    /// The failure that parked it.
+    /// The failure that parked it, or what its performer recorded of an
+    /// unconfirmed intent.
     pub error: Option<String>,
     /// When the owner applied it.
     pub applied_at: Option<String>,
@@ -285,6 +359,11 @@ impl fmt::Display for QueueStatusOutput {
             QueueStatus::Parked => writeln!(
                 f,
                 "Action {id} is parked on {collection}: {}",
+                or_dash(self.error.as_deref())
+            ),
+            QueueStatus::Unconfirmed => writeln!(
+                f,
+                "Action {id} is unconfirmed on {collection}, sent and maybe performed: {}",
                 or_dash(self.error.as_deref())
             ),
             QueueStatus::Applied => match (self.seq, &self.collection) {
@@ -407,6 +486,9 @@ pub struct QueueRow {
     pub target: String,
     /// Apply attempts so far.
     pub attempts: i64,
+    /// Whether the row is a parked intent whose outcome is unknown: sent,
+    /// and maybe performed.
+    pub unconfirmed: bool,
     /// The failure that parked the row, when parked.
     pub error: Option<String>,
 }
@@ -447,9 +529,14 @@ impl fmt::Display for QueueOutput {
                     fields.push("Error", sanitize::text(error));
                 }
 
+                let state = match action.unconfirmed {
+                    true => vec![String::from("unconfirmed")],
+                    false => Vec::new(),
+                };
+
                 records.push(Record {
                     title: action.row.to_string(),
-                    state: Vec::new(),
+                    state,
                     fields,
                     body: String::new(),
                 });
@@ -490,6 +577,23 @@ impl fmt::Display for QueueCancelOutput {
     }
 }
 
+/// The `queue retry` output.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueRetryOutput {
+    /// The queue row put back among the pending ones.
+    pub row: i64,
+    /// Whether it was an intent whose outcome is unknown, which may now
+    /// be performed a second time.
+    pub unconfirmed: bool,
+}
+
+impl fmt::Display for QueueRetryOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Queued action {} is pending again", self.row)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cli::queue::*;
@@ -507,6 +611,7 @@ mod tests {
                 payload: String::from("{\"seq\":1}"),
                 target: String::from("{\"seq\":1}"),
                 attempts: 3,
+                unconfirmed: false,
                 error: Some(String::from("no such seq\u{7}")),
             }],
             undecodable: Vec::new(),

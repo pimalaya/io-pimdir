@@ -97,6 +97,7 @@ fn a_producer_appends_while_another_process_owns_the_store() {
             None,
         )
         .unwrap()
+        .handle
         .id;
     assert_eq!(id, 1);
 }

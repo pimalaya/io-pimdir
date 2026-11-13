@@ -17,8 +17,9 @@ status: current
 - `Copy`: stage a `Created` placement in a target under the identity's provisional handle (below), carrying the source origin; the source is untouched.
 - `Move`: stage a `Created` placement in the target under the identity's provisional handle (carrying the source origin), **and** tombstone the source. A move is thus a copy into the target plus a remove from the source, both derived on the next sync; the source's tombstone and the target's create land in their respective collection hubs. The destination the tombstone carries is what the store derives from the target's pending create on every load (pimdir SYNC §3); the one staged here serves a consumer keeping the placement as written.
 - `Add`: see below.
+- `Abandon { handle }`: give up a delivered create whose member never arrived, on a person's request (below). It has no queue action.
 
-A mutation SHALL touch the local replica only; the remote is reconciled by sync. It answers a `PimdirMutateReport` whose `events` carry the `Overruled` its write reported, a body a policy did not adopt kept as a retained item ([hub](hub.md), vectors/sync/85, 86), once the write committed.
+A mutation SHALL touch the local replica only; the remote is reconciled by sync. It answers a `PimdirMutateReport` whose `events` carry the `Overruled` its write reported, a body a policy did not adopt kept as a retained item ([hub](hub.md), vectors/sync/85, 86), and the `Abandoned` of a delivered create given up, once the write committed.
 
 ### Requirement: Add stages a locally-authored create
 `PimdirMutation::Add { link_id, flags, object, body, summary, sort_key }` SHALL stage a brand-new item with no remote origin (compose, import): a `PimdirStatus::Created` placement in the coroutine's collection under the link id's provisional handle, at `level = Full`, with `base = None` and `origin = None`, pointing at `object`; plus a `StoreObject` carrying `body`. Because the create has no origin, the next sync SHALL push it as `PimdirChange::Add { origin: None }`, an append that uploads the body rather than a server-side copy. `Add` SHALL NOT require an existing source placement, and SHALL fail (`PimdirMutateError::LinkExists`) rather than overwrite when a live (non-tombstone) placement already holds `link_id`; a tombstoned `link_id` does not block the create.
@@ -147,3 +148,11 @@ An `Edit` stating `overrule`, a settle by a rule of the engine's or a connector'
 
 #### Scenario: The vectors
 - vectors/sync 100 (a binding conflict), 101 (refused over an unread body), 102 (an item conflict), 103 (no overrule keeps nothing), tests/vectors_sync.rs; tests/overrule.rs `an_overruling_edit_over_an_unread_item_conflict_is_refused`
+
+### Requirement: A delivered create is given up on request alone
+`PimdirMutation::Abandon { handle }` SHALL give up a delivered create (`PimdirPlacement::delivered`: based under its provisional handle) of the run's source (pimdir SYNC §5, §7): it stages a `Deleted` drop of the provisional handle and nothing else, so the write marks the item deleted and, no other source binding it, retains it with its body, its summary and the flags staged on it, a `Remove` or a relocation held on it given up with the binding. It pushes nothing, and its report carries `PimdirSyncEvent::Abandoned(handle)`, the provisional handle. On any other placement, a pending create (which a `Remove` withdraws) or a member a listing named (which one removes), it SHALL fail as `PimdirMutateError::NotDelivered` (`create-not-delivered`), staging nothing. No sync, no round's absence and no count of runs gives a delivered create up, and no queue action names an `Abandon`: an owner stages it on a person's request, through `PimdirSourceStore::mutate`. Another source binding the item projects a `Tombstone` for it, as for any member gone from a source ([hub](hub.md)); no vector holds two sources, and the standard leaves that reading to its owner.
+
+An `Edit` or a `Remove` carrying `if_match` SHALL be refused (`Replaced`, `held` `None`) over a placement holding no body, as over one holding another (pimdir SYNC §7, vectors/sync/153, 154).
+
+#### Scenario: The vectors, and a tombstoned one
+- vectors/sync 150 (given up, retained, reported), 151 (refused on a pending create), 153, 154, tests/vectors_sync.rs; tests/store_text.rs `a_delivered_create_is_abandoned_on_request_alone` (a tombstoned delivered create goes with its held remove, which no vector states)

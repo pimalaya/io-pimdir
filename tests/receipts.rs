@@ -56,6 +56,7 @@ fn an_applied_add_names_the_item_it_created() {
     let id = producer
         .enqueue("Drafts", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
     assert_eq!(
         producer.action_status(id).unwrap(),
@@ -102,6 +103,7 @@ fn a_parked_row_reads_with_its_error_and_a_cancelled_one_nowhere() {
             None,
         )
         .unwrap()
+        .handle
         .id;
     let flags = producer
         .enqueue(
@@ -114,11 +116,13 @@ fn a_parked_row_reads_with_its_error_and_a_cancelled_one_nowhere() {
             None,
         )
         .unwrap()
+        .handle
         .id;
     let (action, object) = add(&producer, DRAFT);
     let cancelled = producer
         .enqueue("Drafts", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
     assert!(
         PimdirStore::open(dir.path())
@@ -160,10 +164,12 @@ fn a_duplicate_add_parks_and_names_no_item() {
     let first = producer
         .enqueue("Drafts", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
     let second = producer
         .enqueue("Drafts", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
 
     drain(dir.path());
@@ -187,6 +193,7 @@ fn an_old_receipt_is_pruned() {
     let id = producer
         .enqueue("Drafts", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
     drain(dir.path());
 
@@ -247,10 +254,12 @@ fn an_acknowledged_intent_reads_applied_and_a_dropped_one_nowhere() {
     let sent = producer
         .enqueue("INBOX", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
     let withdrawn = producer
         .enqueue("INBOX", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
     assert_eq!(refcount(dir.path(), &object), 2);
 
@@ -291,6 +300,7 @@ fn a_parked_intent_is_acknowledged_too() {
     let id = producer
         .enqueue("INBOX", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
 
     let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
@@ -318,6 +328,7 @@ fn a_receipt_outlives_its_collection_and_names_none() {
     let id = producer
         .enqueue("Drafts", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
     drain(dir.path());
     let PimdirActionStatus::Applied { seq: created, .. } = producer.action_status(id).unwrap()
@@ -349,6 +360,7 @@ fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
     let id = producer
         .enqueue("INBOX", &action, Some(&object))
         .unwrap()
+        .handle
         .id;
 
     let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");

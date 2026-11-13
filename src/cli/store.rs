@@ -1,20 +1,30 @@
-//! The `store` verb group: the one-screen summary of a store.
+//! The `store` verb group: the one-screen summary of a store, and its
+//! copies, a backup and a restore (STORAGE §8).
 
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use io_pimdir::client::{PimdirStore, backup::PimdirCopyReport};
 use pimalaya_cli::{columns::Columns, fields::Fields, printer::Printer, sanitize};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::cli::{StoreFlags, bytes, error::report};
+use crate::cli::{
+    StoreFlags, bytes, confirm,
+    error::{partial, report},
+    or_dash,
+};
 
-/// Inspect the store as a whole.
+/// Inspect the store as a whole, and copy it.
 #[derive(Debug, Subcommand)]
 pub enum StoreCommand {
     /// Summarise the store: identity, versions, sources, counts and bytes.
     Info(StoreInfoCommand),
+    /// Copy the store into a directory, consistently, while it runs.
+    Backup(StoreBackupCommand),
+    /// Put a backup back as the store, under a new incarnation.
+    Restore(StoreRestoreCommand),
 }
 
 impl StoreCommand {
@@ -22,7 +32,174 @@ impl StoreCommand {
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         match self {
             Self::Info(cmd) => cmd.execute(printer, store),
+            Self::Backup(cmd) => cmd.execute(printer, store),
+            Self::Restore(cmd) => cmd.execute(printer, store),
         }
+    }
+}
+
+/// Copy the store into a directory: its database, its bodies, its
+/// quarantine and its owner's local state.
+///
+/// The database is copied as of one instant, whatever a sync writes
+/// meanwhile, and no body it names can be collected during the copy, so
+/// the backup is consistent and may be taken while the store is in use.
+/// The directory must not exist yet, or be empty. The lock files and the
+/// search index are not copied: the index is rebuilt from the store.
+///
+/// Exits 2 once the result is printed when an entry was left out: a link
+/// or a file that is not the store's.
+#[derive(Debug, Args)]
+pub struct StoreBackupCommand {
+    /// The directory to copy the store into.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+}
+
+impl StoreBackupCommand {
+    /// Copies the store.
+    pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
+        let copied = store.read()?.backup(&self.dir).map_err(report)?;
+        let short = !copied.skipped.is_empty();
+
+        printer.out(StoreCopyOutput::new(self.dir, None, None, copied))?;
+
+        match short {
+            true => Err(partial()),
+            false => Ok(()),
+        }
+    }
+}
+
+/// Put a backup back as the store, replacing the store there.
+///
+/// The store at `--store` is replaced by the backup: its database and its
+/// owner's local state are the backup's, its bodies are put back. The
+/// restored store answers a new incarnation, so every program following
+/// it (a search index, a frontend's queued actions) reads it afresh rather
+/// than take it for the store it knew. Nothing else may have the store
+/// open: a sync running refuses it.
+///
+/// Destructive when a store is there (what it held since the backup is
+/// gone), so it asks first unless `--yes` is passed.
+///
+/// Exits 2 once the result is printed when an entry of the backup was
+/// left out: a link or a file that is not the store's.
+#[derive(Debug, Args)]
+pub struct StoreRestoreCommand {
+    /// The directory `store backup` wrote.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+
+    /// Do not ask for confirmation.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+impl StoreRestoreCommand {
+    /// Restores the backup.
+    pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
+        if store.dir().join("pimdir.db").exists() {
+            confirm(
+                printer,
+                self.yes,
+                &format!(
+                    "Replace the store at {} with the backup at {}?",
+                    store.dir().display(),
+                    self.dir.display()
+                ),
+            )?;
+        }
+
+        let restored = PimdirStore::restore(store.dir(), &self.dir).map_err(report)?;
+        let short = !restored.copied.skipped.is_empty();
+
+        printer.out(StoreCopyOutput::new(
+            store.dir().to_path_buf(),
+            Some(restored.incarnation),
+            restored.replaced,
+            restored.copied,
+        ))?;
+
+        match short {
+            true => Err(partial()),
+            false => Ok(()),
+        }
+    }
+}
+
+/// The `store backup` and `store restore` output.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreCopyOutput {
+    /// The directory written: the backup, or the restored store.
+    pub path: PathBuf,
+    /// The incarnation the restored store answers, `null` for a backup.
+    pub incarnation: Option<i64>,
+    /// The incarnation of the store a restore replaced, `null` for a
+    /// backup, and when there was none or it could not be read.
+    pub replaced: Option<i64>,
+    /// Bodies copied.
+    pub objects: usize,
+    /// Quarantined files copied.
+    pub quarantined: usize,
+    /// Files of the owner's local state copied.
+    pub local: usize,
+    /// What those files weigh, the database left out.
+    pub bytes: u64,
+    /// Files the target held already under their name, left as they were.
+    pub kept: usize,
+    /// Entries left out: links and files that are not the store's.
+    pub skipped: Vec<PathBuf>,
+}
+
+impl StoreCopyOutput {
+    /// The output of a copy into `path`.
+    fn new(
+        path: PathBuf,
+        incarnation: Option<i64>,
+        replaced: Option<i64>,
+        copied: PimdirCopyReport,
+    ) -> Self {
+        Self {
+            path,
+            incarnation,
+            replaced,
+            objects: copied.objects,
+            quarantined: copied.quarantined,
+            local: copied.local,
+            bytes: copied.bytes,
+            kept: copied.kept,
+            skipped: copied.skipped,
+        }
+    }
+}
+
+impl fmt::Display for StoreCopyOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = self.path.to_string_lossy();
+        let mut fields = Fields::default();
+
+        fields.push("Path", sanitize::text(&path));
+        if let Some(incarnation) = self.incarnation {
+            let replaced = self.replaced.map(|replaced| replaced.to_string());
+            fields.push("Incarnation", incarnation);
+            fields.push("Replaced", or_dash(replaced.as_deref()));
+        }
+        fields.push("Objects", self.objects);
+        fields.push("Quarantined", self.quarantined);
+        fields.push("Local files", self.local);
+        fields.push("Bytes", bytes(self.bytes));
+        fields.push("Kept", self.kept);
+
+        write!(f, "{fields}")?;
+
+        for skipped in &self.skipped {
+            let skipped = skipped.to_string_lossy();
+            writeln!(f, "Left out: {}", sanitize::text(&skipped))?;
+        }
+
+        Ok(())
     }
 }
 

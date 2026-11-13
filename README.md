@@ -90,7 +90,10 @@ pimdir -s ~/mail item restore 42
 pimdir -s ~/mail item purge --older-than 90d
 pimdir -s ~/mail item erase 42
 pimdir -s ~/mail queue list --parked
-pimdir -s ~/mail check
+pimdir -s ~/mail queue retry 7
+pimdir -s ~/mail check --deep
+pimdir -s ~/mail store backup ~/backups/mail
+pimdir -s ~/mail store restore ~/backups/mail
 pimdir -s ~/mail quarantine empty
 ```
 

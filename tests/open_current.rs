@@ -124,6 +124,7 @@ fn a_cancel_leaves_a_store_of_another_draft_as_it_was() {
             None,
         )
         .unwrap()
+        .handle
         .id;
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch(

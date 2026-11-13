@@ -1,14 +1,16 @@
 //! # The queue
 //!
 //! The producer role (STORAGE §8, §15.1), whose only write is the
-//! enqueue transaction, and the owner's drain (§15.2), which stages each
-//! action through the mutate verb and deletes its row in one transaction.
+//! enqueue transaction, one action or a batch of them, and the owner's
+//! drain (§15.2), which stages each action through the mutate verb and
+//! deletes its row under one savepoint, a bounded run of them in one
+//! transaction.
 
 use core::slice;
 
 use alloc::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
     vec,
@@ -31,13 +33,13 @@ use crate::{
     },
     change::PimdirWriteOp,
     client::{
-        PimdirDuplicate, PimdirError, PimdirSourceStore, PreparedCached, bind_list,
+        PimdirDuplicate, PimdirError, PimdirSourceStore, PreparedCached, begin, bind_list,
         blobs::{self, PimdirBlobCheck, PimdirBlobStage, PimdirBlobWriter, PimdirBlobs},
         busy_or_sql, capability,
         lock::PimdirLock,
         modes, prepare_connection,
         reader::{PimdirItem, item_from_row},
-        record_receipt, rows, schema, write,
+        record_failure, record_receipt, rows, schema, write,
     },
     codec::{
         self, PimdirAction, PimdirActionError, PimdirActionHandle, PimdirPayloadOutcome,
@@ -83,7 +85,7 @@ use crate::{
 /// let object = Some(&object);
 ///
 /// match producer.enqueue_add("contacts", &link_id, flags, object, None) {
-///     Ok(row) => println!("queued as action {row}"),
+///     Ok(queued) => println!("queued as action {}", queued.handle),
 ///     Err(err) => println!("{}: {err}", err.code()),
 /// }
 /// # Ok(())
@@ -250,8 +252,9 @@ impl PimdirProducer {
         self
     }
 
-    /// Appends one action to a collection's queue (§15.1), returning the
-    /// row's handle, its id under the store's identity (§4.5):
+    /// Appends one action to a collection's queue (§15.1), answering the
+    /// row's handle, its id under the store's identity (§4.5), and the
+    /// partial supports the gate passed the action with:
     /// `ensure_collection`, at most one object upsert for the body the
     /// caller staged through [`stage_body`](Self::stage_body) and passes as
     /// `object`, hash and size together, the pin of the hash the action
@@ -261,24 +264,26 @@ impl PimdirProducer {
     /// An action whose payload its schema under payloads/ refuses (§15.3),
     /// an `add` without its `object` or a flag set never read among them,
     /// is [`PimdirError::Action`] naming the member, and nothing is
-    /// written. The action then passes the producer's gate of §15.6: one a
-    /// declared source does not support is [`PimdirError::Unsupported`],
-    /// an intent without a performer [`PimdirError::NoPerformer`] or
-    /// [`PimdirError::Ambiguous`]. [`check`](Self::check) runs the gate
-    /// alone, for the partial supports worth showing; the owner's backstop
-    /// runs it again before it applies the action.
+    /// written. The action then passes the producer's gate of §15.6, once:
+    /// one a declared source does not support is
+    /// [`PimdirError::Unsupported`], an intent without a performer
+    /// [`PimdirError::NoPerformer`] or [`PimdirError::Ambiguous`], and the
+    /// partial supports it passes with are answered, each worth showing.
+    /// [`check`](Self::check) runs the gate alone, for a frontend showing
+    /// them before the user confirms; the owner's backstop runs it again
+    /// before it applies the action.
     pub fn enqueue(
         &mut self,
         collection: &str,
         action: &PimdirAction,
         object: Option<&PimdirObject>,
-    ) -> Result<PimdirActionHandle, PimdirError> {
-        Ok(self.append(collection, action, object, None, None)?.handle)
+    ) -> Result<PimdirEnqueued, PimdirError> {
+        self.append(collection, action, object, None, None)
     }
 
     /// Appends an `add` creating an item under `link_id` (§15.1, §15.3),
-    /// returning the row's handle, as [`enqueue`](Self::enqueue) does with
-    /// the body [`stage_body`](Self::stage_body) answered as `object`.
+    /// as [`enqueue`](Self::enqueue) does with the body
+    /// [`stage_body`](Self::stage_body) answered as `object`.
     ///
     /// Refuses, appending nothing, a link id the drain would park: one a
     /// live item of the collection holds (`live_item_for_link`) and no
@@ -292,21 +297,20 @@ impl PimdirProducer {
         flags: PimdirFlags,
         object: Option<&PimdirObject>,
         supersedes: Option<PimdirSupersedes>,
-    ) -> Result<PimdirActionHandle, PimdirError> {
+    ) -> Result<PimdirEnqueued, PimdirError> {
         let action = PimdirAction::Add {
             link_id: Some(link_id.clone()),
             flags,
             object: object.map(|object| object.hash.clone()),
             supersedes,
         };
-        Ok(self
-            .append(collection, &action, object, None, Some(link_id))?
-            .handle)
+        self.append(collection, &action, object, None, Some(link_id))
     }
 
     /// Stages `body` and appends the action `action` builds from its hash
-    /// as one step (§15.1), answering the row's handle: the gate of §15.6
-    /// and, for an `add`, the duplicate check of
+    /// as one step (§15.1), answering what [`enqueue`](Self::enqueue)
+    /// does, the partial supports read with the body in hand: the gate of
+    /// §15.6 and, for an `add`, the duplicate check of
     /// [`enqueue_add`](Self::enqueue_add) run on the bytes in hand before
     /// anything reaches the blob tree, so a refused write leaves no body
     /// behind. An `add` naming no link id is checked under the key the
@@ -316,26 +320,7 @@ impl PimdirProducer {
     /// The calls staging first ([`stage_body`](Self::stage_body), then
     /// [`enqueue`](Self::enqueue) or [`enqueue_add`](Self::enqueue_add))
     /// leave a refused write's body unpinned in the tree, for the collector.
-    ///
-    /// [`enqueue_with_body_checked`](Self::enqueue_with_body_checked) is
-    /// the same step answering the partial supports the gate passed the
-    /// action with as well.
     pub fn enqueue_with_body(
-        &mut self,
-        collection: &str,
-        body: &[u8],
-        action: impl FnOnce(PimdirHash) -> PimdirAction,
-    ) -> Result<PimdirActionHandle, PimdirError> {
-        Ok(self
-            .enqueue_with_body_checked(collection, body, action)?
-            .handle)
-    }
-
-    /// [`enqueue_with_body`](Self::enqueue_with_body), answering the row's
-    /// handle and the partial supports the action passed the gate of §15.6
-    /// with, read with the body in hand: what [`check`](Self::check) would
-    /// answer, for the frontend to show, without running the gate again.
-    pub fn enqueue_with_body_checked(
         &mut self,
         collection: &str,
         body: &[u8],
@@ -346,17 +331,7 @@ impl PimdirProducer {
             size: body.len(),
         };
         let action = action(object.hash.clone());
-        let fresh = match &action {
-            PimdirAction::Add {
-                link_id: Some(link_id),
-                ..
-            } => Some(link_id.clone()),
-            PimdirAction::Add { link_id: None, .. } => {
-                let kind = write::kind_of(&self.conn, collection)?;
-                summary::derive(&kind, body).map(|derived| derived.link_id)
-            }
-            _ => None,
-        };
+        let fresh = self.fresh(collection, &action, Some(body))?;
         self.append(
             collection,
             &action,
@@ -366,9 +341,9 @@ impl PimdirProducer {
         )
     }
 
-    /// [`enqueue_with_body_checked`](Self::enqueue_with_body_checked) for a
-    /// resource the user did not write as it stands (an invitation added
-    /// to a calendar, an imported file, a resource copied from a message):
+    /// [`enqueue_with_body`](Self::enqueue_with_body) for a resource the
+    /// user did not write as it stands (an invitation added to a
+    /// calendar, an imported file, a resource copied from a message):
     /// into a calendar or an address book, every property `X-PIMDIR-`
     /// names is removed from `body` first (STORAGE §18), so no instruction
     /// to a performer enters the queue with it. The action is built from
@@ -383,27 +358,96 @@ impl PimdirProducer {
             "text/calendar" | "text/vcard" => Cow::Owned(summary::strip_instructions(body)),
             _ => Cow::Borrowed(body),
         };
-        self.enqueue_with_body_checked(collection, &body, action)
+        self.enqueue_with_body(collection, &body, action)
     }
 
-    /// The enqueue transaction, refusing an add whose `fresh` link id is
-    /// taken first when one is given; `body`, the bytes of `object` when
-    /// the caller has not staged them, is gated in hand and written once
-    /// every check passed. Answers the row's handle and the partial supports
-    /// the gate passed the action with.
+    /// Appends several actions in one transaction (§15.1), all of them or
+    /// none, in the order given, which their ids keep: each on the terms
+    /// of [`enqueue`](Self::enqueue), its payload typed, the gate of
+    /// §15.6 run once on it, an `add` checked as
+    /// [`enqueue_add`](Self::enqueue_add) checks it, its body stored and
+    /// pinned with its row. Answers, per action and in order, the row's
+    /// handle and the partial supports its gate passed it with.
     ///
-    /// The staging lock is held across whatever body the action names
-    /// (§8): a body this producer staged holds it already, one given in
-    /// hand takes it for the write, and one named by its hash alone, which
-    /// the store held when the caller read it, takes it and is verified
-    /// against its name under it before a row pins it, so a collector
-    /// never takes the body between the two. A named body the blob
-    /// directory does not hold is [`PimdirError::Io`], kind
-    /// [`NotFound`](io::ErrorKind::NotFound), one failing its name the
-    /// failure a write meeting it answers
-    /// ([`InvalidData`](io::ErrorKind::InvalidData), naming it), and
-    /// nothing is queued. An append that fails closes a window it alone
-    /// opened.
+    /// The first action refused refuses the batch with its error, nothing
+    /// appended and no body written: an action is gated, and an `add`
+    /// checked, over the store as the actions before it in the batch
+    /// leave its queue (a performer one of them chose, a key one of them
+    /// takes), and every body given in hand reaches the blob tree only
+    /// once the last action passed. The staging lock is held across them
+    /// all (§8), until the transaction commits.
+    ///
+    /// An `add` is checked under the key it states, or the one the owner
+    /// derives from the body given in hand.
+    pub fn enqueue_batch(
+        &mut self,
+        batch: &[PimdirEnqueue<'_>],
+    ) -> Result<Vec<PimdirEnqueued>, PimdirError> {
+        let mut queued = Vec::with_capacity(batch.len());
+        for enqueue in batch {
+            let object = match (enqueue.body, &enqueue.object) {
+                (Some(body), _) => {
+                    let object = PimdirObject {
+                        hash: self.hash(body),
+                        size: body.len(),
+                    };
+                    if enqueue.action.object_hash() != Some(&object.hash) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "Body given for a {} hashes to {}, not to the object it names",
+                                enqueue.action.kind(),
+                                object.hash.0
+                            ),
+                        )
+                        .into());
+                    }
+                    Some(object)
+                }
+                (None, object) => object.clone(),
+            };
+            queued.push(PimdirQueued {
+                collection: enqueue.collection,
+                action: &enqueue.action,
+                object,
+                body: enqueue.body,
+                fresh: self.fresh(enqueue.collection, &enqueue.action, enqueue.body)?,
+            });
+        }
+
+        self.append_batch(&queued)
+    }
+
+    /// The key an `add` is checked under before it is appended (§15.3):
+    /// the one it states, else the one the owner derives from the body
+    /// in hand (Annex A); `None` for any other action, and for an `add`
+    /// stating none whose body is not in hand.
+    fn fresh(
+        &self,
+        collection: &str,
+        action: &PimdirAction,
+        body: Option<&[u8]>,
+    ) -> Result<Option<PimdirLinkId>, PimdirError> {
+        Ok(match (action, body) {
+            (
+                PimdirAction::Add {
+                    link_id: Some(link_id),
+                    ..
+                },
+                _,
+            ) => Some(link_id.clone()),
+            (PimdirAction::Add { link_id: None, .. }, Some(body)) => {
+                let kind = write::kind_of(&self.conn, collection)?;
+                summary::derive(&kind, body).map(|derived| derived.link_id)
+            }
+            _ => None,
+        })
+    }
+
+    /// The enqueue transaction of one action, refusing an add whose
+    /// `fresh` link id is taken first when one is given; `body`, the bytes
+    /// of `object` when the caller has not staged them, is gated in hand
+    /// and written once every check passed.
     fn append(
         &mut self,
         collection: &str,
@@ -412,119 +456,202 @@ impl PimdirProducer {
         body: Option<&[u8]>,
         fresh: Option<&PimdirLinkId>,
     ) -> Result<PimdirEnqueued, PimdirError> {
-        let appended = self.append_held(collection, action, object, body, fresh);
+        let queued = PimdirQueued {
+            collection,
+            action,
+            object: object.cloned(),
+            body,
+            fresh: fresh.cloned(),
+        };
+        let mut appended = self.append_batch(slice::from_ref(&queued))?;
+        Ok(appended.pop().expect("one row per action appended"))
+    }
+
+    /// The enqueue transaction (§15.1): every action of `batch` appended
+    /// in order, or none. Answers each row's handle and the partial
+    /// supports the gate passed its action with.
+    ///
+    /// The staging lock is held across whatever bodies the actions name
+    /// (§8), until the transaction commits: a body this producer staged
+    /// holds it already, one given in hand takes it for the write, and
+    /// one named by its hash alone, which the store held when the caller
+    /// read it, takes it and is verified against its name under it before
+    /// a row pins it, so a collector never takes the body between the
+    /// two. A named body the blob directory does not hold is
+    /// [`PimdirError::Io`], kind [`NotFound`](io::ErrorKind::NotFound),
+    /// one failing its name the failure a write meeting it answers
+    /// ([`InvalidData`](io::ErrorKind::InvalidData), naming it), and
+    /// nothing is queued. The lock file held is checked to be the one
+    /// still at its path before the transaction
+    /// ([`PimdirError::LockReplaced`], §8). An append that fails closes a
+    /// window it alone opened.
+    fn append_batch(
+        &mut self,
+        batch: &[PimdirQueued<'_>],
+    ) -> Result<Vec<PimdirEnqueued>, PimdirError> {
+        let appended = self.append_batch_held(batch);
         if appended.is_err() {
             self.pinned(None);
         }
         appended
     }
 
-    /// [`append`](Self::append), leaving the window open when it fails.
-    fn append_held(
+    /// [`append_batch`](Self::append_batch), leaving the window open when
+    /// it fails.
+    fn append_batch_held(
         &mut self,
-        collection: &str,
-        action: &PimdirAction,
-        object: Option<&PimdirObject>,
-        body: Option<&[u8]>,
-        fresh: Option<&PimdirLinkId>,
-    ) -> Result<PimdirEnqueued, PimdirError> {
-        // NOTE: a set the store cannot hold is refused before the gate,
-        // never queued for the drain to park (STORAGE §13).
-        if let PimdirAction::Add { flags, .. } | PimdirAction::SetFlags { flags, .. } = action
-            && let Some(flag) = flags.invalid()
-        {
-            return Err(PimdirError::Flag(flag.into()));
+        batch: &[PimdirQueued<'_>],
+    ) -> Result<Vec<PimdirEnqueued>, PimdirError> {
+        let mut payloads = Vec::with_capacity(batch.len());
+        for queued in batch {
+            // NOTE: a set the store cannot hold is refused before the
+            // gate, never queued for the drain to park (STORAGE §13).
+            if let PimdirAction::Add { flags, .. } | PimdirAction::SetFlags { flags, .. } =
+                queued.action
+                && let Some(flag) = flags.invalid()
+            {
+                return Err(PimdirError::Flag(flag.into()));
+            }
+            if let PimdirAction::SetFlags {
+                base: Some(base), ..
+            } = queued.action
+                && let Some(flag) = base.invalid()
+            {
+                return Err(PimdirError::Flag(flag.into()));
+            }
+            // NOTE: a payload its schema refuses is never queued for the
+            // drain to park (§15.3); one unknown to this crate, a later
+            // program's version or an application's own action, is queued
+            // as it stands.
+            let payload = codec::action_to_payload(queued.action);
+            codec::action_from_payload(queued.action.kind(), &payload)?;
+            payloads.push(payload);
         }
-        if let PimdirAction::SetFlags {
-            base: Some(base), ..
-        } = action
-            && let Some(flag) = base.invalid()
-        {
-            return Err(PimdirError::Flag(flag.into()));
-        }
-        // NOTE: a payload its schema refuses is never queued for the drain
-        // to park (§15.3); one unknown to this crate, a later program's
-        // version or an application's own action, is queued as it stands.
-        let payload = codec::action_to_payload(action);
-        codec::action_from_payload(action.kind(), &payload)?;
-        let partial = capability::gate(&self.conn, &self.blobs, collection, action, body)?;
-        let hash = action.object_hash().cloned();
+
+        // NOTE: the bodies the batch carries in hand, which a later
+        // action of it may name by hash before any reaches the tree.
+        let in_hand: BTreeMap<&PimdirHash, &[u8]> = batch
+            .iter()
+            .filter_map(|queued| Some((&queued.object.as_ref()?.hash, queued.body?)))
+            .collect();
+
         // NOTE: before the transaction, so waiting out a collector never
         // holds the write lock it needs.
-        let _window = match (body, &hash) {
-            (Some(_), _) => Some(self.hold()?),
-            (None, Some(named)) if !self.staged(named) => {
-                let window = self.hold()?;
-                match self.blobs.check(named)? {
-                    PimdirBlobCheck::Sound => Some(window),
-                    PimdirBlobCheck::Failing => return Err(blobs::held(named).into()),
-                    PimdirBlobCheck::Missing => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("Body {} is not in the blob directory", named.0),
-                        )
-                        .into());
+        for queued in batch {
+            // NOTE: the body a row pins, or the one an object row is
+            // written for: either is a `pin_object` or a `store_object`
+            // the lock is held across (§8).
+            let named = queued
+                .action
+                .object_hash()
+                .or(queued.object.as_ref().map(|object| &object.hash));
+            match (queued.body, named) {
+                (Some(_), _) => {
+                    self.hold()?;
+                }
+                (None, Some(named)) if !in_hand.contains_key(named) && !self.staged(named) => {
+                    self.hold()?;
+                    match self.blobs.check(named)? {
+                        // NOTE: a name kept as found is flushed all the
+                        // same before its row commits: the entry may be
+                        // another writer's, moved and not flushed yet
+                        // (§5).
+                        PimdirBlobCheck::Sound => self.blobs.flush_held(named)?,
+                        PimdirBlobCheck::Failing => return Err(blobs::held(named).into()),
+                        PimdirBlobCheck::Missing => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("Body {} is not in the blob directory", named.0),
+                            )
+                            .into());
+                        }
                     }
                 }
+                (None, _) => (),
             }
-            (None, _) => None,
-        };
+        }
+        // NOTE: held from here until the commit, whatever closes the
+        // window meanwhile (§8).
+        let window = self.staging.borrow().lock.clone();
+        if let Some(window) = &window {
+            window.verify()?;
+        }
 
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(busy_or_sql)?;
-        if let Some(link_id) = fresh
-            && let Some(existing) = duplicate(&tx, collection, link_id)?
-        {
-            return Err(PimdirError::Duplicate {
-                collection: collection.to_string(),
-                link_id: link_id.0.clone(),
-                existing,
-            });
-        }
-        // NOTE: inside the transaction, so a duplicate refused above stages
-        // nothing, and under this producer's staging lock (§8).
-        if let (Some(object), Some(body)) = (object, body) {
-            self.blobs.write(&object.hash, body)?;
-        }
-        tx.execute_cached(
-            sql::ENSURE_COLLECTION,
-            named_params! { ":collection": collection, ":account": self.account.as_deref() },
-        )?;
-        if let Some(object) = object {
+        let mut rows = Vec::with_capacity(batch.len());
+        for (queued, payload) in batch.iter().zip(&payloads) {
+            let collection = queued.collection;
+            let hash = queued.action.object_hash();
+            let body = queued
+                .body
+                .or_else(|| hash.and_then(|hash| in_hand.get(hash).copied()));
+            let partial = capability::gate(&tx, &self.blobs, collection, queued.action, body)?;
+            if let Some(link_id) = &queued.fresh
+                && let Some(existing) = duplicate(&tx, collection, link_id)?
+            {
+                return Err(PimdirError::Duplicate {
+                    collection: collection.to_string(),
+                    link_id: link_id.0.clone(),
+                    existing,
+                });
+            }
+
             tx.execute_cached(
-                sql::STORE_OBJECT,
-                named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
+                sql::ENSURE_COLLECTION,
+                named_params! { ":collection": collection, ":account": self.account.as_deref() },
             )?;
+            if let Some(object) = &queued.object {
+                tx.execute_cached(
+                    sql::STORE_OBJECT,
+                    named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
+                )?;
+            }
+            if let Some(hash) = hash {
+                tx.execute_cached(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
+            }
+            tx.execute_cached(
+                sql::ENQUEUE_ACTION,
+                named_params! {
+                    ":producer": self.producer,
+                    ":collection": collection,
+                    ":action": queued.action.kind(),
+                    ":payload": payload,
+                    ":target_collection": queued.action.target_collection().map(|to| to.0.as_str()),
+                    ":object_hash": hash.map(|h| h.0.as_str()),
+                },
+            )?;
+            rows.push((tx.last_insert_rowid(), partial));
         }
-        if let Some(hash) = &hash {
-            tx.execute_cached(sql::PIN_OBJECT, named_params! { ":hash": hash.0 })?;
+
+        // NOTE: once every action passed, so a batch refused stages
+        // nothing, and before the commit, under this producer's staging
+        // lock: no row naming a body lands before its file (§5, §8).
+        for (hash, body) in &in_hand {
+            self.blobs.write(hash, body)?;
         }
-        tx.execute_cached(
-            sql::ENQUEUE_ACTION,
-            named_params! {
-                ":producer": self.producer,
-                ":collection": collection,
-                ":action": action.kind(),
-                ":payload": payload,
-                ":target_collection": action.target_collection().map(|to| to.0.as_str()),
-                ":object_hash": hash.as_ref().map(|h| h.0.as_str()),
-            },
-        )?;
-        let id = tx.last_insert_rowid();
-        // NOTE: read in the transaction that drew the id, so the handle
-        // names the store the row is in (§4.5, §15.4).
+        // NOTE: read in the transaction that drew the ids, so the handles
+        // name the store the rows are in (§4.5, §15.4).
         let store = store_identity(&tx)?;
         tx.commit().map_err(busy_or_sql)?;
-        self.pinned(hash.as_ref());
-        Ok(PimdirEnqueued {
-            handle: PimdirActionHandle {
-                id,
-                store: Some(store),
-            },
-            partial,
-        })
+        drop(window);
+
+        self.pinned(None);
+        for queued in batch {
+            self.pinned(queued.action.object_hash());
+        }
+        Ok(rows
+            .into_iter()
+            .map(|(id, partial)| PimdirEnqueued {
+                handle: PimdirActionHandle {
+                    id,
+                    store: Some(store.clone()),
+                },
+                partial,
+            })
+            .collect())
     }
 
     /// Runs an action through the gate of §15.6 without enqueueing it,
@@ -592,7 +719,7 @@ impl PimdirProducer {
         name: &str,
         parent: Option<&str>,
         chosen: Option<&str>,
-    ) -> Result<PimdirActionHandle, PimdirError> {
+    ) -> Result<PimdirEnqueued, PimdirError> {
         let anchor = parent.unwrap_or(anchor);
         let create = PimdirCollectionCreate {
             source: self.performer(anchor, COLLECTION_CREATE, chosen)?,
@@ -614,7 +741,7 @@ impl PimdirProducer {
         collection: &str,
         name: &str,
         chosen: Option<&str>,
-    ) -> Result<PimdirActionHandle, PimdirError> {
+    ) -> Result<PimdirEnqueued, PimdirError> {
         let rename = PimdirCollectionRename {
             source: self.performer(collection, COLLECTION_RENAME, chosen)?,
             name: name.to_string(),
@@ -631,7 +758,7 @@ impl PimdirProducer {
         &mut self,
         collection: &str,
         chosen: Option<&str>,
-    ) -> Result<PimdirActionHandle, PimdirError> {
+    ) -> Result<PimdirEnqueued, PimdirError> {
         let delete = PimdirCollectionDelete {
             source: self.performer(collection, COLLECTION_DELETE, chosen)?,
         };
@@ -640,7 +767,60 @@ impl PimdirProducer {
     }
 }
 
-/// What [`PimdirProducer::enqueue_with_body_checked`] queued.
+/// One action of a batch [`PimdirProducer::enqueue_batch`] appends
+/// (§15.1): the collection it is queued on, the action, and its body
+/// where it carries one, either staged before
+/// ([`staged`](Self::staged)) or given in hand ([`body`](Self::body)).
+#[derive(Clone, Debug)]
+pub struct PimdirEnqueue<'a> {
+    collection: &'a str,
+    action: PimdirAction,
+    object: Option<PimdirObject>,
+    body: Option<&'a [u8]>,
+}
+
+impl<'a> PimdirEnqueue<'a> {
+    /// `action` on `collection`, naming no body, or one the store
+    /// already indexes.
+    pub fn new(collection: &'a str, action: PimdirAction) -> Self {
+        Self {
+            collection,
+            action,
+            object: None,
+            body: None,
+        }
+    }
+
+    /// The object [`PimdirProducer::stage_body`] answered for the body
+    /// the action names, so its row is written with its size.
+    pub fn staged(mut self, object: PimdirObject) -> Self {
+        self.object = Some(object);
+        self
+    }
+
+    /// The bytes of the body the action names, not staged yet: gated in
+    /// hand and written to the blob tree only once the whole batch
+    /// passed, so a batch refused leaves no body behind. Bytes hashing to
+    /// another name than the action's object refuse the batch.
+    pub fn body(mut self, body: &'a [u8]) -> Self {
+        self.body = Some(body);
+        self
+    }
+}
+
+/// One action as the enqueue transaction appends it.
+struct PimdirQueued<'a> {
+    collection: &'a str,
+    action: &'a PimdirAction,
+    /// The object row to write, when the caller knows the body's size.
+    object: Option<PimdirObject>,
+    /// The body's bytes when they are not staged yet.
+    body: Option<&'a [u8]>,
+    /// The key an `add` is checked under, `None` for no check.
+    fresh: Option<PimdirLinkId>,
+}
+
+/// What an enqueue queued (§15.1, §15.6).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirEnqueued {
     /// The row's handle, which [`PimdirProducer::action_status`] follows.
@@ -648,6 +828,18 @@ pub struct PimdirEnqueued {
     /// The partial supports the action passed the gate with (§15.6), each
     /// worth showing: the action is queued whatever they say.
     pub partial: Vec<PimdirPartial>,
+}
+
+impl From<PimdirEnqueued> for PimdirActionHandle {
+    fn from(enqueued: PimdirEnqueued) -> Self {
+        enqueued.handle
+    }
+}
+
+impl From<&PimdirEnqueued> for PimdirActionHandle {
+    fn from(enqueued: &PimdirEnqueued) -> Self {
+        enqueued.handle.clone()
+    }
 }
 
 /// Where one queue row stands (§15.4), read by the id its enqueue
@@ -663,7 +855,8 @@ pub enum PimdirActionStatus {
         /// Apply attempts so far.
         attempts: i64,
     },
-    /// Refused by the owner, kept with its error until somebody cancels it.
+    /// Refused by the owner, kept with its error until somebody cancels
+    /// or retries it.
     Parked {
         /// The collection it was queued on.
         collection: String,
@@ -673,6 +866,22 @@ pub enum PimdirActionStatus {
         attempts: i64,
         /// The failure that parked it.
         error: String,
+    },
+    /// An intent whose outcome is unknown (§15.2, §15.4): its performer
+    /// sent the request and cannot tell whether it took effect, so it is
+    /// neither performed nor failed, and a frontend shows it as such.
+    /// Parked under the reserved prefix `unconfirmed: `, which this state
+    /// is read from; no drain retries it, and it leaves by its
+    /// performer's acknowledgement, a person's retry or a cancellation.
+    Unconfirmed {
+        /// The collection it was queued on.
+        collection: String,
+        /// The raw action kind.
+        kind: String,
+        /// Perform attempts so far.
+        attempts: i64,
+        /// What its performer recorded after the reserved prefix.
+        detail: String,
     },
     /// Applied by the owner, or an intent it performed and acknowledged,
     /// its receipt kept.
@@ -736,6 +945,14 @@ pub(crate) fn action_status(
                 kind,
                 attempts,
             },
+            Some(error) if codec::unconfirmed(&error).is_some() => {
+                PimdirActionStatus::Unconfirmed {
+                    collection,
+                    kind,
+                    attempts,
+                    detail: codec::unconfirmed(&error).unwrap_or_default().to_string(),
+                }
+            }
             Some(error) => PimdirActionStatus::Parked {
                 collection,
                 kind,
@@ -796,6 +1013,15 @@ pub struct PimdirParkedAction {
     pub attempts: i64,
     /// The failure that parked the row.
     pub error: String,
+}
+
+impl PimdirParkedAction {
+    /// What the row's performer recorded when the row is an intent whose
+    /// outcome is unknown (§15.2), the text after the reserved prefix
+    /// `unconfirmed: `; `None` for a row parked on a failure.
+    pub fn unconfirmed(&self) -> Option<&str> {
+        codec::unconfirmed(&self.error)
+    }
 }
 
 /// What a drain pass did.
@@ -1004,89 +1230,52 @@ impl PimdirSourceStore {
     /// spec's floor, after which a drain prunes it.
     pub const RECEIPT_DAYS: i64 = 7;
 
+    /// How many pending actions one transaction of a drain applies at
+    /// most (§15.2): the bound of a run, this owner's. One commit, and so
+    /// one flush, lands the run where each action took its own; the
+    /// transaction spans no network I/O, and a reader waits on none of
+    /// it.
+    pub const RUN: usize = 64;
+
     /// Drains the pending actions store-wide in append order, the order a
     /// producer relied on when it queued a move and then an edit of the
     /// item where it landed: each is applied as the mutation it names and
-    /// its row deleted in one transaction. A failure of the store (a
-    /// refused rebind, a constraint, a malformed payload) parks the row;
-    /// one this owner cannot perform, or lost the claim to, is skipped; a
-    /// failure of the environment (the
-    /// database busy, a body unreadable) bumps the attempts and parks past
-    /// [`MAX_ATTEMPTS`](Self::MAX_ATTEMPTS). None stops the rows behind it.
-    /// Each applied row leaves a receipt, and the pass ends by pruning the
-    /// receipts past [`RECEIPT_DAYS`](Self::RECEIPT_DAYS) (§15.4).
+    /// its row deleted, exactly once. A failure of the store (a refused
+    /// rebind, a constraint, a malformed payload) parks the row; one this
+    /// owner cannot perform, or lost the claim to, is skipped; a failure
+    /// of the environment (a body unreadable) bumps the attempts and parks
+    /// past [`MAX_ATTEMPTS`](Self::MAX_ATTEMPTS). None stops the rows
+    /// behind it. Each applied row leaves a receipt, and the pass ends by
+    /// pruning the receipts past [`RECEIPT_DAYS`](Self::RECEIPT_DAYS)
+    /// (§15.4).
+    ///
+    /// The rows are applied in runs of at most [`RUN`](Self::RUN), each
+    /// run one transaction and each action a savepoint of its own in it
+    /// (§15.2): the savepoint opens, the claim runs first, the action is
+    /// applied, its receipt recorded, and the savepoint released. A
+    /// failed apply is rolled back to its savepoint before anything else,
+    /// which restores the claimed row and undoes whatever the apply
+    /// wrote, the actions applied before it standing; its park or its
+    /// retry is then recorded in the run's transaction, outside the
+    /// savepoint, and the run goes on with the next row. A run that does
+    /// not commit applies none of its actions, each claimed row restored:
+    /// its failure is the drain's, the runs committed before it standing.
+    ///
+    /// A parked row is listed by no drain, an intent parked
+    /// `unconfirmed: ` among them (§15.2): nothing retries it but
+    /// [`retry_action`](crate::client::PimdirStore::retry_action), on a
+    /// person's request.
     pub fn drain(&mut self) -> Result<PimdirDrainReport, PimdirError> {
         let pending = pending_rows(&self.store.reader.conn, None)?;
 
         let mut report = PimdirDrainReport::default();
-        for row in pending {
-            let action = match row.action() {
-                Ok(action) => action,
-                Err(err) => {
-                    self.fail_action(row.id, Some(&err.to_string()))?;
-                    report.parked += 1;
-                    continue;
-                }
-            };
-            if let PimdirAction::Unknown { kind, payload, .. } = &action {
-                // NOTE: a payload this owner does not know, its action or
-                // its version, is left pending and untouched, read no
-                // further and never parked (§15.2).
-                if codec::payload_outcome(kind, payload) == PimdirPayloadOutcome::Unknown {
-                    report.skipped += 1;
-                    continue;
-                }
-                let conn = &self.store.reader.conn;
-                match capability::backstop_intent(conn, &row.collection, kind, payload) {
-                    Err(PimdirError::Unsupported(refusal)) => {
-                        self.fail_action(row.id, Some(&refusal.to_string()))?;
-                        report.parked += 1;
-                    }
-                    result => {
-                        result?;
-                        report.skipped += 1;
-                    }
-                }
-                continue;
-            }
-            // NOTE: a failed apply rolled its transaction back on the way
-            // out, restoring the claimed row; the park or the bump runs in
-            // a transaction of its own (§15.2).
-            let failed = match self.apply_queued(&row, &action, &mut report.overruled) {
-                Ok(PimdirOutcome::Applied) => {
-                    report.applied += 1;
-                    None
-                }
-                Ok(PimdirOutcome::Skipped) => {
-                    report.skipped += 1;
-                    None
-                }
-                Ok(PimdirOutcome::Unbound(_)) => {
-                    unreachable!("an unbound action is applied or parked")
-                }
-                Ok(PimdirOutcome::Parked(reason)) => {
-                    self.fail_action(row.id, Some(&reason))?;
-                    report.parked += 1;
-                    None
-                }
-                Err(err) if retryable(&err) && row.attempts + 1 < Self::MAX_ATTEMPTS => {
-                    self.fail_action(row.id, None)?;
-                    report.retried += 1;
-                    Some(err)
-                }
-                Err(err) => {
-                    self.fail_action(row.id, Some(&err.to_string()))?;
-                    report.parked += 1;
-                    Some(err)
-                }
-            };
-            // NOTE: the apply's transaction and its writer lock are gone,
-            // so the owner takes the collector's locks to move the body
-            // that failed its name (§7); the move checks it again.
-            if let (Some(PimdirError::Io(err)), Some(hash)) = (&failed, &row.object_hash)
-                && err.kind() == io::ErrorKind::InvalidData
-            {
-                self.store.quarantine(&PimdirHash(hash.clone()))?;
+        for run in pending.chunks(Self::RUN) {
+            let unsound = self.apply_run(run, &mut report)?;
+            // NOTE: the run's transaction and its writer lock are gone,
+            // so the owner takes the collector's locks to move the bodies
+            // that failed their name (§7); the move checks each again.
+            for hash in unsound {
+                self.store.quarantine(&hash)?;
             }
         }
         // NOTE: after the pass, so the pending list is read before any
@@ -1095,9 +1284,120 @@ impl PimdirSourceStore {
         Ok(report)
     }
 
+    /// Applies one run of pending rows in one transaction, a savepoint
+    /// per action (§15.2), adding what it did to `report` once it
+    /// committed. Answers the bodies an apply found failing their name,
+    /// for the caller to set aside once the transaction is gone.
+    fn apply_run(
+        &mut self,
+        run: &[PimdirQueueRow],
+        report: &mut PimdirDrainReport,
+    ) -> Result<Vec<PimdirHash>, PimdirError> {
+        let blobs = self.store.reader.blobs();
+        let lock = Arc::clone(&self.store.lock);
+        let _writing = lock.writing();
+        let source = self.source.clone();
+        let account = self.store.account.clone();
+        let mut tx = begin(&mut self.store.reader.conn, &self.store.lock)?;
+
+        let mut ran = PimdirDrainReport::default();
+        let mut unsound = Vec::new();
+        for row in run {
+            let action = match row.action() {
+                Ok(action) => action,
+                Err(err) => {
+                    record_failure(&tx, row.id, Some(&err.to_string()))?;
+                    ran.parked += 1;
+                    continue;
+                }
+            };
+            if let PimdirAction::Unknown { kind, payload, .. } = &action {
+                // NOTE: a payload this owner does not know, its action or
+                // its version, is left pending and untouched, read no
+                // further and never parked (§15.2).
+                if codec::payload_outcome(kind, payload) == PimdirPayloadOutcome::Unknown {
+                    ran.skipped += 1;
+                    continue;
+                }
+                match capability::backstop_intent(&tx, &row.collection, kind, payload) {
+                    Err(PimdirError::Unsupported(refusal)) => {
+                        record_failure(&tx, row.id, Some(&refusal.to_string()))?;
+                        ran.parked += 1;
+                    }
+                    result => {
+                        result?;
+                        ran.skipped += 1;
+                    }
+                }
+                continue;
+            }
+
+            let mut savepoint = tx.savepoint()?;
+            let applied = apply_claimed(
+                &savepoint,
+                &blobs,
+                &source,
+                account.as_deref(),
+                row,
+                &action,
+            );
+            if let Ok((PimdirOutcome::Applied, overruled)) = applied {
+                savepoint.commit()?;
+                ran.applied += 1;
+                ran.overruled.extend(overruled);
+                continue;
+            }
+            // NOTE: rolled back before anything else (§15.2): the claimed
+            // row is restored and what the apply wrote undone, then the
+            // savepoint is released, the park or the retry below written
+            // outside it. A rollback SQLite refuses, its transaction
+            // gone with the failure, ends the run unapplied.
+            savepoint.rollback()?;
+            savepoint.commit()?;
+
+            match applied {
+                Ok((PimdirOutcome::Applied, _)) => unreachable!("an applied action is released"),
+                Ok((PimdirOutcome::Unbound(_), _)) => {
+                    unreachable!("an unbound action is applied or parked")
+                }
+                Ok((PimdirOutcome::Skipped, _)) => ran.skipped += 1,
+                Ok((PimdirOutcome::Parked(reason), _)) => {
+                    record_failure(&tx, row.id, Some(&reason))?;
+                    ran.parked += 1;
+                }
+                Err(err) => {
+                    if let (PimdirError::Io(io), Some(hash)) = (&err, &row.object_hash)
+                        && io.kind() == io::ErrorKind::InvalidData
+                    {
+                        unsound.push(PimdirHash(hash.clone()));
+                    }
+                    match retryable(&err) && row.attempts + 1 < Self::MAX_ATTEMPTS {
+                        true => {
+                            record_failure(&tx, row.id, None)?;
+                            ran.retried += 1;
+                        }
+                        false => {
+                            record_failure(&tx, row.id, Some(&err.to_string()))?;
+                            ran.parked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        tx.commit().map_err(busy_or_sql)?;
+
+        report.applied += ran.applied;
+        report.parked += ran.parked;
+        report.skipped += ran.skipped;
+        report.retried += ran.retried;
+        report.overruled.extend(ran.overruled);
+        Ok(unsound)
+    }
+
     /// Drops the receipts older than [`RECEIPT_DAYS`](Self::RECEIPT_DAYS)
     /// (§15.4), returning how many went.
     pub fn prune_receipts(&mut self) -> Result<usize, PimdirError> {
+        self.store.lock.verify()?;
         let conn = &self.store.reader.conn;
         let before: String = conn.query_row_cached(
             "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', :age)",
@@ -1107,143 +1407,134 @@ impl PimdirSourceStore {
         conn.execute_cached(sql::PRUNE_RECEIPTS, named_params! { ":before": before })
             .map_err(busy_or_sql)
     }
+}
 
-    /// Applies one action and deletes its row in one transaction, the
-    /// claim first (§15.2): a claim that deletes nothing is a row another
-    /// handle applied or a cancellation removed, and is skipped. The same
-    /// transaction records the row's receipt (§15.4). A body a conflict
-    /// policy kept aside is added to `overruled` once the row committed.
-    fn apply_queued(
-        &mut self,
-        row: &PimdirQueueRow,
-        action: &PimdirAction,
-        overruled: &mut Vec<PimdirDrainOverruled>,
-    ) -> Result<PimdirOutcome, PimdirError> {
-        let collection = row.collection.as_str();
-        let blobs = self.store.reader.blobs();
-        let lock = Arc::clone(&self.store.lock);
-        let _writing = lock.writing();
-        let tx = self
-            .store
-            .reader
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(busy_or_sql)?;
+/// Applies one action and deletes its row under the caller's savepoint,
+/// the claim first (§15.2): a claim that deletes nothing is a row another
+/// handle applied or a cancellation removed, and is skipped. The row's
+/// receipt is recorded with it (§15.4). Answers
+/// [`Applied`](PimdirOutcome::Applied) with the bodies a conflict policy
+/// kept aside, for the caller to release the savepoint; any other answer,
+/// and any error, is the caller's to roll back.
+fn apply_claimed(
+    tx: &Connection,
+    blobs: &PimdirBlobs,
+    own: &PimdirSourceId,
+    account: Option<&str>,
+    row: &PimdirQueueRow,
+    action: &PimdirAction,
+) -> Result<(PimdirOutcome, Vec<PimdirDrainOverruled>), PimdirError> {
+    let collection = row.collection.as_str();
+    let outcome = |outcome| Ok((outcome, Vec::new()));
 
-        let claimed = tx
-            .prepare_cached(sql::CLAIM_ACTION)?
-            .query_row(named_params! { ":id": row.id }, |r| r.get::<_, i64>(0))
-            .optional()?;
-        if claimed.is_none() {
-            return Ok(PimdirOutcome::Skipped);
-        }
+    let claimed = tx
+        .prepare_cached(sql::CLAIM_ACTION)?
+        .query_row(named_params! { ":id": row.id }, |r| r.get::<_, i64>(0))
+        .optional()?;
+    if claimed.is_none() {
+        return outcome(PimdirOutcome::Skipped);
+    }
 
-        // NOTE: the body is the column's (§15.3): read from it, never
-        // from a path built off the payload, so a payload restating
-        // another parks.
-        if let Some(reason) = restated(row, action) {
-            return Ok(PimdirOutcome::Parked(reason));
-        }
+    // NOTE: the body is the column's (§15.3): read from it, never from a
+    // path built off the payload, so a payload restating another parks.
+    if let Some(reason) = restated(row, action) {
+        return outcome(PimdirOutcome::Parked(reason));
+    }
 
-        if let PimdirAction::SetPerformer { capability, source } = action {
-            match capability::set_performer(&tx, collection, capability, source.as_deref()) {
-                Err(PimdirError::Unsupported(refusal)) => {
-                    return Ok(PimdirOutcome::Parked(refusal.to_string()));
-                }
-                result => result?,
-            }
-            record_receipt(&tx, row.id, &row.collection, None)?;
-            tx.commit().map_err(busy_or_sql)?;
-            return Ok(PimdirOutcome::Applied);
-        }
-
-        // NOTE: the owner's backstop (§15.6): what a producer should have
-        // refused is parked here rather than pushed and rejected later.
-        match capability::gate(&tx, &blobs, collection, action, None) {
+    if let PimdirAction::SetPerformer { capability, source } = action {
+        match capability::set_performer(tx, collection, capability, source.as_deref()) {
             Err(PimdirError::Unsupported(refusal)) => {
-                return Ok(PimdirOutcome::Parked(refusal.to_string()));
+                return outcome(PimdirOutcome::Parked(refusal.to_string()));
             }
             result => result?,
-        };
-
-        let acting = acting_source(&tx, &self.source, collection)?;
-        let (source, ops) = match stage_action(&tx, &blobs, &acting, collection, action)? {
-            Ok(staged) => staged,
-            Err(PimdirOutcome::Unbound(link)) => {
-                let kind = write::kind_of(&tx, collection)?;
-                if let Err(outcome) =
-                    apply_unbound(&tx, &blobs, &acting, collection, &kind, &link, action)?
-                {
-                    return Ok(outcome);
-                }
-                if let Some(hash) = &row.object_hash {
-                    tx.execute_cached(
-                        sql::ADJUST_REFCOUNT,
-                        named_params! { ":delta": -1, ":hash": hash },
-                    )?;
-                }
-                record_receipt(&tx, row.id, &row.collection, None)?;
-                tx.commit().map_err(busy_or_sql)?;
-                return Ok(PimdirOutcome::Applied);
-            }
-            Err(outcome) => return Ok(outcome),
-        };
-        // NOTE: an add's item is the one its staged key names once the
-        // write lands, read back for the receipt (§15.2).
-        let created = match action {
-            PimdirAction::Add { .. } => ops.iter().find_map(|op| match op {
-                PimdirWriteOp::UpsertPlacement(placement) => placement.link_id.clone(),
-                _ => None,
-            }),
-            _ => None,
-        };
-        let written = write::apply(&tx, &blobs, &source, self.store.account.as_deref(), ops)?;
-        // NOTE: the item an add supersedes is tombstoned in the transaction
-        // applying it, after its duplicate check parked nothing (§15.3).
-        if let (
-            PimdirAction::Add {
-                supersedes: Some(superseded),
-                ..
-            },
-            Some(link),
-        ) = (action, &created)
-        {
-            let account = self.store.account.as_deref();
-            let by = (collection, link);
-            if let Err(outcome) = supersede(&tx, &blobs, &self.source, account, superseded, by)? {
-                return Ok(outcome);
-            }
         }
-        if let Some(hash) = &row.object_hash {
-            tx.execute_cached(
-                sql::ADJUST_REFCOUNT,
-                named_params! { ":delta": -1, ":hash": hash },
-            )?;
-        }
-        let seq = match created {
-            Some(link) => tx
-                .query_row_cached(
-                    sql::SEQ_BY_LINK,
-                    named_params! { ":collection": collection, ":link_id": link.0 },
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?,
-            None => None,
-        };
-        record_receipt(&tx, row.id, &row.collection, seq)?;
-        tx.commit().map_err(busy_or_sql)?;
-        overruled.extend(
-            written
-                .overruled
-                .into_iter()
-                .map(|(_, link_id)| PimdirDrainOverruled {
-                    id: row.id,
-                    collection: row.collection.clone(),
-                    link_id,
-                }),
-        );
-        Ok(PimdirOutcome::Applied)
+        record_receipt(tx, row.id, &row.collection, None)?;
+        return outcome(PimdirOutcome::Applied);
     }
+
+    // NOTE: the owner's backstop (§15.6): what a producer should have
+    // refused is parked here rather than pushed and rejected later.
+    match capability::gate(tx, blobs, collection, action, None) {
+        Err(PimdirError::Unsupported(refusal)) => {
+            return outcome(PimdirOutcome::Parked(refusal.to_string()));
+        }
+        result => result?,
+    };
+
+    let acting = acting_source(tx, own, collection)?;
+    let (source, ops) = match stage_action(tx, blobs, &acting, collection, action)? {
+        Ok(staged) => staged,
+        Err(PimdirOutcome::Unbound(link)) => {
+            let kind = write::kind_of(tx, collection)?;
+            if let Err(parked) =
+                apply_unbound(tx, blobs, &acting, collection, &kind, &link, action)?
+            {
+                return outcome(parked);
+            }
+            if let Some(hash) = &row.object_hash {
+                tx.execute_cached(
+                    sql::ADJUST_REFCOUNT,
+                    named_params! { ":delta": -1, ":hash": hash },
+                )?;
+            }
+            record_receipt(tx, row.id, &row.collection, None)?;
+            return outcome(PimdirOutcome::Applied);
+        }
+        Err(other) => return outcome(other),
+    };
+    // NOTE: an add's item is the one its staged key names once the write
+    // lands, read back for the receipt (§15.2).
+    let created = match action {
+        PimdirAction::Add { .. } => ops.iter().find_map(|op| match op {
+            PimdirWriteOp::UpsertPlacement(placement) => placement.link_id.clone(),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let written = write::apply(tx, blobs, &source, account, ops)?;
+    // NOTE: the item an add supersedes is tombstoned under the savepoint
+    // applying it, after its duplicate check parked nothing (§15.3).
+    if let (
+        PimdirAction::Add {
+            supersedes: Some(superseded),
+            ..
+        },
+        Some(link),
+    ) = (action, &created)
+    {
+        let by = (collection, link);
+        if let Err(parked) = supersede(tx, blobs, own, account, superseded, by)? {
+            return outcome(parked);
+        }
+    }
+    if let Some(hash) = &row.object_hash {
+        tx.execute_cached(
+            sql::ADJUST_REFCOUNT,
+            named_params! { ":delta": -1, ":hash": hash },
+        )?;
+    }
+    let seq = match created {
+        Some(link) => tx
+            .query_row_cached(
+                sql::SEQ_BY_LINK,
+                named_params! { ":collection": collection, ":link_id": link.0 },
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    record_receipt(tx, row.id, &row.collection, seq)?;
+
+    let overruled = written
+        .overruled
+        .into_iter()
+        .map(|(_, link_id)| PimdirDrainOverruled {
+            id: row.id,
+            collection: row.collection.clone(),
+            link_id,
+        })
+        .collect();
+    Ok((PimdirOutcome::Applied, overruled))
 }
 
 /// Tombstones the item an `add` supersedes, inside the drain transaction

@@ -514,6 +514,7 @@ fn a_copy_is_asked_of_the_sender_and_filed_once_sent() {
     let id = producer
         .enqueue("INBOX", &submit(None), Some(&object))
         .unwrap()
+        .handle
         .id;
     drop(producer);
 
@@ -554,6 +555,7 @@ fn a_collection_is_created_by_a_source_that_declares_it_under_its_anchor() {
     let id = producer
         .enqueue_collection_create("INBOX", "Projects", None, None)
         .unwrap()
+        .handle
         .id;
     let pending = producer.pending_actions("INBOX").unwrap();
     let PimdirAction::Unknown { kind, payload, .. } = &pending[0].action else {
@@ -629,10 +631,12 @@ fn a_collection_is_renamed_and_deleted_on_itself_by_a_source_declaring_it() {
     let renamed = producer
         .enqueue_collection_rename("Archive", "Archive 2026", None)
         .unwrap()
+        .handle
         .id;
     let deleted = producer
         .enqueue_collection_delete("Archive", None)
         .unwrap()
+        .handle
         .id;
 
     // both queued on the collection they address, which no payload restates
@@ -1051,7 +1055,7 @@ fn a_checked_enqueue_answers_the_partial_supports_it_passed_with() {
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
     let meeting = MEETING.replace("UID:m1", "UID:m2");
     let enqueued = producer
-        .enqueue_with_body_checked("work", meeting.as_bytes(), |hash| PimdirAction::Add {
+        .enqueue_with_body("work", meeting.as_bytes(), |hash| PimdirAction::Add {
             link_id: None,
             flags: PimdirFlags::default(),
             object: Some(hash),

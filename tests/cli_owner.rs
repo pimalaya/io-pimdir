@@ -52,6 +52,7 @@ fn newer_store(dir: &Path) -> i64 {
             None,
         )
         .unwrap()
+        .handle
         .id;
     let conn = rusqlite::Connection::open(dir.join("pimdir.db")).unwrap();
     conn.execute_batch(

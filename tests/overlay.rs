@@ -453,6 +453,7 @@ fn an_edit_that_will_park_is_not_folded() {
             }
         })
         .unwrap()
+        .handle
         .id;
     let first = producer
         .pending_actions("INBOX")
