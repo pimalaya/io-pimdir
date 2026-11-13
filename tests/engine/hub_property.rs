@@ -662,8 +662,8 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
         );
     }
 
-    for source in 0..SOURCES {
-        let report = cluster.sources[source]
+    for (source, cluster_source) in cluster.sources.iter_mut().enumerate().take(SOURCES) {
+        let report = cluster_source
             .sync("inbox", PimdirSyncOptions::default())
             .expect("a quiescent sync");
         prop_assert_eq!(
