@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-10, sync-draft-10 and search-draft-10, vendored at pimdir c834ee1, the four batches of those drafts: the schema and the statements, the payloads and identity, the text rules, then search.
+- **BREAKING**: Added pimdir storage-draft-10, sync-draft-10 and search-draft-10, vendored at the commit their tags name (pimdir ae8b231), the four batches of those drafts: the schema and the statements, the payloads and identity, the text rules, then search.
 
   A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft, or of an earlier text of this one (`index_meta.extraction` and `extractor`, the index `object_not_ok`), is rebuilt. The schema holds the shapes of STORAGE §13 by `CHECK` (a base stated without `base_present`, an empty handle, source, link id, collection id or account, a `seq` below 1, a negative size, a stamp or a scope bound in another shape), so a row in another shape is refused where it was stored. A consumer running the `sql` constants over its own binding follows the renamed parameters (`:before` in `purge_retained_before`, `release_before` and `release_bases_before`; `:hash` in `held_elsewhere`, `held_mail_summary` and `origin_for_link`; `:message_id` in `insert_in_reply_to`), the column `mail_in_reply_to.message_id`, the index `items_deleted`, and may bind `NULL` as the first cursor of every paged read. spec/queries/signatures.json, the specification's listing of every statement's parameters and columns, is vendored with them.
 
