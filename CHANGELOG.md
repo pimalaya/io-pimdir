@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-11, sync-draft-11 and search-draft-11, vendored at pimdir e443a65, which the tags of the three drafts will name.
+- **BREAKING**: Added pimdir storage-draft-11, sync-draft-11 and search-draft-11, vendored at the commit their tags name (pimdir 83102f0).
 
   A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The schema holds `mail_summary.date` to an instant in UTC at seconds precision (`2026-08-01T10:00:00Z`) or `NULL` by `CHECK`. One statement is new, `sql::UNCONFIRM_ACTION`, and `sql::PARK_ACTION` changed its text. The vectors gain sync cases 155 to 159, two summary cases, two payload cases and eight search cases; every case passes, tests/pending_vectors.txt naming none.
 
