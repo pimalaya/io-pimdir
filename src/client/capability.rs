@@ -52,6 +52,26 @@ pub(crate) fn at_item(
     )?)
 }
 
+/// What every source holding the item `seq` of `collection` on its server
+/// can do there: every source binding it but one binding it as a pending
+/// create alone (`held` 0, §15.6).
+fn holding(
+    conn: &Connection,
+    collection: &str,
+    seq: i64,
+) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
+    let params = named_params! { ":collection": collection, ":seq": seq };
+    let rows = rows(conn, sql::LOAD_ITEM_CAPABILITIES, params, |r| {
+        Ok((declaration_row(r)?, r.get::<_, bool>(4)?))
+    })?;
+    group(
+        rows.into_iter()
+            .filter(|(_, held)| *held)
+            .map(|(row, _)| row)
+            .collect(),
+    )
+}
+
 /// The sources of `account` declaring an intent capability with some
 /// support at `collection`, its own row winning over the source-wide one,
 /// or anywhere in the account when `collection` is `None`: the candidates
@@ -226,9 +246,8 @@ pub(crate) fn gate(
     }
 
     let sources = match action {
-        PimdirAction::Update { seq, .. } | PimdirAction::Remove { seq, .. } => {
-            at_item(conn, collection, *seq)?
-        }
+        PimdirAction::Update { seq, .. } => at_item(conn, collection, *seq)?,
+        PimdirAction::Remove { seq, .. } => holding(conn, collection, *seq)?,
         _ => at_collection(conn, collection)?,
     };
     partials.extend(capability::check(&needed, &sources)?);
@@ -383,7 +402,15 @@ fn gate_by_kind(
         | PimdirAction::Copy { seq, .. }
         | PimdirAction::Update { seq, .. } => {
             let current = item_flags(conn, collection, *seq)?;
-            let holders = at_item(conn, collection, *seq)?;
+
+            // NOTE: a remove withdraws a pending create, pushing nothing,
+            // and a move or a copy meets its source in the target alone.
+            let holders = match action {
+                PimdirAction::Remove { .. }
+                | PimdirAction::Move { .. }
+                | PimdirAction::Copy { .. } => holding(conn, collection, *seq)?,
+                _ => at_item(conn, collection, *seq)?,
+            };
             let needed = capability::required(kind, action, &current);
             let mut partials = capability::check(&needed, &holders)?;
 

@@ -12,7 +12,7 @@ use io_pimdir::{
     change::PimdirWriteOp,
     client::{PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer},
     codec::{PimdirAction, PimdirActionError},
-    collection::PimdirCollectionId,
+    collection::{PimdirCheckpoint, PimdirCollectionId},
     intent::{
         self, PimdirCollectionCreate, PimdirCollectionDelete, PimdirCollectionRename,
         PimdirIntentItem, PimdirInvitation, PimdirPartstat,
@@ -1074,3 +1074,65 @@ fn a_checked_enqueue_answers_the_partial_supports_it_passed_with() {
         "the row is queued"
     );
 }
+
+/// A message its source never took, its add still pending, is the store's
+/// alone (§15.6): removing it, or moving it to another folder of that
+/// source, withdraws the create and needs neither the source's remove nor
+/// its move, which still guard what its server holds.
+#[test]
+fn a_pending_create_is_withdrawn_whatever_its_source_may_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, held) = seeded(dir.path());
+    store
+        .write(vec![PimdirWriteOp::SetCheckpoint {
+            collection: PimdirCollectionId("Archive".into()),
+            checkpoint: PimdirCheckpoint(b"c0".to_vec()),
+        }])
+        .unwrap();
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, UNSENT);
+    producer.enqueue("INBOX", &action, Some(&object)).unwrap();
+    assert_eq!(store.drain().unwrap().applied, 1);
+    let pending = store
+        .list_items("INBOX", None, 10)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.link_id.0 == "unsent@x")
+        .unwrap()
+        .seq;
+    let none = [
+        capability::MAIL_MESSAGE_REMOVE,
+        capability::MAIL_MESSAGE_MOVE,
+    ];
+    store.declare("graph", &mail(&none)).unwrap();
+
+    let remove = |seq| PimdirAction::Remove {
+        seq,
+        if_match: None,
+        resolves: None,
+    };
+    producer.check("INBOX", &remove(pending)).unwrap();
+    let Err(PimdirError::Unsupported(refusal)) = producer.check("INBOX", &remove(held)) else {
+        panic!("a remove of a message the source holds should be refused");
+    };
+    assert_eq!(refusal.capability, capability::MAIL_MESSAGE_REMOVE);
+    let Err(PimdirError::Unsupported(refusal)) = producer.check("INBOX", &archive(held)) else {
+        panic!("a move of a message the source holds should be refused");
+    };
+    assert_eq!(refusal.capability, capability::MAIL_MESSAGE_MOVE);
+
+    producer.enqueue("INBOX", &archive(pending), None).unwrap();
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (1, 0));
+    let archived: Vec<String> = store
+        .list_items("Archive", None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.link_id.0)
+        .collect();
+    assert_eq!(archived, ["unsent@x"]);
+}
+
+const UNSENT: &str = "Message-ID: <unsent@x>\r\nFrom: a@x\r\nTo: b@x\r\n\
+Subject: Unsent\r\nDate: Sun, 15 Nov 2026 10:00:00 +0000\r\n\r\nNot taken.\r\n";

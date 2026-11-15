@@ -1094,6 +1094,14 @@ The producer's gate is advice the crate follows (STORAGE §15.6: a producer SHOU
 - **WHEN** a producer enqueues an event naming an attendee with no `SCHEDULE-AGENT`
 - **THEN** it is refused with `calendar.scheduling`, and the same event as `summary::calendar::unschedule` writes it is queued (tests/capabilities.rs `a_scheduled_event_needs_a_source_that_notifies`)
 
+### Requirement: A pending create is withdrawn whatever its source may delete
+The gate SHALL leave out of an item's sources, for a `remove`, a `move` or a `copy`, a source binding the item as a pending create alone, `held` 0 in `load_item_capabilities` (pimdir STORAGE §15.6): the remove withdraws the create and pushes nothing, so neither the source's remove nor its move is read, nor a scheduled resource's `calendar.scheduling`; a move or a copy asks that source, when it syncs the target, what an `add` carrying the item's flags needs there, as every source of the target binding nothing of the item. A `set-flags` and an `update` read every source binding the item, what they change riding on the add. A delivered create is held. `PimdirReader::item_capabilities` still answers every source binding the item.
+
+#### Scenario: A message its server refused, deleted while deletes are off
+- GIVEN a message added to INBOX, applied by the drain as a pending create of graph, graph syncing Archive and declaring `mail.message.remove` and `mail.message.move` `none`
+- WHEN a producer checks a remove of it and enqueues a move of it to Archive, and the owner drains
+- THEN both pass, the drain applies the move and parks nothing, while a remove and a move of a message graph holds are refused naming the capability (tests/capabilities.rs `a_pending_create_is_withdrawn_whatever_its_source_may_delete`)
+
 ### Requirement: Accepting that nobody is notified is written into the resource
 `summary::calendar::unschedule(body)` SHALL write `SCHEDULE-AGENT=NONE` on every `ORGANIZER` and `ATTENDEE` lacking `SCHEDULE-AGENT=CLIENT` or `NONE` of every component naming an `ATTENDEE` (a child of the root, time zones aside, as `scheduled` reads them), replacing any other agent the line states, folding a rewritten line at 75 octets and keeping every other line byte for byte, so `scheduled` reads the result false and the gate and the backstop read one answer (STORAGE Annex B.1). It is how a producer records the user's acceptance that nobody is notified, never a flag of its own; the crate holds no other acceptance.
 

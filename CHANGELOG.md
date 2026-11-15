@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the producer's gate refusing to withdraw a pending create: a `remove`, a `move` or a `copy` no longer asks a source binding the item as a pending create alone for its remove or its move, its server holding nothing yet (pimdir STORAGE §15.6). The vendored `load_item_capabilities` answers a fifth column, `held`.
+
+  A message added to a Graph folder other than Drafts, rejected by every sync, could not be deleted while the source's deletes were off.
+
 ## [0.13.0] - 2026-11-15
 
 ### Changed
