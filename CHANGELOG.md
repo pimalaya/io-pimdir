@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-13, sync-draft-13 and search-draft-13, vendored at pimdir 627271b (draft-12, tagged the same day, was never released by this crate).
+- **BREAKING**: Added pimdir storage-draft-13, sync-draft-13 and search-draft-13, vendored at the commit their tags name (pimdir 1c6442e; draft-12, tagged the same day, was never released by this crate).
 
   A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The drafts carry the two fixes below. `sql::FORMAT_VERSION`, `sync::SYNC_VERSION` and `sql::search::FORMAT_VERSION` name them (`sql::search::FORMAT_DRAFT` is 13), and `init_store_meta` and `init_index_meta` changed their text.
 
