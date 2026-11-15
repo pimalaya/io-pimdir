@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **BREAKING**: Added pimdir storage-draft-12, sync-draft-12 and search-draft-12, vendored at pimdir acd00be.
+
+  A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The drafts carry the two fixes below. `sql::FORMAT_VERSION`, `sync::SYNC_VERSION` and `sql::search::FORMAT_VERSION` name them (`sql::search::FORMAT_DRAFT` is 12), and `init_store_meta` and `init_index_meta` changed their text.
+
 ### Fixed
 
 - Fixed the producer's gate refusing to withdraw a pending create: a `remove`, a `move` or a `copy` no longer asks a source binding the item as a pending create alone for its remove or its move, its server holding nothing yet (pimdir STORAGE §15.6). The vendored `load_item_capabilities` answers a fifth column, `held`.
@@ -14,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Fixed a narrowed round dropping members its enumeration holds: the last page of a round a date filter narrowed finds absent only a member in scope its `enumerated` list lacks, whatever its date, and nothing when it hands none, counting what it kept in `PimdirSyncReport::unlisted` (pimdir SYNC §5).
 
-  A band narrowed by arrival (Gmail's `before:`, Graph's `receivedDateTime`) dropped messages dated long before they arrived, which the server still held. The vendored specification follows pimdir 6ccc3d4, ahead of the draft-11 tags: `list_unstamped_bindings` changed its text, vectors 47 and 107 changed, 160 and 161 are new.
+  A band narrowed by arrival (Gmail's `before:`, Graph's `receivedDateTime`) dropped messages dated long before they arrived, which the server still held. The vendored `list_unstamped_bindings` changed its text, vectors 47 and 107 changed, 160 and 161 are new.
 
 ## [0.13.0] - 2026-11-15
 

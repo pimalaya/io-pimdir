@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: a-narrowed-round-proves-only-what-its-enumeration-lacks
-status: active
+status: landed
 created: 2026-11-15
 ---
 

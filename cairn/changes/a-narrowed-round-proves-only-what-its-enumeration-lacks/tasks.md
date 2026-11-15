@@ -12,4 +12,4 @@ change: a-narrowed-round-proves-only-what-its-enumeration-lacks
 - [x] cairn/spec/sync.md "A narrowed listing proves only what its enumeration lacks", "Absence means deleted in scope only", "A capped listing proves no absence"; seam.md "A narrowed listing says so"
 - [x] `cargo fmt --check`, `cargo clippy --all-features --all-targets -D warnings`, the suite in CI's three configurations, tests/spec_drift.rs alone failing on the uncommitted spec (2026-11-15)
 - [x] spec/REVISION to the pimdir commit carrying the change (pimdir 6ccc3d4); tests/spec_drift.rs passes
-- [ ] The owner's decision on pimdir's reading (a); a different reading moves vector 107 and `PimdirSyncReport::unlisted` with it
+- [x] The owner's decision on pimdir's reading: (a), taken on 2026-11-15 and landed in draft-12 (cairn/log/2026-11-15-the-crate-follows-draft-12.md)
