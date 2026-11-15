@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-15
+
 ### Changed
 
 - **BREAKING**: Changed the `pimdir` binary to exit 3, not 2, when a command printed its result short of full success, following pimalaya-cli 0.5 (2 is a refused command line).
@@ -1142,7 +1144,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.12.0..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.13.0..HEAD
+[0.13.0]: https://github.com/pimalaya/io-pimdir/compare/v0.12.0..v0.13.0
 [0.12.0]: https://github.com/pimalaya/io-pimdir/compare/v0.11.0..v0.12.0
 [0.11.0]: https://github.com/pimalaya/io-pimdir/compare/v0.10.0..v0.11.0
 [0.10.0]: https://github.com/pimalaya/io-pimdir/compare/v0.9.0..v0.10.0
