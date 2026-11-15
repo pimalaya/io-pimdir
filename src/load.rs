@@ -7,9 +7,10 @@
 //! plus a blob dir in the reference store). Writes travel the other way
 //! as [`crate::change::PimdirWriteOp`].
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::{
+    change::PimdirChangeKey,
     collection::{PimdirCheckpoint, PimdirCoverage, PimdirRound},
     object::PimdirHash,
     placement::{PimdirHandle, PimdirLinkId, PimdirPlacement, PimdirSuperseded},
@@ -99,4 +100,20 @@ pub struct PimdirLoaded {
     ///
     /// [`PimdirHub::offered`]: crate::hub::PimdirHub::offered
     pub offered: Vec<PimdirHandle>,
+    /// The refusals standing on the source's loaded bindings, by handle
+    /// (`list_refusals`, SYNC §5): a change derived under the key one
+    /// names is held and reported, never pushed.
+    pub refused: Vec<(PimdirHandle, PimdirRefusal)>,
+}
+
+/// A refusal standing on a binding of the loaded source (SYNC §5): the
+/// key of the change the remote refused for good and the reason it gave,
+/// as `list_refusals` reads them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirRefusal {
+    /// The idempotency key of the refused change (SYNC §4): a change
+    /// derived under it is held, one derived under another pushed.
+    pub key: PimdirChangeKey,
+    /// The text the remote gave, scrubbed (STORAGE §18).
+    pub reason: String,
 }

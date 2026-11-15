@@ -20,6 +20,12 @@ The merge reconciles only the placements a `load` returns. A storage that hides 
 - WHEN the collection is synced again, whether delta or full
 - THEN the row is retained but absent from `load`, and no re-derivation occurs
 
+### Requirement: A connector tells a refusal from a stale base
+`PimdirPushOutcome` SHALL be `Accepted`, `Rejected` or `Refused { reason }`, `#[non_exhaustive]` and no longer `Copy` (pimdir SYNC §4). `Rejected` is a precondition the base failed (a stale `If-Match` answered `412` or `409`, a `STORE` refused under `UNCHANGEDSINCE`); `Refused` the remote refusing the change itself for good (an HTTP status from 400 to 499 but 408, 409, 412, 425 and 429, an IMAP `NO` naming the command, an error naming a rule the change breaks), `reason` the text the remote gave. A connector that cannot tell answers `Rejected`; a failure of the transport is no outcome, the change left unreported.
+
+### Requirement: A refusal is the binding's
+A load SHALL answer, in `PimdirLoaded::refused`, the refusals standing on the source's bindings in the collection (`list_refusals`), each a `PimdirRefusal { key, reason }` by handle, whatever the selection. A `PimdirWriteOp::RefusePlacement { collection, handle, key, reason }` SHALL run `refuse_binding`, its reason scrubbed first (`security::scrub`, STORAGE §18), and a `PimdirWriteOp::ClearRefusal { collection, handle }` `clear_refusal`, both after the batch's placement writes and stamps, in the batch's order, so an upsert of the binding in the same batch keeps a refusal; a handle nothing binds records nothing. The hub ignores both, a refusal being push state the storage keeps by source.
+
 ### Requirement: Object write carries bytes or a reference
 `PimdirWriteOp::StoreObject` SHALL carry either the object's bytes or a reference to an object the consumer has already persisted to the blob store. The engine SHALL index the object from its `(hash, size)` in both cases, and SHALL have the storage write bytes only when they are present. Refcounting, dedup and garbage collection are unaffected.
 

@@ -17,7 +17,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Row, named_params};
 
 use crate::{
-    change::{PimdirDropReason, PimdirWriteOp},
+    change::{PimdirChangeKey, PimdirDropReason, PimdirWriteOp},
     client::{
         PimdirError, PimdirSourceStore, PreparedCached, attachments, begin, bind_list,
         blobs::{self, PimdirBlobCheck, PimdirBlobs},
@@ -30,13 +30,13 @@ use crate::{
     },
     coroutine::PimdirWritten,
     hub::{PimdirBinding, PimdirHub, PimdirHubItem, PimdirOverruled, PimdirSourceId},
-    load::{PimdirLoadSelection, PimdirLoaded},
+    load::{PimdirLoadSelection, PimdirLoaded, PimdirRefusal},
     object::{PimdirHash, PimdirHeldObject, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
         PimdirPlacement, PimdirSortKey, PimdirStatus, PimdirSuperseded,
     },
-    sql,
+    security, sql,
     summary::{
         self, PimdirAddress, PimdirAddressRole, PimdirDerivation, PimdirSummary,
         calendar::{PimdirEventSummary, PimdirJournalSummary, PimdirTaskSummary, PimdirTime},
@@ -202,6 +202,28 @@ impl PimdirSourceStore {
 
         let conflicted = hub.conflicted(&placements);
         let offered = hub.offered(&self.source, &placements);
+        // NOTE: the source's refusals, on every selection, so a change it
+        // derives under a refused key is held wherever it is derived
+        // (SYNC §5).
+        let refused = rows(
+            conn,
+            sql::LIST_REFUSALS,
+            named_params! { ":collection": collection.0 },
+            |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    PimdirHandle(r.get(2)?),
+                    PimdirRefusal {
+                        key: PimdirChangeKey(r.get(4)?),
+                        reason: r.get(3)?,
+                    },
+                ))
+            },
+        )?
+        .into_iter()
+        .filter(|(source, ..)| *source == self.source.0)
+        .map(|(_, handle, refusal)| (handle, refusal))
+        .collect();
 
         Ok(PimdirLoaded {
             placements,
@@ -213,6 +235,7 @@ impl PimdirSourceStore {
             superseded,
             conflicted,
             offered,
+            refused,
         })
     }
 
@@ -366,6 +389,10 @@ pub(crate) fn apply(
     let mut dropped: BTreeMap<String, BTreeSet<PimdirHandle>> = BTreeMap::new();
     let mut rekeyed: BTreeSet<String> = BTreeSet::new();
     let mut stamps: Vec<(PimdirCollectionId, Vec<PimdirHandle>)> = Vec::new();
+    // NOTE: a refusal recorded or cleared acts on the binding its handle
+    // names once the placements are written, in the batch's order (STORAGE
+    // §14), so an upsert of the binding earlier in the batch keeps it.
+    let mut refusals: Vec<PimdirWriteOp> = Vec::new();
     // NOTE: each collection is ensured once per batch, and the link an
     // upsert's handle is bound to is read once, before any binding of
     // the batch is written, then handed to the hub's read below.
@@ -445,6 +472,9 @@ pub(crate) fn apply(
                 collection,
                 handles,
             } => stamps.push((collection, handles)),
+            op @ (PimdirWriteOp::RefusePlacement { .. } | PimdirWriteOp::ClearRefusal { .. }) => {
+                refusals.push(op)
+            }
             PimdirWriteOp::SetRoundCursor {
                 collection,
                 cursor,
@@ -622,6 +652,40 @@ pub(crate) fn apply(
             sql::STAMP_BINDINGS,
             named_params! { ":collection": collection.0, ":source": source.0 },
         )?;
+    }
+
+    for op in refusals {
+        match op {
+            PimdirWriteOp::RefusePlacement {
+                collection,
+                handle,
+                key,
+                reason,
+            } => {
+                // NOTE: a server's text may carry a credential (STORAGE §18).
+                tx.execute_cached(
+                    sql::REFUSE_BINDING,
+                    named_params! {
+                        ":collection": collection.0,
+                        ":source": source.0,
+                        ":handle": handle.0,
+                        ":key": key.0,
+                        ":reason": security::scrub(&reason),
+                    },
+                )?;
+            }
+            PimdirWriteOp::ClearRefusal { collection, handle } => {
+                tx.execute_cached(
+                    sql::CLEAR_REFUSAL,
+                    named_params! {
+                        ":collection": collection.0,
+                        ":source": source.0,
+                        ":handle": handle.0,
+                    },
+                )?;
+            }
+            _ => {}
+        }
     }
 
     for collection in rekeyed {

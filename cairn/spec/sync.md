@@ -14,7 +14,7 @@ It reconciles what the replica holds and never fetches a payload: every member a
 The engine SHALL merge each candidate placement over `(local, base, remote)`, pushing local-won changes and pulling remote-won changes, comparing per-placement identities (the flag set and, for mutable-content backends, a content revision) rather than raw bytes.
 
 ### Requirement: Push-outcome discipline
-The engine SHALL confirm a push with the remote before rewriting local state: a flag, content, delete or create push is stashed and applied only on an `Accepted` outcome; a `Rejected` (or unreported) outcome leaves the placement dirty, tombstoned or provisional so the next sync retries it.
+The engine SHALL confirm a push with the remote before rewriting local state: a flag, content, delete or create push is stashed and applied only on an `Accepted` outcome; a `Rejected`, `Refused` or unreported outcome leaves the placement dirty, tombstoned or provisional, a `Rejected` or unreported one pushed again by the next sync, a `Refused` one held (below).
 
 ### Requirement: Push direction
 `PimdirSyncOptions.push` SHALL be the master push switch. When false the source is treated read-only: local flag and content changes are kept dirty and never pushed, remote-won changes are still pulled, and a local delete is applied to the replica only. When true, the `PimdirPushRights` refinement SHALL gate each push kind independently.
@@ -121,6 +121,19 @@ A content push accepted in the same run SHALL rebase the placement the flag merg
 
 ### Requirement: A re-listed member is not a pull
 A member a page lists again with the flags and the meta the store holds for it SHALL derive no write, no event and no count: nothing changed. One listed with other flags merges them; one whose meta moved, its revision not, has its summary and sort key refreshed in the page's write, no event reported. A base-less row holding a body whose member a listing no longer carries, a create-collision conflict whose remote side went, SHALL be resurrected as a `Created` placement, as a based edit is: new content beats a delete; a base-less row holding none is dropped.
+
+### Requirement: A refused change is held by its key
+A `PimdirPushOutcome::Refused { reason }` SHALL write, in the batch recording the chunk's outcomes, a `PimdirWriteOp::RefusePlacement` naming the collection, the handle pushed, the change's key and the reason, count in `PimdirSyncReport::refused` and report `PimdirSyncEvent::Refused { handle, reason }` once that write committed (pimdir SYNC §5). A change the merge derives under the key a refusal standing on its binding names (`PimdirLoaded::refused`) SHALL NOT be pushed: its stashed outcome is dropped, the placement left as the merge wrote it, and the run counts it in `refused` and reports `Refused` with the standing reason with its next write, every run while the refusal stands. A change derived under another key (a body edited, a flag set changed) SHALL be pushed as any other. An `Accepted` outcome for a handle a refusal stands on SHALL write a `PimdirWriteOp::ClearRefusal` of it before the writes settling the push. A refusal goes with its binding: a withdrawal, a landing, a superseded or rekeyed handle.
+
+#### Scenario: A create refused for good, then edited
+- GIVEN a pending create the remote answers `Refused`
+- WHEN it syncs again unchanged, then once its body is edited
+- THEN the first run records the refusal and reports it, the second pushes nothing and reports it again, the third pushes the edited `Add` under its new key, and, accepted, the binding under the assigned handle holds no refusal (vectors/sync/162 to 164; 162, 163 and 166 failed on the old engine: no event, the same `Add` and the same `Remove` pushed again)
+
+#### Scenario: An accepted update clears the refusal
+- GIVEN a binding a refusal of an earlier edit stands on, the card edited again
+- WHEN the `Update` under the new key is accepted
+- THEN the binding is rebased and holds no refusal (vectors/sync/165, which failed on the old engine: the refusal stood)
 
 ### Requirement: A rejection counts for a pushed handle only
 `PimdirSyncReport::rejected` SHALL count a `Rejected` outcome once per handle the chunk pushed, on the terms `pushed` counts an accepted one: a result naming a handle nobody pushed, or naming one twice, cannot inflate either.
@@ -510,7 +523,7 @@ A mutable handle stating another identity under itself retires the old binding (
 - tests/engine/sync_audit.rs `a_restated_identity_keeps_the_local_edit_of_the_old_one` (failed before the change: the local body was dropped with the old binding)
 
 ### Requirement: The report says what a run left pending
-`PimdirSyncReport::unanswered` SHALL count the pushes the connector reported no outcome for, each left pending as a rejected one is; `rejected_creates` SHALL name, by provisional handle, the pending creates the remote rejected in the run, also counted in `rejected`, so a create its server refuses run after run is reported rather than pushed for ever in silence (SYNC §5's push discipline). A run returns once its listing's last page landed, so a round it opened or resumed is closed when it returns Ok, unless `parked` says it parked it. No new event kind: the vectors' event vocabulary is closed.
+`PimdirSyncReport::unanswered` SHALL count the pushes the connector reported no outcome for, each left pending as a rejected one is; `rejected_creates` SHALL name, by provisional handle, the pending creates the remote rejected in the run, also counted in `rejected`, each pushed again by the next run; a create its server refuses for good is answered `Refused` by a connector that can tell, which holds it and reports it every run (above). A run returns once its listing's last page landed, so a round it opened or resumed is closed when it returns Ok, unless `parked` says it parked it. The event vocabulary is the vectors': `Refused` is its one addition, at format 7.
 
 #### Scenario: An unanswered push and a refused create
 - tests/engine/sync_audit.rs `an_unanswered_push_is_counted`, `a_rejected_create_is_reported_on_every_run` (both failed before the change: nothing counted, nothing named)

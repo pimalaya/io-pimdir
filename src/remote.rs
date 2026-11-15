@@ -478,17 +478,38 @@ pub struct PimdirFetchedItem {
     pub revision: Option<String>,
 }
 
-/// The outcome of pushing one change.
+/// The outcome of pushing one change (SYNC §4).
 ///
 /// Pushes are at-least-once ([`crate::change::PimdirChange`]): a remove
 /// whose target is already gone is [`Accepted`](Self::Accepted), since
-/// rejecting it would keep the tombstone retrying forever.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// rejecting it would keep the tombstone retrying forever. A failure of
+/// the transport (a timeout, a `5xx`, a `408`, `425` or `429`) is no
+/// outcome: the connector leaves the change unreported.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PimdirPushOutcome {
     /// The remote accepted the change.
     Accepted,
-    /// Optimistic concurrency rejected it: the base was stale.
+    /// A precondition the base failed (a stale `If-Match` answered `412`
+    /// or `409`, a `STORE` refused under `UNCHANGEDSINCE`): left pending,
+    /// a later listing moving past it. What a connector answers when it
+    /// cannot tell a refusal from a stale base.
     Rejected,
+    /// The remote refused the change itself, as it stands, for good: an
+    /// HTTP status from 400 to 499 but 408, 409, 412, 425 and 429, an IMAP
+    /// `NO` naming the command, an error naming a rule the change breaks
+    /// (an append into a Graph folder other than Drafts, a floating time a
+    /// calendar API refuses, a quota exceeded).
+    ///
+    /// Left pending, the refusal recorded on the binding: the engine holds
+    /// the change while it derives it under the same key, and reports it
+    /// [`Refused`](crate::sync::PimdirSyncEvent::Refused) every run (SYNC
+    /// §5).
+    Refused {
+        /// The text the remote gave, which the storage scrubs of
+        /// credentials before it keeps it (STORAGE §18).
+        reason: String,
+    },
 }
 
 /// The result of pushing one change.

@@ -8,9 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-12, sync-draft-12 and search-draft-12, vendored at the commit their tags name (pimdir e4a05b1).
+- **BREAKING**: Added pimdir storage-draft-13, sync-draft-13 and search-draft-13, vendored at pimdir 627271b (draft-12, tagged the same day, was never released by this crate).
 
-  A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The drafts carry the two fixes below. `sql::FORMAT_VERSION`, `sync::SYNC_VERSION` and `sql::search::FORMAT_VERSION` name them (`sql::search::FORMAT_DRAFT` is 12), and `init_store_meta` and `init_index_meta` changed their text.
+  A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. The drafts carry the two fixes below. `sql::FORMAT_VERSION`, `sync::SYNC_VERSION` and `sql::search::FORMAT_VERSION` name them (`sql::search::FORMAT_DRAFT` is 13), and `init_store_meta` and `init_index_meta` changed their text.
+
+- **BREAKING**: Added the refusal of a push for good (pimdir SYNC §4, §5, STORAGE §15.4): `PimdirPushOutcome::Refused { reason }`, the enum now `#[non_exhaustive]` and no longer `Copy`; `PimdirWriteOp::RefusePlacement { collection, handle, key, reason }` and `PimdirWriteOp::ClearRefusal { collection, handle }`; `PimdirLoaded::refused` with `load::PimdirRefusal`; `PimdirSyncEvent::Refused { handle, reason }` and `PimdirSyncReport::refused`.
+
+  A connector answering `Refused` has the refusal recorded on the binding, its reason scrubbed; the engine then holds the change while it derives it under the same key, reporting it every run, pushes one derived under another key, and clears the refusal on the binding's next accepted push. The bindings gain `refusal`, `refused_key` and `refused_at`; `sql::REFUSE_BINDING`, `sql::CLEAR_REFUSAL`, `sql::LIST_REFUSALS` and `sql::LOAD_RECEIPT_REFUSALS` are new, `sql::PRUNE_RECEIPTS` keeps a receipt while a refusal stands on its item, and the sync vectors move to format 7 with cases 162 to 167.
+
+- **BREAKING**: Added `PimdirActionStatus::Applied::refusals`, the refusals standing on the item an applied row acted on (`client::producer::PimdirReceiptRefusal`), with `PimdirReader::receipt_refusals` and `PimdirReader::refusals` (`client::producer::PimdirRefusalRow`). `pimdir queue status` prints a line per refusal and a `refusals` list in its JSON.
+
+### Changed
+
+- **BREAKING**: Changed every receipt to name the item its row acted on: a `set-flags`, an `update` or a `remove` the item it names when the store holds it, a `move` or a `copy` the item it left in its target, as an `add` named the item it created (pimdir STORAGE §15.2).
 
 ### Fixed
 

@@ -30,8 +30,9 @@ use crate::{
         blobs::PimdirBlobs,
         capability, modes, prepare_connection,
         producer::{
-            PimdirActionStatus, PimdirParkedAction, PimdirPendingAction, action_status,
-            overlaid_actions, pending_actions,
+            self, PimdirActionStatus, PimdirParkedAction, PimdirPendingAction,
+            PimdirReceiptRefusal, PimdirRefusalRow, action_status, overlaid_actions,
+            pending_actions,
         },
         rows, schema,
         write::{
@@ -1170,15 +1171,32 @@ impl PimdirReader {
     }
 
     /// Where the queue row `action` names stands (§15.4): pending, parked,
-    /// applied with the item an `add` created, found nowhere, or
-    /// [`Reset`](PimdirActionStatus::Reset) when the store is no longer
-    /// the one the handle was answered in (§4.5). A bare id is followed
-    /// unchecked.
+    /// applied with the item it acted on and the refusals standing there,
+    /// found nowhere, or [`Reset`](PimdirActionStatus::Reset) when the store
+    /// is no longer the one the handle was answered in (§4.5). A bare id is
+    /// followed unchecked.
     pub fn action_status(
         &self,
         action: impl Into<PimdirActionHandle>,
     ) -> Result<PimdirActionStatus, PimdirError> {
         action_status(&self.conn, &action.into())
+    }
+
+    /// The refusals standing on the item the applied queue row `id` acted
+    /// on (§15.4): per collection filing it and source binding it, the
+    /// reason that source's remote refused the change for good, which
+    /// [`action_status`](Self::action_status) carries too.
+    pub fn receipt_refusals(&self, id: i64) -> Result<Vec<PimdirReceiptRefusal>, PimdirError> {
+        producer::receipt_refusals(&self.conn, id)
+    }
+
+    /// Every refusal standing in `collection` (§14.1, SYNC §5), per item
+    /// and source, for a view beside the queue.
+    pub fn refusals(
+        &self,
+        collection: impl AsRef<str>,
+    ) -> Result<Vec<PimdirRefusalRow>, PimdirError> {
+        producer::refusals(&self.conn, collection.as_ref())
     }
 
     /// A collection's pending actions in append order (§15.4).

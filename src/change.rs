@@ -319,6 +319,33 @@ pub enum PimdirWriteOp {
         /// The create's provisional handle.
         handle: PimdirHandle,
     },
+    /// Record a refusal (SYNC §4, §5): the remote refused for good the
+    /// change keyed `key` the source pushed for its binding under
+    /// `handle`, giving `reason`. The binding keeps it, replacing one
+    /// standing there, and the engine holds that change while it derives
+    /// it under the same key; a handle nothing binds records nothing. The
+    /// storage scrubs the reason of credentials before it keeps it
+    /// (STORAGE §18).
+    RefusePlacement {
+        /// The collection holding the binding.
+        collection: PimdirCollectionId,
+        /// The handle the refused change was pushed for.
+        handle: PimdirHandle,
+        /// The idempotency key of the refused change (SYNC §4).
+        key: PimdirChangeKey,
+        /// The text the remote gave.
+        reason: String,
+    },
+    /// Clear the refusal standing on the binding under `handle` (SYNC §5),
+    /// whose push the remote accepted: what an accepted push writes before
+    /// it moves the binding. A binding standing under none is left as it
+    /// is.
+    ClearRefusal {
+        /// The collection holding the binding.
+        collection: PimdirCollectionId,
+        /// The handle whose push was accepted.
+        handle: PimdirHandle,
+    },
     /// Store an object body.
     ///
     /// Storing takes no reference: the pointing upsert may ride in a later

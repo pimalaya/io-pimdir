@@ -305,6 +305,21 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 },
             );
         }
+        // NOTE: a refusal standing on the binding (SYNC §5), its instant
+        // stamped by the statement.
+        if let Some(reason) = binding["refusal"].as_str() {
+            conn.execute(
+                sql::REFUSE_BINDING,
+                named_params! {
+                    ":collection": binding["collection"].as_str().unwrap(),
+                    ":source": binding["source"].as_str().unwrap(),
+                    ":handle": binding["handle"].as_str().unwrap(),
+                    ":key": binding["refused_key"].as_str(),
+                    ":reason": reason,
+                },
+            )
+            .unwrap();
+        }
     }
     // NOTE: what an add carrying `supersedes` recorded (STORAGE §15.3).
     for pair in store["supersessions"].as_array().into_iter().flatten() {
@@ -778,6 +793,9 @@ impl PimdirRemote for Scripted {
                 handle,
                 outcome: match scripted["outcome"].as_str() {
                     Some("Rejected") => PimdirPushOutcome::Rejected,
+                    Some("Refused") => PimdirPushOutcome::Refused {
+                        reason: scripted["reason"].as_str().unwrap().to_string(),
+                    },
                     _ => PimdirPushOutcome::Accepted,
                 },
                 assigned: scripted["assigned"].as_str().map(PimdirHandle::from),
@@ -942,6 +960,9 @@ fn event_json(event: &PimdirSyncEvent) -> Value {
         PimdirSyncEvent::Disagreed { handle, link_id } => {
             return json!({ "kind": "Disagreed", "handle": handle.0, "link_id": link_id.0 });
         }
+        PimdirSyncEvent::Refused { handle, reason } => {
+            return json!({ "kind": "Refused", "handle": handle.0, "reason": reason });
+        }
         event => panic!("unexpected event {event:?}"),
     };
     json!({ "kind": kind, "handle": handle.0 })
@@ -1073,7 +1094,7 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
             "SELECT i.collection, i.link_id, i.seq, CASE WHEN i.flags_known = 1 THEN trim(CASE WHEN i.marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN i.marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN i.marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN i.marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN i.marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(f.flag, ' ') FROM placement_flag f WHERE f.item = i.id), '')) END, i.object_hash, i.level, i.deleted, i.retained_at, i.retained_by, i.sort_key, i.conflicted, i.conflict_object FROM items i ORDER BY i.collection, i.link_id"
         }
         "bindings" => {
-            "SELECT b.collection, i.link_id, b.source, b.handle, CASE WHEN b.base_flags_known = 1 THEN trim(CASE WHEN b.base_marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN b.base_marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN b.base_marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN b.base_marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN b.base_marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.item = b.item AND g.source = b.source), '')) END, b.base_object, b.base_revision, b.base_present, b.conflicted, b.conflict_revision, b.conflict_object, b.shared_object, b.round FROM bindings b JOIN items i ON i.id = b.item ORDER BY b.collection, i.link_id, b.source"
+            "SELECT b.collection, i.link_id, b.source, b.handle, CASE WHEN b.base_flags_known = 1 THEN trim(CASE WHEN b.base_marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN b.base_marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN b.base_marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN b.base_marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN b.base_marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.item = b.item AND g.source = b.source), '')) END, b.base_object, b.base_revision, b.base_present, b.conflicted, b.conflict_revision, b.conflict_object, b.shared_object, b.round, b.refusal, b.refused_key FROM bindings b JOIN items i ON i.id = b.item ORDER BY b.collection, i.link_id, b.source"
         }
         "sources" => {
             "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until, round_band FROM sources ORDER BY collection, source"
@@ -1134,6 +1155,8 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
                     get("conflict_object", bodies.label(row.get(10)?));
                     get("shared_object", bodies.label(row.get(11)?));
                     get("round", json!(row.get::<_, Option<i64>>(12)?));
+                    get("refusal", json!(row.get::<_, Option<String>>(13)?));
+                    get("refused_key", json!(row.get::<_, Option<String>>(14)?));
                 }
                 "sources" => {
                     get("collection", json!(row.get::<_, String>(0)?));
@@ -1412,7 +1435,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 6, "{label}: the sync format's version");
+        assert_eq!(case["v"], 7, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 

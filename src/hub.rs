@@ -410,6 +410,9 @@ impl PimdirHub {
                 PimdirWriteOp::Settle { handle, .. } => {
                     self.settling.insert(handle.clone());
                 }
+                // NOTE: a refusal is the binding's push state, which the
+                // storage keeps by source (SYNC §5).
+                PimdirWriteOp::RefusePlacement { .. } | PimdirWriteOp::ClearRefusal { .. } => {}
                 // NOTE: the sync state is the storage's, by source.
                 PimdirWriteOp::StoreObject { .. }
                 | PimdirWriteOp::SetCheckpoint { .. }

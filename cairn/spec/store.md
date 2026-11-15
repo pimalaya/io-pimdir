@@ -353,13 +353,13 @@ The store schema is version 1 (`user_version` 1), migrations/storage/0001_init.s
 `PRAGMA journal_mode = WAL` is set after the creation commits, by the owner alone ("The journal mode is chosen when the store is created").
 
 #### Scenario: A fresh store
-- tests/store_version.rs `a_fresh_store_names_this_draft_and_an_identity`: `storage-draft-12`, the three versions at 1, a 32-digit id, incarnation 1, `blake3`, derivation 3, no sync version, `auto_vacuum` INCREMENTAL (0 under an immediate transaction, before the change)
+- tests/store_version.rs `a_fresh_store_names_this_draft_and_an_identity`: `storage-draft-13`, the three versions at 1, a 32-digit id, incarnation 1, `blake3`, derivation 3, no sync version, `auto_vacuum` INCREMENTAL (0 under an immediate transaction, before the change)
 
 ### Requirement: A store of another draft is refused
 Every profile (the owner's `open` and `open_current`, the reader, the producer, and the index, which opens the store through a reader first) SHALL run STORAGE §6's open contract (`schema::check`) before it reads or writes anything, refusing, writing nothing, in this order: a database declaring tables at `user_version` 0, or whose `store_meta` names another `format` or holds no row (`PimdirError::Foreign`, `store-foreign`); one holding no schema (`Uncreated`, or `NotCurrent(Version { found: 0 })` from `open_current`); a store whose `store_meta.format_version` is not `sql::FORMAT_VERSION`, `storage-draft-08`, or which lacks the column, as every draft before 08 wrote (`PimdirError::Version { found }`, `store-version`, naming both versions, `found` `None` for the missing column); disagreeing stamps (`VersionMismatch`, `store-corrupt`); a `hash_algo` other than `blake3` (`HashAlgo`, `store-hash-algo`); then a schema whose text is not the canonical one ("The schema check covers the triggers"). Nothing is reconciled, migrated nor rebuilt, whatever the profile: a store of another draft is set aside and a new one synced, which the CHANGELOG says first (STORAGE §4.2).
 
 #### Scenario: Another draft, a release, a draft-07 store, the released crates' stores
-- GIVEN a store marked `storage-v1`, `storage-draft-07`, `storage-draft-10`, `storage-draft-11` or `storage-draft-13`; a store built from pimdir 9606b43's schema verbatim (tests/fixtures/storage-draft-07.sql); a store marked `storage-v2` at version 2 holding a table this crate does not know; and the stores io-pimdir 0.5.1, 0.7.0 and 0.8.0 wrote
+- GIVEN a store marked `storage-v1`, `storage-draft-07`, `storage-draft-10`, `storage-draft-11`, `storage-draft-12` or `storage-draft-14`; a store built from pimdir 9606b43's schema verbatim (tests/fixtures/storage-draft-07.sql); a store marked `storage-v2` at version 2 holding a table this crate does not know; and the stores io-pimdir 0.5.1, 0.7.0 and 0.8.0 wrote
 - WHEN the owner's two opens, a reader and a producer open each
 - THEN each is refused as `Version`, naming both versions, and pimdir.db is byte for byte as it was (tests/store_version.rs `a_store_of_another_version_is_refused_by_every_profile_and_never_written`, `a_draft_07_store_is_refused_by_every_profile_and_never_written`, `a_store_a_release_of_this_crate_wrote_is_refused_by_every_profile`, `a_later_store_is_refused_for_its_marker`; with `search`, the indexer and the query client too, no index.db made, `the_index_refuses_a_store_of_another_version_and_makes_nothing`); every one fails with the marker check removed
 
@@ -392,10 +392,10 @@ The crate SHALL answer `store_id` and `incarnation` with the change cursor (`Pim
 - tests/store_version.rs `two_restores_of_one_backup_answer_two_incarnations`: two copies of one store, each raised with no replaced store read, keep one id and answer two incarnations
 
 ### Requirement: The store records the sync version that wrote its sync state
-The engine's first write through `PimdirSourceStore::write` SHALL record `sync::SYNC_VERSION`, `sync-draft-12`, with `set_sync_version` in the write's transaction, and `load` and `write` SHALL refuse a store naming another sync version as `PimdirError::SyncVersion { found }` (`sync-version`) before any verb reads or writes (STORAGE §4.3, SYNC §10). The owner's drain, unbound and file writes are no engine's and record nothing. Departure: the engine still follows sync-draft-06's rules until phase 5 of the-crate-follows-storage-draft-08; no store this crate wrote before carries a sync version, being refused for its marker.
+The engine's first write through `PimdirSourceStore::write` SHALL record `sync::SYNC_VERSION`, `sync-draft-13`, with `set_sync_version` in the write's transaction, and `load` and `write` SHALL refuse a store naming another sync version as `PimdirError::SyncVersion { found }` (`sync-version`) before any verb reads or writes (STORAGE §4.3, SYNC §10). The owner's drain, unbound and file writes are no engine's and record nothing. Departure: the engine still follows sync-draft-06's rules until phase 5 of the-crate-follows-storage-draft-08; no store this crate wrote before carries a sync version, being refused for its marker.
 
 #### Scenario: Another engine's sync state
-- tests/store_version.rs `the_engine_records_its_sync_version_and_refuses_another`: a load records nothing, the first write records `sync-draft-12`; a store naming `sync-draft-06` refuses the load and the write, pimdir.db unchanged
+- tests/store_version.rs `the_engine_records_its_sync_version_and_refuses_another`: a load records nothing, the first write records `sync-draft-13`; a store naming `sync-draft-06` refuses the load and the write, pimdir.db unchanged
 
 ### Requirement: Every writing connection deletes securely and syncs fully
 Every connection the crate opens on pimdir.db or index.db (`prepare_connection`: the owner's, the reader's, the producer's, the index's, the store attached there included) SHALL set `foreign_keys = ON`, `synchronous = FULL` and `secure_delete = ON`, with `fullfsync = ON` where `target_vendor` is `apple`, whose `fsync` leaves the drive's cache unflushed, and a busy timeout, `BUSY_TIMEOUT`, 30 s, so a reader or a producer waits out the owner's write transaction (STORAGE §4.1, §11.5). A read-only connection sets them too: a pragma it cannot use costs nothing.
@@ -718,7 +718,7 @@ process owns SHALL fail fast rather than wait.
 It SHALL open the store through `open_current`, never `open`: a consumer cancelling a row owns the store for one write and SHALL NOT create it. A store the open contract refuses is refused here too, left as it was.
 
 #### Scenario: A cancel on a store of another draft
-- GIVEN a store marked `storage-draft-13` whose `task_summary` carries a column that draft added, and a queued row
+- GIVEN a store marked `storage-draft-14` whose `task_summary` carries a column that draft added, and a queued row
 - WHEN a consumer cancels the row through `cancel_action`
 - THEN it answers `Version`, and pimdir.db, the row included, is left byte for byte as it was (tests/open_current.rs `a_cancel_leaves_a_store_of_another_draft_as_it_was`)
 
@@ -1150,7 +1150,19 @@ The gate SHALL read a `collection-rename` payload strictly (`PimdirCollectionRen
 A `calendar-reply` or `calendar-cancel` naming `recurrence_id` SHALL be refused with `PimdirActionError::Invalid` unless the value is `YYYYMMDD` or `YYYYMMDDTHHMMSS[Z]`, with `Unsupported` unless its performer declares `calendar.reply.occurrence` or `calendar.cancel.occurrence` at the anchor, and with `Unsupported` on an account whose sources declare nothing, whose owner would answer or cancel the whole series. Without the field the intent is gated as before. `PimdirInvitation` SHALL build and read both payloads.
 
 ### Requirement: An applied row leaves a receipt a producer follows
-The drain SHALL record a receipt (`record_receipt`) in the transaction applying a row, `seq` the item an `add` created (`seq_by_link` on the key it staged) and `None` for every other kind, and SHALL prune the receipts older than `RECEIPT_DAYS`, seven, once its pass is done, never before it reads the pending list. `action_status(id)`, on the producer and the reader, SHALL answer `Pending`, `Parked` with its error, `Applied` with the receipt (an acknowledged or replaced intent included), or `Unknown` for a row withdrawn by request or applied before its receipt was pruned. `PimdirActionStatus::Applied::collection` is an `Option`: the collection the row was queued on, following its rename, `None` once that collection is gone, the receipt outliving it (STORAGE §15.4). `pimdir queue status` prints such an action as applied on a collection deleted since, its JSON `collection` `null`.
+The drain SHALL record a receipt (`record_receipt`) in the transaction applying a row, `seq` the item the row acted on: the item a `set-flags`, an `update` or a `remove` names, when the store holds it before the apply (a remove of an item already gone names none), the item an `add` created (`seq_by_link` on the key it staged), and the one a `move` or a `copy` left in its target (`seq_by_link` there), `None` for `set-performer`; and SHALL prune the receipts older than `RECEIPT_DAYS`, seven, once its pass is done, never before it reads the pending list, `prune_receipts` keeping a receipt while a refusal stands on its item (STORAGE §15.2, §15.4). `action_status(id)`, on the producer and the reader, SHALL answer `Pending`, `Parked` with its error, `Applied` with the receipt (an acknowledged or replaced intent included), or `Unknown` for a row withdrawn by request or applied before its receipt was pruned. `PimdirActionStatus::Applied::collection` is an `Option`: the collection the row was queued on, following its rename, `None` once that collection is gone, the receipt outliving it (STORAGE §15.4). `pimdir queue status` prints such an action as applied on a collection deleted since, its JSON `collection` `null`.
+
+`PimdirActionStatus::Applied::refusals` SHALL hold the refusals standing on that item (`load_receipt_refusals`, STORAGE §15.4), each a `PimdirReceiptRefusal { collection, source, reason, refused_at }`, empty when none: a row applied and refused by a source, which a frontend shows with the reason and offers the item's own actions for, never a retry of the row. `PimdirReader::receipt_refusals(id)` SHALL read the same, and `PimdirReader::refusals(collection)` every refusal of a collection (`list_refusals`), each a `PimdirRefusalRow { seq, source, handle, reason, key, refused_at }`.
+
+#### Scenario: A refused add read from its receipt
+- **GIVEN** an applied `add` whose create a source refused, the reason carrying a URL's userinfo
+- **WHEN** the producer reads its status, its receipt older than a week and the drain pruning
+- **THEN** it is `Applied` with one refusal, the reason scrubbed, and the receipt is kept until the refusal is cleared, then pruned (tests/receipts.rs `a_refusal_shows_on_the_receipt_and_keeps_it_until_cleared`, which failed to build on the old crate: no refusals, no `RefusePlacement`)
+
+#### Scenario: A flag change and a move name their item
+- **GIVEN** a draft drained into Drafts
+- **WHEN** a `set-flags` on it, then a `move` of it into INBOX, are drained
+- **THEN** the first receipt names the draft's `seq`, the second the item in INBOX (tests/receipts.rs `every_receipt_names_the_item_its_row_acted_on`)
 
 #### Scenario: The collection of an applied add is deleted
 - **GIVEN** an `add` drained into a collection, its receipt naming the item it created
@@ -1311,7 +1323,7 @@ No message SHALL advise deleting the store: a resync restores neither the queue,
 #### Scenario: A later store
 - GIVEN a store marked `storage-v2` at version 2
 - WHEN an owner, a producer or a reader opens it
-- THEN the error's code is `store-version` and its message names `storage-draft-12` (tests/queue.rs `a_store_of_a_later_version_is_refused`); a damaged store is `store-corrupt` (tests/stale_store.rs)
+- THEN the error's code is `store-version` and its message names `storage-draft-13` (tests/queue.rs `a_store_of_a_later_version_is_refused`); a damaged store is `store-corrupt` (tests/stale_store.rs)
 
 ### Requirement: The public API names no foreign error type
 `PimdirError::Sql`, `Unanswerable` and `Json` SHALL wrap the opaque `PimdirSqlError` and `PimdirJsonError`, which display the cause and give it through `Error::source` without naming rusqlite or serde_json types, so a major of either is not one of this crate. The `From` conversions the crate's own `?` relies on are hidden from the documentation and are no contract.

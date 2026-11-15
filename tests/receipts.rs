@@ -9,12 +9,14 @@
 use std::path::Path;
 
 use io_pimdir::{
+    change::{PimdirChangeKey, PimdirWriteOp},
     client::{
         PimdirStore,
         producer::{PimdirActionStatus, PimdirProducer},
         reader::PimdirReader,
     },
     codec::PimdirAction,
+    collection::PimdirCollectionId,
     object::PimdirObject,
     placement::PimdirFlags,
 };
@@ -133,7 +135,8 @@ fn a_parked_row_reads_with_its_error_and_a_cancelled_one_nowhere() {
 
     drain(dir.path());
 
-    // a remove of nothing is a success with no item to name
+    // a remove of nothing is a success with no item to name, a remove
+    // naming the item it removed (§15.2)
     let PimdirActionStatus::Applied { seq: None, .. } = producer.action_status(removal).unwrap()
     else {
         panic!("a remove of an absent item is applied");
@@ -388,4 +391,142 @@ fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
     else {
         panic!("the copy is followed by its own id");
     };
+}
+
+/// Drains one action of `producer` on `collection` and answers its status.
+fn applied(
+    dir: &Path,
+    producer: &mut PimdirProducer,
+    collection: &str,
+    action: PimdirAction,
+) -> PimdirActionStatus {
+    let id = producer
+        .enqueue(collection, &action, None)
+        .unwrap()
+        .handle
+        .id;
+    drain(dir);
+    producer.action_status(id).unwrap()
+}
+
+#[test]
+fn every_receipt_names_the_item_its_row_acted_on() {
+    let dir = tempfile::tempdir().unwrap();
+    store(dir.path());
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, DRAFT);
+    producer.enqueue("Drafts", &action, Some(&object)).unwrap();
+    drain(dir.path());
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let seq = reader.list_items("Drafts", None, 10).unwrap()[0].seq;
+
+    let flagged = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Draft", "\\Seen"]),
+        base: None,
+    };
+    let PimdirActionStatus::Applied { seq: named, .. } =
+        applied(dir.path(), &mut producer, "Drafts", flagged)
+    else {
+        panic!("the flag change is applied");
+    };
+    assert_eq!(named, Some(seq), "a set-flags names the item it changed");
+
+    let moved = PimdirAction::Move {
+        seq,
+        to: PimdirCollectionId::from("INBOX"),
+    };
+    let PimdirActionStatus::Applied { seq: named, .. } =
+        applied(dir.path(), &mut producer, "Drafts", moved)
+    else {
+        panic!("the move is applied");
+    };
+    let landed = reader.list_items("INBOX", None, 10).unwrap();
+    assert_eq!(landed.len(), 1);
+    assert_eq!(
+        named,
+        Some(landed[0].seq),
+        "a move names the item it left in its target"
+    );
+}
+
+#[test]
+fn a_refusal_shows_on_the_receipt_and_keeps_it_until_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    store(dir.path());
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, DRAFT);
+    let id = producer
+        .enqueue("Drafts", &action, Some(&object))
+        .unwrap()
+        .handle
+        .id;
+    drain(dir.path());
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let item = reader.list_items("Drafts", None, 10).unwrap().remove(0);
+
+    // NOTE: what the engine writes on a Refused outcome (SYNC §5), a
+    // server's text carrying a credential the store never keeps (§18).
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    owner
+        .write(vec![PimdirWriteOp::RefusePlacement {
+            collection: PimdirCollectionId::from("Drafts"),
+            handle: item.link_id.provisional(),
+            key: PimdirChangeKey::from("0123456789abcdef"),
+            reason: String::from("appends go to Drafts only: https://me:hunter2@graph.example/x"),
+        }])
+        .unwrap();
+
+    let PimdirActionStatus::Applied { refusals, seq, .. } = producer.action_status(id).unwrap()
+    else {
+        panic!("the refused add is still applied");
+    };
+    assert_eq!(seq, Some(item.seq));
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(
+        (refusals[0].collection.as_str(), refusals[0].source.as_str()),
+        ("Drafts", "local")
+    );
+    assert!(refusals[0].reason.starts_with("appends go to Drafts only"));
+    assert!(
+        !refusals[0].reason.contains("hunter2"),
+        "{}",
+        refusals[0].reason
+    );
+    assert_eq!(reader.receipt_refusals(id).unwrap(), refusals);
+    let listed = reader.refusals("Drafts").unwrap();
+    assert_eq!(
+        (listed[0].seq, listed[0].key.as_str()),
+        (item.seq, "0123456789abcdef")
+    );
+
+    let db = Connection::open(dir.path().join("pimdir.db")).unwrap();
+    let age = || {
+        db.execute(
+            "UPDATE receipts SET applied_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days')",
+            [],
+        )
+        .unwrap()
+    };
+    age();
+    drain(dir.path());
+    let PimdirActionStatus::Applied { .. } = producer.action_status(id).unwrap() else {
+        panic!("a receipt is kept while a refusal stands on its item");
+    };
+
+    owner
+        .write(vec![PimdirWriteOp::ClearRefusal {
+            collection: PimdirCollectionId::from("Drafts"),
+            handle: item.link_id.provisional(),
+        }])
+        .unwrap();
+    assert_eq!(reader.refusals("Drafts").unwrap(), Vec::new());
+    age();
+    drain(dir.path());
+    assert_eq!(
+        producer.action_status(id).unwrap(),
+        PimdirActionStatus::Unknown
+    );
 }

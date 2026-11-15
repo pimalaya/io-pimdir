@@ -892,9 +892,16 @@ pub enum PimdirActionStatus {
         /// once that collection is gone, a `collection-delete` applied
         /// included (§15.4).
         collection: Option<String>,
-        /// The item an `add` created, or an acknowledged intent left when
-        /// its performer knew it; `None` otherwise.
+        /// The item the row acted on: the one a `set-flags`, an `update` or
+        /// a `remove` names, the one an `add` created, or a `move` or a
+        /// `copy` left in its target; or the item an acknowledged intent
+        /// left when its performer knew it; `None` otherwise.
         seq: Option<i64>,
+        /// The refusals standing on that item (`load_receipt_refusals`,
+        /// §15.4): a source whose remote refused the change the row led to
+        /// for good, with its reason, which a frontend shows as applied
+        /// and refused by that source. Empty when none stands.
+        refusals: Vec<PimdirReceiptRefusal>,
     },
     /// In neither the queue nor the receipts: withdrawn by request, or
     /// applied or performed before its receipt was pruned.
@@ -964,14 +971,95 @@ pub(crate) fn action_status(
 
     let receipt = conn
         .query_row_cached(sql::LOAD_RECEIPT, named_params! { ":id": id }, |r| {
-            Ok(PimdirActionStatus::Applied {
-                applied_at: r.get(0)?,
-                collection: r.get(1)?,
-                seq: r.get(2)?,
-            })
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })
         .optional()?;
-    Ok(receipt.unwrap_or(PimdirActionStatus::Unknown))
+    let Some((applied_at, collection, seq)) = receipt else {
+        return Ok(PimdirActionStatus::Unknown);
+    };
+    Ok(PimdirActionStatus::Applied {
+        applied_at,
+        collection,
+        seq,
+        refusals: receipt_refusals(conn, id)?,
+    })
+}
+
+/// A refusal standing on the item an applied queue row acted on (§15.4,
+/// SYNC §5), as `load_receipt_refusals` reads it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirReceiptRefusal {
+    /// The collection filing the item there, the target of a `move`.
+    pub collection: String,
+    /// The source whose remote refused the change.
+    pub source: String,
+    /// The text the remote gave, scrubbed (§18).
+    pub reason: String,
+    /// The RFC 3339 instant the refusal was recorded at.
+    pub refused_at: String,
+}
+
+/// A refusal standing in a collection (§14.1, SYNC §5), as `list_refusals`
+/// reads it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirRefusalRow {
+    /// The public id of the item refused.
+    pub seq: i64,
+    /// The source whose remote refused the change.
+    pub source: String,
+    /// The handle the change was pushed for, a provisional one for a
+    /// create.
+    pub handle: String,
+    /// The text the remote gave, scrubbed (§18).
+    pub reason: String,
+    /// The idempotency key of the refused change (SYNC §4), which the
+    /// engine holds.
+    pub key: String,
+    /// The RFC 3339 instant the refusal was recorded at.
+    pub refused_at: String,
+}
+
+/// The refusals standing on the item the applied row `id` acted on
+/// (`load_receipt_refusals`, §15.4).
+pub(crate) fn receipt_refusals(
+    conn: &Connection,
+    id: i64,
+) -> Result<Vec<PimdirReceiptRefusal>, PimdirError> {
+    Ok(rows(
+        conn,
+        sql::LOAD_RECEIPT_REFUSALS,
+        named_params! { ":id": id },
+        |r| {
+            Ok(PimdirReceiptRefusal {
+                collection: r.get(0)?,
+                source: r.get(1)?,
+                reason: r.get(2)?,
+                refused_at: r.get(3)?,
+            })
+        },
+    )?)
+}
+
+/// Every refusal standing in `collection` (`list_refusals`, §14.1).
+pub(crate) fn refusals(
+    conn: &Connection,
+    collection: &str,
+) -> Result<Vec<PimdirRefusalRow>, PimdirError> {
+    Ok(rows(
+        conn,
+        sql::LIST_REFUSALS,
+        named_params! { ":collection": collection },
+        |r| {
+            Ok(PimdirRefusalRow {
+                seq: r.get(0)?,
+                source: r.get(1)?,
+                handle: r.get(2)?,
+                reason: r.get(3)?,
+                key: r.get(4)?,
+                refused_at: r.get(5)?,
+            })
+        },
+    )?)
 }
 
 /// One pending queue row, in append order (§15.4).
@@ -1477,7 +1565,7 @@ fn apply_claimed(
                     named_params! { ":delta": -1, ":hash": hash },
                 )?;
             }
-            record_receipt(tx, row.id, &row.collection, None)?;
+            record_receipt(tx, row.id, &row.collection, acted_on(action))?;
             return outcome(PimdirOutcome::Applied);
         }
         Err(other) => return outcome(other),
@@ -1490,6 +1578,31 @@ fn apply_claimed(
             _ => None,
         }),
         _ => None,
+    };
+    // NOTE: the item the action names, read before the write moves it: a
+    // remove of an item already gone names none (§15.2).
+    let acted = match acted_on(action) {
+        Some(seq) => tx
+            .query_row_cached(
+                sql::GET_ITEM,
+                named_params! { ":collection": collection, ":seq": seq },
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    // NOTE: a move or a copy names, in its receipt, the item it left in its
+    // target, read back on the key it staged there (§15.2).
+    let landed = match action {
+        PimdirAction::Move { to, .. } | PimdirAction::Copy { to, .. } => {
+            ops.iter().find_map(|op| match op {
+                PimdirWriteOp::UpsertPlacement(placement) if placement.collection == *to => {
+                    placement.link_id.clone().map(|link| (to.0.clone(), link))
+                }
+                _ => None,
+            })
+        }
+        _ => created.clone().map(|link| (String::from(collection), link)),
     };
     let written = write::apply(tx, blobs, &source, account, ops)?;
     // NOTE: the item an add supersedes is tombstoned under the savepoint
@@ -1513,15 +1626,18 @@ fn apply_claimed(
             named_params! { ":delta": -1, ":hash": hash },
         )?;
     }
-    let seq = match created {
-        Some(link) => tx
+    // NOTE: every receipt names the item its row acted on, the one it
+    // created for an add, a move and a copy, so a producer reads the
+    // refusals standing there (§15.2, §15.4).
+    let seq = match landed {
+        Some((target, link)) => tx
             .query_row_cached(
                 sql::SEQ_BY_LINK,
-                named_params! { ":collection": collection, ":link_id": link.0 },
+                named_params! { ":collection": target, ":link_id": link.0 },
                 |r| r.get::<_, i64>(0),
             )
             .optional()?,
-        None => None,
+        None => acted,
     };
     record_receipt(tx, row.id, &row.collection, seq)?;
 
@@ -1535,6 +1651,20 @@ fn apply_claimed(
         })
         .collect();
     Ok((PimdirOutcome::Applied, overruled))
+}
+
+/// The item an action names by its `seq`, which its receipt names
+/// (§15.2): a `set-flags`, an `update`, a `remove`, and a `move` or a
+/// `copy` whose create its target does not hold.
+fn acted_on(action: &PimdirAction) -> Option<i64> {
+    match action {
+        PimdirAction::SetFlags { seq, .. }
+        | PimdirAction::Update { seq, .. }
+        | PimdirAction::Remove { seq, .. }
+        | PimdirAction::Move { seq, .. }
+        | PimdirAction::Copy { seq, .. } => Some(*seq),
+        _ => None,
+    }
 }
 
 /// Tombstones the item an `add` supersedes, inside the drain transaction

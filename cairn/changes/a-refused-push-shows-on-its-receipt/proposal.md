@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: a-refused-push-shows-on-its-receipt
-status: draft
+status: landed
 created: 2026-11-15
 ---
 
@@ -20,3 +20,5 @@ Follows pimdir's draft of the same id (pimdir cairn/changes/a-refused-push-shows
 - Tests failing first: a connector refusing an add, the row's receipt reading the refusal, the next run not pushing it, an edit pushing it again, a remove withdrawing it (with a-pending-create-is-withdrawn-whatever-the-rights).
 
 Nothing is written yet.
+
+Decided by the owner on 2026-11-15, each recommendation of pimdir's change of the same id taken: D1 `Refused { reason }`, D2 binding columns, D3 held by key, D4 every receipt names its item, D5 no re-parking.

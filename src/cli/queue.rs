@@ -250,6 +250,7 @@ impl QueueStatusCommand {
             error: None,
             applied_at: None,
             seq: None,
+            refusals: Vec::new(),
         };
 
         match status {
@@ -291,11 +292,21 @@ impl QueueStatusCommand {
                 applied_at,
                 collection,
                 seq,
+                refusals,
             } => {
                 output.status = QueueStatus::Applied;
                 output.collection = collection;
                 output.applied_at = Some(applied_at);
                 output.seq = seq;
+                output.refusals = refusals
+                    .into_iter()
+                    .map(|refusal| QueueRefusal {
+                        collection: refusal.collection,
+                        source: refusal.source,
+                        reason: refusal.reason,
+                        refused_at: refusal.refused_at,
+                    })
+                    .collect();
             }
             PimdirActionStatus::Unknown => (),
             PimdirActionStatus::Reset => output.status = QueueStatus::Reset,
@@ -346,8 +357,27 @@ pub struct QueueStatusOutput {
     pub error: Option<String>,
     /// When the owner applied it.
     pub applied_at: Option<String>,
-    /// The item an applied add created.
+    /// The item an applied action acted on, the one an add, a move or a
+    /// copy created.
     pub seq: Option<i64>,
+    /// The refusals standing on that item (§15.4): a source whose remote
+    /// refused for good the change the action led to. Empty when none
+    /// stands.
+    pub refusals: Vec<QueueRefusal>,
+}
+
+/// A refusal standing on the item an applied action acted on.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueRefusal {
+    /// The collection filing the item there.
+    pub collection: String,
+    /// The source whose remote refused the change.
+    pub source: String,
+    /// The text the remote gave.
+    pub reason: String,
+    /// When the refusal was recorded.
+    pub refused_at: String,
 }
 
 impl fmt::Display for QueueStatusOutput {
@@ -378,7 +408,16 @@ impl fmt::Display for QueueStatusOutput {
                 (None, None) => {
                     writeln!(f, "Action {id} was applied on a collection deleted since")
                 }
-            },
+            }
+            .and_then(|()| {
+                self.refusals.iter().try_for_each(|refusal| {
+                    writeln!(
+                        f,
+                        "Refused by {} in {} at {}: {}",
+                        refusal.source, refusal.collection, refusal.refused_at, refusal.reason
+                    )
+                })
+            }),
             QueueStatus::Unknown => writeln!(
                 f,
                 "Action {id} is neither queued nor applied recently: cancelled, or applied before its receipt was pruned"
@@ -641,6 +680,7 @@ Error:       no such seq\u{fffd}
             error: None,
             applied_at: Some(String::from("2026-11-11T18:13:39.904Z")),
             seq,
+            refusals: Vec::new(),
         };
 
         assert_eq!(

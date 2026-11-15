@@ -43,13 +43,13 @@ use alloc::{
 use log::{debug, trace};
 
 use crate::{
-    change::{PimdirChange, PimdirChangeKind, PimdirDropReason, PimdirWriteOp},
+    change::{PimdirChange, PimdirChangeKey, PimdirChangeKind, PimdirDropReason, PimdirWriteOp},
     collection::{
         PimdirCheckpoint, PimdirCollectionId, PimdirCoverage, PimdirCursor, PimdirRound,
         PimdirScope,
     },
     coroutine::*,
-    load::{PimdirLoadSelection, PimdirLoaded},
+    load::{PimdirLoadSelection, PimdirLoaded, PimdirRefusal},
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
@@ -69,7 +69,7 @@ mod join;
 /// The version of SYNC.md this engine follows (SYNC §10), which a store
 /// records in `store_meta.sync_version` with the engine's first write: a
 /// store naming another is refused before any verb runs.
-pub const SYNC_VERSION: &str = "sync-draft-12";
+pub const SYNC_VERSION: &str = "sync-draft-13";
 
 /// Which push kinds a writable source may derive.
 ///
@@ -228,6 +228,17 @@ pub enum PimdirSyncEvent {
     /// dropped, the item retained. Reported by the mutation, never by a
     /// sync, which gives no delivered create up.
     Abandoned(PimdirHandle),
+    /// A change the remote refused for good this run, or one the run holds
+    /// for a refusal standing on its binding (SYNC §5), with the reason the
+    /// remote gave: reported every run while the refusal stands, so a
+    /// caller shows it beside the row that queued the change
+    /// (`load_receipt_refusals`, STORAGE §15.4).
+    Refused {
+        /// The handle the change was pushed for.
+        handle: PimdirHandle,
+        /// The text the remote gave.
+        reason: String,
+    },
 }
 
 /// A create a sync left waiting (SYNC §5).
@@ -304,14 +315,19 @@ pub struct PimdirSyncReport {
     /// Pushes the remote rejected on optimistic concurrency.
     pub rejected: usize,
     /// The pending creates the remote rejected this run, by provisional
-    /// handle, each left pending (SYNC §5): a create named here run after
-    /// run is one its server keeps refusing, for the consumer to report
-    /// rather than let it be pushed for ever in silence. Counted in
-    /// `rejected` too.
+    /// handle, each left pending (SYNC §5) and pushed again by the next
+    /// run: a connector refusing one for good answers
+    /// [`Refused`](PimdirPushOutcome::Refused), which holds it instead.
+    /// Counted in `rejected` too.
     pub rejected_creates: Vec<PimdirHandle>,
     /// Pushes the connector reported no outcome for: left pending, as a
     /// rejected one is, and pushed again by the next run (SYNC §5).
     pub unanswered: usize,
+    /// Changes the remote refused for good this run, and those held for a
+    /// refusal standing on their binding (SYNC §5), each reported
+    /// [`Refused`](PimdirSyncEvent::Refused) with its reason: left
+    /// pending, the held ones pushed again once derived under another key.
+    pub refused: usize,
     /// Placements whose stale body was dropped after a remote content change.
     pub refreshed: usize,
     /// The creates of this source the run pushed no add for and landed on
@@ -414,6 +430,12 @@ pub struct PimdirSync {
     /// Only these are settled or forgotten when the outcomes land: a
     /// later chunk's are still waiting for their own.
     in_flight: BTreeMap<PimdirHandle, Pending>,
+    /// The keys of the chunk awaiting its outcome, which a refusal records
+    /// (SYNC §5).
+    in_flight_keys: BTreeMap<PimdirHandle, PimdirChangeKey>,
+    /// The refusals standing on the source's loaded bindings, by handle: a
+    /// change derived under the key one names is held (SYNC §5).
+    refused: BTreeMap<PimdirHandle, PimdirRefusal>,
     /// The chunk awaiting the verification of the bodies it uploads.
     chunk: Vec<PimdirChange>,
     /// The events of the writes not answered yet, reported once the write
@@ -476,6 +498,8 @@ impl PimdirSync {
             pushes: Vec::new(),
             pending: BTreeMap::new(),
             in_flight: BTreeMap::new(),
+            in_flight_keys: BTreeMap::new(),
+            refused: BTreeMap::new(),
             chunk: Vec::new(),
             unwritten: Vec::new(),
             report: PimdirSyncReport::default(),
@@ -837,6 +861,7 @@ impl PimdirSync {
         self.held.extend(loaded.held);
         self.offered.extend(loaded.offered);
         self.superseded.extend(loaded.superseded);
+        self.refused.extend(loaded.refused);
     }
 
     /// The hints a page before the last loads the holders of, so naming
@@ -1455,6 +1480,10 @@ impl PimdirSync {
             .iter()
             .filter_map(|change| self.pending.remove_entry(change.handle()))
             .collect();
+        self.in_flight_keys = changes
+            .iter()
+            .map(|change| (change.handle().clone(), change.key.clone()))
+            .collect();
 
         debug!(
             "push {} local changes to remote, {} left after them",
@@ -1513,7 +1542,23 @@ impl PimdirSync {
             }
 
             if let Some(kind) = self.merge(candidate) {
-                self.pushes.push(PimdirChange::new(&self.collection, kind));
+                let change = PimdirChange::new(&self.collection, kind);
+                match self.refused.get(&handle) {
+                    // NOTE: the change the remote refused for good, derived
+                    // again as it was: held, pending, and reported every run
+                    // while the refusal stands (SYNC §5).
+                    Some(refusal) if refusal.key == change.key => {
+                        debug!("hold the change {} refused for good", handle.as_str());
+                        let reason = refusal.reason.clone();
+                        self.pending.remove(&handle);
+                        self.report.refused += 1;
+                        self.emit(PimdirSyncEvent::Refused {
+                            handle: handle.clone(),
+                            reason,
+                        });
+                    }
+                    _ => self.pushes.push(change),
+                }
             }
 
             if let Some(fresh) = fresh {
@@ -2517,8 +2562,18 @@ impl PimdirCoroutine for PimdirSync {
                     let Some(pending) = self.in_flight.remove(&result.handle) else {
                         continue;
                     };
-                    match result.outcome {
+                    let key = self.in_flight_keys.remove(&result.handle);
+                    match &result.outcome {
                         PimdirPushOutcome::Accepted => {
+                            // NOTE: cleared before the settle moves the
+                            // binding, which a superseded handle then leaves
+                            // (SYNC §5).
+                            if self.refused.remove(&result.handle).is_some() {
+                                self.writes.push(PimdirWriteOp::ClearRefusal {
+                                    collection: self.collection.clone(),
+                                    handle: result.handle.clone(),
+                                });
+                            }
                             self.settle(pending, result);
                             self.report.pushed += 1;
                         }
@@ -2528,12 +2583,29 @@ impl PimdirCoroutine for PimdirSync {
                                 self.report.rejected_creates.push(result.handle.clone());
                             }
                         }
+                        PimdirPushOutcome::Refused { reason } => {
+                            debug!("the change {} is refused for good", result.handle.as_str());
+                            if let Some(key) = key {
+                                self.writes.push(PimdirWriteOp::RefusePlacement {
+                                    collection: self.collection.clone(),
+                                    handle: result.handle.clone(),
+                                    key,
+                                    reason: reason.clone(),
+                                });
+                            }
+                            self.report.refused += 1;
+                            self.emit(PimdirSyncEvent::Refused {
+                                handle: result.handle.clone(),
+                                reason: reason.clone(),
+                            });
+                        }
                     }
                 }
                 // NOTE: unreported handles stay pending and are counted, but
                 // only this chunk's: later chunks have not been pushed yet.
                 self.report.unanswered += self.in_flight.len();
                 self.in_flight.clear();
+                self.in_flight_keys.clear();
 
                 debug!("pushed, write {} storage ops", self.writes.len());
                 trace!("push results: {results:?}");

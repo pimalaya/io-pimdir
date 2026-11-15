@@ -206,6 +206,7 @@ fn an_absent_value_prints_null() {
             "error": null,
             "appliedAt": null,
             "seq": null,
+            "refusals": [],
         })
     );
 }
