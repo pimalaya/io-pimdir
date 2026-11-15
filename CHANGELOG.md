@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   A message added to a Graph folder other than Drafts, rejected by every sync, could not be deleted while the source's deletes were off.
 
+- Fixed a narrowed round dropping members its enumeration holds: the last page of a round a date filter narrowed finds absent only a member in scope its `enumerated` list lacks, whatever its date, and nothing when it hands none, counting what it kept in `PimdirSyncReport::unlisted` (pimdir SYNC §5).
+
+  A band narrowed by arrival (Gmail's `before:`, Graph's `receivedDateTime`) dropped messages dated long before they arrived, which the server still held. The vendored specification follows pimdir 6ccc3d4, ahead of the draft-11 tags: `list_unstamped_bindings` changed its text, vectors 47 and 107 changed, 160 and 161 are new.
+
 ## [0.13.0] - 2026-11-15
 
 ### Changed

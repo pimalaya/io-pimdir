@@ -11,7 +11,8 @@
 //! [`PimdirRemoteMeta`], or by [`PimdirEnumerated::CursorRejected`] when
 //! the source refuses the cursor a resumed round handed it. A round a date
 //! filter narrowed says so on every page, and may hand on its last page the
-//! collection's handles listed unfiltered (SYNC §4, §5).
+//! collection's handles listed unfiltered, the only proof of an absence it
+//! offers (SYNC §4, §5).
 //!
 //! While a round is open, a run resuming it first asks for the round's
 //! head ([`PimdirListing::Head`], SYNC §4, §5): what changed since the
@@ -153,11 +154,11 @@ pub struct PimdirRemoteSnapshot {
     /// page of such a round and on no other page (SYNC §4, §5).
     ///
     /// A filter lists a member only when it matches, so it misses an
-    /// undated member received before its window and one whose `Date`
-    /// runs ahead of its arrival: IMAP `SENTSINCE`, JMAP `after`, Graph's
-    /// `receivedDateTime` and Gmail's `after:` each narrow. The round
-    /// then finds absent only a member dated before it opened, or one
-    /// [`enumerated`](Self::enumerated) lacks.
+    /// undated member, one whose `Date` runs ahead of its arrival and one
+    /// received long after its `Date`: IMAP `SENTSINCE`, JMAP `after`,
+    /// Graph's `receivedDateTime` and Gmail's `after:` and `before:` each
+    /// narrow. The round then finds absent only a member
+    /// [`enumerated`](Self::enumerated) lacks, and none without it.
     pub narrowed: bool,
     /// Every handle the collection holds on the source, read by an
     /// enumeration no date filter narrowed, on the last page of a narrowed
@@ -166,8 +167,8 @@ pub struct PimdirRemoteSnapshot {
     /// A connector offering such an enumeration SHOULD hand it: IMAP's
     /// `UID SEARCH ALL`, JMAP's `Email/query` filtered by the mailbox
     /// alone, Graph's message ids of the folder. The round finds absent
-    /// any member, undated or dated after it opened included, whose
-    /// handle it lacks.
+    /// a member in scope whose handle it lacks, whatever its date, and
+    /// never one whose handle it holds.
     pub enumerated: Option<Vec<PimdirHandle>>,
     /// Whether the source caps the round's listing (SYNC §4, §5).
     pub capped: bool,

@@ -31,14 +31,17 @@ pub enum PimdirLoadSelection {
     /// last page of the source's open round, with the bindings the round
     /// finds absent ([`PimdirLoaded::unstamped`]): `list_unstamped_bindings`
     /// bound with what the page states of its listing (SYNC §4, §5).
+    ///
+    /// The sync engine binds neither narrowing, reading every binding of
+    /// the scope the round did not stamp, and applies the page's proof
+    /// itself.
     LastPage {
         /// Whether a date filter narrowed the round's listing, whose
-        /// silence then proves only the absence of a member dated before
-        /// the round opened (`:narrowed`).
+        /// silence then proves no absence by itself (`:narrowed`).
         narrowed: bool,
         /// The collection's handles an unfiltered enumeration listed, on
-        /// the last page of a narrowed round: any member they lack is
-        /// absent (`:enumerated` and the `handles` slot).
+        /// the last page of a narrowed round: a member is absent only when
+        /// they lack it (`:enumerated` and the `handles` slot).
         enumerated: Option<Vec<PimdirHandle>>,
     },
     /// The placements holding these handles.

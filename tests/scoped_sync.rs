@@ -1213,3 +1213,25 @@ fn a_resumed_narrowed_round_drops_only_what_its_enumeration_lacks() {
     assert_eq!(report.parked, None);
     assert_eq!(live(dir.path()), ["recent@x", "undated@x"]);
 }
+
+/// A resumed round whose listing a date filter narrowed and which hands no
+/// enumeration finds no member absent, a member dated before it opened
+/// included: it closes, drops nothing and reports what it left unlisted
+/// (SYNC §5).
+#[test]
+fn a_resumed_narrowed_round_handing_no_enumeration_drops_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, mut remote) = round_left_open(dir.path(), false);
+
+    let PimdirEnumerated::Page(mut last) = page(Vec::new(), None) else {
+        unreachable!("a page");
+    };
+    last.narrowed = true;
+    remote.pages = vec![PimdirEnumerated::Page(last)];
+    let report = store
+        .sync("INBOX", PimdirSyncOptions::default(), &mut remote)
+        .unwrap();
+    assert_eq!(report.parked, None);
+    assert_eq!(report.unlisted, 3);
+    assert_eq!(live(dir.path()), ["ahead@x", "recent@x", "undated@x"]);
+}

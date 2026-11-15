@@ -12,7 +12,7 @@
 //! one write with its resume cursor and the round's stamp on every
 //! binding it listed; deletes are inferred once, when the last page
 //! lands, from the bindings in scope no page stamped, a listing a date
-//! filter narrowed proving only what its filter could list, and a round
+//! filter narrowed proving only what its enumeration lacks, and a round
 //! naming no member parking rather than dropping. A run resuming an
 //! open round first lists its head, what changed since the round began,
 //! when the connector lists one: a delta head is stamped and moves the
@@ -37,7 +37,6 @@ use core::mem;
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     string::String,
-    vec,
     vec::Vec,
 };
 
@@ -326,7 +325,8 @@ pub struct PimdirSyncReport {
     /// The round this run parked rather than closed, its last page
     /// finding most of its scope absent (SYNC §5).
     pub parked: Option<PimdirParked>,
-    /// Based bindings a capped round did not list (SYNC §5).
+    /// Based bindings in scope a capped round, or a narrowed one handing
+    /// no enumeration, did not list and kept (SYNC §5).
     pub unlisted: usize,
     /// The per-item events this sync emitted, in order, each once the
     /// write recording it committed (SYNC §5).
@@ -786,9 +786,11 @@ impl PimdirSync {
                         .collect(),
                 )
             }
+            // NOTE: every unstamped binding of the scope, which tells a round
+            // that named a member; the page's proof applies at the merge.
             PageKind::Last => PimdirLoadSelection::LastPage {
-                narrowed,
-                enumerated: enumerated.clone(),
+                narrowed: false,
+                enumerated: None,
             },
             // NOTE: a delta reasons about what it does not list only
             // through what owes a push, which the store names (SYNC §10);
@@ -816,26 +818,6 @@ impl PimdirSync {
         self.held.clear();
         self.offered.clear();
         self.superseded.clear();
-
-        // NOTE: a narrowed round finds absent only what is dated before it
-        // opened, an instant the store stamps (SYNC §5): a round its last
-        // page would open is opened in a write of its own first, so the
-        // store reads its absences as for a round opened before.
-        if let (PageKind::Last, true, Plan::Round(round)) = (kind, narrowed, &mut self.plan)
-            && round.open
-        {
-            debug!("open the narrowed round before its last page lands");
-            round.open = false;
-            self.round_open = true;
-            self.state = State::Opening;
-            return PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(vec![
-                PimdirWriteOp::OpenRound {
-                    collection: self.collection.clone(),
-                    scope: round.scope.clone(),
-                    band: round.band,
-                },
-            ]));
-        }
 
         self.state = State::LoadingPage;
         PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
@@ -923,16 +905,31 @@ impl PimdirSync {
                     .cloned()
                     .collect(),
             };
-            trace!("found absent in scope: {absent:?}");
+            trace!("unlisted in scope: {absent:?}");
 
-            let absent = match page.capped {
-                true => {
+            // NOTE: a narrowed listing proves an absence only by the
+            // enumeration it hands, whatever the member's date (SYNC §5).
+            let absent = match (page.capped, page.narrowed, &page.enumerated) {
+                (true, _, _) => {
                     debug!("capped listing, {} unlisted members kept", absent.len());
                     self.report.unlisted = absent.len();
                     Vec::new()
                 }
-                false => absent,
+                (false, true, None) => {
+                    debug!("narrowed listing, {} unlisted members kept", absent.len());
+                    self.report.unlisted = absent.len();
+                    Vec::new()
+                }
+                (false, true, Some(enumerated)) => {
+                    let enumerated: BTreeSet<&PimdirHandle> = enumerated.iter().collect();
+                    absent
+                        .into_iter()
+                        .filter(|handle| !enumerated.contains(handle))
+                        .collect()
+                }
+                (false, false, _) => absent,
             };
+            trace!("found absent in scope: {absent:?}");
 
             // NOTE: a listing dropping most of a large scope is read as a
             // truncated or emptied answer until the caller confirms it, and
@@ -944,7 +941,7 @@ impl PimdirSync {
                 .values()
                 .filter(|p| p.base.is_some() && !p.delivered() && round.finds_absent(date_of(p)))
                 .count();
-            let named = self.named || !page.items.is_empty() || self.stamped(round, &page);
+            let named = self.named || !page.items.is_empty() || self.stamped(round);
             let accepted = self.opts.accept_absences;
             match PimdirParked::guard(absent.len(), bound, named, accepted) {
                 Some(parked) => {
@@ -1086,30 +1083,17 @@ impl PimdirSync {
     }
 
     /// Whether a page an earlier run listed for the resumed `round` named a
-    /// member (SYNC §5): a based binding in its scope, whose absence its
-    /// listing could prove, that the store does not answer unstamped. A
-    /// round this run opened was stamped by this run's pages alone.
-    fn stamped(&self, round: &RoundPlan, page: &Page) -> bool {
-        let Some(started_at) = &round.started_at else {
+    /// member (SYNC §5): a based binding in its scope that the store does
+    /// not answer unstamped. A round this run opened was stamped by this
+    /// run's pages alone.
+    fn stamped(&self, round: &RoundPlan) -> bool {
+        if round.started_at.is_none() {
             return false;
-        };
+        }
         let unstamped: BTreeSet<&PimdirHandle> = self.unstamped.iter().collect();
-        let enumerated: Option<BTreeSet<&PimdirHandle>> = page
-            .enumerated
-            .as_ref()
-            .map(|handles| handles.iter().collect());
-        let provable = |p: &PimdirPlacement| {
-            let dated = date_of(p).is_some_and(|date| date < started_at.as_str());
-            let unlisted = enumerated
-                .as_ref()
-                .is_some_and(|handles| !handles.contains(&p.handle));
-            !page.narrowed || dated || unlisted
-        };
-
         self.local
             .values()
             .filter(|p| p.base.is_some() && !p.delivered() && round.finds_absent(date_of(p)))
-            .filter(|p| provable(p))
             .any(|p| !unstamped.contains(&p.handle))
     }
 
@@ -2484,25 +2468,6 @@ impl PimdirCoroutine for PimdirSync {
                 self.take_page(page)
             }
 
-            (State::Opening, Some(arg @ (PimdirArg::Write | PimdirArg::Written(_)))) => {
-                self.commit(match arg {
-                    PimdirArg::Written(written) => written,
-                    _ => PimdirWritten::default(),
-                });
-                let selection = match &self.page {
-                    Some(page) => PimdirLoadSelection::LastPage {
-                        narrowed: page.narrowed,
-                        enumerated: page.enumerated.clone(),
-                    },
-                    None => PimdirLoadSelection::All,
-                };
-                self.state = State::LoadingPage;
-                PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
-                    collection: self.collection.clone(),
-                    selection,
-                })
-            }
-
             (State::LoadingPage, Some(PimdirArg::Load(loaded))) => {
                 self.absorb_load(loaded);
                 let partial = self.page.as_ref().is_some_and(|page| {
@@ -2849,7 +2814,6 @@ enum State {
     Start,
     Reading,
     Enumerating,
-    Opening,
     LoadingPage,
     LoadingLinks,
     Merging,

@@ -323,7 +323,7 @@ Every page SHALL land in one write: its members named and merged, the handles it
 - THEN it asks for the round from `p1`, and the last page closes it with the coverage of its scope
 
 ### Requirement: Absence means deleted in scope only
-The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope, or is unknown and the round is no band round (`NULL`, an empty `date` a connector hands, or one that is no instant at seconds precision, being stored as `NULL` ([store](store.md)), so a round resumed in a later run and one opened and closed in the same run find the same members absent), read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A band round (`OpenRound { band: true }`, `sources.round_band`) SHALL infer no delete of an undated member: its date filter never returns undated mail, so the member is left to rounds over a whole scope and to deltas, and a vanished handle still applies to it; the in-memory rule (`RoundPlan::finds_absent`) and `list_unstamped_bindings` agree for a listing no date filter narrowed, the statement bound with `:narrowed` 0, `:enumerated` 0 and its `handles` slot empty; a narrowed listing is the store's to read ("A narrowed listing proves only what its filter could list" below). A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
+The deletes a round infers SHALL be the based bindings of its source no page of the round stamped and whose item's summary `date` falls in its scope, or is unknown and the round is no band round (`NULL`, an empty `date` a connector hands, or one that is no instant at seconds precision, being stored as `NULL` ([store](store.md)), so a round resumed in a later run and one opened and closed in the same run find the same members absent), read when its last page lands (`PimdirLoaded::unstamped`; for a round that page opens, the based placements it did not list), each handled as a vanished member is. A band round (`OpenRound { band: true }`, `sources.round_band`) SHALL infer no delete of an undated member: its date filter never returns undated mail, so the member is left to rounds over a whole scope and to deltas, and a vanished handle still applies to it; the in-memory rule (`RoundPlan::finds_absent`) and `list_unstamped_bindings` agree, the statement bound with `:narrowed` 0, `:enumerated` 0 and its `handles` slot empty, which the engine always binds; what a narrowed listing proves is applied after it ("A narrowed listing proves only what its enumeration lacks" below). A placement out of scope is neither dropped, pulled nor pushed on the evidence of its absence; a vanished handle applies whatever the date; the engine filters no page by date and names every member a page carries. A `Remove` is derived from a tombstone the consumer staged and from nothing else.
 
 #### Scenario: A message older than the scope
 - GIVEN a bound member dated August and an undated one, both unlisted, under a scope since September
@@ -340,16 +340,26 @@ The deletes a round infers SHALL be the based bindings of its source no page of 
 - WHEN the resumed round's last page lands
 - THEN the member is dropped `Deleted`, as it is by a round opened and closed in one run
 
-### Requirement: A narrowed listing proves only what its filter could list
-A round whose last page states `narrowed` (`PimdirRemoteSnapshot::narrowed`, set by a connector on every page a date filter narrowed) SHALL find absent only a member whose `date` is known and earlier than the instant the round opened (`round_started_at`), and an undated or later-dated one only when the last page hands `enumerated` and that enumeration lacks its handle; any other member is left as it stands, neither dropped nor pushed (pimdir SYNC §4, §5; STORAGE §10). The last page loads `PimdirLoadSelection::LastPage { narrowed, enumerated }`, which the store answers through `list_unstamped_bindings` bound with `:narrowed`, `:enumerated` and the enumeration in the `handles` slot. A narrowed round that page would open, whose opening instant only the store stamps, is opened in a write of its own (`OpenRound`) before that load, so its absences are read as a round opened before. A head and a delta prove no absence, whatever they state.
+### Requirement: A narrowed listing proves only what its enumeration lacks
+A round whose last page states `narrowed` (`PimdirRemoteSnapshot::narrowed`, set by a connector on every page a date filter narrowed) SHALL find absent only a member in its scope whose handle the `enumerated` list that page hands lacks, whatever its `date`, and SHALL find none absent when that page hands no `enumerated`, closing as any round does and counting the based bindings in scope it did not list in `PimdirSyncReport::unlisted`; a member the enumeration holds is left as it stands, neither dropped nor pushed (pimdir SYNC §4, §5; STORAGE §10). The last page loads `PimdirLoadSelection::LastPage { narrowed: false, enumerated: None }`, every unstamped binding of the scope, so the empty-listing guard sees every stamp an earlier run left, and the engine filters the absences by the page's enumeration itself, for a round that page opens as for one opened before. A head and a delta prove no absence, whatever they state.
 
-#### Scenario: Graph's narrowed round
-- GIVEN an undated draft received in May, a message dated 2035 by its sender's clock, and one dated 5 October, none listed by a round over `[2026-09-01, open)` narrowed by `receivedDateTime` with no enumeration
+#### Scenario: A band narrowed by arrival and an old `Date` received late
+- GIVEN a band `[2025-11-01, 2026-10-16)` narrowed by arrival, a message dated 1 January received in November that its pages miss and its enumeration holds, and one of the band the enumeration lacks
 - WHEN the round's last page lands
-- THEN the 5 October member is dropped `Deleted` and the other two stay as they were (vectors/sync/107; a narrowed enumeration lacking the undated member drops it, vectors/sync/47; a resumed round's enumeration, tests/scoped_sync.rs `a_resumed_narrowed_round_drops_only_what_its_enumeration_lacks`)
+- THEN the first stays as it was and the second is dropped `Deleted` (vectors/sync/160; a `Date` ahead of its arrival, vectors/sync/161; an enumeration lacking an undated member drops it, vectors/sync/47)
+
+#### Scenario: A narrowed round handing no enumeration
+- GIVEN an undated draft, a message dated 2035 and one dated 5 October, none listed by a round over `[2026-09-01, open)` narrowed by `receivedDateTime` with no enumeration
+- WHEN the round's last page lands
+- THEN all three stay as they were and the round closes (vectors/sync/107; resumed, tests/scoped_sync.rs `a_resumed_narrowed_round_handing_no_enumeration_drops_nothing`, which reports the three unlisted)
+
+#### Scenario: A resumed narrowed round an earlier page named
+- GIVEN a round an earlier run listed a member in and was interrupted, resumed with an empty narrowed last page whose enumeration holds that member and lacks another
+- WHEN the last page lands
+- THEN the round closes, the earlier stamp telling it named a member, and drops the member the enumeration lacks (tests/scoped_sync.rs `a_resumed_narrowed_round_drops_only_what_its_enumeration_lacks`)
 
 ### Requirement: A capped listing proves no absence
-A round whose last page states `capped` SHALL find no member absent: it closes as any round does, drops only vanished handles, and counts the based bindings in scope it did not list in `PimdirSyncReport::unlisted` (pimdir SYNC §5).
+A round whose last page states `capped` SHALL find no member absent: it closes as any round does, drops only vanished handles, and counts the based bindings in scope it did not list in `PimdirSyncReport::unlisted`, as a narrowed round handing no enumeration does (pimdir SYNC §5).
 
 #### Scenario: A folder under a size limit
 - GIVEN a based binding a capped round's last page does not list
