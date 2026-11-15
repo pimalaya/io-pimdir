@@ -322,7 +322,7 @@ impl ItemExportCommand {
 /// the action stays queued and applies at the next drain. Either way nothing
 /// is lost.
 ///
-/// Exits 2 once the result is printed when the drain ran and the item is
+/// Exits 3 once the result is printed when the drain ran and the item is
 /// still not live: the store refused the action, which `pimdir queue list
 /// --parked` shows.
 #[derive(Debug, Args)]
@@ -1050,7 +1050,7 @@ pub struct ItemRestoreOutput {
     /// what `queue status` and `queue cancel` check the store against.
     pub handle: String,
     /// Whether the row waits for the store's sync engine: another writer
-    /// held the store lock. `false` with exit status 2 when the drain ran
+    /// held the store lock. `false` with exit status 3 when the drain ran
     /// and the item is still not live.
     pub queued: bool,
     /// What became of the row, for the text form.

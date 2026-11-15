@@ -150,7 +150,7 @@ The CLI SHALL expose, at minimum:
   `formatVersion`, `schemaVersion`, `readVersion`, `produceVersion`,
   `derivation`, `syncVersion`).
 - `store backup DIR`: copy the store into a directory absent or empty (`PimdirReader::backup`, STORAGE §8), the reader role, usable beside a running sync, answering `path`, `objects`, `quarantined`, `local`, `bytes`, `kept` and `skipped`, with `incarnation` and `replaced` `null` (`pimdir-store-backup`).
-- `store restore DIR`: put the backup at DIR back as the store at `--store` (`PimdirStore::restore`), answering the same keys with the new `incarnation` and the `replaced` one, `null` when no store was there or it could not be read (`pimdir-store-restore`). It creates the store directory when there is none, the one verb that does. Both exit 2 when `skipped` names an entry left out.
+- `store restore DIR`: put the backup at DIR back as the store at `--store` (`PimdirStore::restore`), answering the same keys with the new `incarnation` and the `replaced` one, `null` when no store was there or it could not be read (`pimdir-store-restore`). It creates the store directory when there is none, the one verb that does. Both exit 3 when `skipped` names an entry left out.
 - `check --deep`: the store's self-check (`PimdirReader::check_deep`, STORAGE §7) beside the plain one, under `deep` (`integrity`, `foreignKeys`, `hashed`, `failing`), `null` without the flag; a problem it finds counts as one `--fix` does not repair, and it moves nothing.
 - `check`: object rows whose body is missing, refcount drift, dangling
   references and orphan blob files, with `--fix` repairing the drift and the
@@ -183,7 +183,7 @@ A write SHALL answer a receipt: `item restore` its `seq`, `collection`, `linkId`
 
 Every failure SHALL print pimalaya-cli's failure object with a kebab-case `code`, `null` when none applies: a store failure carries io-pimdir's `PimdirError::code` by its spelling, and the CLI's own failures carry `item-not-found`, `collection-required`, `item-live`, `body-absent`, `body-missing`, `row-not-found`, `source-required`, `confirmation-required`, `cancelled`, `page-token-invalid` or `dump-exists`. A refused query SHALL fail with `query-refused`, its message naming the fault, where it lies, and what would be valid there.
 
-A command that ran to its end short of full success SHALL print its result, then exit 2, its `--help` saying when: `check` leaving a problem `--fix` does not repair, `store backup` and `store restore` leaving an entry out, `item restore` whose drain left the item retained, `tag` with a placement neither planned, unchanged, applied nor queued, `export` leaving a body out, `quarantine empty` leaving an entry in place.
+A command that ran to its end short of full success SHALL print its result, then exit 3, its `--help` saying when: `check` leaving a problem `--fix` does not repair, `store backup` and `store restore` leaving an entry out, `item restore` whose drain left the item retained, `tag` with a placement neither planned, unchanged, applied nor queued, `export` leaving a body out, `quarantine empty` leaving an entry in place.
 
 #### Scenario: A body exported under JSON
 - GIVEN a mail item holding its body
@@ -193,7 +193,7 @@ A command that ran to its end short of full success SHALL print its result, then
 #### Scenario: A check finding a quarantined body
 - GIVEN a store whose quarantine/ holds a file
 - WHEN `pimdir --json check --fix` runs
-- THEN it prints the file under `quarantined` and exits 2 (tests/cli_json.rs `a_check_leaving_a_problem_exits_2`)
+- THEN it prints the file under `quarantined` and exits 3 (tests/cli_json.rs `a_check_leaving_a_problem_exits_3`)
 
 ### Requirement: The text output is plain text
 Without `--json`, a list SHALL print through pimalaya-cli's `records::Records` when its rows carry more than one value of unbounded length, and through `columns::Columns` when every cell but the last is short and bounded, with no border, no colour and no truncation either way.

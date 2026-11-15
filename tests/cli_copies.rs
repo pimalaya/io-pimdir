@@ -105,7 +105,7 @@ fn a_store_is_backed_up_and_restored_under_a_new_incarnation() {
 }
 
 /// `check` printed a store consistent without hashing a body: `--deep`
-/// hashes every one, reports a flipped byte and exits 2, moving nothing.
+/// hashes every one, reports a flipped byte and exits 3, moving nothing.
 #[test]
 fn a_deep_check_reports_a_flipped_byte() {
     let dir = tempfile::tempdir().unwrap();
@@ -125,7 +125,7 @@ fn a_deep_check_reports_a_flipped_byte() {
     assert_eq!(code, 0, "the plain check hashes nothing: {out}");
 
     let (code, out) = pimdir(dir.path(), &["check", "--deep"]);
-    assert_eq!(code, 2, "{out}");
+    assert_eq!(code, 3, "{out}");
     assert_eq!(out["deep"]["failing"], serde_json::json!([hash]));
     assert_eq!(out["deep"]["integrity"], Value::Array(Vec::new()));
     assert!(path.exists(), "reported, never moved");

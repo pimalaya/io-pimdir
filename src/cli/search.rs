@@ -312,7 +312,7 @@ impl ShowCommand {
 /// written as given. `--dry-run` prints what would be staged and writes
 /// nothing.
 ///
-/// Exits 2 once the result is printed when a placement is not tagged and a
+/// Exits 3 once the result is printed when a placement is not tagged and a
 /// run would not tag it: unknown flags, an ambiguous or unsynced source, an
 /// unsupported change, or an action the store refused.
 #[derive(Debug, Args)]
@@ -1011,7 +1011,7 @@ impl TagStatus {
     }
 
     /// Whether the placement does not end up tagged, nor will by a run
-    /// without `--dry-run`: the tag exits 2.
+    /// without `--dry-run`: the tag exits 3.
     fn falls_short(self) -> bool {
         match self {
             Self::Planned | Self::Unchanged | Self::Applied | Self::Queued => false,

@@ -41,7 +41,7 @@ impl QuarantineCommand {
 /// undone. Takes the owner role, fails while a producer is staging a body,
 /// and asks first unless `--yes` is passed.
 ///
-/// Exits 2 once the result is printed when it left an entry in place that
+/// Exits 3 once the result is printed when it left an entry in place that
 /// is neither a file nor a link.
 #[derive(Debug, Args)]
 pub struct QuarantineEmptyCommand {

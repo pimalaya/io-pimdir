@@ -2,7 +2,7 @@
 //! it for every Pimalaya binary, run as the binary over a temporary store
 //! with `--json`: a body travels as data, a listing resumes at the
 //! `nextPage` it printed, an absent value prints `null`, and a check
-//! leaving a problem prints its result and exits 2.
+//! leaving a problem prints its result and exits 3.
 //!
 //! A file of its own, so no test forking the binary shares a process with
 //! tests taking the owner lock; the tests here take [`SERIAL`] for the
@@ -210,10 +210,10 @@ fn an_absent_value_prints_null() {
     );
 }
 
-/// `check` prints its result whatever it finds, and exits 2 while a
+/// `check` prints its result whatever it finds, and exits 3 while a
 /// problem it does not repair is left.
 #[test]
-fn a_check_leaving_a_problem_exits_2() {
+fn a_check_leaving_a_problem_exits_3() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     filed(dir.path(), "a");
@@ -226,6 +226,6 @@ fn a_check_leaving_a_problem_exits_2() {
     fs::write(quarantine.join("a.1-1-1"), b"failing").unwrap();
 
     let (status, found) = pimdir(dir.path(), &["check", "--fix"]);
-    assert_eq!(status, 2, "{found}");
+    assert_eq!(status, 3, "{found}");
     assert_eq!(found["quarantined"].as_array().unwrap().len(), 1);
 }

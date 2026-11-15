@@ -239,7 +239,7 @@ fn a_tag_stages_each_placement_as_the_source_syncing_its_collection() {
 
     let (status, tagged) = pimdir(dir, &["tag", "alpha", "--add", "flagged"]);
     assert_eq!(
-        status, 2,
+        status, 3,
         "a placement of an ambiguous source is not tagged"
     );
     assert_eq!(
@@ -283,7 +283,7 @@ fn a_tag_stages_each_placement_as_the_source_syncing_its_collection() {
             "--dry-run",
         ],
     );
-    assert_eq!(status, 2, "a placement of an unsynced source would not be");
+    assert_eq!(status, 3, "a placement of an unsynced source would not be");
     assert_eq!(
         sourced(&elsewhere)["INBOX"],
         entry("unsynced", &["imap"]),

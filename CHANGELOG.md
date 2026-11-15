@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: Changed the `pimdir` binary to exit 3, not 2, when a command printed its result short of full success, following pimalaya-cli 0.5 (2 is a refused command line).
+- Changed the mime-rs dependency to 0.2, which reads a structural field an entity states twice from its first occurrence, as the summaries and the extraction already did.
+- Changed the pimalaya-cli dependency of the `cli` feature to 0.5.
+
 ## [0.12.0] - 2026-11-13
 
 ### Added

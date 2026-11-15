@@ -55,7 +55,7 @@ const FORMAT_VERSION: i64 = 3;
 /// before a risky operation, to move one between machines, or to look at a
 /// store with ordinary text tools.
 ///
-/// Exits 2 once the result is printed when a body was missing from the blob
+/// Exits 3 once the result is printed when a body was missing from the blob
 /// store and left out of the dump.
 #[derive(Debug, Args)]
 pub struct ExportCommand {

@@ -46,7 +46,7 @@ const SHOWN: usize = 20;
 /// body (left in place) and the files quarantine/ holds. Reading only, unless
 /// `--fix` is passed.
 ///
-/// Exits 2 once the result is printed when it found a problem it left
+/// Exits 3 once the result is printed when it found a problem it left
 /// unrepaired: anything but the drift and the dangling bindings `--fix`
 /// repairs.
 #[derive(Debug, Args)]

@@ -241,7 +241,7 @@ pub fn report(err: PimdirError) -> anyhow::Error {
 }
 
 /// What a command returns once it printed a result short of full success:
-/// the exit status 2, nothing more printed.
+/// the exit status 3, nothing more printed.
 pub fn partial() -> anyhow::Error {
     PartialOutcome::default().into()
 }

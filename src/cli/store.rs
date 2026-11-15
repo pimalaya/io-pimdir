@@ -47,7 +47,7 @@ impl StoreCommand {
 /// The directory must not exist yet, or be empty. The lock files and the
 /// search index are not copied: the index is rebuilt from the store.
 ///
-/// Exits 2 once the result is printed when an entry was left out: a link
+/// Exits 3 once the result is printed when an entry was left out: a link
 /// or a file that is not the store's.
 #[derive(Debug, Args)]
 pub struct StoreBackupCommand {
@@ -83,7 +83,7 @@ impl StoreBackupCommand {
 /// Destructive when a store is there (what it held since the backup is
 /// gone), so it asks first unless `--yes` is passed.
 ///
-/// Exits 2 once the result is printed when an entry of the backup was
+/// Exits 3 once the result is printed when an entry of the backup was
 /// left out: a link or a file that is not the store's.
 #[derive(Debug, Args)]
 pub struct StoreRestoreCommand {

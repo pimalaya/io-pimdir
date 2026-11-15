@@ -50,7 +50,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [build-dependencies]
-pimalaya-cli = { version = "0.4", default-features = false, features = ["build"], optional = true }
+pimalaya-cli = { version = "0.5", default-features = false, features = ["build"], optional = true }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
@@ -67,8 +67,8 @@ humantime = { version = "2.2", default-features = false, optional = true }
 ical-rs = { version = "0.7", default-features = false, features = ["parser", "tzdb"], optional = true }
 jiff = { version = "0.2.33", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
 log = { version = "0.4", default-features = false }
-mime-rs = { version = "0.1", default-features = false, features = ["parser", "base64", "encoding"], optional = true }
-pimalaya-cli = { version = "0.4", default-features = false, features = ["prompt", "terminal"], optional = true }
+mime-rs = { version = "0.2", default-features = false, features = ["parser", "base64", "encoding"], optional = true }
+pimalaya-cli = { version = "0.5", default-features = false, features = ["prompt", "terminal"], optional = true }
 rusqlite = { version = "0.41", default-features = false, features = ["cache"], optional = true }
 schemars = { version = "1", default-features = false, features = ["derive", "std"], optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
@@ -79,6 +79,3 @@ vcard-rs = { version = "0.6", default-features = false, features = ["parser"], o
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"], optional = true }
-
-[patch.crates-io]
-pimalaya-cli = { git = "https://github.com/pimalaya/cli", rev = "5ad858f5bf6b546f3e1c7124cc97418adf89f7ed" }
