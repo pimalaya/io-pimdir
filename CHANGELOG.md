@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-16
+
 ### Changed
 
 - Changed the pimalaya-cli dependency of the `cli` feature to 0.6: a `pimdir` listing prints `Next page:` after its items, and a header's values sit two spaces after its longest label.
@@ -1176,7 +1178,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.14.0..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.14.1..HEAD
+[0.14.1]: https://github.com/pimalaya/io-pimdir/compare/v0.14.0..v0.14.1
 [0.14.0]: https://github.com/pimalaya/io-pimdir/compare/v0.13.0..v0.14.0
 [0.13.0]: https://github.com/pimalaya/io-pimdir/compare/v0.12.0..v0.13.0
 [0.12.0]: https://github.com/pimalaya/io-pimdir/compare/v0.11.0..v0.12.0
