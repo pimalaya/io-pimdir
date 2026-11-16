@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-16
+
+### Changed
+
+- **BREAKING**: Changed the rusqlite dependency to 0.43 (libsqlite3-sys 0.40).
+
+  Two libsqlite3-sys versions cannot link into one build, so a dependent naming rusqlite itself moves it to 0.43 with this release.
+
 ## [0.14.1] - 2026-11-16
 
 ### Changed
@@ -1178,7 +1186,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.14.1..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.15.0..HEAD
+[0.15.0]: https://github.com/pimalaya/io-pimdir/compare/v0.14.1..v0.15.0
 [0.14.1]: https://github.com/pimalaya/io-pimdir/compare/v0.14.0..v0.14.1
 [0.14.0]: https://github.com/pimalaya/io-pimdir/compare/v0.13.0..v0.14.0
 [0.13.0]: https://github.com/pimalaya/io-pimdir/compare/v0.12.0..v0.13.0
