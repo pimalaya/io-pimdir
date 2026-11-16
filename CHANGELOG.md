@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Changed the pimalaya-cli dependency of the `cli` feature to 0.6: a `pimdir` listing prints `Next page:` after its items, and a header's values sit two spaces after its longest label.
+
 ## [0.14.0] - 2026-11-15
 
 ### Added
