@@ -1,3 +1,8 @@
+---
+cairn: delta
+change: acknowledged-intents-leave-receipts
+---
+
 ## ADDED Requirements
 
 ### Requirement: A performed intent is acknowledged with a receipt

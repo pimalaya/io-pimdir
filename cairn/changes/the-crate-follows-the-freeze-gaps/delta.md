@@ -1,3 +1,8 @@
+---
+cairn: delta
+change: the-crate-follows-the-freeze-gaps
+---
+
 ## ADDED Requirements
 
 ### Requirement: An edit over an unread base waits for it
