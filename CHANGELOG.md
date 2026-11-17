@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-17
+
 ### Added
 
 - Added `PimdirSearchCursor`, the place of the last hit a search page answered, written and read back as a token (`token`, `from_token`).
@@ -1226,7 +1228,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.15.1..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.16.0..HEAD
+[0.16.0]: https://github.com/pimalaya/io-pimdir/compare/v0.15.1..v0.16.0
 [0.15.1]: https://github.com/pimalaya/io-pimdir/compare/v0.15.0..v0.15.1
 [0.15.0]: https://github.com/pimalaya/io-pimdir/compare/v0.14.1..v0.15.0
 [0.14.1]: https://github.com/pimalaya/io-pimdir/compare/v0.14.0..v0.14.1
