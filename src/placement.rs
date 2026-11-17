@@ -12,7 +12,9 @@ use alloc::{
     collections::BTreeSet,
     format,
     string::{String, ToString},
+    vec::Vec,
 };
+use core::cmp::Reverse;
 
 use crate::{codec, collection::PimdirCollectionId, object::PimdirHash, summary::PimdirSummary};
 
@@ -118,6 +120,25 @@ impl PimdirLinkId {
         key.push_str(handle.as_str());
 
         Self(key)
+    }
+
+    /// The keys this one may be [`minted`](Self::minted) from, longest
+    /// first: for `dup:k#h`, every `k` a `#` ends, since a handle may hold
+    /// one, and those of `k#h` again when it is itself minted, since a key
+    /// minted again nests. Empty for a key no mint yields.
+    ///
+    /// How a rekey tells the old copies of an identity whatever handle
+    /// each was minted over (SYNC §8), a rekey having carried the key and
+    /// not the handle: the longest of these a listing names is the one.
+    pub fn minted_from(&self) -> Vec<&str> {
+        let mut keys = Vec::new();
+        let mut rest = self.as_str();
+        while let Some(inner) = rest.strip_prefix("dup:") {
+            keys.extend(inner.match_indices('#').map(|(at, _)| &inner[..at]));
+            rest = inner;
+        }
+        keys.sort_by_key(|key| Reverse(key.len()));
+        keys
     }
 
     /// This identity while free, else a [`minted`](Self::minted) one that is.

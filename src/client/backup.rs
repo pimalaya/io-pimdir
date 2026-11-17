@@ -20,11 +20,17 @@
 //! index is derived, its indexer rebuilding it from a store whose
 //! incarnation moved.
 
-use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
+use alloc::{
+    collections::BTreeSet,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 use std::{
     fs,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -34,12 +40,15 @@ use rusqlite::{Connection, OpenFlags, named_params};
 use crate::{
     client::{
         PimdirError, PimdirStore, PreparedCached,
-        blobs::{PimdirBlobCheck, PimdirBlobStrayKind, PimdirBlobs, sync_dir},
+        blobs::{
+            self, PimdirBlobCheck, PimdirBlobFile, PimdirBlobStrayKind, PimdirBlobs, sync_dir,
+        },
         lock::PimdirLock,
         modes, prepare_connection,
         reader::PimdirReader,
         rows, schema,
     },
+    hash::PimdirHasher,
     object::PimdirHash,
     sql,
     version::PimdirProfile,
@@ -145,7 +154,10 @@ impl PimdirReader {
     /// files. Its database is one file, in a rollback journal mode. The
     /// lock files and the search index are not copied. A writer's
     /// temporary, a link and any entry that is not the store's are left
-    /// out and named in the report.
+    /// out and named in the report, and so is a body failing its name.
+    /// Every file is written through a temporary moved onto its name (§5),
+    /// the database last of all, so a backup stopped part way holds no
+    /// pimdir.db, which no restore takes.
     ///
     /// A `target` holding anything is [`PimdirError::Occupied`], nothing
     /// copied.
@@ -160,7 +172,8 @@ impl PimdirReader {
             Err(err) if err.kind() == ErrorKind::NotFound => (),
             Err(err) => return Err(err.into()),
         }
-        let Some(database) = target.join(DATABASE).to_str().map(String::from) else {
+        let staged = target.join(format!(".{DATABASE}.{}.tmp", blobs::unique()));
+        let Some(database) = staged.to_str().map(String::from) else {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 format!("Backup path {} is not UTF-8", target.display()),
@@ -183,6 +196,9 @@ impl PimdirReader {
         fs::File::open(&database)?.sync_all()?;
 
         let report = copy_files(&self.dir, target)?;
+        if !settle_copy(&staged, &target.join(DATABASE))? {
+            return Err(PimdirError::Occupied(target.to_path_buf()));
+        }
         sync_dir(target)?;
         debug!(
             "backed up {} bodies, {} quarantined and {} local files",
@@ -252,8 +268,13 @@ impl PimdirStore {
     /// failure its open answers, before anything of the store is
     /// touched.
     ///
-    /// A body the store holds already under its name is kept, never
-    /// replaced (§5), and the bodies the replaced store alone named stay
+    /// A sound body the store holds already under its name is kept,
+    /// never replaced (§5); one failing its name holds no body and is
+    /// moved into quarantine/ for the backup's, and a body of the backup
+    /// failing its own is put in nowhere and named in the report. Every
+    /// file is written through a temporary moved onto its name, so a
+    /// restore stopped part way leaves no part of a file under a name.
+    /// The bodies the replaced store alone named stay
     /// as orphans for the collector. The old database, its WAL and its
     /// journal are removed only once every body is in place and the new
     /// one is ready, flushed, under local/; what local/ holds is replaced
@@ -460,6 +481,7 @@ fn copy_files(from: &Path, to: &Path) -> Result<PimdirCopyReport, PimdirError> {
 /// after its files.
 fn copy_bodies(from: &Path, to: &Path, report: &mut PimdirCopyReport) -> Result<(), PimdirError> {
     let scan = PimdirBlobs::open(from).scan()?;
+    let blobs = PimdirBlobs::open(to);
     let objects = to.join("objects");
     modes::create_dir_all(&objects)?;
     let mut shards: BTreeSet<PathBuf> = BTreeSet::new();
@@ -473,12 +495,13 @@ fn copy_bodies(from: &Path, to: &Path, report: &mut PimdirCopyReport) -> Result<
             }
             shards.insert(shard.clone());
         }
-        match copy_file(&body.path, &shard.join(&body.hash))? {
-            Some(bytes) => {
+        match copy_body(&blobs, &shard, &body)? {
+            PimdirBodyCopy::Written(bytes) => {
                 report.objects += 1;
                 report.bytes += bytes;
             }
-            None => report.kept += 1,
+            PimdirBodyCopy::Kept => report.kept += 1,
+            PimdirBodyCopy::Failing => report.skipped.push(body.path),
         }
     }
     for shard in &shards {
@@ -561,19 +584,124 @@ fn sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// Copies the regular file `from` to `to`, created `0600` and flushed,
 /// answering the bytes copied; `None`, nothing written, when `to` exists
 /// already: a file of a store is never replaced (§5).
+///
+/// Written as a body is (§5): the source opened before anything is
+/// created, its bytes into a period-prefixed temporary beside `to`,
+/// flushed, then moved onto `to` without replacing it, so `to` never holds
+/// part of a file, whatever stops the copy, and a copy run again finds
+/// either nothing or the whole file there.
 fn copy_file(from: &Path, to: &Path) -> io::Result<Option<u64>> {
-    let mut target = match modes::options().write(true).create_new(true).open(to) {
-        Ok(target) => target,
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    let copied = io::copy(&mut fs::File::open(from)?, &mut target).and_then(|bytes| {
-        target.sync_all()?;
-        Ok(bytes)
-    });
-    if copied.is_err() {
-        let _ = fs::remove_file(to);
+    if fs::symlink_metadata(to).is_ok() {
+        return Ok(None);
+    }
+    let (tmp, bytes, _) = stage_copy(from, to)?;
+    match settle_copy(&tmp, to)? {
+        true => Ok(Some(bytes)),
+        false => Ok(None),
+    }
+}
+
+/// What putting one body in did.
+enum PimdirBodyCopy {
+    /// Written under its name, its bytes.
+    Written(u64),
+    /// Held already under its name, sound, and kept.
+    Kept,
+    /// The source's bytes fail their name: nothing written.
+    Failing,
+}
+
+/// Puts the body `body` into the blob tree of `to`, under `shard` (§5,
+/// §8): a sound body held under its name is kept; one failing it, which
+/// holds no body, is moved into quarantine/ first, the caller holding the
+/// owner lock and the staging lock exclusively as a restore does, and the
+/// copy put in its place. A source whose bytes fail their name is put in
+/// nowhere.
+fn copy_body(
+    to: &PimdirBlobs,
+    shard: &Path,
+    body: &PimdirBlobFile,
+) -> Result<PimdirBodyCopy, PimdirError> {
+    let hash = PimdirHash(body.hash.clone());
+    let path = shard.join(&body.hash);
+    match to.check(&hash)? {
+        PimdirBlobCheck::Sound => return Ok(PimdirBodyCopy::Kept),
+        PimdirBlobCheck::Missing => (),
+        PimdirBlobCheck::Failing => {
+            warn!("body {} fails its name, set aside for the copy", hash.0);
+            to.quarantine(&hash)?;
+        }
     }
 
-    copied.map(Some)
+    let (tmp, bytes, copied) = stage_copy(&body.path, &path)?;
+    if copied != hash {
+        warn!("body {} of the copy fails its name, left out", hash.0);
+        let _ = fs::remove_file(&tmp);
+        return Ok(PimdirBodyCopy::Failing);
+    }
+    match settle_copy(&tmp, &path)? {
+        true => Ok(PimdirBodyCopy::Written(bytes)),
+        false => match to.check(&hash)? {
+            PimdirBlobCheck::Sound => Ok(PimdirBodyCopy::Kept),
+            _ => Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("Body {} is held by a file failing its name", hash.0),
+            )
+            .into()),
+        },
+    }
+}
+
+/// Copies the regular file `from` into a period-prefixed temporary beside
+/// `to`, created `0600` and flushed, answering it with the bytes copied
+/// and their hash. The source is opened first, so one that cannot be read
+/// leaves nothing; a copy that fails unlinks its temporary.
+fn stage_copy(from: &Path, to: &Path) -> io::Result<(PathBuf, u64, PimdirHash)> {
+    let mut source = fs::File::open(from)?;
+    let name = to
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = to.with_file_name(format!(".{name}.{}.tmp", blobs::unique()));
+    let mut target = modes::options().write(true).create_new(true).open(&tmp)?;
+
+    let mut hasher = PimdirHasher::new();
+    let mut buffer = vec![0; 64 * 1024];
+    let copied = (|| {
+        let mut bytes = 0;
+        loop {
+            let read = match source.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            hasher.update(&buffer[..read]);
+            target.write_all(&buffer[..read])?;
+            bytes += read as u64;
+        }
+        target.sync_all()?;
+        Ok(bytes)
+    })();
+
+    match copied {
+        Ok(bytes) => Ok((tmp, bytes, hasher.finish())),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+/// Moves the temporary `tmp` onto `to` without replacing a file there,
+/// `link(2)` then `unlink(2)` of the temporary (§5), answering whether it
+/// took the name; the temporary is unlinked either way.
+fn settle_copy(tmp: &Path, to: &Path) -> io::Result<bool> {
+    let linked = fs::hard_link(tmp, to);
+    let _ = fs::remove_file(tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err),
+    }
 }

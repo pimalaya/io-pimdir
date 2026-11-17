@@ -939,7 +939,7 @@ fn hash_file(file: &mut fs::File) -> io::Result<PimdirHash> {
 /// A suffix unique to this process and this call: the process id, a
 /// per-process counter and the time, so a temporary or a quarantined name
 /// is never another writer's.
-fn unique() -> String {
+pub(crate) fn unique() -> String {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -57,7 +57,9 @@ pub const EXTRACTION: i64 = 1;
 /// holds, and a bump of mime-rs, vcard-rs, ical-rs or encoding_rs that
 /// reads a body otherwise. Revision 1 is the first recorded: tags
 /// separating words, and the hidden elements told by their first word.
-pub const EXTRACTOR: &str = "io-pimdir 1";
+/// Revision 2: an HTML comment closed by any run of two dashes or more,
+/// and a rule stepping past the last year a date spells not cut.
+pub const EXTRACTOR: &str = "io-pimdir 2";
 
 /// A body's text by field (SEARCH §6): the seven fields, then one per
 /// address role (STORAGE Annex A.6).

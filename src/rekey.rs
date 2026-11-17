@@ -159,6 +159,7 @@ impl PimdirRekey {
             .iter()
             .filter_map(|p| Some((p.link_id.clone()?, p.clone())))
             .collect();
+        let copies = Self::copies(&links, &old_by_link);
 
         // NOTE: walked in handle order, since which copy of a hint keeps
         // the bare key decides what every other copy takes.
@@ -186,6 +187,7 @@ impl PimdirRekey {
                     (revision, body),
                     &claimed,
                     &old_by_link,
+                    copies.get(&resolved.link_id).map(Vec::as_slice),
                 )
             });
             let carried = key.as_ref().and_then(|key| old_by_link.remove(key));
@@ -315,37 +317,58 @@ impl PimdirRekey {
         (drops, unresolved)
     }
 
+    /// The old copies of each identity a listing names, by its key: the
+    /// placement holding the key itself, and each holding a key minted from
+    /// it over whatever handle (SYNC §8), a rekey carrying the key and not
+    /// the handle. A minted key goes to the longest key it may be minted
+    /// from that the listing names; one it names none of is no copy.
+    fn copies(
+        links: &BTreeMap<PimdirHandle, Resolved>,
+        old_by_link: &BTreeMap<PimdirLinkId, PimdirPlacement>,
+    ) -> BTreeMap<PimdirLinkId, Vec<PimdirLinkId>> {
+        let named: BTreeSet<&str> = links.values().map(|r| r.link_id.as_str()).collect();
+        let mut copies: BTreeMap<PimdirLinkId, Vec<PimdirLinkId>> = BTreeMap::new();
+        for key in old_by_link.keys() {
+            let roots = key.minted_from();
+            let owner = match roots.is_empty() {
+                true => Some(key.clone()),
+                false => roots
+                    .into_iter()
+                    .find(|root| named.contains(root))
+                    .map(PimdirLinkId::from),
+            };
+            if let Some(owner) = owner {
+                copies.entry(owner).or_default().push(key.clone());
+            }
+        }
+        copies
+    }
+
     /// The key a rebuilt member takes, and the old placement is found under.
     ///
-    /// Where one hint had several old copies, the unclaimed copy whose
-    /// base holds the member's revision, then among those (or among all
-    /// when none does) the one holding the body the listing carried, in
-    /// handle order among what neither tells apart, so a renumbering that
-    /// swapped two resources under one identity carries each one's state
-    /// onto itself (SYNC §8); then the hint while unclaimed, then the
-    /// minted key an old copy carries in handle order (the handle it was
-    /// minted from is what the change took away), else a mint of the
-    /// member's own, for a copy with no old row to carry.
+    /// Where one hint had several old copies (`copies`, see
+    /// [`copies`](Self::copies)), the unclaimed copy whose base holds the
+    /// member's revision, then among those (or among all when none does)
+    /// the one holding the body the listing carried, in handle order among
+    /// what neither tells apart, so a renumbering that swapped two
+    /// resources under one identity carries each one's state onto itself
+    /// (SYNC §8); then the hint while unclaimed and an old row holds it or
+    /// no copy is left, then the minted key an old copy carries in handle
+    /// order, so a copy whose bare sibling is gone is carried too, else a
+    /// mint of the member's own, for a copy with no old row to carry.
     fn key_of(
         hint: &PimdirLinkId,
         handle: &PimdirHandle,
         (revision, body): (Option<&str>, Option<&PimdirHash>),
         claimed: &BTreeSet<PimdirLinkId>,
         old_by_link: &BTreeMap<PimdirLinkId, PimdirPlacement>,
+        copies: Option<&[PimdirLinkId]>,
     ) -> PimdirLinkId {
-        let copies = || {
-            old_by_link.values().filter(|old| {
-                old.link_id.as_ref() == Some(hint)
-                    || old.link_id.as_ref() == Some(&hint.minted(&old.handle))
-            })
-        };
-
-        let mut unclaimed: Vec<&PimdirPlacement> = copies()
-            .filter(|old| {
-                old.link_id
-                    .as_ref()
-                    .is_some_and(|key| !claimed.contains(key))
-            })
+        let mut unclaimed: Vec<&PimdirPlacement> = copies
+            .unwrap_or_default()
+            .iter()
+            .filter(|key| !claimed.contains(*key))
+            .filter_map(|key| old_by_link.get(key))
             .collect();
         unclaimed.sort_by(|a, b| a.handle.cmp(&b.handle));
         let by_revision: Vec<&PimdirPlacement> = match revision {
@@ -372,15 +395,12 @@ impl PimdirRekey {
             return old.link_id.clone().expect("a keyed copy");
         }
 
-        if !claimed.contains(hint) {
+        let bare = old_by_link.contains_key(hint) || unclaimed.is_empty();
+        if !claimed.contains(hint) && bare {
             return hint.clone();
         }
 
-        let minted = copies()
-            .filter(|old| old.link_id.as_ref() != Some(hint))
-            .min_by(|a, b| a.handle.cmp(&b.handle))
-            .and_then(|old| old.link_id.clone());
-
+        let minted = unclaimed.first().and_then(|old| old.link_id.clone());
         minted.unwrap_or_else(|| {
             hint.claim(handle, |key| {
                 claimed.contains(key) || old_by_link.contains_key(key)
@@ -395,7 +415,9 @@ impl PimdirRekey {
     /// (SYNC §8): a placement holding a local edit is carried conflicted
     /// at it with its base untouched, a tombstone is revived as a sync
     /// would, and anything else is carried as the pull a sync would make,
-    /// body dropped and base at the fetched revision.
+    /// body dropped and base at the fetched revision. A local edit of a
+    /// mutable kind the remote did not edit keeps its own summary and sort
+    /// key, the fetch's describing the server's body (SYNC §5).
     fn carry(
         &self,
         old: PimdirPlacement,
@@ -414,14 +436,20 @@ impl PimdirRekey {
         let remote_edited = observed.is_some() && observed != base_revision;
         let local_edit = old.object.is_some() && old_base.is_none_or(|b| b.object != old.object);
 
-        let summary = summary::without_body(
-            old.summary.as_ref(),
-            resolved.and_then(|r| r.summary.clone()),
-            old.object.is_some() && !remote_edited,
-        );
-        let sort_key = resolved
-            .map(|r| r.sort_key.clone())
-            .unwrap_or_else(|| old.sort_key.clone());
+        let mutable = observed.is_some() || base_revision.is_some();
+        let kept_edit = local_edit && !remote_edited && mutable;
+        let summary = match kept_edit {
+            true => old.summary.clone(),
+            false => summary::without_body(
+                old.summary.as_ref(),
+                resolved.and_then(|r| r.summary.clone()),
+                old.object.is_some() && !remote_edited,
+            ),
+        };
+        let sort_key = match (kept_edit, resolved) {
+            (false, Some(resolved)) => resolved.sort_key.clone(),
+            _ => old.sort_key.clone(),
+        };
 
         let mut carried = PimdirPlacement {
             collection: self.collection.clone(),

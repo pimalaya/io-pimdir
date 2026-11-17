@@ -613,6 +613,55 @@ fn a_restore_stopped_at_the_bodies_leaves_the_store_it_found() {
     );
 }
 
+/// A backup and a restore put each file in as a body is written (STORAGE
+/// §5, §8): a body that cannot be read leaves nothing under its name, a
+/// body the store holds failing its name is set aside for the backup's,
+/// and a backup stopped part way holds no pimdir.db.
+#[test]
+fn a_backup_and_a_restore_never_leave_part_of_a_file() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backup = scratch.path().join("backup");
+    let source = populated(scratch.path().join("source").as_path(), &["a@x"]);
+    let hash = PimdirHash(source.indexed_hashes().unwrap().pop_first().unwrap());
+    let body = source.blobs().path(&hash).unwrap();
+    let sound = fs::read(&body).unwrap();
+
+    let unreadable = fs::metadata(&body).unwrap().permissions();
+    fs::set_permissions(&body, fs::Permissions::from_mode(0o000)).unwrap();
+    let stopped = source.backup(&backup);
+    fs::set_permissions(&body, unreadable.clone()).unwrap();
+    assert!(stopped.is_err(), "{stopped:?}");
+    assert!(
+        !backup.join("pimdir.db").exists(),
+        "a backup stopped part way holds no database"
+    );
+    fs::remove_dir_all(&backup).unwrap();
+    source.backup(&backup).unwrap();
+    drop(source);
+
+    let dir = tempfile::tempdir().unwrap();
+    let held = PimdirStore::open(dir.path())
+        .unwrap()
+        .blobs()
+        .path(&hash)
+        .unwrap();
+    let copy = backup.join(held.strip_prefix(dir.path()).unwrap());
+    fs::set_permissions(&copy, fs::Permissions::from_mode(0o000)).unwrap();
+    let stopped = PimdirStore::restore(dir.path(), &backup);
+    fs::set_permissions(&copy, unreadable).unwrap();
+    assert!(stopped.is_err(), "{stopped:?}");
+    assert!(!held.exists(), "nothing under the body's name");
+
+    fs::write(&held, &sound[..sound.len() / 2]).unwrap();
+    let report = PimdirStore::restore(dir.path(), &backup).unwrap();
+    assert_eq!((report.copied.objects, report.copied.kept), (1, 0));
+    assert_eq!(fs::read(&held).unwrap(), sound, "the backup's body put in");
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    assert!(reader.check_deep().unwrap().is_sound());
+    let quarantined = reader.blobs().quarantined().unwrap();
+    assert_eq!(quarantined.len(), 1, "the part set aside, not unlinked");
+}
+
 /// The deep check hashes every body an object row names (STORAGE §7): a
 /// flipped byte is reported, and a missing body, and nothing is moved.
 #[test]

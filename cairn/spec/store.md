@@ -1080,8 +1080,8 @@ The open contract SHALL compare every table, index and trigger the store declare
 #### Scenario: A damaged draft-09 store
 - tests/stale_store.rs: a table dropped, a column dropped and an extra index, each refused by every profile naming it, pimdir.db unchanged; both stamps at 2, refused naming `user_version`
 
-### Requirement: SQLite is the system's unless `vendored` says otherwise
-The `client` feature SHALL take `rusqlite` with no features of its own, so the default build links the SQLite the machine provides through pkg-config and a store this crate writes is the one the system's `sqlite3` reads. A `vendored` feature, off by default, SHALL forward to `rusqlite/bundled` for a static target or a platform carrying no library, mirroring what `vendored` does for OpenSSL across the org. No other feature SHALL imply either choice.
+### Requirement: SQLite is bundled unless `vendored` is turned off
+The `client` feature SHALL take `rusqlite` with no features of its own. A `vendored` feature, on by default since 0.5.1, SHALL forward to `rusqlite/bundled`, so `cargo install io-pimdir --features cli` builds SQLite from source and needs none on the machine, mirroring what `vendored` does for OpenSSL across the org. A consumer building with `--no-default-features` and without `vendored` SHALL link the SQLite the machine provides through pkg-config, as the Nix builds do, so a store this crate writes is the one the system's `sqlite3` reads; CI proves that link on its own (`cargo test --no-default-features --features cli`). No other feature SHALL imply either choice.
 
 ### Requirement: A collection's name is a label, never an address
 `collections.name` SHALL be writable independently of `collections.id`: `set_collection_name(collection, name)` moves the label and touches neither the id every foreign key cascades on, the declared kind, nor the account. An owner namespacing its ids SHALL record the bare name there, since the separator is its own convention and a reader cannot strip one it does not know. Nothing keys on the column, so moving it costs a label and never a re-sync; it is observable, so the collection takes a new `changed` stamp and a reader on the feed re-renders.
@@ -1567,3 +1567,14 @@ Storage-draft-11 states the restore as the crate runs it (STORAGE §8): bodies m
 
 ### Requirement: A write ensures a collection once and reads a handle's link once
 `write::apply` SHALL run `ensure_collection` once per collection of a batch, and SHALL read the link an upserted handle is bound to once, before any binding of the batch is written, handing it to the read of the hub the batch touches (`batch_links`) rather than looking it up again (the audit's line P4). A load resolves its handles one statement each: no canonical statement reads the links of a slot of handles, and the crate adds no statement text of its own for it.
+
+### Requirement: A copy never leaves part of a file under a name
+`store backup` and `store restore` SHALL write every file as a body is written (STORAGE §5): the source opened before anything is created, its bytes into a period-prefixed temporary beside the final name, flushed, then moved onto the name without replacing it (`link(2)` then `unlink(2)`). A body the target holds already under its name SHALL be verified: a sound one is kept, one failing its name is moved into quarantine/ (the restore holding the owner lock and the staging lock exclusively) and the copy put in its place. A body of the source failing its name SHALL be put in nowhere and named in the report's `skipped`. A backup SHALL copy its database under a temporary name and give it pimdir.db last, so a backup stopped part way holds no pimdir.db, which no restore takes.
+
+#### Scenario: Unreadable, truncated and stopped
+- GIVEN a store's body made unreadable during a backup, then a backup body made unreadable during a restore, then the store's body truncated under its name
+- WHEN each copy runs and is run again
+- THEN the stopped backup holds no pimdir.db, the stopped restore leaves nothing under the body's name, and the rerun puts the backup's body in, the truncated one in quarantine/ and `check --deep` sound (tests/store_text.rs `a_backup_and_a_restore_never_leave_part_of_a_file`)
+
+### Requirement: A reader answers from one snapshot
+A reader answer spanning several statements (`list_items_page_*` and every listing through the overlay, `count_items`) SHALL read them in one read transaction (STORAGE §8), so a sync committing between two of them is seen whole or not at all, rolled back when the answer is read; a connection in a transaction already, an owner reading through its own, reads in that one.

@@ -204,22 +204,34 @@ impl Horizon {
 /// The start of a rule's first period past [`PERIODS_MAX`], on the
 /// series' clock: the period holding `start` is the first, each next one
 /// `INTERVAL` times `FREQ` on, as RFC 5545 §3.3.10 steps them. `None` past
-/// the last year a date spells.
+/// the last year a date spells, however far past it the period lies.
 fn unexamined(rule: &IcalRecurRule, start: IcalRecurDateTime) -> Option<IcalRecurDateTime> {
     let steps = PERIODS_MAX * i64::from(rule.interval.max(1));
     let day = start.seconds().div_euclid(DAY);
-    let date = |day: i64| IcalRecurDateTime::from_seconds(day * DAY);
+    let last = time::days_from_civil(9999, 12, 31);
+    let date = |day: Option<i64>| {
+        day.filter(|day| *day <= last)
+            .map(|day| IcalRecurDateTime::from_seconds(day * DAY))
+    };
+    let moment = |unit: i64| {
+        let seconds = steps
+            .checked_mul(unit)
+            .and_then(|span| start.seconds().checked_add(span))
+            .filter(|seconds| seconds.div_euclid(DAY) <= last)?;
+        Some(IcalRecurDateTime::from_seconds(seconds))
+    };
 
     let at = match rule.freq {
-        IcalRecurFreq::Secondly => IcalRecurDateTime::from_seconds(start.seconds() + steps),
-        IcalRecurFreq::Minutely => IcalRecurDateTime::from_seconds(start.seconds() + steps * 60),
-        IcalRecurFreq::Hourly => IcalRecurDateTime::from_seconds(start.seconds() + steps * 3600),
-        IcalRecurFreq::Daily => date(day + steps),
+        IcalRecurFreq::Secondly => moment(1)?,
+        IcalRecurFreq::Minutely => moment(60)?,
+        IcalRecurFreq::Hourly => moment(3600)?,
+        IcalRecurFreq::Daily => date(day.checked_add(steps))?,
         IcalRecurFreq::Weekly => {
             // NOTE: 1970-01-01 was a Thursday, weekday 4 counted from
             // Sunday as `WKST` is.
             let back = (day + 4 - rule.week_start as i64).rem_euclid(7);
-            date(day - back + steps * 7)
+            let span = steps.checked_mul(7);
+            date(span.and_then(|span| (day - back).checked_add(span)))?
         }
         IcalRecurFreq::Monthly => {
             let month = i64::from(start.year) * 12 + i64::from(start.month) - 1 + steps;
@@ -326,6 +338,24 @@ mod tests {
             None,
             "a daily rule reaches the horizon's end long before its bound"
         );
+    }
+
+    /// A rule whose first unexamined period lies past the last year a date
+    /// spells is examined whole, however large its `INTERVAL`: its
+    /// occurrences in the horizon are written and it is not cut.
+    #[test]
+    fn a_rule_stepping_past_year_9999_is_not_cut() {
+        let horizon = Horizon::around(time::unix(2026, 8, 20, 0, 0, 0));
+        let start = time::unix(2026, 8, 1, 0, 0, 0);
+        for freq in ["SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY"] {
+            for interval in [200_000_000, u32::MAX] {
+                let rule = alloc::format!("FREQ={freq};INTERVAL={interval}");
+                let body = event(":20260801T000000Z", &rule);
+                let (occurrences, cut) = horizon.occurrences(body.as_bytes(), FLOATING_ZONE);
+                assert_eq!(occurrences.first(), Some(&(start, start + 300)), "{rule}");
+                assert_eq!(cut, None, "{rule}");
+            }
+        }
     }
 
     /// A floating time is read in the zone the indexer states, a zoned or

@@ -740,7 +740,7 @@ impl ZoneRule {
         // NOTE: the onsets in order, the `DTSTART` the first of `COUNT`.
         let mut push = |onset: i64, index: i64, onsets: &mut Vec<i64>| -> bool {
             let past_until = self.until.is_some_and(|(until, utc)| match utc {
-                true => onset - from > until,
+                true => onset.saturating_sub(from) > until,
                 false => onset > until,
             });
             if past_until || self.count.is_some_and(|count| index >= count) || onset > high {
@@ -755,7 +755,9 @@ impl ZoneRule {
 
         match &self.shape {
             ZoneShape::Step(step) => {
-                let step = step * self.interval;
+                let Some(step) = step.checked_mul(self.interval) else {
+                    return onsets;
+                };
                 let last = ZONE_PERIODS_MAX - 1;
                 let first = (low - start).div_euclid(step).clamp(0, last);
                 let from = match first {
@@ -763,7 +765,10 @@ impl ZoneRule {
                     first => first,
                 };
                 for index in from..=last {
-                    if !push(start + index * step, index, &mut onsets) {
+                    let onset = index
+                        .checked_mul(step)
+                        .and_then(|span| start.checked_add(span));
+                    if !onset.is_some_and(|onset| push(onset, index, &mut onsets)) {
                         break;
                     }
                 }
@@ -778,8 +783,9 @@ impl ZoneRule {
                 let clock = start.rem_euclid(86_400);
                 let mut index = 0;
                 'periods: for period in 0..ZONE_PERIODS_MAX {
-                    let Some(year) = i32::try_from(period * self.interval)
-                        .ok()
+                    let Some(year) = period
+                        .checked_mul(self.interval)
+                        .and_then(|years| i32::try_from(years).ok())
                         .and_then(|years| first.checked_add(years))
                         .filter(|year| *year <= 9999)
                     else {
@@ -1230,6 +1236,35 @@ BEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Weekly:20260109T120000\r\nEND:VEVENT\r\nEN
             "2026-08-14T09:00:00Z",
             "matched byte for byte"
         );
+    }
+
+    /// A rule whose next onset no instant spells ends its walk there, as
+    /// the period bound does, the onsets before it standing: an
+    /// `INTERVAL` overflowing the step, the onset or the `UNTIL` reading
+    /// keys the event as its `DTSTART` alone would.
+    #[test]
+    fn an_observance_rule_stepping_past_every_instant_ends_its_walk() {
+        let with_rule = |rule: &str| {
+            let body = alloc::format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Hostile\r\n\
+BEGIN:STANDARD\r\nDTSTART:20260101T000000\r\nTZOFFSETFROM:-0100\r\nTZOFFSETTO:+0200\r\n\
+RRULE:{rule}\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=Hostile:20260801T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            );
+            derive(body.as_bytes()).sort_key.0
+        };
+        let start = time::unix(2026, 1, 1, 0, 0, 0);
+        let rules = [
+            String::from("FREQ=MINUTELY;INTERVAL=4611686018427387904"),
+            alloc::format!("FREQ=SECONDLY;INTERVAL={}", i64::MAX),
+            alloc::format!(
+                "FREQ=SECONDLY;INTERVAL={};UNTIL=99991231T000000Z",
+                i64::MAX - start
+            ),
+        ];
+        for rule in rules {
+            assert_eq!(with_rule(&rule), "2026-08-01T10:00:00Z", "{rule}");
+        }
     }
 
     /// Accepting that nobody is notified marks every person of a component

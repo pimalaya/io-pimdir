@@ -562,3 +562,19 @@ tests/vectors_sync.rs SHALL run every case of the vendored spec/vectors/sync/ at
 
 #### Scenario: Each reason
 - src/sync.rs `an_out_of_scope_create_waits`, `a_round_landing_no_delivered_create_keeps_it_waiting`, `a_create_holding_neither_body_nor_origin_is_reported_undeliverable`
+
+### Requirement: An offered create is landed with the union of its flags
+A member landing a `Created` placement the store offers this source (an item it does not bind yet, `PimdirLoaded::offered`) SHALL be landed with the union of the placement's flags and the member's, neither side holding a base to have removed one against (SYNC §5); a pending create of this source keeps its staged flags as before.
+
+#### Scenario: A first pairing ends alike whatever the page
+- GIVEN two mail sources holding one message, one with `\Seen` and the other without, either way round
+- WHEN the second source lists it on the first page of a round of two, or on the last
+- THEN both servers end with `\Seen` (tests/engine/join_immutable.rs `a_first_pairing_ends_alike_whatever_the_page`)
+
+### Requirement: A kept local edit keeps its summary
+A listing naming a member at its base revision SHALL refresh the summary and sort key of its placement only when the placement holds no local edit of a mutable kind (`staged_edit`): the listing describes the server's body, and a placement whose local body the run keeps, pushed or still pending, keeps that body's summary (SYNC §5). A rekey carrying such an edit the remote did not edit keeps its summary and sort key the same way.
+
+#### Scenario: A renamed contact
+- GIVEN a synced card edited offline, its edit stating its own summary and sort key
+- WHEN a full round lists the member at the unchanged revision, with push off or on, or the server renumbers and the collection is rekeyed
+- THEN the placement keeps the edit's summary and sort key (tests/engine/summary_kept.rs)

@@ -158,6 +158,11 @@ pub struct PimdirHub {
     pub items: BTreeMap<PimdirLinkId, PimdirHubItem>,
     /// How a cross-source content conflict is resolved.
     pub conflict: PimdirHubConflict,
+    /// Whether the collection holds an immutable kind (`message/rfc822`):
+    /// one identity is one message, so no binding owes a body whatever its
+    /// base names, and a write adopts the shared body as its base (SYNC
+    /// §3).
+    pub immutable: bool,
     /// The bindings a `Superseded` or `Rekeyed` drop released within the
     /// batch being absorbed, by source and link id: the upsert moving the
     /// binding onto its new handle follows the drop (SYNC §10), and the
@@ -315,7 +320,9 @@ impl PimdirHub {
     /// was never reconciled with its remote, so it projects `Created`. An
     /// item holding no body, one another source's content pull dropped,
     /// is no divergence on the content axis: this source owes nothing
-    /// until a hydration gives the item a body again.
+    /// until a hydration gives the item a body again. Nor is a body an
+    /// immutable item holds, whatever the base names: one identity is one
+    /// message (SYNC §3 rule 4).
     fn bound_placement(
         &self,
         collection: &PimdirCollectionId,
@@ -323,6 +330,7 @@ impl PimdirHub {
         item: &PimdirHubItem,
         binding: &PimdirBinding,
     ) -> PimdirPlacement {
+        let mutable = !self.immutable;
         // NOTE: the flag sets differ only when both are known (SYNC §3
         // rule 4): an unknown one holds no opinion.
         let in_sync = binding.base.as_ref().is_some_and(|b| {
@@ -330,7 +338,7 @@ impl PimdirHub {
                 (Some(base), Some(held)) => base == held,
                 _ => true,
             };
-            flags && (item.object.is_none() || b.object == item.object)
+            flags && (!mutable || item.object.is_none() || b.object == item.object)
         });
         let status = if binding.conflicted || item.conflicted {
             PimdirStatus::Conflict
@@ -395,14 +403,26 @@ impl PimdirHub {
     /// binding stays, for the store to retain (STORAGE §11). `StoreObject`,
     /// the checkpoint and the round ops are the storage's.
     pub fn absorb(&mut self, source: &PimdirSourceId, writes: &[PimdirWriteOp]) {
+        let mut bound: BTreeMap<PimdirHandle, PimdirLinkId> = self
+            .items
+            .iter()
+            .filter_map(|(link, item)| {
+                Some((item.sources.get(source)?.handle.clone(), link.clone()))
+            })
+            .collect();
         for op in writes {
             match op {
-                PimdirWriteOp::UpsertPlacement(placement) => self.absorb_upsert(source, placement),
+                PimdirWriteOp::UpsertPlacement(placement) => {
+                    self.absorb_upsert(source, placement);
+                    if let Some(link) = &placement.link_id {
+                        bound.insert(placement.handle.clone(), link.clone());
+                    }
+                }
                 PimdirWriteOp::DropPlacement { handle, reason, .. } => {
-                    self.absorb_drop(source, handle, *reason)
+                    self.absorb_drop(source, bound.get(handle), handle, *reason)
                 }
                 PimdirWriteOp::DeliverPlacement { handle, .. } => {
-                    self.absorb_delivery(source, handle)
+                    self.absorb_delivery(source, bound.get(handle), handle)
                 }
                 PimdirWriteOp::Overrule { handle, .. } => {
                     self.overruling.insert(handle.clone());
@@ -435,9 +455,12 @@ impl PimdirHub {
     /// resurrects it, while its known flags ride along; it settles the
     /// item's conflict only when a `Settle` precedes it, a person's
     /// resolution by deleting, the item keeping its body (SYNC §7, §9).
-    /// An unknown flag set or sort key never erases a known one. An
-    /// immutable kind never owes a body, so its binding's base adopts the
-    /// shared one (SYNC §9).
+    /// An unknown flag set or sort key never erases a known one, and a
+    /// source binding the item for the first time, with no base against
+    /// it, joins its flags to the held ones as a union (SYNC §5), whichever
+    /// page of a round named it. An immutable kind never owes a body, so
+    /// its binding's base adopts the shared one, a base naming none in an
+    /// immutable collection included (SYNC §3, §9).
     fn absorb_upsert(&mut self, source: &PimdirSourceId, placement: &PimdirPlacement) {
         let Some(link) = placement.link_id.clone() else {
             return;
@@ -450,6 +473,7 @@ impl PimdirHub {
         let settling = self.settling.remove(&placement.handle);
 
         let policy = self.conflict;
+        let immutable = self.immutable;
         let released = self.rebinding.remove(&(source.clone(), link.clone()));
         let item = self
             .items
@@ -499,8 +523,12 @@ impl PimdirHub {
 
         item.deleted = false;
 
+        let joining = !item.sources.contains_key(source);
         if !placement.flags.is_unknown() {
-            item.flags = placement.flags.clone();
+            item.flags = match joining {
+                true => PimdirFlags::merge(&PimdirFlags::Unknown, &item.flags, &placement.flags),
+                false => placement.flags.clone(),
+            };
         }
         let held = item.object.clone();
         let held_summary = item.summary.clone();
@@ -597,7 +625,7 @@ impl PimdirHub {
         let mut binding = Self::binding_of(placement, agreed);
         if let Some(base) = &mut binding.base
             && base.revision.is_none()
-            && base.object.is_some()
+            && (base.object.is_some() || immutable)
             && item.object.is_some()
         {
             base.object = item.object.clone();
@@ -809,15 +837,22 @@ impl PimdirHub {
     /// Records the create bound under the provisional `handle` delivered
     /// (SYNC §2, §4): its binding gains a base naming nothing while it holds
     /// none, and one holding a base, or no binding, is left as it is.
-    fn absorb_delivery(&mut self, source: &PimdirSourceId, handle: &PimdirHandle) {
+    /// Records a delivered create (SYNC §2): the binding of `source` under
+    /// the provisional `handle`, found through `link`, the item the batch
+    /// last bound it to, gains a base naming nothing.
+    fn absorb_delivery(
+        &mut self,
+        source: &PimdirSourceId,
+        link: Option<&PimdirLinkId>,
+        handle: &PimdirHandle,
+    ) {
         if !handle.is_provisional() {
             return;
         }
-        let binding = self
-            .items
-            .values_mut()
-            .filter_map(|item| item.sources.get_mut(source))
-            .find(|binding| &binding.handle == handle);
+        let binding = link
+            .and_then(|link| self.items.get_mut(link))
+            .and_then(|item| item.sources.get_mut(source))
+            .filter(|binding| &binding.handle == handle);
         if let Some(binding) = binding
             && binding.base.is_none()
         {
@@ -829,26 +864,35 @@ impl PimdirHub {
         }
     }
 
+    /// Drops the binding of `source` under `handle`, found through `link`,
+    /// the item the batch last bound it to, checked to bind it still: one
+    /// lookup, not a walk of every item, so a rebuild dropping every
+    /// handle stays linear in the collection.
     fn absorb_drop(
         &mut self,
         source: &PimdirSourceId,
+        link: Option<&PimdirLinkId>,
         handle: &PimdirHandle,
         reason: PimdirDropReason,
     ) {
-        for (link, item) in self.items.iter_mut() {
-            let bound_here = item
-                .sources
-                .get(source)
-                .is_some_and(|binding| &binding.handle == handle);
-            if bound_here {
-                let genuine = reason == PimdirDropReason::Deleted;
-                item.deleted |= genuine;
-                if let Some(released) = item.sources.remove(source)
-                    && !genuine
-                {
-                    self.rebinding
-                        .insert((source.clone(), link.clone()), released);
-                }
+        let Some(link) = link else {
+            return;
+        };
+        let Some(item) = self.items.get_mut(link) else {
+            return;
+        };
+        let bound_here = item
+            .sources
+            .get(source)
+            .is_some_and(|binding| &binding.handle == handle);
+        if bound_here {
+            let genuine = reason == PimdirDropReason::Deleted;
+            item.deleted |= genuine;
+            if let Some(released) = item.sources.remove(source)
+                && !genuine
+            {
+                self.rebinding
+                    .insert((source.clone(), link.clone()), released);
             }
         }
     }

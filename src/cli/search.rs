@@ -20,15 +20,16 @@ use anyhow::Result;
 use clap::{ArgGroup, Args, ValueEnum};
 use io_pimdir::{
     client::search::{
-        PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchHit,
-        PimdirSearchMatched, PimdirSearchOptions, PimdirSearchPlacement, PimdirSearchSort,
-        PimdirSearchThread,
+        PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchCursor,
+        PimdirSearchHit, PimdirSearchMatched, PimdirSearchOptions, PimdirSearchPlacement,
+        PimdirSearchSort, PimdirSearchThread,
     },
     placement::PimdirLevel,
     search::{
         coverage::{
             PimdirSearchCoverage, PimdirSearchReads, PimdirSearchRemote, PimdirSearchTemporal,
         },
+        occurrence,
         query::PimdirQuery,
         tag::PimdirSearchTagSource,
     },
@@ -63,20 +64,21 @@ pub struct IndexCommand {
     /// The IANA zone floating times and dates are read in (`UTC`,
     /// `Europe/Paris`).
     ///
-    /// The index records it: another zone re-expands every calendar item,
-    /// so pass the same one to every command refreshing the index.
-    #[arg(long, value_name = "ZONE", default_value = "UTC")]
-    pub floating_zone: String,
+    /// The index records it: another zone re-expands every calendar item.
+    /// The one the index records by default, `UTC` for a new index.
+    #[arg(long, value_name = "ZONE")]
+    pub floating_zone: Option<String>,
 }
 
 impl IndexCommand {
     /// Runs a full refresh.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         store.ensure_store()?;
+        let floating_zone = floating_zone(self.floating_zone, store);
         let mut index = PimdirIndex::open(store.dir()).map_err(report)?;
         let report = index
             .refresh(&PimdirIndexRefreshOptions {
-                floating_zone: self.floating_zone,
+                floating_zone,
                 ..Default::default()
             })
             .map_err(report)?;
@@ -120,7 +122,8 @@ pub struct SearchCommand {
     /// Resume a listing at the given page.
     ///
     /// The token is the `nextPage` value a previous listing printed, given
-    /// back as it is.
+    /// back as it is: the place of its last hit, so a hit arriving or
+    /// leaving in between neither repeats nor hides another.
     #[arg(long = "page-token", alias = "offset", value_name = "TOKEN")]
     pub page_token: Option<String>,
 
@@ -148,19 +151,18 @@ impl SearchCommand {
         let query = parse(&self.query)?;
         let index = self.refresh.index(store)?;
         let limit = self.limit.max(1);
-        // NOTE: the token is the offset of the next page, as its decimal.
-        let offset = match &self.page_token {
-            None => 0,
-            Some(token) => token.parse::<usize>().map_err(|_| {
+        let after = match &self.page_token {
+            None => None,
+            Some(token) => Some(PimdirSearchCursor::from_token(token).ok_or_else(|| {
                 ErrorCode::PageTokenInvalid.error(format!(
                     "--page-token takes the nextPage a listing printed, got {token:?}"
                 ))
-            })?,
+            })?),
         };
         let options = PimdirSearchOptions {
             sort: self.sort.into(),
             limit,
-            offset,
+            after,
             clock: clock(&index, self.zone)?,
         };
 
@@ -169,9 +171,7 @@ impl SearchCommand {
 
             return printer.out(SearchThreadsOutput {
                 query: self.query,
-                next_page: answer
-                    .more
-                    .then(|| (offset + answer.threads.len()).to_string()),
+                next_page: answer.next.as_ref().map(PimdirSearchCursor::token),
                 threads: answer.threads.iter().map(ThreadRow::from).collect(),
                 coverage: CoverageRow::from(&answer.coverage),
             });
@@ -181,9 +181,7 @@ impl SearchCommand {
 
         printer.out(SearchOutput {
             query: self.query,
-            next_page: answer
-                .more
-                .then(|| (offset + answer.hits.len()).to_string()),
+            next_page: answer.next.as_ref().map(PimdirSearchCursor::token),
             hits: answer.hits.iter().map(HitRow::from).collect(),
             coverage: CoverageRow::from(&answer.coverage),
         })
@@ -233,6 +231,9 @@ impl CountCommand {
 /// placements and its text by field as SEARCH.md §6 extracts it, read
 /// afresh from its body, or from its summary when it holds none, with the
 /// chunks its long fields split into.
+///
+/// Reads the index as it stands: it creates, rebuilds and refreshes
+/// nothing, so it needs one `index` built.
 #[derive(Debug, Args)]
 pub struct ShowCommand {
     /// Public id of the item (`seq`), as a hit prints it.
@@ -248,7 +249,7 @@ impl ShowCommand {
     /// Prints the item.
     pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
         store.ensure_store()?;
-        let index = PimdirIndex::open(store.dir()).map_err(report)?;
+        let index = PimdirIndex::open_query(store.dir()).map_err(report)?;
         let Some(item) = index
             .item(self.account.as_deref(), self.seq)
             .map_err(report)?
@@ -542,38 +543,56 @@ impl ThreadCommand {
 #[derive(Debug, Args)]
 pub struct RefreshFlags {
     /// Stop folding the store's changes into the index after this long
-    /// (`2s`, `500ms`, `0s` to answer from the index as it stands).
+    /// (`2s`, `500ms`, `0s` to answer from the index as it stands, which
+    /// it then neither creates nor rebuilds).
     ///
     /// What is left unfolded is counted in the coverage's `unindexed`; run
     /// `index` to fold everything.
-    #[arg(long, value_name = "DURATION", default_value = "2s")]
-    pub refresh_timeout: humantime::Duration,
+    #[arg(long, value_name = "DURATION", default_value = "2s", value_parser = crate::cli::duration)]
+    pub refresh_timeout: Duration,
 
     /// The IANA zone floating times and dates are read in (`UTC`,
     /// `Europe/Paris`), as `index --floating-zone` states it.
     ///
     /// The index records it: another zone re-expands every calendar item.
-    #[arg(long, value_name = "ZONE", default_value = "UTC")]
-    pub floating_zone: String,
+    /// The one the index records by default, `UTC` for a new index.
+    #[arg(long, value_name = "ZONE")]
+    pub floating_zone: Option<String>,
 }
 
 impl RefreshFlags {
-    /// Opens the index and refreshes it until the deadline.
+    /// Opens the index and refreshes it until the deadline, in the zone
+    /// it records unless one is given; a zero timeout opens it for
+    /// queries alone.
     fn index(&self, store: &StoreFlags) -> Result<PimdirIndex> {
         store.ensure_store()?;
-        let mut index = PimdirIndex::open(store.dir()).map_err(report)?;
-        let timeout: Duration = self.refresh_timeout.into();
-        if !timeout.is_zero() {
-            index
-                .refresh(&PimdirIndexRefreshOptions {
-                    deadline: Some(Instant::now() + timeout),
-                    floating_zone: self.floating_zone.clone(),
-                    ..Default::default()
-                })
-                .map_err(report)?;
+        let timeout = self.refresh_timeout;
+        if timeout.is_zero() {
+            return PimdirIndex::open_query(store.dir()).map_err(report);
         }
+
+        let floating_zone = floating_zone(self.floating_zone.clone(), store);
+        let mut index = PimdirIndex::open(store.dir()).map_err(report)?;
+        index
+            .refresh(&PimdirIndexRefreshOptions {
+                deadline: Some(Instant::now() + timeout),
+                floating_zone,
+                ..Default::default()
+            })
+            .map_err(report)?;
         Ok(index)
     }
+}
+
+/// The zone a refresh reads floating times in: the one given, else the one
+/// the index records, read before [`PimdirIndex::open`] rebuilds an index
+/// standing under another extraction, else `UTC`.
+fn floating_zone(given: Option<String>, store: &StoreFlags) -> String {
+    given.unwrap_or_else(|| {
+        PimdirIndex::open_query(store.dir())
+            .and_then(|index| index.floating_zone())
+            .unwrap_or_else(|_| occurrence::FLOATING_ZONE.into())
+    })
 }
 
 /// The orders a search takes.

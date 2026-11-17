@@ -28,13 +28,13 @@ pub mod summary;
 use std::{
     io::{IsTerminal, stdin, stdout},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use anyhow::Result;
 use clap::Args;
 use io_pimdir::client::{PimdirError, PimdirStore, producer::PimdirProducer, reader::PimdirReader};
-use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt};
+use pimalaya_cli::{clap::parsers::path_parser, printer::Printer, prompt, sanitize};
 
 use crate::cli::error::{ErrorCode, report};
 
@@ -169,7 +169,7 @@ pub fn confirm(printer: &impl Printer, yes: bool, question: &str) -> Result<()> 
             .error("refusing to proceed without a confirmation: pass --yes to proceed"));
     }
 
-    if !prompt::bool(question, false)? {
+    if !prompt::bool(sanitize::text(question), false)? {
         return Err(ErrorCode::Cancelled.error("cancelled"));
     }
 
@@ -179,16 +179,34 @@ pub fn confirm(printer: &impl Printer, yes: bool, question: &str) -> Result<()> 
 /// The current instant as the RFC 3339 stamp the store's own timestamps use
 /// (UTC, milliseconds), so a stamp this tool writes sorts against them.
 pub fn now() -> String {
-    humantime::format_rfc3339_millis(SystemTime::now()).to_string()
+    stamp(jiff::Timestamp::now())
 }
 
 /// The RFC 3339 instant `age` ago, the cutoff a time-based purge passes to the
 /// store. An age reaching before the epoch clamps to the epoch.
 pub fn cutoff(age: Duration) -> String {
-    let cutoff = SystemTime::now()
-        .checked_sub(age)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    humantime::format_rfc3339_millis(cutoff).to_string()
+    let now = jiff::Timestamp::now();
+    let cutoff = jiff::SignedDuration::try_from(age)
+        .ok()
+        .and_then(|age| now.checked_sub(age).ok())
+        .filter(|cutoff| *cutoff >= jiff::Timestamp::UNIX_EPOCH)
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+    stamp(cutoff)
+}
+
+/// An instant as RFC 3339 in UTC with milliseconds.
+fn stamp(instant: jiff::Timestamp) -> String {
+    instant.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// Parses a duration flag (`2s`, `12h`, `90d`, `2 weeks`), a day being 24
+/// hours; a negative one is refused.
+pub fn duration(value: &str) -> Result<Duration, String> {
+    let span: jiff::Span = value.parse().map_err(|err| format!("{err}"))?;
+    let signed = span
+        .to_duration(jiff::SpanRelativeTo::days_are_24_hours())
+        .map_err(|err| format!("{err}"))?;
+    Duration::try_from(signed).map_err(|_| format!("{value} is a negative duration"))
 }
 
 /// A byte count in the largest unit that keeps it readable.
@@ -212,4 +230,31 @@ pub fn bytes(count: u64) -> String {
 /// A value that may be absent, rendered as a dash in the text output.
 pub fn or_dash(value: Option<&str>) -> &str {
     value.unwrap_or("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    /// The duration flags read what humantime read for them, a day being 24
+    /// hours, and refuse a negative one.
+    #[test]
+    fn a_duration_flag_reads_the_friendly_forms() {
+        let parsed = |value: &str| super::duration(value).unwrap();
+        assert_eq!(parsed("2s"), Duration::from_secs(2));
+        assert_eq!(parsed("12h"), Duration::from_secs(12 * 3600));
+        assert_eq!(parsed("90d"), Duration::from_secs(90 * 86_400));
+        assert_eq!(parsed("2weeks"), Duration::from_secs(14 * 86_400));
+        assert_eq!(parsed("0s"), Duration::ZERO);
+        assert!(super::duration("-1s").is_err());
+        assert!(super::duration("soon").is_err());
+    }
+
+    /// A stamp sorts against the store's own: RFC 3339, UTC, milliseconds.
+    #[test]
+    fn a_stamp_is_rfc_3339_in_utc_with_milliseconds() {
+        let stamp = super::cutoff(Duration::from_secs(u64::MAX));
+        assert_eq!(stamp, "1970-01-01T00:00:00.000Z");
+        assert_eq!(super::now().len(), stamp.len());
+    }
 }

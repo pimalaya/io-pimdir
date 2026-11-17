@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `PimdirSearchCursor`, the place of the last hit a search page answered, written and read back as a token (`token`, `from_token`).
+- Added `PimdirLinkId::minted_from`, the keys a minted key may be minted from.
+- Added `PimdirHub::immutable`, set by the store for a `message/rfc822` collection.
+- Added `PimdirMutateError::MoveInPlace` (`move-in-place`).
+
+### Changed
+
+- **BREAKING**: Changed search paging from an offset to a cursor: `PimdirSearchOptions::after` replaces `offset`, and `PimdirSearchOutput::next` and `PimdirSearchThreadsOutput::next` name where the next page starts.
+
+  A page now starts after the last hit the page before it answered, so a hit arriving or leaving in between neither repeats nor hides another. The `pimdir search` `nextPage` and `--page-token` carry the cursor's token; a token printed before is refused as `page-token-invalid`.
+- Changed `EXTRACTOR` to `io-pimdir 2`: every search index another revision built is extracted again once.
+- Changed `pimdir show`, and `search`, `count`, `tag` and `thread` given `--refresh-timeout 0s`, to answer from the index as it stands, creating and rebuilding none (`index-missing` when there is none).
+- Changed `--floating-zone` of `pimdir index` and of the one-shot answers to default to the zone the index records, `UTC` for a new index.
+- Changed the `pimdir` duration flags to read through jiff instead of humantime (RUSTSEC-2026-0542, unmaintained): `2s`, `12h`, `90d`, `2 weeks`, a day being 24 hours; months and years are refused.
+
+### Fixed
+
+- Fixed a `VTIMEZONE` rule with a huge `INTERVAL` aborting the calendar derivation (a panic, or a division by zero in release), on writes, re-derivations and a sync engine's pull.
+- Fixed a recurrence rule with a huge `INTERVAL` panicking the search expansion, or in release cutting every occurrence.
+- Fixed an HTML comment closed by three dashes or more swallowing the rest of the body from the search index.
+- Fixed `pimdir show` creating index.db, or wiping an index another release built, and a one-shot answer resetting the floating zone a sync engine indexed in.
+- Fixed `pimdir queue status`, `item restore`, `item erase`, `item list`, `item show`, `store info` and the confirmation prompts printing control and bidi characters a server put in a mailbox name or an answer.
+- Fixed a second rekey, a delivered copy and a lone minted copy losing their body and pending state, and making another source of the collection remove the message from its server.
+- Fixed a rekey being quadratic in the collection, in the engine and in the store's write (16,000 members: 5.3 s to 65 ms in the engine).
+- Fixed a mail binding joined to a message another source holds deriving an `Update` every run and never pushing a flag, and a first pairing removing a flag from the server that had it, by the page the message sat on.
+- Fixed a queued `move` into the item's own collection deleting the message from its server: it parks as `move-in-place`.
+- Fixed `store backup` and `store restore` leaving an empty or truncated body under its name that a rerun kept, keeping a corrupt body over the backup's, and leaving a backup stopped part way with its database.
+- Fixed a listing at the base revision replacing the summary and sort key of a locally edited contact or event with the server's.
+- Fixed a store kept on a rollback journal failing to be indexed or searched.
+- Fixed a reader listing or count reading a sync's commit half way.
+- Fixed `pimdir item export --output` creating its file readable by others.
+
 ## [0.15.1] - 2026-11-16
 
 ### Changed

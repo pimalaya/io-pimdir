@@ -514,6 +514,58 @@ fn a_queued_bodiless_move_applies_into_a_target_its_source_syncs() {
     assert!(store.list_items("Archive", None, 10).unwrap().is_empty());
 }
 
+/// A move into the collection its item is in parks: applied, it would
+/// tombstone a message held without its body, whose create could never
+/// deliver, so the sync would push a `Remove` nobody asked for.
+#[test]
+fn a_queued_move_into_its_own_collection_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let mut listed = placement("1", "mid:a", "", &[]);
+    listed.object = None;
+    listed.level = PimdirLevel::Meta;
+    listed.base = Some(PimdirBase {
+        flags: PimdirFlags::default(),
+        revision: None,
+        object: None,
+    });
+    store
+        .write(vec![
+            PimdirWriteOp::UpsertPlacement(listed),
+            PimdirWriteOp::SetCheckpoint {
+                collection: inbox(),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
+        ])
+        .unwrap();
+    let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    producer
+        .enqueue("INBOX", &PimdirAction::Move { seq, to: inbox() }, None)
+        .unwrap();
+
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (0, 1));
+    let parked = store.parked_actions().unwrap();
+    assert!(
+        parked[0]
+            .error
+            .contains("moved into the collection it is in"),
+        "{}",
+        parked[0].error
+    );
+    let items = store.list_items("INBOX", None, 10).unwrap();
+    assert_eq!(items.len(), 1, "no copy staged beside it");
+    assert_eq!(items[0].seq, seq);
+    let placements = store.open_collection("INBOX").unwrap().placements;
+    assert!(
+        placements.iter().all(|p| p.status == PimdirStatus::Clean),
+        "nothing tombstoned nor created: {placements:?}"
+    );
+}
+
 #[test]
 fn update_repoints_the_body() {
     let dir = tempfile::tempdir().unwrap();

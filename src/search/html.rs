@@ -66,7 +66,7 @@ pub(crate) fn to_text(html: &str) -> String {
         if in_comment {
             match ch {
                 b'-' => comment_pos += 1,
-                b'>' if comment_pos == 2 => {
+                b'>' if comment_pos >= 2 => {
                     comment_pos = 0;
                     in_comment = false;
                     in_tag = false;
@@ -884,6 +884,25 @@ mod tests {
                 "<div>Hello</div><template><div>Hidden</div><style>.x{}</style></template><div>World</div>",
                 "Hello World",
             ),
+        ];
+
+        for (html, text) in cases {
+            assert_eq!(to_text(html), text, "{html:?}");
+        }
+    }
+
+    /// A comment closes on two dashes or more before its `>`, so a
+    /// decorated separator hides itself and not the rest of the body.
+    #[test]
+    fn a_comment_closes_on_any_run_of_dashes() {
+        let cases = [
+            (
+                "<p>before</p><!----------- SECTION -----------><p>after</p>",
+                "before\nafter\n",
+            ),
+            ("one<!-- a - b --->two", "onetwo"),
+            ("one<!---->two", "onetwo"),
+            ("one<!-- -> -- > ->-->two", "onetwo"),
         ];
 
         for (html, text) in cases {

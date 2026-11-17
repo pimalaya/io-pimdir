@@ -388,3 +388,90 @@ fn a_search_prints_the_four_counts_and_whether_it_is_complete() {
     assert_eq!(behind["local"]["unindexed"], 0);
     assert!(behind["local"]["behind"].as_u64().unwrap() > 0);
 }
+
+/// A read verb takes the index as it stands (SEARCH §3): `show`, and an
+/// answer given no time to refresh, create no index.db and rebuild none
+/// standing under another extractor; a refresh given no zone keeps the
+/// one the index records.
+#[test]
+fn a_read_verb_leaves_the_index_as_it_stands() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    file_message(dir, "INBOX", "late@x", 23, &[]);
+    let index = dir.join("index.db");
+
+    let (status, output) = pimdir(dir, &["show", "1"]);
+    assert_eq!(
+        (status, output["code"].as_str()),
+        (1, Some("index-missing"))
+    );
+    assert!(!index.exists(), "show creates no index");
+    let (status, output) = pimdir(dir, &["count", "--refresh-timeout", "0s", "late"]);
+    assert_eq!(
+        (status, output["code"].as_str()),
+        (1, Some("index-missing"))
+    );
+    assert!(!index.exists(), "an answer given no time creates no index");
+
+    let (status, _) = pimdir(dir, &["index", "--floating-zone", "Europe/Paris"]);
+    assert_eq!(status, 0);
+    let (status, output) = pimdir(dir, &["count", "date:2026-08-02"]);
+    assert_eq!((status, output["count"].as_u64()), (0, Some(1)), "{output}");
+    let (_, output) = pimdir(dir, &["index"]);
+    assert_eq!(output["indexed"].as_u64(), Some(0), "nothing re-expanded");
+    let (_, output) = pimdir(dir, &["count", "date:2026-08-02"]);
+    assert_eq!(output["count"].as_u64(), Some(1), "Europe/Paris still");
+
+    rusqlite::Connection::open(&index)
+        .unwrap()
+        .execute("UPDATE index_meta SET extractor = 'another 1'", [])
+        .unwrap();
+    let extractor = || -> String {
+        let conn = rusqlite::Connection::open(&index).unwrap();
+        conn.query_row("SELECT extractor FROM index_meta", [], |row| row.get(0))
+            .unwrap()
+    };
+    let (status, output) = pimdir(dir, &["show", "1"]);
+    assert_eq!((status, output["seq"].as_i64()), (0, Some(1)), "{output}");
+    let (status, output) = pimdir(dir, &["count", "--refresh-timeout", "0s", "late"]);
+    assert_eq!((status, output["count"].as_u64()), (0, Some(1)), "{output}");
+    assert_eq!(extractor(), "another 1", "another extractor's index kept");
+
+    let (_, output) = pimdir(dir, &["count", "date:2026-08-02"]);
+    assert_eq!(output["count"].as_u64(), Some(1), "rebuilt in its zone");
+    assert_ne!(extractor(), "another 1", "a refresh rebuilds it");
+}
+
+/// `search --page-token` resumes after the last hit the page before it
+/// printed (SEARCH §8.2): a message arriving in between repeats none.
+#[test]
+fn a_search_page_token_resumes_after_its_last_hit() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    for hour in 1..=5 {
+        file_message(dir, "INBOX", &format!("m{hour}@x"), hour, &[]);
+    }
+    let titles = |output: &Value| -> Vec<String> {
+        output["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["title"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, first) = pimdir(dir, &["search", "kind:mail", "-n", "2"]);
+    assert_eq!(status, 0, "{first}");
+    assert_eq!(titles(&first), ["m5@x", "m4@x"]);
+    let token = first["nextPage"].as_str().unwrap().to_string();
+
+    file_message(dir, "INBOX", "m6@x", 6, &[]);
+    let (status, second) = pimdir(
+        dir,
+        &["search", "kind:mail", "-n", "2", "--page-token", &token],
+    );
+    assert_eq!(status, 0, "{second}");
+    assert_eq!(titles(&second), ["m3@x", "m2@x"], "m4 not printed twice");
+}

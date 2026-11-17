@@ -27,8 +27,8 @@ use io_pimdir::{
         producer::PimdirProducer,
         reader::PimdirReader,
         search::{
-            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchMatched,
-            PimdirSearchOptions, PimdirSearchSort,
+            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchCursor,
+            PimdirSearchMatched, PimdirSearchOptions, PimdirSearchSort,
         },
     },
     collection::{PimdirCollectionId, PimdirScope},
@@ -511,7 +511,7 @@ fn answers(
             _ => PimdirSearchSort::Date,
         },
         limit: 100,
-        offset: 0,
+        after: None,
         clock: clock.clone(),
     };
     if let Some(want) = case.get("threads") {
@@ -561,6 +561,25 @@ fn answers(
         .iter()
         .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
         .collect();
+    let mut walked = Vec::new();
+    let mut page = PimdirSearchOptions {
+        limit: 1,
+        ..options.clone()
+    };
+    loop {
+        let answer = index.search(&parsed, &page).unwrap();
+        walked.extend(
+            answer
+                .hits
+                .iter()
+                .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq)),
+        );
+        match answer.next {
+            Some(next) => page.after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(walked, got, "{query:?}: the pages walked one by one");
     let want = pairs(&case["hits"]);
 
     if case["ordered"].as_bool() == Some(true) {
@@ -3726,4 +3745,76 @@ mod memory {
         assert_eq!(lost, [("home/Lost", 34)]);
         agree(dir.path(), &memory);
     }
+}
+
+/// A store its operator keeps on a rollback journal (STORAGE §8, a
+/// network filesystem) is indexed and searched as any other: the index
+/// sets its own journal mode, never the read-only store's it attaches.
+#[test]
+fn a_store_on_a_rollback_journal_is_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    drop(conn);
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(hits(&index, "alpha").len(), 1);
+    drop(index);
+    let index = PimdirIndex::open_query(dir.path()).unwrap();
+    assert_eq!(hits(&index, "alpha").len(), 1);
+}
+
+/// A page starts after the last hit the one before it answered (SEARCH
+/// §8.2): a message arriving before that place repeats no hit, and two
+/// leaving it hide none, where a count of hits skipped would.
+#[test]
+fn a_page_resumes_after_the_last_hit_it_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    for hour in 1..=5 {
+        let id = format!("m{hour}");
+        file_message(dir.path(), "INBOX", mail(&id, hour, ""), &[]);
+    }
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let query = PimdirQuery::parse("kind:mail").unwrap();
+    let page = |index: &mut PimdirIndex, after| {
+        index
+            .refresh(&PimdirIndexRefreshOptions::default())
+            .unwrap();
+        let options = PimdirSearchOptions {
+            limit: 2,
+            after,
+            ..Default::default()
+        };
+        let answer = index.search(&query, &options).unwrap();
+        let titles: Vec<String> = answer.hits.iter().map(|hit| hit.title.clone()).collect();
+        (titles, answer.next)
+    };
+
+    let (first, next) = page(&mut index, None);
+    assert_eq!(first, ["m5", "m4"]);
+    file_message(dir.path(), "INBOX", mail("m6", 6, ""), &[]);
+    let (second, next) = page(&mut index, next);
+    assert_eq!(second, ["m3", "m2"], "m4 not answered twice");
+
+    delete_message(dir.path(), "m6");
+    delete_message(dir.path(), "m5");
+    let (third, next) = page(&mut index, next);
+    assert_eq!(third, ["m1"], "m1 not hidden");
+    assert_eq!(next, None);
+
+    let token = PimdirSearchCursor::from_token("1.0.-.-..7.").unwrap();
+    assert_eq!(PimdirSearchCursor::from_token(&token.token()), Some(token));
+    assert_eq!(PimdirSearchCursor::from_token("2"), None);
 }

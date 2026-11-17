@@ -1125,8 +1125,9 @@ impl PimdirSync {
     /// Names every member the page lists (SYNC §4, §6), in handle order:
     /// a new handle is keyed against the whole collection or lands the
     /// pending create its hint is held by, a bound one has its summary
-    /// and sort key refreshed from its meta, and a mutable resource
-    /// stating a new identity under its handle is keyed afresh.
+    /// and sort key refreshed from its meta unless it holds a local edit
+    /// of a mutable kind, whose own they stay (SYNC §5), and a mutable
+    /// resource stating a new identity under its handle is keyed afresh.
     fn name_members(&mut self, items: &[PimdirRemoteItem]) {
         // NOTE: extended as the page resolves, since both copies of a
         // duplicate commonly arrive in one page.
@@ -1175,6 +1176,9 @@ impl PimdirSync {
             if item.revision.is_some() && item.revision.as_ref() != base_revision {
                 continue;
             }
+            if mutable && placement.staged_edit().is_some() {
+                continue;
+            }
 
             let mut refreshed = placement.clone();
             refreshed.summary = summary::without_body(
@@ -1194,13 +1198,20 @@ impl PimdirSync {
     }
 
     /// Names one new member: lands the pending create its hint is held
-    /// by, else keys it, the hint when free and a minted key otherwise.
+    /// by, else keys it, the hint when free and a minted key otherwise. A
+    /// create the store offers this source, an item it does not bind yet,
+    /// is landed with the union of its flags and the member's, neither side
+    /// having a base to have removed one against (SYNC §5).
     fn name(&mut self, item: &PimdirRemoteItem, claimed: &mut BTreeSet<PimdirLinkId>) {
         let meta = &item.meta;
 
-        if let Some(create) = self.take_pending_create(item) {
+        if let Some(mut create) = self.take_pending_create(item) {
             claimed.insert(meta.link_id.clone());
             let provisional = create.handle.clone();
+            if self.offered.contains(&provisional) {
+                create.flags =
+                    PimdirFlags::merge(&PimdirFlags::Unknown, &create.flags, &item.flags);
+            }
             let landed = self.land(create, item);
             let conflicted = landed.status == PimdirStatus::Conflict;
             self.local.insert(item.handle.clone(), landed);

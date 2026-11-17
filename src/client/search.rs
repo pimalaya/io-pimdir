@@ -28,7 +28,7 @@ mod compile;
 mod refresh;
 mod tag;
 
-use core::mem;
+use core::{cmp::Ordering, mem};
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -181,8 +181,9 @@ pub struct PimdirSearchOptions {
     pub sort: PimdirSearchSort,
     /// The most hits answered.
     pub limit: usize,
-    /// The hits skipped before the first answered.
-    pub offset: usize,
+    /// Where the page starts: after the hit, or the thread, an earlier
+    /// page ended on (SEARCH §8.2), its `next`; `None` for the first.
+    pub after: Option<PimdirSearchCursor>,
     /// The instant and the zone the query's dates resolve in.
     pub clock: PimdirSearchClock,
 }
@@ -192,8 +193,131 @@ impl Default for PimdirSearchOptions {
         Self {
             sort: PimdirSearchSort::Date,
             limit: 50,
-            offset: 0,
+            after: None,
             clock: PimdirSearchClock::default(),
+        }
+    }
+}
+
+/// The place of the last hit a page answered in its query's order, the
+/// cursor the next page starts after (SEARCH §8.2): a hit arriving or
+/// leaving between two pages neither repeats nor hides another, every
+/// page walked to the end answering the hits one whole answer does as
+/// the index stood when each was read.
+///
+/// Opaque: [`token`](Self::token) writes it as printable ASCII and
+/// [`from_token`](Self::from_token) reads it back.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirSearchCursor {
+    /// Whether the hit is undated, the `date` order's first key.
+    undated: bool,
+    /// Its sort key, the `date` order's second.
+    sort_key: Option<String>,
+    /// The bits of its rank, the `relevance` order's first, `None` last.
+    rank: Option<u64>,
+    /// Its title folded, the `name` order's first.
+    title: String,
+    /// Its public id, every order's tie-break.
+    seq: i64,
+    /// Its account, empty for none, the last tie-break.
+    account: String,
+}
+
+impl PimdirSearchCursor {
+    /// The cursor as a token: its six fields, each hex or decimal, after
+    /// a `1` naming the form.
+    pub fn token(&self) -> String {
+        let hex =
+            |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+        format!(
+            "1.{}.{}.{}.{}.{}.{}",
+            u8::from(self.undated),
+            self.sort_key
+                .as_deref()
+                .map_or(String::from("-"), |key| hex(key.as_bytes())),
+            self.rank
+                .map_or(String::from("-"), |rank| format!("{rank:016x}")),
+            hex(self.title.as_bytes()),
+            self.seq,
+            hex(self.account.as_bytes()),
+        )
+    }
+
+    /// Reads a token [`token`](Self::token) wrote, `None` for any other
+    /// text.
+    pub fn from_token(token: &str) -> Option<Self> {
+        let unhex = |text: &str| -> Option<String> {
+            if !text.len().is_multiple_of(2) {
+                return None;
+            }
+            let bytes = (0..text.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(text.get(at..at + 2)?, 16).ok())
+                .collect::<Option<Vec<u8>>>()?;
+            String::from_utf8(bytes).ok()
+        };
+        let mut fields = token.split('.');
+        if fields.next()? != "1" {
+            return None;
+        }
+        let undated = match fields.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let sort_key = match fields.next()? {
+            "-" => None,
+            key => Some(unhex(key)?),
+        };
+        let rank = match fields.next()? {
+            "-" => None,
+            rank if rank.len() == 16 => Some(u64::from_str_radix(rank, 16).ok()?),
+            _ => return None,
+        };
+        let title = unhex(fields.next()?)?;
+        let seq = fields.next()?.parse().ok()?;
+        let account = unhex(fields.next()?)?;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            undated,
+            sort_key,
+            rank,
+            title,
+            seq,
+            account,
+        })
+    }
+
+    /// The order of two places under `sort`, the one the statement and
+    /// the `name` fold give a whole answer.
+    fn compare(&self, other: &Self, sort: PimdirSearchSort) -> Ordering {
+        let ties = || {
+            self.seq
+                .cmp(&other.seq)
+                .then_with(|| self.account.cmp(&other.account))
+        };
+        match sort {
+            PimdirSearchSort::Date => self
+                .undated
+                .cmp(&other.undated)
+                .then_with(|| match self.undated {
+                    false => other.sort_key.cmp(&self.sort_key),
+                    true => self.sort_key.cmp(&other.sort_key),
+                })
+                .then_with(ties),
+            PimdirSearchSort::Relevance => {
+                let rank = |rank: Option<u64>| rank.map(f64::from_bits);
+                match (rank(self.rank), rank(other.rank)) {
+                    (Some(left), Some(right)) => left.total_cmp(&right),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                }
+                .then_with(ties)
+            }
+            PimdirSearchSort::Name => self.title.cmp(&other.title).then_with(ties),
         }
     }
 }
@@ -230,6 +354,9 @@ pub struct PimdirSearchThreadsOutput {
     pub threads: Vec<PimdirSearchThread>,
     /// Whether threads follow this page.
     pub more: bool,
+    /// Where the next page starts, when one follows: the place of the
+    /// first hit of this page's last thread.
+    pub next: Option<PimdirSearchCursor>,
     /// What the answer could not see (SEARCH §8.2).
     pub coverage: PimdirSearchCoverage,
 }
@@ -277,6 +404,9 @@ pub struct PimdirSearchOutput {
     pub hits: Vec<PimdirSearchHit>,
     /// Whether hits follow this page.
     pub more: bool,
+    /// Where the next page starts, when one follows: the place of this
+    /// page's last hit.
+    pub next: Option<PimdirSearchCursor>,
     /// What the answer could not see (SEARCH §8.2).
     pub coverage: PimdirSearchCoverage,
 }
@@ -376,9 +506,12 @@ pub struct PimdirSearchItem {
 }
 
 /// A hit as a compiled query answers it, before it is described.
+#[derive(Clone)]
 struct Found {
     account: Option<String>,
     seq: i64,
+    /// Its place in the order asked.
+    place: PimdirSearchCursor,
 }
 
 impl PimdirIndex {
@@ -416,7 +549,7 @@ impl PimdirIndex {
                 conn = build(dir)?;
             }
         }
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        conn.execute_batch("PRAGMA main.journal_mode = WAL;")?;
 
         Ok(Self {
             conn,
@@ -654,21 +787,27 @@ impl PimdirIndex {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
         let mut compiled = self.compile(query, now, &zone)?;
-        // NOTE: one more than asked, so the page knows whether it is the
-        // last without a count.
-        let probe = options.limit.saturating_add(1);
-        let mut found = self.found(&mut compiled, options.sort, Some((probe, options.offset)))?;
-        let more = found.len() > options.limit;
-        found.truncate(options.limit);
+        let found = self.found(&mut compiled, options.sort)?;
+        let rest = Self::from_cursor(&found, options.after.as_ref(), options.sort);
+        let page = &rest[..rest.len().min(options.limit)];
+        let more = rest.len() > options.limit;
+        let next = match more {
+            true => page
+                .last()
+                .map(|hit| hit.place.clone())
+                .or(options.after.clone()),
+            false => None,
+        };
 
         let mut hits = Vec::new();
-        for hit in found {
-            hits.push(self.hit(hit, &compiled.probes, &compiled.words)?);
+        for hit in page {
+            hits.push(self.hit(hit.clone(), &compiled.probes, &compiled.words)?);
         }
 
         Ok(PimdirSearchOutput {
             hits,
             more,
+            next,
             coverage: self.coverage(query, now, &options.clock, &zone)?,
         })
     }
@@ -676,8 +815,9 @@ impl PimdirIndex {
     /// One page of the threaded listing of a query (SEARCH §9): its hits
     /// collapsed to their thread in their account, each thread with its
     /// count, first and last date, the threads in the order of their
-    /// first hit and paged by `options.limit` and `options.offset`. A hit
-    /// no thread holds, an item other than mail, stands alone.
+    /// first hit and paged by `options.limit` after `options.after`, the
+    /// first hit of the last thread an earlier page answered. A hit no
+    /// thread holds, an item other than mail, stands alone.
     pub fn threads(
         &self,
         query: &PimdirQuery,
@@ -686,7 +826,7 @@ impl PimdirIndex {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
         let mut compiled = self.compile(query, now, &zone)?;
-        let found = self.found(&mut compiled, options.sort, None)?;
+        let found = self.found(&mut compiled, options.sort)?;
 
         let mut groups: Vec<(Option<String>, Vec<Found>)> = Vec::new();
         let mut known: BTreeMap<(Option<String>, String), usize> = BTreeMap::new();
@@ -712,10 +852,24 @@ impl PimdirIndex {
                 }
             }
         }
-        let more = groups.len() > options.offset.saturating_add(options.limit);
+        let start = options.after.as_ref().map_or(0, |after| {
+            groups.partition_point(|(_, hits)| {
+                hits[0].place.compare(after, options.sort) != Ordering::Greater
+            })
+        });
+        let more = groups.len() > start.saturating_add(options.limit);
+        let page: Vec<(Option<String>, Vec<Found>)> =
+            groups.into_iter().skip(start).take(options.limit).collect();
+        let next = match more {
+            true => page
+                .last()
+                .map(|(_, hits)| hits[0].place.clone())
+                .or(options.after.clone()),
+            false => None,
+        };
 
         let mut threads = Vec::new();
-        for (thread, found) in groups.into_iter().skip(options.offset).take(options.limit) {
+        for (thread, found) in page {
             let account = found[0].account.clone();
             let (count, first, last) = match &thread {
                 Some(thread) => self.conn.query_row_cached(
@@ -742,6 +896,7 @@ impl PimdirIndex {
         Ok(PimdirSearchThreadsOutput {
             threads,
             more,
+            next,
             coverage: self.coverage(query, now, &options.clock, &zone)?,
         })
     }
@@ -783,6 +938,7 @@ impl PimdirIndex {
             let found = Found {
                 account: account.clone(),
                 seq,
+                place: PimdirSearchCursor::default(),
             };
             return Ok(Some(PimdirSearchThread {
                 account,
@@ -807,6 +963,7 @@ impl PimdirIndex {
             let found = Found {
                 account: account.clone(),
                 seq,
+                place: PimdirSearchCursor::default(),
             };
             let hit = self.hit(found, &[], &[])?;
             // NOTE: a member whose placements went since the last refresh
@@ -933,42 +1090,58 @@ impl PimdirIndex {
         }))
     }
 
-    /// The hits of a compiled query in `sort` order, `page` holding how
-    /// many after how many, `None` for them all.
+    /// Every hit of a compiled query in `sort` order, each with its place
+    /// in it. Sorted here by that place, the `name` order folding titles
+    /// as STORAGE Annex A.2 folds `fn`, which SQL cannot, so a page's
+    /// cursor compares in the very order the answer is in.
     fn found(
         &self,
         compiled: &mut Compiled,
         sort: PimdirSearchSort,
-        page: Option<(usize, usize)>,
     ) -> Result<Vec<Found>, PimdirError> {
-        let sql = compiled.select(sort, page.filter(|_| sort != PimdirSearchSort::Name));
+        let sql = compiled.select(sort, None);
         trace!("search statement: {sql}");
 
         // NOTE: prepared uncached, its text being this query's alone.
         let mut statement = self.conn.prepare(&sql).map_err(unanswerable)?;
         let mut found = statement
             .query_map(params_from_iter(compiled.params.iter()), |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(5)?,
-                ))
+                let account = row.get::<_, Option<String>>(0)?;
+                let title = row.get::<_, String>(5)?;
+                let place = PimdirSearchCursor {
+                    undated: row.get::<_, Option<bool>>(4)?.unwrap_or_default(),
+                    sort_key: row.get(3)?,
+                    rank: row.get::<_, Option<f64>>(2)?.map(f64::to_bits),
+                    title: match sort {
+                        PimdirSearchSort::Name => fold::value(&title),
+                        _ => String::new(),
+                    },
+                    seq: row.get(1)?,
+                    account: account.clone().unwrap_or_default(),
+                };
+                Ok(Found {
+                    account,
+                    seq: place.seq,
+                    place,
+                })
             })
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
             .map_err(unanswerable)?;
-        if sort == PimdirSearchSort::Name {
-            // NOTE: the title folded as STORAGE Annex A.2 folds `fn`,
-            // ties to the seq then the account, as the SQL order gave.
-            found.sort_by_cached_key(|(_, _, title)| fold::value(title));
-            if let Some((limit, offset)) = page {
-                found = found.into_iter().skip(offset).take(limit).collect();
-            }
-        }
+        found.sort_by(|left, right| left.place.compare(&right.place, sort));
 
-        Ok(found
-            .into_iter()
-            .map(|(account, seq, _)| Found { account, seq })
-            .collect())
+        Ok(found)
+    }
+
+    /// The hits of `found`, in order, from the one following `after`.
+    fn from_cursor<'a>(
+        found: &'a [Found],
+        after: Option<&PimdirSearchCursor>,
+        sort: PimdirSearchSort,
+    ) -> &'a [Found] {
+        let start = after.map_or(0, |after| {
+            found.partition_point(|hit| hit.place.compare(after, sort) != Ordering::Greater)
+        });
+        &found[start..]
     }
 
     /// One hit, `(account, seq)`, as an answer carries it: its kind, title
@@ -979,7 +1152,7 @@ impl PimdirIndex {
         probes: &[Probe],
         words: &[String],
     ) -> Result<PimdirSearchHit, PimdirError> {
-        let Found { account, seq } = found;
+        let Found { account, seq, .. } = found;
         let (kind, title, placements) = self.placements(account.as_deref(), seq)?;
         let matched = self.matched(seq, &placements, probes)?;
         let snippet = self.snippet(&kind, &placements, words)?;
@@ -1556,7 +1729,7 @@ fn build(dir: &Path) -> Result<Connection, PimdirError> {
         }
     }
     let mut conn = connect(dir, false)?;
-    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    conn.execute_batch("PRAGMA main.journal_mode = WAL;")?;
     init(&mut conn)?;
     Ok(conn)
 }

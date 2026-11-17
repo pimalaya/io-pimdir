@@ -957,6 +957,7 @@ impl PimdirReader {
     /// A collection's live item count.
     pub fn count_items(&self, collection: impl AsRef<str>) -> Result<u64, PimdirError> {
         let collection = collection.as_ref();
+        let _snapshot = self.snapshot()?;
         let count: i64 = self.conn.query_row_cached(
             sql::COUNT_ITEMS,
             named_params! { ":collection": collection },
@@ -2309,6 +2310,18 @@ impl PimdirReader {
         Ok(items)
     }
 
+    /// A read transaction over the statements of one answer, so a writer
+    /// committing between two of them is seen whole or not at all
+    /// (STORAGE §8): rolled back when dropped, having written nothing.
+    /// None when the connection is in a transaction already, an owner
+    /// reading through its own.
+    fn snapshot(&self) -> Result<Option<rusqlite::Transaction<'_>>, PimdirError> {
+        match self.conn.is_autocommit() {
+            true => Ok(Some(self.conn.unchecked_transaction()?)),
+            false => Ok(None),
+        }
+    }
+
     /// Folds the overlay into one page, reading past the limit by the
     /// pending removals so a page comes back short only where the
     /// collection ends.
@@ -2320,6 +2333,7 @@ impl PimdirReader {
         inside: impl Fn(&PimdirItem) -> bool,
         order: impl Fn(&PimdirItem, &PimdirItem) -> Ordering,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
+        let _snapshot = self.snapshot()?;
         if !self.overlay {
             return fetch(limit);
         }

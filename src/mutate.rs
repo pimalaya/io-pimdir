@@ -181,6 +181,11 @@ pub enum PimdirMutation {
     /// The conflict is settled first, by an [`Edit`](Self::Edit) or a
     /// [`Remove`](Self::Remove) stating `resolves`, and the item moved
     /// after. A [`Copy`](Self::Copy) meets none: it tombstones nothing.
+    ///
+    /// A target naming the collection the item is in is refused, staging
+    /// nothing ([`PimdirMutateError::MoveInPlace`]): its tombstone would
+    /// push a `Remove` of a member whose create, held without a body,
+    /// could never deliver.
     Move {
         /// The source placement to move.
         handle: PimdirHandle,
@@ -312,6 +317,10 @@ pub enum PimdirMutateError {
     /// run's source (SYNC §7): a pending create, which a `Remove`
     /// withdraws, or a member a listing named, which one removes.
     NotDelivered(String),
+    /// A `Move` names the collection its placement is in as its target:
+    /// there is nothing to move, and its tombstone would remove the
+    /// member from its server.
+    MoveInPlace(String),
     /// The caller broke the coroutine contract.
     Arg(PimdirArgError),
 }
@@ -332,6 +341,7 @@ impl PimdirMutateError {
     /// | `flags-unknown` | [`UnknownFlags`](Self::UnknownFlags) |
     /// | `placement-undeliverable` | [`Undeliverable`](Self::Undeliverable) |
     /// | `create-not-delivered` | [`NotDelivered`](Self::NotDelivered) |
+    /// | `move-in-place` | [`MoveInPlace`](Self::MoveInPlace) |
     /// | `coroutine-arg` | [`Arg`](Self::Arg) |
     pub fn code(&self) -> &'static str {
         match self {
@@ -343,6 +353,7 @@ impl PimdirMutateError {
             Self::UnknownFlags(_) => "flags-unknown",
             Self::Undeliverable(_) => "placement-undeliverable",
             Self::NotDelivered(_) => "create-not-delivered",
+            Self::MoveInPlace(_) => "move-in-place",
             Self::Arg(_) => "coroutine-arg",
         }
     }
@@ -376,6 +387,12 @@ impl fmt::Display for PimdirMutateError {
                 write!(
                     f,
                     "Pimdir MUTATE failed: handle {handle} is no delivered create, which alone is abandoned"
+                )
+            }
+            Self::MoveInPlace(handle) => {
+                write!(
+                    f,
+                    "Pimdir MUTATE failed: handle {handle} is moved into the collection it is in"
                 )
             }
             Self::UnknownFlags(handle) => {
@@ -867,6 +884,13 @@ impl PimdirCoroutine for PimdirMutate {
                             };
                             return PimdirCoroutineState::Complete(Err(err));
                         }
+                    }
+
+                    if let PimdirMutation::Move { target, .. } = &self.mutation
+                        && *target == self.collection
+                    {
+                        let err = PimdirMutateError::MoveInPlace(handle.as_str().into());
+                        return PimdirCoroutineState::Complete(Err(err));
                     }
 
                     if let Some(target) = self.mutation.create_target()
@@ -1977,6 +2001,37 @@ mod tests {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
         assert_eq!(copy.link_id, Some(PimdirLinkId::from("dup:1#\u{1}1")));
+    }
+
+    /// A move into the collection its item is in stages nothing: its
+    /// tombstone would push a `Remove` nobody asked for. A copy there is a
+    /// second copy, minted.
+    #[test]
+    fn a_move_into_its_own_collection_is_refused() {
+        let mutation = PimdirMutation::Move {
+            handle: PimdirHandle::from("1"),
+            target: "inbox".into(),
+        };
+        let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
+        let _ = mutate.resume(None);
+        let state = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
+        let PimdirCoroutineState::Complete(Err(err)) = state else {
+            panic!("expected a refusal, got {state:?}");
+        };
+        assert!(matches!(&err, PimdirMutateError::MoveInPlace(handle) if handle == "1"));
+        assert_eq!(err.code(), "move-in-place");
+
+        let mutation = PimdirMutation::Copy {
+            handle: PimdirHandle::from("1"),
+            target: "inbox".into(),
+        };
+        let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
+        let _ = mutate.resume(None);
+        let state = mutate.resume(Some(PimdirArg::Load(loaded("1"))));
+        assert!(matches!(
+            state,
+            PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { .. })
+        ));
     }
 
     /// A row on its way out holds no key against a create, as for an `Add`.

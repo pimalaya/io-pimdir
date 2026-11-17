@@ -383,18 +383,14 @@ pub struct QueueRefusal {
 impl fmt::Display for QueueStatusOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let id = self.row;
-        let collection = or_dash(self.collection.as_deref());
+        let collection = sanitize::text(or_dash(self.collection.as_deref()));
+        let error = sanitize::text(or_dash(self.error.as_deref()));
         match self.status {
             QueueStatus::Pending => writeln!(f, "Action {id} is pending on {collection}"),
-            QueueStatus::Parked => writeln!(
-                f,
-                "Action {id} is parked on {collection}: {}",
-                or_dash(self.error.as_deref())
-            ),
+            QueueStatus::Parked => writeln!(f, "Action {id} is parked on {collection}: {error}"),
             QueueStatus::Unconfirmed => writeln!(
                 f,
-                "Action {id} is unconfirmed on {collection}, sent and maybe performed: {}",
-                or_dash(self.error.as_deref())
+                "Action {id} is unconfirmed on {collection}, sent and maybe performed: {error}"
             ),
             QueueStatus::Applied => match (self.seq, &self.collection) {
                 (Some(seq), Some(_)) => {
@@ -414,7 +410,10 @@ impl fmt::Display for QueueStatusOutput {
                     writeln!(
                         f,
                         "Refused by {} in {} at {}: {}",
-                        refusal.source, refusal.collection, refusal.refused_at, refusal.reason
+                        sanitize::text(&refusal.source),
+                        sanitize::text(&refusal.collection),
+                        sanitize::text(&refusal.refused_at),
+                        sanitize::text(&refusal.reason)
                     )
                 })
             }),
@@ -698,6 +697,46 @@ Error:       no such seq\u{fffd}
         assert_eq!(
             status(None, None).to_string(),
             "Action 4 was applied on a collection deleted since\n"
+        );
+    }
+
+    /// What a server named and answered is printed defused: a collection
+    /// id, a parked error, a refusal's every field.
+    #[test]
+    fn a_status_prints_what_the_store_names_sanitized() {
+        let status = |status, error: Option<&str>| QueueStatusOutput {
+            row: 4,
+            status,
+            collection: Some(String::from("IN\x1b]52;c;eA==\x07BOX")),
+            kind: None,
+            attempts: None,
+            error: error.map(String::from),
+            applied_at: None,
+            seq: Some(7),
+            refusals: vec![QueueRefusal {
+                collection: String::from("IN\x1bBOX"),
+                source: String::from("im\x07ap"),
+                reason: String::from("no\x1b[2J way"),
+                refused_at: String::from("2026\u{9b}"),
+            }],
+        };
+
+        assert_eq!(
+            status(QueueStatus::Parked, Some("gone\x1b[2J")).to_string(),
+            "Action 4 is parked on IN\u{fffd}]52;c;eA==\u{fffd}BOX: gone\u{fffd}[2J\n"
+        );
+        assert_eq!(
+            status(QueueStatus::Unconfirmed, Some("\x07")).to_string(),
+            "Action 4 is unconfirmed on IN\u{fffd}]52;c;eA==\u{fffd}BOX, sent and maybe performed: \u{fffd}\n"
+        );
+        assert_eq!(
+            status(QueueStatus::Pending, None).to_string(),
+            "Action 4 is pending on IN\u{fffd}]52;c;eA==\u{fffd}BOX\n"
+        );
+        assert_eq!(
+            status(QueueStatus::Applied, None).to_string(),
+            "Action 4 was applied: item 7 in IN\u{fffd}]52;c;eA==\u{fffd}BOX\n\
+             Refused by im\u{fffd}ap in IN\u{fffd}BOX at 2026\u{fffd}: no\u{fffd}[2J way\n"
         );
     }
 }

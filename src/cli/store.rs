@@ -332,9 +332,9 @@ impl fmt::Display for StoreInfoOutput {
         let mut fields = Fields::default();
 
         fields.push("Path", sanitize::text(&self.path));
-        fields.push("Store id", &self.store_id);
+        fields.push("Store id", sanitize::text(&self.store_id));
         fields.push("Incarnation", self.incarnation);
-        fields.push("Format version", &self.format_version);
+        fields.push("Format version", sanitize::text(&self.format_version));
         fields.push("Schema version", self.schema_version);
         fields.push("Read version", self.read_version);
         fields.push("Produce version", self.produce_version);

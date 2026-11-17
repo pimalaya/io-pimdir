@@ -75,7 +75,7 @@ impl PimdirIndex {
         let now = clock.now();
         let zone = clock.time_zone()?;
         let mut compiled = self.compile(query, now, &zone)?;
-        let found = self.found(&mut compiled, PimdirSearchSort::Date, None)?;
+        let found = self.found(&mut compiled, PimdirSearchSort::Date)?;
 
         let mut pending: BTreeMap<String, Vec<PimdirPendingAction>> = BTreeMap::new();
         let mut sources: BTreeMap<String, Collection> = BTreeMap::new();

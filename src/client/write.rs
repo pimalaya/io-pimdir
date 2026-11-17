@@ -985,6 +985,7 @@ pub(crate) fn read_hub(
 
     let kind = kind_of(conn, collection)?;
     let tables = tables_of(&kind);
+    hub.immutable = kind.split(';').next().unwrap_or_default().trim() == "message/rfc822";
     // NOTE: one fill of the `links` slot serves every read below, none of
     // which binds another slot.
     if let Some(links) = links {

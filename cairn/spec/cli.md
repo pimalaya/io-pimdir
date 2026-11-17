@@ -315,3 +315,26 @@ The tools STORAGE §7 and §8 specify SHALL each be a verb over a library functi
 
 #### Scenario: A backup restored, a flipped byte, a retry
 - tests/cli_copies.rs `a_store_is_backed_up_and_restored_under_a_new_incarnation`, `a_deep_check_reports_a_flipped_byte` (the plain `check` exits 0 on the same store, hashing nothing), `a_parked_row_is_retried_and_an_unconfirmed_one_shown`
+
+### Requirement: A read verb takes the index as it stands
+`pimdir show` SHALL open the index for queries alone (`PimdirIndex::open_query`), and so SHALL `search`, `count`, `tag` and `thread` given `--refresh-timeout 0s`: none creates index.db, nor rebuilds one standing under another extractor, which another release's indexer keeps; an index missing is `index-missing`. A refresh given no `--floating-zone` (`index`, and the one-shot answers) SHALL fold in the zone the index records, read before an open rebuilds an index of another extraction, `UTC` for a new one, so a one-shot answer never resets the zone a sync engine indexed in and re-expands every calendar item.
+
+#### Scenario: Read verbs on a store with no index, then on another extractor's
+- GIVEN a store holding one message and no index.db
+- WHEN `show 1` and `count --refresh-timeout 0s` run
+- THEN both fail `index-missing` and index.db is not created
+- WHEN `index --floating-zone Europe/Paris` runs, then `count date:2026-08-02` twice beside a plain `index`
+- THEN the message of 23:00Z counts on 2 August each time, nothing re-expanded
+- WHEN the index records another extractor and `show 1` and a `0s` count run
+- THEN both answer and the index keeps its extractor until a refresh rebuilds it (tests/search_cli.rs `a_read_verb_leaves_the_index_as_it_stands`)
+
+### Requirement: Store strings a server named are printed defused
+Every text output SHALL pass a string the store holds through `pimalaya_cli::sanitize::text` before printing it: `queue status` its collection, its parked or unconfirmed error and each refusal's source, collection, instant and reason; `item restore` its collection and handle; `item erase` its collection; `item list`'s empty-collection line; `item show` its object hashes and summary table; `store info` its store id and format version; and every confirmation prompt, its whole question. A collection id is a server's mailbox name and an error or a refusal is what a server answered, so ESC, BEL, C1 and bidi characters print as U+FFFD.
+
+#### Scenario: A hostile mailbox name and server answer
+- GIVEN a status whose collection holds an OSC 52 sequence and whose error, refusal source, collection, instant and reason hold ESC, BEL and C1
+- WHEN it prints as text in each state
+- THEN every one of them prints U+FFFD in their place (src/cli/queue.rs `a_status_prints_what_the_store_names_sanitized`, src/cli/item.rs `a_restore_and_an_erase_print_the_collection_sanitized`)
+
+### Requirement: An exported body is the store's user's alone
+`item export --output` SHALL create its file `0600` (STORAGE §18), as `export` creates its dump: it holds what the store holds.

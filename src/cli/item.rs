@@ -7,15 +7,16 @@
 
 use std::{
     fmt,
-    fs::File,
     io::{self, Read, Write, stdout},
     path::PathBuf,
+    time::Duration,
 };
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
 use io_pimdir::{
     client::{
+        modes,
         reader::{PimdirItem, PimdirReader},
         search::PimdirIndex,
     },
@@ -244,6 +245,9 @@ pub struct ItemExportCommand {
     pub collection: Option<String>,
 
     /// Write the body to this file instead of stdout.
+    ///
+    /// Created `0600`, as the store's own files: it holds what the store
+    /// holds.
     #[arg(long, short = 'o', value_name = "PATH")]
     pub output: Option<PathBuf>,
 }
@@ -298,7 +302,11 @@ impl ItemExportCommand {
                 Ok(())
             }
             Some(path) => {
-                let mut file = File::create(&path)?;
+                let mut file = modes::options()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)?;
                 let size = io::copy(&mut reader, &mut file)?;
                 file.flush()?;
                 printer.out(ItemExportOutput {
@@ -430,8 +438,8 @@ pub struct ItemPurgeCommand {
     pub seq: Option<i64>,
 
     /// Destroy every item retained longer than this (`90d`, `12h`, `2weeks`).
-    #[arg(long, value_name = "DURATION")]
-    pub older_than: Option<humantime::Duration>,
+    #[arg(long, value_name = "DURATION", value_parser = crate::cli::duration)]
+    pub older_than: Option<Duration>,
 
     /// Destroy every retained item in the store.
     #[arg(long)]
@@ -456,7 +464,7 @@ impl ItemPurgeCommand {
         // NOTE: `--all` is `--older-than 0`: nothing can be retained in
         // the future, so "before now" is "everything".
         let cutoff = match self.older_than {
-            Some(age) => crate::cli::cutoff(*age),
+            Some(age) => crate::cli::cutoff(age),
             None => now(),
         };
 
@@ -794,7 +802,8 @@ impl fmt::Display for ItemsOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.items.is_empty() {
             let what = if self.retained { "retained" } else { "live" };
-            return writeln!(f, "No {what} item in {}", self.collection);
+            let collection = sanitize::text(&self.collection);
+            return writeln!(f, "No {what} item in {collection}");
         }
 
         let mut records = Records::default();
@@ -932,7 +941,7 @@ impl fmt::Display for ItemShowOutput {
             fields.push("Link id", sanitize::text(&item.link_id));
             fields.push("Flags", flags_text(item.flags.as_deref()));
             fields.push("Level", item.level);
-            fields.push("Object", or_dash(item.object.as_deref()));
+            fields.push("Object", sanitize::text(or_dash(item.object.as_deref())));
 
             if let Some(size) = item.size {
                 fields.push("Size", bytes(size));
@@ -944,7 +953,7 @@ impl fmt::Display for ItemShowOutput {
                 fields.push("Retained by", sanitize::text(by));
             }
 
-            fields.push("Summary", or_dash(table));
+            fields.push("Summary", sanitize::text(or_dash(table)));
             blocks.push(fields);
 
             if let Some(summary) = &item.summary {
@@ -959,14 +968,15 @@ impl fmt::Display for ItemShowOutput {
                 if binding.base {
                     let object = or_dash(binding.base_object.as_deref());
                     let revision = or_dash(binding.base_revision.as_deref());
-                    fields.push("Base object", object);
+                    fields.push("Base object", sanitize::text(object));
                     fields.push("Base flags", flags_text(binding.base_flags.as_deref()));
                     fields.push("Base revision", sanitize::text(revision));
                 } else {
                     fields.push("Base", "none");
                 }
 
-                fields.push("Shared object", or_dash(binding.shared_object.as_deref()));
+                let shared = or_dash(binding.shared_object.as_deref());
+                fields.push("Shared object", sanitize::text(shared));
 
                 // NOTE: printed only when it applies, so a diverged binding
                 // stands out from the ordinary ones beside it.
@@ -974,7 +984,7 @@ impl fmt::Display for ItemShowOutput {
                     let revision = or_dash(binding.conflict_revision.as_deref());
                     let object = or_dash(binding.conflict_object.as_deref());
                     fields.push("Conflicted at revision", sanitize::text(revision));
-                    fields.push("Conflict object", object);
+                    fields.push("Conflict object", sanitize::text(object));
                 }
 
                 blocks.push(fields);
@@ -1060,21 +1070,20 @@ pub struct ItemRestoreOutput {
 
 impl fmt::Display for ItemRestoreOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let seq = self.seq;
+        let collection = sanitize::text(&self.collection);
         match self.status {
-            RestoreStatus::Applied => writeln!(
-                f,
-                "Restored item {} into {} (applied)",
-                self.seq, self.collection
-            ),
+            RestoreStatus::Applied => {
+                writeln!(f, "Restored item {seq} into {collection} (applied)")
+            }
             RestoreStatus::Queued => writeln!(
                 f,
-                "Restore of item {} into {} queued as action {}: another writer holds the store lock, so it applies at the next sync",
-                self.seq, self.collection, self.handle
+                "Restore of item {seq} into {collection} queued as action {}: another writer holds the store lock, so it applies at the next sync",
+                sanitize::text(&self.handle)
             ),
             RestoreStatus::Refused => writeln!(
                 f,
-                "Restore of item {} into {} was not applied: see `pimdir queue list --parked`",
-                self.seq, self.collection
+                "Restore of item {seq} into {collection} was not applied: see `pimdir queue list --parked`"
             ),
         }
     }
@@ -1122,7 +1131,7 @@ impl fmt::Display for ItemEraseOutput {
             f,
             "Erased item {} from {}, unlinking {} blob file(s) ({})",
             self.seq,
-            self.collection,
+            sanitize::text(&self.collection),
             self.blobs,
             bytes(self.bytes)
         )?;
@@ -1265,5 +1274,51 @@ Conflicted at revision:  7
 Conflict object:         -
 ";
         assert_eq!(output.to_string(), expected);
+    }
+
+    /// A collection id is a server's mailbox name: a restore and an erase
+    /// print it defused, and the handle with it.
+    #[test]
+    fn a_restore_and_an_erase_print_the_collection_sanitized() {
+        let restore = |status| ItemRestoreOutput {
+            seq: 7,
+            collection: String::from("IN\x1b]52;c;eA==\x07BOX"),
+            link_id: String::from("7@x"),
+            row: 4,
+            handle: String::from("4\x1b"),
+            queued: false,
+            status,
+        };
+        let mailbox = "IN\u{fffd}]52;c;eA==\u{fffd}BOX";
+
+        assert_eq!(
+            restore(RestoreStatus::Applied).to_string(),
+            format!("Restored item 7 into {mailbox} (applied)\n")
+        );
+        assert!(
+            restore(RestoreStatus::Queued)
+                .to_string()
+                .starts_with(&format!(
+                    "Restore of item 7 into {mailbox} queued as action 4\u{fffd}:"
+                ))
+        );
+        assert!(
+            restore(RestoreStatus::Refused)
+                .to_string()
+                .starts_with(&format!("Restore of item 7 into {mailbox} was not"))
+        );
+
+        let erase = ItemEraseOutput {
+            seq: 7,
+            collection: String::from("IN\x1b]52;c;eA==\x07BOX"),
+            blobs: 1,
+            bytes: 3,
+            index: false,
+        };
+        assert!(
+            erase
+                .to_string()
+                .starts_with(&format!("Erased item 7 from {mailbox},"))
+        );
     }
 }

@@ -28,11 +28,11 @@ The reference implementation of pimdir SEARCH.md (`search-draft-13`, an indexer 
 - WHEN `open_query` opens it, THEN it answers `IndexOutdated`; WHEN `open` opens it or `refresh` folds into it, THEN it is rebuilt from the store as it stands (tests/search.rs `an_index_built_from_another_store_or_copy_is_rebuilt`)
 
 ### Requirement: An index records the revisions of its extraction
-The crate SHALL state the revision of SEARCH §6 it extracts and expands under, `search::extract::EXTRACTION` (1), and its own revision of what §6 leaves to an indexer, `search::extract::EXTRACTOR` (`io-pimdir 1`), an opaque text bumped in the change that alters what the extraction of any body yields: the reduction of `text/html`, the charsets decoded, what a field holds, or a bump of mime-rs, vcard-rs, ical-rs or encoding_rs reading a body otherwise. `init_index_meta` SHALL record both (SEARCH §2). `PimdirIndex::open`, and `refresh` under index.lock, SHALL rebuild an index recording another of either, the texts compared byte for byte (`PimdirIndexHeld::Extracted`): the rebuild, which SEARCH §2 allows in place of extracting every held body again, leaves what a rebuild writes by construction, and its `init_index_meta` records the crate's own, so the crate runs no `set_extraction`, whose constant (`sql::search::SET_EXTRACTION`) stands for a consumer extracting again in place. `PimdirIndex::open_query` SHALL answer from such an index and never refuse it: the hits are the index's, and a snippet is cut from the chunks of this build's own extraction (`PimdirExtract::chunks`) rather than the stored offsets, which index another extraction's text (SEARCH §6). The refresh coroutine reads neither revision: a consumer of another shape compares the two constants with what its index records before it runs one, and rebuilds or extracts again itself, as it judges the version and the tokenizer.
+The crate SHALL state the revision of SEARCH §6 it extracts and expands under, `search::extract::EXTRACTION` (1), and its own revision of what §6 leaves to an indexer, `search::extract::EXTRACTOR` (`io-pimdir 2` since an HTML comment closes on any run of dashes and an expansion stepping past year 9999 is not cut; `io-pimdir 1` before), an opaque text bumped in the change that alters what the extraction of any body yields: the reduction of `text/html`, the charsets decoded, what a field holds, or a bump of mime-rs, vcard-rs, ical-rs or encoding_rs reading a body otherwise. `init_index_meta` SHALL record both (SEARCH §2). `PimdirIndex::open`, and `refresh` under index.lock, SHALL rebuild an index recording another of either, the texts compared byte for byte (`PimdirIndexHeld::Extracted`): the rebuild, which SEARCH §2 allows in place of extracting every held body again, leaves what a rebuild writes by construction, and its `init_index_meta` records the crate's own, so the crate runs no `set_extraction`, whose constant (`sql::search::SET_EXTRACTION`) stands for a consumer extracting again in place. `PimdirIndex::open_query` SHALL answer from such an index and never refuse it: the hits are the index's, and a snippet is cut from the chunks of this build's own extraction (`PimdirExtract::chunks`) rather than the stored offsets, which index another extraction's text (SEARCH §6). The refresh coroutine reads neither revision: a consumer of another shape compares the two constants with what its index records before it runs one, and rebuilds or extracts again itself, as it judges the version and the tokenizer.
 
 #### Scenario: An index another extractor wrote
 - GIVEN an index of three bodies and a calendar item, its `index_meta.extractor` then restated `another 7` (`set_extraction`), or its `extraction` 2
-- WHEN `open_query` opens it, THEN it answers its hits and a snippet; WHEN `open` opens it or `refresh` folds into it, THEN the index is rebuilt, every body indexed and the calendar item expanded again, and it records `io-pimdir 1` under revision 1 (tests/search.rs `an_index_under_another_extraction_is_rebuilt_and_every_body_indexed_again`, which rebuilds nothing without the comparison)
+- WHEN `open_query` opens it, THEN it answers its hits and a snippet; WHEN `open` opens it or `refresh` folds into it, THEN the index is rebuilt, every body indexed and the calendar item expanded again, and it records `io-pimdir 2` under revision 1 (tests/search.rs `an_index_under_another_extraction_is_rebuilt_and_every_body_indexed_again`, which rebuilds nothing without the comparison)
 
 #### Scenario: An index lacking a column the statements read
 - GIVEN an index.db naming this draft whose `index_meta` lacks `extractor`
@@ -273,3 +273,35 @@ Storage-draft-11 states the two cases the walkers parted on (Annex A.1; SEARCH �
 
 #### Scenario: Each reading put back
 - The derivation dropping the last child fails the summary case, the invitation table, the fixture test and both properties. The walk counting the line break the message ends with fails the fixture's size, 8 for 6. The tree read off the message as written fails the fixture test (`[]` for part 2 `text/csv`) and the property over restated fields. The extraction parsing the message as written indexes the repeated-fields fixture whole, its delimiters and its header lines, as one text part. A `first_occurrences` leaving a repeated `Content-Disposition` in fails the fixture and the property
+
+### Requirement: A rule stepping past year 9999 is examined whole
+`occurrence::unexamined`, the start of a rule's first period past `PERIODS_MAX` (SEARCH §7), SHALL compute that period with checked arithmetic and answer `None`, every period examined, whenever it lies past 9999-12-31, however far past: an overflow or a day count beyond what a civil date spells never wraps to a cut in the past that would drop every occurrence, nor panics.
+
+#### Scenario: A huge INTERVAL is not cut
+- GIVEN an event starting 2026-08-01 under `FREQ=SECONDLY` to `WEEKLY`, each with `INTERVAL=200000000` and `INTERVAL=4294967295`
+- WHEN it is expanded
+- THEN its first occurrence is written and it records no cut (src/search/occurrence.rs `a_rule_stepping_past_year_9999_is_not_cut`)
+
+### Requirement: An HTML comment closes on any run of dashes
+The `text/html` reduction (`search::html::to_text`) SHALL close a comment at the first `>` after two dashes or more, so a decorated separator (`<!----------- SECTION ----------->`) hides itself and not the rest of the body. The change bumps `EXTRACTOR` to `io-pimdir 2`, so every index another revision built is extracted again once.
+
+#### Scenario: A separator comment
+- GIVEN `<p>before</p><!----------- SECTION -----------><p>after</p>`
+- WHEN it is reduced
+- THEN it reads `before` then `after` (src/search/html.rs `a_comment_closes_on_any_run_of_dashes`)
+
+### Requirement: A page resumes after the last hit it answered
+`PimdirSearchOptions::after` SHALL name where a page starts: a `PimdirSearchCursor`, the place in the query's order of the last hit an earlier page answered (its sort key and whether undated, its rank, or its folded title, then its `seq` and account), which `PimdirSearchOutput::next` and `PimdirSearchThreadsOutput::next` answer while more follows; a threaded listing's cursor is the first hit of its last thread. A page SHALL answer the hits after that place, so a hit arriving or leaving between two pages neither repeats nor hides another, and every page walked to the end answers the hits and the order one whole answer does (SEARCH §8.2). `token` writes a cursor as printable ASCII and `from_token` reads it back; the binary's `nextPage` and `--page-token` carry it, an unreadable one being `page-token-invalid`. The offset of 0.15 is gone.
+
+#### Scenario: An arrival and two removals between pages
+- GIVEN five messages, the first page of two answering m5 and m4
+- WHEN m6 arrives and the next page is read after the cursor, then m6 and m5 leave
+- THEN the pages answer m3 and m2, then m1 and no cursor (tests/search.rs `a_page_resumes_after_the_last_hit_it_answered`, tests/search_cli.rs `a_search_page_token_resumes_after_its_last_hit`; every search vector is also walked one hit a page)
+
+### Requirement: The index sets its own journal mode alone
+The indexer SHALL set the journal mode of index.db alone (`PRAGMA main.journal_mode`), never that of the store it attaches read-only, so a store its operator keeps on a rollback journal (STORAGE §8, a network filesystem) is indexed and searched as any other.
+
+#### Scenario: A rollback-journal store
+- GIVEN a store switched to `journal_mode = DELETE`
+- WHEN it is indexed and searched, by the indexer and by a query client
+- THEN both answer (tests/search.rs `a_store_on_a_rollback_journal_is_indexed`; before, `attempt to write a readonly database` and a 0-byte index.db)

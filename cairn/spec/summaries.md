@@ -116,3 +116,11 @@ A `VTODO` summary SHALL carry `created` (Annex A.4, revision 2), `CREATED` as an
 
 #### Scenario: The capture vectors
 - tests/summaries.rs, the cases "todo, captured and waiting on an address" and "todo, waiting on a text" of pimdir vectors/summaries.json and the three earlier task cases' `created`; the unit test `a_task_reads_its_contacts_on_annex_a4s_edges` of src/summary/calendar.rs (a `CREATED` that is no instant, an empty `CONTACT`, a `mailto:` `ALTREP` with no text, another `ALTREP`).
+
+### Requirement: A zone rule stepping past every instant ends its walk
+`ZoneRule::onsets` SHALL compute every step and onset of a `VTIMEZONE` observance's `RRULE` with checked arithmetic: an `INTERVAL` whose step, onset or `UNTIL` comparison overflows what an instant spells ends the walk there, as the bound of `ZONE_PERIODS_MAX` periods does (STORAGE Annex A.3), the onsets found before it standing. No cap SHALL be put on `INTERVAL`: a large legal value keys the event as a conforming writer's exact arithmetic does, the next onset lying past any wall time. A hostile resource, from a CalDAV server or a co-writer, never aborts the derivation, which runs on writes, on re-derivation and in a sync engine's pull.
+
+#### Scenario: An overflowing interval keys the event as its DTSTART alone
+- GIVEN an event zoned by its own `VTIMEZONE` whose observance states `FREQ=MINUTELY;INTERVAL=4611686018427387904`, `FREQ=SECONDLY;INTERVAL=9223372036854775807`, or an interval reaching `i64::MAX` exactly beside a negative `TZOFFSETFROM` and an `UTC` `UNTIL`
+- WHEN it is derived
+- THEN its sort key is the one the observance's `DTSTART` alone gives, and nothing panics (src/summary/calendar.rs `an_observance_rule_stepping_past_every_instant_ends_its_walk`; tests/zone_rule_property.rs over every `FREQ` the walk steps by, any `INTERVAL`, `COUNT` and `UNTIL`)

@@ -245,3 +245,14 @@ It follows that mirroring is a sync **plus** an upgrade. The hub offers a member
 
 ### Requirement: A load says which creates the store offers
 `PimdirHub::offered(source, placements)` SHALL answer the `Created` placements of a projection whose item `source` binds not, the copies the store offers it of items other sources hold (pimdir SYNC §3, §9), for `PimdirLoaded::offered` ([seam](seam.md)). Every other `Created` placement is a create of the source's own, pending or delivered, which a sync reports a member minted apart from ([sync](sync.md), vectors/sync/93, 111).
+
+### Requirement: An immutable binding owes no body
+`PimdirHub::immutable`, set by the store's `read_hub` for a `message/rfc822` collection, SHALL make the projection compare no body against a binding's base (SYNC §3 rule 4: the body axis is a mutable kind's), and the absorb SHALL let a binding of such a collection adopt the shared body as its base whatever its own base named, a listing carrying none included (SYNC §3, §9). A message another source holds, joined by a member a page before the last names, or listed by both sources before either hydrated it, so projects `Clean` and derives no `Update`, which an IMAP connector rejects every run while no flag change for the message ever pushes; a binding a store already wrote with a body-less base is read so without a rebuild.
+
+#### Scenario: A message another source holds
+- GIVEN a mail collection one source holds a message in, hydrated, and a second source listing its own copy on the first page of a round of two, or both sources listing it at `Meta` before each hydrates
+- WHEN the second source syncs several times, then the first's server gains a flag
+- THEN the second source pushes no `Update`, its placement is `Clean`, and the flag reaches its server (tests/engine/join_immutable.rs)
+
+### Requirement: A source binding an item for the first time joins its flags as a union
+The absorb SHALL take the union of the item's flags and those of an upsert binding the item for a source that bound it in no row before (`PimdirFlags::merge` against no base, SYNC §5), whichever page of a round named the member, so a first pairing never removes a flag from the server that had it; a source already binding the item sets the flags as before.
