@@ -317,10 +317,36 @@ impl PimdirProducer {
     /// owner derives from the body (Annex A). The duplicate check, the
     /// blob write and the append are one transaction.
     ///
+    /// Into a calendar or an address book, every property `X-PIMDIR-` names
+    /// is removed from `body` first (STORAGE §18), so no instruction to a
+    /// performer enters the queue unasked: the action is built from the
+    /// stripped body's hash, and a body of another kind is queued whole.
+    /// A body whose instructions are the user's own ask is
+    /// [`enqueue_user_body`](Self::enqueue_user_body)'s.
+    ///
     /// The calls staging first ([`stage_body`](Self::stage_body), then
     /// [`enqueue`](Self::enqueue) or [`enqueue_add`](Self::enqueue_add))
-    /// leave a refused write's body unpinned in the tree, for the collector.
+    /// take the body as given, and leave a refused write's body unpinned
+    /// in the tree, for the collector.
     pub fn enqueue_with_body(
+        &mut self,
+        collection: &str,
+        body: &[u8],
+        action: impl FnOnce(PimdirHash) -> PimdirAction,
+    ) -> Result<PimdirEnqueued, PimdirError> {
+        let body = match write::kind_of(&self.conn, collection)?.as_str() {
+            "text/calendar" | "text/vcard" => Cow::Owned(summary::strip_instructions(body)),
+            _ => Cow::Borrowed(body),
+        };
+        self.enqueue_user_body(collection, &body, action)
+    }
+
+    /// [`enqueue_with_body`](Self::enqueue_with_body) keeping `body` whole,
+    /// for a resource the user wrote as it stands or whose `X-PIMDIR-`
+    /// properties they asked for (an online meeting they ticked, STORAGE
+    /// §18, Annex B.1), never for an invitation, an imported file or a
+    /// resource copied from a message.
+    pub fn enqueue_user_body(
         &mut self,
         collection: &str,
         body: &[u8],
@@ -339,26 +365,6 @@ impl PimdirProducer {
             Some(body),
             fresh.as_ref(),
         )
-    }
-
-    /// [`enqueue_with_body`](Self::enqueue_with_body) for a resource the
-    /// user did not write as it stands (an invitation added to a
-    /// calendar, an imported file, a resource copied from a message):
-    /// into a calendar or an address book, every property `X-PIMDIR-`
-    /// names is removed from `body` first (STORAGE §18), so no instruction
-    /// to a performer enters the queue with it. The action is built from
-    /// the stripped body's hash; a body of another kind is queued whole.
-    pub fn enqueue_foreign_body(
-        &mut self,
-        collection: &str,
-        body: &[u8],
-        action: impl FnOnce(PimdirHash) -> PimdirAction,
-    ) -> Result<PimdirEnqueued, PimdirError> {
-        let body = match write::kind_of(&self.conn, collection)?.as_str() {
-            "text/calendar" | "text/vcard" => Cow::Owned(summary::strip_instructions(body)),
-            _ => Cow::Borrowed(body),
-        };
-        self.enqueue_with_body(collection, &body, action)
     }
 
     /// Appends several actions in one transaction (§15.1), all of them or

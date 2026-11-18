@@ -280,6 +280,111 @@ impl fmt::Display for PimdirVersionRefusal {
 
 impl core::error::Error for PimdirVersionRefusal {}
 
+/// The prefix of the `format_version` a draft of the storage part writes,
+/// its number following (STORAGE §4.2).
+const DRAFT: &str = "storage-draft-";
+
+/// Where a store's `format_version` stands against a program's own, by the
+/// order of STORAGE §4.2: none first, then the drafts by number, then the
+/// releases by major.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PimdirFormatOrder {
+    /// Written by an earlier program, whose engine drains it.
+    Earlier,
+    /// The program's own version.
+    Same,
+    /// Written by a later program.
+    Later,
+    /// A marker the order does not read, on either side.
+    Unknown,
+}
+
+/// The refusal of a store of another `format_version` (STORAGE §4.2), in
+/// the one wording every program shows: which of the two is the earlier,
+/// and what that asks of the user, never to delete the store.
+///
+/// [`PimdirError::Version`] reads so for "this program"; an application
+/// names itself through this one.
+///
+/// [`PimdirError::Version`]: crate::client::PimdirError::Version
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PimdirFormatRefusal<'a> {
+    /// The store's `format_version`, `None` when it lacks the column.
+    pub found: Option<&'a str>,
+    /// The program's own, [`sql::FORMAT_VERSION`] for this crate's.
+    ///
+    /// [`sql::FORMAT_VERSION`]: crate::sql::FORMAT_VERSION
+    pub own: &'a str,
+    /// The program as the user calls it (`calendula`, `this program`).
+    pub program: &'a str,
+}
+
+impl PimdirFormatRefusal<'_> {
+    /// Orders the store's version against the program's (STORAGE §4.2).
+    pub fn order(&self) -> PimdirFormatOrder {
+        match (rank(self.found), rank(Some(self.own))) {
+            (Some(found), Some(own)) if found < own => PimdirFormatOrder::Earlier,
+            (Some(found), Some(own)) if found > own => PimdirFormatOrder::Later,
+            (Some(_), Some(_)) => PimdirFormatOrder::Same,
+            _ => PimdirFormatOrder::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for PimdirFormatRefusal<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            found,
+            own,
+            program,
+        } = self;
+
+        match found {
+            Some(found) => write!(f, "Pimdir store is {found}")?,
+            None => write!(f, "Pimdir store names no format version")?,
+        }
+
+        match self.order() {
+            PimdirFormatOrder::Earlier => write!(
+                f,
+                ", written by an earlier sync engine, and {program} reads {own} alone: a store is never migrated, so sync it with the engine that wrote it until nothing is queued, then move its directory aside and sync a new store"
+            ),
+            PimdirFormatOrder::Later => write!(
+                f,
+                ", written by a later sync engine, and {program} reads {own} alone: upgrade {program}"
+            ),
+            PimdirFormatOrder::Same => write!(f, ", the version {program} reads"),
+            PimdirFormatOrder::Unknown => write!(
+                f,
+                ", and {program} reads {own} alone: a store opens under its own version only, so upgrade {program} if the store's sync engine is newer, else sync the store with that engine until nothing is queued, then move its directory aside and sync a new store"
+            ),
+        }
+    }
+}
+
+/// A marker's place in the order of STORAGE §4.2, `None` for one it does
+/// not read: a draft's number in decimal digits, a release's major in
+/// digits without a leading zero.
+fn rank(marker: Option<&str>) -> Option<(u8, u64)> {
+    let Some(marker) = marker else {
+        return Some((0, 0));
+    };
+    let digits = |number: &str| match number.bytes().all(|b| b.is_ascii_digit()) {
+        true => number.parse().ok(),
+        false => None,
+    };
+
+    if let Some(number) = marker.strip_prefix(DRAFT) {
+        return digits(number).map(|number| (1, number));
+    }
+
+    let major = marker.strip_prefix(RELEASED)?;
+    match major.starts_with('0') {
+        true => None,
+        false => digits(major).map(|major| (2, major)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::version::*;
@@ -498,6 +603,68 @@ mod tests {
                 ..store("storage-draft-13", (1, 1, 1))
             };
             assert_eq!(other.opens(&draft), Ok(()));
+        }
+    }
+
+    /// The order of STORAGE §4.2: none, then drafts by number, then
+    /// releases by major; a marker it does not read is neither way.
+    #[test]
+    fn a_store_version_is_ordered_drafts_before_releases() {
+        use PimdirFormatOrder::*;
+
+        let cases = [
+            (None, "storage-draft-13", Earlier),
+            (None, "storage-v1", Earlier),
+            (Some("storage-draft-08"), "storage-draft-13", Earlier),
+            (Some("storage-draft-13"), "storage-draft-13", Same),
+            (Some("storage-draft-014"), "storage-draft-13", Later),
+            (Some("storage-draft-99"), "storage-v1", Earlier),
+            (Some("storage-v1"), "storage-draft-13", Later),
+            (Some("storage-v10"), "storage-v9", Later),
+            (Some("storage-v01"), "storage-v1", Unknown),
+            (Some("storage-draft-"), "storage-draft-13", Unknown),
+            (Some("storage-v+2"), "storage-v1", Unknown),
+            (Some("storage-draft-13"), "storage-x", Unknown),
+        ];
+        for (found, own, order) in cases {
+            let refusal = PimdirFormatRefusal {
+                found,
+                own,
+                program: "calendula",
+            };
+            assert_eq!(refusal.order(), order, "{found:?} against {own}");
+        }
+    }
+
+    /// A draft store under a release is an earlier engine's, never "upgrade
+    /// calendula", and no wording advises deleting the store.
+    #[test]
+    fn a_draft_store_under_a_release_asks_for_its_engine() {
+        let refusal = PimdirFormatRefusal {
+            found: Some("storage-draft-13"),
+            own: "storage-v1",
+            program: "calendula",
+        }
+        .to_string();
+        assert!(refusal.contains("earlier sync engine"), "{refusal}");
+        assert!(!refusal.contains("upgrade calendula"), "{refusal}");
+
+        let later = PimdirFormatRefusal {
+            found: Some("storage-v2"),
+            own: "storage-v1",
+            program: "calendula",
+        }
+        .to_string();
+        assert!(later.ends_with("upgrade calendula"), "{later}");
+
+        for found in [None, Some("storage-v01"), Some("storage-draft-12")] {
+            let refusal = PimdirFormatRefusal {
+                found,
+                own: "storage-draft-13",
+                program: "calendula",
+            }
+            .to_string();
+            assert!(!refusal.contains("delete"), "{refusal}");
         }
     }
 }

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `version::PimdirFormatRefusal` and `version::PimdirFormatOrder`: the one refusal of a store of another format version, ordering it against the program's by pimdir STORAGE §4.2 (none, then drafts by number, then releases by major) and saying which is the earlier and what that asks, the program naming itself. `PimdirError::Version` reads so for "this program".
+- Added `PimdirProducer::enqueue_user_body`, queueing a body whole, for a resource the user wrote as it stands or whose `X-PIMDIR-` properties they asked for.
+
+### Changed
+
+- **BREAKING**: Changed `PimdirProducer::enqueue_with_body` to remove every `X-PIMDIR-` property from a calendar or address-book body before queueing it (pimdir STORAGE §18), as `enqueue_foreign_body` did, which is removed. A caller queueing an instruction the user asked for moves to `enqueue_user_body`.
+- Changed the message of `PimdirError::Version` (`store-version`) to say which store is the earlier: a draft store under a release, or no format version, reads as an earlier sync engine's, drained then set aside; a later one asks for a later program.
+
 ## [0.16.0] - 2026-11-17
 
 ### Added

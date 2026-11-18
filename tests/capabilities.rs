@@ -341,11 +341,11 @@ fn an_online_meeting_is_asked_in_the_resource() {
     assert_eq!(refusal.capability, capability::CALENDAR_ONLINE_MEETING);
 }
 
-/// STORAGE §18: a resource the user did not write as it stands enters the
-/// queue without the instructions it carried, so an online meeting
-/// another party asked for is no request of the user's.
+/// STORAGE §18: the default enqueue takes the instructions out of a
+/// resource, so an online meeting another party asked for is no request
+/// of the user's; the user's own ask goes through `enqueue_user_body`.
 #[test]
-fn a_foreign_resource_is_queued_without_its_instructions() {
+fn a_resource_is_queued_without_its_instructions_unless_the_user_asks() {
     let dir = tempfile::tempdir().unwrap();
     seeded_event(dir.path(), "dav", "work", "m0");
     let mut store = PimdirStore::open(dir.path()).unwrap();
@@ -364,13 +364,13 @@ fn a_foreign_resource_is_queued_without_its_instructions() {
         supersedes: None,
     };
     let Err(PimdirError::Unsupported(_)) =
-        producer.enqueue_with_body("work", asking.as_bytes(), add)
+        producer.enqueue_user_body("work", asking.as_bytes(), add)
     else {
         panic!("the user's own online meeting should be refused");
     };
 
     producer
-        .enqueue_foreign_body("work", asking.as_bytes(), add)
+        .enqueue_with_body("work", asking.as_bytes(), add)
         .unwrap();
     let pending = producer.pending_actions("work").unwrap();
     let hash = pending[0].action.object_hash().unwrap();

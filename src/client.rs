@@ -50,7 +50,7 @@ use crate::{
         file::{self, PimdirFileSummary},
     },
     sync::SYNC_VERSION,
-    version::PimdirProfile,
+    version::{PimdirFormatRefusal, PimdirProfile},
 };
 
 /// The local time collection's id (§14.3): `U+0001` and `time`, under no
@@ -2343,16 +2343,12 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir create refused: collection {collection} already has {link_id} queued as action {id}"
             ),
-            Self::Version { found: Some(found) } => write!(
-                f,
-                "Pimdir store is {found}, not this program's {}: a store opens under its own version alone, so let the sync engine that wrote it push what it queued, then move it aside and sync a new one",
-                sql::FORMAT_VERSION
-            ),
-            Self::Version { found: None } => write!(
-                f,
-                "Pimdir store names no format version, as a draft before {0} wrote it, and this program is {0}: a store opens under its own version alone, so let the sync engine that wrote it push what it queued, then move it aside and sync a new one",
-                sql::FORMAT_VERSION
-            ),
+            Self::Version { found } => PimdirFormatRefusal {
+                found: found.as_deref(),
+                own: sql::FORMAT_VERSION,
+                program: "this program",
+            }
+            .fmt(f),
             Self::Uncreated => write!(
                 f,
                 "Pimdir store has no schema yet: its owner has to create it first"
