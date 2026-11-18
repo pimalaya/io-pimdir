@@ -6,7 +6,7 @@ landed: 2026-11-18
 
 # One recognition of a minted key
 
-CLI family analysis of 2026-11-15, PIM-13, re-checked at d7cfe5e: the engine looked a pending create up by the hint and the key minted over its provisional handle, `is_landable` cut the hint out of a minted key by its length, and `starts_with("dup:")` stood in sync.rs and upgrade.rs, beside the rekey's `minted_from`.
+CLI family analysis of 2026-11-15, PIM-13, re-checked at 59886ad: the engine looked a pending create up by the hint and the key minted over its provisional handle, `is_landable` cut the hint out of a minted key by its length, and `starts_with("dup:")` stood in sync.rs and upgrade.rs, beside the rekey's `minted_from`.
 
 ## What landed
 
@@ -18,4 +18,4 @@ CLI family analysis of 2026-11-15, PIM-13, re-checked at d7cfe5e: the engine loo
 
 sync ("A minted key is recognised once", added).
 
-In the working tree on io-pimdir d7cfe5e, uncommitted, no version bumped; CHANGELOG.md [Unreleased] names it.
+In the working tree on io-pimdir 59886ad, uncommitted, no version bumped; CHANGELOG.md [Unreleased] names it.

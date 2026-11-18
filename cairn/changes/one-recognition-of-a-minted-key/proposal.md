@@ -9,7 +9,7 @@ created: 2026-11-18
 
 ## Why
 
-CLI family analysis of 2026-11-15, PIM-13: "which held row does this hint name" was answered three times with three recognitions of a minted key: the engine's two lookups of a pending create (src/sync.rs, the hint and the key minted over its provisional handle), `PimdirLinkId::is_landable` (the key cut out by its length), and the rekey's `minted_from`; PIM-6 and PIM-7 were each a disagreement between two of them. Re-checked at d7cfe5e: the rekey already reads `minted_from` (2026-11-17), the other two still recognised a minted key apart, and `starts_with("dup:")` stood in two more places.
+CLI family analysis of 2026-11-15, PIM-13: "which held row does this hint name" was answered three times with three recognitions of a minted key: the engine's two lookups of a pending create (src/sync.rs, the hint and the key minted over its provisional handle), `PimdirLinkId::is_landable` (the key cut out by its length), and the rekey's `minted_from`; PIM-6 and PIM-7 were each a disagreement between two of them. Re-checked at 59886ad: the rekey already reads `minted_from` (2026-11-17), the other two still recognised a minted key apart, and `starts_with("dup:")` stood in two more places.
 
 ## What
 

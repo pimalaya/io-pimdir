@@ -9,7 +9,7 @@ created: 2026-11-18
 
 ## Why
 
-CLI family analysis of 2026-11-15, PIM-10, re-checked at 757e6c0: every page of a broad query sorted the whole hit set (100,000 messages: 1.18 s for a page whatever its offset), and every overlaid read read the conflicts of every item a pending `update`, `remove` or `move` names in the collection, about 15 statements each, before showing a page of a few. Paging became a cursor on 2026-11-17 (0.16.0), so the page can be selected rather than sliced. No format change: what an answer holds is the same.
+CLI family analysis of 2026-11-15, PIM-10, re-checked at 117b5e7: every page of a broad query sorted the whole hit set (100,000 messages: 1.18 s for a page whatever its offset), and every overlaid read read the conflicts of every item a pending `update`, `remove` or `move` names in the collection, about 15 statements each, before showing a page of a few. Paging became a cursor on 2026-11-17 (0.16.0), so the page can be selected rather than sliced. No format change: what an answer holds is the same.
 
 ## What
 

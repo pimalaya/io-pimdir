@@ -6,7 +6,7 @@ landed: 2026-11-18
 
 # A page sorts its own hits
 
-CLI family analysis of 2026-11-15, PIM-10, re-checked at 757e6c0: a search page sorted the whole hit set, and an overlaid read read the conflicts of every item a pending `update`, `remove` or `move` names in its collection before folding a page.
+CLI family analysis of 2026-11-15, PIM-10, re-checked at 117b5e7: a search page sorted the whole hit set, and an overlaid read read the conflicts of every item a pending `update`, `remove` or `move` names in its collection before folding a page.
 
 ## What landed
 
@@ -19,4 +19,4 @@ CLI family analysis of 2026-11-15, PIM-10, re-checked at 757e6c0: a search page 
 
 search ("A page sorts its own hits", added).
 
-In the working tree on io-pimdir 757e6c0, uncommitted, no version bumped; CHANGELOG.md [Unreleased] names it.
+In the working tree on io-pimdir 117b5e7, uncommitted, no version bumped; CHANGELOG.md [Unreleased] names it.

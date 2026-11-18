@@ -14,6 +14,6 @@ An item SHALL write at most 10,000 occurrences (`search::occurrence::OCCURRENCES
 - spec/vectors/search store items 27 (`FREQ=HOURLY`, 10,000 occurrences, cut at 2028-03-23T16:00:00Z) and 28 (`FREQ=SECONDLY` limited to 1 August at midnight, its `DTSTART` alone, cut at its millionth second), their two occurrence windows and the four cases stating `cut` (tests/search.rs `every_search_vector_answers`); src/search/occurrence.rs `one_item_writes_at_most_the_bound_and_is_cut_at_the_next`, `a_rule_is_examined_for_at_most_the_period_bound`
 
 #### Scenario: A rule filling every period
-- spec/vectors/search store item 35 (every second from 2025-04-26T19:13:20Z under `COUNT=4000000000`, cut at 2025-08-20T13:00:00Z, its 10,000,001st instance), its window and the case `kind:event date:2025-08-20` (tests/search.rs `every_search_vector_answers`, failing on io-pimdir a8f6cda); src/search/occurrence.rs `a_rule_is_walked_for_at_most_the_instance_bound`, the PIM-15 rule from 1914 cut at its 10,000,001st second
+- spec/vectors/search store item 35 (every second from 2025-04-26T19:13:20Z under `COUNT=4000000000`, cut at 2025-08-20T13:00:00Z, its 10,000,001st instance), its window and the case `kind:event date:2025-08-20` (tests/search.rs `every_search_vector_answers`, failing on io-pimdir d1051d8); src/search/occurrence.rs `a_rule_is_walked_for_at_most_the_instance_bound`, the PIM-15 rule from 1914 cut at its 10,000,001st second
 
 ## REMOVED Requirements

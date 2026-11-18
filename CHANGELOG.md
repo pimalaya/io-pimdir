@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-14, sync-draft-14 and search-draft-14, vendored at pimdir 2997103.
+- **BREAKING**: Added pimdir storage-draft-14, sync-draft-14 and search-draft-14, vendored at pimdir da7e01a.
 
   A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. `sql::FORMAT_VERSION`, `sync::SYNC_VERSION` and `sql::search::FORMAT_VERSION` name them (`sql::search::FORMAT_DRAFT` is 14), and `init_store_meta` and `init_index_meta` changed their text.
 - Added the binding of a refused offered create: a create the store offers a source binding nothing of the item, refused for good, is bound as that source's pending create with its refusal, so it is held by its key, reported every run and read by the receipt, where it was pushed and refused every run.

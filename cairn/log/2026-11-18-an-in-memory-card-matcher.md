@@ -19,4 +19,4 @@ cardamum's card search (its cairn/changes/card-search) matches the cards a serve
 
 search ("Cards are matched in memory as the index matches them", added).
 
-In the working tree on io-pimdir f23be32, uncommitted, no version bumped; CHANGELOG.md [Unreleased] names it.
+In the working tree on io-pimdir 7370ac4, uncommitted, no version bumped; CHANGELOG.md [Unreleased] names it.
