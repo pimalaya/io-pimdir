@@ -280,7 +280,7 @@ impl PimdirUpgrade {
             let restated = patched
                 .link_id
                 .as_ref()
-                .is_some_and(|key| *key != item.link_id && !key.as_str().starts_with("dup:"));
+                .is_some_and(|key| *key != item.link_id && !key.is_minted());
             if mutable && restated {
                 debug!(
                     "handle {} states a new identity, keying it afresh",

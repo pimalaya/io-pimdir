@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added the binding of a refused offered create: a create the store offers a source binding nothing of the item, refused for good, is bound as that source's pending create with its refusal, so it is held by its key, reported every run and read by the receipt, where it was pushed and refused every run.
 - Added `version::PimdirFormatRefusal` and `version::PimdirFormatOrder`: the one refusal of a store of another format version, ordering it against the program's by pimdir STORAGE §4.2 (none, then drafts by number, then releases by major) and saying which is the earlier and what that asks, the program naming itself. `PimdirError::Version` reads so for "this program".
 - Added `PimdirProducer::enqueue_user_body`, queueing a body whole, for a resource the user wrote as it stands or whose `X-PIMDIR-` properties they asked for.
+- Added `PimdirLinkId::landed_hint` and `PimdirLinkId::is_minted`: the one recognition of a minted key, which `is_landable` and the engine's lookup of the create a listed hint lands now read.
 
 ### Changed
 

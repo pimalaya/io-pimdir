@@ -170,6 +170,12 @@ A `Created` placement SHALL derive no `Add` from a page before the last of a rou
 - WHEN the second source syncs under `Manual`
 - THEN the create lands conflicted, its body the staged one and the server's recorded as the divergence, the base holding no body, and nothing is pushed
 
+### Requirement: A minted key is recognised once
+`PimdirLinkId::landed_hint` SHALL answer the hint whose arrival lands a create of the key (SYNC §3, §6): the key itself when it is no minted one (`is_minted`, `dup:` leading it), else the hint among `minted_from` that is no minted key and mints it over its own provisional handle, else none. `is_landable` SHALL read it, and the engine SHALL find the pending or delivered create a listed hint lands, to land it or to report the member minted apart from it, by it alone, the create keyed by the hint first. The rekey's copies stay `minted_from`'s, over any handle.
+
+#### Scenario: A hint holding `#`
+- src/placement.rs `a_key_names_the_hint_that_lands_it_or_none`: `a#b@x` and its key minted over its provisional handle name `a#b@x`; one minted over `7#8`, that key minted again, and a key minted twice over its own handle name none
+
 ### Requirement: An item-level conflict is held, a binding conflict is reconciled
 `reconcile_content` SHALL take its conflict branch for a placement carrying a `conflict_revision`, the divergence between this source and its own remote. A `Conflict` placement carrying none is the item's cross-source conflict projected onto this source ([hub](hub.md)): it SHALL derive no push, a pending create under it included, until a person's resolution (an `Edit` stating `resolves`, [mutate](mutate.md)), an overruling `Edit` or a `Remove` settles the item (pimdir SYNC §3, §7). A remote revision its base does not hold SHALL still be recorded, whatever the conflict policy: the binding is marked conflicted with that revision and its diverging body wanted, reported as `Conflicted`, since an incremental enumeration never lists the member again (pimdir SYNC §5, vectors/sync/33).
 

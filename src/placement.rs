@@ -96,16 +96,32 @@ impl PimdirLinkId {
     /// hint no source states (STORAGE §9 escapes one beginning `dup:`), so
     /// no arrival lands a create of it.
     pub fn is_landable(&self) -> bool {
-        let Some(minted) = self.0.strip_prefix("dup:") else {
-            return true;
-        };
-        // NOTE: the key, `#`, U+0001 and the key again, so the key is cut
-        // out by its length, as origin_for_link reads a minted key.
-        let length = minted.len().saturating_sub(2) / 2;
-        let Some(key) = minted.get(..length) else {
-            return false;
-        };
-        !key.starts_with("dup:") && Self::from(key).minted(&Self::from(key).provisional()) == *self
+        self.landed_hint().is_some()
+    }
+
+    /// Whether this key is [`minted`](Self::minted), `dup:` leading it.
+    pub fn is_minted(&self) -> bool {
+        self.0.starts_with("dup:")
+    }
+
+    /// The hint whose arrival lands a create of this key (SYNC §3, §6): the
+    /// key itself when it is no minted one, else the hint it was minted
+    /// from over the provisional handle that hint derives, itself no minted
+    /// key; `None` for a key minted over any other handle.
+    ///
+    /// The one recognition of a create's identity: the engine finds the
+    /// create a listed hint lands by it, and [`is_landable`]
+    /// (Self::is_landable) reads it, as the canonical `origin_for_link` and
+    /// `destination_for_link` read the same key.
+    pub fn landed_hint(&self) -> Option<&str> {
+        if !self.is_minted() {
+            return Some(self.as_str());
+        }
+
+        self.minted_from().into_iter().find(|hint| {
+            let hint = Self::from(*hint);
+            !hint.is_minted() && hint.minted(&hint.provisional()) == *self
+        })
     }
 
     /// The key a second copy of this identity takes in one collection.
@@ -472,6 +488,26 @@ mod tests {
         assert!(!minted.is_landable());
         assert!(!minted.minted(&minted.provisional()).is_landable());
         assert!(!PimdirLinkId::from("dup:").is_landable());
+    }
+
+    /// One recognition answers which hint lands a key, a hint holding `#`
+    /// and a key minted twice included: the hint a key was minted from over
+    /// its own provisional handle, the key itself when it is no minted one,
+    /// and none for any other mint (SYNC §3, §6).
+    #[test]
+    fn a_key_names_the_hint_that_lands_it_or_none() {
+        let hash = PimdirLinkId::from("a#b@x");
+        let minted = hash.minted(&hash.provisional());
+        assert_eq!(hash.landed_hint(), Some("a#b@x"));
+        assert_eq!(minted.landed_hint(), Some("a#b@x"));
+
+        let elsewhere = hash.minted(&PimdirHandle::from("7#8"));
+        assert_eq!(elsewhere.landed_hint(), None);
+        assert_eq!(
+            elsewhere.minted(&elsewhere.provisional()).landed_hint(),
+            None
+        );
+        assert_eq!(minted.minted(&minted.provisional()).landed_hint(), None);
     }
 
     /// A connector names the identity a body states, the one `esc:` the

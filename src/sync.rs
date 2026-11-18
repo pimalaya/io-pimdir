@@ -1153,7 +1153,7 @@ impl PimdirSync {
             let restated = placement
                 .link_id
                 .as_ref()
-                .is_some_and(|key| *key != meta.link_id && !key.as_str().starts_with("dup:"));
+                .is_some_and(|key| *key != meta.link_id && !key.is_minted());
             if mutable && restated {
                 debug!(
                     "handle {} states a new identity, keying it afresh",
@@ -1269,21 +1269,31 @@ impl PimdirSync {
     /// the create the member is minted apart from, no longer landed by it
     /// (SYNC §6). `None` when no create holds the hint, or one agrees.
     fn disagreeing_create(&self, item: &PimdirRemoteItem) -> Option<PimdirLinkId> {
-        let hint = &item.meta.link_id;
-        let minted = hint.minted(&hint.provisional());
-        [hint, &minted].into_iter().find_map(|key| {
-            self.local
-                .values()
-                .find(|p| {
-                    p.link_id.as_ref() == Some(key)
-                        && ((p.status == PimdirStatus::Created && p.base.is_none())
-                            || p.delivered())
-                        && p.handle != item.handle
-                        && !self.offered.contains(&p.handle)
-                        && !summary::same_message(p.summary.as_ref(), item.meta.summary.as_ref())
-                })
-                .and_then(|p| p.link_id.clone())
-        })
+        self.creates_of(&item.meta.link_id)
+            .into_iter()
+            .find(|p| {
+                p.handle != item.handle
+                    && !self.offered.contains(&p.handle)
+                    && !summary::same_message(p.summary.as_ref(), item.meta.summary.as_ref())
+            })
+            .and_then(|p| p.link_id.clone())
+    }
+
+    /// The pending and delivered creates of this source a listed `hint`
+    /// lands (SYNC §3, §6), the one keyed by the hint itself first: those
+    /// whose key is the hint or the one minted over its provisional handle
+    /// ([`PimdirLinkId::landed_hint`]).
+    fn creates_of(&self, hint: &PimdirLinkId) -> Vec<&PimdirPlacement> {
+        let mut creates: Vec<&PimdirPlacement> = self
+            .local
+            .values()
+            .filter(|p| {
+                p.link_id.as_ref().and_then(PimdirLinkId::landed_hint) == Some(hint.as_str())
+                    && ((p.status == PimdirStatus::Created && p.base.is_none()) || p.delivered())
+            })
+            .collect();
+        creates.sort_by_key(|p| p.link_id.as_ref().is_some_and(PimdirLinkId::is_minted));
+        creates
     }
 
     /// Takes the pending create of this source holding `hint`, if any.
@@ -1297,19 +1307,12 @@ impl PimdirSync {
     /// create's is another message reusing the `Message-ID`, minted rather
     /// than joined (SYNC §6).
     fn take_pending_create(&mut self, item: &PimdirRemoteItem) -> Option<PimdirPlacement> {
-        let hint = &item.meta.link_id;
-        let arrived = &item.handle;
-        let minted = hint.minted(&hint.provisional());
-        let provisional = [hint, &minted]
+        let provisional = self
+            .creates_of(&item.meta.link_id)
             .into_iter()
-            .find_map(|key| {
-                self.local.values().find(|p| {
-                    p.link_id.as_ref() == Some(key)
-                        && ((p.status == PimdirStatus::Created && p.base.is_none())
-                            || p.delivered())
-                        && &p.handle != arrived
-                        && summary::same_message(p.summary.as_ref(), item.meta.summary.as_ref())
-                })
+            .find(|p| {
+                p.handle != item.handle
+                    && summary::same_message(p.summary.as_ref(), item.meta.summary.as_ref())
             })
             .map(|p| p.handle.clone())?;
 
