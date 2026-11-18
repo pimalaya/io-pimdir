@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added `version::PimdirFormatRefusal` and `version::PimdirFormatOrder`: the one refusal of a store of another format version, ordering it against the program's by pimdir STORAGE §4.2 (none, then drafts by number, then releases by major) and saying which is the earlier and what that asks, the program naming itself. `PimdirError::Version` reads so for "this program".
 - Added `PimdirProducer::enqueue_user_body`, queueing a body whole, for a resource the user wrote as it stands or whose `X-PIMDIR-` properties they asked for.
 - Added `PimdirLinkId::landed_hint` and `PimdirLinkId::is_minted`: the one recognition of a minted key, which `is_landable` and the engine's lookup of the create a listed hint lands now read.
+- Added `search::card::PimdirCard`, `PimdirQuery::match_cards` and `PimdirQuery::store_terms`: a query matched over cards held in memory, as an index holding those cards answers it (SEARCH §11's contact cases), under `search` without `client`; a term only a store answers refuses the match (`PimdirCardMatchError`).
 
 ### Changed
 

@@ -8,12 +8,15 @@
 //! within a horizon (`occurrence`), the plan of a tag (`tag`), and the
 //! refresh folding the store's feed into the index as an I/O-free
 //! coroutine yielding typed reads and writes (`refresh`), which threads
-//! the mail it touches. The index over SQLite, index.db and its queries,
+//! the mail it touches, and a query matched over cards held in memory
+//! (`card`). The index over SQLite, index.db and its queries,
 //! is the client's (`client::search`, features `client` and `search`).
 //!
 //! [`coverage`] is outside the feature: the store's `LIKE` reads answer
 //! the same coverage before any index exists.
 
+#[cfg(feature = "search")]
+pub mod card;
 #[cfg(feature = "search")]
 pub mod chunk;
 pub mod coverage;
