@@ -8,8 +8,9 @@
 //! Expansion is ical-rs's: the resource's own `VTIMEZONE`s, else the
 //! bundled database by `TZID`, else floating, a floating time and a date
 //! read in the zone the indexer states. One item writes at most
-//! [`OCCURRENCES_MAX`] occurrences and a rule is examined for at most
-//! [`PERIODS_MAX`] periods; an item either bound stops records its cut.
+//! [`OCCURRENCES_MAX`] occurrences, and a rule is examined for at most
+//! [`PERIODS_MAX`] periods and walked for at most [`INSTANCES_MAX`]
+//! instances; an item a bound stops records its cut.
 //! What re-expands an item, and the rows the occurrences are written to,
 //! are the refresh's ([`refresh`](crate::search::refresh)).
 
@@ -36,6 +37,11 @@ pub const OCCURRENCES_MAX: usize = 10_000;
 /// §7), a period being `INTERVAL` times the rule's `FREQ` from the one
 /// holding its `DTSTART`, whether or not it yields.
 pub const PERIODS_MAX: i64 = 1_000_000;
+
+/// The most instances of a recurrence rule an expansion walks (SEARCH
+/// §7), each start the rule yields from its `DTSTART`, before the horizon
+/// or in it, whatever `COUNT` it states beyond them.
+pub const INSTANCES_MAX: usize = 10_000_000;
 
 /// The zone floating times and dates are read in when the indexer states
 /// none (SEARCH §7).
@@ -129,7 +135,10 @@ impl Horizon {
             }
 
             let walked = timeline
-                .expand(self.start - DAY, self.end + DAY)
+                .expand(
+                    examined.map_or(self.start, |examined| examined.min(self.start)) - DAY,
+                    examined.map_or(self.end, |examined| examined.min(self.end)) + DAY,
+                )
                 .map(|instant| match instant.floating {
                     true => (floating(instant.start), floating(instant.end)),
                     false => (instant.start, instant.end),
@@ -156,9 +165,11 @@ impl Horizon {
     }
 
     /// The instant a series' rules stop being examined (SEARCH §7): the
-    /// earliest start of a rule's first unexamined period lying before the
-    /// horizon's end, `None` when every rule ends before it, by its `UNTIL`
-    /// or its `COUNT`, or reaches the horizon's end within the bound.
+    /// earliest, before the horizon's end, of a rule's first instance not
+    /// walked and its first unexamined period, `None` when every rule ends
+    /// before both, by its `UNTIL` or its `COUNT`, or reaches the horizon's
+    /// end within the bounds. The walk stops at the horizon's end, so a
+    /// rule costs at most [`INSTANCES_MAX`] instances.
     fn examined(
         &self,
         timeline: &IcalRecurTimeline,
@@ -179,21 +190,32 @@ impl Horizon {
         set.rules
             .iter()
             .filter_map(|rule| {
-                let unexamined = unexamined(rule, start)?;
+                let unexamined = unexamined(rule, start);
+                let count = rule.count.map(|count| count as usize);
+                let walked = IcalRecurExpand::new(rule.clone(), start)
+                    .take_while(|at| {
+                        unexamined.is_none_or(|unexamined| *at < unexamined)
+                            && instant(*at) < self.end
+                    })
+                    .take(count.unwrap_or(usize::MAX))
+                    .take(INSTANCES_MAX + 1);
+                let mut instances = 0;
+                for at in walked {
+                    if instances == INSTANCES_MAX {
+                        return Some(instant(at));
+                    }
+                    instances += 1;
+                }
+                if count == Some(instances) {
+                    return None;
+                }
+
+                let unexamined = unexamined?;
                 if instant(unexamined) >= self.end {
                     return None;
                 }
                 if rule.until.is_some_and(|until| until < unexamined) {
                     return None;
-                }
-                if let Some(count) = rule.count {
-                    let before = IcalRecurExpand::new(rule.clone(), start)
-                        .take_while(|at| *at < unexamined)
-                        .take(count as usize)
-                        .count();
-                    if before == count as usize {
-                        return None;
-                    }
                 }
                 Some(instant(unexamined))
             })
@@ -338,6 +360,32 @@ mod tests {
             None,
             "a daily rule reaches the horizon's end long before its bound"
         );
+    }
+
+    /// The instance bound stops a rule whose `BYxxx` parts fill every period
+    /// at its 10,000,001st instance, counted from `DTSTART` before the
+    /// horizon, whatever `COUNT` it states beyond them; one whose `COUNT`
+    /// ends first is not cut (PIM-15: this rule walked its four billion
+    /// instances).
+    #[test]
+    fn a_rule_is_walked_for_at_most_the_instance_bound() {
+        let horizon = Horizon::around(time::unix(2026, 8, 20, 0, 0, 0));
+        let every: alloc::vec::Vec<alloc::string::String> =
+            (0..60).map(|n| alloc::format!("{n}")).collect();
+        let every = every.join(",");
+        let dense = alloc::format!("FREQ=HOURLY;BYMINUTE={every};BYSECOND={every}");
+
+        let body = event(
+            ":19140601T000000Z",
+            &alloc::format!("{dense};COUNT=4000000000"),
+        );
+        let (occurrences, cut) = horizon.occurrences(body.as_bytes(), FLOATING_ZONE);
+        let start = time::unix(1914, 6, 1, 0, 0, 0);
+        assert!(occurrences.is_empty());
+        assert_eq!(cut, Some(start + INSTANCES_MAX as i64));
+
+        let body = event(":19140601T000000Z", &alloc::format!("{dense};COUNT=100"));
+        assert_eq!(horizon.occurrences(body.as_bytes(), FLOATING_ZONE).1, None);
     }
 
     /// A rule whose first unexamined period lies past the last year a date

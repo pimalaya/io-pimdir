@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- **BREAKING**: Added pimdir storage-draft-14, sync-draft-14 and search-draft-14, vendored at pimdir 466dda6.
+- **BREAKING**: Added pimdir storage-draft-14, sync-draft-14 and search-draft-14, vendored at pimdir 2997103.
 
   A store of an earlier draft is refused by every profile (`store-version`), and one whose sync state an earlier engine wrote too (`sync-version`), never migrated; an index of an earlier draft is rebuilt. `sql::FORMAT_VERSION`, `sync::SYNC_VERSION` and `sql::search::FORMAT_VERSION` name them (`sql::search::FORMAT_DRAFT` is 14), and `init_store_meta` and `init_index_meta` changed their text.
 - Added the binding of a refused offered create: a create the store offers a source binding nothing of the item, refused for good, is bound as that source's pending create with its refusal, so it is held by its key, reported every run and read by the receipt, where it was pushed and refused every run.
@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed a recurrence rule whose `BYxxx` parts fill every period stalling the indexer for as many instances as its `COUNT` names (22 s for one event): an expansion walks at most 10,000,000 instances of a rule from its `DTSTART` (`search::occurrence::INSTANCES_MAX`, pimdir SEARCH §7 in search-draft-14), cut at the first not walked, so such a series writes no occurrence past that instant.
 - Fixed a search page sorting every hit of its query, and an overlaid read reading the conflicts of every item with a pending update, remove or move in the collection rather than of the items it shows.
 
 ## [0.16.0] - 2026-11-17
