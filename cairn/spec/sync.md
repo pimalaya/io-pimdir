@@ -135,6 +135,12 @@ A `PimdirPushOutcome::Refused { reason }` SHALL write, in the batch recording th
 - WHEN the `Update` under the new key is accepted
 - THEN the binding is rebased and holds no refusal (vectors/sync/165, which failed on the old engine: the refusal stood)
 
+### Requirement: A refused offered create is bound with its refusal
+A create the store offers a source binding nothing of the item (SYNC §3, §9), refused for good, SHALL be upserted as that source's pending create, under the provisional handle it was pushed under and with no base, in the write recording its refusal and before the `RefusePlacement`, so the refusal stands on a binding and holds the create by its key (SYNC §5, D6 of pimdir's the-draft-14-lines).
+
+#### Scenario: Another source holds the card
+- pimdir vectors/sync/171, failing on io-pimdir 12f2a69 ("bindings rows differ")
+
 ### Requirement: A rejection counts for a pushed handle only
 `PimdirSyncReport::rejected` SHALL count a `Rejected` outcome once per handle the chunk pushed, on the terms `pushed` counts an accepted one: a result naming a handle nobody pushed, or naming one twice, cannot inflate either.
 

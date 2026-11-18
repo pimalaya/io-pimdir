@@ -482,9 +482,12 @@ pub struct PimdirFetchedItem {
 ///
 /// Pushes are at-least-once ([`crate::change::PimdirChange`]): a remove
 /// whose target is already gone is [`Accepted`](Self::Accepted), since
-/// rejecting it would keep the tombstone retrying forever. A failure of
-/// the transport (a timeout, a `5xx`, a `408`, `425` or `429`) is no
-/// outcome: the connector leaves the change unreported.
+/// rejecting it would keep the tombstone retrying forever. A failure that
+/// is not the change's own is no outcome, and the connector leaves the
+/// change unreported: the transport's (a timeout, a `5xx`, a `408`, `425`
+/// or `429`), credentials refused (`401`, `407`), a lock another client
+/// holds (`423`) or a quota exceeded (an IMAP `NO [OVERQUOTA]`), each of
+/// which may pass with the change as it stands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PimdirPushOutcome {
@@ -496,10 +499,10 @@ pub enum PimdirPushOutcome {
     /// cannot tell a refusal from a stale base.
     Rejected,
     /// The remote refused the change itself, as it stands, for good: an
-    /// HTTP status from 400 to 499 but 408, 409, 412, 425 and 429, an IMAP
-    /// `NO` naming the command, an error naming a rule the change breaks
-    /// (an append into a Graph folder other than Drafts, a floating time a
-    /// calendar API refuses, a quota exceeded).
+    /// HTTP status from 400 to 499 but 401, 407, 408, 409, 412, 423, 425
+    /// and 429, an IMAP `NO` naming the command, an error naming a rule the
+    /// change breaks (an append into a Graph folder other than Drafts, a
+    /// floating time a calendar API refuses, a size exceeded).
     ///
     /// Left pending, the refusal recorded on the binding: the engine holds
     /// the change while it derives it under the same key, and reports it

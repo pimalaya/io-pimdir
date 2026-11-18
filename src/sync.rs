@@ -69,7 +69,7 @@ mod join;
 /// The version of SYNC.md this engine follows (SYNC §10), which a store
 /// records in `store_meta.sync_version` with the engine's first write: a
 /// store naming another is refused before any verb runs.
-pub const SYNC_VERSION: &str = "sync-draft-13";
+pub const SYNC_VERSION: &str = "sync-draft-14";
 
 /// Which push kinds a writable source may derive.
 ///
@@ -327,6 +327,8 @@ pub struct PimdirSyncReport {
     /// refusal standing on their binding (SYNC §5), each reported
     /// [`Refused`](PimdirSyncEvent::Refused) with its reason: left
     /// pending, the held ones pushed again once derived under another key.
+    /// A create the store offered, which this source bound not, is bound
+    /// as its pending create by the write recording its refusal.
     pub refused: usize,
     /// Placements whose stale body was dropped after a remote content change.
     pub refreshed: usize,
@@ -2597,6 +2599,10 @@ impl PimdirCoroutine for PimdirSync {
                         PimdirPushOutcome::Refused { reason } => {
                             debug!("the change {} is refused for good", result.handle.as_str());
                             if let Some(key) = key {
+                                if let Pending::Create(create) = &pending {
+                                    self.writes
+                                        .push(PimdirWriteOp::UpsertPlacement(create.clone()));
+                                }
                                 self.writes.push(PimdirWriteOp::RefusePlacement {
                                     collection: self.collection.clone(),
                                     handle: result.handle.clone(),
