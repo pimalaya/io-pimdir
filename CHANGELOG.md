@@ -22,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **BREAKING**: Changed `PimdirProducer::enqueue_with_body` to remove every `X-PIMDIR-` property from a calendar or address-book body before queueing it (pimdir STORAGE §18), as `enqueue_foreign_body` did, which is removed. A caller queueing an instruction the user asked for moves to `enqueue_user_body`.
 - Changed the message of `PimdirError::Version` (`store-version`) to say which store is the earlier: a draft store under a release, or no format version, reads as an earlier sync engine's, drained then set aside; a later one asks for a later program.
 
+### Fixed
+
+- Fixed a search page sorting every hit of its query, and an overlaid read reading the conflicts of every item with a pending update, remove or move in the collection rather than of the items it shows.
+
 ## [0.16.0] - 2026-11-17
 
 ### Added

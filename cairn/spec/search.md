@@ -298,6 +298,12 @@ The `text/html` reduction (`search::html::to_text`) SHALL close a comment at the
 - WHEN m6 arrives and the next page is read after the cursor, then m6 and m5 leave
 - THEN the pages answer m3 and m2, then m1 and no cursor (tests/search.rs `a_page_resumes_after_the_last_hit_it_answered`, tests/search_cli.rs `a_search_page_token_resumes_after_its_last_hit`; every search vector is also walked one hit a page)
 
+### Requirement: A page sorts its own hits
+`PimdirIndex::search` SHALL select a page's hits among those following its cursor before sorting them, sorting the page alone, and answer exactly the hits a whole sorted answer holds after the cursor, in its order. A reader's overlay SHALL read the conflicts an item stands in only when it folds that item and an `update`, a `remove` or a `move` pending on it meets them (STORAGE §15.3, §15.4).
+
+#### Scenario: Every order, cursor and limit
+- src/client/search.rs `a_page_is_the_slice_of_the_sorted_answer_after_its_cursor`: 40 hits tying on every key but the public id, in the `date`, `relevance` and `name` orders, at every cursor and at limits 0, 1, 3 and 40; the overlay's suites (tests/overlay.rs, tests/item_conflict_settle.rs) unchanged
+
 ### Requirement: The index sets its own journal mode alone
 The indexer SHALL set the journal mode of index.db alone (`PRAGMA main.journal_mode`), never that of the store it attaches read-only, so a store its operator keeps on a rollback journal (STORAGE §8, a network filesystem) is indexed and searched as any other.
 

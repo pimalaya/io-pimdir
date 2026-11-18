@@ -861,14 +861,16 @@ impl PimdirReader {
         }
 
         let pending = self.pending(collection)?;
-        let item = match item {
-            Some(item) => Some(item),
+        let edits = pending.edits.get(&seq);
+        match item {
+            Some(item) => self.folded(collection, item, edits),
             None => match pending.arrivals.get(&seq) {
-                Some((from, moved)) => self.arrival(from, seq, *moved)?,
-                None => None,
+                Some((from, moved)) => Ok(self
+                    .arrival(from, seq, *moved)?
+                    .and_then(|item| fold(item, edits, None))),
+                None => Ok(None),
             },
-        };
-        Ok(item.and_then(|item| fold(item, pending.edits.get(&seq), pending.standing.get(&seq))))
+        }
     }
 
     /// Resolves an item's public id from its key, for a consumer that
@@ -973,7 +975,7 @@ impl PimdirReader {
             let Some(item) = self.committed_item(collection, *seq)? else {
                 continue;
             };
-            if fold(item, Some(edits), pending.standing.get(seq)).is_none() {
+            if self.folded(collection, item, Some(edits))?.is_none() {
                 count -= 1;
             }
         }
@@ -1997,10 +1999,6 @@ struct PimdirPending {
     /// to the collection their row is still read from and whether a move
     /// brings them.
     arrivals: BTreeMap<i64, (String, bool)>,
-    /// The conflicts of the items a pending `update`, `remove` or `move`
-    /// names, by public id, which decide whether the drain applies it or
-    /// parks it (§15.3).
-    standing: BTreeMap<i64, PimdirStanding>,
 }
 
 /// The conflicts an item stands in (SYNC §7), as the overlay reads what a
@@ -2218,33 +2216,31 @@ impl PimdirReader {
             }
         }
 
-        // NOTE: an update or a remove meeting a conflict its `resolves`
-        // does not name parks, as a move meeting any does (§15.3), so the
-        // conflicts it meets are read with it.
-        let updated: Vec<i64> = pending
-            .edits
-            .iter()
-            .filter(|(_, actions)| {
-                actions.iter().any(|action| {
-                    matches!(
-                        action,
-                        PimdirAction::Update { .. }
-                            | PimdirAction::Remove { .. }
-                            | PimdirAction::Move { .. }
-                    )
-                })
-            })
-            .map(|(seq, _)| *seq)
-            .collect();
-        for seq in updated {
-            let Some(item) = self.committed_item(collection, seq)? else {
-                continue;
-            };
-            if let Some(standing) = self.standing(collection, &item.link_id)? {
-                pending.standing.insert(seq, standing);
-            }
-        }
         Ok(pending)
+    }
+
+    /// Folds `item` of `collection` as [`fold`] does, reading the conflicts
+    /// it stands in only when an `update`, a `remove` or a `move` pending on
+    /// it meets them (§15.3), so a read pays for the items it shows alone.
+    fn folded(
+        &self,
+        collection: &str,
+        item: PimdirItem,
+        edits: Option<&Vec<PimdirAction>>,
+    ) -> Result<Option<PimdirItem>, PimdirError> {
+        let meets = edits.into_iter().flatten().any(|action| {
+            matches!(
+                action,
+                PimdirAction::Update { .. }
+                    | PimdirAction::Remove { .. }
+                    | PimdirAction::Move { .. }
+            )
+        });
+        let standing = match meets {
+            true => self.standing(collection, &item.link_id)?,
+            false => None,
+        };
+        Ok(fold(item, edits, standing.as_ref()))
     }
 
     /// The conflicts the item `link` of `collection` stands in, `None`
@@ -2289,7 +2285,7 @@ impl PimdirReader {
         {
             let source = self.pending(from)?;
             let edits = source.edits.get(&seq);
-            if fold(item.clone(), edits, source.standing.get(&seq)).is_some() {
+            if self.folded(from, item.clone(), edits)?.is_some() {
                 return Ok(None);
             }
         }
@@ -2303,7 +2299,7 @@ impl PimdirReader {
             let Some(item) = self.arrival(from, *seq, *moved)? else {
                 continue;
             };
-            if let Some(item) = fold(item, pending.edits.get(seq), pending.standing.get(seq)) {
+            if let Some(item) = fold(item, pending.edits.get(seq), None) {
                 items.push(item);
             }
         }
@@ -2340,14 +2336,13 @@ impl PimdirReader {
 
         let pending = self.pending(collection)?;
         let page = fetch(limit + pending.removals())?;
-        let mut items: Vec<PimdirItem> = page
-            .into_iter()
-            .filter_map(|item| {
-                let edits = pending.edits.get(&item.seq);
-                let standing = pending.standing.get(&item.seq);
-                fold(item, edits, standing)
-            })
-            .collect();
+        let mut items = Vec::with_capacity(page.len());
+        for item in page {
+            let edits = pending.edits.get(&item.seq);
+            if let Some(item) = self.folded(collection, item, edits)? {
+                items.push(item);
+            }
+        }
 
         for item in self.arrived(&pending)? {
             if inside(&item) && !items.iter().any(|held| held.seq == item.seq) {

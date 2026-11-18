@@ -787,10 +787,8 @@ impl PimdirIndex {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
         let mut compiled = self.compile(query, now, &zone)?;
-        let found = self.found(&mut compiled, options.sort)?;
-        let rest = Self::from_cursor(&found, options.after.as_ref(), options.sort);
-        let page = &rest[..rest.len().min(options.limit)];
-        let more = rest.len() > options.limit;
+        let found = self.unsorted(&mut compiled, options.sort)?;
+        let (page, more) = Self::page(found, options.after.as_ref(), options.sort, options.limit);
         let next = match more {
             true => page
                 .last()
@@ -801,7 +799,7 @@ impl PimdirIndex {
 
         let mut hits = Vec::new();
         for hit in page {
-            hits.push(self.hit(hit.clone(), &compiled.probes, &compiled.words)?);
+            hits.push(self.hit(hit, &compiled.probes, &compiled.words)?);
         }
 
         Ok(PimdirSearchOutput {
@@ -1099,12 +1097,25 @@ impl PimdirIndex {
         compiled: &mut Compiled,
         sort: PimdirSearchSort,
     ) -> Result<Vec<Found>, PimdirError> {
+        let mut found = self.unsorted(compiled, sort)?;
+        found.sort_by(|left, right| left.place.compare(&right.place, sort));
+
+        Ok(found)
+    }
+
+    /// Every hit of a compiled query with its place in `sort` order, in no
+    /// order.
+    fn unsorted(
+        &self,
+        compiled: &mut Compiled,
+        sort: PimdirSearchSort,
+    ) -> Result<Vec<Found>, PimdirError> {
         let sql = compiled.select(sort, None);
         trace!("search statement: {sql}");
 
         // NOTE: prepared uncached, its text being this query's alone.
         let mut statement = self.conn.prepare(&sql).map_err(unanswerable)?;
-        let mut found = statement
+        let found = statement
             .query_map(params_from_iter(compiled.params.iter()), |row| {
                 let account = row.get::<_, Option<String>>(0)?;
                 let title = row.get::<_, String>(5)?;
@@ -1127,21 +1138,35 @@ impl PimdirIndex {
             })
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
             .map_err(unanswerable)?;
-        found.sort_by(|left, right| left.place.compare(&right.place, sort));
 
         Ok(found)
     }
 
-    /// The hits of `found`, in order, from the one following `after`.
-    fn from_cursor<'a>(
-        found: &'a [Found],
+    /// The first `limit` hits of `found` following `after`, in `sort`
+    /// order, and whether more follow: the page is selected before it is
+    /// sorted, so a hit it skips costs a comparison or two and only the
+    /// page is sorted.
+    fn page(
+        found: Vec<Found>,
         after: Option<&PimdirSearchCursor>,
         sort: PimdirSearchSort,
-    ) -> &'a [Found] {
-        let start = after.map_or(0, |after| {
-            found.partition_point(|hit| hit.place.compare(after, sort) != Ordering::Greater)
-        });
-        &found[start..]
+        limit: usize,
+    ) -> (Vec<Found>, bool) {
+        let order = |left: &Found, right: &Found| left.place.compare(&right.place, sort);
+        let mut rest: Vec<Found> = found
+            .into_iter()
+            .filter(|hit| {
+                after.is_none_or(|after| hit.place.compare(after, sort) == Ordering::Greater)
+            })
+            .collect();
+
+        let more = rest.len() > limit;
+        if more {
+            rest.select_nth_unstable_by(limit, order);
+            rest.truncate(limit);
+        }
+        rest.sort_by(order);
+        (rest, more)
     }
 
     /// One hit, `(account, seq)`, as an answer carries it: its kind, title
@@ -1909,5 +1934,54 @@ fn unanswerable(err: rusqlite::Error) -> PimdirError {
     match busy_or_sql(err) {
         PimdirError::Sql(err) => PimdirError::Unanswerable(err),
         err => err,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::search::*;
+
+    /// A page selected then sorted is the slice of the whole answer sorted
+    /// after the cursor, in every order, at every cursor and limit, ties
+    /// on every key but the public id included.
+    #[test]
+    fn a_page_is_the_slice_of_the_sorted_answer_after_its_cursor() {
+        let found: Vec<Found> = (0..40i64)
+            .map(|n| {
+                let seq = (n * 17) % 40;
+                Found {
+                    account: None,
+                    seq,
+                    place: PimdirSearchCursor {
+                        undated: n % 7 == 0,
+                        sort_key: (n % 5 != 0).then(|| format!("{:02}", n % 3)),
+                        rank: (n % 4 != 0).then_some((n % 6) as u64),
+                        title: format!("t{}", n % 4),
+                        seq,
+                        account: String::new(),
+                    },
+                }
+            })
+            .collect();
+
+        for sort in [
+            PimdirSearchSort::Date,
+            PimdirSearchSort::Relevance,
+            PimdirSearchSort::Name,
+        ] {
+            let mut sorted = found.clone();
+            sorted.sort_by(|left, right| left.place.compare(&right.place, sort));
+            let cursors = core::iter::once(None).chain(sorted.iter().map(|hit| Some(&hit.place)));
+            for (at, after) in cursors.enumerate() {
+                for limit in [0, 1, 3, 40] {
+                    let (page, more) = PimdirIndex::page(found.clone(), after, sort, limit);
+                    let rest = &sorted[at..];
+                    let want: Vec<i64> = rest.iter().take(limit).map(|hit| hit.seq).collect();
+                    let got: Vec<i64> = page.iter().map(|hit| hit.seq).collect();
+                    assert_eq!(got, want, "{sort:?} after {at} by {limit}");
+                    assert_eq!(more, rest.len() > limit, "{sort:?} after {at} by {limit}");
+                }
+            }
+        }
     }
 }
