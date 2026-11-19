@@ -72,10 +72,10 @@ fn main() {
 
     let cli = Cli::parse();
 
-    Logger::try_init(&cli.log).expect("init logger");
     let mut printer = StdoutPrinter::new(&cli.json);
 
-    let result = cli.command.execute(&mut printer, &cli.store);
+    let result =
+        Logger::try_init(&cli.log).and_then(|()| cli.command.execute(&mut printer, &cli.store));
     ErrorReport::<ErrorCode>::eval_coded(&mut printer, result)
 }
 

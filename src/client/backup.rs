@@ -41,7 +41,8 @@ use crate::{
     client::{
         PimdirError, PimdirStore, PreparedCached,
         blobs::{
-            self, PimdirBlobCheck, PimdirBlobFile, PimdirBlobStrayKind, PimdirBlobs, sync_dir,
+            self, PimdirBlobCheck, PimdirBlobFile, PimdirBlobFiled, PimdirBlobMove,
+            PimdirBlobStrayKind, PimdirBlobs, sync_dir,
         },
         lock::PimdirLock,
         modes, prepare_connection,
@@ -693,15 +694,19 @@ fn stage_copy(from: &Path, to: &Path) -> io::Result<(PathBuf, u64, PimdirHash)> 
     }
 }
 
-/// Moves the temporary `tmp` onto `to` without replacing a file there,
-/// `link(2)` then `unlink(2)` of the temporary (§5), answering whether it
-/// took the name; the temporary is unlinked either way.
+/// Moves the temporary `tmp` onto `to` without replacing a file there, by
+/// [`PimdirBlobMove`] (§5), answering whether it took the name; the
+/// temporary is gone either way.
 fn settle_copy(tmp: &Path, to: &Path) -> io::Result<bool> {
-    let linked = fs::hard_link(tmp, to);
-    let _ = fs::remove_file(tmp);
-    match linked {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(err),
+    match PimdirBlobMove::default().run(tmp, to) {
+        Ok(PimdirBlobFiled::Moved) => Ok(true),
+        Ok(PimdirBlobFiled::Held) => {
+            let _ = fs::remove_file(tmp);
+            Ok(false)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(tmp);
+            Err(err)
+        }
     }
 }

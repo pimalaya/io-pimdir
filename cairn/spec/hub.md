@@ -137,6 +137,12 @@ Flags are unaffected (element-wise, never conflicting).
 - WHEN that edit is absorbed
 - THEN the ancestor becomes the shared body, the source having spoken even though its body is the one it last synced
 
+### Requirement: The merge verdict is public
+`PimdirHubItem::reconcile(source, placement, policy)` SHALL be the one implementation of the three facts and the two rules above: I/O-free, it moves the item's body and conflict and answers a `PimdirHubVerdict` (`diverged`, `kept_shared`, `lost` as a `PimdirHubLoser` with its `PimdirHubLoserSide`: `Shared`, `Incoming` or `Diverging`, `unsummarized`). `absorb` SHALL call it for every live upsert but a person's settle, so a storage applying upserts itself (the Android app) reads the same verdict from its own copy of the item, rather than restating the rules.
+
+#### Scenario: Each policy loses the body it does not adopt
+- tests/hub_reconcile.rs `two_read_bodies_lose_the_one_the_policy_does_not_adopt`, `an_unread_body_diverges_whatever_the_policy`, `a_fill_settles_the_conflict_recorded_without_it`
+
 ### Requirement: A per-source content conflict round-trips through the hub
 `PimdirBinding` SHALL carry a `conflicted` flag and a `conflict_revision`, recording that **this source and its own remote** diverged and the merge left the placement `Conflict`. This is a distinct fact from the item-level cross-source conflict above, one saying "left and its server disagree" and the other "left and right disagree", and a two-source store needs both independently; neither SHALL set the other. The projection reads both, a binding's conflict carrying its revision and the item's carrying none, which is how a consumer tells them apart.
 

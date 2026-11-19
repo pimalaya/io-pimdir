@@ -338,3 +338,6 @@ Every text output SHALL pass a string the store holds through `pimalaya_cli::san
 
 ### Requirement: An exported body is the store's user's alone
 `item export --output` SHALL create its file `0600` (STORAGE §18), as `export` creates its dump: it holds what the store holds.
+
+### Requirement: A logger failing to start is an error
+The `pimdir` binary SHALL start its logger inside the command's result, so a `--log-file` it cannot open is reported on the output contract, exit 1, never a panic (tests/cli_json.rs `an_unopenable_log_file_is_an_error_not_a_panic`).

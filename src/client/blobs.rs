@@ -29,7 +29,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use log::warn;
+use log::{trace, warn};
 
 use crate::{
     change::PimdirWriteOp,
@@ -47,6 +47,11 @@ const QUARANTINE: &str = "quarantine";
 
 /// How many bytes a whole read hashes at a time.
 const CHUNK: usize = 64 * 1024;
+
+/// How many times an exclusive copy files again a name moved away while it
+/// copied (§5).
+#[cfg(unix)]
+const CLAIMS_MAX: usize = 3;
 
 /// A read-only handle over a store's blob directory (STORAGE §5).
 ///
@@ -316,8 +321,8 @@ impl PimdirBlobs {
 
     /// Writes a body without ever replacing a file (§5): a temporary file
     /// named uniquely to this writer in the shard directory, `fsync`, a
-    /// hard link onto the final name, then the temporary unlinked and the
-    /// shard directory flushed, objects/ too when the shard is new.
+    /// [`PimdirBlobMove`] onto the final name, then the shard directory
+    /// flushed, objects/ too when the shard is new.
     ///
     /// A name already taken is verified (§5): a file hashing to it is kept,
     /// the write skipped and the shard directory flushed all the same, the
@@ -416,29 +421,28 @@ impl PimdirBlobs {
     }
 
     /// Moves a written temporary onto its final name without replacing a
-    /// file there, `link(2)` then `unlink(2)` of the temporary (§5); the
-    /// caller flushes the shard directory, whichever way the name came to
-    /// hold the body. A name already taken is verified (§5): a file
-    /// hashing to it is kept and the temporary unlinked; one failing it
-    /// fails the move ([`held_name`]), the temporary left in place for
-    /// the caller to unlink, or to move again once the owner set the file
-    /// aside. Any other failure unlinks it.
+    /// file there, by [`PimdirBlobMove`] (§5); the caller flushes the
+    /// shard directory, whichever way the name came to hold the body. A
+    /// name already taken is verified (§5): a file hashing to it is kept
+    /// and the temporary unlinked; one failing it fails the move
+    /// ([`held_name`]), the temporary left in place for the caller to
+    /// unlink, or to move again once the owner set the file aside. A name
+    /// found held, then gone before its check, is moved to again, once.
+    /// Any other failure unlinks the temporary.
     fn settle(&self, hash: &PimdirHash, tmp: &Path, path: &Path) -> io::Result<()> {
-        // NOTE: a name found held, then gone before its check, is linked
-        // again, once.
         let mut tries = 2;
         loop {
             tries -= 1;
-            match fs::hard_link(tmp, path) {
-                Ok(()) => break,
-                Err(err) if err.kind() == ErrorKind::AlreadyExists => match self.check(hash)? {
+            match PimdirBlobMove::default().run(tmp, path) {
+                Ok(PimdirBlobFiled::Moved) => return Ok(()),
+                Ok(PimdirBlobFiled::Held) => match self.check(hash)? {
                     PimdirBlobCheck::Sound => {
                         let _ = fs::remove_file(tmp);
                         return Ok(());
                     }
                     PimdirBlobCheck::Failing => return Err(held(hash)),
                     PimdirBlobCheck::Missing if tries > 0 => continue,
-                    PimdirBlobCheck::Missing => return Err(err),
+                    PimdirBlobCheck::Missing => return Err(ErrorKind::AlreadyExists.into()),
                 },
                 Err(err) => {
                     let _ = fs::remove_file(tmp);
@@ -446,7 +450,6 @@ impl PimdirBlobs {
                 }
             }
         }
-        fs::remove_file(tmp)
     }
 
     /// Makes sure `shard` is a directory, answering whether it created it:
@@ -818,6 +821,52 @@ impl Drop for PimdirBlobWriter {
     }
 }
 
+/// A move of a written file onto a body's name that never replaces a file
+/// there (STORAGE §5): `renameat2` with `RENAME_NOREPLACE` (`renameatx_np`
+/// with `RENAME_EXCL` on Apple), else `link(2)` then `unlink(2)`, else, on
+/// Unix where the link is denied, an exclusive create and copy.
+///
+/// Every write of the store moves its temporary so; an app writing bodies
+/// itself moves them through [`run`](Self::run).
+#[derive(Clone, Copy, Debug)]
+pub struct PimdirBlobMove {
+    /// Whether the move may call `renameat2`: false where a system call
+    /// filter ends the process on it (Android before API 30).
+    pub renameat2: bool,
+}
+
+impl Default for PimdirBlobMove {
+    fn default() -> Self {
+        Self { renameat2: true }
+    }
+}
+
+impl PimdirBlobMove {
+    /// Moves `from` onto `to` unless a name holds `to`, a link included,
+    /// never replacing it. A name held answers [`PimdirBlobFiled::Held`],
+    /// `from` left where it was, for the caller to verify what holds the
+    /// name (§5) before deleting `from`.
+    pub fn run(&self, from: &Path, to: &Path) -> io::Result<PimdirBlobFiled> {
+        match self.renameat2 {
+            true => file(from, to, renameat2, |from, to| fs::hard_link(from, to)),
+            false => {
+                let refused =
+                    |_: &Path, _: &Path| -> io::Result<()> { Err(ErrorKind::Unsupported.into()) };
+                file(from, to, refused, |from, to| fs::hard_link(from, to))
+            }
+        }
+    }
+}
+
+/// What a [`PimdirBlobMove`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PimdirBlobFiled {
+    /// The moved file now holds the name.
+    Moved,
+    /// The name was already held, and kept: the file is where it was.
+    Held,
+}
+
 /// What sits where a body belongs, opened without following a link.
 enum PimdirBlobOpen {
     /// A regular file, open.
@@ -899,6 +948,146 @@ fn set_aside(blobs: &PimdirBlobs, lock: &PimdirLock, hash: &PimdirHash) -> io::R
         );
     }
     Ok(moved.is_some())
+}
+
+/// [`PimdirBlobMove::run`] through `rename`, a rename refusing a name
+/// held, then `link`, then on Unix an exclusive create and copy.
+fn file(
+    from: &Path,
+    to: &Path,
+    rename: fn(&Path, &Path) -> io::Result<()>,
+    link: fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PimdirBlobFiled> {
+    match rename(from, to) {
+        Ok(()) => return Ok(PimdirBlobFiled::Moved),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(PimdirBlobFiled::Held),
+        Err(err) if !unsupported(&err) => return Err(err),
+        Err(err) => trace!("no-replace rename unavailable, linking: {err}"),
+    }
+
+    match link(from, to) {
+        Ok(()) => {
+            fs::remove_file(from)?;
+            Ok(PimdirBlobFiled::Moved)
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(PimdirBlobFiled::Held),
+        #[cfg(unix)]
+        Err(err) if denied(&err) => {
+            trace!("link denied, copying exclusively: {err}");
+            claimed(from, to)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Files `from`'s bytes under `to` by creating `to` exclusively
+/// (`O_CREAT | O_EXCL`, mode `0600`), copying them into it a buffer at a
+/// time and syncing it, then unlinking `from` (§5). The exclusive create
+/// fails on any name held, a link included, so nothing is replaced.
+///
+/// Not atomic: until the copy is synced the name holds part of the bytes,
+/// which a read finds failing its name (§7). A copy failing unlinks the
+/// part it wrote while the name still holds it; one whose name was moved
+/// away meanwhile is filed again, [`CLAIMS_MAX`] times.
+#[cfg(unix)]
+fn claimed(from: &Path, to: &Path) -> io::Result<PimdirBlobFiled> {
+    let mut source = fs::File::open(from)?;
+    let mut buffer = vec![0; CHUNK];
+
+    for _ in 0..CLAIMS_MAX {
+        let mut target = match modes::options().write(true).create_new(true).open(to) {
+            Ok(target) => target,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                return Ok(PimdirBlobFiled::Held);
+            }
+            Err(err) => return Err(err),
+        };
+        let ours = target.metadata()?;
+
+        source.seek(io::SeekFrom::Start(0))?;
+        let copied = (|| {
+            loop {
+                match source.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => target.write_all(&buffer[..read])?,
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            target.sync_all()
+        })();
+
+        if let Err(err) = copied {
+            if holds(to, &ours) {
+                let _ = fs::remove_file(to);
+            }
+            return Err(err);
+        }
+
+        if holds(to, &ours) {
+            let _ = fs::remove_file(from);
+            return Ok(PimdirBlobFiled::Moved);
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "{} was moved away while its bytes were copied",
+        to.display()
+    )))
+}
+
+/// Whether `path` names the file `ours` describes, following no link.
+#[cfg(unix)]
+fn holds(path: &Path, ours: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    fs::symlink_metadata(path)
+        .is_ok_and(|held| held.dev() == ours.dev() && held.ino() == ours.ino())
+}
+
+/// Whether a failed no-replace rename says the platform, the kernel, the
+/// file system or a system call filter lacks or refuses it (`ENOSYS`,
+/// `EINVAL`, `EOPNOTSUPP`, `EPERM`), rather than refusing this move.
+#[cfg(unix)]
+fn unsupported(err: &io::Error) -> bool {
+    use rustix::io::Errno;
+
+    denied(err) || Errno::from_io_error(err).is_some_and(|errno| errno == Errno::INVAL)
+}
+
+/// Whether a failed no-replace rename says the platform lacks it.
+#[cfg(not(unix))]
+fn unsupported(err: &io::Error) -> bool {
+    err.kind() == ErrorKind::Unsupported
+}
+
+/// Whether a failed move says the call is denied or unsupported there, as
+/// an Android app's SELinux policy denies `link(2)` on its own files.
+#[cfg(unix)]
+fn denied(err: &io::Error) -> bool {
+    use rustix::io::Errno;
+
+    let kind = err.kind();
+    kind == ErrorKind::Unsupported
+        || kind == ErrorKind::PermissionDenied
+        || Errno::from_io_error(err)
+            .is_some_and(|errno| errno == Errno::NOTSUP || errno == Errno::OPNOTSUPP)
+}
+
+/// `renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE)`, as a raw
+/// system call on Linux and Android, `renameatx_np` with `RENAME_EXCL` on
+/// Apple.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn renameat2(from: &Path, to: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    Ok(renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)?)
+}
+
+/// No no-replace rename elsewhere: the link runs.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn renameat2(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(ErrorKind::Unsupported.into())
 }
 
 /// Whether a directory name is a shard's: two characters of the name
@@ -993,4 +1182,162 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use alloc::{format, vec::Vec};
+
+    use std::{
+        fs, io,
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+        path::Path,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    use crate::client::blobs::{PimdirBlobFiled, PimdirBlobMove, claimed, file};
+
+    fn refused(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn denied(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+
+    fn linked(from: &Path, to: &Path) -> io::Result<()> {
+        fs::hard_link(from, to)
+    }
+
+    /// A free name takes the source itself, whichever move runs, and the
+    /// source is gone.
+    #[test]
+    fn a_free_name_takes_the_source() {
+        for renameat2 in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (from, to) = (dir.path().join(".x.tmp"), dir.path().join("x"));
+            fs::write(&from, b"body").unwrap();
+            let source = fs::metadata(&from).unwrap().ino();
+
+            let filed = PimdirBlobMove { renameat2 }.run(&from, &to).unwrap();
+            assert_eq!(filed, PimdirBlobFiled::Moved);
+            assert_eq!(fs::metadata(&to).unwrap().ino(), source);
+            assert_eq!(fs::read(&to).unwrap(), b"body");
+            assert!(!from.exists());
+        }
+    }
+
+    /// A name held, a link included, is never replaced nor followed, on
+    /// every path: the source stays for the caller (STORAGE §5).
+    #[test]
+    fn a_held_name_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join(".x.tmp");
+        fs::write(&from, b"new").unwrap();
+        let held = dir.path().join("held");
+        fs::write(&held, b"held").unwrap();
+        let link = dir.path().join("link");
+        symlink(dir.path().join("nowhere"), &link).unwrap();
+
+        for to in [&held, &link] {
+            for renameat2 in [true, false] {
+                let filed = PimdirBlobMove { renameat2 }.run(&from, to).unwrap();
+                assert_eq!(filed, PimdirBlobFiled::Held);
+            }
+            assert_eq!(
+                file(&from, to, refused, denied).unwrap(),
+                PimdirBlobFiled::Held
+            );
+            assert_eq!(fs::read(&from).unwrap(), b"new");
+        }
+        assert_eq!(fs::read(&held).unwrap(), b"held");
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
+
+    /// Where the rename is unavailable and `link(2)` denied, as for an
+    /// Android app, the body is filed by an exclusive create and copy: a
+    /// file of its own, `0600`, holding every byte, the source gone.
+    #[test]
+    fn a_denied_link_files_by_an_exclusive_copy() {
+        let body: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join(".x.tmp"), dir.path().join("x"));
+        fs::write(&from, &body).unwrap();
+        let source = fs::metadata(&from).unwrap().ino();
+
+        assert_eq!(
+            file(&from, &to, refused, denied).unwrap(),
+            PimdirBlobFiled::Moved
+        );
+        let filed = fs::symlink_metadata(&to).unwrap();
+        assert_ne!(filed.ino(), source);
+        assert_eq!(filed.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&to).unwrap(), body);
+        assert!(!from.exists());
+    }
+
+    /// An unavailable rename falls back to the link, which keeps the
+    /// source's file.
+    #[test]
+    fn an_unavailable_rename_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join(".x.tmp"), dir.path().join("x"));
+        fs::write(&from, b"body").unwrap();
+        let source = fs::metadata(&from).unwrap().ino();
+
+        assert_eq!(
+            file(&from, &to, refused, linked).unwrap(),
+            PimdirBlobFiled::Moved
+        );
+        assert_eq!(fs::metadata(&to).unwrap().ino(), source);
+        assert!(!from.exists());
+    }
+
+    /// Writers racing for one name through the exclusive copy: one files
+    /// it, every other finds it held, and the name holds the bytes of the
+    /// one that filed it.
+    #[test]
+    fn racing_copies_never_replace() {
+        const WRITERS: usize = 8;
+
+        for round in 0..100 {
+            let dir = tempfile::tempdir().unwrap();
+            let to = dir.path().join("x");
+            let barrier = Arc::new(Barrier::new(WRITERS));
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let from = dir.path().join(format!(".x.{writer}.tmp"));
+                    fs::write(&from, format!("writer {writer}")).unwrap();
+                    let (to, barrier) = (to.clone(), Arc::clone(&barrier));
+                    thread::spawn(move || {
+                        barrier.wait();
+                        (writer, claimed(&from, &to).unwrap())
+                    })
+                })
+                .collect();
+
+            let filed: Vec<usize> = writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap())
+                .filter(|(_, filed)| *filed == PimdirBlobFiled::Moved)
+                .map(|(writer, _)| writer)
+                .collect();
+
+            assert_eq!(filed.len(), 1, "round {round}: {filed:?}");
+            let held = format!("writer {}", filed[0]);
+            assert_eq!(fs::read_to_string(&to).unwrap(), held, "round {round}");
+        }
+    }
+
+    /// A missing source fails every path and claims no name.
+    #[test]
+    fn a_missing_source_claims_no_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("gone"), dir.path().join("x"));
+
+        assert!(PimdirBlobMove::default().run(&from, &to).is_err());
+        assert!(file(&from, &to, refused, denied).is_err());
+        assert!(!to.exists());
+    }
 }

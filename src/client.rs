@@ -875,6 +875,50 @@ impl PimdirStore {
         Ok(true)
     }
 
+    /// Purges the retained items `items` names by collection and public id
+    /// in one transaction, as [`purge`](Self::purge) does each, answering
+    /// how many there were: an owner sweeping one account's retention
+    /// commits once, not once an item. A live or missing item is skipped.
+    ///
+    /// A purge that removed rows gives a bounded number of the pages they
+    /// freed back to the filesystem (§4.1).
+    pub fn purge_items<'a>(
+        &mut self,
+        items: impl IntoIterator<Item = (&'a str, i64)>,
+    ) -> Result<PimdirPurgeReport, PimdirError> {
+        let tx = begin(&mut self.reader.conn, &self.lock)?;
+
+        let mut pinned = Vec::new();
+        {
+            let mut purge = tx.prepare_cached(sql::PURGE_ITEM)?;
+            for (collection, seq) in items {
+                let row = purge
+                    .query_row(
+                        named_params! { ":collection": collection, ":seq": seq },
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                pinned.extend(row);
+            }
+        }
+
+        let items = pinned.len();
+        release_pins(
+            &tx,
+            pinned
+                .into_iter()
+                .flat_map(|(object, conflict): (Option<String>, Option<String>)| [object, conflict])
+                .flatten(),
+        )?;
+        tx.commit().map_err(busy_or_sql)?;
+        debug!("purge {items} retained item(s)");
+        if items > 0 {
+            vacuum(&self.conn);
+        }
+
+        Ok(PimdirPurgeReport { items })
+    }
+
     /// Purges every item retired strictly before `cutoff` (RFC 3339),
     /// store-wide: the cutoff is the caller's policy, never the store's clock.
     ///

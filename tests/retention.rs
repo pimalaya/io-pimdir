@@ -396,6 +396,59 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
 }
 
 #[test]
+fn purge_items_purges_the_retained_ones_in_one_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let hashes = [
+        "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
+        "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+        "facefacefacefacefacefacefacefacefacefacefacefaceface",
+    ];
+    let mut ops = Vec::new();
+    for (n, hash) in hashes.iter().enumerate() {
+        ops.push(store_object(hash, format!("body {n}").as_bytes()));
+        ops.push(PimdirWriteOp::UpsertPlacement(placement(
+            &n.to_string(),
+            &format!("mid:{n}"),
+            hash,
+            &[],
+        )));
+    }
+    store.write(ops).unwrap();
+    let seqs: Vec<i64> = store
+        .list_items("INBOX", None, 10)
+        .unwrap()
+        .iter()
+        .map(|item| item.seq)
+        .collect();
+    store
+        .write(vec![drop_placement("0"), drop_placement("2")])
+        .unwrap();
+
+    let report = store
+        .purge_items([
+            ("INBOX", seqs[0]),
+            ("INBOX", seqs[1]),
+            ("INBOX", seqs[2]),
+            ("INBOX", 999_999),
+            ("Other", seqs[0]),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        report.items, 2,
+        "the live, missing and foreign ones skipped"
+    );
+    assert_eq!(store.count_retained(inbox()).unwrap(), 0);
+    assert!(store.get_item("INBOX", seqs[1]).unwrap().is_some());
+    assert_eq!(store.collect_garbage().unwrap().blobs, 2);
+    assert!(!blob_exists(dir.path(), hashes[0]));
+    assert!(blob_exists(dir.path(), hashes[1]));
+    assert!(!blob_exists(dir.path(), hashes[2]));
+    assert_eq!(store.purge_items([("INBOX", seqs[0])]).unwrap().items, 0);
+}
+
+#[test]
 fn purge_retained_before_respects_the_cutoff_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");

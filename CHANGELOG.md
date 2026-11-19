@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `client::blobs::PimdirBlobMove`, the move of a written body onto its name that never replaces a file, for an app writing bodies itself.
+- Added `client::blobs::PimdirBlobFiled`, what a `PimdirBlobMove` did.
+- Added `PimdirStore::purge_items`, purging chosen retained items in one transaction.
+- Added `hub::PimdirHubItem::reconcile`, the cross-source merge of one upsert, for a storage applying upserts itself.
+- Added `hub::PimdirHubVerdict`, what `reconcile` decided: a divergence, the body kept, the body lost.
+- Added `hub::PimdirHubLoser`, a body a policy did not adopt.
+- Added `hub::PimdirHubLoserSide`, which body it was.
+
+### Changed
+
+- Changed the blob move to `renameat2` with `RENAME_NOREPLACE` (`renameatx_np` with `RENAME_EXCL` on Apple), falling back to `link(2)`, then on Unix to an exclusive create and copy where the link is denied.
+
+  A store an Android app writes, its SELinux policy denying `link(2)`, is filed by the same move as any other.
+
+### Fixed
+
+- Fixed `pimdir` panicking (exit 101, nothing printed) on a `--log-file` it cannot open: the error is reported on the output contract, exit 1.
+
 ## [0.17.0] - 2026-11-18
 
 ### Added

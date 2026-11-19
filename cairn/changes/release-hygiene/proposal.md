@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: release-hygiene
-status: active
+status: landed
 created: 2026-10-30
 ---
 

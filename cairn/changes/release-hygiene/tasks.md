@@ -10,6 +10,6 @@ change: release-hygiene
 - [x] Cargo.toml: `exclude` the agent, deny and nix files (`cargo package --list` checked)
 - [x] Cargo.lock: `cargo update -p libz-sys` (1.1.29 to 1.1.31); `cargo deny --all-features check` passes
 - [x] .github/workflows/tests.yml: pimdir checked out at the spec tag the crate claims (`storage-draft-07`, 2026-10-31)
-- [ ] Cargo.toml: `[patch]` dropped once ical-rs and pimalaya-cli are released (the user's)
-- [ ] CHANGELOG [Unreleased] read again as a net diff before the release
-- [ ] Log, CHANGELOG (the package `exclude` entry is in; the rest is CI and lockfile, no entry)
+- [x] Cargo.toml: `[patch]` dropped once ical-rs and pimalaya-cli are released (the user's): dropped in 3494c25 (2026-11-15), ical-rs 0.7.1 and pimalaya-cli 0.6.0 from crates.io (Cargo.lock), no git source left
+- [x] CHANGELOG [Unreleased] read again as a net diff before the release: released as 0.16.0 and 0.17.0, [Unreleased] empty at e78ef92 (2026-11-19)
+- [x] Log, CHANGELOG (the package `exclude` entry is in; the rest is CI and lockfile, no entry)

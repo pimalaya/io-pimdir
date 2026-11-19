@@ -110,9 +110,9 @@ impl PimdirLinkId {
     /// key; `None` for a key minted over any other handle.
     ///
     /// The one recognition of a create's identity: the engine finds the
-    /// create a listed hint lands by it, and [`is_landable`]
-    /// (Self::is_landable) reads it, as the canonical `origin_for_link` and
-    /// `destination_for_link` read the same key.
+    /// create a listed hint lands by it, and
+    /// [`is_landable`](Self::is_landable) reads it, as the canonical
+    /// `origin_for_link` and `destination_for_link` read the same key.
     pub fn landed_hint(&self) -> Option<&str> {
         if !self.is_minted() {
             return Some(self.as_str());

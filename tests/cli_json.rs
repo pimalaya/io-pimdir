@@ -230,3 +230,17 @@ fn a_check_leaving_a_problem_exits_3() {
     assert_eq!(status, 3, "{found}");
     assert_eq!(found["quarantined"].as_array().unwrap().len(), 1);
 }
+
+/// A log file the binary cannot open is an error on the output contract,
+/// exit 1, never a panic (exit 101) printing nothing.
+#[test]
+fn an_unopenable_log_file_is_an_error_not_a_panic() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("missing").join("pimdir.log");
+
+    let (status, output) = pimdir(dir.path(), &["--log-file", log.to_str().unwrap(), "check"]);
+
+    assert_eq!(status, 1, "{output}");
+    assert!(output.get("error").is_some(), "{output}");
+}

@@ -124,6 +124,150 @@ impl PimdirHubItem {
         }
     }
 
+    /// Reconciles the shared body against an incoming upsert by policy,
+    /// the cross-source merge of SYNC §9, I/O-free: the item takes the
+    /// body and conflict it settles on, the verdict says what it lost.
+    ///
+    /// Three facts, read before the upsert applies (SYNC §9): the source
+    /// edited when the upsert differs from the base its binding held, or
+    /// it leaves a conflict whatever body it restates; the item changed
+    /// when the shared body differs from what this source last agreed
+    /// with; the two disagree when the bodies differ. An item holding no
+    /// body has changed for a binding that agreed one, and an upsert
+    /// carrying none disagrees with one the item holds. Mutable kinds
+    /// only, a revision on either base saying so: an immutable kind never
+    /// diverges, one identity being one message.
+    ///
+    /// Two rules keep every body: a body filling an item a pull emptied,
+    /// from a binding whose base names none, is adopted without measuring
+    /// a divergence; a divergence one of whose bodies nobody has read is
+    /// recorded as `Manual` records one, whatever the policy. A body a
+    /// policy does not adopt is the verdict's loser, which the storage
+    /// keeps.
+    ///
+    /// The hub calls it for every live upsert but a person's settle; a
+    /// storage applying upserts itself calls it on its own copy of the item
+    /// for the same verdict.
+    pub fn reconcile(
+        &mut self,
+        source: &PimdirSourceId,
+        placement: &PimdirPlacement,
+        policy: PimdirHubConflict,
+    ) -> PimdirHubVerdict {
+        let mut verdict = PimdirHubVerdict::default();
+
+        let binding = self.sources.get(source);
+        let prev_base = binding.and_then(|b| b.base.as_ref());
+        let prev = prev_base.and_then(|b| b.object.clone());
+        let agreed = binding
+            .and_then(|b| b.shared_object.clone())
+            .or_else(|| prev.clone());
+        let shared = self.object.clone();
+        let incoming = placement.object.clone();
+
+        let mutable = self
+            .sources
+            .values()
+            .filter_map(|b| b.base.as_ref())
+            .chain(placement.base.as_ref())
+            .any(|base| base.revision.is_some());
+        let resolving = binding.is_some_and(|binding| binding.conflicted)
+            && placement.status != PimdirStatus::Conflict;
+        let source_edited = incoming != prev || resolving;
+        let hub_moved = shared != agreed;
+        let body_changed = incoming != shared;
+
+        if !mutable {
+            if source_edited && body_changed {
+                self.object = incoming;
+                self.conflicted = false;
+                self.conflict_object = None;
+            }
+            return verdict;
+        }
+
+        // NOTE: the pull that emptied the item is the one this body was
+        // read for. An item conflict standing was recorded without it, so
+        // with both bodies read at last a `prefer-` policy settles it, the
+        // body it does not adopt kept over this binding's handle; `manual`
+        // leaves it standing.
+        if incoming.is_some() && shared.is_none() && prev.is_none() {
+            self.object = incoming.clone();
+            let diverging = self.conflict_object.clone().filter(|_| self.conflicted);
+            let settled = match (diverging, policy) {
+                (None, _) | (Some(_), PimdirHubConflict::Manual) => return verdict,
+                (Some(diverging), PimdirHubConflict::PreferIncoming) => {
+                    self.object = Some(diverging);
+                    verdict.kept_shared = true;
+                    verdict.unsummarized = true;
+                    incoming.map(|object| PimdirHubLoser {
+                        object,
+                        side: PimdirHubLoserSide::Incoming,
+                    })
+                }
+                (Some(diverging), PimdirHubConflict::PreferExisting) => Some(PimdirHubLoser {
+                    object: diverging,
+                    side: PimdirHubLoserSide::Diverging,
+                }),
+            };
+            verdict.lost = settled;
+            self.conflicted = false;
+            self.conflict_object = None;
+            return verdict;
+        }
+
+        if source_edited && hub_moved && body_changed {
+            let unread = incoming.is_none() || shared.is_none();
+            match (unread, policy) {
+                (true, _) | (false, PimdirHubConflict::Manual) => {
+                    self.conflicted = true;
+                    self.conflict_object = incoming;
+                    verdict.diverged = true;
+                    verdict.kept_shared = true;
+                }
+                (false, PimdirHubConflict::PreferIncoming) => {
+                    verdict.lost = shared.map(|object| PimdirHubLoser {
+                        object,
+                        side: PimdirHubLoserSide::Shared,
+                    });
+                    self.object = incoming;
+                    self.conflicted = false;
+                    self.conflict_object = None;
+                }
+                (false, PimdirHubConflict::PreferExisting) => {
+                    verdict.lost = incoming.map(|object| PimdirHubLoser {
+                        object,
+                        side: PimdirHubLoserSide::Incoming,
+                    });
+                    verdict.kept_shared = true;
+                    self.conflicted = false;
+                    self.conflict_object = None;
+                }
+            }
+            return verdict;
+        }
+
+        if source_edited && body_changed && !hub_moved {
+            // NOTE: a pull replacing a body the binding's base never held
+            // drops a local edit the remote never saw, which a source's
+            // `PreferRemote` decided and which is kept (SYNC §9); a local
+            // edit or a resolution moves no base revision.
+            let pulled =
+                placement.base.as_ref().map(|b| &b.revision) != prev_base.map(|b| &b.revision);
+            if pulled && !resolving && shared != prev {
+                verdict.lost = shared.map(|object| PimdirHubLoser {
+                    object,
+                    side: PimdirHubLoserSide::Shared,
+                });
+            }
+            self.object = incoming;
+            self.conflicted = false;
+            self.conflict_object = None;
+        }
+
+        verdict
+    }
+
     /// The shared half of a projection into `collection` under `handle`.
     ///
     /// Status, base and conflict fields are the binding's to settle.
@@ -550,9 +694,9 @@ impl PimdirHub {
                 item.object = placement.object.clone();
                 item.conflicted = false;
                 item.conflict_object = None;
-                PimdirVerdict::default()
+                PimdirHubVerdict::default()
             }
-            false => Self::reconcile_content(item, source, placement, policy),
+            false => item.reconcile(source, placement, policy),
         };
         // NOTE: an overruling edit restating the shared body settles the
         // item's conflict, whose diverging body it kept (SYNC §7, §9); a
@@ -586,12 +730,12 @@ impl PimdirHub {
             // NOTE: a diverging body nobody summarized is derived by the
             // storage from its bytes as it keeps it.
             let (summary, sort_key) = match lost.side {
-                PimdirLoserSide::Shared => (held_summary, held_sort_key),
-                PimdirLoserSide::Incoming => (
+                PimdirHubLoserSide::Shared => (held_summary, held_sort_key),
+                PimdirHubLoserSide::Incoming => (
                     placement.summary.clone().map(PimdirSummary::stored),
                     placement.sort_key.clone(),
                 ),
-                PimdirLoserSide::Diverging => (None, held_sort_key),
+                PimdirHubLoserSide::Diverging => (None, held_sort_key),
             };
             self.overruled.push(PimdirOverruled {
                 source: source.clone(),
@@ -650,144 +794,6 @@ impl PimdirHub {
                 .flatten(),
             shared_object,
         }
-    }
-
-    /// Reconciles the shared body against an incoming upsert by policy.
-    ///
-    /// Three facts, read before the upsert applies (SYNC §9): the source
-    /// edited when the upsert differs from the base its binding held, or
-    /// it leaves a conflict whatever body it restates; the item changed
-    /// when the shared body differs from what this source last agreed
-    /// with; the two disagree when the bodies differ. An item holding no
-    /// body has changed for a binding that agreed one, and an upsert
-    /// carrying none disagrees with one the item holds. Mutable kinds
-    /// only, a revision on either base saying so: an immutable kind never
-    /// diverges, one identity being one message.
-    ///
-    /// Two rules keep every body: a body filling an item a pull emptied,
-    /// from a binding whose base names none, is adopted without measuring
-    /// a divergence; a divergence one of whose bodies nobody has read is
-    /// recorded as `Manual` records one, whatever the policy. A body a
-    /// policy does not adopt is the verdict's loser, which the storage
-    /// keeps.
-    fn reconcile_content(
-        item: &mut PimdirHubItem,
-        source: &PimdirSourceId,
-        placement: &PimdirPlacement,
-        policy: PimdirHubConflict,
-    ) -> PimdirVerdict {
-        let mut verdict = PimdirVerdict::default();
-
-        let binding = item.sources.get(source);
-        let prev_base = binding.and_then(|b| b.base.as_ref());
-        let prev = prev_base.and_then(|b| b.object.clone());
-        let agreed = binding
-            .and_then(|b| b.shared_object.clone())
-            .or_else(|| prev.clone());
-        let shared = item.object.clone();
-        let incoming = placement.object.clone();
-
-        let mutable = item
-            .sources
-            .values()
-            .filter_map(|b| b.base.as_ref())
-            .chain(placement.base.as_ref())
-            .any(|base| base.revision.is_some());
-        let resolving = binding.is_some_and(|binding| binding.conflicted)
-            && placement.status != PimdirStatus::Conflict;
-        let source_edited = incoming != prev || resolving;
-        let hub_moved = shared != agreed;
-        let body_changed = incoming != shared;
-
-        if !mutable {
-            if source_edited && body_changed {
-                item.object = incoming;
-                item.conflicted = false;
-                item.conflict_object = None;
-            }
-            return verdict;
-        }
-
-        // NOTE: the pull that emptied the item is the one this body was
-        // read for. An item conflict standing was recorded without it, so
-        // with both bodies read at last a `prefer-` policy settles it, the
-        // body it does not adopt kept over this binding's handle; `manual`
-        // leaves it standing.
-        if incoming.is_some() && shared.is_none() && prev.is_none() {
-            item.object = incoming.clone();
-            let diverging = item.conflict_object.clone().filter(|_| item.conflicted);
-            let settled = match (diverging, policy) {
-                (None, _) | (Some(_), PimdirHubConflict::Manual) => return verdict,
-                (Some(diverging), PimdirHubConflict::PreferIncoming) => {
-                    item.object = Some(diverging);
-                    verdict.kept_shared = true;
-                    verdict.unsummarized = true;
-                    incoming.map(|object| PimdirLoser {
-                        object,
-                        side: PimdirLoserSide::Incoming,
-                    })
-                }
-                (Some(diverging), PimdirHubConflict::PreferExisting) => Some(PimdirLoser {
-                    object: diverging,
-                    side: PimdirLoserSide::Diverging,
-                }),
-            };
-            verdict.lost = settled;
-            item.conflicted = false;
-            item.conflict_object = None;
-            return verdict;
-        }
-
-        if source_edited && hub_moved && body_changed {
-            let unread = incoming.is_none() || shared.is_none();
-            match (unread, policy) {
-                (true, _) | (false, PimdirHubConflict::Manual) => {
-                    item.conflicted = true;
-                    item.conflict_object = incoming;
-                    verdict.diverged = true;
-                    verdict.kept_shared = true;
-                }
-                (false, PimdirHubConflict::PreferIncoming) => {
-                    verdict.lost = shared.map(|object| PimdirLoser {
-                        object,
-                        side: PimdirLoserSide::Shared,
-                    });
-                    item.object = incoming;
-                    item.conflicted = false;
-                    item.conflict_object = None;
-                }
-                (false, PimdirHubConflict::PreferExisting) => {
-                    verdict.lost = incoming.map(|object| PimdirLoser {
-                        object,
-                        side: PimdirLoserSide::Incoming,
-                    });
-                    verdict.kept_shared = true;
-                    item.conflicted = false;
-                    item.conflict_object = None;
-                }
-            }
-            return verdict;
-        }
-
-        if source_edited && body_changed && !hub_moved {
-            // NOTE: a pull replacing a body the binding's base never held
-            // drops a local edit the remote never saw, which a source's
-            // `PreferRemote` decided and which is kept (SYNC §9); a local
-            // edit or a resolution moves no base revision.
-            let pulled =
-                placement.base.as_ref().map(|b| &b.revision) != prev_base.map(|b| &b.revision);
-            if pulled && !resolving && shared != prev {
-                verdict.lost = shared.map(|object| PimdirLoser {
-                    object,
-                    side: PimdirLoserSide::Shared,
-                });
-            }
-            item.object = incoming;
-            item.conflicted = false;
-            item.conflict_object = None;
-        }
-
-        verdict
     }
 
     /// Keeps the diverging bodies an overruling edit settles and does not
@@ -898,30 +904,35 @@ impl PimdirHub {
     }
 }
 
-/// What the cross-source merge decided for one upsert (SYNC §9).
-#[derive(Debug, Default)]
-struct PimdirVerdict {
-    /// The upsert recorded a divergence on the item.
-    diverged: bool,
+/// What the cross-source merge decided for one upsert (SYNC §9), as
+/// [`PimdirHubItem::reconcile`] answers it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirHubVerdict {
+    /// The upsert recorded a divergence on the item, which its handle
+    /// reports as conflicted.
+    pub diverged: bool,
     /// The item kept its own body over the one the upsert carried, so its
     /// summary and sort key stay.
-    kept_shared: bool,
-    /// The body a policy did not adopt.
-    lost: Option<PimdirLoser>,
+    pub kept_shared: bool,
+    /// The body a policy did not adopt, which the storage keeps as a
+    /// retained item.
+    pub lost: Option<PimdirHubLoser>,
     /// The item adopted a body whose summary it does not hold.
-    unsummarized: bool,
+    pub unsummarized: bool,
 }
 
-/// A body a policy did not adopt, and which one it was.
-#[derive(Debug)]
-struct PimdirLoser {
-    object: PimdirHash,
-    side: PimdirLoserSide,
+/// A body a policy did not adopt, and which one it was (SYNC §9).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirHubLoser {
+    /// The body.
+    pub object: PimdirHash,
+    /// Which body it was, which says whose summary and sort key it keeps.
+    pub side: PimdirHubLoserSide,
 }
 
 /// Which body a policy did not adopt (SYNC §9).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PimdirLoserSide {
+pub enum PimdirHubLoserSide {
     /// The item's own body.
     Shared,
     /// The body the upsert carried.

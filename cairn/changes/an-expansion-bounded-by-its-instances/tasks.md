@@ -9,4 +9,4 @@ change: an-expansion-bounded-by-its-instances
 - [x] spec/ and spec/REVISION at pimdir da7e01a; the search vectors failing on d1051d8, passing now
 - [x] The PIM-15 probe timed: 138 ms in release where it took 22 s
 - [x] cairn/spec folded, the log written, CHANGELOG.md
-- [ ] pimdir pins the commit; the owner tags draft-14
+- [x] pimdir pins the commit; the owner tags draft-14: pinned at 1b34ff5 (pimdir b83ffc7), then at v0.17.0 e78ef92 (2026-11-19, uncommitted); the tags stay the owner's
