@@ -487,3 +487,37 @@ fn an_edit_that_will_park_is_not_folded() {
     let two = reader.hash(b"Subject: two\r\n\r\ntwo");
     assert_eq!(chained.object, Some(two), "an edit over a queued one is");
 }
+
+#[test]
+fn a_collection_is_quiet_until_an_action_changes_what_its_read_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let seqs = store(dir.path());
+    let quiet = |collection: &str| {
+        let reader = PimdirReader::open(dir.path()).unwrap();
+        reader.overlay_quiet(collection).unwrap()
+    };
+    assert!(quiet("INBOX"));
+    assert!(quiet("Archive"));
+
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::Copy {
+            seq: seqs[0],
+            to: PimdirCollectionId("Archive".into()),
+        },
+    );
+    assert!(quiet("INBOX"));
+    assert!(!quiet("Archive"));
+
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::SetFlags {
+            seq: seqs[1],
+            flags: PimdirFlags::from_iter(["\\Flagged"]),
+            base: None,
+        },
+    );
+    assert!(!quiet("INBOX"));
+}

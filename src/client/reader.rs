@@ -548,6 +548,15 @@ impl PimdirReader {
         self.overlay
     }
 
+    /// Whether no pending action changes what a read of `collection`
+    /// shows with the queue folded in (§15.4): no item of it restated or
+    /// taken out, none brought in. Its committed rows are then what
+    /// [`with_pending`](Self::with_pending) reads, whichever this reader is.
+    pub fn overlay_quiet(&self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
+        let pending = self.pending(collection.as_ref())?;
+        Ok(pending.edits.is_empty() && pending.arrivals.is_empty())
+    }
+
     /// The blob directory, independent of the SQLite connection.
     pub fn blobs(&self) -> PimdirBlobs {
         PimdirBlobs::open(&self.dir)
@@ -626,6 +635,23 @@ impl PimdirReader {
     /// The accounts owning at least one collection; not a configured roster.
     pub fn list_accounts(&self) -> Result<Vec<String>, PimdirError> {
         Ok(rows(&self.conn, sql::LIST_ACCOUNTS, [], |r| r.get(0))?)
+    }
+
+    /// The accounts holding collections of the media type `kind`, or of
+    /// any kind for `None`, sorted and deduplicated, `None` within for the
+    /// ungrouped (§9.2). An undeclared collection, of the empty kind,
+    /// belongs to no media type.
+    pub fn accounts_of(&self, kind: Option<&str>) -> Result<Vec<Option<String>>, PimdirError> {
+        let mut accounts: Vec<Option<String>> = self
+            .list_collections()?
+            .into_iter()
+            .filter(|held| kind.is_none_or(|kind| collection::media_type(&held.kind) == kind))
+            .map(|held| held.account)
+            .collect();
+
+        accounts.sort();
+        accounts.dedup();
+        Ok(accounts)
     }
 
     /// A collection's handle-space epoch (§12), `None` for an unknown one.
@@ -733,18 +759,17 @@ impl PimdirReader {
         let kind = self.collection_kind(collection)?.unwrap_or_default();
         let tables = tables_of(&kind);
         let descending = kind.starts_with("message/rfc822");
-        let statements: Vec<(&str, PimdirSummaryTable)> =
-            match kind.split(';').next().unwrap_or_default().trim() {
-                "message/rfc822" => vec![(sql::LIST_MAIL_PAGE_DESC, PimdirSummaryTable::Mail)],
-                "text/vcard" => vec![(sql::LIST_CONTACTS_PAGE_ASC, PimdirSummaryTable::Contact)],
-                file::KIND => vec![(sql::LIST_FILES_PAGE_ASC, PimdirSummaryTable::File)],
-                "text/calendar" => vec![
-                    (sql::LIST_EVENTS_PAGE_ASC, PimdirSummaryTable::Event),
-                    (sql::LIST_TASKS_PAGE_ASC, PimdirSummaryTable::Task),
-                    (sql::LIST_JOURNALS_PAGE_ASC, PimdirSummaryTable::Journal),
-                ],
-                _ => return self.list_items_page_asc(collection, after, limit),
-            };
+        let statements: Vec<(&str, PimdirSummaryTable)> = match collection::media_type(&kind) {
+            "message/rfc822" => vec![(sql::LIST_MAIL_PAGE_DESC, PimdirSummaryTable::Mail)],
+            "text/vcard" => vec![(sql::LIST_CONTACTS_PAGE_ASC, PimdirSummaryTable::Contact)],
+            file::KIND => vec![(sql::LIST_FILES_PAGE_ASC, PimdirSummaryTable::File)],
+            "text/calendar" => vec![
+                (sql::LIST_EVENTS_PAGE_ASC, PimdirSummaryTable::Event),
+                (sql::LIST_TASKS_PAGE_ASC, PimdirSummaryTable::Task),
+                (sql::LIST_JOURNALS_PAGE_ASC, PimdirSummaryTable::Journal),
+            ],
+            _ => return self.list_items_page_asc(collection, after, limit),
+        };
 
         let after = after.map(|(key, seq)| (key.to_string(), seq));
         let mut items = self.overlaid(

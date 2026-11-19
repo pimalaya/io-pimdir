@@ -203,11 +203,13 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
     }
     for (label, object) in &bodies.hashes {
         let size = bodies.bytes[label].len();
-        conn.execute(
-            sql::STORE_OBJECT,
-            named_params! { ":hash": object, ":size": size as i64 },
-        )
-        .unwrap();
+        if store["objects"][label]["row"].as_bool() != Some(false) {
+            conn.execute(
+                sql::STORE_OBJECT,
+                named_params! { ":hash": object, ":size": size as i64 },
+            )
+            .unwrap();
+        }
         damage(label, &store["objects"][label]);
     }
     let mut next_seq = 1;
@@ -1324,7 +1326,8 @@ fn assert_objects(label: &str, dir: &Path, conn: &Connection, spec: &Path, objec
                 |r| r.get::<_, i64>(0),
             )
             .unwrap();
-        assert_eq!(row, 1, "{label}: object {object} keeps its row");
+        let rows = i64::from(stated["row"].as_bool() != Some(false));
+        assert_eq!(row, rows, "{label}: object {object}'s rows");
 
         let held = fs::read(blobs.path(&name).unwrap()).ok();
         match (stated["blob"].as_bool(), stated["corrupt"].as_bool()) {
@@ -1435,7 +1438,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 7, "{label}: the sync format's version");
+        assert_eq!(case["v"], 8, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 

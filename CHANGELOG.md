@@ -15,9 +15,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added `hub::PimdirHubVerdict`, what `reconcile` decided: a divergence, the body kept, the body lost.
 - Added `hub::PimdirHubLoser`, a body a policy did not adopt.
 - Added `hub::PimdirHubLoserSide`, which body it was.
+- Added `collection::media_type`, the bare media type of a collection kind, which every rule of the crate keyed on a kind now reads.
+- Added `PimdirReader::accounts_of`, the accounts holding collections of a media type, an undeclared collection counting for none.
+- Added `PimdirReader::overlay_quiet`, whether no pending action changes what a read of a collection shows.
+- Added `PimdirQuery::scoped`, a query narrowed to a kind, an account and a collection as top-level conjuncts, which scope its coverage.
+- Added `PimdirSearchCoverage::unread_counted`, the bodies out of sight that count against an answer, by the rule `is_complete` reads.
 
 ### Changed
 
+- Changed the sync conformance suite to the sync vectors' format 8 (an object's `row`), and vendored the vector stating a file under its name with no row (pimdir sync vector 172).
 - Changed the blob move to `renameat2` with `RENAME_NOREPLACE` (`renameatx_np` with `RENAME_EXCL` on Apple), falling back to `link(2)`, then on Unix to an exclusive create and copy where the link is denied.
 
   A store an Android app writes, its SELinux policy denying `link(2)`, is filed by the same move as any other.

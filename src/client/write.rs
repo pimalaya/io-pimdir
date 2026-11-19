@@ -25,7 +25,7 @@ use crate::{
     },
     codec,
     collection::{
-        PimdirCheckpoint, PimdirCollectionId, PimdirCoverage, PimdirCursor, PimdirRound,
+        self, PimdirCheckpoint, PimdirCollectionId, PimdirCoverage, PimdirCursor, PimdirRound,
         PimdirScope,
     },
     coroutine::PimdirWritten,
@@ -985,7 +985,7 @@ pub(crate) fn read_hub(
 
     let kind = kind_of(conn, collection)?;
     let tables = tables_of(&kind);
-    hub.immutable = kind.split(';').next().unwrap_or_default().trim() == "message/rfc822";
+    hub.immutable = collection::media_type(&kind) == "message/rfc822";
     // NOTE: one fill of the `links` slot serves every read below, none of
     // which binds another slot.
     if let Some(links) = links {
@@ -1064,7 +1064,7 @@ pub(crate) fn kind_of(conn: &Connection, collection: &str) -> Result<String, Pim
 /// a body derives for a collection whose kind was never declared, a file
 /// collection being always declared (§14.3).
 pub(crate) fn tables_of(kind: &str) -> Vec<PimdirSummaryTable> {
-    match kind.split(';').next().unwrap_or_default().trim() {
+    match collection::media_type(kind) {
         "message/rfc822" => vec![PimdirSummaryTable::Mail],
         "text/vcard" => vec![PimdirSummaryTable::Contact],
         file::KIND => vec![PimdirSummaryTable::File],
@@ -1568,7 +1568,7 @@ fn mint_other_messages(
     ops: &mut [PimdirWriteOp],
 ) -> Result<(), PimdirError> {
     let kind = kind_of(conn, collection)?;
-    if kind.split(';').next().unwrap_or_default().trim() != "message/rfc822" {
+    if collection::media_type(&kind) != "message/rfc822" {
         return Ok(());
     }
 
@@ -1910,7 +1910,7 @@ fn revive_item(
     };
 
     let kind = kind_of(conn, collection)?;
-    let mutable = kind.split(';').next().unwrap_or_default().trim() != "message/rfc822";
+    let mutable = collection::media_type(&kind) != "message/rfc822";
     // NOTE: a batch is one source's, the one binding a revive gains.
     let reviving = item.sources.iter().next();
     match (item.object.is_none(), &object, reviving) {

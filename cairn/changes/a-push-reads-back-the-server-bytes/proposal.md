@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: a-push-reads-back-the-server-bytes
-status: draft
+status: active
 created: 2026-10-18
 ---
 
@@ -25,3 +25,7 @@ Borrowed from an external engine: after a write, re-read through the same path a
 - The cost: one fetch per pushed body. A connector whose write answers the stored body (a DAV `PUT` with `Prefer: return=representation`) could hand it with the outcome instead, `Accepted { revision, object }`.
 - Whether the read-back goes through a delta from the checkpoint (which also advances it) or a fetch by handle, for a connector that lists deltas.
 - How a consumer is told, and whether `Manual` should keep the pushed body as a divergence instead of adopting the server's.
+
+## Ruled (2026-11-19)
+
+The owner ruled it after v1, additive: a push outcome MAY carry the stored body (`Accepted { revision, object }` or a read-back the engine asks for), an optional field SYNC §4 gains in a minor after sync-v1.0.0; SYNC §5 does not make the server's body the base a MUST before the tags, so no frozen behaviour or vector moves. Accepted and deferred: nothing is implemented before sync-v1.0.0. The local body still holds what a server dropped meanwhile, so nothing is lost.

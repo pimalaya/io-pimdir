@@ -21,6 +21,7 @@ pub(crate) mod time;
 use alloc::{format, string::String, vec::Vec};
 
 use crate::{
+    collection,
     placement::{PimdirLinkId, PimdirSortKey},
     summary::{
         calendar::{PimdirEventSummary, PimdirJournalSummary, PimdirTaskSummary},
@@ -245,7 +246,7 @@ pub struct PimdirDerivation {
 /// The kind is the collection's declared one (STORAGE §14), matched on
 /// the bare media type: `text/vcard; charset=utf-8` reads as `text/vcard`.
 pub fn derive(kind: &str, body: &[u8]) -> Option<PimdirDerivation> {
-    let kind = kind.split(';').next().unwrap_or_default().trim();
+    let kind = collection::media_type(kind);
 
     match kind {
         "message/rfc822" => Some(mail::derive(body)),

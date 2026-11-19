@@ -272,6 +272,38 @@ impl PimdirQuery {
         terms
     }
 
+    /// The query narrowed to `kind`, `account` and `collection`, each
+    /// given: their terms joined to its top-level `and`, where they stand
+    /// as conjuncts that scope its coverage (SEARCH §8.2). A query of
+    /// another shape becomes the first operand of that `and`.
+    pub fn scoped(
+        self,
+        kind: Option<PimdirQueryKind>,
+        account: Option<&str>,
+        collection: Option<&str>,
+    ) -> Self {
+        let mut conjuncts = match self {
+            Self::And(conjuncts) => conjuncts,
+            query => vec![query],
+        };
+
+        let predicates = [
+            kind.map(PimdirQueryPredicate::Kind),
+            account.map(|account| PimdirQueryPredicate::Account(account.into())),
+            collection.map(|collection| PimdirQueryPredicate::Collection(collection.into())),
+        ];
+        let terms = predicates.into_iter().flatten().map(|predicate| {
+            Self::Term(PimdirQueryTerm {
+                predicate,
+                start: 0,
+                end: 0,
+            })
+        });
+
+        conjuncts.extend(terms);
+        Self::And(conjuncts)
+    }
+
     /// The bodies the query's terms read (SEARCH §8.2), wherever each
     /// stands, negated or not: what tells whether a body out of sight
     /// counts against the answer, which a coverage holding it says by
@@ -1705,5 +1737,29 @@ mod tests {
             PimdirQueryId::Digits("99999999999999999999".into()).seq(),
             None
         );
+    }
+
+    #[test]
+    fn a_scope_stands_as_conjuncts_of_the_whole_query() {
+        let predicates = |query: &PimdirQuery| -> Vec<PimdirQueryPredicate> {
+            let conjuncts = query.conjuncts().into_iter();
+            conjuncts.map(|term| term.predicate.clone()).collect()
+        };
+        let kind = PimdirQueryPredicate::Kind(PimdirQueryKind::Contact);
+        let account = PimdirQueryPredicate::Account("work".into());
+        let collection = PimdirQueryPredicate::Collection("Cards".into());
+
+        let either = PimdirQuery::parse("a or b").unwrap();
+        let scoped = either.scoped(Some(PimdirQueryKind::Contact), Some("work"), Some("Cards"));
+        assert_eq!(predicates(&scoped), [kind.clone(), account, collection]);
+
+        let both = PimdirQuery::parse("a b").unwrap();
+        let terms = predicates(&both);
+        let scoped = both.scoped(Some(PimdirQueryKind::Contact), None, None);
+        let PimdirQuery::And(operands) = &scoped else {
+            panic!("and at the root");
+        };
+        assert_eq!(operands.len(), 3);
+        assert_eq!(predicates(&scoped), [terms, vec![kind]].concat());
     }
 }

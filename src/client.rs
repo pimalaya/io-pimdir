@@ -39,7 +39,7 @@ use crate::{
         write::kind_of,
     },
     codec::{self, PimdirAction, PimdirActionError, PimdirActionHandle},
-    hash,
+    collection, hash,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
     object::{PimdirHash, PimdirObject},
     placement::PimdirLinkId,
@@ -632,7 +632,7 @@ impl PimdirStore {
     ) -> Result<(PimdirLinkId, i64), PimdirError> {
         let collection = collection.as_ref();
         let kind = kind_of(&self.conn, collection)?;
-        let derivation = match kind.split(';').next().unwrap_or_default().trim() {
+        let derivation = match collection::media_type(&kind) {
             "text/vcard" | "text/calendar" => summary::derive(&kind, body),
             _ => None,
         };

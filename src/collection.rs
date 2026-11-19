@@ -20,12 +20,18 @@ impl AsRef<str> for PimdirCollectionId {
     }
 }
 
+/// The bare media type of a collection kind (STORAGE §13): the part
+/// before any `;` parameter, trimmed, empty for an undeclared kind.
+pub fn media_type(kind: &str) -> &str {
+    kind.split(';').next().unwrap_or_default().trim()
+}
+
 /// Whether `role` is of the vocabulary STORAGE §14 lists for collections
 /// of `kind`: the one an owner writes, and the one a reader knows. The
 /// column is an open vocabulary (§13), so a role outside it is read as
 /// none rather than refused.
 pub fn role_of_kind(kind: &str, role: &str) -> bool {
-    match kind.split(';').next().unwrap_or_default().trim() {
+    match media_type(kind) {
         "message/rfc822" => matches!(
             role,
             "inbox"

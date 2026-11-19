@@ -34,6 +34,7 @@ use mime::{
 use vcard::{tree::cst::VcardCst, value::VcardValue};
 
 use crate::{
+    collection,
     search::{chunk, fold, html},
     summary::{
         PimdirAddress, PimdirAddressRole, PimdirSummary,
@@ -223,7 +224,7 @@ impl PimdirExtract {
     /// SEARCH §6 reads: mail, a vCard or an iCalendar resource; `None` for
     /// any other kind, a file's included, which is read from its summary.
     pub fn body(kind: &str, body: &[u8]) -> Option<Self> {
-        match kind.split(';').next().unwrap_or_default().trim() {
+        match collection::media_type(kind) {
             "message/rfc822" => Some(Self::mail(body)),
             "text/vcard" => Some(Self::contact(body)),
             "text/calendar" => Some(Self::calendar(body)),

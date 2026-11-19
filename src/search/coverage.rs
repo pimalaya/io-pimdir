@@ -96,19 +96,37 @@ impl PimdirSearchCoverage {
     /// listed and not fetched under a query none of whose terms reads a
     /// message's body.
     pub fn is_complete(&self) -> bool {
-        let reads = &self.local.reads;
-        let read = self.local.kinds.iter().all(|(kind, counts)| {
-            (!reads.kinds.contains(kind) || counts.missing + counts.unparseable == 0)
-                && (!reads.counts_bodiless(kind) || counts.bodiless == 0)
-                && (!reads.content || counts.encrypted == 0)
-        });
-
-        read && self.local.unindexed == 0
+        self.unread_counted().is_empty()
+            && self.local.unindexed == 0
             && self.local.behind == 0
             && self.temporal == PimdirSearchTemporal::Full
             && self.remote != PimdirSearchRemote::Augmented { exhaustive: false }
             && !self.horizon_left
             && self.cut == 0
+    }
+
+    /// The bodies out of sight that count against the answer (SEARCH
+    /// §8.2), summed over the kinds as [`is_complete`](Self::is_complete)
+    /// reads them: `bodiless`, `missing` and `unparseable` of a kind a term
+    /// reads, mail's `bodiless` under `has:attachment` too, `encrypted`
+    /// while a text term reads the content. A count no term reads is zero.
+    pub fn unread_counted(&self) -> PimdirSearchUnread {
+        let reads = &self.local.reads;
+        let mut counted = PimdirSearchUnread::default();
+        for (kind, counts) in &self.local.kinds {
+            if reads.kinds.contains(kind) {
+                counted.missing += counts.missing;
+                counted.unparseable += counts.unparseable;
+            }
+            if reads.counts_bodiless(kind) {
+                counted.bodiless += counts.bodiless;
+            }
+            if reads.content {
+                counted.encrypted += counts.encrypted;
+            }
+        }
+
+        counted
     }
 }
 
@@ -598,5 +616,38 @@ mod tests {
             ..Default::default()
         };
         assert!(coverage.is_complete(), "reported apart");
+    }
+
+    #[test]
+    fn only_the_counts_a_term_reads_are_counted() {
+        let mut coverage = PimdirSearchCoverage::default();
+        let unread = PimdirSearchUnread {
+            bodiless: 1,
+            missing: 2,
+            unparseable: 3,
+            encrypted: 4,
+        };
+        coverage.local.kinds.insert("message/rfc822".into(), unread);
+        coverage.local.kinds.insert("text/vcard".into(), unread);
+        assert!(coverage.unread_counted().is_empty());
+        assert!(coverage.is_complete());
+
+        coverage.local.reads.mark = true;
+        let mark = PimdirSearchUnread {
+            bodiless: 1,
+            ..Default::default()
+        };
+        assert_eq!(coverage.unread_counted(), mark);
+        assert!(!coverage.is_complete());
+
+        coverage.local.reads.kinds.insert("text/vcard".into());
+        coverage.local.reads.content = true;
+        let read = PimdirSearchUnread {
+            bodiless: 2,
+            missing: 2,
+            unparseable: 3,
+            encrypted: 8,
+        };
+        assert_eq!(coverage.unread_counted(), read);
     }
 }

@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: an-ambiguous-intent-awaits-confirmation
-status: draft
+status: landed
 created: 2026-10-18
 ---
 
@@ -25,3 +25,7 @@ What the queue already has is kept: append order serialises the actions on one i
 - Whether the state is a column of `queue` or a reserved `error` form, so an older owner reads it as parked rather than pending.
 - Which intents can end unconfirmed: `submit` surely; `collection-create` is idempotent by name (Annex B.2) and needs none.
 - Whether a performer may confirm automatically by finding the message, and by what match (`Message-ID` in the account's sent collection).
+
+## Landed in substance (2026-11-19)
+
+The owner ruled on 2026-11-19 (pimdir the-lines-before-v1) to close this change as landed: the state arrived through pimdir draft-10 and draft-11 (audit-2026-11-12 O7 and F16), as a parked row under the reserved `error` prefix `unconfirmed: ` rather than a column, which answers the first open question (an older owner reads it as parked); `submit` is the intent Annex B.2 names, and a performer confirms by `acknowledge_action`. Evidence in cairn/log/2026-11-19-an-ambiguous-intent-awaits-confirmation.md.

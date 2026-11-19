@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: a-page-lands-in-few-statements
-status: active
+status: abandoned
 created: 2026-11-04
 ---
 
@@ -79,3 +79,7 @@ The target: a page of 500 new messages written in under 0.5 s on the phone (abou
 - Whether the pending sentinel takes `-2` or a column of its own. `-2` costs no migration and `items_by_changed` already indexes it; STORAGE §4.5 and §17 then name two reserved values instead of one.
 - Whether a stale `-2` should abort the commit (a trigger cannot see a commit; the runner would check before `setTransactionSuccessful`) or only fail the checks.
 - Whether the search index's refresh after each write batch (the app's `PimdirIndexDb.refreshSoon`) should wait for a fill to pause. Step 1's device run says what it costs; changing it is the app's own change.
+
+## Closed (2026-11-19)
+
+Closed without landing on the owner's ruling of 2026-11-19 (pimdir the-lines-before-v1): the pending stamp of step 2 left the format (pimdir cairn/log/2026-11-05-storage-draft-09.md), the owner closed write speed as good enough after the phone fill of 2026-11-13 (30 s, 4.2 ms a message) and asked that the write path not be re-proposed, so steps 2 and 3 are dropped and the device numbers are not owed. What landed of it landed in the Android app (step 1's measurement and the list-binding fix of step 3); the delta was never folded.

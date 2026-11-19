@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: an-owner-write-checks-its-fence
-status: draft
+status: active
 created: 2026-10-18
 ---
 
@@ -48,3 +48,7 @@ The owner's to decide; nothing is implemented. Already ruled around it: Q9 of pi
 ### Recommendation
 
 (a): it is what Q9 already decided, and nothing in it gates storage-v1.0.0. This change stays draft until a store on a network filesystem, or a second owning process on one device, is a case the owner wants supported. Android stays exempt for the reason of 2026-11-13.
+
+## Ruled (2026-11-19)
+
+The owner took option (a): the fence lands after v1, in a storage-v1 minor adding the owner epoch as a `store_meta` column, which raises neither `read_version` nor `produce_version` (STORAGE §4.4). The Android app stays exempt, for the reason of 2026-11-13 (one process, the store in its private directory). Accepted and deferred: nothing is implemented before storage-v1.0.0, and nothing in this change gates the v1 tags.

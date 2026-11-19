@@ -154,6 +154,8 @@ it; the lazy collection creation inside `write` uses `ON CONFLICT DO NOTHING` an
 never clobbers a declared kind. This makes the store self-describing and lets one
 store hold several item kinds.
 
+`collection::media_type` SHALL be the one reading of a kind as a media type, the part before any `;` parameter, trimmed, the empty kind of an undeclared collection staying empty: every rule of the crate keyed on a kind (the role vocabulary, the summary a body derives, the immutability of mail, the index extraction) reads it so, and a consumer filtering collections by kind reads it there rather than restating it.
+
 ### Requirement: A collection records the account it belongs to
 `collections` SHALL carry `account` (TEXT, nullable): an opaque owner-chosen id,
 `NULL` in a single-account store. A partial index `collections_by_account ON
@@ -221,6 +223,9 @@ is not a configured roster: an account with no collection does not appear, and a
 consumer needing the full roster reads it from its own configuration. The store
 records which account a collection belongs to and nothing else about it: no
 credentials, no endpoints, no display name.
+
+### Requirement: The accounts of a media type are read in one place
+`PimdirReader::accounts_of(kind)` SHALL answer the accounts holding collections of the media type `kind`, or of any kind for `None`, sorted and deduplicated, `None` within for the ungrouped. An undeclared collection, of the empty kind, belongs to no media type, so it counts for no application's kind. The choice of an account (the configured one, the only one, or a refusal for several) and its messages stay the consumer's, under one rule for every application: a configured account is accepted on a store holding no collection yet, a first sync not having run, and refused on one whose collections name other accounts only (tests/multi_account.rs `the_accounts_of_a_kind_leave_an_undeclared_collection_out`).
 
 ### Requirement: A client reads the store by indexed, paginated getters
 The store SHALL expose a read-only query surface for a client projecting the
@@ -587,6 +592,9 @@ removals and cut back to the limit afterwards, rather than returning a page
 shortened in the middle of a collection. A caller therefore pages until a short
 page, as it always did, and a whole-collection scan written that way does not end
 early.
+
+### Requirement: A reader says whether the queue changes a collection's read
+`PimdirReader::overlay_quiet(collection)` SHALL answer whether no pending action changes what a read of `collection` shows with the queue folded in, by the overlay's own fold: no `set-flags`, `update` or `remove` on one of its items, no `move` out of it, no `move` or `copy` into it, no `add` superseding one of its items. A `copy` out of it, a pending create and a row the overlay skips leave it quiet. It answers so whether or not the reader itself overlays, so a consumer reading committed rows for speed knows when they are what the overlay would show (tests/overlay.rs `a_collection_is_quiet_until_an_action_changes_what_its_read_shows`).
 
 > Initial seed spec (Cairn adopted 2026-07-31): captures the store's core
 > guarantees; further capabilities may be spelled out as they are touched.

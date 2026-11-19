@@ -320,3 +320,41 @@ fn a_body_lookup_still_dedups_across_collections() {
         "one message filed in two mailboxes is one body, downloaded once",
     );
 }
+
+#[test]
+fn the_accounts_of_a_kind_leave_an_undeclared_collection_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PimdirStore::open(dir.path()).unwrap();
+    assert!(store.accounts_of(None).unwrap().is_empty());
+
+    store.ensure_collection("home/Cards", "text/vcard").unwrap();
+    store
+        .set_collection_account("home/Cards", Some("home"))
+        .unwrap();
+    store.ensure_collection("work/Cards", "text/vcard").unwrap();
+    store
+        .set_collection_account("work/Cards", Some("work"))
+        .unwrap();
+    store.ensure_collection("Cards", "text/vcard").unwrap();
+    store.ensure_collection("work/Calendar", "").unwrap();
+    store
+        .set_collection_account("work/Calendar", Some("work"))
+        .unwrap();
+    store.ensure_collection("old/Calendar", "").unwrap();
+    store
+        .set_collection_account("old/Calendar", Some("old"))
+        .unwrap();
+
+    let cards = store.accounts_of(Some("text/vcard")).unwrap();
+    assert_eq!(cards, [None, Some("home".into()), Some("work".into())]);
+    assert!(store.accounts_of(Some("text/calendar")).unwrap().is_empty());
+
+    let every = store.accounts_of(None).unwrap();
+    let held = [
+        None,
+        Some("home".into()),
+        Some("old".into()),
+        Some("work".into()),
+    ];
+    assert_eq!(every, held);
+}
