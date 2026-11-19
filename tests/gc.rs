@@ -20,7 +20,7 @@ use io_pimdir::{
     },
 };
 use io_pimdir::{
-    client::PimdirStore,
+    client::{PimdirError, PimdirStore},
     sql,
     summary::{PimdirSummary, mail::PimdirMailSummary},
 };
@@ -355,4 +355,45 @@ fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
             .iter()
             .any(|(name, _)| *name == "RECOMPUTE_REFCOUNTS")
     );
+}
+
+/// A runner of its own counts its verb in flight through
+/// `PimdirSourceStore::running` (STORAGE §5): while the guard is held the
+/// collector, the eviction and the release refuse, from this handle and
+/// from another of the process, the body a chunk staged surviving; once it
+/// drops the collector reclaims it.
+#[test]
+fn a_running_guard_keeps_the_collector_out() {
+    const HASH: &str = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let mut other = PimdirStore::open(dir.path()).unwrap();
+
+    let running = store.running();
+    store.write(vec![store_object(HASH, b"first")]).unwrap();
+
+    assert!(matches!(
+        store.collect_garbage(),
+        Err(PimdirError::InFlight(_))
+    ));
+    assert!(matches!(
+        other.collect_garbage(),
+        Err(PimdirError::InFlight(_))
+    ));
+    assert!(matches!(
+        store.evict_before("INBOX", "2026-01-01T00:00:00Z"),
+        Err(PimdirError::InFlight(_))
+    ));
+    assert!(matches!(
+        store.release_before(&["INBOX"], None),
+        Err(PimdirError::InFlight(_))
+    ));
+    assert!(blob_exists(dir.path(), HASH), "the verb's body is kept");
+
+    drop(running);
+    let collected = other.collect_garbage().unwrap();
+    assert_eq!((collected.objects, collected.blobs), (1, 1));
+    assert!(!blob_exists(dir.path(), HASH), "referenced by nothing");
 }

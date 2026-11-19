@@ -40,7 +40,7 @@ use std::{
 // the crate's stated MSRV, and goes when that reaches 1.89.
 use fs4::FileExt;
 
-use crate::client::PimdirError;
+use crate::client::{PimdirError, PimdirRunning};
 
 /// The file an owning handle locks exclusively.
 const OWNER: &str = "owner.lock";
@@ -114,12 +114,9 @@ pub struct PimdirLock {
     shared: Arc<Shared>,
 }
 
-/// A verb in flight, counted until it drops (STORAGE §5).
-pub struct PimdirRunning<'a>(&'a Shared);
-
-impl Drop for PimdirRunning<'_> {
+impl Drop for PimdirRunning {
     fn drop(&mut self) {
-        self.0.running.fetch_sub(1, Ordering::AcqRel);
+        self.0.shared.running.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -321,9 +318,9 @@ impl PimdirLock {
     /// the writer lock held shared, so a collector, which reads it under
     /// that lock held exclusively, never runs beside a verb it did not
     /// see. A thread holding [`writing`](Self::writing) does not call it.
-    pub fn running(&self) -> PimdirRunning<'_> {
+    pub(crate) fn running(self: &Arc<Self>) -> PimdirRunning {
         self.count();
-        PimdirRunning(&self.shared)
+        PimdirRunning(Arc::clone(self))
     }
 
     /// Counts a blob stream in flight until the guard drops, as

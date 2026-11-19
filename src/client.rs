@@ -126,6 +126,15 @@ impl DerefMut for PimdirSourceStore {
     }
 }
 
+/// A verb of this process in flight, counted until the guard drops
+/// (STORAGE §5).
+///
+/// While any is held, the collector, `evict_before` and `release_before`
+/// refuse as [`PimdirError::InFlight`]: a body one chunk of the verb
+/// streamed has no pointer until the next attaches it. Taken by
+/// [`PimdirSourceStore::running`].
+pub struct PimdirRunning(Arc<PimdirLock>);
+
 /// What a purge retired: rows, never bytes, which the collector frees.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirPurgeReport {

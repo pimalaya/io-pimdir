@@ -11,10 +11,8 @@ use core::{convert::Infallible, error, fmt};
 
 use alloc::vec::Vec;
 
-use std::sync::Arc;
-
 use crate::{
-    client::{PimdirError, PimdirSourceStore},
+    client::{PimdirError, PimdirRunning, PimdirSourceStore},
     collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoaded,
@@ -95,6 +93,20 @@ impl PimdirRemote for PimdirOffline {
 }
 
 impl PimdirSourceStore {
+    /// Counts a verb in flight until the guard drops, for a runner of its
+    /// own driving a coroutine through [`service`](Self::service): taken
+    /// before the first resume and held to the last, as [`run`](Self::run)
+    /// holds it, so the collector never takes a body one chunk streamed
+    /// and the next attaches (STORAGE §5).
+    ///
+    /// Waits out a collection of this process: the count is raised under
+    /// the writer lock held shared, so a collector never runs beside a
+    /// verb it did not see. The collector called while the guard is held,
+    /// by this thread or another, refuses as [`PimdirError::InFlight`].
+    pub fn running(&self) -> PimdirRunning {
+        self.store.lock.running()
+    }
+
     /// Services one storage yield, or hands a remote one back untouched.
     pub fn service(
         &mut self,
@@ -128,8 +140,7 @@ impl PimdirSourceStore {
         C: PimdirCoroutine<Yield = PimdirYield, Return = Result<T, E>>,
         R: PimdirRemote,
     {
-        let lock = Arc::clone(&self.store.lock);
-        let _running = lock.running();
+        let _running = self.running();
         let mut arg: Option<PimdirArg> = None;
 
         loop {
