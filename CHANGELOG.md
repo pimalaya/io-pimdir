@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-19
+
 ### Added
 
 - Added `PimdirSourceStore::running`, the in-flight guard `run` holds, for a runner of its own driving a coroutine through `service`, so the collector refuses while its verb runs.
@@ -1285,7 +1287,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.18.0..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.18.1..HEAD
+[0.18.1]: https://github.com/pimalaya/io-pimdir/compare/v0.18.0..v0.18.1
 [0.18.0]: https://github.com/pimalaya/io-pimdir/compare/v0.17.0..v0.18.0
 [0.17.0]: https://github.com/pimalaya/io-pimdir/compare/v0.16.0..v0.17.0
 [0.16.0]: https://github.com/pimalaya/io-pimdir/compare/v0.15.1..v0.16.0
