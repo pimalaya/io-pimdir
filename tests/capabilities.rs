@@ -417,6 +417,13 @@ fn a_uidless_resource_is_keyed_over_the_bytes_it_is_queued_with() {
         .enqueue_with_body("work", raw.as_bytes(), stated(None))
         .unwrap();
     assert_eq!(enqueued.link_id, Some(summary::hash_key(&stripped)));
+
+    let Err(PimdirError::Duplicate { .. }) =
+        producer.enqueue_with_body("work", raw.as_bytes(), stated(None))
+    else {
+        panic!("a second keyless add of the same bytes should meet the first");
+    };
+    assert_eq!(producer.pending_actions("work").unwrap().len(), 1);
 }
 
 /// STORAGE §15.2, §15.3: an `add` whose stated `hash:` key its stored

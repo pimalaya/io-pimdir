@@ -358,6 +358,7 @@ impl PimdirProducer {
         };
         let action = action(object.hash.clone());
         let fresh = self.fresh(collection, &action, Some(body))?;
+        let action = keyed(action, fresh.as_ref());
         self.append(
             collection,
             &action,
@@ -389,8 +390,14 @@ impl PimdirProducer {
         &mut self,
         batch: &[PimdirEnqueue<'_>],
     ) -> Result<Vec<PimdirEnqueued>, PimdirError> {
-        let mut queued = Vec::with_capacity(batch.len());
+        let mut keyed_actions = Vec::with_capacity(batch.len());
         for enqueue in batch {
+            let fresh = self.fresh(enqueue.collection, &enqueue.action, enqueue.body)?;
+            keyed_actions.push((keyed(enqueue.action.clone(), fresh.as_ref()), fresh));
+        }
+
+        let mut queued = Vec::with_capacity(batch.len());
+        for (enqueue, (action, fresh)) in batch.iter().zip(&keyed_actions) {
             let object = match (enqueue.body, &enqueue.object) {
                 (Some(body), _) => {
                     let object = PimdirObject {
@@ -414,10 +421,10 @@ impl PimdirProducer {
             };
             queued.push(PimdirQueued {
                 collection: enqueue.collection,
-                action: &enqueue.action,
+                action,
                 object,
                 body: enqueue.body,
-                fresh: self.fresh(enqueue.collection, &enqueue.action, enqueue.body)?,
+                fresh: fresh.clone(),
             });
         }
 
@@ -2320,4 +2327,27 @@ fn apply_unbound(
         _ => unreachable!("only a remove, a set-flags or an update is unbound"),
     }
     Ok(Ok(()))
+}
+
+/// `action` with the key an `add` stating none was checked under written
+/// into it (§15.3), so a later `add` of the same key meets it as a pending
+/// duplicate and the drain applies it under that key.
+fn keyed(action: PimdirAction, fresh: Option<&PimdirLinkId>) -> PimdirAction {
+    match (action, fresh) {
+        (
+            PimdirAction::Add {
+                link_id: None,
+                flags,
+                object,
+                supersedes,
+            },
+            Some(fresh),
+        ) => PimdirAction::Add {
+            link_id: Some(fresh.clone()),
+            flags,
+            object,
+            supersedes,
+        },
+        (action, _) => action,
+    }
 }
