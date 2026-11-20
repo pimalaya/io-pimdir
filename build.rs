@@ -3,14 +3,15 @@
 //! metadata.
 //!
 //! spec/ is a byte-for-byte copy of the pimdir repository's migrations/
-//! and queries/ (with vectors/ and payloads/, which the suites read); one
-//! file per statement under queries/storage/<profile>/ and
-//! queries/search/, named after it. queries/signatures.json, the
-//! specification's own listing of every statement's parameters and
-//! columns, sits beside those directories and is no statement: only the
-//! profile directories are read. Re-vendor by copying the four
-//! directories over, and tests/spec_drift.rs proves the copy against a
-//! sibling checkout.
+//! and queries/ (with vectors/ and payloads/, which the suites read, and
+//! generator/, the specification's own test tooling); one file per
+//! statement under queries/storage/<profile>/ and queries/search/, named
+//! after it. queries/signatures.json, the specification's own listing of
+//! every statement's parameters and columns, sits beside those
+//! directories and is no statement: only the profile directories are
+//! read. Re-vendor by copying the five directories over, generator/
+//! without its target/, and tests/spec_drift.rs proves the copy against
+//! a sibling checkout.
 
 use std::{
     env, fs,

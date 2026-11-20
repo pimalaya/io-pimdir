@@ -22,6 +22,7 @@ exclude = [
   "flake.nix",
   "package.nix",
   "shell.nix",
+  "spec/generator/",
   "spec/payloads/",
   "spec/vectors/",
   "tests/proptest-regressions/",

@@ -1,11 +1,11 @@
 //! The crate's vendored copy against the canonical pimdir specification.
 //!
 //! spec/ is a byte-for-byte copy of the specification's migrations/,
-//! queries/, vectors/ and payloads/ at the revision spec/REVISION names.
-//! `sql` is generated from its storage statements and, read by the `search`
-//! feature, its search statements, so a consumer holding its own SQLite
-//! binding runs the format's own statements by name; the suites read the
-//! vectors from it. The copy is only worth something if it is checked:
+//! queries/, vectors/, payloads/ and generator/ at the revision
+//! spec/REVISION names. `sql` is generated from its storage statements
+//! and, read by the `search` feature, its search statements, so a
+//! consumer holding its own SQLite binding runs the format's own
+//! statements by name; the suites read the vectors from it. The copy is only worth something if it is checked:
 //! the crate and the spec live in separate repositories, so nothing else
 //! notices when one moves and the other does not.
 //!
@@ -39,7 +39,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// The directories of spec/ copied whole from the specification.
-const VENDORED: [&str; 4] = ["migrations", "queries", "vectors", "payloads"];
+const VENDORED: [&str; 5] = ["migrations", "queries", "vectors", "payloads", "generator"];
 
 /// The files of vectors/ and payloads/ the manifest does not list: itself
 /// and the README.
