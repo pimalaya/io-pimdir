@@ -2034,7 +2034,7 @@ struct PimdirArrival {
     /// The collection its row is still read from.
     from: String,
     /// The rows queued on it there before the move or copy, in append
-    /// order, then the move itself.
+    /// order, then the move or copy itself.
     rows: Vec<PimdirAction>,
     /// Whether a move brings it.
     moved: bool,
@@ -2260,13 +2260,17 @@ impl PimdirReader {
                 }
                 PimdirAction::Copy { seq, to } if !here && to.0 == collection => {
                     let seq = *seq;
-                    let rows = elsewhere.get(&(from.clone(), seq)).cloned();
+                    let mut rows = elsewhere
+                        .get(&(from.clone(), seq))
+                        .cloned()
+                        .unwrap_or_default();
+                    rows.push(action.action.clone());
                     pending
                         .arrivals
                         .entry(seq)
                         .or_insert_with(|| PimdirArrival {
                             from,
-                            rows: rows.unwrap_or_default(),
+                            rows,
                             moved: false,
                         });
                 }
