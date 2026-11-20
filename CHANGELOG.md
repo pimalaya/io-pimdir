@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Added `PimdirStore::set_collection_parent` and `PimdirStore::set_collection_presentation`, writing a collection's parent (its account's hierarchy kept a forest) and its color, description and sort order through pimdir's new owner statements, with `PimdirError::Parent` (`collection-parent`) and `PimdirError::Undeclared` (`collection-undeclared`).
 - **BREAKING**: Added `PimdirWritten::adopted` and `PimdirWritten::refused`, the handles whose body a write's policy took over the item's or kept apart (pimdir SYNC §9), which a sync reports as a pull or not: a storage building `PimdirWritten` by a struct literal needs both fields.
 - Added `PimdirReader::pending_arrivals`, the pending moves and copies other collections queued into a collection (pimdir STORAGE §15.4, `load_pending_arrivals`).
 - Added `PimdirEnqueued::link_id`, the key an `add` was checked under, stated or derived from its body in hand, so a producer states none and reports the key the store will hold.

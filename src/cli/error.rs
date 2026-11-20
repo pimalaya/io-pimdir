@@ -68,6 +68,11 @@ pub enum ErrorCode {
     /// A role outside the collection kind's vocabulary, or an undeclared
     /// collection.
     CollectionRole,
+    /// A collection placed under another account's, under itself or under
+    /// one of its own descendants.
+    CollectionParent,
+    /// A collection, or the parent named for it, the store does not hold.
+    CollectionUndeclared,
     /// A collection holding queue rows was deleted: cancel them first.
     CollectionQueued,
     /// The collection already holds the item, or has its creation queued.
@@ -161,6 +166,8 @@ const PIMDIR_CODES: &[(&str, ErrorCode)] = &[
     ("collection-synced", ErrorCode::CollectionSynced),
     ("collection-not-unbound", ErrorCode::CollectionNotUnbound),
     ("collection-role", ErrorCode::CollectionRole),
+    ("collection-parent", ErrorCode::CollectionParent),
+    ("collection-undeclared", ErrorCode::CollectionUndeclared),
     ("collection-queued", ErrorCode::CollectionQueued),
     ("item-duplicate", ErrorCode::ItemDuplicate),
     ("store-version", ErrorCode::StoreVersion),

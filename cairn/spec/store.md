@@ -1210,6 +1210,14 @@ The drain SHALL record a receipt (`record_receipt`) in the transaction applying 
 - **WHEN** the owner sets `sent` on `imap/Sent Items`
 - **THEN** `imap/Sent` holds no role, `imap/Sent Items` holds `sent`, and both are above the reader's cursor
 
+### Requirement: A collection keeps the parent and presentation its source states
+`PimdirStore::set_collection_parent(collection, parent)` SHALL set or clear `collections.parent` through `set_collection_parent` (pimdir STORAGE §14), the hierarchy a forest within an account: a parent of another account, the collection itself or one under it SHALL be refused as `PimdirError::Parent { collection, parent }` (code `collection-parent`), and a collection or parent the store does not hold as `PimdirError::Undeclared { collection }` (code `collection-undeclared`), the row left as it was. `PimdirStore::set_collection_presentation(collection, color, description, sort_order)` SHALL write the three together through `set_collection_presentation`, an undeclared collection refused as `Undeclared`. `PimdirCollection` SHALL carry them, `list_collections` ordering by `sort_order`.
+
+#### Scenario: A folder moved under its own child
+- **GIVEN** `Q1` under `Projects` under `INBOX`
+- **WHEN** the owner places `INBOX` under `Q1`
+- **THEN** it is refused as `Parent` and `INBOX` stays at the top (tests/collection_parent.rs)
+
 ### Requirement: The store holds coverage and rounds per source
 `write` SHALL apply `OpenRound`, `SetRoundCursor`, `CloseRound` and `SetCoverage` with the canonical statements (`open_round`, `set_round_cursor`, `close_round`, `set_coverage`), the first in its batch after `ensure_collection`, `open_round` recording whether the round is a band round (`round_band`), which `load_round` answers as `PimdirRound::band`, and `Stamp` (`stamp_bindings`) after the batch's upserts, so a binding the batch inserted is stamped too (STORAGE §4.3, SYNC §5). The items a batch inserts SHALL draw their public ids in the order the batch upserts them, a page's members numbered in the order it names them. The level is closed to 1 and 2 (STORAGE §13), which the schema holds; the owner's read special-cases no other value.
 

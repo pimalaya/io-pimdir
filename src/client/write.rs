@@ -1062,6 +1062,18 @@ pub(crate) fn kind_of(conn: &Connection, collection: &str) -> Result<String, Pim
         .unwrap_or_default())
 }
 
+/// Whether the store holds a row for the collection, declared or not.
+pub(crate) fn collection_exists(conn: &Connection, collection: &str) -> Result<bool, PimdirError> {
+    Ok(conn
+        .query_row_cached(
+            sql::LOAD_KIND,
+            named_params! { ":collection": collection },
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
 /// The summary tables a collection's kind may hold rows in; every table
 /// a body derives for a collection whose kind was never declared, a file
 /// collection being always declared (§14.3).

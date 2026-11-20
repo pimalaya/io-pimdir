@@ -514,6 +514,80 @@ impl PimdirStore {
         Ok(())
     }
 
+    /// Records where the source places a collection in its account's
+    /// hierarchy, or at its top with `None` (§14).
+    ///
+    /// Only from what a source states, the parent declared first. The
+    /// hierarchy stays a forest within an account: a parent of another
+    /// account, the collection itself or one under it is refused as
+    /// [`PimdirError::Parent`], and an undeclared collection or parent as
+    /// [`PimdirError::Undeclared`], the row left as it was.
+    pub fn set_collection_parent(
+        &self,
+        collection: impl AsRef<str>,
+        parent: Option<&str>,
+    ) -> Result<(), PimdirError> {
+        let collection = collection.as_ref();
+        self.lock.verify()?;
+        let changed = self
+            .conn
+            .execute_cached(
+                sql::SET_COLLECTION_PARENT,
+                named_params! { ":collection": collection, ":parent": parent },
+            )
+            .map_err(busy_or_sql)?;
+        if changed > 0 {
+            return Ok(());
+        }
+        for id in core::iter::once(collection).chain(parent) {
+            if !write::collection_exists(&self.conn, id)? {
+                return Err(PimdirError::Undeclared {
+                    collection: String::from(id),
+                });
+            }
+        }
+        Err(PimdirError::Parent {
+            collection: String::from(collection),
+            parent: parent.map(String::from).unwrap_or_default(),
+        })
+    }
+
+    /// Records how the source shows a collection (§14): its color as
+    /// written, its description and its position among its siblings, each
+    /// `None` when the source states none, the three written together.
+    ///
+    /// Presentation alone, which nothing keys on; a reader takes the color
+    /// and the description as untrusted text (§18). An undeclared
+    /// collection is refused as [`PimdirError::Undeclared`].
+    pub fn set_collection_presentation(
+        &self,
+        collection: impl AsRef<str>,
+        color: Option<&str>,
+        description: Option<&str>,
+        sort_order: Option<i64>,
+    ) -> Result<(), PimdirError> {
+        let collection = collection.as_ref();
+        self.lock.verify()?;
+        let changed = self
+            .conn
+            .execute_cached(
+                sql::SET_COLLECTION_PRESENTATION,
+                named_params! {
+                    ":collection": collection,
+                    ":color": color,
+                    ":description": description,
+                    ":sort_order": sort_order,
+                },
+            )
+            .map_err(busy_or_sql)?;
+        match changed {
+            0 => Err(PimdirError::Undeclared {
+                collection: String::from(collection),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Records a reference from one item to another (`add_reference`,
     /// §14.2), answering it as it stands, recorded now or before, a
     /// person's taking over a rule's; `None` when it cannot link: an end
@@ -2013,6 +2087,21 @@ pub enum PimdirError {
         /// The role refused.
         role: String,
     },
+    /// A collection was placed under another account's, under itself or
+    /// under one of its own descendants (§14): the hierarchy stays a forest
+    /// within an account.
+    Parent {
+        /// The collection placed.
+        collection: String,
+        /// The parent refused.
+        parent: String,
+    },
+    /// A collection, or the parent named for it, is not one the store
+    /// holds (§14): declare it first.
+    Undeclared {
+        /// The collection the store does not hold.
+        collection: String,
+    },
     /// An item was put into a collection of a kind no unbound write
     /// derives (§14.3): mail, files, or undeclared.
     NotUnbound {
@@ -2236,6 +2325,8 @@ impl PimdirError {
     /// | `collection-synced` | [`Synced`](Self::Synced) |
     /// | `collection-not-unbound` | [`NotUnbound`](Self::NotUnbound) |
     /// | `collection-role` | [`Role`](Self::Role) |
+    /// | `collection-parent` | [`Parent`](Self::Parent) |
+    /// | `collection-undeclared` | [`Undeclared`](Self::Undeclared) |
     /// | `collection-queued` | [`Queued`](Self::Queued) |
     /// | `item-duplicate` | [`Duplicate`](Self::Duplicate) |
     /// | `hash-key-mismatch` | [`HashKeyMismatch`](Self::HashKeyMismatch) |
@@ -2286,6 +2377,8 @@ impl PimdirError {
             Self::Synced { .. } => "collection-synced",
             Self::NotUnbound { .. } => "collection-not-unbound",
             Self::Role { .. } => "collection-role",
+            Self::Parent { .. } => "collection-parent",
+            Self::Undeclared { .. } => "collection-undeclared",
             Self::Queued { .. } => "collection-queued",
             Self::Duplicate { .. } => "item-duplicate",
             Self::HashKeyMismatch { .. } => "hash-key-mismatch",
@@ -2385,6 +2478,14 @@ impl fmt::Display for PimdirError {
             Self::Role { collection, role } => write!(
                 f,
                 "Pimdir collection role refused: {role} is not a role of collection {collection}'s kind"
+            ),
+            Self::Parent { collection, parent } => write!(
+                f,
+                "Pimdir collection parent refused: {parent} is of another account than collection {collection}, or {collection} itself or under it"
+            ),
+            Self::Undeclared { collection } => write!(
+                f,
+                "Pimdir collection refused: the store holds no collection {collection}"
             ),
             Self::NotUnbound { collection, kind } => write!(
                 f,
