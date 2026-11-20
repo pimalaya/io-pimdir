@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- **BREAKING**: Added `PimdirWritten::adopted` and `PimdirWritten::refused`, the handles whose body a write's policy took over the item's or kept apart (pimdir SYNC §9), which a sync reports as a pull or not: a storage building `PimdirWritten` by a struct literal needs both fields.
 - Added `PimdirReader::pending_arrivals`, the pending moves and copies other collections queued into a collection (pimdir STORAGE §15.4, `load_pending_arrivals`).
 - Added `PimdirEnqueued::link_id`, the key an `add` was checked under, stated or derived from its body in hand, so a producer states none and reports the key the store will hold.
 - **BREAKING**: Added `PimdirError::HashKeyMismatch` and `PimdirMutateError::HashKeyMismatch` (`hash-key-mismatch`): an `add` stating a `hash:` key its body's bytes do not give is refused, and a drain parks one (pimdir STORAGE §15.3, SYNC §7).
@@ -21,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed a sync reporting a member joining an item another source binds as `Created` and settling a diverging body it carried by the source's own policy: it is `Added`, its body folded into the item by the collection's policy (pimdir SYNC §6, §9).
+- Fixed a sync reporting `ContentChanged` for a pull whose body the collection's `prefer-existing` kept apart, the item keeping its own (pimdir SYNC §5).
 - Fixed `PimdirIndex::refresh` keeping a body indexed after its last placement left it or moved off it, and a thread's id and bounds after a member's sort key moved: a refreshed index is the one a rebuild writes (`PimdirIndexOp::DropUnplaced`, pimdir SEARCH §4, §9).
 - Fixed `PimdirReader::with_pending` folding rows the owner parks: an action on an item no source binds where the owner settles it alone, a move into a collection of no declared kind, and a row the capability backstop parks fold into nothing, and a folded update carries the summary and sort key of its new body, paged by that key.
 - Fixed `enqueue_with_body` queueing a UID-less contact or event under the `hash:` key its caller derived before the `X-PIMDIR-` properties were taken out, a key naming bytes the store never held: it is refused, and stating no key answers the right one.

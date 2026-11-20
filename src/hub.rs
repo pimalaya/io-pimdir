@@ -337,6 +337,12 @@ pub struct PimdirHub {
     /// The handles whose upsert recorded a divergence on the item while
     /// absorbing, in order (SYNC §5, §9).
     pub(crate) diverged: Vec<PimdirHandle>,
+    /// The handles whose upsert's body replaced the item's while
+    /// absorbing, the replaced one kept (SYNC §9), in order.
+    pub(crate) adopted: Vec<PimdirHandle>,
+    /// The handles whose upsert's body a policy kept apart while
+    /// absorbing, the item keeping its own (SYNC §9), in order.
+    pub(crate) refused: Vec<PimdirHandle>,
     /// The handles whose next upsert is an overruling edit (SYNC §7),
     /// within the batch being absorbed.
     overruling: BTreeSet<PimdirHandle>,
@@ -746,6 +752,11 @@ impl PimdirHub {
         item.level = item.stored_level();
 
         if let Some(lost) = verdict.lost {
+            match lost.side {
+                PimdirHubLoserSide::Shared => self.adopted.push(placement.handle.clone()),
+                PimdirHubLoserSide::Incoming => self.refused.push(placement.handle.clone()),
+                PimdirHubLoserSide::Diverging => {}
+            }
             // NOTE: a diverging body nobody summarized is derived by the
             // storage from its bytes as it keeps it.
             let (summary, sort_key) = match lost.side {

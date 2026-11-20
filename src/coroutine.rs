@@ -202,6 +202,13 @@ pub struct PimdirWritten {
     /// The bodies a policy did not adopt, each kept as a retained item:
     /// the handle whose write settled it and the retained item's key.
     pub overruled: Vec<(PimdirHandle, PimdirLinkId)>,
+    /// The handles whose upsert's body became the item's over the one it
+    /// held, which a policy kept (SYNC §9): a pull the verb reports, a
+    /// join's included.
+    pub adopted: Vec<PimdirHandle>,
+    /// The handles whose upsert's body a policy kept apart, the item
+    /// keeping its own (SYNC §9): no pull to report.
+    pub refused: Vec<PimdirHandle>,
 }
 
 #[cfg(test)]

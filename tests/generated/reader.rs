@@ -41,9 +41,10 @@ use crate::common::{
 
 /// The statements the oracle states that no reader call wraps, each the
 /// owner's or the engine's to run.
-const UNWRAPPED: [&str; 2] = [
+const UNWRAPPED: [&str; 3] = [
     "storage/read/handle_for_link",
     "storage/owner/load_conflict",
+    "storage/owner/load_round",
 ];
 
 /// Finding G1 (implementation, public API): a collection's pending listing

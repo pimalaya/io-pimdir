@@ -9,7 +9,8 @@
 //! source gets a handle of it plus its own remote.
 
 use io_pimdir::{
-    hub::{PimdirHub, PimdirSourceId},
+    client::PimdirStore,
+    hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
     mutate::PimdirMutation,
     object::{PimdirHash, PimdirObject},
     placement::{PimdirHandle, PimdirLinkId, PimdirStatus},
@@ -814,9 +815,10 @@ fn a_withdrawn_create_beside_a_holder_deletes_the_item() {
 
 /// Two sources holding one identity under two bodies before either synced.
 ///
-/// The second source's listing lands the create the hub projects for it.
-/// Taking its own body as the base read the projected body as an edit,
-/// pushed over a body the two never agreed on.
+/// The second source's listing joins the item the hub offers it, its body
+/// folded by the collection's policy (pimdir SYNC §6, §9). Taking the
+/// offered body as the base read it as an edit, pushed over a body the two
+/// never agreed on.
 fn diverged_before_any_sync() -> Mirror {
     let mut mirror = Mirror::new();
     mirror.a.remote_mut().mutable = true;
@@ -844,7 +846,7 @@ fn body_on_b(mirror: &Mirror) -> Vec<u8> {
 }
 
 #[test]
-fn a_landed_create_holding_another_body_conflicts_rather_than_overwrites() {
+fn a_joining_body_is_the_items_conflict_rather_than_overwritten() {
     let mut mirror = diverged_before_any_sync();
 
     let report = mirror
@@ -855,23 +857,27 @@ fn a_landed_create_holding_another_body_conflicts_rather_than_overwrites() {
     assert_eq!(report.pushed, 0, "nothing pushed over the arrival");
     assert_eq!(body_on_b(&mirror), b"tel +9", "the server keeps its body");
 
+    let hub = mirror.hub();
+    let item = &hub.items[&PimdirLinkId::from("card-1")];
+    assert!(item.conflicted, "the collection's manual records it");
+    assert_eq!(
+        item.object,
+        Some(hash(b"tel +1")),
+        "the item keeps its body"
+    );
+    assert_eq!(item.conflict_object, Some(hash(b"tel +9")));
+
     let landed = mirror.b.storage().placement("inbox", "b1");
     assert_eq!(landed.status, PimdirStatus::Conflict, "{landed:?}");
     assert_eq!(
-        landed.object,
-        Some(hash(b"tel +1")),
-        "the staged body stays"
-    );
-    assert_eq!(landed.conflict_object, Some(hash(b"tel +9")));
-    assert_eq!(
         landed.base.as_ref().and_then(|base| base.object.clone()),
-        None,
-        "the two never agreed on a body",
+        Some(hash(b"tel +9")),
+        "b agreed with its own server",
     );
 }
 
 #[test]
-fn a_landed_create_holding_another_body_follows_the_policy() {
+fn a_joining_body_follows_the_collections_policy_not_the_sources() {
     let mut mirror = diverged_before_any_sync();
     let prefer_local = PimdirSyncOptions {
         conflict: PimdirConflictPolicy::PreferLocal,
@@ -881,8 +887,31 @@ fn a_landed_create_holding_another_body_follows_the_policy() {
     mirror.b.sync("inbox", prefer_local).unwrap();
 
     assert_eq!(
-        mirror.object_on('b'),
-        Some(hash(b"tel +1")),
-        "a declared preference is what overwrites",
+        body_on_b(&mirror),
+        b"tel +9",
+        "a source's preference settles nothing between sources",
     );
+    assert!(mirror.conflicted("card-1"));
+}
+
+#[test]
+fn a_joining_body_prefer_existing_refuses_is_kept_and_pushed_over() {
+    let mut mirror = diverged_before_any_sync();
+    PimdirStore::open(mirror.a.path())
+        .unwrap()
+        .set_collection_conflict("inbox", PimdirHubConflict::PreferExisting)
+        .unwrap();
+
+    mirror
+        .b
+        .sync("inbox", PimdirSyncOptions::default())
+        .unwrap();
+    mirror
+        .b
+        .sync("inbox", PimdirSyncOptions::default())
+        .unwrap();
+
+    assert!(!mirror.conflicted("card-1"));
+    assert_eq!(mirror.object_on('b'), Some(hash(b"tel +1")));
+    assert!(mirror.retained("dup:card-1#b1"), "the refused body is kept");
 }

@@ -622,6 +622,8 @@ pub(crate) fn apply(
         let licensed = licensed.remove(&collection).unwrap_or_default();
         save_hub_diff(tx, &collection, source, &ops, &old, &mut new, &licensed)?;
         written.conflicted.append(&mut new.diverged);
+        written.adopted.append(&mut new.adopted);
+        written.refused.append(&mut new.refused);
         for mut lost in core::mem::take(&mut new.overruled) {
             // NOTE: a conflict's body kept by an overruling edit has no
             // summary the hub holds, so it is derived from the body.

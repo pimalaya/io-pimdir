@@ -1213,17 +1213,19 @@ impl PimdirSync {
         if let Some(mut create) = self.take_pending_create(item) {
             claimed.insert(meta.link_id.clone());
             let provisional = create.handle.clone();
-            if self.offered.contains(&provisional) {
+            let offered = self.offered.contains(&provisional);
+            if offered {
                 create.flags =
                     PimdirFlags::merge(&PimdirFlags::Unknown, &create.flags, &item.flags);
             }
-            let landed = self.land(create, item);
+            let landed = self.land(create, item, offered);
             let conflicted = landed.status == PimdirStatus::Conflict;
             self.local.insert(item.handle.clone(), landed);
             self.fresh.insert(
                 item.handle.clone(),
                 Fresh::Landed {
                     provisional,
+                    offered,
                     conflicted,
                 },
             );
@@ -1339,7 +1341,17 @@ impl PimdirSync {
     /// tombstone, carrying the destination its load derived, if any, so
     /// its remove is pushed against the listed handle (SYNC §5, §6). The
     /// join drops the provisional handle, `Superseded`.
-    fn land(&mut self, create: PimdirPlacement, item: &PimdirRemoteItem) -> PimdirPlacement {
+    ///
+    /// An `offered` create is no create of this source but the store's copy
+    /// of an item other sources bind, which the member joins (SYNC §6): a
+    /// body it carries is its own, its base and its summary, and the write
+    /// folds it into the item by the collection's policy (SYNC §9).
+    fn land(
+        &mut self,
+        create: PimdirPlacement,
+        item: &PimdirRemoteItem,
+        offered: bool,
+    ) -> PimdirPlacement {
         debug!(
             "land the pending create {} under {}",
             create.handle.as_str(),
@@ -1349,6 +1361,11 @@ impl PimdirSync {
         let tombstone = create.status == PimdirStatus::Tombstone;
         let mut landed = create;
         landed.handle = item.handle.clone();
+        if offered && item.meta.body.is_some() {
+            landed.object = None;
+            landed.summary = item.meta.summary.clone();
+            landed.sort_key = item.meta.sort_key.clone();
+        }
 
         let diverged = item.revision.is_some()
             && item.meta.body.as_ref().is_some_and(|body| {
@@ -1604,8 +1621,18 @@ impl PimdirSync {
                             self.emit(PimdirSyncEvent::Disagreed { handle, link_id });
                         }
                     }
-                    Fresh::Landed { conflicted, .. } => {
-                        self.emit(PimdirSyncEvent::Created(handle.clone()));
+                    Fresh::Landed {
+                        offered,
+                        conflicted,
+                        ..
+                    } => {
+                        match offered {
+                            true => {
+                                self.report.pulled += 1;
+                                self.emit(PimdirSyncEvent::Added(handle.clone()));
+                            }
+                            false => self.emit(PimdirSyncEvent::Created(handle.clone())),
+                        }
                         if conflicted {
                             self.report.conflicts += 1;
                             self.emit(PimdirSyncEvent::Conflicted(handle));
@@ -2272,8 +2299,10 @@ impl PimdirSync {
     /// Reports the events of the write just answered, with what it
     /// recorded beyond its ops (SYNC §5, §9): an upsert the write recorded
     /// as a divergence on the item reports `Conflicted` in place of the
-    /// pull the item did not take, and a body a policy did not adopt
-    /// reports `Overruled`.
+    /// pull the item did not take, a body a policy kept apart reports no
+    /// pull, one it adopted over the item's reports `ContentChanged` after
+    /// the member's `Added` when the merge reported none, a join's, and a
+    /// body a policy did not adopt reports `Overruled`.
     fn commit(&mut self, written: PimdirWritten) {
         let mut events = mem::take(&mut self.unwritten);
 
@@ -2295,6 +2324,28 @@ impl PimdirSync {
                 }
                 None => events.push(PimdirSyncEvent::Conflicted(handle)),
             }
+        }
+        for handle in written.refused {
+            let pulled = events.iter().position(
+                |event| matches!(event, PimdirSyncEvent::ContentChanged(h) if *h == handle),
+            );
+            if let Some(at) = pulled {
+                self.report.refreshed = self.report.refreshed.saturating_sub(1);
+                events.remove(at);
+            }
+        }
+        for handle in written.adopted {
+            if events
+                .iter()
+                .any(|event| matches!(event, PimdirSyncEvent::ContentChanged(h) if *h == handle))
+            {
+                continue;
+            }
+            let at = events
+                .iter()
+                .rposition(|event| matches!(event, PimdirSyncEvent::Added(h) if *h == handle))
+                .map_or(events.len(), |at| at + 1);
+            events.insert(at, PimdirSyncEvent::ContentChanged(handle));
         }
         for (handle, link_id) in written.overruled {
             events.push(PimdirSyncEvent::Overruled { handle, link_id });
@@ -2859,9 +2910,11 @@ enum Fresh {
     Named { apart: Option<PimdirLinkId> },
     /// A pending create landed, its provisional handle superseded,
     /// `conflicted` when its arrival carried no body to agree on (SYNC
-    /// §6).
+    /// §6), `offered` when the create was the store's copy of an item
+    /// other sources bind, which the member joins (SYNC §6, §9).
     Landed {
         provisional: PimdirHandle,
+        offered: bool,
         conflicted: bool,
     },
     /// Bound already, its summary or sort key refreshed.

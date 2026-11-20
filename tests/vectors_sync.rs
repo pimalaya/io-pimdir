@@ -938,13 +938,15 @@ fn mutation(
     })
 }
 
-/// What a run gave back: its pushes, its events, whether it failed, and
-/// the counts of a round or a rekey it parked.
+/// What a run gave back: its pushes, its events, whether it failed, the
+/// counts of a round or a rekey it parked, and the based bindings a capped
+/// or narrowed round left unlisted.
 struct Ran {
     pushes: Vec<Value>,
     events: Vec<Value>,
     failed: bool,
     parked: Option<PimdirParked>,
+    unlisted: usize,
 }
 
 /// An event as SYNC §11 spells it.
@@ -977,6 +979,7 @@ fn run(store: &mut PimdirSourceStore, case: &Value, remote: &mut Scripted) -> Ra
     let collection = run["collection"].as_str().unwrap();
     let mut failed = false;
     let mut parked = None;
+    let mut unlisted = 0;
     let events = match run["verb"].as_str().unwrap() {
         "sync" => {
             // NOTE: driven here rather than through the store's runner, so
@@ -1018,6 +1021,7 @@ fn run(store: &mut PimdirSourceStore, case: &Value, remote: &mut Scripted) -> Ra
                 });
             };
             parked = report.parked;
+            unlisted = report.unlisted;
             report.events
         }
         "upgrade" => {
@@ -1077,6 +1081,7 @@ fn run(store: &mut PimdirSourceStore, case: &Value, remote: &mut Scripted) -> Ra
         events: events.iter().map(event_json).collect(),
         failed,
         parked,
+        unlisted,
     }
 }
 
@@ -1439,7 +1444,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 10, "{label}: the sync format's version");
+        assert_eq!(case["v"], 11, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 
@@ -1510,6 +1515,7 @@ fn reproduce(spec: &Path, path: &Path) {
             events,
             failed,
             parked,
+            unlisted,
         } = run(&mut store, &case, &mut remote);
         drop(store);
         assert!(
@@ -1543,6 +1549,11 @@ fn reproduce(spec: &Path, path: &Path) {
                 bound: parked["bound"].as_u64().unwrap() as usize,
             });
         assert_eq!(expect_parked, parked, "{label}: the park differs");
+        let expect_unlisted = case["expect"]["unlisted"].as_u64().unwrap_or(0) as usize;
+        assert_eq!(
+            expect_unlisted, unlisted,
+            "{label}: the bindings left unlisted differ"
+        );
 
         let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
         let expect = case["expect"]["store"].as_object().unwrap();
