@@ -1,7 +1,8 @@
 //! The search index against the format's own vectors (pimdir SEARCH.md
 //! §11): the fixture store of vectors/search/store.json built through the
 //! owner, indexed, and asked every case of vectors/search/queries.json;
-//! the chunk boundaries of vectors/search/chunks.json.
+//! the chunk boundaries of vectors/search/chunks.json; the refreshes of
+//! vectors/search/refresh.json.
 //!
 //! Every case is answered: none is skipped. A case stating `threads` is
 //! asked as a threaded listing (SEARCH §9).
@@ -23,9 +24,9 @@ use io_pimdir::{
     capability::{self, PimdirCapability, PimdirSupport},
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
-        PimdirError, PimdirStore,
+        PimdirError, PimdirSourceStore, PimdirStore,
         producer::PimdirProducer,
-        reader::PimdirReader,
+        reader::{PimdirChangeCursor, PimdirReader},
         search::{
             PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchCursor,
             PimdirSearchMatched, PimdirSearchOptions, PimdirSearchSort,
@@ -139,6 +140,12 @@ fn mail_summary(row: &Value, addresses: &[Value]) -> PimdirSummary {
 fn build(spec: &Path, dir: &Path) {
     let store = json(&spec.join("vectors/search/store.json"));
     assert_eq!(store["v"], 2, "store.json at another version");
+    build_store(spec, dir, &store);
+}
+
+/// A store as store.json states one, built through the owner, a stand-in
+/// written as an owner recording attachments leaves it (STORAGE §14.3).
+fn build_store(spec: &Path, dir: &Path, store: &Value) {
     let mut unreadable = Vec::new();
 
     let mut kinds = BTreeMap::new();
@@ -190,77 +197,20 @@ fn build(spec: &Path, dir: &Path) {
     let mut store_handle = PimdirStore::open(dir).unwrap().for_source("vectors");
     for item in store["items"].as_array().unwrap() {
         let collection = item["collection"].as_str().unwrap();
-        let link_id = item["link_id"].as_str().unwrap();
-        let seq = item["seq"].as_i64().unwrap();
-        let flags: PimdirFlags = strings(&item["flags"]).into_iter().collect();
-        let kind = &kinds[collection];
-
-        if stand_ins.contains(collection) {
-            // NOTE: the owner records a stand-in as its message's body
-            // enters (STORAGE §14.3); the vector states what it left.
-        } else if let Some(fixture) = item["fixture"].as_str() {
-            let body = fs::read(spec.join("vectors").join(fixture)).unwrap();
-            let derived = summary::derive(kind, &body).unwrap();
-            assert_eq!(derived.link_id.as_str(), link_id, "{fixture}: link id");
-            let hash = store_handle.hash(&body);
+        if !stand_ins.contains(collection) {
+            let hash = put(spec, &mut store_handle, &kinds[collection], item);
             if item["unreadable"].as_bool() == Some(true) {
-                unreadable.push(hash.clone());
-            }
-            store_handle
-                .write(vec![
-                    PimdirWriteOp::StoreObject {
-                        object: PimdirObject {
-                            hash: hash.clone(),
-                            size: body.len(),
-                        },
-                        body: Some(body),
-                    },
-                    PimdirWriteOp::UpsertPlacement(placement(
-                        collection,
-                        &seq.to_string(),
-                        link_id,
-                        Some(hash),
-                        derived.summary.unwrap(),
-                        derived.sort_key.as_str(),
-                        flags,
-                    )),
-                ])
-                .unwrap();
-        } else {
-            let stated = &item["summary"];
-            let row = &stated["row"];
-            match stated["table"].as_str().unwrap() {
-                "mail_summary" => {
-                    let addresses = stated["addresses"].as_array().unwrap();
-                    store_handle
-                        .write(vec![PimdirWriteOp::UpsertPlacement(placement(
-                            collection,
-                            &seq.to_string(),
-                            link_id,
-                            None,
-                            mail_summary(row, addresses),
-                            stated["sort_key"].as_str().unwrap(),
-                            flags,
-                        ))])
-                        .unwrap();
-                }
-                "file_summary" => {
-                    let file = PimdirFileSummary {
-                        name: row["name"].as_str().unwrap().into(),
-                        media_type: row["media_type"].as_str().map(Into::into),
-                        size: row["size"].as_u64(),
-                        part: row["part"].as_str().map(Into::into),
-                    };
-                    store_handle
-                        .put_file(collection, &PimdirLinkId(link_id.into()), &file)
-                        .unwrap();
-                }
-                table => panic!("no fixture builder for {table}"),
+                unreadable.extend(hash);
             }
         }
 
+        let link_id = item["link_id"].as_str().unwrap();
         let placed = store_handle.seq_for_link(collection, link_id).unwrap();
-        assert_eq!(placed, Some(seq), "{link_id} draws the vector's seq");
+        assert_eq!(
+            placed,
+            item["seq"].as_i64(),
+            "{link_id} draws the vector's seq"
+        );
     }
 
     for reference in store["references"].as_array().unwrap() {
@@ -284,6 +234,255 @@ fn build(spec: &Path, dir: &Path) {
     for hash in unreadable {
         fs::remove_file(blobs.path(&hash).unwrap()).unwrap();
     }
+}
+
+/// Writes one item as store.json states it, answering its body's hash.
+fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> Option<PimdirHash> {
+    let collection = item["collection"].as_str().unwrap();
+    let link_id = item["link_id"].as_str().unwrap();
+    let handle = item["seq"].as_i64().unwrap().to_string();
+    let flags: PimdirFlags = strings(&item["flags"]).into_iter().collect();
+
+    if let Some(fixture) = item["fixture"].as_str() {
+        let body = fs::read(spec.join("vectors").join(fixture)).unwrap();
+        let derived = summary::derive(kind, &body).unwrap();
+        assert_eq!(derived.link_id.as_str(), link_id, "{fixture}: link id");
+        let hash = store.hash(&body);
+        store
+            .write(vec![
+                PimdirWriteOp::StoreObject {
+                    object: PimdirObject {
+                        hash: hash.clone(),
+                        size: body.len(),
+                    },
+                    body: Some(body),
+                },
+                PimdirWriteOp::UpsertPlacement(placement(
+                    collection,
+                    &handle,
+                    link_id,
+                    Some(hash.clone()),
+                    derived.summary.unwrap(),
+                    derived.sort_key.as_str(),
+                    flags,
+                )),
+            ])
+            .unwrap();
+        return Some(hash);
+    }
+
+    let stated = &item["summary"];
+    let row = &stated["row"];
+    match stated["table"].as_str().unwrap() {
+        "mail_summary" => {
+            let addresses = stated["addresses"].as_array().unwrap();
+            store
+                .write(vec![PimdirWriteOp::UpsertPlacement(placement(
+                    collection,
+                    &handle,
+                    link_id,
+                    None,
+                    mail_summary(row, addresses),
+                    stated["sort_key"].as_str().unwrap(),
+                    flags,
+                ))])
+                .unwrap();
+        }
+        "file_summary" => {
+            let file = PimdirFileSummary {
+                name: row["name"].as_str().unwrap().into(),
+                media_type: row["media_type"].as_str().map(Into::into),
+                size: row["size"].as_u64(),
+                part: row["part"].as_str().map(Into::into),
+            };
+            store
+                .put_file(collection, &PimdirLinkId(link_id.into()), &file)
+                .unwrap();
+        }
+        table => panic!("no fixture builder for {table}"),
+    }
+    None
+}
+
+/// The refresh cases of vectors/search/refresh.json (SEARCH §11, STORAGE
+/// §4.5): after each write, the feed above the cursor read before it, then
+/// the answers of the refreshed index and of one rebuilt from the store.
+#[test]
+fn every_refresh_vector_answers() {
+    let spec = spec_dir();
+    let vectors = json(&spec.join("vectors/search/refresh.json"));
+    assert_eq!(vectors["v"], 1, "refresh.json at another version");
+    let now = unix(
+        json(&spec.join("vectors/search/queries.json"))["now"]
+            .as_str()
+            .unwrap(),
+    );
+    let refreshed = PimdirIndexRefreshOptions {
+        now: Some(now),
+        ..Default::default()
+    };
+
+    let mut outcomes = Vec::new();
+    for case in vectors["cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        build_store(&spec, dir.path(), &case["store"]);
+        let mut index = PimdirIndex::open(dir.path()).unwrap();
+        index.refresh(&refreshed).unwrap();
+
+        let mut kinds: BTreeMap<String, String> = case["store"]["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["id"].as_str().unwrap().to_string(),
+                    c["kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        for (number, step) in case["steps"].as_array().unwrap().iter().enumerate() {
+            let name = format!("refresh {label:?} step {}", number + 1);
+            let outcome = pending::check(|| {
+                let cursor = PimdirReader::open(dir.path())
+                    .unwrap()
+                    .change_cursor()
+                    .unwrap();
+                apply(&spec, dir.path(), &mut kinds, &step["write"]);
+                feed(dir.path(), &cursor, &step["changed"]);
+
+                index.refresh(&refreshed).unwrap();
+                let rebuilt = tempfile::tempdir().unwrap();
+                PimdirReader::open(dir.path())
+                    .unwrap()
+                    .backup(rebuilt.path())
+                    .unwrap();
+                let mut fresh = PimdirIndex::open(rebuilt.path()).unwrap();
+                fresh.refresh(&refreshed).unwrap();
+                for query in step["queries"].as_array().unwrap() {
+                    let text = query["query"].as_str().unwrap();
+                    let want: BTreeSet<_> = pairs(&query["hits"]).into_iter().collect();
+                    assert_eq!(hit_set(&index, text), want, "{text:?}: refreshed");
+                    assert_eq!(hit_set(&fresh, text), want, "{text:?}: rebuilt");
+                }
+            });
+            outcomes.push((name, outcome));
+        }
+    }
+    pending::settle("refresh", outcomes);
+}
+
+/// Applies one refresh write as an owner makes it.
+fn apply(spec: &Path, dir: &Path, kinds: &mut BTreeMap<String, String>, write: &Value) {
+    let collection = || write["collection"].as_str().unwrap();
+    let seq = || write["seq"].as_i64().unwrap();
+    let mut store = PimdirStore::open(dir).unwrap().for_source("vectors");
+    match write["kind"].as_str().unwrap() {
+        "put" => {
+            let item = &write["item"];
+            let kind = kinds[item["collection"].as_str().unwrap()].clone();
+            put(spec, &mut store, &kind, item);
+        }
+        "remove" => {
+            store
+                .write(vec![PimdirWriteOp::DropPlacement {
+                    collection: PimdirCollectionId(collection().into()),
+                    handle: PimdirHandle(seq().to_string()),
+                    reason: PimdirDropReason::Deleted,
+                }])
+                .unwrap();
+        }
+        "purge" => assert!(store.purge(collection(), seq()).unwrap(), "purged"),
+        "erase" => assert!(store.erase(collection(), seq()).unwrap().erased, "erased"),
+        "rename" => {
+            let to = write["to"].as_str().unwrap();
+            store.rename_collection(collection(), to).unwrap();
+            let kind = kinds.remove(collection()).unwrap();
+            kinds.insert(to.into(), kind);
+        }
+        "cover" => {
+            let scope = PimdirScope {
+                since: write["covered_since"].as_str().map(Into::into),
+                until: write["covered_until"].as_str().map(Into::into),
+            };
+            drop(store);
+            PimdirStore::open(dir)
+                .unwrap()
+                .for_source(write["source"].as_str().unwrap())
+                .write(vec![
+                    PimdirWriteOp::OpenRound {
+                        collection: PimdirCollectionId(collection().into()),
+                        scope: scope.clone(),
+                        band: false,
+                    },
+                    PimdirWriteOp::CloseRound {
+                        collection: PimdirCollectionId(collection().into()),
+                        coverage: scope,
+                        checkpoint: None,
+                    },
+                ])
+                .unwrap();
+        }
+        kind => panic!("no refresh write {kind}"),
+    }
+}
+
+/// What the feed lists above `cursor` against what a step states.
+fn feed(dir: &Path, cursor: &PimdirChangeCursor, changed: &Value) {
+    let reader = PimdirReader::open(dir).unwrap();
+    let items: BTreeSet<(String, String)> = reader
+        .items_changed_since(cursor.changed, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.collection, item.link_id.0))
+        .collect();
+    let want: BTreeSet<(String, String)> = changed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| {
+            (
+                pair[0].as_str().unwrap().to_string(),
+                pair[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(items, want, "the items the feed lists");
+
+    let collections: BTreeSet<String> = reader
+        .collections_changed_since(cursor.changed, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|collection| collection.id)
+        .collect();
+    assert_eq!(
+        collections,
+        strings(&changed["collections"]).into_iter().collect(),
+        "the collections the feed lists"
+    );
+
+    let purged = reader.change_cursor().unwrap().purges != cursor.purges;
+    assert_eq!(
+        purged,
+        changed["purged"].as_bool().unwrap(),
+        "whether the purge count moved"
+    );
+}
+
+/// The hits of `query` as a set of `(account, seq)` pairs.
+fn hit_set(index: &PimdirIndex, query: &str) -> BTreeSet<(String, i64)> {
+    let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{query:?}: {err}"));
+    let options = PimdirSearchOptions {
+        limit: 100,
+        ..Default::default()
+    };
+    index
+        .search(&parsed, &options)
+        .unwrap_or_else(|err| panic!("{query:?}: {err}"))
+        .hits
+        .iter()
+        .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+        .collect()
 }
 
 /// A hit list as `(account, seq)` pairs.

@@ -8,4 +8,4 @@
 #
 # Suites: objects (vectors/objects.json), summaries (vectors/summaries.json),
 # payloads (vectors/payloads.json), sync (vectors/sync/, by file stem),
-# queries and chunks (vectors/search/).
+# queries, chunks and refresh (vectors/search/).

@@ -11,4 +11,5 @@ change: the-crate-follows-draft-15
 - [x] cairn/spec folded, the log written, CHANGELOG.md
 - [x] spec/REVISION names the pimdir commit carrying the bump (476c6a0, then 5371b73 with the generator); pimdir pins this crate in checks/io-pimdir.rev (1460f07)
 - [x] spec/generator/ vendored and checked by tests/spec_drift.rs; no dev-dependency declared yet
-- [ ] The later draft-15 lines of pimdir's freeze plan: the change-feed vectors, D2, the query language
+- [x] The change-feed refresh vectors (vectors/search/refresh.json), run by tests/search.rs
+- [ ] The later draft-15 lines of pimdir's freeze plan: D2, the query language

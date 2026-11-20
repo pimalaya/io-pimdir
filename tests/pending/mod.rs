@@ -11,13 +11,14 @@
 use std::{collections::BTreeMap, fs, panic, path::PathBuf};
 
 /// The suites the list may name, one per vector runner.
-const SUITES: [&str; 6] = [
+const SUITES: [&str; 7] = [
     "objects",
     "summaries",
     "payloads",
     "sync",
     "queries",
     "chunks",
+    "refresh",
 ];
 
 /// What one case's checks found: what failed, or nothing.
