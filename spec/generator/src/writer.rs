@@ -12,9 +12,11 @@
 //! the model and the statements reading STORAGE §9.1 two ways.
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write,
     path::Path,
+    process,
 };
 
 use rusqlite::{ToSql, types::Value};
@@ -23,6 +25,7 @@ use crate::{
     error::{Error, Result},
     model::{Item, Model, State, Table, split_flags},
     name::ObjectName,
+    queue::{Row, RowState},
     store::{Store, create_private_dir},
 };
 
@@ -84,6 +87,45 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
         }
     }
 
+    let sources: BTreeSet<&String> = model.capabilities.iter().map(|row| &row.source).collect();
+    for source in sources {
+        let source_value = Value::Text(source.clone());
+        run(
+            store,
+            "storage/owner/delete_capabilities",
+            &[("source", &source_value)],
+        )?;
+        for row in model
+            .capabilities
+            .iter()
+            .filter(|row| &row.source == source)
+        {
+            run(
+                store,
+                "storage/owner/set_capability",
+                &[
+                    ("account", &text(row.account.as_deref())),
+                    ("source", &source_value),
+                    ("collection", &text(row.collection.as_deref())),
+                    ("capability", &Value::Text(row.name.clone())),
+                    ("support", &Value::Text(row.support.clone())),
+                    ("detail", &text(row.detail.as_deref())),
+                ],
+            )?;
+        }
+    }
+    for ((account, capability), source) in &model.performers {
+        run(
+            store,
+            "storage/owner/set_performer",
+            &[
+                ("account", &text(account.as_deref())),
+                ("capability", &Value::Text(capability.clone())),
+                ("source", &Value::Text(source.clone())),
+            ],
+        )?;
+    }
+
     for (name, bytes) in &model.objects {
         let hash = Value::Text(name.0.clone());
         let size = Value::Integer(bytes.len() as i64);
@@ -96,6 +138,40 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
 
     for item in &model.items {
         write_item(store, item)?;
+    }
+
+    for reference in &model.references {
+        let answered = run_rows(
+            store,
+            "storage/owner/add_reference",
+            &[
+                (
+                    "from_kind",
+                    &Value::Text(String::from(reference.from_kind.media_type())),
+                ),
+                ("from_link_id", &Value::Text(reference.from_link_id.clone())),
+                (
+                    "to_kind",
+                    &Value::Text(String::from(reference.to_kind.media_type())),
+                ),
+                ("to_link_id", &Value::Text(reference.to_link_id.clone())),
+                ("role", &Value::Text(reference.role.clone())),
+                ("origin", &Value::Text(reference.origin.clone())),
+            ],
+        )?;
+        if answered.is_empty() {
+            return Err(Error::Disagreement {
+                what: format!(
+                    "the reference {} to {}",
+                    reference.from_link_id, reference.to_link_id
+                ),
+                detail: String::from("add_reference records nothing the model holds"),
+            });
+        }
+    }
+
+    for row in &model.queue {
+        write_row(store, model, row)?;
     }
 
     store.run("storage/owner/recompute_refcounts", &[])?;
@@ -115,7 +191,7 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
     }
 
     let (flags_known, marks, others) = flag_columns(item.flags.as_ref());
-    let object = text(item.object.as_ref().map(|name| name.0.as_str()));
+    let object = name(&item.object);
     run(
         store,
         "storage/owner/insert_item",
@@ -132,8 +208,8 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
                 "deleted",
                 &Value::Integer(i64::from(item.state != State::Live)),
             ),
-            ("conflicted", &Value::Integer(0)),
-            ("conflict_object", &Value::Null),
+            ("conflicted", &Value::Integer(i64::from(item.conflicted))),
+            ("conflict_object", &name(&item.conflict_object)),
         ],
     )?;
     if !others.is_empty() {
@@ -151,7 +227,6 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
     if let Some(binding) = &item.binding {
         let source = Value::Text(binding.source.clone());
         let (base_flags_known, base_marks, base_others) = flag_columns(binding.base_flags.as_ref());
-        let name = |name: &Option<ObjectName>| text(name.as_ref().map(|name| name.0.as_str()));
         run(
             store,
             "storage/owner/insert_binding",
@@ -164,10 +239,16 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
                 ("base_marks", &base_marks),
                 ("base_object", &name(&binding.base_object)),
                 ("base_revision", &text(binding.base_revision.as_deref())),
-                ("base_present", &Value::Integer(1)),
-                ("conflicted", &Value::Integer(0)),
-                ("conflict_revision", &Value::Null),
-                ("conflict_object", &Value::Null),
+                (
+                    "base_present",
+                    &Value::Integer(i64::from(binding.base_present)),
+                ),
+                ("conflicted", &Value::Integer(i64::from(binding.conflicted))),
+                (
+                    "conflict_revision",
+                    &text(binding.conflict_revision.as_deref()),
+                ),
+                ("conflict_object", &name(&binding.conflict_object)),
                 ("shared_object", &name(&binding.shared_object)),
             ],
         )?;
@@ -181,6 +262,19 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
             store.run("storage/owner/retain_base_flags", &key)?;
             store.run("storage/owner/add_base_flags", &key)?;
         }
+        if let Some(refusal) = &binding.refusal {
+            run(
+                store,
+                "storage/owner/refuse_binding",
+                &[
+                    ("reason", &Value::Text(refusal.reason.clone())),
+                    ("key", &Value::Text(refusal.key.clone())),
+                    ("collection", &collection),
+                    ("source", &source),
+                    ("handle", &Value::Text(binding.handle.clone())),
+                ],
+            )?;
+        }
     }
 
     if let State::Retained { by } = &item.state {
@@ -193,6 +287,75 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
                 ("source", &text(by.as_deref())),
             ],
         )?;
+    }
+
+    Ok(())
+}
+
+fn write_row(store: &Store, model: &Model, row: &Row) -> Result<()> {
+    let collection = Value::Text(row.collection.clone());
+    let account = text(model.collections[&row.collection].account.as_deref());
+    run(
+        store,
+        "storage/queue/ensure_collection",
+        &[("collection", &collection), ("account", &account)],
+    )?;
+
+    let object = row.action.body().map(ObjectName::of);
+    if let Some(object) = &object {
+        let hash = Value::Text(object.0.clone());
+        run(store, "storage/queue/pin_object", &[("hash", &hash)])?;
+    }
+    run(
+        store,
+        "storage/queue/enqueue_action",
+        &[
+            ("producer", &Value::Text(row.producer.clone())),
+            ("collection", &collection),
+            ("action", &Value::Text(String::from(row.action.name()))),
+            ("payload", &Value::Text(row.action.payload())),
+            ("target_collection", &text(row.action.target())),
+            ("object_hash", &name(&object)),
+        ],
+    )?;
+    let id = store.last_insert_rowid();
+    if id != row.id {
+        return Err(Error::Disagreement {
+            what: String::from("a queue row's id"),
+            detail: format!("the store draws {id}, the model {}", row.id),
+        });
+    }
+
+    let id = Value::Integer(id);
+    match &row.state {
+        RowState::Pending => {}
+        RowState::Parked(error) => run(
+            store,
+            "storage/owner/park_action",
+            &[("error", &Value::Text(error.clone())), ("id", &id)],
+        )?,
+        RowState::Unconfirmed(detail) => {
+            let answered = run_rows(
+                store,
+                "storage/owner/unconfirm_action",
+                &[("detail", &Value::Text(detail.clone())), ("id", &id)],
+            )?;
+            if answered.is_empty() {
+                return Err(Error::Disagreement {
+                    what: format!("unconfirm_action on row {}", row.id),
+                    detail: format!("it refuses a {} row", row.action.name()),
+                });
+            }
+        }
+        RowState::Applied(seq) => {
+            run(store, "storage/owner/claim_action", &[("id", &id)])?;
+            let seq = seq.map_or(Value::Null, Value::Integer);
+            run(
+                store,
+                "storage/owner/record_receipt",
+                &[("id", &id), ("collection", &collection), ("seq", &seq)],
+            )?;
+        }
     }
 
     Ok(())
@@ -317,7 +480,7 @@ fn write_summary(store: &Store, item: &Item, collection: &Value, link_id: &Value
     Ok(())
 }
 
-fn flag_columns(flags: Option<&std::collections::BTreeSet<String>>) -> (Value, Value, Vec<Value>) {
+fn flag_columns(flags: Option<&BTreeSet<String>>) -> (Value, Value, Vec<Value>) {
     match flags {
         None => (Value::Integer(0), Value::Integer(0), Vec::new()),
         Some(flags) => {
@@ -343,6 +506,10 @@ fn run_rows(store: &Store, name: &str, params: &[(&str, &Value)]) -> Result<Vec<
     store.run(name, &bound)
 }
 
+fn name(name: &Option<ObjectName>) -> Value {
+    text(name.as_ref().map(|name| name.0.as_str()))
+}
+
 fn text(text: Option<&str>) -> Value {
     text.map_or(Value::Null, |text| Value::Text(String::from(text)))
 }
@@ -361,7 +528,7 @@ fn write_blob(dir: &Path, name: &ObjectName, bytes: &[u8]) -> Result<()> {
     }
 
     let target = dir.join(name.path());
-    let temporary = shard.join(format!(".{}-{}", std::process::id(), &name.0[..8]));
+    let temporary = shard.join(format!(".{}-{}", process::id(), &name.0[..8]));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

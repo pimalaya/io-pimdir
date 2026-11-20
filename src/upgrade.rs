@@ -452,10 +452,11 @@ impl PimdirUpgrade {
     /// Settles a binding's divergence by the source's policy once its
     /// server body, `fetched` at `revision`, is read (SYNC §5, §6).
     ///
-    /// `Manual`, and `PreferLocal` without content pushes, record it as
-    /// the binding's diverging body. `PreferLocal` keeps it as a retained
-    /// item, an overruling write setting it aside, and moves the base onto
-    /// it, so the next sync pushes the local body gated on its revision.
+    /// `Manual`, and `PreferLocal` or `KeepLocal` without content pushes,
+    /// record it as the binding's diverging body. `PreferLocal` and
+    /// `KeepLocal` keep it as a retained item, an overruling write setting
+    /// it aside, and move the base onto it, so the next sync pushes the
+    /// local body gated on its revision.
     /// `PreferRemote` adopts it as the body and the base, the write keeping
     /// the local edit it drops (SYNC §9).
     fn settle(
@@ -475,7 +476,9 @@ impl PimdirUpgrade {
         diverged.conflict_object = Some(fetched.clone());
 
         let policy = match (self.opts.conflict, self.opts.push_content) {
-            (PimdirConflictPolicy::PreferLocal, false) => PimdirConflictPolicy::Manual,
+            (PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal, false) => {
+                PimdirConflictPolicy::Manual
+            }
             (policy, _) => policy,
         };
         match policy {
@@ -483,7 +486,7 @@ impl PimdirUpgrade {
                 self.ops.push(PimdirWriteOp::UpsertPlacement(diverged));
                 return;
             }
-            PimdirConflictPolicy::PreferLocal => {
+            PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal => {
                 debug!("keep the body {} pushes over", patched.handle.as_str());
                 self.ops.push(PimdirWriteOp::UpsertPlacement(diverged));
                 self.ops.push(PimdirWriteOp::Overrule {

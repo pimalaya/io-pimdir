@@ -19,12 +19,14 @@
 //!   canonical text, a store, object names, instants, PCG32, failures.
 
 pub mod body;
+pub mod capability;
 pub mod error;
 pub mod fixture;
 pub mod model;
 pub mod name;
 pub mod oracle;
 pub mod profile;
+pub mod queue;
 pub mod rng;
 pub mod spec;
 pub mod store;

@@ -130,6 +130,9 @@ pub enum PimdirConflictPolicy {
     PreferLocal,
     /// Keep the remote edit, dropping the local one and pulling the remote.
     PreferRemote,
+    /// `PreferLocal` for a source the store is authoritative over: a
+    /// change made on the remote alone is a divergence too, never pulled.
+    KeepLocal,
 }
 
 /// Tuning for one sync run: the push direction, the listing and its scope.
@@ -1957,6 +1960,12 @@ impl PimdirSync {
 
         match (local_changed, remote_changed) {
             (false, false) => ContentOutcome::Untouched,
+            (false, true)
+                if self.opts.conflict == PimdirConflictPolicy::KeepLocal
+                    && local.object.is_some() =>
+            {
+                self.resolve_conflict(local, item)
+            }
             (false, true) => ContentOutcome::Rewritten(self.pull_content(local, item)),
             (true, false) => {
                 if !(self.opts.push && self.opts.rights.content) {
@@ -2007,21 +2016,24 @@ impl PimdirSync {
     /// Resolves a content conflict by the configured [`PimdirConflictPolicy`].
     ///
     /// No policy pushes over a body nobody has read (SYNC §5): under
-    /// `PreferLocal`, a member carrying no body is recorded as `Manual`
-    /// records it, for the upgrade to fetch and settle.
+    /// `PreferLocal` and `KeepLocal`, a member carrying no body is recorded
+    /// as `Manual` records it, for the upgrade to fetch and settle.
     fn resolve_conflict(&mut self, local: &PimdirPlacement, item: &Remote) -> ContentOutcome {
+        let pushes = self.opts.push && self.opts.rights.content;
         match self.opts.conflict {
             PimdirConflictPolicy::Manual => self.mark_conflict(local, item),
             PimdirConflictPolicy::PreferRemote => {
                 ContentOutcome::Rewritten(self.pull_content(local, item))
             }
-            PimdirConflictPolicy::PreferLocal if !(self.opts.push && self.opts.rights.content) => {
+            PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal if !pushes => {
                 self.mark_conflict(local, item)
             }
-            PimdirConflictPolicy::PreferLocal => match self.carried_body(&item.handle) {
-                Some(observed) => self.keep_observed(local, item, observed),
-                None => self.mark_conflict(local, item),
-            },
+            PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal => {
+                match self.carried_body(&item.handle) {
+                    Some(observed) => self.keep_observed(local, item, observed),
+                    None => self.mark_conflict(local, item),
+                }
+            }
         }
     }
 

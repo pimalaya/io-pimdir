@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- **BREAKING**: Added `PimdirConflictPolicy::KeepLocal`, the policy of a source the store is authoritative over (pimdir SYNC §5, sync-draft-15): a change made on its remote alone is a divergence settled for the store, its body kept and reported `Overruled` and the store's pushed over it, never pulled. An exhaustive `match` on the enum needs the arm.
 - **BREAKING**: Added pimdir storage-draft-15, sync-draft-15 and search-draft-15, vendored from the pimdir working tree of 2026-11-20: a store or a sync state of draft-14 is refused, never migrated, and an index of draft-14 is rebuilt.
 
 ### Changed

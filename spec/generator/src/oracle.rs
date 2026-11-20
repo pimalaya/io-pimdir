@@ -12,13 +12,23 @@
 //! self-check of README.md, holding the writer to the statements and the
 //! model to the store.
 
-use std::collections::{BTreeMap, BTreeSet};
+pub mod feed;
+mod links;
+mod rights;
+mod search;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    iter,
+};
 
 use rusqlite::{ToSql, types::Value};
 
 use crate::{
     error::Result,
-    model::{Item, Kind, MARKS, Model, State, Table},
+    model::{Binding, Item, Kind, MARKS, Model, Refusal, State, Table},
+    name::ObjectName,
+    queue::RowState,
     spec::Spec,
     store::Store,
 };
@@ -54,6 +64,15 @@ pub const INSTANTS: [&str; 6] = [
     "round_started_at",
 ];
 
+/// The marker the model states for an instant SQLite stamps.
+pub const INSTANT: &str = "instant";
+
+/// The marker the model states for a change stamp (STORAGE §4.5).
+pub const STAMP: &str = "stamp";
+
+/// The marker the model states for the store's id.
+pub const STORE_ID: &str = "store id";
+
 /// Every expectation the model states over the reads it covers.
 pub fn expectations(model: &Model, spec: &Spec) -> Result<Vec<Expectation>> {
     let mut oracle = Oracle {
@@ -71,6 +90,12 @@ pub fn expectations(model: &Model, spec: &Spec) -> Result<Vec<Expectation>> {
     oracle.identities();
     oracle.mail()?;
     oracle.people();
+    oracle.conflicts();
+    oracle.queue();
+    oracle.rights();
+    oracle.links();
+    oracle.feed();
+    oracle.searches()?;
     Ok(oracle.out)
 }
 
@@ -123,7 +148,10 @@ struct Oracle<'a> {
 impl Oracle<'_> {
     fn expect(&mut self, statement: &str, params: &[(&str, Value)], rows: Vec<Vec<Value>>) {
         self.out.push(Expectation {
-            statement: format!("storage/read/{statement}"),
+            statement: match statement.contains('/') {
+                true => String::from(statement),
+                false => format!("storage/read/{statement}"),
+            },
             params: params
                 .iter()
                 .map(|(name, value)| (String::from(*name), value.clone()))
@@ -342,7 +370,7 @@ impl Oracle<'_> {
                         .iter()
                         .map(|column| match column.as_str() {
                             "retained_at" => match item.state {
-                                State::Retained { .. } => Value::Text(String::from("instant")),
+                                State::Retained { .. } => Value::Text(String::from(INSTANT)),
                                 _ => Value::Null,
                             },
                             "retained_by" => match &item.state {
@@ -460,11 +488,11 @@ impl Oracle<'_> {
                     flag_text(binding.base_flags.as_ref()),
                     text(binding.base_object.as_ref().map(|name| name.0.as_str())),
                     text(binding.base_revision.as_deref()),
-                    Value::Integer(1),
-                    Value::Integer(0),
-                    Value::Null,
-                    Value::Null,
-                    text(binding.shared_object.as_ref().map(|name| name.0.as_str())),
+                    Value::Integer(i64::from(binding.base_present)),
+                    Value::Integer(i64::from(binding.conflicted)),
+                    text(binding.conflict_revision.as_deref()),
+                    hash(&binding.conflict_object),
+                    hash(&binding.shared_object),
                 ]
             })
             .collect();
@@ -731,6 +759,197 @@ impl Oracle<'_> {
         Ok(())
     }
 
+    fn conflicts(&mut self) {
+        let model = self.model;
+        let accounts: BTreeSet<Option<&String>> = model
+            .collections
+            .values()
+            .map(|collection| collection.account.as_ref())
+            .collect();
+        let account_of = |item: &Item| model.collections[&item.collection].account.as_ref();
+
+        for account in accounts {
+            let mut items: Vec<&Item> = model
+                .items
+                .iter()
+                .filter(|item| item.conflicted && account_of(item) == account)
+                .collect();
+            items.sort_by(|a, b| (&a.collection, a.seq).cmp(&(&b.collection, b.seq)));
+            let rows = items
+                .iter()
+                .map(|item| {
+                    vec![
+                        Value::Text(item.collection.clone()),
+                        Value::Text(item.link_id.clone()),
+                        Value::Integer(item.seq),
+                        hash(&item.object),
+                        hash(&item.conflict_object),
+                    ]
+                })
+                .collect();
+            let params = [("account", text(account.map(String::as_str)))];
+            self.expect("list_conflicted_items", &params, rows);
+
+            let mut bound: Vec<(&Item, &Binding)> = model
+                .items
+                .iter()
+                .filter(|item| account_of(item) == account)
+                .filter_map(|item| item.binding.as_ref().map(|binding| (item, binding)))
+                .filter(|(_, binding)| binding.conflicted)
+                .collect();
+            bound.sort_by(|(a, x), (b, y)| {
+                (&a.collection, &a.link_id, &x.source).cmp(&(&b.collection, &b.link_id, &y.source))
+            });
+            let rows = bound
+                .iter()
+                .map(|(item, binding)| {
+                    vec![
+                        Value::Text(item.collection.clone()),
+                        Value::Text(item.link_id.clone()),
+                        Value::Text(binding.source.clone()),
+                        Value::Text(binding.handle.clone()),
+                        text(binding.conflict_revision.as_deref()),
+                        hash(&binding.base_object),
+                        hash(&item.object),
+                        hash(&binding.conflict_object),
+                    ]
+                })
+                .collect();
+            self.expect("list_conflicted_bindings", &params, rows);
+        }
+
+        for id in model.collections.keys() {
+            let mut refused: Vec<(&Item, &Binding, &Refusal)> = model
+                .items
+                .iter()
+                .filter(|item| &item.collection == id)
+                .filter_map(|item| item.binding.as_ref().map(|binding| (item, binding)))
+                .filter_map(|(item, binding)| {
+                    binding
+                        .refusal
+                        .as_ref()
+                        .map(|refusal| (item, binding, refusal))
+                })
+                .collect();
+            refused.sort_by(|(a, x, _), (b, y, _)| (a.seq, &x.source).cmp(&(b.seq, &y.source)));
+            let rows = refused
+                .iter()
+                .map(|(item, binding, refusal)| {
+                    vec![
+                        Value::Integer(item.seq),
+                        Value::Text(binding.source.clone()),
+                        Value::Text(binding.handle.clone()),
+                        Value::Text(refusal.reason.clone()),
+                        Value::Text(refusal.key.clone()),
+                        Value::Text(String::from(INSTANT)),
+                    ]
+                })
+                .collect();
+            self.expect(
+                "list_refusals",
+                &[("collection", Value::Text(id.clone()))],
+                rows,
+            );
+        }
+    }
+
+    fn queue(&mut self) {
+        let model = self.model;
+        let instant = || Value::Text(String::from(INSTANT));
+
+        for id in model.collections.keys() {
+            let rows = model
+                .queue
+                .iter()
+                .filter(|row| &row.collection == id && row.state == RowState::Pending)
+                .map(|row| {
+                    vec![
+                        Value::Integer(row.id),
+                        instant(),
+                        Value::Text(row.producer.clone()),
+                        Value::Text(String::from(row.action.name())),
+                        Value::Text(row.action.payload()),
+                        text(row.action.target()),
+                        hash(&row.action.body().map(ObjectName::of)),
+                        Value::Integer(0),
+                    ]
+                })
+                .collect();
+            self.expect(
+                "load_pending_actions",
+                &[("collection", Value::Text(id.clone()))],
+                rows,
+            );
+        }
+
+        let mut parked = Vec::new();
+        for row in &model.queue {
+            let id = [("id", Value::Integer(row.id))];
+            let error = match &row.state {
+                RowState::Pending => Some(Value::Null),
+                RowState::Parked(error) => Some(Value::Text(error.clone())),
+                RowState::Unconfirmed(detail) => {
+                    Some(Value::Text(format!("unconfirmed: {detail}")))
+                }
+                RowState::Applied(_) => None,
+            };
+            let action = error.clone().map(|error| {
+                vec![
+                    Value::Integer(row.id),
+                    instant(),
+                    Value::Text(row.producer.clone()),
+                    Value::Text(row.collection.clone()),
+                    Value::Text(String::from(row.action.name())),
+                    Value::Text(row.action.payload()),
+                    text(row.action.target()),
+                    Value::Integer(i64::from(error != Value::Null)),
+                    error,
+                ]
+            });
+            if let Some(action) = &action
+                && action[8] != Value::Null
+            {
+                parked.push(action.clone());
+            }
+            self.expect("load_action", &id, action.into_iter().collect());
+
+            let RowState::Applied(seq) = row.state else {
+                self.expect("load_receipt", &id, Vec::new());
+                continue;
+            };
+            let receipt = vec![
+                instant(),
+                Value::Text(row.collection.clone()),
+                seq.map_or(Value::Null, Value::Integer),
+            ];
+            self.expect("load_receipt", &id, vec![receipt]);
+
+            let account = model.collections[&row.collection].account.as_ref();
+            let mut refusals: Vec<Vec<Value>> = model
+                .items
+                .iter()
+                .filter(|item| Some(item.seq) == seq)
+                .filter(|item| model.collections[&item.collection].account.as_ref() == account)
+                .filter_map(|item| item.binding.as_ref().map(|binding| (item, binding)))
+                .filter_map(|(item, binding)| {
+                    binding.refusal.as_ref().map(|refusal| {
+                        vec![
+                            Value::Text(item.collection.clone()),
+                            Value::Text(binding.source.clone()),
+                            Value::Text(refusal.reason.clone()),
+                            instant(),
+                        ]
+                    })
+                })
+                .collect();
+            refusals.sort_by(|a, b| {
+                (as_text(&a[0]), as_text(&a[1])).cmp(&(as_text(&b[0]), as_text(&b[1])))
+            });
+            self.expect("load_receipt_refusals", &id, refusals);
+        }
+        self.expect("storage/owner/load_parked_actions", &[], parked);
+    }
+
     fn people(&mut self) {
         let model = self.model;
         let placed: Vec<&Item> = model
@@ -764,7 +983,7 @@ impl Oracle<'_> {
                 }
             }
             let roles: BTreeSet<&String> = firsts.iter().map(|(_, role)| *role).collect();
-            let wanted = std::iter::once(None).chain(roles.into_iter().map(Some));
+            let wanted = iter::once(None).chain(roles.into_iter().map(Some));
             for role in wanted {
                 let mut rows: Vec<(&Item, &String)> = firsts
                     .iter()
@@ -877,26 +1096,33 @@ fn seen_bit(item: &Item) -> i64 {
 }
 
 fn same_row(columns: &[String], got: &[Value], want: &[Value]) -> bool {
-    got.len() == want.len()
-        && columns
-            .iter()
-            .zip(got.iter().zip(want))
-            .all(|(column, (got, want))| match (column.as_str(), got, want) {
-                ("flags" | "base_flags", Value::Text(got), Value::Text(want)) => {
-                    flag_set(got) == flag_set(want)
-                }
-                (column, Value::Text(got), Value::Text(_)) if INSTANTS.contains(&column) => {
-                    is_instant(got)
-                }
-                _ => got == want,
-            })
+    got.len() == want.len() && columns.len() == got.len() && got == want
 }
 
-/// Writes a flag set's text in one order, so rows compare as sets do.
+/// Writes a flag set's text in one order, so rows compare as sets do, and
+/// a value no model can predict (an instant SQLite stamps, a change stamp,
+/// the store's id) as the marker the model states for it, once its shape
+/// is checked.
 fn normalise(columns: &[String], row: &mut [Value]) {
     for (column, value) in columns.iter().zip(row.iter_mut()) {
-        if let ("flags" | "base_flags", Value::Text(text)) = (column.as_str(), &*value) {
-            *value = Value::Text(flag_set(text).join(" "));
+        let marker = match (column.as_str(), &*value) {
+            ("flags" | "base_flags", Value::Text(text)) => Some(flag_set(text).join(" ")),
+            (column, Value::Text(text)) if INSTANTS.contains(&column) && is_instant(text) => {
+                Some(String::from(INSTANT))
+            }
+            ("changed", Value::Integer(stamp)) if *stamp > 0 => Some(String::from(STAMP)),
+            ("store_id", Value::Text(text))
+                if text.len() == 32
+                    && text
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                Some(String::from(STORE_ID))
+            }
+            _ => None,
+        };
+        if let Some(marker) = marker {
+            *value = Value::Text(marker);
         }
     }
 }
@@ -949,21 +1175,38 @@ fn cell(item: &Item, column: &str, table: Option<Table>) -> Value {
     }
 }
 
+fn as_text(value: &Value) -> &str {
+    match value {
+        Value::Text(text) => text,
+        _ => "",
+    }
+}
+
+fn hash(name: &Option<ObjectName>) -> Value {
+    text(name.as_ref().map(|name| name.0.as_str()))
+}
+
 fn text(text: Option<&str>) -> Value {
     text.map_or(Value::Null, |text| Value::Text(String::from(text)))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::BTreeSet, env, fs, path::PathBuf, process};
 
     use crate::{name::ObjectName, oracle, profile::Profile, spec::Spec, store::Store, writer};
 
+    /// The read statements no oracle point answers by itself: the list
+    /// slots' own, and the open's, which the store's tests hold.
+    const INFRASTRUCTURE: [&str; 4] = [
+        "storage/read/bind_param",
+        "storage/read/clear_param",
+        "storage/read/create_param",
+        "storage/read/load_store_meta",
+    ];
+
     fn scratch(seed: u64) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pimdir-generator-oracle-{}-{seed}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("pimdir-generator-oracle-{}-{seed}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -982,11 +1225,24 @@ mod tests {
             let disagreements = oracle::check(&store, &expectations).unwrap();
             assert!(disagreements.is_empty(), "seed {seed}: {disagreements:#?}");
 
-            let statements: std::collections::BTreeSet<&str> = expectations
+            let statements: BTreeSet<&str> = expectations
                 .iter()
                 .map(|expectation| expectation.statement.as_str())
                 .collect();
-            assert!(statements.len() >= 40, "seed {seed}: {statements:?}");
+            let uncovered: Vec<&String> = spec
+                .statements
+                .keys()
+                .filter(|name| name.starts_with("storage/read/"))
+                .filter(|name| !INFRASTRUCTURE.contains(&name.as_str()))
+                .filter(|name| !statements.contains(name.as_str()))
+                .collect();
+            assert!(
+                uncovered.is_empty(),
+                "seed {seed}: no expectation for {uncovered:?}"
+            );
+
+            let faults = oracle::feed::order(&store).unwrap();
+            assert!(faults.is_empty(), "seed {seed}: {faults:#?}");
 
             for (name, bytes) in &model.objects {
                 let file = fs::read(dir.join(name.path())).unwrap();
