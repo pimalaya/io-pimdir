@@ -10,5 +10,7 @@
 mod common;
 
 mod drain;
+#[cfg(feature = "search")]
+mod index;
 mod overlay;
 mod reader;
