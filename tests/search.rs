@@ -899,6 +899,59 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
 }
 
 #[test]
+fn a_hit_whose_body_cannot_be_read_lists_without_a_snippet() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("a@x", "Alpha", "first body"),
+        &[],
+    );
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("b@x", "Beta", "second body"),
+        &[],
+    );
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+
+    let query = PimdirQuery::parse("subject:alpha").unwrap();
+    let alpha = index
+        .search(&query, &PimdirSearchOptions::default())
+        .unwrap();
+    let hash = alpha.hits[0].placements[0].object.clone().unwrap();
+    let blob = index.reader().blobs().path(&hash).unwrap();
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let answer = index
+        .search(
+            &PimdirQuery::parse("body").unwrap(),
+            &PimdirSearchOptions::default(),
+        )
+        .unwrap();
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
+
+    let snippets: BTreeMap<String, Option<String>> = answer
+        .hits
+        .into_iter()
+        .map(|hit| (hit.title, hit.snippet))
+        .collect();
+    assert_eq!(
+        snippets,
+        BTreeMap::from([
+            ("Alpha".to_string(), None),
+            ("Beta".to_string(), Some("second body".to_string())),
+        ]),
+        "the other hits list, the unreadable body cuts no snippet"
+    );
+}
+
+#[test]
 fn an_index_built_otherwise_is_rebuilt_and_a_held_lock_skips_the_refresh() {
     let dir = tempfile::tempdir().unwrap();
     file_message(

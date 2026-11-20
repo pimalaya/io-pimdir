@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `PimdirIndex::search`, `threads` and `thread` failing the whole page when one hit's blob cannot be read: that hit lists without a snippet.
+
 ## [0.18.1] - 2026-11-19
 
 ### Added

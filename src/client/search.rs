@@ -442,7 +442,7 @@ pub struct PimdirSearchHit {
     pub matched: Option<PimdirSearchMatched>,
     /// A passage of its body, re-read from the blob: from the first chunk
     /// naming a query word, else the first; `None` without an indexed
-    /// body or a chunk.
+    /// body or a chunk, or when the blob cannot be read.
     pub snippet: Option<String>,
 }
 
@@ -1369,7 +1369,8 @@ impl PimdirIndex {
 
     /// A passage of a hit's indexed body: the first chunk naming one of
     /// `words`, else the first chunk, trimmed to about [`SNIPPET_LEN`]
-    /// characters around the word.
+    /// characters around the word. A blob that cannot be read cuts none,
+    /// so one hit never fails the page.
     fn snippet(
         &self,
         kind: &str,
@@ -1397,8 +1398,13 @@ impl PimdirIndex {
         if chunks.is_empty() && self.own_extraction {
             return Ok(None);
         }
-        let Some(blob) = self.reader.blobs().get(hash)? else {
-            return Ok(None);
+        let blob = match self.reader.blobs().get(hash) {
+            Ok(Some(blob)) => blob,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                debug!("cannot read body {} for a snippet: {err}", hash.0);
+                return Ok(None);
+            }
         };
 
         let media_type = match PimdirQueryKind::parse(kind) {
