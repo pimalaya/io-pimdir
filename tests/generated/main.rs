@@ -16,3 +16,5 @@ mod drain;
 mod index;
 mod overlay;
 mod reader;
+#[cfg(feature = "search")]
+mod replay;

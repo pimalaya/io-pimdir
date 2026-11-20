@@ -198,7 +198,7 @@ fn cut(before: &Path, held: &Path, wal: &str, end: u64) -> tempfile::TempDir {
 /// Every row of the store at `root` by table, in one order, an instant
 /// SQLite stamped (a column named `_at`) as the oracle's marker, and the
 /// files of its blob tree and quarantine as `files`.
-fn store_rows(root: &Path) -> BTreeMap<String, Vec<Vec<Value>>> {
+pub fn store_rows(root: &Path) -> BTreeMap<String, Vec<Vec<Value>>> {
     let conn = Connection::open(root.join("pimdir.db")).unwrap();
     let names: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
