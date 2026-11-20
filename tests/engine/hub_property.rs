@@ -785,3 +785,23 @@ fn a_pending_create_a_pass_resurrected_has_seen_the_shared_body() {
     ])
     .unwrap();
 }
+
+/// An upgrade reading the body a base named at its own revision fills the
+/// base and settles no item conflict (SYNC §5, §6): s0 edited an item it
+/// held at `Meta` after a rebuild, s1 diverged from s0's second edit, and
+/// s0's upgrade of the server body both edits were made over kept the
+/// conflict and both edits.
+///
+/// Found by the property above (2026-11-20).
+#[test]
+fn a_base_read_at_its_own_revision_keeps_the_item_conflict() {
+    check_hub_model(vec![
+        HubOp::ServerAdd(8902919689650134319, 0),
+        HubOp::Bump(3573659382024138960),
+        HubOp::Edit(3196897750361235906, 17436267663627111228, 0),
+        HubOp::Sync(5748930266644911766),
+        HubOp::Edit(13647608989997215515, 7843442433136614280, 1),
+        HubOp::Edit(15107088274842412705, 13021446597980136012, 2),
+    ])
+    .unwrap();
+}

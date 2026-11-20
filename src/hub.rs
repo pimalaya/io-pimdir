@@ -145,6 +145,11 @@ impl PimdirHubItem {
     /// policy does not adopt is the verdict's loser, which the storage
     /// keeps.
     ///
+    /// A base read at the revision it named and no body, while the item's
+    /// conflict holds its diverging body, is the body the source's edits
+    /// were made over, not an edit (SYNC §5, §6): the item and its
+    /// conflict stand, only the binding's base taking the body.
+    ///
     /// The hub calls it for every live upsert but a person's settle; a
     /// storage applying upserts itself calls it on its own copy of the item
     /// for the same verdict.
@@ -213,6 +218,20 @@ impl PimdirHubItem {
             verdict.lost = settled;
             self.conflicted = false;
             self.conflict_object = None;
+            return verdict;
+        }
+
+        let base_read = prev_base
+            .zip(placement.base.as_ref())
+            .is_some_and(|(prev_base, base)| {
+                prev_base.object.is_none()
+                    && prev_base.revision.is_some()
+                    && base.revision == prev_base.revision
+                    && base.object.is_some()
+                    && base.object == incoming
+            });
+        if base_read && self.conflicted && self.conflict_object.is_some() {
+            verdict.kept_shared = true;
             return verdict;
         }
 

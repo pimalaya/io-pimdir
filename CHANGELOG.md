@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed an upgrade reading the body a base named at its revision, while the item's conflict held its diverging body, fast-forwarding the item to it: the conflict cleared and both the source's edit and the diverging body were lost. The base takes the body and the item and its conflict stand.
 - Fixed `PimdirIndex::search`, `threads` and `thread` failing the whole page when one hit's blob cannot be read: that hit lists without a snippet.
 - Fixed `PimdirReader::with_pending` showing an item a pending move or copy brings in without the rows queued on it in its source before: it arrives with them folded in.
 - Fixed `PimdirIndex::refresh` failing the whole run on a body it cannot read: its placement is recorded missing and tried again.
