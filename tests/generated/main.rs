@@ -18,3 +18,5 @@ mod overlay;
 mod reader;
 #[cfg(feature = "search")]
 mod replay;
+#[cfg(feature = "search")]
+mod scale;

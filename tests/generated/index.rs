@@ -256,7 +256,7 @@ pub fn writes(drained: &Model) -> Vec<Write> {
 
 /// The index of a copy of the store at `root`, built from nothing and
 /// refreshed with `options`.
-fn rebuilt(root: &Path, options: &PimdirIndexRefreshOptions) -> Dump {
+pub fn rebuilt(root: &Path, options: &PimdirIndexRefreshOptions) -> Dump {
     let copy = tempfile::tempdir().unwrap();
     let store = copy.path().join("store");
     copy_store(root, &store, false);
