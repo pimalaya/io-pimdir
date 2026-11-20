@@ -952,6 +952,46 @@ fn a_hit_whose_body_cannot_be_read_lists_without_a_snippet() {
 }
 
 #[test]
+fn a_body_the_refresh_cannot_read_is_recorded_missing_then_indexed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = message("a@x", "Alpha", "first body");
+    let hash = PimdirStore::open(dir.path()).unwrap().hash(&alpha);
+    file_message(dir.path(), "INBOX", alpha, &[]);
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("b@x", "Beta", "second body"),
+        &[],
+    );
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let blob = index.reader().blobs().path(&hash).unwrap();
+    let missing = || -> i64 {
+        rusqlite::Connection::open(dir.path().join("index.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM missing", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o000)).unwrap();
+    let report = index.refresh(&PimdirIndexRefreshOptions::default());
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
+
+    assert_eq!(report.unwrap().indexed, 1, "the other body is indexed");
+    assert_eq!(missing(), 1);
+    assert_eq!(hits(&index, "first").len(), 0);
+    assert_eq!(hits(&index, "second").len(), 1);
+
+    let report = index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(report.indexed, 1, "tried again once readable");
+    assert_eq!(missing(), 0);
+    assert_eq!(hits(&index, "first").len(), 1);
+}
+
+#[test]
 fn an_index_built_otherwise_is_rebuilt_and_a_held_lock_skips_the_refresh() {
     let dir = tempfile::tempdir().unwrap();
     file_message(

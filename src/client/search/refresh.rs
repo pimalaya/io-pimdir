@@ -13,7 +13,7 @@ use alloc::{
     vec::Vec,
 };
 
-use log::trace;
+use log::{debug, trace};
 use rusqlite::{Connection, OptionalExtension, Transaction, named_params};
 
 use crate::{
@@ -39,7 +39,8 @@ pub(crate) struct Statements<'a> {
 }
 
 impl Statements<'_> {
-    /// Answers one yield, writing a [`Writes`] yield's ops in order.
+    /// Answers one yield, writing a [`Writes`] yield's ops in order. A body
+    /// that cannot be read is answered as a gone one (SEARCH §4).
     ///
     /// [`Writes`]: PimdirIndexRefreshYield::Writes
     pub(crate) fn answer(
@@ -105,8 +106,12 @@ impl Statements<'_> {
             PimdirIndexRefreshYield::WantsBodies { hashes } => {
                 let mut bodies = BTreeMap::new();
                 for hash in hashes {
-                    if let Some(body) = self.blobs.get(&hash)? {
-                        bodies.insert(hash, body);
+                    match self.blobs.get(&hash) {
+                        Ok(Some(body)) => {
+                            bodies.insert(hash, body);
+                        }
+                        Ok(None) => {}
+                        Err(err) => debug!("cannot read body {}: {err}", hash.0),
                     }
                 }
                 PimdirIndexRefreshArg::Bodies(bodies)
