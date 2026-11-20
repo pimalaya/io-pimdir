@@ -24,6 +24,9 @@ use pimdir_generator::{
 use rusqlite::types::Value;
 use tempfile::TempDir;
 
+/// The marker a park's reason is compared as, its text being free.
+pub const PARKED: &str = "parked";
+
 /// The seeds every generated test runs, fixed so a failure replays.
 pub const SEEDS: [u64; 4] = [7, 42, 1337, 20_261_120];
 
@@ -87,9 +90,10 @@ pub fn text(text: Option<&str>) -> Value {
     text.map_or(Value::Null, |text| Value::Text(String::from(text)))
 }
 
-/// Writes a flag set in one order and a value no model predicts (an
-/// instant SQLite stamps, a change stamp, the store's id) as the marker
-/// the oracle states for it, once its shape is checked.
+/// Writes a flag set in one order, a value no model predicts (an instant
+/// SQLite stamps, a change stamp, the store's id) as the marker the oracle
+/// states for it once its shape is checked, and a park's reason, free
+/// text (STORAGE §15.2), as [`PARKED`].
 pub fn normalise(columns: &[&str], row: &mut [Value]) {
     for (column, value) in columns.iter().zip(row.iter_mut()) {
         let marker = match (*column, &*value) {
@@ -102,6 +106,9 @@ pub fn normalise(columns: &[&str], row: &mut [Value]) {
                 Some(String::from(INSTANT))
             }
             ("changed", Value::Integer(stamp)) if *stamp > 0 => Some(String::from(STAMP)),
+            ("error", Value::Text(text)) if !text.starts_with("unconfirmed: ") => {
+                Some(String::from(PARKED))
+            }
             ("store_id", Value::Text(text))
                 if text.len() == 32
                     && text

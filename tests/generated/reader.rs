@@ -9,7 +9,10 @@
 
 use core::cmp::Ordering;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use io_pimdir::{
     client::{
@@ -28,6 +31,7 @@ use pimdir_generator::{
     model::Model,
     oracle::{self, Expectation},
     queue::{Action, RowState},
+    spec::Spec,
 };
 use rusqlite::types::Value;
 
@@ -82,15 +86,34 @@ fn every_read_of_a_generated_store_answers_what_the_oracle_states_known_included
 /// were stated.
 fn disagreements(seed: u64) -> (usize, Vec<(Option<&'static str>, String)>) {
     let generated = Generated::structure(seed);
-    let reader = PimdirReader::open(generated.root()).unwrap();
-    let expectations = oracle::expectations(&generated.model, &generated.spec).unwrap();
+    compare(
+        &generated.spec,
+        &generated.model,
+        &generated.root(),
+        |_, _, _, _| None,
+    )
+}
+
+/// Every point of the oracle over `model` the reader of the store at
+/// `root` disagrees on, each with the known finding it stands under,
+/// beside how many points were stated. `differ` names the finding a
+/// point no known one covers stands under, from the columns compared and
+/// the rows io-pimdir and the oracle answer there.
+pub fn compare(
+    spec: &Spec,
+    model: &Model,
+    root: &Path,
+    differ: impl Fn(&Expectation, &[&str], &[Vec<Value>], &[Vec<Value>]) -> Option<&'static str>,
+) -> (usize, Vec<(Option<&'static str>, String)>) {
+    let reader = PimdirReader::open(root).unwrap();
+    let expectations = oracle::expectations(model, spec).unwrap();
 
     let mut disagreements = Vec::new();
     let mut answered: BTreeSet<&str> = BTreeSet::new();
     let mut skipped: BTreeSet<&str> = BTreeSet::new();
     for expectation in &expectations {
         let statement = expectation.statement.as_str();
-        let known = known(&generated.model, expectation);
+        let known = known(model, expectation);
         let answer = match answer(&reader, expectation) {
             Ok(Some(answer)) => answer,
             Ok(None) => {
@@ -108,7 +131,7 @@ fn disagreements(seed: u64) -> (usize, Vec<(Option<&'static str>, String)>) {
         };
         answered.insert(statement);
 
-        let columns = &generated.spec.statement(statement).unwrap().columns;
+        let columns = &spec.statement(statement).unwrap().columns;
         let mut want: Vec<Vec<Value>> = expectation
             .rows
             .iter()
@@ -139,6 +162,7 @@ fn disagreements(seed: u64) -> (usize, Vec<(Option<&'static str>, String)>) {
                 "{statement} at {:?} {:?} on {:?}: io-pimdir answers {got:?}, the oracle {want:?}",
                 expectation.params, expectation.slot, answer.columns
             );
+            let known = known.or_else(|| differ(expectation, &answer.columns, &got, &want));
             disagreements.push((known, disagreement));
         }
     }
@@ -148,10 +172,7 @@ fn disagreements(seed: u64) -> (usize, Vec<(Option<&'static str>, String)>) {
         .copied()
         .filter(|statement| !UNWRAPPED.contains(statement))
         .collect();
-    assert!(
-        unmapped.is_empty(),
-        "seed {seed}: no reader call answers {unmapped:?}"
-    );
+    assert!(unmapped.is_empty(), "no reader call answers {unmapped:?}");
 
     (expectations.len(), disagreements)
 }

@@ -9,5 +9,6 @@
 
 mod common;
 
+mod drain;
 mod overlay;
 mod reader;
