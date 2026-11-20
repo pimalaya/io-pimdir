@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed a sync recording a contact or event joining an item another source binds, listed without its body, as a conflict of its binding: it is the item's conflict, which the upgrade reading a body equal to the item's now clears, as it no longer leaves two equal bodies in conflict (pimdir SYNC §6, §9).
 - Fixed a sync reporting a member joining an item another source binds as `Created` and settling a diverging body it carried by the source's own policy: it is `Added`, its body folded into the item by the collection's policy (pimdir SYNC §6, §9).
 - Fixed a sync reporting `ContentChanged` for a pull whose body the collection's `prefer-existing` kept apart, the item keeping its own (pimdir SYNC §5).
 - Fixed `PimdirIndex::refresh` keeping a body indexed after its last placement left it or moved off it, and a thread's id and bounds after a member's sort key moved: a refreshed index is the one a rebuild writes (`PimdirIndexOp::DropUnplaced`, pimdir SEARCH §4, §9).

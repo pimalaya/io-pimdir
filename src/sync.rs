@@ -1345,7 +1345,9 @@ impl PimdirSync {
     /// An `offered` create is no create of this source but the store's copy
     /// of an item other sources bind, which the member joins (SYNC §6): a
     /// body it carries is its own, its base and its summary, and the write
-    /// folds it into the item by the collection's policy (SYNC §9).
+    /// folds it into the item by the collection's policy (SYNC §9). A
+    /// mutable member carrying none holds no body: the write records the
+    /// item's conflict until the upgrade reads it.
     fn land(
         &mut self,
         create: PimdirPlacement,
@@ -1361,7 +1363,7 @@ impl PimdirSync {
         let tombstone = create.status == PimdirStatus::Tombstone;
         let mut landed = create;
         landed.handle = item.handle.clone();
-        if offered && item.meta.body.is_some() {
+        if offered && (item.meta.body.is_some() || item.revision.is_some()) {
             landed.object = None;
             landed.summary = item.meta.summary.clone();
             landed.sort_key = item.meta.sort_key.clone();

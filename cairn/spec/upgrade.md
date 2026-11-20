@@ -160,6 +160,8 @@ The `Links` load an upgrade makes for a fresh hint asks for the hint and its min
 ### Requirement: An item conflict's late body meets the policy
 An item conflict recorded for want of its incoming body SHALL be revisited by the `Full` upgrade of each binding whose base names a revision and no body, and only those: the fetched body lands as that binding's body and base, and the write settles it against the item's by the collection's policy as a carried body would have been, `Manual` recording it in `items.conflict_object`, `PreferIncoming` adopting it and `PreferExisting` keeping the shared body, the conflict cleared and the body not adopted kept and reported `Overruled` (pimdir SYNC §6, §9, vectors/sync/84, 90, 91). A binding whose base holds a body is not refetched for the item's conflict.
 
+A fetched body equal to the item's own is no divergence, whatever the policy: the write clears the item's conflict, the binding based and agreed on that body (pimdir SYNC §6, sync-draft-15, vectors/sync/188, failing before it).
+
 An item holding no body when its conflict was recorded waits for the fill: the upgrade reading that binding's own body fills the item, and the write settles a `prefer-` conflict then, `prefer-incoming` adopting the diverging body and `prefer-existing` keeping the filled one, the conflict cleared and the body not adopted kept over the filling binding's handle and reported `Overruled`; `manual` leaves the conflict standing (pimdir SYNC §9, vectors/sync/112 to 115; hub.md).
 
 ### Requirement: A full fetch answering no body counts nothing

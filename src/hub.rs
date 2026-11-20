@@ -150,6 +150,10 @@ impl PimdirHubItem {
     /// were made over, not an edit (SYNC §5, §6): the item and its
     /// conflict stand, only the binding's base taking the body.
     ///
+    /// A source binding none of the item changed, a member joining it (SYNC
+    /// §9). An item conflict waiting for a body nobody read clears when the
+    /// body read is the item's own: no divergence (SYNC §6).
+    ///
     /// The hub calls it for every live upsert but a person's settle; a
     /// storage applying upserts itself calls it on its own copy of the item
     /// for the same verdict.
@@ -178,7 +182,7 @@ impl PimdirHubItem {
             .any(|base| base.revision.is_some());
         let resolving = binding.is_some_and(|binding| binding.conflicted)
             && placement.status != PimdirStatus::Conflict;
-        let source_edited = incoming != prev || resolving;
+        let source_edited = incoming != prev || resolving || binding.is_none();
         let hub_moved = shared != agreed;
         let body_changed = incoming != shared;
 
@@ -232,6 +236,15 @@ impl PimdirHubItem {
             });
         if base_read && self.conflicted && self.conflict_object.is_some() {
             verdict.kept_shared = true;
+            return verdict;
+        }
+        if self.conflicted
+            && self.conflict_object.is_none()
+            && prev.is_none()
+            && incoming.is_some()
+            && incoming == shared
+        {
+            self.conflicted = false;
             return verdict;
         }
 

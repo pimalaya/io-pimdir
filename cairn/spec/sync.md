@@ -576,7 +576,7 @@ tests/vectors_sync.rs SHALL run every case of the vendored spec/vectors/sync/ at
 - src/sync.rs `an_out_of_scope_create_waits`, `a_round_landing_no_delivered_create_keeps_it_waiting`, `a_create_holding_neither_body_nor_origin_is_reported_undeliverable`
 
 ### Requirement: An offered create is landed with the union of its flags
-A member landing a `Created` placement the store offers this source (an item it does not bind yet, `PimdirLoaded::offered`) SHALL be landed with the union of the placement's flags and the member's, neither side holding a base to have removed one against (SYNC §5); a pending create of this source keeps its staged flags as before. Such a member joins the item (SYNC §6): it SHALL be reported `Added`, never `Created`, and a body it carries SHALL be its own, its base and its summary, the write folding it into the item by the collection's policy (SYNC §9), never the source's both-changed case (vectors/sync/184, 185, both failing before it).
+A member landing a `Created` placement the store offers this source (an item it does not bind yet, `PimdirLoaded::offered`) SHALL be landed with the union of the placement's flags and the member's, neither side holding a base to have removed one against (SYNC §5); a pending create of this source keeps its staged flags as before. Such a member joins the item (SYNC §6): it SHALL be reported `Added`, never `Created`, and a body it carries SHALL be its own, its base and its summary, the write folding it into the item by the collection's policy (SYNC §9), never the source's both-changed case (vectors/sync/184, 185, both failing before it). A mutable member carrying none holds no body: the write records the item's conflict, the source counting as changed since it bound none of the item, whatever the policy, until the upgrade reads it (pimdir SYNC §9, vector 187, failing before it).
 
 #### Scenario: A first pairing ends alike whatever the page
 - GIVEN two mail sources holding one message, one with `\Seen` and the other without, either way round
@@ -588,6 +588,14 @@ A member landing a `Created` placement the store offers this source (an item it 
 - WHEN source b, binding none of it, lists it carrying `c2`
 - THEN the item takes `c2`, `c1` is a retained item over b's handle, and the run reports `Added`, `ContentChanged` and `Overruled` (vectors/sync/185)
 - tests/engine/hub.rs `a_joining_body_is_the_items_conflict_rather_than_overwritten`, `a_joining_body_follows_the_collections_policy_not_the_sources`, `a_joining_body_prefer_existing_refuses_is_kept_and_pushed_over`
+
+### Requirement: A change is derived before its write folds it
+The merge SHALL derive each candidate's change from its placement and its member before the write folds the candidate into the item (pimdir SYNC §5, §9, sync-draft-15): what the fold leaves the binding owing, the item's body a collection's policy kept over the member's, is pushed by the source's next run, never by the run that pulled.
+
+#### Scenario: Prefer-existing keeps the item's body
+- GIVEN a card another source changed to `c3`, the collection under `prefer-existing`
+- WHEN source b's `PreferRemote` pulls `c2`
+- THEN the item keeps `c3`, `c2` is kept and reported `Overruled`, b's base is `c2` and nothing is pushed this run (vectors/sync/182)
 
 ### Requirement: A kept local edit keeps its summary
 A listing naming a member at its base revision SHALL refresh the summary and sort key of its placement only when the placement holds no local edit of a mutable kind (`staged_edit`): the listing describes the server's body, and a placement whose local body the run keeps, pushed or still pending, keeps that body's summary (SYNC §5). A rekey carrying such an edit the remote did not edit keeps its summary and sort key the same way.
