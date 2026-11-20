@@ -54,6 +54,7 @@ required-features = ["cli"]
 pimalaya-cli = { version = "0.6", default-features = false, features = ["build"], optional = true }
 
 [dev-dependencies]
+pimdir-generator = { path = "spec/generator" }
 proptest = { version = "1", default-features = false, features = ["std"] }
 sha2 = { version = "0.11", default-features = false }
 tempfile = { version = "3", default-features = false }

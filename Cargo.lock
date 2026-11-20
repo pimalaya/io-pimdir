@@ -468,6 +468,7 @@ dependencies = [
  "log",
  "mime-rs",
  "pimalaya-cli",
+ "pimdir-generator",
  "proptest",
  "rusqlite",
  "rustix",
@@ -685,6 +686,16 @@ dependencies = [
  "thiserror",
  "toml",
  "unicode-width",
+]
+
+[[package]]
+name = "pimdir-generator"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
