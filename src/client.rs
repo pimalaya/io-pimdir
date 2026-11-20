@@ -2031,6 +2031,14 @@ pub enum PimdirError {
         /// What holds it.
         existing: PimdirDuplicate,
     },
+    /// A create stated a `hash:` key its body's bytes do not give (§9,
+    /// §15.3), refused before anything was appended.
+    HashKeyMismatch {
+        /// The collection the create was for.
+        collection: String,
+        /// The key it stated.
+        link_id: String,
+    },
     /// The store is of another version of the format than this crate's
     /// [`FORMAT_VERSION`](crate::sql::FORMAT_VERSION) (STORAGE §4.2, §6):
     /// another draft's, a release's, or one lacking `format_version`,
@@ -2230,6 +2238,7 @@ impl PimdirError {
     /// | `collection-role` | [`Role`](Self::Role) |
     /// | `collection-queued` | [`Queued`](Self::Queued) |
     /// | `item-duplicate` | [`Duplicate`](Self::Duplicate) |
+    /// | `hash-key-mismatch` | [`HashKeyMismatch`](Self::HashKeyMismatch) |
     /// | `store-version` | [`Version`](Self::Version) |
     /// | `store-uncreated` | `Uncreated`, or an absent `NotCurrent` |
     /// | `store-foreign` | [`Foreign`](Self::Foreign) |
@@ -2279,6 +2288,7 @@ impl PimdirError {
             Self::Role { .. } => "collection-role",
             Self::Queued { .. } => "collection-queued",
             Self::Duplicate { .. } => "item-duplicate",
+            Self::HashKeyMismatch { .. } => "hash-key-mismatch",
             Self::Version { .. } => "store-version",
             Self::Uncreated => "store-uncreated",
             Self::Foreign => "store-foreign",
@@ -2395,6 +2405,13 @@ impl fmt::Display for PimdirError {
             } => write!(
                 f,
                 "Pimdir create refused: collection {collection} already has {link_id} queued as action {id}"
+            ),
+            Self::HashKeyMismatch {
+                collection,
+                link_id,
+            } => write!(
+                f,
+                "Pimdir create refused: {link_id} in collection {collection} is the key of other bytes than its body"
             ),
             Self::Version { found } => PimdirFormatRefusal {
                 found: found.as_deref(),

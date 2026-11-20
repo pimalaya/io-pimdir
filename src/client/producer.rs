@@ -427,7 +427,8 @@ impl PimdirProducer {
     /// The key an `add` is checked under before it is appended (§15.3):
     /// the one it states, else the one the owner derives from the body
     /// in hand (Annex A); `None` for any other action, and for an `add`
-    /// stating none whose body is not in hand.
+    /// stating none whose body is not in hand. A stated `hash:` key the
+    /// body in hand does not give is [`PimdirError::HashKeyMismatch`].
     fn fresh(
         &self,
         collection: &str,
@@ -435,6 +436,18 @@ impl PimdirProducer {
         body: Option<&[u8]>,
     ) -> Result<Option<PimdirLinkId>, PimdirError> {
         Ok(match (action, body) {
+            (
+                PimdirAction::Add {
+                    link_id: Some(link_id),
+                    ..
+                },
+                Some(body),
+            ) if link_id.as_str().starts_with("hash:") && *link_id != summary::hash_key(body) => {
+                return Err(PimdirError::HashKeyMismatch {
+                    collection: collection.to_string(),
+                    link_id: link_id.0.clone(),
+                });
+            }
             (
                 PimdirAction::Add {
                     link_id: Some(link_id),
@@ -629,7 +642,7 @@ impl PimdirProducer {
                     ":object_hash": hash.map(|h| h.0.as_str()),
                 },
             )?;
-            rows.push((tx.last_insert_rowid(), partial));
+            rows.push((tx.last_insert_rowid(), partial, queued.fresh.clone()));
         }
 
         // NOTE: once every action passed, so a batch refused stages
@@ -650,12 +663,13 @@ impl PimdirProducer {
         }
         Ok(rows
             .into_iter()
-            .map(|(id, partial)| PimdirEnqueued {
+            .map(|(id, partial, link_id)| PimdirEnqueued {
                 handle: PimdirActionHandle {
                     id,
                     store: Some(store.clone()),
                 },
                 partial,
+                link_id,
             })
             .collect())
     }
@@ -834,6 +848,10 @@ pub struct PimdirEnqueued {
     /// The partial supports the action passed the gate with (§15.6), each
     /// worth showing: the action is queued whatever they say.
     pub partial: Vec<PimdirPartial>,
+    /// The key an `add` was checked under (§15.3), the one it states or
+    /// the one the owner derives from its body in hand; `None` for any
+    /// other action and for an `add` whose body was not in hand.
+    pub link_id: Option<PimdirLinkId>,
 }
 
 impl From<PimdirEnqueued> for PimdirActionHandle {
@@ -1858,10 +1876,11 @@ fn stage_action(
         ..
     } = action
     {
-        let derivation = match object {
-            Some(hash) => summary::derive(&kind, &queued_body(blobs, hash)?),
+        let body = match object {
+            Some(hash) => Some(queued_body(blobs, hash)?),
             None => None,
         };
+        let derivation = body.as_ref().and_then(|body| summary::derive(&kind, body));
         let link = link_id
             .clone()
             .or_else(|| derivation.as_ref().map(|d| d.link_id.clone()));
@@ -1870,6 +1889,15 @@ fn stage_action(
                 "add carries no link id and none derives from its body".to_string(),
             )));
         };
+        if let Some(body) = &body
+            && link.as_str().starts_with("hash:")
+            && link != summary::hash_key(body)
+        {
+            return Ok(Err(PimdirOutcome::Parked(format!(
+                "add states {}, the key of other bytes than its body",
+                link.0
+            ))));
+        }
         let live = tx
             .query_row_cached(
                 sql::LIVE_ITEM_FOR_LINK,

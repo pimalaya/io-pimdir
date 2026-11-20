@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Added `PimdirEnqueued::link_id`, the key an `add` was checked under, stated or derived from its body in hand, so a producer states none and reports the key the store will hold.
+- **BREAKING**: Added `PimdirError::HashKeyMismatch` and `PimdirMutateError::HashKeyMismatch` (`hash-key-mismatch`): an `add` stating a `hash:` key its body's bytes do not give is refused, and a drain parks one (pimdir STORAGE §15.3, SYNC §7).
 - **BREAKING**: Added `PimdirConflictPolicy::KeepLocal`, the policy of a source the store is authoritative over (pimdir SYNC §5, sync-draft-15): a change made on its remote alone is a divergence settled for the store, its body kept and reported `Overruled` and the store's pushed over it, never pulled. An exhaustive `match` on the enum needs the arm.
 - **BREAKING**: Added pimdir storage-draft-15, sync-draft-15 and search-draft-15, vendored from the pimdir working tree of 2026-11-20: a store or a sync state of draft-14 is refused, never migrated, and an index of draft-14 is rebuilt.
 
@@ -18,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed `enqueue_with_body` queueing a UID-less contact or event under the `hash:` key its caller derived before the `X-PIMDIR-` properties were taken out, a key naming bytes the store never held: it is refused, and stating no key answers the right one.
 - Fixed an upgrade reading the body a base named at its revision, while the item's conflict held its diverging body, fast-forwarding the item to it: the conflict cleared and both the source's edit and the diverging body were lost. The base takes the body and the item and its conflict stand.
 - Fixed `PimdirIndex::search`, `threads` and `thread` failing the whole page when one hit's blob cannot be read: that hit lists without a snippet.
 - Fixed `PimdirReader::with_pending` showing an item a pending move or copy brings in without the rows queued on it in its source before: it arrives with them folded in.

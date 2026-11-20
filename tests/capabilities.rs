@@ -378,6 +378,82 @@ fn a_resource_is_queued_without_its_instructions_unless_the_user_asks() {
     assert_eq!(queued, invitation.as_bytes(), "the instruction left");
 }
 
+/// STORAGE §9, §15.3: a UID-less resource is keyed over the bytes it is
+/// queued with. A key derived before the instructions were taken out names
+/// bytes the store never holds, so it is refused; stating none, the add
+/// answers the key the owner derives from what it queued.
+#[test]
+fn a_uidless_resource_is_keyed_over_the_bytes_it_is_queued_with() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded_event(dir.path(), "dav", "work", "m0");
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let raw = MEETING
+        .replace("UID:m1\r\n", "")
+        .replace("END:VEVENT", "X-PIMDIR-ONLINE-MEETING:TRUE\r\nEND:VEVENT");
+    let stripped = summary::strip_instructions(raw.as_bytes());
+    let before = summary::derive("text/calendar", raw.as_bytes())
+        .unwrap()
+        .link_id;
+    assert!(before.as_str().starts_with("hash:"), "{before:?}");
+
+    let stated = |link_id: Option<PimdirLinkId>| {
+        move |hash| PimdirAction::Add {
+            link_id,
+            flags: PimdirFlags::default(),
+            object: Some(hash),
+            supersedes: None,
+        }
+    };
+    let Err(PimdirError::HashKeyMismatch { link_id, .. }) =
+        producer.enqueue_with_body("work", raw.as_bytes(), stated(Some(before.clone())))
+    else {
+        panic!("a key derived before the instructions left should be refused");
+    };
+    assert_eq!(link_id, before.0);
+    assert!(producer.pending_actions("work").unwrap().is_empty());
+
+    let enqueued = producer
+        .enqueue_with_body("work", raw.as_bytes(), stated(None))
+        .unwrap();
+    assert_eq!(enqueued.link_id, Some(summary::hash_key(&stripped)));
+}
+
+/// STORAGE §15.2, §15.3: an `add` whose stated `hash:` key its stored
+/// body does not give, queued with its body staged apart, is parked by
+/// the owner and never staged under a key naming other bytes.
+#[test]
+fn the_owner_parks_an_add_stating_another_bodys_hash_key() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded_event(dir.path(), "dav", "work", "m0");
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let body = MEETING.replace("UID:m1\r\n", "");
+    let (PimdirAction::Add { object, .. }, staged) = add(&producer, &body) else {
+        unreachable!()
+    };
+    let foreign = summary::hash_key(b"another body");
+    let action = PimdirAction::Add {
+        link_id: Some(foreign.clone()),
+        flags: PimdirFlags::default(),
+        object,
+        supersedes: None,
+    };
+    producer.enqueue("work", &action, Some(&staged)).unwrap();
+    drop(producer);
+
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("dav");
+    let report = store.drain().unwrap();
+    assert_eq!(report.parked, 1, "{report:?}");
+    let parked = store.parked_actions().unwrap();
+    assert!(
+        parked[0].error.contains(foreign.as_str()),
+        "{}",
+        parked[0].error
+    );
+    assert_eq!(store.seq_for_link("work", foreign.as_str()).unwrap(), None);
+}
+
 /// STORAGE §15.6: the owner's backstop decides whatever the producer's
 /// gate let through. An intent naming a declared source that does not
 /// declare its capability, or the option it asks for, parks naming both;

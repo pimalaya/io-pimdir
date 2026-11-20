@@ -28,7 +28,7 @@ use crate::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
         PimdirPlacement, PimdirSortKey, PimdirStatus,
     },
-    summary::PimdirSummary,
+    summary::{self, PimdirSummary},
     sync::PimdirSyncEvent,
 };
 
@@ -280,6 +280,9 @@ pub enum PimdirMutateError {
     Unnamed(String),
     /// An `Add` names a link id a live placement already holds.
     LinkExists(String),
+    /// An `Add` states a `hash:` key its body's bytes do not give: the
+    /// key names other bytes (STORAGE §9, §15.3).
+    HashKeyMismatch(String),
     /// An `Edit` or a `Remove` stating the body it was made over names
     /// one the placement no longer holds: another write replaced it
     /// since.
@@ -336,6 +339,7 @@ impl PimdirMutateError {
     /// | `handle-unknown` | [`UnknownHandle`](Self::UnknownHandle) |
     /// | `placement-unnamed` | [`Unnamed`](Self::Unnamed) |
     /// | `item-duplicate` | [`LinkExists`](Self::LinkExists) |
+    /// | `hash-key-mismatch` | [`HashKeyMismatch`](Self::HashKeyMismatch) |
     /// | `body-replaced` | [`Replaced`](Self::Replaced) |
     /// | `conflict-unresolved` | [`Unresolved`](Self::Unresolved) |
     /// | `flags-unknown` | [`UnknownFlags`](Self::UnknownFlags) |
@@ -348,6 +352,7 @@ impl PimdirMutateError {
             Self::UnknownHandle(_) => "handle-unknown",
             Self::Unnamed(_) => "placement-unnamed",
             Self::LinkExists(_) => "item-duplicate",
+            Self::HashKeyMismatch(_) => "hash-key-mismatch",
             Self::Replaced { .. } => "body-replaced",
             Self::Unresolved { .. } => "conflict-unresolved",
             Self::UnknownFlags(_) => "flags-unknown",
@@ -375,6 +380,12 @@ impl fmt::Display for PimdirMutateError {
                 write!(
                     f,
                     "Pimdir MUTATE failed: link id already present: {link_id}"
+                )
+            }
+            Self::HashKeyMismatch(link_id) => {
+                write!(
+                    f,
+                    "Pimdir MUTATE failed: {link_id} is the key of other bytes than the body added"
                 )
             }
             Self::Undeliverable(handle) => {
@@ -785,7 +796,12 @@ impl PimdirCoroutine for PimdirMutate {
                 })
             }
             (State::Loading, Some(PimdirArg::Load(loaded))) => {
-                let ops = if let PimdirMutation::Add { link_id, .. } = &self.mutation {
+                let ops = if let PimdirMutation::Add { link_id, body, .. } = &self.mutation {
+                    if link_id.as_str().starts_with("hash:") && *link_id != summary::hash_key(body)
+                    {
+                        let err = PimdirMutateError::HashKeyMismatch(link_id.0.clone());
+                        return PimdirCoroutineState::Complete(Err(err));
+                    }
                     let collides = loaded.placements.iter().any(|p| {
                         p.status != PimdirStatus::Tombstone && p.link_id.as_ref() == Some(link_id)
                     });

@@ -1439,7 +1439,7 @@ fn reproduce(spec: &Path, path: &Path) {
         // NOTE: a case of another format version states fields this
         // runner would read under another meaning, or not at all (SYNC
         // §11), so it is refused rather than run.
-        assert_eq!(case["v"], 9, "{label}: the sync format's version");
+        assert_eq!(case["v"], 10, "{label}: the sync format's version");
         let dir = tempfile::tempdir().unwrap();
         let bodies = seed(dir.path(), spec, &case["store"]);
 
