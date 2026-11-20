@@ -1,6 +1,7 @@
 //! # A write cut at a commit, finished on reopening
 //!
-//! The owner writes of tests/generated/index.rs and the index refresh, each
+//! The owner writes of tests/generated/index.rs, the index refresh and every
+//! engine run of the generator's histories (tests/generated/replay.rs), each
 //! cut after every commit it makes and run again on the store reopened
 //! (STORAGE §7, §8; SEARCH §4), against the run no crash cut.
 //!
@@ -14,7 +15,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, OpenOptions},
+    fs::{self, DirBuilder, OpenOptions},
+    os::unix::fs::DirBuilderExt,
     path::Path,
 };
 
@@ -22,12 +24,13 @@ use io_pimdir::client::{
     PimdirStore,
     search::{PimdirIndex, PimdirIndexRefreshOptions},
 };
-use pimdir_generator::{oracle::INSTANT, profile::Profile, spec::Spec};
+use pimdir_generator::{engine::Run, history::Step, oracle::INSTANT, profile::Profile, spec::Spec};
 use rusqlite::{Connection, types::Value};
 
 use crate::{
     common::{Generated, SEEDS},
     index::{self, BATCH, NOW},
+    replay::{self, Scripted},
 };
 
 /// The writes that checkpoint the log themselves, whose cuts this test
@@ -141,6 +144,126 @@ fn an_index_refresh_cut_after_any_batch_finishes_as_the_uncut_refresh() {
             }
         }
         assert!(differences.is_empty(), "{differences:#?}");
+    }
+}
+
+#[test]
+fn an_engine_run_cut_after_any_commit_finishes_as_the_uncut_run() {
+    let mut differences = Vec::new();
+    for seed in SEEDS {
+        for (name, history) in replay::histories(seed) {
+            let history = replay::declared(&history);
+            let mut revisions = BTreeMap::new();
+            for pair in history.steps.windows(2) {
+                let (before, step) = (&pair[0], &pair[1]);
+                let Some(run) = &step.run else {
+                    continue;
+                };
+                for page in &run.pages {
+                    for item in &page.items {
+                        if let Some(revision) = &item.revision {
+                            revisions.insert(
+                                (run.collection.clone(), item.handle.clone()),
+                                revision.clone(),
+                            );
+                        }
+                    }
+                }
+                let at = format!("seed {seed} {name} {}", step.label);
+                differences.extend(
+                    cut_run(before, step, run, &revisions)
+                        .into_iter()
+                        .map(|text| format!("{at}: {text}")),
+                );
+            }
+        }
+    }
+    assert!(differences.is_empty(), "{differences:#?}");
+}
+
+/// Cuts one run after each of its commits, from the store of the step
+/// before it with the step's queued rows drained, and runs it again on the
+/// store reopened, its connector answering what each request asks: the
+/// store it leaves is the uncut run's, or the one the uncut run and that
+/// same run again leave, where the cut fell past a write leaving a change
+/// owed to the next run (SYNC §5).
+fn cut_run(
+    before: &Step,
+    step: &Step,
+    run: &Run,
+    revisions: &BTreeMap<(String, String), String>,
+) -> Vec<String> {
+    let generated = Generated::write(Spec::load_default().unwrap(), before.model.clone());
+    let root = generated.root();
+    let _ = replay::produce(&root, before, step);
+
+    let start = tempfile::tempdir().unwrap();
+    let held = tempfile::tempdir().unwrap();
+    index::copy_store(&root, &start.path().join("store"), true);
+
+    let keeper = Connection::open(root.join("pimdir.db")).unwrap();
+    keeper
+        .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    let mut remote = Scripted::of(step, run, revisions, false);
+    let uncut = replay::run_verb(&root, before, step, run, &mut remote);
+    let log = log_of(&root, "pimdir.db", &start.path().join("store"), held.path());
+    drop(keeper);
+    let want = store_rows(&root);
+    let next = {
+        let copy = tempfile::tempdir().unwrap();
+        let store = copy.path().join("store");
+        index::copy_store(&root, &store, true);
+        let mut remote = Scripted::of(step, run, revisions, true);
+        let _ = replay::run_verb(&store, before, step, run, &mut remote);
+        store_rows(&store)
+    };
+
+    let Some(log) = log else {
+        return vec![String::from("the run checkpointed the log")];
+    };
+    let mut found = Vec::new();
+    for end in log.ends {
+        let cut = cut(start.path(), held.path(), "pimdir.db-wal", end);
+        let store = cut.path().join("store");
+        held_objects(&root.join("objects"), &store.join("objects"));
+        let mut remote = Scripted::of(step, run, revisions, true);
+        let again = replay::run_verb(&store, before, step, run, &mut remote);
+        let got = store_rows(&store);
+        if got != want && got != next {
+            found.push(format!(
+                "cut at byte {end}, run again ({:?}, uncut {:?}): {}",
+                again.map(|events| events.len()),
+                uncut.as_ref().map(Vec::len),
+                apart(&got, &want)
+            ));
+        }
+    }
+    found
+}
+
+/// Copies into `to` each blob of `from` it lacks: the bodies a run wrote
+/// before the commit naming them, which a crash after any commit leaves.
+fn held_objects(from: &Path, to: &Path) {
+    let Ok(entries) = fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        let target = to.join(path.file_name().unwrap());
+        match path.is_dir() {
+            true => {
+                if !target.exists() {
+                    DirBuilder::new().mode(0o700).create(&target).unwrap();
+                }
+                held_objects(&path, &target);
+            }
+            false => {
+                if !target.exists() {
+                    fs::copy(&path, &target).unwrap();
+                }
+            }
+        }
     }
 }
 

@@ -132,7 +132,19 @@ fn every_generated_history_replays_as_its_model_states_known_included() {
 /// Every difference the histories of `seed` replay with, each with the
 /// known finding it stands under.
 fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
-    let histories = [
+    histories(seed)
+        .into_iter()
+        .flat_map(|(name, history)| {
+            replay(&history)
+                .into_iter()
+                .map(move |(known, text)| (known, format!("{name}: {text}")))
+        })
+        .collect()
+}
+
+/// Every history of the generator at `seed`, by name.
+pub fn histories(seed: u64) -> [(&'static str, History); 8] {
+    [
         ("mail", History::mail(seed)),
         ("cards", History::cards(seed)),
         ("moves", History::moves(seed)),
@@ -141,15 +153,7 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
         ("policies", History::policies(seed)),
         ("sources", History::sources(seed)),
         ("scopes", History::scopes(seed)),
-    ];
-    histories
-        .into_iter()
-        .flat_map(|(name, history)| {
-            replay(&history)
-                .into_iter()
-                .map(move |(known, text)| (known, format!("{name}: {text}")))
-        })
-        .collect()
+    ]
 }
 
 /// Replays `history` from the store of its first step, naming each
@@ -278,7 +282,7 @@ fn retained_sort_key(
 /// row and its sources' (STORAGE §14), which io-pimdir's owner would
 /// write as the configuration it is, so a step's run finds them as the
 /// model's did.
-fn declared(history: &History) -> History {
+pub fn declared(history: &History) -> History {
     let last = &history.steps[history.steps.len() - 1].model;
     let mut history = history.clone();
     for step in &mut history.steps {
@@ -317,47 +321,8 @@ fn replay_run(
             }
         }
     }
-    let kind = step.model.collections[&run.collection]
-        .kind
-        .map(|kind| String::from(kind.media_type()))
-        .unwrap_or_default();
-    let mut remote = Scripted {
-        kind,
-        collection: run.collection.clone(),
-        pages: run
-            .pages
-            .iter()
-            .map(snapshot_of(&step.model, &run.collection))
-            .collect(),
-        fetch: run.fetch.clone(),
-        revisions: revisions.clone(),
-        outcomes: run.outcomes.clone(),
-        pushes: Vec::new(),
-        requests: Vec::new(),
-    };
-    let options = options(before, step, run);
-
-    let mut owner = PimdirStore::open(root)
-        .unwrap()
-        .for_source(run.source.as_str());
-    let events = match run.verb {
-        "sync" => owner
-            .sync(run.collection.as_str(), options, &mut remote)
-            .map(|report| report.events),
-        _ => owner
-            .upgrade(
-                run.collection.as_str(),
-                run.fetch
-                    .keys()
-                    .map(|handle| PimdirHandle::from(handle.as_str()))
-                    .collect(),
-                PimdirTier::Full,
-                (&options).into(),
-                &mut remote,
-            )
-            .map(|report| report.events),
-    };
-    drop(owner);
+    let mut remote = Scripted::of(step, run, revisions, false);
+    let events = run_verb(root, before, step, run, &mut remote);
 
     let mut found = Vec::new();
     let events = match events {
@@ -440,7 +405,7 @@ fn replay_run(
 }
 
 /// The options a run ran under, read where the run states none (G11).
-fn options(before: &Step, step: &Step, run: &Run) -> PimdirSyncOptions {
+pub fn options(before: &Step, step: &Step, run: &Run) -> PimdirSyncOptions {
     let state = step.model.collections[&run.collection]
         .sources
         .get(&run.source);
@@ -480,7 +445,7 @@ fn scope_of(scope: &Scope) -> PimdirScope {
 /// Enqueues through io-pimdir's producer the rows the step's model holds
 /// and the one before did not, each drained by the owner as the model did
 /// unless the model leaves it pending.
-fn produce(root: &Path, before: &Step, step: &Step) -> Vec<String> {
+pub fn produce(root: &Path, before: &Step, step: &Step) -> Vec<String> {
     let mut found = Vec::new();
     for row in &step.model.queue[before.model.queue.len()..] {
         let action = match codec::action_from_payload(row.action.name(), &row.action.payload()) {
@@ -516,18 +481,117 @@ fn produce(root: &Path, before: &Step, step: &Step) -> Vec<String> {
     found
 }
 
-/// The connector a run answers from: its pages in order, its fetched
-/// bodies, its outcomes by handle; recording the listing asked for and
-/// each push handed.
-struct Scripted {
+/// Runs a step's verb as its source against `remote`, answering the events
+/// it reports.
+pub fn run_verb(
+    root: &Path,
+    before: &Step,
+    step: &Step,
+    run: &Run,
+    remote: &mut Scripted,
+) -> Result<Vec<PimdirSyncEvent>, String> {
+    let options = options(before, step, run);
+    let mut owner = PimdirStore::open(root)
+        .unwrap()
+        .for_source(run.source.as_str());
+    match run.verb {
+        "sync" => owner
+            .sync(run.collection.as_str(), options, remote)
+            .map(|report| report.events)
+            .map_err(|err| err.to_string()),
+        _ => owner
+            .upgrade(
+                run.collection.as_str(),
+                run.fetch
+                    .keys()
+                    .map(|handle| PimdirHandle::from(handle.as_str()))
+                    .collect(),
+                PimdirTier::Full,
+                (&options).into(),
+                remote,
+            )
+            .map(|report| report.events)
+            .map_err(|err| err.to_string()),
+    }
+}
+
+/// The connector a run answers from: its pages, its fetched bodies, its
+/// outcomes by handle; recording the listing asked for and each push
+/// handed. Served in order, or, `resuming` a run a crash cut, by what each
+/// request asks: a round from its start or after its cursor, a delta from
+/// the checkpoint the run delivers answered with nothing changed, an
+/// outcome answered again for a push made again.
+pub struct Scripted {
     kind: String,
     collection: String,
     pages: VecDeque<PimdirRemoteSnapshot>,
+    all: Vec<PimdirRemoteSnapshot>,
+    resuming: bool,
     fetch: BTreeMap<String, Vec<u8>>,
     revisions: BTreeMap<(String, String), String>,
     outcomes: Vec<Outcome>,
     pushes: Vec<String>,
     requests: Vec<&'static str>,
+}
+
+impl Scripted {
+    /// The connector of `run`, the revisions of earlier listings at hand.
+    pub fn of(
+        step: &Step,
+        run: &Run,
+        revisions: &BTreeMap<(String, String), String>,
+        resuming: bool,
+    ) -> Self {
+        let kind = step.model.collections[&run.collection]
+            .kind
+            .map(|kind| String::from(kind.media_type()))
+            .unwrap_or_default();
+        let all: Vec<PimdirRemoteSnapshot> = run
+            .pages
+            .iter()
+            .map(snapshot_of(&step.model, &run.collection))
+            .collect();
+        Self {
+            kind,
+            collection: run.collection.clone(),
+            pages: all.iter().cloned().collect(),
+            all,
+            resuming,
+            fetch: run.fetch.clone(),
+            revisions: revisions.clone(),
+            outcomes: run.outcomes.clone(),
+            pushes: Vec::new(),
+            requests: Vec::new(),
+        }
+    }
+
+    /// The page a resumed run's request asks for.
+    fn resumed(&self, request: &PimdirEnumerate) -> Option<PimdirRemoteSnapshot> {
+        if let Some(cursor) = request.cursor() {
+            let at = self
+                .all
+                .iter()
+                .position(|page| page.cursor.as_ref() == Some(cursor))?;
+            return self.all.get(at + 1).cloned();
+        }
+        let delivered = self.all.iter().find_map(|page| page.checkpoint.as_ref());
+        if let Some(checkpoint) = request.checkpoint()
+            && Some(checkpoint) == delivered
+        {
+            return Some(PimdirRemoteSnapshot {
+                items: Vec::new(),
+                vanished: Vec::new(),
+                complete: false,
+                last: true,
+                cursor: None,
+                checkpoint: Some(checkpoint.clone()),
+                narrowed: false,
+                capped: false,
+                enumerated: None,
+            });
+        }
+        self.all.first().cloned()
+    }
 }
 
 impl PimdirRemote for Scripted {
@@ -546,6 +610,12 @@ impl PimdirRemote for Scripted {
             });
         if request.head().is_some() {
             return Ok(PimdirEnumerated::NoHead);
+        }
+        if self.resuming {
+            return self
+                .resumed(&request)
+                .map(PimdirEnumerated::Page)
+                .ok_or_else(|| String::from("no page scripted"));
         }
         self.pages
             .pop_front()
@@ -600,7 +670,10 @@ impl PimdirRemote for Scripted {
             else {
                 continue;
             };
-            let outcome = self.outcomes.remove(at);
+            let outcome = match self.resuming {
+                true => self.outcomes[at].clone(),
+                false => self.outcomes.remove(at),
+            };
             results.push(PimdirPushResult {
                 relocated: outcome.relocated.unwrap_or(false),
                 handle,
