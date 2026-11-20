@@ -9,6 +9,8 @@
 
 mod common;
 
+#[cfg(feature = "search")]
+mod crash;
 mod drain;
 #[cfg(feature = "search")]
 mod index;

@@ -16,7 +16,7 @@ use std::{
 };
 
 use io_pimdir::client::{
-    PimdirSourceStore, PimdirStore,
+    PimdirError, PimdirSourceStore, PimdirStore,
     search::{PimdirIndex, PimdirIndexRefreshOptions},
 };
 use pimdir_generator::{
@@ -54,13 +54,13 @@ const G9: &str = "G9: a refreshed index keeps a body no placement names";
 const G10: &str = "G10: a restated sort key leaves its thread's bounds";
 
 /// The instant every refresh draws its horizon around, Unix seconds.
-const NOW: i64 = 1_790_000_000;
+pub const NOW: i64 = 1_790_000_000;
 
 /// What a refresh folds per transaction, small so a pass is cut often.
-const BATCH: usize = 3;
+pub const BATCH: usize = 3;
 
 /// The rows of an index by what they index, per table.
-type Dump = BTreeMap<&'static str, Vec<Vec<Value>>>;
+pub type Dump = BTreeMap<&'static str, Vec<Vec<Value>>>;
 
 #[test]
 fn an_index_refreshed_after_each_owner_write_is_the_one_a_rebuild_writes() {
@@ -110,7 +110,7 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
     let mut differences = Vec::new();
     for (step, write) in writes(&drained).into_iter().enumerate() {
         let label = write.label();
-        write.apply(&mut owner);
+        assert!(write.apply(&mut owner).unwrap(), "{label}");
         index.refresh(&options).unwrap();
 
         let refreshed = dump(&root);
@@ -143,7 +143,7 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
 }
 
 /// One owner write of the run.
-enum Write {
+pub enum Write {
     Nothing,
     Drain,
     Purge { collection: String, seq: i64 },
@@ -158,7 +158,8 @@ enum Write {
 }
 
 impl Write {
-    fn label(&self) -> String {
+    /// What the write is, for a failure to name.
+    pub fn label(&self) -> String {
         match self {
             Self::Nothing => String::from("as written"),
             Self::Drain => String::from("drain"),
@@ -177,42 +178,43 @@ impl Write {
         }
     }
 
-    fn apply(&self, owner: &mut PimdirSourceStore) {
+    /// Runs the write as `owner`, answering whether it found what it
+    /// names: the purge its item, the delete its collection.
+    pub fn apply(&self, owner: &mut PimdirSourceStore) -> Result<bool, PimdirError> {
         match self {
             Self::Nothing => {}
             Self::Drain => {
-                owner.drain().unwrap();
+                owner.drain()?;
             }
-            Self::Purge { collection, seq } => assert!(owner.purge(collection, *seq).unwrap()),
+            Self::Purge { collection, seq } => return owner.purge(collection, *seq),
             Self::SortKey {
                 collection,
                 link_id,
-            } => owner
-                .set_sort_key(collection, link_id, "2001-01-01T00:00:00Z")
-                .unwrap(),
-            Self::Name { collection } => owner.set_collection_name(collection, "Renamed").unwrap(),
-            Self::Rename { collection } => owner
-                .rename_collection(collection, &format!("{collection} renamed"))
-                .unwrap(),
+            } => owner.set_sort_key(collection, link_id, "2001-01-01T00:00:00Z")?,
+            Self::Name { collection } => owner.set_collection_name(collection, "Renamed")?,
+            Self::Rename { collection } => {
+                owner.rename_collection(collection, &format!("{collection} renamed"))?
+            }
             Self::Release { collection } => {
-                owner.release_before(&[collection], None).unwrap();
+                owner.release_before(&[collection], None)?;
             }
             Self::Evict { collection, before } => {
-                owner.evict_before(collection, before).unwrap();
+                owner.evict_before(collection, before)?;
             }
             Self::Erase { collection, seq } => {
-                owner.erase(collection, *seq).unwrap();
+                owner.erase(collection, *seq)?;
             }
-            Self::Delete { collection } => assert!(owner.delete_collection(collection).unwrap()),
+            Self::Delete { collection } => return owner.delete_collection(collection),
             Self::Collect => {
-                owner.collect_garbage().unwrap();
+                owner.collect_garbage()?;
             }
         }
+        Ok(true)
     }
 }
 
 /// The run of writes the drained model gives, each target drawn from it.
-fn writes(drained: &Model) -> Vec<Write> {
+pub fn writes(drained: &Model) -> Vec<Write> {
     let mut writes = vec![Write::Nothing, Write::Drain];
 
     for item in &drained.items {
@@ -290,24 +292,26 @@ fn writes(drained: &Model) -> Vec<Write> {
 fn rebuilt(root: &Path, options: &PimdirIndexRefreshOptions) -> Dump {
     let copy = tempfile::tempdir().unwrap();
     let store = copy.path().join("store");
-    copy_store(root, &store);
+    copy_store(root, &store, false);
     let mut index = PimdirIndex::open(&store).unwrap();
     index.refresh(options).unwrap();
     drop(index);
     dump(&store)
 }
 
-fn copy_store(from: &Path, to: &Path) {
+/// Copies the store at `from` into `to`, private as the store is, its
+/// index files with it when `index` holds.
+pub fn copy_store(from: &Path, to: &Path, index: bool) {
     DirBuilder::new().mode(0o700).create(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with("index.") {
+        if !index && name.to_string_lossy().starts_with("index.") {
             continue;
         }
         let target = to.join(&name);
         match entry.file_type().unwrap().is_dir() {
-            true => copy_store(&entry.path(), &target),
+            true => copy_store(&entry.path(), &target, index),
             false => {
                 fs::copy(entry.path(), target).unwrap();
             }
@@ -319,7 +323,7 @@ fn copy_store(from: &Path, to: &Path) {
 /// placement names by hash, those none names apart, the placements by
 /// collection and `seq`, and the full-text tables as the tokens each
 /// document holds, read through `fts5vocab`.
-fn dump(root: &Path) -> Dump {
+pub fn dump(root: &Path) -> Dump {
     let conn = Connection::open(root.join("index.db")).unwrap();
     conn.execute_batch(
         "CREATE VIRTUAL TABLE temp.object_vocab USING fts5vocab(main, object_text, instance);
@@ -412,7 +416,7 @@ fn dump(root: &Path) -> Dump {
 
 /// The model with every body G8 stands under held as none, its item kept
 /// at `Meta` and listed from its summary, its seq unmoved.
-fn tamed(mut model: Model) -> Model {
+pub fn tamed(mut model: Model) -> Model {
     let hostile: Vec<ObjectName> = model
         .objects
         .iter()
