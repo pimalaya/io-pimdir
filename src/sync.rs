@@ -407,6 +407,10 @@ pub struct PimdirSync {
     /// The `Created` placements the store offers this source, which are
     /// no create of its own (SYNC §3, §9).
     offered: BTreeSet<PimdirHandle>,
+    /// The placements owing a body another source folded into the item,
+    /// which a server edit meets as the collection's divergence (SYNC §5,
+    /// §9).
+    folded: BTreeSet<PimdirHandle>,
     /// The member each pending create may be moved from (SYNC §3).
     superseded: BTreeMap<PimdirHandle, PimdirSuperseded>,
     /// The meta each listed member carried, by handle.
@@ -493,6 +497,7 @@ impl PimdirSync {
             unstamped: Vec::new(),
             held: BTreeSet::new(),
             offered: BTreeSet::new(),
+            folded: BTreeSet::new(),
             superseded: BTreeMap::new(),
             metas: BTreeMap::new(),
             fresh: BTreeMap::new(),
@@ -846,6 +851,7 @@ impl PimdirSync {
         self.unstamped.clear();
         self.held.clear();
         self.offered.clear();
+        self.folded.clear();
         self.superseded.clear();
 
         self.state = State::LoadingPage;
@@ -865,6 +871,7 @@ impl PimdirSync {
         self.unstamped.extend(loaded.unstamped);
         self.held.extend(loaded.held);
         self.offered.extend(loaded.offered);
+        self.folded.extend(loaded.folded);
         self.superseded.extend(loaded.superseded);
         self.refused.extend(loaded.refused);
     }
@@ -2010,6 +2017,16 @@ impl PimdirSync {
             // whose record was lost, landed: no divergence (SYNC §5).
             (true, true) if self.carries(&item.handle, local.object.as_ref()) => {
                 ContentOutcome::Rewritten(self.rebase_content(local, item.revision.clone()))
+            }
+            (true, true)
+                if self.folded.contains(&local.handle)
+                    && self.opts.conflict != PimdirConflictPolicy::KeepLocal =>
+            {
+                debug!(
+                    "{} owes another source's change: the collection's divergence",
+                    local.handle.as_str()
+                );
+                ContentOutcome::Rewritten(self.pull_content(local, item))
             }
             (true, true) => self.resolve_conflict(local, item),
         }

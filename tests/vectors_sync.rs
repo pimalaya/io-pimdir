@@ -1067,7 +1067,7 @@ fn run(store: &mut PimdirSourceStore, case: &Value, remote: &mut Scripted) -> Ra
             let accept = run["options"]["accept_absences"].as_bool().unwrap_or(false);
             let report = store.rekey(collection, accept, remote).unwrap();
             parked = report.parked;
-            Vec::new()
+            report.events
         }
         "open" => {
             store.open_collection(collection).unwrap();

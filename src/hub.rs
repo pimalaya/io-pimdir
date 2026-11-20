@@ -493,6 +493,35 @@ impl PimdirHub {
             .collect()
     }
 
+    /// The placements among `placements`, a projection of this hub for
+    /// `source`, whose item holds a body another source folded in since
+    /// this source last agreed with it, for
+    /// [`PimdirLoaded::folded`](crate::load::PimdirLoaded::folded): the
+    /// item's body differs from the binding's `shared_object`, or its base
+    /// until it folded once (SYNC §9), so what the binding owes is
+    /// propagation, never an edit made through it.
+    pub fn folded(
+        &self,
+        source: &PimdirSourceId,
+        placements: &[PimdirPlacement],
+    ) -> Vec<PimdirHandle> {
+        placements
+            .iter()
+            .filter(|placement| {
+                let Some(item) = placement.link_id.as_ref().and_then(|l| self.items.get(l)) else {
+                    return false;
+                };
+                let Some(binding) = item.sources.get(source) else {
+                    return false;
+                };
+                let base = binding.base.as_ref().and_then(|base| base.object.as_ref());
+                let agreed = binding.shared_object.as_ref().or(base);
+                binding.base.is_some() && item.object.is_some() && item.object.as_ref() != agreed
+            })
+            .map(|placement| placement.handle.clone())
+            .collect()
+    }
+
     /// The placement for an item this source already holds.
     ///
     /// A recorded conflict outranks the base comparison, else the merge
@@ -563,7 +592,8 @@ impl PimdirHub {
     /// A `Created` append for an item missing on this source.
     ///
     /// Staged only when the body is held, so it claims `Full` and never
-    /// triggers a fetch.
+    /// triggers a fetch, and never for a `hash:` key, which asserts no
+    /// identity another source could hold (SYNC §9).
     fn created_placement(
         &self,
         collection: &PimdirCollectionId,
@@ -571,6 +601,9 @@ impl PimdirHub {
         item: &PimdirHubItem,
     ) -> Option<PimdirPlacement> {
         item.object.as_ref()?;
+        if link.as_str().starts_with("hash:") {
+            return None;
+        }
 
         let mut placement = item.project(collection, link, link.provisional());
         placement.status = PimdirStatus::Created;
@@ -751,7 +784,8 @@ impl PimdirHub {
         // NOTE: the summary and sort key describe the item's body, so an
         // upsert whose body the item did not take leaves them as they
         // were (SYNC §5, §9).
-        if verdict.kept_shared {
+        let elsewhere = !immutable && placement.object.is_some() && item.object != placement.object;
+        if verdict.kept_shared || elsewhere {
             item.summary = held_summary.clone();
             item.sort_key = held_sort_key.clone();
         }

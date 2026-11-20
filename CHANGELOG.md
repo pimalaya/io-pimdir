@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- **BREAKING**: Added `PimdirRekeyReport::events`, `Added` for a member a rekey names that no old placement resolves to (pimdir SYNC §5, §8); the report is no longer `Copy`.
+- **BREAKING**: Added `PimdirLoaded::folded`, the placements owing a change another source folded into their item, answered by `PimdirHub::folded`: a storage building `PimdirLoaded` by a struct literal needs the field.
 - Added `PimdirStore::set_collection_parent` and `PimdirStore::set_collection_presentation`, writing a collection's parent (its account's hierarchy kept a forest) and its color, description and sort order through pimdir's new owner statements, with `PimdirError::Parent` (`collection-parent`) and `PimdirError::Undeclared` (`collection-undeclared`).
 - **BREAKING**: Added `PimdirWritten::adopted` and `PimdirWritten::refused`, the handles whose body a write's policy took over the item's or kept apart (pimdir SYNC §9), which a sync reports as a pull or not: a storage building `PimdirWritten` by a struct literal needs both fields.
 - Added `PimdirReader::pending_arrivals`, the pending moves and copies other collections queued into a collection (pimdir STORAGE §15.4, `load_pending_arrivals`).
@@ -23,6 +25,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed a sync offering another source an item under a `hash:` key, which asserts no identity (pimdir SYNC §9).
+- Fixed an item keeping its body under a divergence taking the incoming body's summary and sort key (pimdir SYNC §9).
+- Fixed a kept body's retained item carrying the winning item's sort key instead of the one its own body gives (pimdir SYNC §9, STORAGE Annex A).
+- Fixed a server edit meeting a change another source folded being recorded as the source's own conflict: it is the collection's divergence, settled by its policy (pimdir SYNC §5, §9).
 - Fixed a sync recording a contact or event joining an item another source binds, listed without its body, as a conflict of its binding: it is the item's conflict, which the upgrade reading a body equal to the item's now clears, as it no longer leaves two equal bodies in conflict (pimdir SYNC §6, §9).
 - Fixed a sync reporting a member joining an item another source binds as `Created` and settling a diverging body it carried by the source's own policy: it is `Added`, its body folded into the item by the collection's policy (pimdir SYNC §6, §9).
 - Fixed a sync reporting `ContentChanged` for a pull whose body the collection's `prefer-existing` kept apart, the item keeping its own (pimdir SYNC §5).

@@ -48,11 +48,11 @@ use crate::{
     },
     remote::{PimdirEnumerate, PimdirEnumerated, PimdirListing, PimdirRemoteItem},
     summary::{self, PimdirSummary},
-    sync::PimdirParked,
+    sync::{PimdirParked, PimdirSyncEvent},
 };
 
 /// What a rekey did.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirRekeyReport {
     /// Old placements carried over to their new handle.
     pub rekeyed: usize,
@@ -68,6 +68,10 @@ pub struct PimdirRekeyReport {
     /// when it names no member or is capped (SYNC §8): nothing written,
     /// the counts above zero.
     pub parked: Option<PimdirParked>,
+    /// The members no old placement resolved to, each named in the
+    /// rekey's write and reported `Added` once it committed (SYNC §5, §8),
+    /// as a sync naming it would.
+    pub events: Vec<PimdirSyncEvent>,
 }
 
 /// I/O-free REKEY coroutine.
@@ -211,6 +215,9 @@ impl PimdirRekey {
                         self.fresh(&item, resolved, key),
                     ));
                     self.report.pulled += 1;
+                    self.report
+                        .events
+                        .push(PimdirSyncEvent::Added(item.handle.clone()));
                 }
             }
         }
@@ -714,7 +721,7 @@ impl PimdirCoroutine for PimdirRekey {
                     self.report.rekeyed, self.report.pulled, self.report.dropped,
                 );
                 self.state = State::Done;
-                PimdirCoroutineState::Complete(Ok(self.report))
+                PimdirCoroutineState::Complete(Ok(mem::take(&mut self.report)))
             }
 
             (State::Done, _) | (_, Some(_)) => {

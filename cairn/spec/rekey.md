@@ -153,3 +153,11 @@ A rebuild SHALL index the old copies by identity once (`PimdirRekey::copies`) ra
 - GIVEN mailboxes of 2,000 to 16,000 distinct messages, renumbered
 - WHEN each is rekeyed
 - THEN the coroutine's and the write's times grow about as the collection does (tests/engine/rekey_scale.rs, ignored, run with `--release --ignored`)
+
+### Requirement: A rekey reports the members it names
+A member no old placement resolves to by link id SHALL be named in the rekey's batch as a page names one and reported `PimdirSyncEvent::Added` on `PimdirRekeyReport::events` once the batch committed (pimdir SYNC §5, §8); a parked rekey reports none.
+
+#### Scenario: A message arriving during a renumbering
+- **GIVEN** a source renumbering `10` into `20` while a new message arrives as `21`
+- **WHEN** the rekey runs
+- **THEN** `21` is named under its own key and reported `Added` (vectors/sync/190)

@@ -597,6 +597,9 @@ The merge SHALL derive each candidate's change from its placement and its member
 - WHEN source b's `PreferRemote` pulls `c2`
 - THEN the item keeps `c3`, `c2` is kept and reported `Overruled`, b's base is `c2` and nothing is pushed this run (vectors/sync/182)
 
+### Requirement: Propagation owed meets a server edit as the collection's divergence
+A both-changed placement listed in `PimdirLoaded::folded` (its item holds a body another source folded in since the binding last agreed with it) SHALL be pulled whatever the source's policy, `KeepLocal` aside, the write settling the divergence by the collection's policy (pimdir SYNC §5, §9; vectors/sync/192, 193). An item under a `hash:` key SHALL be offered to no other source (vectors/sync/191), and a body a policy keeps SHALL be retained under the summary and sort key its own bytes give (vectors/sync/117).
+
 ### Requirement: A kept local edit keeps its summary
 A listing naming a member at its base revision SHALL refresh the summary and sort key of its placement only when the placement holds no local edit of a mutable kind (`staged_edit`): the listing describes the server's body, and a placement whose local body the run keeps, pushed or still pending, keeps that body's summary (SYNC §5). A rekey carrying such an edit the remote did not edit keeps its summary and sort key the same way.
 

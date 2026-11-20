@@ -100,6 +100,16 @@ pub struct PimdirLoaded {
     ///
     /// [`PimdirHub::offered`]: crate::hub::PimdirHub::offered
     pub offered: Vec<PimdirHandle>,
+    /// The loaded placements whose item holds a body another source folded
+    /// in since this source last agreed with it, the item's body differing
+    /// from the binding's `shared_object`, as [`PimdirHub::folded`]
+    /// answers: a change this source owes as propagation, never its own
+    /// edit, which a server edit meets as the collection's divergence (SYNC
+    /// §5, §9); a storage stating none has every such body read as the
+    /// source's own edit.
+    ///
+    /// [`PimdirHub::folded`]: crate::hub::PimdirHub::folded
+    pub folded: Vec<PimdirHandle>,
     /// The refusals standing on the source's loaded bindings, by handle
     /// (`list_refusals`, SYNC §5): a change derived under the key one
     /// names is held and reported, never pushed.

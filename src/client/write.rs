@@ -202,6 +202,7 @@ impl PimdirSourceStore {
 
         let conflicted = hub.conflicted(&placements);
         let offered = hub.offered(&self.source, &placements);
+        let folded = hub.folded(&self.source, &placements);
         // NOTE: the source's refusals, on every selection, so a change it
         // derives under a refused key is held wherever it is derived
         // (SYNC §5).
@@ -235,6 +236,7 @@ impl PimdirSourceStore {
             superseded,
             conflicted,
             offered,
+            folded,
             refused,
         })
     }
@@ -631,7 +633,12 @@ pub(crate) fn apply(
                 && let Some(body) = blobs.get(&lost.object)?
             {
                 let kind = kind_of(tx, &collection)?;
-                lost.summary = summary::derive(&kind, &body).and_then(|derived| derived.summary);
+                if let Some(derived) = summary::derive(&kind, &body) {
+                    lost.summary = derived.summary;
+                    if !derived.sort_key.is_unknown() {
+                        lost.sort_key = derived.sort_key;
+                    }
+                }
             }
             let key = keep_overruled(tx, &collection, &new, &lost)?;
             written.overruled.push((lost.handle, key));
