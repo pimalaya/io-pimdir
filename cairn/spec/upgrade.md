@@ -162,6 +162,8 @@ An item conflict recorded for want of its incoming body SHALL be revisited by th
 
 A fetched body equal to the item's own is no divergence, whatever the policy: the write clears the item's conflict, the binding based and agreed on that body (pimdir SYNC §6, sync-draft-15, vectors/sync/188, failing before it).
 
+The late body lands with the summary and sort key the fetch derived from it: an item adopting it takes them, its address rows following, and an item keeping its own body keeps its own (pimdir STORAGE §9.3, Annex A; tests/engine/upgrade_summary.rs, failing before it).
+
 An item holding no body when its conflict was recorded waits for the fill: the upgrade reading that binding's own body fills the item, and the write settles a `prefer-` conflict then, `prefer-incoming` adopting the diverging body and `prefer-existing` keeping the filled one, the conflict cleared and the body not adopted kept over the filling binding's handle and reported `Overruled`; `manual` leaves the conflict standing (pimdir SYNC §9, vectors/sync/112 to 115; hub.md).
 
 ### Requirement: A full fetch answering no body counts nothing

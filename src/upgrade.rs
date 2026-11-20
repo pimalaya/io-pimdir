@@ -219,6 +219,11 @@ impl PimdirUpgrade {
                     body: bytes,
                 });
                 patched.object = Some(hash.clone());
+                patched.summary =
+                    summary::without_body(patched.summary.as_ref(), item.summary, false);
+                if !item.sort_key.is_unknown() {
+                    patched.sort_key = item.sort_key;
+                }
                 patched.base = Some(PimdirBase {
                     flags: patched
                         .base

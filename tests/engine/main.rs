@@ -30,3 +30,4 @@ mod soft_delete;
 mod summary_kept;
 mod supersedes;
 mod sync_audit;
+mod upgrade_summary;
