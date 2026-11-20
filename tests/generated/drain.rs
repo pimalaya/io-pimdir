@@ -7,8 +7,7 @@
 //! against the oracle stated over the drained model.
 
 use io_pimdir::client::{PimdirStore, producer::PimdirActionStatus, reader::PimdirReader};
-use pimdir_generator::{oracle::Expectation, queue::RowState};
-use rusqlite::types::Value;
+use pimdir_generator::queue::RowState;
 
 use crate::{
     common::{Generated, SEEDS},
@@ -26,20 +25,6 @@ fn a_drained_generated_queue_leaves_what_the_model_drains_to() {
             .collect();
         assert!(unknown.is_empty(), "seed {seed}: {unknown:#?}");
     }
-}
-
-#[test]
-#[ignore = "G6: the binding's shared body after an applied local write"]
-fn a_drained_generated_queue_leaves_what_the_model_drains_to_known_included() {
-    let differences: Vec<(u64, Option<&str>, String)> = SEEDS
-        .into_iter()
-        .flat_map(|seed| {
-            differences(seed)
-                .into_iter()
-                .map(move |(known, difference)| (seed, known, difference))
-        })
-        .collect();
-    assert!(differences.is_empty(), "{differences:#?}");
 }
 
 /// Every difference between io-pimdir's drain of the store at `seed` and
@@ -80,34 +65,12 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
         }
     }
 
-    let (_, rows) = reader::compare(&generated.spec, &drained, &generated.root(), shared);
+    let (_, rows) = reader::compare(
+        &generated.spec,
+        &drained,
+        &generated.root(),
+        |_, _, _, _| None,
+    );
     differences.extend(rows);
     differences
-}
-
-/// Finding G6 (spec minor, the generator's to follow): after the drain
-/// applies an `update`, or an `add`, `move` or `copy` creating a pending
-/// create, io-pimdir moves the acting binding's `shared_object` to the
-/// body written, as SYNC §9 says of "a live upsert carrying a body"; the
-/// generator keeps the body agreed before, or none, and no vector pins
-/// either.
-const G6: &str = "G6: the binding's shared body after an applied local write";
-
-/// Whether a disagreement is G6: the bindings agree but on `shared_object`,
-/// io-pimdir's naming a body.
-fn shared(
-    expectation: &Expectation,
-    columns: &[&str],
-    got: &[Vec<Value>],
-    want: &[Vec<Value>],
-) -> Option<&'static str> {
-    let at = columns
-        .iter()
-        .position(|column| *column == "shared_object")?;
-    let only = got.len() == want.len()
-        && got.iter().zip(want).all(|(got, want)| {
-            (0..got.len()).all(|column| column == at || got[column] == want[column])
-                && got[at] != Value::Null
-        });
-    (expectation.statement == "storage/read/list_item_bindings" && only).then_some(G6)
 }

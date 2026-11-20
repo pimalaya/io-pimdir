@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Added `PimdirReader::pending_arrivals`, the pending moves and copies other collections queued into a collection (pimdir STORAGE §15.4, `load_pending_arrivals`).
 - Added `PimdirEnqueued::link_id`, the key an `add` was checked under, stated or derived from its body in hand, so a producer states none and reports the key the store will hold.
 - **BREAKING**: Added `PimdirError::HashKeyMismatch` and `PimdirMutateError::HashKeyMismatch` (`hash-key-mismatch`): an `add` stating a `hash:` key its body's bytes do not give is refused, and a drain parks one (pimdir STORAGE §15.3, SYNC §7).
 - **BREAKING**: Added `PimdirConflictPolicy::KeepLocal`, the policy of a source the store is authoritative over (pimdir SYNC §5, sync-draft-15): a change made on its remote alone is a divergence settled for the store, its body kept and reported `Overruled` and the store's pushed over it, never pulled. An exhaustive `match` on the enum needs the arm.
@@ -20,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed `PimdirIndex::refresh` keeping a body indexed after its last placement left it or moved off it, and a thread's id and bounds after a member's sort key moved: a refreshed index is the one a rebuild writes (`PimdirIndexOp::DropUnplaced`, pimdir SEARCH §4, §9).
 - Fixed `PimdirReader::with_pending` folding rows the owner parks: an action on an item no source binds where the owner settles it alone, a move into a collection of no declared kind, and a row the capability backstop parks fold into nothing, and a folded update carries the summary and sort key of its new body, paged by that key.
 - Fixed `enqueue_with_body` queueing a UID-less contact or event under the `hash:` key its caller derived before the `X-PIMDIR-` properties were taken out, a key naming bytes the store never held: it is refused, and stating no key answers the right one.
 - Fixed an upgrade reading the body a base named at its revision, while the item's conflict held its diverging body, fast-forwarding the item to it: the conflict cleared and both the source's edit and the diverging body were lost. The base takes the body and the item and its conflict stand.

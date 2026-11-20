@@ -8,12 +8,14 @@
 //! rows, named after its present member with the lowest
 //! `(sort_key, link_id)`.
 //!
-//! A refresh collects the message ids its batch touched (a mail placement
-//! new, rebodied, rekeyed or dropped) and relinks them before the batch
-//! commits: the thread of one no placement holds any more pruned first
-//! through the canonical statements, then the parents of the others
-//! re-read, the edge closing a cycle ignored, and every thread they and
-//! the pruned rows reach recomputed. No joining by subject.
+//! A refresh collects the message ids its batch touched (every mail
+//! placement it folds, its sort key moved or not, and one dropped) and
+//! relinks them before the batch commits: the thread of one no placement
+//! holds any more pruned first through the canonical statements, then
+//! the parents of the others re-read, the edge closing a cycle ignored,
+//! and every thread they and the pruned rows reach recomputed, its id
+//! and bounds read from its members' sort keys as they stand. No joining
+//! by subject.
 //!
 //! The relink here reads nothing: it runs over the messages the refresh
 //! has read ([`PimdirIndexMessage`]), changes them in memory, and answers

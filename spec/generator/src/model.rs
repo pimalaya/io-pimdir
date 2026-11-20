@@ -54,10 +54,37 @@ pub struct Collection {
     pub name: String,
     /// The role its source states, or none.
     pub role: Option<String>,
-    /// The one source syncing it, or none for a local collection.
-    pub source: Option<String>,
-    /// The checkpoint that source last recorded.
+    /// The sources syncing it, none for a local collection.
+    pub sources: BTreeMap<String, SourceState>,
+    /// Its cross-source conflict policy, `manual`, `prefer-incoming` or
+    /// `prefer-existing` (STORAGE §13).
+    pub conflict: String,
+}
+
+impl Collection {
+    /// The source an action queued on it runs as, its first (STORAGE
+    /// §15.2), or none for a local collection.
+    pub fn source(&self) -> Option<&String> {
+        self.sources.keys().next()
+    }
+}
+
+/// One source's sync state in a collection (STORAGE §4.3).
+#[derive(Clone, Debug, Default)]
+pub struct SourceState {
+    /// The checkpoint it last recorded.
     pub checkpoint: Option<Vec<u8>>,
+    /// The rounds it closed, the last one's id.
+    pub rounds: i64,
+}
+
+/// The sync state of a collection its `sources` sync, none of them synced
+/// yet.
+pub fn synced_by<S: AsRef<str>>(sources: &[S]) -> BTreeMap<String, SourceState> {
+    sources
+        .iter()
+        .map(|source| (String::from(source.as_ref()), SourceState::default()))
+        .collect()
 }
 
 /// The table a summary row lives in (STORAGE §4.3).
@@ -188,6 +215,8 @@ pub struct Binding {
     pub conflict_object: Option<ObjectName>,
     /// The refusal standing on the binding (SYNC §5).
     pub refusal: Option<Refusal>,
+    /// The id of the last round that listed its handle.
+    pub round: Option<i64>,
 }
 
 /// A change a remote refused for good (STORAGE §13).
@@ -226,8 +255,8 @@ pub struct Item {
     pub summary: Summary,
     /// Its address rows.
     pub addresses: Vec<Address>,
-    /// The binding of its collection's source, if one syncs it.
-    pub binding: Option<Binding>,
+    /// Its bindings, one per source binding it, in source order.
+    pub bindings: Vec<Binding>,
 }
 
 /// The state of an item's row (STORAGE §11).
@@ -244,6 +273,30 @@ pub enum State {
     },
 }
 
+impl Item {
+    /// The binding `source` holds of it.
+    pub fn bound(&self, source: &str) -> Option<&Binding> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.source == source)
+    }
+
+    /// The binding `source` holds of it, to write.
+    pub fn bound_mut(&mut self, source: &str) -> Option<&mut Binding> {
+        self.bindings
+            .iter_mut()
+            .find(|binding| binding.source == source)
+    }
+
+    /// Adds a binding, the bindings kept in source order.
+    pub fn bind(&mut self, binding: Binding) {
+        let at = self
+            .bindings
+            .partition_point(|held| held.source < binding.source);
+        self.bindings.insert(at, binding);
+    }
+}
+
 /// How an item is placed in a collection.
 #[derive(Clone, Debug, Default)]
 pub struct Placement {
@@ -255,6 +308,8 @@ pub struct Placement {
     pub handle: Option<String>,
     /// The revision its source states.
     pub revision: Option<String>,
+    /// The source binding it, its collection's first when none is named.
+    pub source: Option<String>,
 }
 
 /// The truth of one store.
@@ -268,6 +323,9 @@ pub struct Model {
     pub objects: BTreeMap<ObjectName, Vec<u8>>,
     /// The next `seq` to draw, `store_meta.next_seq`.
     pub next_seq: i64,
+    /// The rows purged, objects collected and collections deleted or
+    /// renamed, `store_meta.purges` (STORAGE §4.5).
+    pub purges: i64,
     /// The queue's rows, applied ones included, by id.
     pub queue: Vec<Row>,
     /// What each source declares it can do (STORAGE §15.6).
@@ -342,13 +400,7 @@ impl Model {
     /// from the hint, escaped, or the fallback, minted over the handle
     /// while held (STORAGE §9), the `seq` shared or drawn (§9.1).
     pub fn file(&mut self, collection: &str, filed: Filed, placement: Placement) -> usize {
-        let base = match &filed.hint {
-            Some(hint) if RESERVED.iter().any(|prefix| hint.starts_with(prefix)) => {
-                format!("esc:{hint}")
-            }
-            Some(hint) => hint.clone(),
-            None => fallback(&filed),
-        };
+        let base = key(&filed);
         let handle = placement
             .handle
             .clone()
@@ -365,7 +417,10 @@ impl Model {
         }
         let object = placement.held.then_some(object);
 
-        let source = self.collections[collection].source.clone();
+        let source = placement
+            .source
+            .clone()
+            .or_else(|| self.collections[collection].source().cloned());
         let binding = source.map(|source| Binding {
             source,
             handle,
@@ -378,6 +433,7 @@ impl Model {
             conflict_revision: None,
             conflict_object: None,
             refusal: None,
+            round: None,
         });
 
         self.items.push(Item {
@@ -393,7 +449,7 @@ impl Model {
             conflict_object: None,
             summary: filed.summary,
             addresses: filed.addresses,
-            binding,
+            bindings: binding.into_iter().collect(),
         });
         self.items.len() - 1
     }
@@ -408,7 +464,8 @@ impl Model {
     /// (STORAGE §11).
     pub fn retain(&mut self, index: usize) {
         let item = &mut self.items[index];
-        let by = item.binding.take().map(|binding| binding.source);
+        let by = item.bindings.first().map(|binding| binding.source.clone());
+        item.bindings.clear();
         item.state = State::Retained { by };
     }
 
@@ -469,6 +526,19 @@ pub fn split_flags(flags: &BTreeSet<String>) -> (i64, Vec<String>) {
         }
     }
     (marks, others)
+}
+
+/// The key a writer assigns from what a body declares, before minting:
+/// its hint, escaped before a reserved prefix, else its kind's fallback
+/// (STORAGE §9).
+pub fn key(filed: &Filed) -> String {
+    match &filed.hint {
+        Some(hint) if RESERVED.iter().any(|prefix| hint.starts_with(prefix)) => {
+            format!("esc:{hint}")
+        }
+        Some(hint) => hint.clone(),
+        None => fallback(filed),
+    }
 }
 
 pub(crate) fn fallback(filed: &Filed) -> String {

@@ -103,6 +103,9 @@ pub struct PimdirIndexRefresh {
     put: BTreeSet<PimdirHash>,
     /// The message ids to relink (SEARCH §9).
     touched: BTreeSet<String>,
+    /// The bodies a placement of the page left or moved off, dropped once
+    /// the page placed what it holds if none names them (SEARCH §4).
+    unplaced: BTreeSet<PimdirHash>,
 }
 
 impl PimdirIndexRefresh {
@@ -123,6 +126,7 @@ impl PimdirIndexRefresh {
             full: false,
             put: BTreeSet::new(),
             touched: BTreeSet::new(),
+            unplaced: BTreeSet::new(),
         }
     }
 
@@ -236,12 +240,14 @@ impl PimdirIndexRefresh {
                 self.output.reconciled = true;
                 for placement in gone.placements {
                     self.touched.insert(placement.link_id.0);
+                    self.unplaced.extend(placement.hash);
                     self.output.removed += 1;
                     self.ops.push(PimdirIndexOp::DropPlacement {
                         collection: placement.collection,
                         seq: placement.seq,
                     });
                 }
+                self.drop_unplaced();
                 self.ops
                     .extend(gone.objects.into_iter().map(PimdirIndexOp::DropObject));
                 self.relink_touched()
@@ -534,6 +540,7 @@ impl PimdirIndexRefresh {
 
             if !row.is_live() {
                 if let Some(held) = held {
+                    self.unplaced.extend(held.hash.clone());
                     self.touched.insert(held.link_id.0.clone());
                     self.output.removed += 1;
                     self.ops.push(PimdirIndexOp::DropPlacement {
@@ -564,12 +571,17 @@ impl PimdirIndexRefresh {
             }
 
             let held_hash = held.as_ref().map(|held| held.hash.clone());
+            if let Some(Some(left)) = &held_hash
+                && hash.as_ref() != Some(left)
+            {
+                self.unplaced.insert(left.clone());
+            }
             if row.kind == MAIL {
                 let keyed = held.map(|held| held.link_id);
-                if held_hash.as_ref() != Some(&hash) || keyed.as_ref() != Some(&row.link_id) {
+                if keyed.as_ref() != Some(&row.link_id) {
                     self.touched.extend(keyed.map(|keyed| keyed.0));
-                    self.touched.insert(row.link_id.0.clone());
                 }
+                self.touched.insert(row.link_id.0.clone());
             }
 
             self.ops
@@ -643,8 +655,20 @@ impl PimdirIndexRefresh {
                 flags: row.flags.known().cloned().unwrap_or_default(),
             });
         }
+        self.drop_unplaced();
 
         self.after(fold.after)
+    }
+
+    /// Drops each body a placement left or moved off once no placement
+    /// names it (SEARCH §4), after the ops placing what the page holds; a
+    /// body put earlier in the run is put again should a later page name
+    /// it.
+    fn drop_unplaced(&mut self) {
+        for hash in mem::take(&mut self.unplaced) {
+            self.put.remove(&hash);
+            self.ops.push(PimdirIndexOp::DropUnplaced(hash));
+        }
     }
 
     /// What follows a folded page: the placements folded again read the
@@ -933,6 +957,11 @@ pub enum PimdirIndexOp {
     /// Drops a body the store no longer holds, its text, chunks and
     /// categories with it (`delete_object`, `delete_object_row`).
     DropObject(PimdirHash),
+    /// Drops a body once no placement names it, as [`DropObject`] drops
+    /// one (`object_placed`, SEARCH §4): a placement left it or moved off it.
+    ///
+    /// [`DropObject`]: PimdirIndexOp::DropObject
+    DropUnplaced(PimdirHash),
     /// Puts a placement, or updates its key and body (`upsert_placement`).
     PutPlacement(PimdirIndexPlacement),
     /// Drops a placement, its flags and occurrences with it, and its
@@ -1379,6 +1408,8 @@ pub struct PimdirIndexGonePlacement {
     pub seq: i64,
     /// The item's key.
     pub link_id: PimdirLinkId,
+    /// The body indexed for it, which goes with its last placement.
+    pub hash: Option<PimdirHash>,
 }
 
 /// What a step of the run answers.

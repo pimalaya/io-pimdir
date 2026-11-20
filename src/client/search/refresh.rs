@@ -168,6 +168,7 @@ impl Statements<'_> {
                         collection: r.get(0)?,
                         seq: r.get(1)?,
                         link_id: PimdirLinkId(r.get(2)?),
+                        hash: r.get::<_, Option<String>>(3)?.map(PimdirHash),
                     })
                 })?;
                 let objects = rows(tx, search::OBJECTS_GONE, [], |r| Ok(PimdirHash(r.get(0)?)))?;
@@ -333,6 +334,16 @@ impl Statements<'_> {
                     tx.execute_cached(search::DELETE_OBJECT, named_params! { ":rowid": id })?;
                 }
                 tx.execute_cached(search::DELETE_OBJECT_ROW, named_params! { ":hash": hash.0 })?;
+            }
+            PimdirIndexOp::DropUnplaced(hash) => {
+                let placed: bool = tx.query_row_cached(
+                    search::OBJECT_PLACED,
+                    named_params! { ":hash": hash.0 },
+                    |r| r.get(0),
+                )?;
+                if !placed {
+                    return self.write(PimdirIndexOp::DropObject(hash));
+                }
             }
             PimdirIndexOp::PutPlacement(placement) => {
                 tx.query_row_cached(

@@ -311,7 +311,7 @@ fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> 
 fn every_refresh_vector_answers() {
     let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/refresh.json"));
-    assert_eq!(vectors["v"], 1, "refresh.json at another version");
+    assert_eq!(vectors["v"], 2, "refresh.json at another version");
     let now = unix(
         json(&spec.join("vectors/search/queries.json"))["now"]
             .as_str()
@@ -325,6 +325,15 @@ fn every_refresh_vector_answers() {
     let mut outcomes = Vec::new();
     for case in vectors["cases"].as_array().unwrap() {
         let label = case["label"].as_str().unwrap();
+        let steps = case["steps"].as_array().unwrap();
+        let names: Vec<String> = (1..=steps.len())
+            .map(|number| format!("refresh {label:?} step {number}"))
+            .collect();
+        if names.iter().any(|name| pending::is_listed("refresh", name)) {
+            let skipped = || Err(String::from("pending, not run"));
+            outcomes.extend(names.into_iter().map(|name| (name, skipped())));
+            continue;
+        }
         let dir = tempfile::tempdir().unwrap();
         build_store(&spec, dir.path(), &case["store"]);
         let mut index = PimdirIndex::open(dir.path()).unwrap();
@@ -359,8 +368,24 @@ fn every_refresh_vector_answers() {
                     .unwrap();
                 let mut fresh = PimdirIndex::open(rebuilt.path()).unwrap();
                 fresh.refresh(&refreshed).unwrap();
+                if let Some(objects) = step["objects"].as_i64() {
+                    let held = |dir: &Path| -> i64 {
+                        rusqlite::Connection::open(dir.join("index.db"))
+                            .unwrap()
+                            .query_row("SELECT count(*) FROM object", [], |r| r.get(0))
+                            .unwrap()
+                    };
+                    assert_eq!(held(dir.path()), objects, "object rows: refreshed");
+                    assert_eq!(held(rebuilt.path()), objects, "object rows: rebuilt");
+                }
                 for query in step["queries"].as_array().unwrap() {
                     let text = query["query"].as_str().unwrap();
+                    if let Some(threads) = query.get("threads") {
+                        let want = thread_set(threads);
+                        assert_eq!(listed_threads(&index, text), want, "{text:?}: refreshed");
+                        assert_eq!(listed_threads(&fresh, text), want, "{text:?}: rebuilt");
+                        continue;
+                    }
                     let want: BTreeSet<_> = pairs(&query["hits"]).into_iter().collect();
                     assert_eq!(hit_set(&index, text), want, "{text:?}: refreshed");
                     assert_eq!(hit_set(&fresh, text), want, "{text:?}: rebuilt");
@@ -467,6 +492,61 @@ fn feed(dir: &Path, cursor: &PimdirChangeCursor, changed: &Value) {
         changed["purged"].as_bool().unwrap(),
         "whether the purge count moved"
     );
+}
+
+/// A thread as a vector states it: id, count, bounds and hits.
+type ThreadRow = (
+    Option<String>,
+    u64,
+    Option<String>,
+    Option<String>,
+    BTreeSet<(String, i64)>,
+);
+
+/// The threads a vector states, each its id, count, bounds and hits.
+fn thread_set(threads: &Value) -> BTreeSet<ThreadRow> {
+    threads
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|thread| {
+            (
+                thread["thread"].as_str().map(String::from),
+                thread["count"].as_u64().unwrap(),
+                thread["first"].as_str().map(String::from),
+                thread["last"].as_str().map(String::from),
+                pairs(&thread["hits"]).into_iter().collect(),
+            )
+        })
+        .collect()
+}
+
+/// The threaded listing of `query`, as [`thread_set`] states one.
+fn listed_threads(index: &PimdirIndex, query: &str) -> BTreeSet<ThreadRow> {
+    let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{query:?}: {err}"));
+    let options = PimdirSearchOptions {
+        limit: 100,
+        ..Default::default()
+    };
+    index
+        .threads(&parsed, &options)
+        .unwrap_or_else(|err| panic!("{query:?}: {err}"))
+        .threads
+        .iter()
+        .map(|thread| {
+            (
+                thread.thread.clone(),
+                thread.count,
+                thread.first.clone(),
+                thread.last.clone(),
+                thread
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// The hits of `query` as a set of `(account, seq)` pairs.
@@ -3599,6 +3679,7 @@ mod memory {
                             collection: key.0.clone(),
                             seq: key.1,
                             link_id: PimdirLinkId(self.placements[key].0.clone()),
+                            hash: self.placements[key].1.clone().map(PimdirHash),
                         })
                         .collect();
                     let objects = self
@@ -3638,6 +3719,15 @@ mod memory {
                 }
                 PimdirIndexOp::DropObject(hash) => {
                     self.objects.remove(&hash.0);
+                }
+                PimdirIndexOp::DropUnplaced(hash) => {
+                    let placed = self
+                        .placements
+                        .values()
+                        .any(|(_, held)| held.as_deref() == Some(hash.0.as_str()));
+                    if !placed {
+                        self.objects.remove(&hash.0);
+                    }
                 }
                 PimdirIndexOp::PutPlacement(placement) => {
                     self.placements.insert(

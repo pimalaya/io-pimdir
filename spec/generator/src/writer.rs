@@ -9,7 +9,12 @@
 //! and its binding, and settling the refcounts.
 //!
 //! Every `seq` the store draws is held to the model's: a disagreement is
-//! the model and the statements reading STORAGE §9.1 two ways.
+//! the model and the statements reading STORAGE §9.1 two ways. A history
+//! leaves gaps and shared seqs whose first holder a purge took: a seq the
+//! counter passed already is written as the model holds it, and one above
+//! it drawn past the gap. The purges a history counted are restored by
+//! creating and deleting as many empty scratch collections, the one write
+//! counting in `purges` that leaves no row (STORAGE §4.5).
 
 use std::{
     collections::BTreeSet,
@@ -23,7 +28,7 @@ use rusqlite::{ToSql, types::Value};
 
 use crate::{
     error::{Error, Result},
-    model::{Item, Model, State, Table, split_flags},
+    model::{Collection, Item, Model, State, Table, split_flags},
     name::ObjectName,
     queue::{Row, RowState},
     store::{Store, create_private_dir},
@@ -61,6 +66,12 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
             "storage/owner/set_collection_name",
             &[("collection", &id), ("account", &account), ("name", &name)],
         )?;
+        let conflict = Value::Text(collection.conflict.clone());
+        run(
+            store,
+            "storage/owner/set_conflict",
+            &[("conflict", &conflict), ("collection", &id)],
+        )?;
         if let Some(role) = &collection.role {
             let role = Value::Text(role.clone());
             run(
@@ -69,12 +80,9 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
                 &[("collection", &id), ("role", &role)],
             )?;
         }
-        if let Some(source) = &collection.source {
+        for (source, sync) in &collection.sources {
             let source = Value::Text(source.clone());
-            let checkpoint = collection
-                .checkpoint
-                .clone()
-                .map_or(Value::Null, Value::Blob);
+            let checkpoint = sync.checkpoint.clone().map_or(Value::Null, Value::Blob);
             run(
                 store,
                 "storage/owner/upsert_checkpoint",
@@ -140,6 +148,10 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
         write_item(store, item)?;
     }
 
+    for collection in model.collections.values() {
+        write_rounds(store, model, collection)?;
+    }
+
     for reference in &model.references {
         let answered = run_rows(
             store,
@@ -172,6 +184,20 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
 
     for row in &model.queue {
         write_row(store, model, row)?;
+    }
+
+    for count in 0..model.purges {
+        let scratch = Value::Text(format!("\u{1}purged-{count}"));
+        run(
+            store,
+            "storage/queue/ensure_collection",
+            &[("collection", &scratch), ("account", &Value::Null)],
+        )?;
+        run(
+            store,
+            "storage/owner/delete_collection",
+            &[("collection", &scratch)],
+        )?;
     }
 
     store.run("storage/owner/recompute_refcounts", &[])?;
@@ -224,7 +250,7 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
 
     write_summary(store, item, &collection, &link_id)?;
 
-    if let Some(binding) = &item.binding {
+    for binding in &item.bindings {
         let source = Value::Text(binding.source.clone());
         let (base_flags_known, base_marks, base_others) = flag_columns(binding.base_flags.as_ref());
         run(
@@ -287,6 +313,58 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
                 ("source", &text(by.as_deref())),
             ],
         )?;
+    }
+
+    Ok(())
+}
+
+/// Replays the rounds a collection's source closed, each opened, its
+/// handles stamped and closed in turn, so the round ids, the stamps and
+/// the coverage stand as the model holds them (STORAGE §4.3, SYNC §5). The
+/// checkpoint the declaration wrote is kept, a round closing with none.
+fn write_rounds(store: &Store, model: &Model, collection: &Collection) -> Result<()> {
+    let id = Value::Text(collection.id.clone());
+
+    for (name, sync) in &collection.sources {
+        let source = Value::Text(name.clone());
+        for round in 1..=sync.rounds {
+            run(
+                store,
+                "storage/owner/open_round",
+                &[
+                    ("collection", &id),
+                    ("source", &source),
+                    ("since", &Value::Null),
+                    ("until", &Value::Null),
+                    ("band", &Value::Integer(0)),
+                ],
+            )?;
+            let handles: Vec<Value> = model
+                .items
+                .iter()
+                .filter(|item| item.collection == collection.id)
+                .flat_map(|item| item.bindings.iter())
+                .filter(|binding| &binding.source == name && binding.round == Some(round))
+                .map(|binding| Value::Text(binding.handle.clone()))
+                .collect();
+            store.bind_slot("handles", &handles)?;
+            run(
+                store,
+                "storage/owner/stamp_bindings",
+                &[("collection", &id), ("source", &source)],
+            )?;
+            run(
+                store,
+                "storage/owner/close_round",
+                &[
+                    ("checkpoint", &Value::Null),
+                    ("since", &Value::Null),
+                    ("until", &Value::Null),
+                    ("collection", &id),
+                    ("source", &source),
+                ],
+            )?;
+        }
     }
 
     Ok(())
@@ -387,13 +465,31 @@ fn draw_seq(store: &Store, item: &Item) -> Result<i64> {
         }
     }
 
-    let rows = store.run("storage/owner/bump_next_seq", &[])?;
-    match rows.first().and_then(|row| row.first()) {
-        Some(Value::Integer(seq)) => Ok(*seq),
-        _ => Err(Error::Disagreement {
-            what: String::from("bump_next_seq"),
-            detail: String::from("it answered no seq"),
-        }),
+    let meta = store.run("storage/read/load_store_meta", &[])?;
+    let at = store
+        .spec()
+        .statement("storage/read/load_store_meta")?
+        .columns
+        .iter()
+        .position(|column| column == "next_seq");
+    if let Some(Value::Integer(next)) = at.and_then(|at| meta.first().map(|row| &row[at]))
+        && item.seq < *next
+    {
+        return Ok(item.seq);
+    }
+
+    loop {
+        let rows = store.run("storage/owner/bump_next_seq", &[])?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(Value::Integer(seq)) if *seq >= item.seq => return Ok(*seq),
+            Some(Value::Integer(_)) => {}
+            _ => {
+                return Err(Error::Disagreement {
+                    what: String::from("bump_next_seq"),
+                    detail: String::from("it answered no seq"),
+                });
+            }
+        }
     }
 }
 

@@ -10,24 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use io_pimdir::client::reader::{PimdirItem, PimdirReader};
-use pimdir_generator::{
-    model::{Item, Model},
-    queue::{Action, RowState},
-};
+use pimdir_generator::model::Item;
 use rusqlite::types::Value;
 
 use crate::common::{Generated, SEEDS, item_cells, table_cells};
-
-/// Finding G4 (implementation, SHOULD): a pending `add` is not shown in
-/// the collection it creates into, `pending_creates` reporting it apart,
-/// where STORAGE §15.4 folds a row as the owner would apply it.
-const G4: &str = "G4: a pending add is not overlaid";
-
-/// Finding G5 (spec minor, reads two ways): a `move` or `copy` queued on
-/// another collection shows in its target in io-pimdir, which folds the
-/// whole queue, and not in the generator, which folds the target's own
-/// `load_pending_actions` as STORAGE §15.4 names them.
-const G5: &str = "G5: an arrival from another collection's queue";
 
 /// The page the overlay is walked at, small so the fold crosses pages.
 const PAGE: usize = 3;
@@ -43,20 +29,6 @@ fn an_overlaid_read_shows_what_the_drain_would_leave() {
             .collect();
         assert!(unknown.is_empty(), "seed {seed}: {unknown:#?}");
     }
-}
-
-#[test]
-#[ignore = "G4 and G5: the overlay findings of the generated suite"]
-fn an_overlaid_read_shows_what_the_drain_would_leave_known_included() {
-    let differences: Vec<(u64, Option<&str>, String)> = SEEDS
-        .into_iter()
-        .flat_map(|seed| {
-            differences(seed)
-                .into_iter()
-                .map(move |(known, difference)| (seed, known, difference))
-        })
-        .collect();
-    assert!(differences.is_empty(), "{differences:#?}");
 }
 
 /// Every difference between io-pimdir's overlay and the model's at
@@ -90,17 +62,10 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
         let seqs: BTreeSet<i64> = want.keys().chain(shown.keys()).copied().collect();
         for seq in seqs {
             let committed = model.live(id).any(|item| item.seq == seq);
-            let rows = Rows {
-                model,
-                collection: id,
-                seq,
-            };
             let (known, what) = match (want.get(&seq), shown.get(&seq)) {
-                (Some(want), None) if !committed => {
-                    (rows.added(&want.link_id).then_some(G4), "not shown")
-                }
+                (Some(_), None) if !committed => (None, "not shown"),
                 (Some(_), None) => (None, "folded out"),
-                (None, Some(_)) if !committed => (rows.arrives().then_some(G5), "shown"),
+                (None, Some(_)) if !committed => (None, "shown"),
                 (None, Some(_)) => (None, "kept"),
                 (Some(want), Some(got)) => {
                     let table = collection.kind.map(|_| want.summary.table.stem());
@@ -152,41 +117,6 @@ fn walk(reader: &PimdirReader, collection: &str) -> BTreeMap<i64, PimdirItem> {
         }
     }
     shown
-}
-
-/// The pending rows that bring one item into a collection or create it
-/// there.
-struct Rows<'a> {
-    model: &'a Model,
-    collection: &'a str,
-    seq: i64,
-}
-
-impl Rows<'_> {
-    /// Whether a pending `add` queued on the collection creates the item of
-    /// key `link_id`.
-    fn added(&self, link_id: &str) -> bool {
-        self.model.queue.iter().any(|row| {
-            row.state == RowState::Pending
-                && row.collection == self.collection
-                && matches!(&row.action, Action::Add { link_id: added, .. } if added == link_id)
-        })
-    }
-
-    /// Whether a `move` or `copy` queued on another collection brings the
-    /// item in.
-    fn arrives(&self) -> bool {
-        self.model.queue.iter().any(|row| {
-            row.state == RowState::Pending
-                && row.collection != self.collection
-                && match &row.action {
-                    Action::Move { seq, to } | Action::Copy { seq, to } => {
-                        *seq == self.seq && to == self.collection
-                    }
-                    _ => false,
-                }
-        })
-    }
 }
 
 /// A model item in the six item columns.

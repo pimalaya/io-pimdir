@@ -39,20 +39,6 @@ use crate::common::{Generated, SEEDS};
 /// so the test holds such a body as none, the item listed from its summary.
 const G8: &str = "G8: a hostile zone rule exhausts the indexer's memory";
 
-/// Finding G9 (spec minor): SEARCH §4 deletes an `object` row only once
-/// the store no longer holds its body (`objects_gone`), so a body an
-/// `update` replaced, still pinned by a binding's base, stays indexed with
-/// its text after its last placement left it, where a rebuild indexes only
-/// the bodies a placement names. No query answers from such a row.
-const G9: &str = "G9: a refreshed index keeps a body no placement names";
-
-/// Finding G10 (spec minor, implementation): a restated sort key is folded
-/// as the placement it stamps, and the thread it is a member of keeps its
-/// `first`, `last` and id, where a rebuild names and bounds the thread by
-/// its members' sort keys as they stand (SEARCH §9 recomputes a thread on
-/// a join and a leave alone).
-const G10: &str = "G10: a restated sort key leaves its thread's bounds";
-
 /// The instant every refresh draws its horizon around, Unix seconds.
 pub const NOW: i64 = 1_790_000_000;
 
@@ -73,20 +59,6 @@ fn an_index_refreshed_after_each_owner_write_is_the_one_a_rebuild_writes() {
             .collect();
         assert!(unknown.is_empty(), "seed {seed}: {unknown:#?}");
     }
-}
-
-#[test]
-#[ignore = "G9 and G10: the refresh findings of the generated suite"]
-fn an_index_refreshed_after_each_owner_write_is_the_one_a_rebuild_writes_known_included() {
-    let differences: Vec<(u64, Option<&str>, String)> = SEEDS
-        .into_iter()
-        .flat_map(|seed| {
-            differences(seed)
-                .into_iter()
-                .map(move |(known, difference)| (seed, known, difference))
-        })
-        .collect();
-    assert!(differences.is_empty(), "{differences:#?}");
 }
 
 /// Every table a refreshed index at `seed` holds otherwise than the index
@@ -126,17 +98,12 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
                     .cloned()
                     .collect::<Vec<_>>()
             };
-            let known = match (*table, &write) {
-                ("unplaced", _) => Some(G9),
-                ("thread" | "message", Write::SortKey { .. }) => Some(G10),
-                _ => None,
-            };
             let difference = format!(
                 "step {step} ({label}), {table}: refreshed alone {:?}, rebuilt alone {:?}",
                 only(rows, built),
                 only(built, rows),
             );
-            differences.push((known, difference));
+            differences.push((None, difference));
         }
     }
     differences
@@ -443,7 +410,7 @@ pub fn tamed(mut model: Model) -> Model {
         }
         held(&mut item.object);
         held(&mut item.conflict_object);
-        if let Some(binding) = &mut item.binding {
+        for binding in &mut item.bindings {
             held(&mut binding.base_object);
             held(&mut binding.shared_object);
             held(&mut binding.conflict_object);

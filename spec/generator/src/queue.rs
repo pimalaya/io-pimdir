@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use serde_json::{Value as Json, json};
 
 use crate::{
-    body::Filed,
+    body::{Filed, fnv1a64},
     model::{Binding, Item, Model, State},
     name::ObjectName,
 };
@@ -58,6 +58,9 @@ pub enum Action {
         filed: Filed,
         /// The body the producer read.
         if_match: Option<ObjectName>,
+        /// The diverging bodies a person resolved, naming each conflict it
+        /// settles (STORAGE §15.3).
+        resolves: Option<Vec<ObjectName>>,
     },
     /// `move`.
     Move {
@@ -153,6 +156,7 @@ impl Action {
                 seq,
                 filed,
                 if_match,
+                resolves,
             } => {
                 let mut value = json!({
                     "v": 1,
@@ -161,6 +165,9 @@ impl Action {
                 });
                 if let Some(name) = if_match {
                     value["if_match"] = json!(name.0);
+                }
+                if let Some(names) = resolves {
+                    value["resolves"] = json!(names.iter().map(|name| &name.0).collect::<Vec<_>>());
                 }
                 value
             }
@@ -192,6 +199,18 @@ impl Action {
     pub fn target(&self) -> Option<&str> {
         match self {
             Self::Move { to, .. } | Self::Copy { to, .. } => Some(to),
+            _ => None,
+        }
+    }
+
+    /// The `seq` of the item it acts on, for an action on an existing one.
+    pub fn seq(&self) -> Option<i64> {
+        match self {
+            Self::SetFlags { seq, .. }
+            | Self::Remove { seq, .. }
+            | Self::Update { seq, .. }
+            | Self::Move { seq, .. }
+            | Self::Copy { seq, .. } => Some(*seq),
             _ => None,
         }
     }
@@ -285,19 +304,52 @@ impl Model {
         self.queue[id as usize - 1].state = state;
     }
 
-    /// The live items of `collection` as a reader overlaying its pending
-    /// rows shows them, each folded as the owner would apply it, a row it
-    /// would park or skip folded into nothing (STORAGE §15.4).
+    /// The live items of `collection` as a reader overlaying the pending rows
+    /// shows them, each folded as the owner would apply it, a row it would
+    /// park or skip folded into nothing (STORAGE §15.4): the collection's own
+    /// rows but its `add` rows, shown apart ([`Model::pending_creates`]), and
+    /// what other collections' `move` and `copy` rows bring into it, the rows
+    /// queued on the item where it leaves folded in first, all in append
+    /// order.
     pub fn overlay(&self, collection: &str) -> Vec<Item> {
-        let mut folded = self.clone();
-        for row in self
+        let pending = |row: &&Row| row.state == RowState::Pending;
+        let mut rows: Vec<&Row> = self
             .queue
             .iter()
-            .filter(|row| row.collection == collection && row.state == RowState::Pending)
+            .filter(pending)
+            .filter(|row| row.collection == collection)
+            .filter(|row| !matches!(row.action, Action::Add { .. }))
+            .collect();
+        for arrival in
+            self.queue.iter().filter(pending).filter(|row| {
+                row.collection != collection && row.action.target() == Some(collection)
+            })
         {
+            rows.extend(self.queue.iter().filter(pending).filter(|row| {
+                row.collection == arrival.collection
+                    && row.id <= arrival.id
+                    && row.action.seq() == arrival.action.seq()
+            }));
+        }
+        rows.sort_by_key(|row| row.id);
+        rows.dedup_by_key(|row| row.id);
+
+        let mut folded = self.clone();
+        for row in rows {
             folded.apply(&row.collection, &row.action);
         }
         folded.live(collection).cloned().collect()
+    }
+
+    /// The pending `add` rows queued on `collection`, which a reader shows
+    /// apart as the creates they stage, the `seq` of each being the owner's
+    /// to draw when it applies the row (STORAGE §9.1, §15.4).
+    pub fn pending_creates(&self, collection: &str) -> Vec<&Row> {
+        self.queue
+            .iter()
+            .filter(|row| row.collection == collection && row.state == RowState::Pending)
+            .filter(|row| matches!(row.action, Action::Add { .. }))
+            .collect()
     }
 
     /// Applies `action` queued on `collection` as the owner's drain does,
@@ -353,18 +405,21 @@ impl Model {
                 let Some(index) = self.found(collection, *seq) else {
                     return Outcome::Applied(None);
                 };
-                if let Some(reason) = self.gate(index, if_match.as_ref()) {
+                if let Some(reason) = self.gate(index, if_match.as_ref(), None) {
                     return Outcome::Parked(reason);
                 }
                 let item = &mut self.items[index];
-                match &item.binding {
-                    Some(binding) if binding.base_present => item.state = State::Tombstone,
-                    Some(binding) => {
-                        let by = Some(binding.source.clone());
-                        item.binding = None;
+                let based = item.bindings.iter().any(|binding| binding.base_present);
+                let by = item.bindings.first().map(|binding| binding.source.clone());
+                match (based, by) {
+                    (true, _) => {
+                        item.bindings.retain(|binding| binding.base_present);
+                        item.state = State::Tombstone;
+                    }
+                    (false, by) => {
+                        item.bindings.clear();
                         item.state = State::Retained { by };
                     }
-                    None => item.state = State::Retained { by: None },
                 }
                 Outcome::Applied(Some(item.seq))
             }
@@ -372,21 +427,33 @@ impl Model {
                 seq,
                 filed,
                 if_match,
+                resolves,
             } => {
                 let Some(index) = self.bound(collection, *seq) else {
                     return Outcome::Parked(String::from("the item is not bound yet"));
                 };
-                if let Some(reason) = self.gate(index, if_match.as_ref()) {
+                if let Some(reason) = self.gate(index, if_match.as_ref(), resolves.as_deref()) {
                     return Outcome::Parked(reason);
                 }
                 let name = ObjectName::of(&filed.bytes);
                 self.objects.insert(name.clone(), filed.bytes.clone());
                 let item = &mut self.items[index];
-                item.object = Some(name);
+                item.object = Some(name.clone());
                 item.level = 2;
                 item.summary = filed.summary.clone();
                 item.addresses = filed.addresses.clone();
                 item.sort_key = filed.sort_key.clone();
+                item.conflicted = false;
+                item.conflict_object = None;
+                let acting = acting(item, resolves.is_some());
+                if let Some(binding) = acting.and_then(|at| item.bindings.get_mut(at)) {
+                    if binding.conflicted {
+                        binding.base_object = binding.conflict_object.take();
+                        binding.base_revision = binding.conflict_revision.take();
+                        binding.conflicted = false;
+                    }
+                    binding.shared_object = Some(name);
+                }
                 Outcome::Applied(Some(item.seq))
             }
             Action::Move { seq, to } => self.apply_copy(collection, *seq, to, true),
@@ -401,13 +468,16 @@ impl Model {
         flags: &BTreeSet<String>,
         filed: &Filed,
     ) -> Outcome {
+        if link_id.starts_with("hash:") && link_id != format!("hash:{}", fnv1a64(&filed.bytes)) {
+            return Outcome::Parked(String::from("a hash: key its body does not give"));
+        }
         if self.live(collection).any(|item| item.link_id == link_id) {
             return Outcome::Parked(String::from("a live item holds the key"));
         }
         let seq = self.seq_for(collection, link_id, &filed.summary);
         let name = ObjectName::of(&filed.bytes);
         self.objects.insert(name.clone(), filed.bytes.clone());
-        let binding = self.created(collection, link_id);
+        let binding = self.created(collection, link_id, Some(&name));
         self.items.push(Item {
             collection: String::from(collection),
             link_id: String::from(link_id),
@@ -421,7 +491,7 @@ impl Model {
             conflict_object: None,
             summary: filed.summary.clone(),
             addresses: filed.addresses.clone(),
-            binding,
+            bindings: binding.into_iter().collect(),
         });
         Outcome::Applied(Some(seq))
     }
@@ -451,7 +521,7 @@ impl Model {
             link_id = format!("dup:{link_id}#{handle}");
         }
         let seq = self.seq_for(to, &link_id, &source.summary);
-        let binding = self.created(to, &link_id);
+        let binding = self.created(to, &link_id, source.object.as_ref());
         self.items.push(Item {
             collection: String::from(to),
             link_id,
@@ -459,7 +529,7 @@ impl Model {
             state: State::Live,
             conflicted: false,
             conflict_object: None,
-            binding,
+            bindings: binding.into_iter().collect(),
             ..source
         });
         if moves {
@@ -468,10 +538,18 @@ impl Model {
         Outcome::Applied(Some(seq))
     }
 
-    fn created(&self, collection: &str, link_id: &str) -> Option<Binding> {
+    /// The pending create the collection's source binds a new item by: its
+    /// provisional handle, no base, and as its shared body the one the
+    /// write carries, a live upsert moving it there (SYNC §9).
+    fn created(
+        &self,
+        collection: &str,
+        link_id: &str,
+        body: Option<&ObjectName>,
+    ) -> Option<Binding> {
         self.collections[collection]
-            .source
-            .clone()
+            .source()
+            .cloned()
             .map(|source| Binding {
                 source,
                 handle: format!("\u{1}{link_id}"),
@@ -479,11 +557,12 @@ impl Model {
                 base_object: None,
                 base_revision: None,
                 base_present: false,
-                shared_object: None,
+                shared_object: body.cloned(),
                 conflicted: false,
                 conflict_revision: None,
                 conflict_object: None,
                 refusal: None,
+                round: None,
             })
     }
 
@@ -498,45 +577,74 @@ impl Model {
     /// local one (STORAGE §15.3).
     fn bound(&self, collection: &str, seq: i64) -> Option<usize> {
         let index = self.found(collection, seq)?;
-        let synced = self.collections[collection].source.is_some();
-        match (&self.items[index].binding, synced) {
-            (Some(_), _) => Some(index),
-            (None, false) => Some(index),
+        let synced = self.collections[collection].source().is_some();
+        match (self.items[index].bindings.is_empty(), synced) {
+            (false, _) => Some(index),
+            (true, false) => Some(index),
             _ => None,
         }
     }
 
     fn conflict(&self, index: usize) -> bool {
         let item = &self.items[index];
-        item.conflicted
-            || item
-                .binding
-                .as_ref()
-                .is_some_and(|binding| binding.conflicted)
+        item.conflicted || item.bindings.iter().any(|binding| binding.conflicted)
     }
 
     /// Why an `update` or a `remove` stating no resolution parks: a body
     /// other than the one it read, or a conflict (STORAGE §15.3).
-    fn gate(&self, index: usize, if_match: Option<&ObjectName>) -> Option<String> {
+    fn gate(
+        &self,
+        index: usize,
+        if_match: Option<&ObjectName>,
+        resolves: Option<&[ObjectName]>,
+    ) -> Option<String> {
         let item = &self.items[index];
         if let Some(name) = if_match
             && item.object.as_ref() != Some(name)
         {
             return Some(format!("if_match {} is not the item's body", name.0));
         }
-        self.conflict(index)
-            .then(|| String::from("the item is in conflict"))
+
+        let mut met = Vec::new();
+        if item.conflicted {
+            met.push(item.conflict_object.as_ref());
+        }
+        if let Some(binding) = acting(item, resolves.is_some())
+            .map(|at| &item.bindings[at])
+            .filter(|binding| binding.conflicted)
+        {
+            met.push(binding.conflict_object.as_ref());
+        }
+        match (met.is_empty(), resolves) {
+            (true, None) => None,
+            (true, Some(_)) => Some(String::from("a resolution meeting no conflict")),
+            (false, None) => Some(String::from("the item is in conflict")),
+            (false, Some(names)) => met
+                .iter()
+                .any(|object| object.is_none_or(|object| !names.contains(object)))
+                .then(|| String::from("a resolution not naming each conflict it meets")),
+        }
     }
+}
+
+/// The binding an `update` or a `remove` runs through: for a resolution, one
+/// whose conflict it names, else the item's first (STORAGE §15.2).
+fn acting(item: &Item, resolving: bool) -> Option<usize> {
+    resolving
+        .then(|| item.bindings.iter().position(|binding| binding.conflicted))
+        .flatten()
+        .or_else(|| (!item.bindings.is_empty()).then_some(0))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, process};
+    use std::{collections::BTreeSet, env, fs, process};
 
     use rusqlite::types::Value;
 
     use crate::{
         model::{Model, State},
+        name::ObjectName,
         oracle,
         profile::Profile,
         queue::{Action, RowState},
@@ -604,13 +712,35 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert!(shown.iter().any(|item| item.link_id == added));
+        assert!(
+            shown.iter().all(|item| item.link_id != added),
+            "a pending add shows in no listing of items"
+        );
+        let creates = model.pending_creates("work/contacts");
+        assert!(creates.iter().any(|row| matches!(
+            &row.action,
+            Action::Add { link_id, .. } if *link_id == added
+        )));
+        assert!(
+            creates
+                .iter()
+                .all(|row| matches!(row.action, Action::Add { .. }))
+        );
     }
 
     #[test]
     fn an_overlay_shows_flags_changed_by_their_base_and_skips_a_base_over_unknown_flags() {
         let model = structure();
         let shown = model.overlay("work/INBOX");
+        let moved = model
+            .queue
+            .iter()
+            .filter(|row| row.state == RowState::Pending)
+            .find_map(|row| match &row.action {
+                Action::Move { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .unwrap();
 
         for row in model
             .queue
@@ -620,6 +750,9 @@ mod tests {
             let Action::SetFlags { seq, base, .. } = &row.action else {
                 continue;
             };
+            if *seq == moved {
+                continue;
+            }
             let held = model
                 .items
                 .iter()
@@ -641,23 +774,97 @@ mod tests {
             }
         }
 
-        let moved = model
+        assert!(shown.iter().all(|item| item.seq != moved));
+        let arrived = model.overlay("work/Archive");
+        let item = arrived
+            .iter()
+            .find(|item| item.seq == moved)
+            .expect("a move queued on another collection shows in its target");
+        assert_eq!(
+            item.flags,
+            Some(BTreeSet::from([String::from("$Filed")])),
+            "the rows queued on it where it leaves fold in first"
+        );
+    }
+
+    #[test]
+    fn a_move_the_owner_would_park_brings_nothing_into_its_target() {
+        let mut model = structure();
+        let queued: Vec<i64> = model
             .queue
             .iter()
-            .filter(|row| row.state == RowState::Pending)
-            .find_map(|row| match &row.action {
-                Action::Move { seq, .. } => Some(*seq),
-                _ => None,
+            .filter_map(|row| row.action.seq())
+            .collect();
+        let index = model
+            .items
+            .iter()
+            .position(|item| {
+                item.collection == "work/INBOX"
+                    && item.state == State::Live
+                    && !item.bindings.is_empty()
+                    && !queued.contains(&item.seq)
+                    && !model
+                        .items
+                        .iter()
+                        .any(|other| other.collection == "work/Archive" && other.seq == item.seq)
             })
             .unwrap();
-        assert!(shown.iter().all(|item| item.seq != moved));
+        model.items[index].conflicted = true;
+        let seq = model.items[index].seq;
+        let to = String::from("work/Archive");
+        model.enqueue("himalaya", "work/INBOX", Action::Move { seq, to });
+
         assert!(
             model
                 .overlay("work/Archive")
                 .iter()
-                .all(|item| item.seq != moved),
-            "a move queued on another collection is that collection's to fold"
+                .all(|item| item.seq != seq)
         );
+        assert!(
+            model
+                .overlay("work/INBOX")
+                .iter()
+                .any(|item| item.seq == seq)
+        );
+    }
+    #[test]
+    fn a_drained_write_moves_its_binding_shared_body_onto_the_body_it_carries() {
+        let mut model = structure();
+        model.drain_all();
+
+        for row in &model.queue {
+            let (Action::Update { seq, filed, .. }, RowState::Applied(_)) =
+                (&row.action, &row.state)
+            else {
+                continue;
+            };
+            let item = model
+                .items
+                .iter()
+                .find(|item| item.collection == row.collection && item.seq == *seq)
+                .unwrap();
+            if item.object == Some(ObjectName::of(&filed.bytes)) {
+                let binding = item.bindings.first().unwrap();
+                assert_eq!(binding.shared_object, item.object, "an update");
+            }
+        }
+        let creates: Vec<_> = model
+            .items
+            .iter()
+            .filter(|item| {
+                item.bindings
+                    .first()
+                    .is_some_and(|binding| !binding.base_present)
+            })
+            .collect();
+        assert!(!creates.is_empty());
+        for item in creates {
+            assert_eq!(
+                item.bindings.first().unwrap().shared_object,
+                item.object,
+                "a pending create"
+            );
+        }
     }
 
     #[test]

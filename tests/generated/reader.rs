@@ -41,7 +41,10 @@ use crate::common::{
 
 /// The statements the oracle states that no reader call wraps, each the
 /// owner's or the engine's to run.
-const UNWRAPPED: [&str; 1] = ["storage/read/handle_for_link"];
+const UNWRAPPED: [&str; 2] = [
+    "storage/read/handle_for_link",
+    "storage/owner/load_conflict",
+];
 
 /// Finding G1 (implementation, public API): a collection's pending listing
 /// fails whole on one row whose payload does not decode, where STORAGE
@@ -766,6 +769,30 @@ fn answer(reader: &PimdirReader, expectation: &Expectation) -> Result<Option<Ans
                         Value::Text(refusal.reason),
                         Value::Text(refusal.key),
                         Value::Text(refusal.refused_at),
+                    ]
+                })
+                .collect(),
+        ),
+        "load_pending_arrivals" => Answer::new(
+            &[
+                "id",
+                "created_at",
+                "producer",
+                "collection",
+                "action",
+                "attempts",
+            ],
+            reader
+                .pending_arrivals(at.string("collection"))?
+                .into_iter()
+                .map(|pending| {
+                    vec![
+                        Value::Integer(pending.id),
+                        Value::Text(pending.created_at),
+                        Value::Text(pending.producer),
+                        Value::Text(pending.collection),
+                        Value::Text(String::from(pending.action.kind())),
+                        Value::Integer(pending.attempts),
                     ]
                 })
                 .collect(),

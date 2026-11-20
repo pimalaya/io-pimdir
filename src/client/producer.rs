@@ -1181,6 +1181,37 @@ pub(crate) fn pending_actions(
     Ok(actions)
 }
 
+/// The pending moves and copies other collections queued into `target`
+/// (`load_pending_arrivals`, §15.4), in append order.
+pub(crate) fn pending_arrivals(
+    conn: &Connection,
+    target: &str,
+) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+    let found = rows(
+        conn,
+        sql::LOAD_PENDING_ARRIVALS,
+        named_params! { ":collection": target },
+        |r| {
+            Ok(PimdirQueueRow {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                producer: r.get(2)?,
+                collection: r.get(3)?,
+                action: r.get(4)?,
+                payload: r.get(5)?,
+                target_collection: Some(target.to_string()),
+                object_hash: r.get(6)?,
+                attempts: r.get(7)?,
+            })
+        },
+    )?;
+    let mut actions = Vec::with_capacity(found.len());
+    for row in found {
+        actions.push(row.decode()?);
+    }
+    Ok(actions)
+}
+
 /// Reads every pending row for an overlay (§15.4): a row whose payload
 /// does not decode is left out, the drain being what parks it.
 pub(crate) fn overlaid_actions(conn: &Connection) -> Result<Vec<PimdirPendingAction>, PimdirError> {

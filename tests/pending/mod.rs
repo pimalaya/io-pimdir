@@ -68,6 +68,13 @@ pub fn settle(suite: &str, outcomes: Vec<(String, Outcome)>) {
     );
 }
 
+/// Whether the list names `case` of `suite`, for a runner that must not
+/// run it at all: one exhausting memory fails no assertion to catch.
+#[allow(dead_code)]
+pub fn is_listed(suite: &str, case: &str) -> bool {
+    listed(suite).contains_key(case)
+}
+
 /// The cases of `suite` the list names, each with its phase.
 fn listed(suite: &str) -> BTreeMap<String, u32> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/pending_vectors.txt");

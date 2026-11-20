@@ -1239,6 +1239,15 @@ impl PimdirReader {
         pending_actions(&self.conn, Some(collection))
     }
 
+    /// The pending moves and copies other collections queued into
+    /// `collection`, in append order (§15.4): what they bring in.
+    pub fn pending_arrivals(
+        &self,
+        collection: impl AsRef<str>,
+    ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
+        producer::pending_arrivals(&self.conn, collection.as_ref())
+    }
+
     /// What every source syncing `collection` can do there (§15.6).
     pub fn capabilities(
         &self,
