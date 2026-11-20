@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-20
+
 ### Added
 
 - **BREAKING**: Added `PimdirRekeyReport::events`, `Added` for a member a rekey names that no old placement resolves to (pimdir SYNC §5, §8); the report is no longer `Copy`.
@@ -20,11 +22,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Changed the search extractor revision to `io-pimdir 3`, on ical-rs 0.7.3: an index built before is extracted again.
 - Changed the documentation of the search layer: it follows the crate's versioning like the store and the engine, SEARCH being released together with STORAGE and SYNC.
 - Changed `pimdir --help` and README.md to state that the `pimdir` binary is outside the crate's 1.0 contract: its commands, flags and output may change in any release.
 
 ### Fixed
 
+- Fixed a keyless `add` being queued with no key: the key it was checked under is written into its row, so a second `add` of the same key meets it as a pending duplicate.
 - Fixed a sync offering another source an item under a `hash:` key, which asserts no identity (pimdir SYNC §9).
 - Fixed an item keeping its body under a divergence taking the incoming body's summary and sort key (pimdir SYNC §9).
 - Fixed a kept body's retained item carrying the winning item's sort key instead of the one its own body gives (pimdir SYNC §9, STORAGE Annex A).
@@ -39,6 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Fixed `PimdirIndex::search`, `threads` and `thread` failing the whole page when one hit's blob cannot be read: that hit lists without a snippet.
 - Fixed `PimdirReader::with_pending` showing an item a pending move or copy brings in without the rows queued on it in its source before: it arrives with them folded in.
 - Fixed `PimdirIndex::refresh` failing the whole run on a body it cannot read: its placement is recorded missing and tried again.
+- Fixed an upgrade settling an item conflict recorded before its incoming body was read, under the collection's `prefer-incoming`, giving the item the fetched body but keeping the summary, sort key and address rows of the body it held (pimdir SYNC §9, STORAGE §9.3, Annex A).
 
 ## [0.18.1] - 2026-11-19
 
@@ -1321,7 +1326,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.18.1..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.19.0..HEAD
+[0.19.0]: https://github.com/pimalaya/io-pimdir/compare/v0.18.1..v0.19.0
 [0.18.1]: https://github.com/pimalaya/io-pimdir/compare/v0.18.0..v0.18.1
 [0.18.0]: https://github.com/pimalaya/io-pimdir/compare/v0.17.0..v0.18.0
 [0.17.0]: https://github.com/pimalaya/io-pimdir/compare/v0.16.0..v0.17.0

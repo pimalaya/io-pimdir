@@ -10,7 +10,3 @@
 # payloads (vectors/payloads.json), sync (vectors/sync/, by file stem),
 # queries, chunks and refresh (vectors/search/).
 
-# pimdir draft-15, finding G8: event-zoned-hostile.ics exhausts the indexer's
-# memory through ical-rs's zone transitions; listed, and not run, until the
-# crate takes the ical-rs that bounds them.
-15 refresh: refresh "an event in a zone whose rule steps by the second is indexed within bounds" step 1
