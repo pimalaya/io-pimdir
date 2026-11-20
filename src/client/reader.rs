@@ -890,8 +890,8 @@ impl PimdirReader {
         match item {
             Some(item) => self.folded(collection, item, edits),
             None => match pending.arrivals.get(&seq) {
-                Some((from, moved)) => Ok(self
-                    .arrival(from, seq, *moved)?
+                Some(arrival) => Ok(self
+                    .arrival(seq, arrival)?
                     .and_then(|item| fold(item, edits, None))),
                 None => Ok(None),
             },
@@ -2020,10 +2020,21 @@ fn entry_from_row(
 struct PimdirPending {
     /// Actions restating or removing an item the collection holds, by public id.
     edits: BTreeMap<i64, Vec<PimdirAction>>,
-    /// Items another collection's pending move or copy brings in, mapped
-    /// to the collection their row is still read from and whether a move
-    /// brings them.
-    arrivals: BTreeMap<i64, (String, bool)>,
+    /// Items another collection's pending move or copy brings in, by public
+    /// id, the first such row winning.
+    arrivals: BTreeMap<i64, PimdirArrival>,
+}
+
+/// An item another collection's pending move or copy brings in.
+#[derive(Debug)]
+struct PimdirArrival {
+    /// The collection its row is still read from.
+    from: String,
+    /// The rows queued on it there before the move or copy, in append
+    /// order, then the move itself.
+    rows: Vec<PimdirAction>,
+    /// Whether a move brings it.
+    moved: bool,
 }
 
 /// The conflicts an item stands in (SYNC §7), as the overlay reads what a
@@ -2197,45 +2208,78 @@ impl PimdirReader {
     /// Folds the store's pending queue into what it changes about one
     /// collection, walked in global append order; a row whose payload
     /// does not decode is skipped, the drain being what parks it.
+    ///
+    /// An arrival carries the rows queued on its item in the collection it
+    /// leaves before its move or copy, so it arrives as the owner would
+    /// have left it there.
     fn pending(&self, collection: &str) -> Result<PimdirPending, PimdirError> {
         let mut pending = PimdirPending::default();
+        let mut elsewhere: BTreeMap<(String, i64), Vec<PimdirAction>> = BTreeMap::new();
+
         for action in overlaid_actions(&self.conn)? {
             let from = action.collection;
             let here = from == collection;
             match &action.action {
                 PimdirAction::SetFlags { seq, .. }
                 | PimdirAction::Update { seq, .. }
-                | PimdirAction::Remove { seq, .. }
-                    if here =>
-                {
-                    pending.edits.entry(*seq).or_default().push(action.action);
+                | PimdirAction::Remove { seq, .. } => {
+                    let seq = *seq;
+                    match here {
+                        true => pending.edits.entry(seq).or_default(),
+                        false => elsewhere.entry((from, seq)).or_default(),
+                    }
+                    .push(action.action);
                 }
                 PimdirAction::Move { seq, to } => {
+                    let seq = *seq;
                     if here && to.0 != collection {
-                        pending.edits.entry(*seq).or_default().push(action.action);
-                    } else if !here && to.0 == collection {
-                        pending.arrivals.insert(*seq, (from, true));
+                        pending.edits.entry(seq).or_default().push(action.action);
+                    } else if !here {
+                        let rows = elsewhere.entry((from.clone(), seq)).or_default();
+                        rows.push(action.action.clone());
+                        if to.0 == collection {
+                            pending
+                                .arrivals
+                                .entry(seq)
+                                .or_insert_with(|| PimdirArrival {
+                                    from,
+                                    rows: rows.clone(),
+                                    moved: true,
+                                });
+                        }
                     }
                 }
                 PimdirAction::Copy { seq, to } if !here && to.0 == collection => {
-                    pending.arrivals.insert(*seq, (from, false));
+                    let seq = *seq;
+                    let rows = elsewhere.get(&(from.clone(), seq)).cloned();
+                    pending
+                        .arrivals
+                        .entry(seq)
+                        .or_insert_with(|| PimdirArrival {
+                            from,
+                            rows: rows.unwrap_or_default(),
+                            moved: false,
+                        });
                 }
                 // NOTE: the item a pending add supersedes reads as removed,
                 // as it will be once the add is applied (§15.3).
                 PimdirAction::Add {
                     supersedes: Some(superseded),
                     ..
-                } if superseded.collection.0 == collection => {
+                } => {
                     let seq = superseded.seq;
-                    pending
-                        .edits
-                        .entry(seq)
-                        .or_default()
-                        .push(PimdirAction::Remove {
-                            seq,
-                            if_match: None,
-                            resolves: None,
-                        });
+                    let remove = PimdirAction::Remove {
+                        seq,
+                        if_match: None,
+                        resolves: None,
+                    };
+                    match superseded.collection.0 == collection {
+                        true => pending.edits.entry(seq).or_default(),
+                        false => elsewhere
+                            .entry((superseded.collection.0.clone(), seq))
+                            .or_default(),
+                    }
+                    .push(remove);
                 }
                 _ => {}
             }
@@ -2287,41 +2331,49 @@ impl PimdirReader {
         }))
     }
 
-    /// The item `seq` a pending move (`moved`) or copy brings in from the
-    /// collection `from`, as its committed rows hold it there. `None` for
-    /// one that collection does not hold, and for one whose move the
-    /// owner would park over a conflict (§15.4), a copy meeting none.
+    /// The item `seq` a pending move or copy brings in, as its committed
+    /// rows hold it in the collection it leaves with the rows queued on it
+    /// there before folded in (§15.4). `None` for one that collection does
+    /// not hold or those rows take out, and for one whose move the owner
+    /// would park over a conflict, a copy meeting none.
     fn arrival(
         &self,
-        from: &str,
         seq: i64,
-        moved: bool,
+        arrival: &PimdirArrival,
     ) -> Result<Option<PimdirItem>, PimdirError> {
-        let Some(item) = self.committed_item(from, seq)? else {
+        let Some(item) = self.committed_item(&arrival.from, seq)? else {
             return Ok(None);
         };
-        // NOTE: the collection it leaves is folded only for an item
-        // standing in a conflict, to learn whether a resolution queued
-        // before the move settles it first.
-        if moved
-            && self
-                .standing(from, &item.link_id)?
-                .is_some_and(|standing| !standing.is_clear())
-        {
-            let source = self.pending(from)?;
-            let edits = source.edits.get(&seq);
-            if self.folded(from, item.clone(), edits)?.is_some() {
+
+        let meets = arrival.rows.iter().any(|action| {
+            matches!(
+                action,
+                PimdirAction::Update { .. }
+                    | PimdirAction::Remove { .. }
+                    | PimdirAction::Move { .. }
+            )
+        });
+        let standing = match meets {
+            true => self.standing(&arrival.from, &item.link_id)?,
+            false => None,
+        };
+
+        let mut before = arrival.rows.clone();
+        if arrival.moved {
+            if fold(item.clone(), Some(&arrival.rows), standing.as_ref()).is_some() {
                 return Ok(None);
             }
+            before.pop();
         }
-        Ok(Some(item))
+
+        Ok(fold(item, Some(&before), standing.as_ref()))
     }
 
     /// The items pending moves and copies bring into the collection.
     fn arrived(&self, pending: &PimdirPending) -> Result<Vec<PimdirItem>, PimdirError> {
         let mut items = Vec::new();
-        for (seq, (from, moved)) in &pending.arrivals {
-            let Some(item) = self.arrival(from, *seq, *moved)? else {
+        for (seq, arrival) in &pending.arrivals {
+            let Some(item) = self.arrival(*seq, arrival)? else {
                 continue;
             };
             if let Some(item) = fold(item, pending.edits.get(seq), None) {

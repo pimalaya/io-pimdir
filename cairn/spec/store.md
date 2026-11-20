@@ -585,6 +585,8 @@ draft-10's second batch such a row was left out of every read.
 The overlay SHALL be chosen when the reader is built rather than per call, so
 one handle cannot answer two ways about one collection.
 
+An item a pending `move` or `copy` brings into a collection SHALL arrive as the owner would leave it there: its committed row in the collection it leaves, with the rows queued on it there before the `move` or `copy` folded in order as that collection's own read folds them, then the rows queued on it in the target (STORAGE §15.4, rows applied in order; the owner's move carries the source's flags as the earlier rows left them). A row queued in the source after a `copy` stays the source's, and the first `move` or `copy` into the collection is the one it arrives by. The queue is walked once for every arrival (tests/overlay.rs `an_arrival_carries_the_flags_queued_on_it_before_its_move_or_copy`; the arrival showed its committed flags before, the source's rows read only for an item in a conflict).
+
 An overlaid page SHALL keep the meaning an unoverlaid one has: it comes back
 short only where the collection ends. A staged removal drops a row the statement
 returned, so the fold SHALL read past the limit by the number of pending
@@ -1501,7 +1503,7 @@ The overlay SHALL fold each as the owner would apply it (STORAGE §15.4): a `set
 ### Requirement: A queued move meeting a conflict parks
 The drain SHALL park a `move` meeting a conflict, the item's or that of the binding it runs through, naming the diverging body, whatever it states (STORAGE §15.2, §15.3, storage-draft-11): it is staged as `PimdirMutation::Move`, which is refused over one ([mutate](mutate.md)), and nothing is written in either collection. A `copy` meets none. The conflict is settled first, by an `update` or a `remove` stating `resolves`, and a `move` queued behind that resolution applies in the same drain.
 
-The overlay SHALL fold nothing for such a `move` (§15.4), in the collection it leaves, where the item stays listed and counted, and in the one it names, where it does not arrive (`get_item`, `count_items` and every page). A reader does not know which binding the owner runs the row through, so it reads a move as it reads an ordinary `update`: applied only over no conflict at all, the item's or any binding's, the overlay never showing what the drain parks. An item standing in a conflict arrives in the target only when the pending rows of the collection it leaves, folded in order, settle it before the move, that collection's queue being read for such an item alone.
+The overlay SHALL fold nothing for such a `move` (§15.4), in the collection it leaves, where the item stays listed and counted, and in the one it names, where it does not arrive (`get_item`, `count_items` and every page). A reader does not know which binding the owner runs the row through, so it reads a move as it reads an ordinary `update`: applied only over no conflict at all, the item's or any binding's, the overlay never showing what the drain parks. An item standing in a conflict arrives in the target only when the pending rows of the collection it leaves, folded in order, settle it before the move.
 
 #### Scenario: Refused, parked, folded into nothing, then settled and moved
 - tests/item_conflict_settle.rs `a_move_over_a_conflicted_item_is_refused_and_parks`: it fails with the refusal removed, with the move folded out of its collection ("not folded"), with the arrival shown ("nor in"), and with the resolution queued before the move left unread ("folded: brought in")

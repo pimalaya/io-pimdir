@@ -210,6 +210,67 @@ fn a_staged_move_leaves_one_collection_and_enters_the_other() {
 }
 
 #[test]
+fn an_arrival_carries_the_flags_queued_on_it_before_its_move_or_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let seqs = store(dir.path());
+    let flag = |seq: i64, flag: &str| {
+        enqueue(
+            dir.path(),
+            "INBOX",
+            &PimdirAction::SetFlags {
+                seq,
+                flags: PimdirFlags::from_iter([flag]),
+                base: None,
+            },
+        );
+    };
+
+    flag(seqs[0], "\\Flagged");
+    flag(seqs[1], "\\Flagged");
+    for seq in [seqs[0], seqs[1]] {
+        enqueue(
+            dir.path(),
+            "INBOX",
+            &PimdirAction::Move {
+                seq,
+                to: PimdirCollectionId("Archive".into()),
+            },
+        );
+    }
+    flag(seqs[2], "\\Answered");
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::Copy {
+            seq: seqs[2],
+            to: PimdirCollectionId("Archive".into()),
+        },
+    );
+    flag(seqs[2], "\\Draft");
+
+    let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let flags = |item: io_pimdir::client::reader::PimdirItem| (item.seq, item.flags);
+    let set = |flag: &str| PimdirFlags::from_iter([flag]);
+    let listed: Vec<(i64, PimdirFlags)> = overlaid
+        .list_items("Archive", None, 10)
+        .unwrap()
+        .into_iter()
+        .map(flags)
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (seqs[0], set("\\Flagged")),
+            (seqs[1], set("\\Flagged")),
+            (seqs[2], set("\\Answered")),
+        ],
+        "a row queued after the copy stays in the source"
+    );
+    let got = overlaid.get_item("Archive", seqs[0]).unwrap().unwrap();
+    assert_eq!(flags(got), (seqs[0], set("\\Flagged")));
+}
+
+#[test]
 fn a_staged_copy_enters_the_target_and_stays_in_the_source() {
     let dir = tempfile::tempdir().unwrap();
     let seqs = store(dir.path());
