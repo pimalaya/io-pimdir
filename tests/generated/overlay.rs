@@ -18,14 +18,6 @@ use rusqlite::types::Value;
 
 use crate::common::{Generated, SEEDS, item_cells, table_cells};
 
-/// Finding G2 (implementation, known, another lane's): the overlay folds a
-/// row the owner parks (STORAGE §15.4: such a row folds into nothing).
-const G2: &str = "G2: the overlay folds a row the owner parks";
-
-/// Finding G3 (implementation, known, another lane's): a folded `update`
-/// repoints the body and keeps the committed summary and sort key.
-const G3: &str = "G3: a folded update keeps the stale summary";
-
 /// Finding G4 (implementation, SHOULD): a pending `add` is not shown in
 /// the collection it creates into, `pending_creates` reporting it apart,
 /// where STORAGE §15.4 folds a row as the owner would apply it.
@@ -54,7 +46,7 @@ fn an_overlaid_read_shows_what_the_drain_would_leave() {
 }
 
 #[test]
-#[ignore = "G2 to G5: the overlay findings of the generated suite"]
+#[ignore = "G4 and G5: the overlay findings of the generated suite"]
 fn an_overlaid_read_shows_what_the_drain_would_leave_known_included() {
     let differences: Vec<(u64, Option<&str>, String)> = SEEDS
         .into_iter()
@@ -73,9 +65,6 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
     let generated = Generated::structure(seed);
     let model = &generated.model;
     let reader = PimdirReader::open(generated.root()).unwrap().with_pending();
-
-    let mut drained = model.clone();
-    drained.drain_all();
 
     let mut differences = Vec::new();
     for (id, collection) in &model.collections {
@@ -103,7 +92,6 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
             let committed = model.live(id).any(|item| item.seq == seq);
             let rows = Rows {
                 model,
-                drained: &drained,
                 collection: id,
                 seq,
             };
@@ -111,7 +99,7 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
                 (Some(want), None) if !committed => {
                     (rows.added(&want.link_id).then_some(G4), "not shown")
                 }
-                (Some(_), None) => (rows.parks().then_some(G2), "folded out"),
+                (Some(_), None) => (None, "folded out"),
                 (None, Some(_)) if !committed => (rows.arrives().then_some(G5), "shown"),
                 (None, Some(_)) => (None, "kept"),
                 (Some(want), Some(got)) => {
@@ -124,13 +112,10 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
                     let restated = [1, 2, 3, 5]
                         .into_iter()
                         .any(|at| got_cells[at] != want_cells[at]);
-                    let known = match (restated, summary || sorted) {
-                        (false, false) => continue,
-                        (false, true) if rows.updates() => Some(G3),
-                        _ if rows.parks() => Some(G2),
-                        _ => None,
-                    };
-                    (known, "restated")
+                    if !restated && !summary && !sorted {
+                        continue;
+                    }
+                    (None, "restated")
                 }
                 (None, None) => continue,
             };
@@ -169,53 +154,15 @@ fn walk(reader: &PimdirReader, collection: &str) -> BTreeMap<i64, PimdirItem> {
     shown
 }
 
-/// The pending rows queued on one item of a collection, read against what
-/// the drain makes of each.
+/// The pending rows that bring one item into a collection or create it
+/// there.
 struct Rows<'a> {
     model: &'a Model,
-    drained: &'a Model,
     collection: &'a str,
     seq: i64,
 }
 
 impl Rows<'_> {
-    fn pending(&self) -> impl Iterator<Item = (i64, &Action)> {
-        self.model
-            .queue
-            .iter()
-            .filter(|row| row.state == RowState::Pending && row.collection == self.collection)
-            .filter(|row| match &row.action {
-                Action::SetFlags { seq, .. }
-                | Action::Remove { seq, .. }
-                | Action::Update { seq, .. }
-                | Action::Move { seq, .. }
-                | Action::Copy { seq, .. } => *seq == self.seq,
-                _ => false,
-            })
-            .map(|row| (row.id, &row.action))
-    }
-
-    /// Whether the drain parks one of them.
-    fn parks(&self) -> bool {
-        self.pending().any(|(id, _)| {
-            matches!(
-                self.drained.queue[id as usize - 1].state,
-                RowState::Parked(_)
-            )
-        })
-    }
-
-    /// Whether the drain applies an `update` among them.
-    fn updates(&self) -> bool {
-        self.pending().any(|(id, action)| {
-            matches!(action, Action::Update { .. })
-                && matches!(
-                    self.drained.queue[id as usize - 1].state,
-                    RowState::Applied(_)
-                )
-        })
-    }
-
     /// Whether a pending `add` queued on the collection creates the item of
     /// key `link_id`.
     fn added(&self, link_id: &str) -> bool {

@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Fixed `PimdirReader::with_pending` folding rows the owner parks: an action on an item no source binds where the owner settles it alone, a move into a collection of no declared kind, and a row the capability backstop parks fold into nothing, and a folded update carries the summary and sort key of its new body, paged by that key.
 - Fixed `enqueue_with_body` queueing a UID-less contact or event under the `hash:` key its caller derived before the `X-PIMDIR-` properties were taken out, a key naming bytes the store never held: it is refused, and stating no key answers the right one.
 - Fixed an upgrade reading the body a base named at its revision, while the item's conflict held its diverging body, fast-forwarding the item to it: the conflict cleared and both the source's edit and the diverging body were lost. The base takes the body and the item and its conflict stand.
 - Fixed `PimdirIndex::search`, `threads` and `thread` failing the whole page when one hit's blob cannot be read: that hit lists without a snippet.

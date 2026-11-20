@@ -582,3 +582,136 @@ fn a_collection_is_quiet_until_an_action_changes_what_its_read_shows() {
     );
     assert!(!quiet("INBOX"));
 }
+
+/// A card in `collection` no source binds, written as a device keeps one.
+fn local_card(dir: &std::path::Path, collection: &str, uid: &str, name: &str) -> i64 {
+    let mut owner = PimdirStore::open(dir).unwrap();
+    owner.ensure_collection(collection, "text/vcard").unwrap();
+    let body = format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:{name}\r\nEND:VCARD\r\n");
+    owner.put_item(collection, body.as_bytes()).unwrap().1
+}
+
+/// The full name a card item reads as.
+fn full_name(item: &io_pimdir::client::reader::PimdirItem) -> String {
+    match &item.summary {
+        Some(io_pimdir::summary::PimdirSummary::Contact(card)) => card.full_name.clone(),
+        other => panic!("no card summary: {other:?}"),
+    }
+}
+
+/// STORAGE §15.3, §15.4: an item no source binds is the owner's to settle,
+/// and the overlay folds its rows as the drain applies them. In a
+/// collection no source syncs an update applies, its summary derived from
+/// the new body, and a move parks; where a source syncs the collection a
+/// set-flags and an update park. What the overlay shows is what the drain
+/// leaves.
+#[test]
+fn an_item_no_source_binds_folds_as_the_owner_settles_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_card(dir.path(), "Local", "a", "Ann Old");
+    let synced = local_card(dir.path(), "Synced", "b", "Bob");
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .ensure_collection("Other", "text/vcard")
+        .unwrap();
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("dav")
+        .write(vec![PimdirWriteOp::SetCheckpoint {
+            collection: PimdirCollectionId("Synced".into()),
+            checkpoint: io_pimdir::collection::PimdirCheckpoint(b"c0".to_vec()),
+        }])
+        .unwrap();
+
+    let mut producer =
+        io_pimdir::client::producer::PimdirProducer::open(dir.path(), "test").unwrap();
+    let renamed = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a\r\nFN:Ann New\r\nEND:VCARD\r\n";
+    producer
+        .enqueue_with_body("Local", renamed, |object| PimdirAction::Update {
+            seq: local,
+            object,
+            if_match: None,
+            resolves: None,
+        })
+        .unwrap();
+    producer
+        .enqueue(
+            "Local",
+            &PimdirAction::Move {
+                seq: local,
+                to: PimdirCollectionId("Other".into()),
+            },
+            None,
+        )
+        .unwrap();
+    producer
+        .enqueue(
+            "Synced",
+            &PimdirAction::SetFlags {
+                seq: synced,
+                flags: PimdirFlags::from_iter(["\\Flagged"]),
+                base: None,
+            },
+            None,
+        )
+        .unwrap();
+    drop(producer);
+
+    let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
+    let card = overlaid
+        .get_item("Local", local)
+        .unwrap()
+        .expect("a parked move leaves it");
+    assert_eq!(full_name(&card), "Ann New", "the update's body summarized");
+    assert!(overlaid.list_items("Other", None, 10).unwrap().is_empty());
+    let card = overlaid.get_item("Synced", synced).unwrap().unwrap();
+    assert!(!card.flags.contains("\\Flagged"), "the drain parks it");
+    let shown = (
+        overlaid
+            .get_item("Local", local)
+            .unwrap()
+            .map(|card| card.object),
+        overlaid
+            .get_item("Synced", synced)
+            .unwrap()
+            .map(|card| card.flags),
+    );
+    drop(overlaid);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("dav");
+    let report = owner.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (1, 2), "{report:?}");
+    let raw = PimdirReader::open(dir.path()).unwrap();
+    let applied = (
+        raw.get_item("Local", local)
+            .unwrap()
+            .map(|card| card.object),
+        raw.get_item("Synced", synced)
+            .unwrap()
+            .map(|card| card.flags),
+    );
+    assert_eq!(shown, applied, "the overlay showed what the drain left");
+}
+
+/// STORAGE §15.2, §15.4: a move into a collection of no declared kind
+/// parks, so the overlay leaves its item where it is.
+#[test]
+fn a_move_into_an_undeclared_collection_folds_into_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let seqs = store(dir.path());
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::Move {
+            seq: seqs[0],
+            to: PimdirCollectionId("Nowhere".into()),
+        },
+    );
+
+    let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
+    assert!(overlaid.get_item("INBOX", seqs[0]).unwrap().is_some());
+    drop(overlaid);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    assert_eq!(owner.drain().unwrap().parked, 1);
+}

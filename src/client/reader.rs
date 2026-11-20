@@ -50,7 +50,7 @@ use crate::{
     search::coverage::{PimdirSearchCoverage, PimdirSearchReads, PimdirSearchTemporal},
     sql,
     summary::{
-        PimdirAddressRole, PimdirSummary,
+        self, PimdirAddressRole, PimdirSummary,
         file::{self, PimdirFileSummary},
     },
     version::PimdirProfile,
@@ -772,7 +772,7 @@ impl PimdirReader {
         };
 
         let after = after.map(|(key, seq)| (key.to_string(), seq));
-        let mut items = self.overlaid(
+        self.overlaid(
             collection,
             limit,
             |limit| {
@@ -794,6 +794,7 @@ impl PimdirReader {
                         },
                     )?;
                     if statements.len() == 1 {
+                        self.attach_addresses(collection, &tables, &mut rows)?;
                         return Ok(rows);
                     }
                     // NOTE: a calendar's three tables each answer for
@@ -810,6 +811,7 @@ impl PimdirReader {
                     (a.sort_key.as_str(), a.seq).cmp(&(b.sort_key.as_str(), b.seq))
                 });
                 page.truncate(limit);
+                self.attach_addresses(collection, &tables, &mut page)?;
                 Ok(page)
             },
             |item| {
@@ -825,10 +827,7 @@ impl PimdirReader {
                     (left.sort_key.as_str(), left.seq).cmp(&(right.sort_key.as_str(), right.seq));
                 if descending { order.reverse() } else { order }
             },
-        )?;
-
-        self.attach_addresses(collection, &tables, &mut items)?;
-        Ok(items)
+        )
     }
 
     fn sorted_page(
@@ -890,9 +889,13 @@ impl PimdirReader {
         match item {
             Some(item) => self.folded(collection, item, edits),
             None => match pending.arrivals.get(&seq) {
-                Some(arrival) => Ok(self
-                    .arrival(seq, arrival)?
-                    .and_then(|item| fold(item, edits, None))),
+                Some(arrival) => {
+                    let queued = edits.map_or(&[][..], Vec::as_slice);
+                    let edits = self.admitted(collection, queued)?;
+                    Ok(self
+                        .arrival(seq, arrival)?
+                        .and_then(|item| fold(item, Some(&edits), None)))
+                }
                 None => Ok(None),
             },
         }
@@ -1004,7 +1007,7 @@ impl PimdirReader {
                 count -= 1;
             }
         }
-        Ok(count + self.arrived(&pending)?.len() as u64)
+        Ok(count + self.arrived(collection, &pending)?.len() as u64)
     }
 
     /// Every live placement of one key, with its collection and account (§9.2).
@@ -2046,6 +2049,12 @@ struct PimdirStanding {
     item: Option<Option<PimdirHash>>,
     /// The diverging body of each of its conflicted bindings.
     bindings: Vec<Option<PimdirHash>>,
+    /// Whether a source syncs the collection of an item no source binds,
+    /// which the owner settles alone (§15.3); `None` for a bound item.
+    unbound: Option<bool>,
+    /// The targets of its pending moves the store declares no kind for,
+    /// where a move parks (§15.2).
+    undeclared: Vec<String>,
 }
 
 impl PimdirStanding {
@@ -2297,30 +2306,73 @@ impl PimdirReader {
         item: PimdirItem,
         edits: Option<&Vec<PimdirAction>>,
     ) -> Result<Option<PimdirItem>, PimdirError> {
-        let meets = edits.into_iter().flatten().any(|action| {
-            matches!(
-                action,
-                PimdirAction::Update { .. }
-                    | PimdirAction::Remove { .. }
-                    | PimdirAction::Move { .. }
-            )
-        });
-        let standing = match meets {
-            true => self.standing(collection, &item.link_id)?,
-            false => None,
+        let edits = self.admitted(collection, edits.map_or(&[][..], Vec::as_slice))?;
+        if edits.is_empty() {
+            return Ok(Some(item));
+        }
+        let mut standing = self.standing(collection, &item.link_id)?;
+        if let Some(standing) = &mut standing {
+            for action in &edits {
+                if let PimdirAction::Move { to, .. } = action
+                    && self
+                        .collection_kind(&to.0)?
+                        .is_none_or(|kind| kind.is_empty())
+                {
+                    standing.undeclared.push(to.0.clone());
+                }
+            }
+        }
+
+        let committed = item.object.clone();
+        let Some(mut folded) = fold(item, Some(&edits), standing.as_ref()) else {
+            return Ok(None);
         };
-        Ok(fold(item, edits, standing.as_ref()))
+        if folded.object != committed
+            && let Some(object) = folded.object.clone()
+        {
+            self.summarize(collection, &mut folded, &object)?;
+        }
+        Ok(Some(folded))
     }
 
-    /// The conflicts the item `link` of `collection` stands in, `None`
-    /// when the collection holds no such item.
+    /// Derives the summary and sort key a folded `update` leaves (Annex A),
+    /// as the owner applying it does, from the body it names: one the blob
+    /// directory does not hold leaves them as they were.
+    fn summarize(
+        &self,
+        collection: &str,
+        item: &mut PimdirItem,
+        object: &PimdirHash,
+    ) -> Result<(), PimdirError> {
+        let Some(kind) = self.collection_kind(collection)? else {
+            return Ok(());
+        };
+        let Ok(Some(body)) = self.blobs().get(object) else {
+            return Ok(());
+        };
+        if let Some(derived) = summary::derive(&kind, &body) {
+            item.summary = derived.summary;
+            item.sort_key = derived.sort_key.0;
+        }
+        Ok(())
+    }
+
+    /// The conflicts the item `link` of `collection` stands in, and whether
+    /// a source binds it, `None` when the collection holds no such item.
     fn standing(
         &self,
         collection: &str,
         link: &PimdirLinkId,
     ) -> Result<Option<PimdirStanding>, PimdirError> {
         let hub = read_hub(&self.conn, collection, Some(slice::from_ref(&link.0)))?;
-        Ok(hub.items.get(link).map(|shared| PimdirStanding {
+        let Some(shared) = hub.items.get(link) else {
+            return Ok(None);
+        };
+        let unbound = match shared.sources.is_empty() {
+            true => Some(!self.collection_sources(collection)?.is_empty()),
+            false => None,
+        };
+        Ok(Some(PimdirStanding {
             item: shared.conflicted.then(|| shared.conflict_object.clone()),
             bindings: shared
                 .sources
@@ -2328,6 +2380,8 @@ impl PimdirReader {
                 .filter(|binding| binding.conflicted)
                 .map(|binding| binding.conflict_object.clone())
                 .collect(),
+            unbound,
+            undeclared: Vec::new(),
         }))
     }
 
@@ -2345,38 +2399,71 @@ impl PimdirReader {
             return Ok(None);
         };
 
-        let meets = arrival.rows.iter().any(|action| {
-            matches!(
-                action,
-                PimdirAction::Update { .. }
-                    | PimdirAction::Remove { .. }
-                    | PimdirAction::Move { .. }
-            )
-        });
-        let standing = match meets {
-            true => self.standing(&arrival.from, &item.link_id)?,
-            false => None,
-        };
+        let standing = self.standing(&arrival.from, &item.link_id)?;
+        if standing
+            .as_ref()
+            .is_some_and(|standing| standing.unbound.is_some())
+        {
+            return Ok(None);
+        }
 
-        let mut before = arrival.rows.clone();
+        let Some((carried, before)) = arrival.rows.split_last() else {
+            return Ok(None);
+        };
+        if !self.admits(&arrival.from, carried)? {
+            return Ok(None);
+        }
+        let before = self.admitted(&arrival.from, before)?;
         if arrival.moved {
-            if fold(item.clone(), Some(&arrival.rows), standing.as_ref()).is_some() {
+            let mut rows = before.clone();
+            rows.push(carried.clone());
+            if fold(item.clone(), Some(&rows), standing.as_ref()).is_some() {
                 return Ok(None);
             }
-            before.pop();
         }
 
         Ok(fold(item, Some(&before), standing.as_ref()))
     }
 
+    /// Whether the owner's backstop lets `action` of `collection` through
+    /// (§15.6): one a source it names does not support is parked, so it
+    /// folds into nothing.
+    fn admits(&self, collection: &str, action: &PimdirAction) -> Result<bool, PimdirError> {
+        match capability::gate(&self.conn, &self.blobs(), collection, action, None) {
+            Err(PimdirError::Unsupported(_)) => Ok(false),
+            result => result.map(|_| true),
+        }
+    }
+
+    /// The rows of `edits` the owner's backstop lets through (§15.6).
+    fn admitted(
+        &self,
+        collection: &str,
+        edits: &[PimdirAction],
+    ) -> Result<Vec<PimdirAction>, PimdirError> {
+        let mut kept = Vec::with_capacity(edits.len());
+        for action in edits {
+            if self.admits(collection, action)? {
+                kept.push(action.clone());
+            }
+        }
+        Ok(kept)
+    }
+
     /// The items pending moves and copies bring into the collection.
-    fn arrived(&self, pending: &PimdirPending) -> Result<Vec<PimdirItem>, PimdirError> {
+    fn arrived(
+        &self,
+        collection: &str,
+        pending: &PimdirPending,
+    ) -> Result<Vec<PimdirItem>, PimdirError> {
         let mut items = Vec::new();
         for (seq, arrival) in &pending.arrivals {
             let Some(item) = self.arrival(*seq, arrival)? else {
                 continue;
             };
-            if let Some(item) = fold(item, pending.edits.get(seq), None) {
+            let queued = pending.edits.get(seq).map_or(&[][..], Vec::as_slice);
+            let edits = self.admitted(collection, queued)?;
+            if let Some(item) = fold(item, Some(&edits), None) {
                 items.push(item);
             }
         }
@@ -2412,16 +2499,40 @@ impl PimdirReader {
         }
 
         let pending = self.pending(collection)?;
-        let page = fetch(limit + pending.removals())?;
+        let restated: Vec<i64> = pending
+            .edits
+            .iter()
+            .filter(|(_, edits)| {
+                edits
+                    .iter()
+                    .any(|action| matches!(action, PimdirAction::Update { .. }))
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+        let page = fetch(limit + pending.removals() + restated.len())?;
         let mut items = Vec::with_capacity(page.len());
         for item in page {
+            if restated.contains(&item.seq) {
+                continue;
+            }
             let edits = pending.edits.get(&item.seq);
             if let Some(item) = self.folded(collection, item, edits)? {
                 items.push(item);
             }
         }
 
-        for item in self.arrived(&pending)? {
+        for seq in &restated {
+            let Some(item) = self.committed_item(collection, *seq)? else {
+                continue;
+            };
+            if let Some(item) = self.folded(collection, item, pending.edits.get(seq))?
+                && inside(&item)
+            {
+                items.push(item);
+            }
+        }
+
+        for item in self.arrived(collection, &pending)? {
             if inside(&item) && !items.iter().any(|held| held.seq == item.seq) {
                 items.push(item);
             }
@@ -2437,7 +2548,9 @@ impl PimdirReader {
 /// (§15.4), `None` when they take it out of the collection: `set-flags`
 /// replaces the set or, stating its base, changes it, `update` repoints
 /// the body, and `remove` and `move` take the item out, over the conflicts
-/// the item stands in; a row the owner would park folds into nothing.
+/// the item stands in; a row the owner would park folds into nothing, an
+/// action on an item no source binds among them where the owner settles
+/// it alone (§15.3), and a move into a collection of no declared kind.
 fn fold(
     mut item: PimdirItem,
     actions: Option<&Vec<PimdirAction>>,
@@ -2446,6 +2559,10 @@ fn fold(
     let mut standing = standing.cloned().unwrap_or_default();
     for action in actions.into_iter().flatten() {
         match action {
+            PimdirAction::SetFlags { .. } | PimdirAction::Update { .. }
+                if standing.unbound == Some(true) => {}
+            PimdirAction::Move { .. } if standing.unbound.is_some() => {}
+            PimdirAction::Move { to, .. } if standing.undeclared.contains(&to.0) => {}
             // NOTE: a change stating its base is folded as the change it
             // is, over the set the item shows, and as nothing over an
             // unknown set, where the owner parks it (§15.4).

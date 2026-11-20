@@ -582,6 +582,8 @@ and failing on it would fail every read until a later owner applies it
 tests/queue.rs `an_unknown_payload_stays_pending_untouched_and_listed`). Before
 draft-10's second batch such a row was left out of every read.
 
+A row the drain would park SHALL fold into nothing (STORAGE §15.4): an action on an item no source binds where the owner settles it alone (§15.3: a `set-flags` or an `update` where a source syncs its collection, a `move` or a `copy` anywhere, its arrival brought nowhere), a `move` into a collection of no declared kind, and a row the owner's capability backstop parks (§15.6, the producer's gate run again over the row). A folded `update` SHALL carry the summary and the sort key the owner derives from its new body (Annex A), read from the blob directory, the item paged by that key: a restated item is read apart from the committed page and kept where its folded key falls past the cursor, so a keyset walk lists it once (tests/overlay.rs `an_item_no_source_binds_folds_as_the_owner_settles_it`, `a_move_into_an_undeclared_collection_folds_into_nothing`; tests/generated/overlay.rs, findings G2 and G3 lifted, and the page and address faults it caught on the way: a restated item listed twice, its addresses joined twice).
+
 The overlay SHALL be chosen when the reader is built rather than per call, so
 one handle cannot answer two ways about one collection.
 
