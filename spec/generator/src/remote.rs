@@ -16,6 +16,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
+    mem,
 };
 
 use rusqlite::types::Value;
@@ -93,6 +94,21 @@ pub struct Remote {
     pub cap: Option<usize>,
     /// The instant it receives a member stating no date at.
     pub clock: Instant,
+    /// The pages after which its next round fails, as a connection lost
+    /// between two pages, once.
+    pub interrupt: Option<usize>,
+    /// The pushes after which its next run fails, the last one taken and its
+    /// outcome never written, as a crash between the two, once.
+    pub crash: Option<usize>,
+    /// Whether its checkpoint is bound to the scope it was made under (SYNC
+    /// §4); one bound to none lets a widening list the band it lacks.
+    pub scope_bound: bool,
+    /// Whether its connector lists delta heads (SYNC §4).
+    pub delta_heads: bool,
+    /// Whether it rejects the next resume cursor it is handed, once.
+    pub reject_cursor: bool,
+    /// The page of its next round whose cursor it leaves out, once.
+    pub drop_cursor: Option<usize>,
 }
 
 /// A member as a page lists it.
@@ -164,6 +180,12 @@ impl Remote {
             enumerates: false,
             cap: None,
             clock: Instant::at(2026, 10, 1, 9, 0, 0),
+            interrupt: None,
+            crash: None,
+            scope_bound: true,
+            delta_heads: false,
+            reject_cursor: false,
+            drop_cursor: None,
         }
     }
 
@@ -248,6 +270,27 @@ impl Remote {
         Some(revision)
     }
 
+    /// Renumbers every member, as a server bumping its `UIDVALIDITY` or
+    /// restored from a backup (SYNC §8): the members in arrival order take
+    /// the handles from `from` on, and the removals it stated are forgotten,
+    /// the new handle space naming none of them.
+    pub fn renumber(&mut self, from: u64) {
+        let mut members: Vec<Member> = mem::take(&mut self.members).into_values().collect();
+        members.sort_by_key(|member| member.arrival);
+        self.vanished.clear();
+        self.modseq += 1;
+        self.next = from;
+        for mut member in members {
+            let handle = match self.mutable {
+                true => format!("r{}.vcf", self.next),
+                false => self.next.to_string(),
+            };
+            self.next += 1;
+            member.changed = self.modseq;
+            self.members.insert(handle, member);
+        }
+    }
+
     /// Loses a member unannounced, as a server whose deletion no delta
     /// states: only a round's absence finds it.
     pub fn forget(&mut self, handle: &str) {
@@ -274,6 +317,12 @@ impl Remote {
     /// member out of scope dropped by the connector's own check, the last
     /// page of a narrowed round handing every handle where it enumerates.
     pub fn round(&self, size: usize, scope: &Scope) -> Vec<Page> {
+        self.round_from(size, scope, None)
+    }
+
+    /// The pages of [`Remote::round`] from the one `cursor` names on, or
+    /// from the first without one.
+    pub fn round_from(&self, size: usize, scope: &Scope, cursor: Option<&str>) -> Vec<Page> {
         let mut newest: Vec<(&String, &Member)> = self.members.iter().collect();
         newest.sort_by_key(|(_, member)| Reverse(member.arrival));
         if let Some(cap) = self.cap {
@@ -290,7 +339,11 @@ impl Remote {
         let enumerated =
             (narrowed && self.enumerates).then(|| self.members.keys().cloned().collect());
 
-        (0..count)
+        let skip = cursor
+            .and_then(|cursor| cursor.strip_prefix("page-"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .unwrap_or(0);
+        (skip.min(count - 1)..count)
             .map(|index| {
                 let chunk = chunks.get(index).copied().unwrap_or(&[]);
                 let last = index + 1 == count;

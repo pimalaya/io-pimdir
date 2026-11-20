@@ -252,18 +252,29 @@ impl Oracle<'_> {
                     collection.kind.map_or("", |kind| kind.media_type()),
                 )),
                 Value::Text(collection.name.clone()),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Value::Integer(1),
+                text(collection.parent.as_deref()),
+                text(collection.presentation.color.as_deref()),
+                text(collection.presentation.description.as_deref()),
+                collection
+                    .presentation
+                    .sort_order
+                    .map_or(Value::Null, Value::Integer),
+                Value::Integer(collection.generation),
                 text(collection.role.as_deref()),
             ];
             row.extend(covered(collection));
             row
         };
 
-        let all = model.collections.keys().map(|id| row(id)).collect();
+        let mut listed: Vec<&Collection> = model.collections.values().collect();
+        listed.sort_by_key(|collection| {
+            let order = collection.presentation.sort_order;
+            (order.is_none(), order, collection.id.as_str())
+        });
+        let all = listed
+            .iter()
+            .map(|collection| row(&collection.id))
+            .collect();
         self.expect("list_collections", &[], all);
 
         let accounts: BTreeSet<Option<&String>> = model
@@ -272,9 +283,8 @@ impl Oracle<'_> {
             .map(|collection| collection.account.as_ref())
             .collect();
         for account in &accounts {
-            let rows = model
-                .collections
-                .values()
+            let rows = listed
+                .iter()
                 .filter(|collection| collection.account.as_ref() == *account)
                 .map(|collection| row(&collection.id))
                 .collect();
@@ -317,7 +327,8 @@ impl Oracle<'_> {
         self.expect("load_account", &key, vec![vec![account]]);
         let conflict = Value::Text(collection.conflict.clone());
         self.expect("storage/owner/load_conflict", &key, vec![vec![conflict]]);
-        self.expect("load_generation", &key, vec![vec![Value::Integer(1)]]);
+        let generation = Value::Integer(collection.generation);
+        self.expect("load_generation", &key, vec![vec![generation]]);
         let instant = |held: bool| match held {
             false => Value::Null,
             true => Value::Text(String::from(INSTANT)),
@@ -354,6 +365,11 @@ impl Oracle<'_> {
                 .map(|open| open.scope.clone())
                 .unwrap_or_default()
                 .values();
+            let cursor = sync
+                .open
+                .as_ref()
+                .and_then(|open| open.cursor.clone())
+                .map_or(Value::Null, |cursor| Value::Blob(cursor.into_bytes()));
             let checkpoint = sync
                 .open
                 .as_ref()
@@ -364,9 +380,9 @@ impl Oracle<'_> {
                 instant(sync.open.is_some()),
                 since,
                 until,
-                Value::Null,
+                cursor,
                 checkpoint,
-                Value::Integer(0),
+                Value::Integer(i64::from(sync.open.as_ref().is_some_and(|open| open.band))),
             ];
             self.expect("storage/owner/load_round", &params, vec![row]);
         }

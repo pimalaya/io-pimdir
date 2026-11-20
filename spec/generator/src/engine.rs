@@ -14,15 +14,18 @@
 //! no scope, every right, no head, no rekey, which later parts add
 //! (README.md, "Limits").
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+};
 
 use rusqlite::types::Value;
 
 use crate::{
     body::Filed,
     model::{
-        Address, Binding, Item, Model, OpenRound, Placement, Refusal, Scope, State, Summary, Table,
-        key,
+        Address, Binding, Derived, Item, Model, OpenRound, Placement, Refusal, Scope, SourceState,
+        State, Summary, Table, key,
     },
     name::ObjectName,
     remote::{Listed, Page, Policy, Remote},
@@ -228,12 +231,21 @@ pub struct Options {
 /// One verb run over one collection and the script it ran against.
 #[derive(Clone, Debug)]
 pub struct Run {
-    /// `sync` or `upgrade`.
+    /// `sync`, `upgrade`, `rekey` or `mutate`.
     pub verb: &'static str,
+    /// What it was asked, a vector's `run.options`: the scope and whether
+    /// absences are accepted.
+    pub options: Options,
+    /// The source's conflict policy against its remote (SYNC §5).
+    pub policy: Policy,
+    /// The handles an upgrade raised, none for another verb.
+    pub handles: Vec<String>,
     /// The collection.
     pub collection: String,
     /// The source.
     pub source: String,
+    /// The head listed before a resumed round's pages, if any.
+    pub head: Option<Page>,
     /// The pages the enumeration answered, a round's or a delta's.
     pub pages: Vec<Page>,
     /// The bodies fetched, by handle.
@@ -247,6 +259,12 @@ pub struct Run {
     /// A round left open by a mass or an empty listing's absence: the
     /// based bindings it found absent and those in its scope (SYNC §5).
     pub parked: Option<(usize, usize)>,
+    /// How many based bindings a closing round, capped or narrowed handing
+    /// no enumeration, left unlisted, none when it left none (SYNC §5).
+    pub unlisted: Option<usize>,
+    /// Whether the run failed: interrupted between two pages, or cut after a
+    /// push the remote took and before the write recording its outcome.
+    pub failed: bool,
 }
 
 impl Model {
@@ -271,8 +289,12 @@ impl Model {
     /// choosing its listing as SYNC §5 does: the open round resumed when it
     /// lists the scope asked for, a round of pages of `size` opened when no
     /// round closed, one is open over another scope or the scope reaches
-    /// outside the coverage, else a delta from the checkpoint, recording a
-    /// narrower scope as the coverage.
+    /// outside the coverage (the band it lacks alone where the checkpoint is
+    /// bound to no scope), else a delta from the checkpoint, recording a
+    /// narrower scope as the coverage. A resumed round lists its delta head
+    /// first where the connector lists heads; one whose cursor the source
+    /// rejects restarts under a new id; a page handing no cursor, or a cut,
+    /// fails the run with what landed kept.
     pub fn sync_in(
         &mut self,
         remotes: &mut BTreeMap<String, Remote>,
@@ -281,38 +303,101 @@ impl Model {
         options: &Options,
     ) -> Run {
         let collection = String::from(collection);
-        let remote = &remotes[&collection];
-        let source = remote.source.clone();
+        let source = remotes[&collection].source.clone();
         let state = self.collections[&collection]
             .sources
             .get(&source)
             .cloned()
             .unwrap_or_default();
         let scope = &options.scope;
-        let (listing, round) = match (&state.open, &state.coverage) {
-            (Some(open), _) if &open.scope == scope => (true, state.rounds),
+        let band = match remotes[&collection].scope_bound {
+            true => None,
+            false => state
+                .coverage
+                .as_ref()
+                .and_then(|coverage| scope.band(coverage)),
+        };
+        let banded = band.is_some();
+        let target = band.unwrap_or_else(|| scope.clone());
+        let open = state
+            .open
+            .as_ref()
+            .filter(|open| open.scope == target && open.band == banded);
+        let (listing, mut round) = match (&state.open, &state.coverage) {
+            _ if open.is_some() => (true, state.rounds),
             (Some(_), _) | (None, None) => (true, state.rounds + 1),
             (None, Some(coverage)) if !scope.within(coverage) => (true, state.rounds + 1),
             _ => (false, state.rounds),
         };
-        let pages = match listing {
-            true => remote.round(size, scope),
+        let remote = remotes.get_mut(&collection).expect("a remote");
+        let mut cursor = open.and_then(|open| open.cursor.clone());
+        let mut landed = open.and_then(|open| open.checkpoint.clone());
+        let restarted = cursor.is_some() && mem::take(&mut remote.reject_cursor);
+        if restarted {
+            round = state.rounds + 1;
+            cursor = None;
+            landed = None;
+        }
+        let resuming = open.is_some() && !restarted;
+        let from = match banded {
+            true => state.checkpoint.clone(),
+            false => landed.clone(),
+        };
+        let head = from
+            .filter(|_| resuming && remote.delta_heads)
+            .map(|from| remote.delta(&String::from_utf8_lossy(&from), scope));
+        let dropped = remote.drop_cursor.take();
+        let remote = &remotes[&collection];
+        let mut pages = match listing {
+            true => remote.round_from(size, &target, cursor.as_deref()),
             false => {
                 let checkpoint = state.checkpoint.clone().unwrap_or_default();
                 vec![remote.delta(&String::from_utf8_lossy(&checkpoint), scope)]
             }
         };
+        if let Some(page) = dropped
+            .and_then(|at| pages.get_mut(at))
+            .filter(|page| !page.last)
+        {
+            page.cursor = None;
+        }
+        if banded {
+            for page in &mut pages {
+                page.checkpoint = None;
+                page.items
+                    .retain(|member| remote.members[&member.handle].date().is_some());
+            }
+        }
+        let refused = pages
+            .iter()
+            .position(|page| !page.last && page.cursor.is_none());
+        if let Some(at) = refused {
+            pages.truncate(at);
+        }
+        let interrupt = remotes
+            .get_mut(&collection)
+            .expect("a remote")
+            .interrupt
+            .take();
+        let interrupted =
+            refused.is_some() || (listing && interrupt.is_some_and(|after| after < pages.len()));
+        if let (None, Some(after)) = (refused, interrupt.filter(|_| interrupted)) {
+            pages.truncate(after);
+        }
         let policy = remotes[&collection].policy;
         let mut events = Vec::new();
         let mut listed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut owing: BTreeSet<String> = BTreeSet::new();
 
-        for page in &pages {
+        for page in head.iter().chain(pages.iter()) {
             for member in &page.items {
                 listed.insert(member.handle.clone(), member.flags.clone());
                 let filed = remotes[&collection].members[&member.handle].filed.clone();
                 let index = match self.bound_handle(&collection, &source, &member.handle) {
                     Some(index) => {
-                        self.refresh(index, member, &filed, &source, policy, &mut events);
+                        if self.refresh(index, member, &filed, &source, policy, &mut events) {
+                            owing.insert(member.handle.clone());
+                        }
                         index
                     }
                     None => match self.landing(&collection, &source, &filed) {
@@ -323,24 +408,34 @@ impl Model {
                         }
                         None => match self.joining(&collection, &source, &filed) {
                             Some(index) => {
-                                self.join(index, member, &filed, &source, &mut events);
+                                if self.join(index, member, &filed, &source, &mut events) {
+                                    owing.insert(member.handle.clone());
+                                }
                                 index
                             }
-                            None => {
-                                if member.carries {
-                                    self.objects
-                                        .insert(ObjectName::of(&member.meta), member.meta.clone());
+                            None => match self.reviving(&collection, &filed) {
+                                Some(index) => {
+                                    self.revive(index, member, &filed, &source, &mut events);
+                                    index
                                 }
-                                let placement = Placement {
-                                    flags: Some(member.flags.clone()),
-                                    held: member.carries,
-                                    handle: Some(member.handle.clone()),
-                                    revision: member.revision.clone(),
-                                    source: Some(source.clone()),
-                                };
-                                events.push(Event::Added(member.handle.clone()));
-                                self.file(&collection, filed, placement)
-                            }
+                                None => {
+                                    if member.carries {
+                                        self.objects.insert(
+                                            ObjectName::of(&member.meta),
+                                            member.meta.clone(),
+                                        );
+                                    }
+                                    let placement = Placement {
+                                        flags: Some(member.flags.clone()),
+                                        held: member.carries,
+                                        handle: Some(member.handle.clone()),
+                                        revision: member.revision.clone(),
+                                        source: Some(source.clone()),
+                                    };
+                                    events.push(Event::Added(member.handle.clone()));
+                                    self.file(&collection, filed, placement)
+                                }
+                            },
                         },
                     },
                 };
@@ -357,56 +452,63 @@ impl Model {
             }
         }
 
-        let parked = match listing {
-            true => self.absences(&collection, &source, round, &pages, options, &mut events),
-            false => None,
-        };
-
-        let mutable = remotes[&collection].mutable;
-        let pushes: Vec<Push> = self
-            .derive(
-                &collection,
-                &source,
-                &listed,
-                mutable,
-                scope,
-                parked.is_none(),
-            )
-            .into_iter()
-            .filter(|push| {
-                let held = self
-                    .refusal_on(&collection, &source, push.handle())
-                    .filter(|refusal| refusal.key == push.key(&collection));
-                if let Some(refusal) = &held {
-                    events.push(Event::Refused {
-                        handle: String::from(push.handle()),
-                        reason: refusal.reason.clone(),
-                    });
-                }
-                held.is_none()
-            })
-            .collect();
-        let mut outcomes = Vec::new();
-        for push in &pushes {
-            outcomes.push(self.push(remotes, &collection, push, &mut events));
+        let checkpoint = pages
+            .iter()
+            .rev()
+            .chain(head.iter())
+            .find_map(|page| page.checkpoint.clone())
+            .map(String::into_bytes)
+            .or(landed);
+        if interrupted {
+            let entry = self.sync_state(&collection, &source);
+            entry.rounds = round;
+            entry.open = Some(OpenRound {
+                scope: target,
+                band: banded,
+                checkpoint,
+                cursor: pages.last().and_then(|page| page.cursor.clone()).or(cursor),
+            });
+            return Run {
+                verb: "sync",
+                options: options.clone(),
+                policy,
+                handles: Vec::new(),
+                collection,
+                source,
+                head,
+                pages,
+                fetch: BTreeMap::new(),
+                pushes: Vec::new(),
+                outcomes: Vec::new(),
+                events,
+                parked: None,
+                unlisted: None,
+                failed: true,
+            };
         }
 
-        let checkpoint = pages.iter().find_map(|page| page.checkpoint.clone());
-        let entry = self
-            .collections
-            .get_mut(&collection)
-            .expect("a declared collection")
-            .sources
-            .entry(source.clone())
-            .or_default();
+        let (parked, unlisted) = match listing {
+            true => {
+                let named = head.as_ref().is_some_and(|head| !head.items.is_empty());
+                let listed = Listing {
+                    pages: &pages,
+                    named,
+                    scope: &target,
+                    band: banded,
+                };
+                self.absences(&collection, &source, round, listed, options, &mut events)
+            }
+            false => (None, None),
+        };
+        let entry = self.sync_state(&collection, &source);
         entry.rounds = round;
-        let checkpoint = checkpoint.map(String::into_bytes);
         match (listing, parked) {
             (true, Some(_)) => {
-                let checkpoint = checkpoint.or(entry.open.take().and_then(|open| open.checkpoint));
                 entry.open = Some(OpenRound {
-                    scope: scope.clone(),
+                    scope: target.clone(),
+                    band: banded,
                     checkpoint,
+                    cursor: None,
                 });
             }
             (true, None) => {
@@ -424,8 +526,52 @@ impl Model {
             }
         }
 
+        let mutable = remotes[&collection].mutable;
+        let pushes: Vec<Push> = self
+            .derive(
+                &collection,
+                &source,
+                &listed,
+                mutable,
+                scope,
+                parked.is_none(),
+            )
+            .into_iter()
+            .filter(|push| !matches!(push, Push::Update { handle, .. } if owing.contains(handle)))
+            .filter(|push| {
+                let held = self
+                    .refusal_on(&collection, &source, push.handle())
+                    .filter(|refusal| refusal.key == push.key(&collection));
+                if let Some(refusal) = &held {
+                    events.push(Event::Refused {
+                        handle: String::from(push.handle()),
+                        reason: refusal.reason.clone(),
+                    });
+                }
+                held.is_none()
+            })
+            .collect();
+        let crash = remotes.get_mut(&collection).expect("a remote").crash.take();
+        let mut outcomes = Vec::new();
+        let mut failed = false;
+        let mut pushes = pushes;
+        for (at, push) in pushes.iter().enumerate() {
+            if crash == Some(at + 1) {
+                let written = self.clone();
+                outcomes.push(self.push(remotes, &collection, push, &mut Vec::new()));
+                *self = written;
+                failed = true;
+                break;
+            }
+            outcomes.push(self.push(remotes, &collection, push, &mut events));
+        }
+        pushes.truncate(outcomes.len());
+
         Run {
             verb: "sync",
+            options: options.clone(),
+            policy,
+            handles: Vec::new(),
             pushes: pushes
                 .into_iter()
                 .map(|push| {
@@ -435,11 +581,14 @@ impl Model {
                 .collect(),
             collection,
             source,
+            head,
             pages,
             fetch: BTreeMap::new(),
             outcomes,
             events,
             parked,
+            unlisted,
+            failed,
         }
     }
 
@@ -450,30 +599,43 @@ impl Model {
     /// hands none; none for a capped one. They are dropped `Deleted`, unless
     /// more than half of at least 20 in scope or any after a listing naming
     /// nothing are, which parks the round, answered as the absent and the
-    /// bound counts, unless the run accepts absences.
+    /// bound counts, unless the run accepts absences. A closing round that
+    /// is capped, or narrowed handing no enumeration, answers too how many
+    /// it left unlisted, counted as the deletes are, when it left any.
     fn absences(
         &mut self,
         collection: &str,
         source: &str,
         round: i64,
-        pages: &[Page],
+        listing: Listing,
         options: &Options,
         events: &mut Vec<Event>,
-    ) -> Option<(usize, usize)> {
-        let last = pages.last()?;
+    ) -> (Option<(usize, usize)>, Option<usize>) {
+        let pages = listing.pages;
+        let Some(last) = pages.last() else {
+            return (None, None);
+        };
         let scoped: Vec<(String, bool)> = self
             .items
             .iter()
             .filter(|item| item.collection == collection)
-            .filter(|item| options.scope.holds(item.date().as_deref()))
+            .filter(|item| match item.date() {
+                Some(date) => listing.scope.holds(Some(&date)),
+                None => !listing.band,
+            })
             .filter_map(|item| item.bound(source))
             .filter(|binding| binding.base_present && !binding.handle.starts_with('\u{1}'))
             .map(|binding| (binding.handle.clone(), binding.round == Some(round)))
             .collect();
-        let absent: Vec<String> = scoped
+        let unstamped: Vec<String> = scoped
             .iter()
             .filter(|(_, stamped)| !stamped)
             .map(|(handle, _)| handle.clone())
+            .collect();
+        let undecided = last.capped || (last.narrowed && last.enumerated.is_none());
+        let unlisted = (undecided && !unstamped.is_empty()).then_some(unstamped.len());
+        let absent: Vec<String> = unstamped
+            .into_iter()
             .filter(|handle| match (last.narrowed, &last.enumerated) {
                 (false, _) => !last.capped,
                 (true, Some(enumerated)) => !last.capped && !enumerated.contains(handle),
@@ -481,11 +643,11 @@ impl Model {
             })
             .collect();
 
-        let named = pages.iter().any(|page| !page.items.is_empty());
+        let named = listing.named || pages.iter().any(|page| !page.items.is_empty());
         let mass = absent.len() * 2 > scoped.len() && scoped.len() >= 20;
         let empty = !named && !absent.is_empty();
         if (mass || empty) && !options.accept_absences {
-            return Some((absent.len(), scoped.len()));
+            return (Some((absent.len(), scoped.len())), None);
         }
         for handle in absent {
             if let Some(index) = self.bound_handle(collection, source, &handle) {
@@ -493,46 +655,627 @@ impl Model {
                 events.push(Event::Vanished(handle));
             }
         }
-        None
+        (None, unlisted)
+    }
+
+    /// Rebuilds `remote`'s collection after its source renumbered every
+    /// member (SYNC §8): one round over the whole collection read before its
+    /// one write, each based binding of the source carried onto the member
+    /// resolving to its link id (the copy whose base names the listed
+    /// revision first, then the one whose base holds the carried body, then
+    /// in old handle order), a member of a mutable kind listed at another
+    /// revision pulled to `Meta`, or recorded in conflict over a local edit,
+    /// and every binding no member resolves to dropped `Deleted`, the
+    /// collection's generation bumped. A rekey missing more than half of at
+    /// least 20, naming no member while any is missing, or capped while any
+    /// is, writes nothing and parks unless the run accepts absences.
+    pub fn rekey(&mut self, remote: &Remote, options: &Options) -> Run {
+        let collection = remote.collection.clone();
+        let source = remote.source.clone();
+        let pages = remote.round(usize::MAX, &Scope::default());
+        let mut members: Vec<&Listed> = pages.iter().flat_map(|page| page.items.iter()).collect();
+        members.sort_by(|a, b| a.handle.cmp(&b.handle));
+        let capped = pages.last().is_some_and(|page| page.capped);
+
+        let mut old: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.collection == collection)
+            .filter(|(_, item)| {
+                item.bound(&source).is_some_and(|binding| {
+                    binding.base_present && !binding.handle.starts_with('\u{1}')
+                })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        old.sort_by(|a, b| {
+            let handle =
+                |index: &usize| self.items[*index].bound(&source).map(|b| b.handle.clone());
+            handle(a).cmp(&handle(b))
+        });
+
+        let mut taken = BTreeSet::new();
+        let mut resolved = Vec::new();
+        for member in &members {
+            let filed = &remote.members[&member.handle].filed;
+            let hint = key(filed);
+            let minted = format!("dup:{hint}#");
+            let carried = member.carries.then(|| ObjectName::of(&member.meta));
+            let candidates: Vec<usize> = old
+                .iter()
+                .copied()
+                .filter(|index| !taken.contains(index))
+                .filter(|index| {
+                    let item = &self.items[*index];
+                    (item.link_id == hint || item.link_id.starts_with(&minted))
+                        && agrees(&item.summary, &filed.summary)
+                })
+                .collect();
+            let base = |index: &usize| self.items[*index].bound(&source).expect("a bound item");
+            let choice = candidates
+                .iter()
+                .find(|index| {
+                    member.revision.is_some() && base(index).base_revision == member.revision
+                })
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .find(|index| carried.is_some() && base(index).base_object == carried)
+                })
+                .or(candidates.first())
+                .copied();
+            if let Some(index) = choice {
+                taken.insert(index);
+            }
+            resolved.push((*member, choice));
+        }
+
+        let absent: Vec<usize> = old
+            .iter()
+            .copied()
+            .filter(|index| !taken.contains(index))
+            .collect();
+        let mass = absent.len() * 2 > old.len() && old.len() >= 20;
+        let empty = members.is_empty() && !absent.is_empty();
+        let parked = ((mass || empty || (capped && !absent.is_empty()))
+            && !options.accept_absences)
+            .then_some((absent.len(), old.len()));
+        let mut events = Vec::new();
+
+        if parked.is_none() {
+            let mutable = remote.mutable;
+            for (member, choice) in &resolved {
+                let Some(index) = choice else {
+                    let filed = remote.members[&member.handle].filed.clone();
+                    if member.carries {
+                        self.objects
+                            .insert(ObjectName::of(&member.meta), member.meta.clone());
+                    }
+                    let placement = Placement {
+                        flags: Some(member.flags.clone()),
+                        held: member.carries,
+                        handle: Some(member.handle.clone()),
+                        revision: member.revision.clone(),
+                        source: Some(source.clone()),
+                    };
+                    events.push(Event::Added(member.handle.clone()));
+                    self.file(&collection, filed, placement);
+                    continue;
+                };
+                let item = &mut self.items[*index];
+                let edited = item.object.is_some()
+                    && item.object != item.bound(&source).expect("a bound item").base_object;
+                let moved = mutable
+                    && member.revision != item.bound(&source).expect("a bound item").base_revision;
+                if moved && !edited {
+                    item.object = None;
+                    item.level = 1;
+                }
+                let binding = item.bound_mut(&source).expect("a bound item");
+                binding.handle = member.handle.clone();
+                match (moved, edited) {
+                    (true, true) => {
+                        binding.conflicted = true;
+                        binding.conflict_revision = member.revision.clone();
+                        binding.conflict_object = None;
+                    }
+                    (true, false) => {
+                        binding.base_object = None;
+                        binding.base_revision = member.revision.clone();
+                    }
+                    _ => {}
+                }
+            }
+            let mut gone = absent;
+            gone.sort_unstable_by(|a, b| b.cmp(a));
+            for index in gone {
+                self.drop_deleted(index, &source);
+            }
+
+            let checkpoint = pages.iter().find_map(|page| page.checkpoint.clone());
+            let entry = self
+                .collections
+                .get_mut(&collection)
+                .expect("a declared collection");
+            entry.generation += 1;
+            if let Some(checkpoint) = checkpoint {
+                entry.sources.entry(source.clone()).or_default().checkpoint =
+                    Some(checkpoint.into_bytes());
+            }
+        }
+
+        Run {
+            verb: "rekey",
+            options: options.clone(),
+            policy: remote.policy,
+            handles: Vec::new(),
+            collection,
+            source,
+            head: None,
+            pages,
+            fetch: BTreeMap::new(),
+            pushes: Vec::new(),
+            outcomes: Vec::new(),
+            events,
+            parked,
+            unlisted: None,
+            failed: false,
+        }
     }
 
     /// Raises the placements of `handles` to `Full`, fetching each body
-    /// the store does not hold, the base moving onto it (SYNC §6).
+    /// the store does not hold, the base moving onto it, and each a binding
+    /// names a revision of and no body while the item holds one, which an
+    /// item conflict recorded unread waits for (SYNC §6, §9), and the
+    /// diverging body a binding's conflict asks for, which clears it when
+    /// it is the placement's own (SYNC §5).
     pub fn upgrade(&mut self, remote: &Remote, handles: &[String]) -> Run {
         let collection = remote.collection.clone();
         let source = remote.source.clone();
         let mut fetch = BTreeMap::new();
+        let mut events = Vec::new();
 
         for handle in handles {
             let Some(index) = self.bound_handle(&collection, &source, handle) else {
                 continue;
             };
-            if self.items[index].object.is_some() {
+            let item = &self.items[index];
+            let binding = item.bound(&source).expect("a bound item");
+            let unread = binding.base_object.is_none() && binding.base_revision.is_some();
+            let diverging = binding.conflicted && binding.conflict_object.is_none();
+            if item.object.is_some() && !unread && !diverging {
                 continue;
             }
-            let bytes = remote.members[handle].filed.bytes.clone();
-            let name = ObjectName::of(&bytes);
-            self.objects.insert(name.clone(), bytes.clone());
-            fetch.insert(handle.clone(), bytes);
+            let filed = remote.members[handle].filed.clone();
+            let name = ObjectName::of(&filed.bytes);
+            self.objects.insert(name.clone(), filed.bytes.clone());
+            fetch.insert(handle.clone(), filed.bytes.clone());
+            if diverging {
+                let item = &mut self.items[index];
+                let equal = item.object.as_ref() == Some(&name);
+                let binding = item.bound_mut(&source).expect("a bound item");
+                match equal {
+                    true => {
+                        binding.base_object = Some(name.clone());
+                        binding.base_revision = binding.conflict_revision.take();
+                        binding.shared_object = Some(name);
+                        binding.conflicted = false;
+                    }
+                    false => binding.conflict_object = Some(name),
+                }
+                continue;
+            }
+            if self.items[index].object.is_some() {
+                self.revisit(index, &source, handle, name, &filed, &mut events);
+                continue;
+            }
 
-            let item = &mut self.items[index];
-            item.object = Some(name.clone());
-            item.level = 2;
-            let binding = item.bound_mut(&source).expect("a bound item");
-            binding.base_object = Some(name.clone());
-            binding.shared_object = Some(name);
+            let member = &remote.members[handle];
+            let binding = self.items[index].bound(&source).expect("a bound item");
+            let held = binding.base_object.is_some();
+            let moved = member.revision.is_some() && member.revision != binding.base_revision;
+            match (held, moved) {
+                (true, true) => {
+                    let listed = Listed {
+                        handle: handle.clone(),
+                        flags: member.flags.clone(),
+                        revision: member.revision.clone(),
+                        meta: filed.bytes.clone(),
+                        carries: true,
+                    };
+                    self.diverge(index, &listed, &filed, Some(name), &source, &mut events);
+                }
+                (true, false) => {}
+                (false, _) => {
+                    let revision = member.revision.clone();
+                    self.fill(index, &source, handle, name, &filed, revision, &mut events);
+                }
+            }
         }
 
         Run {
             verb: "upgrade",
+            options: Options::default(),
+            policy: remote.policy,
+            handles: handles.to_vec(),
             collection,
             source,
+            head: None,
             pages: Vec::new(),
             fetch,
             pushes: Vec::new(),
             outcomes: Vec::new(),
-            events: Vec::new(),
+            events,
             parked: None,
+            unlisted: None,
+            failed: false,
+        }
+    }
+
+    /// Settles a body an upgrade read for a binding naming a revision and no
+    /// body, over an item holding one (SYNC §6, §9): the base takes it, and
+    /// that is all unless an item conflict waits for that body. Then one
+    /// equal to the item's is no divergence, the conflict clearing; another
+    /// is settled by the collection's policy as a carried one would have been, `manual`
+    /// landing it as the item's `conflict_object`, `prefer-incoming` and
+    /// `prefer-existing` keeping the body not adopted over the handle, the
+    /// conflict cleared. The base takes the body read; the shared body the
+    /// one the item settles on, unless it stays conflicted.
+    fn revisit(
+        &mut self,
+        index: usize,
+        source: &str,
+        handle: &str,
+        fetched: ObjectName,
+        filed: &Filed,
+        events: &mut Vec<Event>,
+    ) {
+        let item = &self.items[index];
+        if !item.conflicted || item.conflict_object.is_some() {
+            let item = &mut self.items[index];
+            let binding = item.bound_mut(source).expect("a bound item");
+            binding.base_object = Some(fetched);
+            return;
+        }
+        let policy = self.collections[&item.collection].conflict.clone();
+        let equal = item.object.as_ref() == Some(&fetched);
+        let kept = match (equal, policy.as_str()) {
+            (true, _) => None,
+            (false, "prefer-incoming") => {
+                let kept = Kept {
+                    object: item.object.clone(),
+                    flags: item.flags.clone(),
+                    summary: item.summary.clone(),
+                    addresses: item.addresses.clone(),
+                    sort_key: item.sort_key.clone(),
+                };
+                let item = &mut self.items[index];
+                item.object = Some(fetched.clone());
+                item.summary = filed.summary.clone();
+                item.addresses = filed.addresses.clone();
+                item.sort_key = filed.sort_key.clone();
+                Some(kept)
+            }
+            (false, "prefer-existing") => Some(Kept {
+                object: Some(fetched.clone()),
+                flags: item.flags.clone(),
+                summary: filed.summary.clone(),
+                addresses: filed.addresses.clone(),
+                sort_key: filed.sort_key.clone(),
+            }),
+            (false, _) => {
+                self.remember(Some(&fetched), filed);
+                let item = &mut self.items[index];
+                item.conflict_object = Some(fetched.clone());
+                let binding = item.bound_mut(source).expect("a bound item");
+                binding.base_object = Some(fetched);
+                return;
+            }
+        };
+
+        let item = &mut self.items[index];
+        item.conflicted = false;
+        item.conflict_object = None;
+        let settled = item.object.clone();
+        let binding = item.bound_mut(source).expect("a bound item");
+        binding.base_object = Some(fetched);
+        binding.shared_object = settled;
+        if let Some(kept) = kept {
+            let link_id = self.keep(index, handle, kept, source);
+            events.push(Event::Overruled {
+                handle: String::from(handle),
+                link_id,
+            });
+        }
+    }
+
+    /// The sync state `source` keeps in `collection`, to write.
+    fn sync_state(&mut self, collection: &str, source: &str) -> &mut SourceState {
+        self.collections
+            .get_mut(collection)
+            .expect("a declared collection")
+            .sources
+            .entry(String::from(source))
+            .or_default()
+    }
+
+    /// Keeps the row a body derives, for an item that may adopt it later.
+    fn remember(&mut self, name: Option<&ObjectName>, filed: &Filed) {
+        if let Some(name) = name {
+            let derived = Derived {
+                summary: filed.summary.clone(),
+                addresses: filed.addresses.clone(),
+                sort_key: filed.sort_key.clone(),
+            };
+            self.rows.insert(name.clone(), derived);
+        }
+    }
+
+    /// Fills an item holding no body with the one a binding whose base
+    /// names none read (SYNC §9): adopted without a divergence measured.
+    /// An item conflict waiting on the item's own body is then settled by
+    /// the collection's policy: `manual` keeps it, `prefer-incoming` adopts
+    /// the diverging body and `prefer-existing` the one filled, the body not
+    /// adopted kept over the filling binding's handle.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        index: usize,
+        source: &str,
+        handle: &str,
+        name: ObjectName,
+        filed: &Filed,
+        revision: Option<String>,
+        events: &mut Vec<Event>,
+    ) {
+        let policy = self.collections[&self.items[index].collection]
+            .conflict
+            .clone();
+        let item = &mut self.items[index];
+        item.object = Some(name.clone());
+        item.level = 2;
+        item.summary = filed.summary.clone();
+        item.addresses = filed.addresses.clone();
+        item.sort_key = filed.sort_key.clone();
+        let conflicted = item.conflicted;
+        let waiting = item.conflict_object.clone().filter(|_| conflicted);
+        let binding = item.bound_mut(source).expect("a bound item");
+        binding.base_object = Some(name.clone());
+        if revision.is_some() {
+            binding.base_revision = revision;
+        }
+        let Some(incoming) = waiting else {
+            if !conflicted {
+                binding.shared_object = Some(name);
+            }
+            return;
+        };
+
+        let derived = self.rows.get(&incoming).cloned();
+        let item = &self.items[index];
+        let (kept, settled) = match policy.as_str() {
+            "prefer-incoming" => {
+                let kept = Kept {
+                    object: Some(name),
+                    flags: item.flags.clone(),
+                    summary: item.summary.clone(),
+                    addresses: item.addresses.clone(),
+                    sort_key: item.sort_key.clone(),
+                };
+                let item = &mut self.items[index];
+                item.object = Some(incoming.clone());
+                if let Some(derived) = derived {
+                    item.summary = derived.summary;
+                    item.addresses = derived.addresses;
+                    item.sort_key = derived.sort_key;
+                }
+                (kept, incoming)
+            }
+            "prefer-existing" => {
+                let derived = derived.unwrap_or_else(|| Derived {
+                    summary: item.summary.clone(),
+                    addresses: item.addresses.clone(),
+                    sort_key: item.sort_key.clone(),
+                });
+                let kept = Kept {
+                    object: Some(incoming),
+                    flags: item.flags.clone(),
+                    summary: derived.summary,
+                    addresses: derived.addresses,
+                    sort_key: derived.sort_key,
+                };
+                (kept, name)
+            }
+            _ => return,
+        };
+        let item = &mut self.items[index];
+        item.conflicted = false;
+        item.conflict_object = None;
+        item.bound_mut(source).expect("a bound item").shared_object = Some(settled);
+        let link_id = self.keep(index, handle, kept, source);
+        events.push(Event::Overruled {
+            handle: String::from(handle),
+            link_id,
+        });
+    }
+
+    /// The retained row of the collection a member revives: the one holding
+    /// its key, its summary agreeing, and a message's size too where both
+    /// state one (SYNC §6, STORAGE §11.1).
+    fn reviving(&self, collection: &str, filed: &Filed) -> Option<usize> {
+        let key = key(filed);
+        self.items.iter().position(|item| {
+            item.collection == collection
+                && item.link_id == key
+                && matches!(item.state, State::Retained { .. })
+                && agrees(&item.summary, &filed.summary)
+                && (item.summary.table != Table::Mail
+                    || item.summary.get("size") == filed.summary.get("size")
+                    || [&item.summary, &filed.summary]
+                        .iter()
+                        .any(|summary| summary.get("size") == Value::Null))
+        })
+    }
+
+    /// Revives a retained row under the member naming it, reported `Added`
+    /// (STORAGE §11.1): bound by the source at the member's flags and
+    /// revision. A message keeps its body, the member's own. A mutable kind
+    /// takes the body the member carries, none when it carries none, at
+    /// `Meta`, the body the row held kept as a retained item over the
+    /// member's handle, reported `Overruled`, its server having perhaps
+    /// replaced it.
+    fn revive(
+        &mut self,
+        index: usize,
+        member: &Listed,
+        filed: &Filed,
+        source: &str,
+        events: &mut Vec<Event>,
+    ) {
+        let carried = member.carries.then(|| ObjectName::of(&member.meta));
+        if let Some(name) = &carried {
+            self.objects.insert(name.clone(), member.meta.clone());
+        }
+        let item = &self.items[index];
+        let mutable = item.summary.table != Table::Mail;
+        let kept = (mutable && item.object.is_some() && item.object != carried).then(|| Kept {
+            object: item.object.clone(),
+            flags: item.flags.clone(),
+            summary: item.summary.clone(),
+            addresses: item.addresses.clone(),
+            sort_key: item.sort_key.clone(),
+        });
+
+        let item = &mut self.items[index];
+        item.state = State::Live;
+        item.flags = Some(member.flags.clone());
+        if mutable {
+            item.object = carried;
+            item.level = if item.object.is_some() { 2 } else { 1 };
+            item.summary = filed.summary.clone();
+            item.addresses = filed.addresses.clone();
+            item.sort_key = filed.sort_key.clone();
+        }
+        let object = item.object.clone();
+        item.bind(Binding {
+            source: String::from(source),
+            handle: member.handle.clone(),
+            base_flags: Some(member.flags.clone()),
+            base_object: object.clone(),
+            base_revision: member.revision.clone(),
+            base_present: true,
+            shared_object: object,
+            conflicted: false,
+            conflict_revision: None,
+            conflict_object: None,
+            refusal: None,
+            round: None,
+        });
+        events.push(Event::Added(member.handle.clone()));
+        if let Some(kept) = kept {
+            let link_id = self.keep(index, &member.handle, kept, source);
+            events.push(Event::Overruled {
+                handle: member.handle.clone(),
+                link_id,
+            });
+        }
+    }
+
+    /// An `Edit` stating `overrule` through `source`'s binding of the item
+    /// at `seq` (SYNC §7): an engine settling a conflict by its own rule.
+    /// It is refused, staging nothing, when a conflict it settles holds a
+    /// diverging body nobody has read. Else the binding's conflict is
+    /// adopted as its base, as any settling `Edit` adopts it, the item takes
+    /// the edit's body, and each diverging body not adopted is kept over the
+    /// binding's handle, the binding's then the item's, reported `Overruled`.
+    pub fn overrule(&mut self, collection: &str, source: &str, seq: i64, filed: Filed) -> Run {
+        let index = self
+            .items
+            .iter()
+            .position(|item| {
+                item.collection == collection && item.seq == seq && item.bound(source).is_some()
+            })
+            .expect("a bound item");
+        let item = &self.items[index];
+        let binding = item.bound(source).expect("a bound item");
+        let handle = binding.handle.clone();
+        let unread = (binding.conflicted && binding.conflict_object.is_none())
+            || (item.conflicted && item.conflict_object.is_none());
+        let mut events = Vec::new();
+
+        if !unread {
+            let name = ObjectName::of(&filed.bytes);
+            self.objects.insert(name.clone(), filed.bytes.clone());
+            let item = &self.items[index];
+            let binding = item.bound(source).expect("a bound item");
+            let diverging = [
+                binding
+                    .conflict_object
+                    .clone()
+                    .filter(|_| binding.conflicted),
+                item.conflict_object.clone().filter(|_| item.conflicted),
+            ];
+            let kept: Vec<Kept> = diverging
+                .into_iter()
+                .flatten()
+                .filter(|object| object != &name)
+                .map(|object| {
+                    let derived = self.rows.get(&object).cloned().unwrap_or_else(|| Derived {
+                        summary: item.summary.clone(),
+                        addresses: item.addresses.clone(),
+                        sort_key: item.sort_key.clone(),
+                    });
+                    Kept {
+                        object: Some(object),
+                        flags: item.flags.clone(),
+                        summary: derived.summary,
+                        addresses: derived.addresses,
+                        sort_key: derived.sort_key,
+                    }
+                })
+                .collect();
+
+            let item = &mut self.items[index];
+            item.object = Some(name.clone());
+            item.level = 2;
+            item.summary = filed.summary.clone();
+            item.addresses = filed.addresses.clone();
+            item.sort_key = filed.sort_key.clone();
+            item.conflicted = false;
+            item.conflict_object = None;
+            let binding = item.bound_mut(source).expect("a bound item");
+            if binding.conflicted {
+                binding.base_object = binding.conflict_object.take();
+                binding.base_revision = binding.conflict_revision.take();
+                binding.conflicted = false;
+            }
+            binding.shared_object = Some(name);
+            for kept in kept {
+                let link_id = self.keep(index, &handle, kept, source);
+                events.push(Event::Overruled {
+                    handle: handle.clone(),
+                    link_id,
+                });
+            }
+        }
+
+        Run {
+            verb: "mutate",
+            options: Options::default(),
+            policy: Policy::Manual,
+            handles: vec![handle],
+            collection: String::from(collection),
+            source: String::from(source),
+            head: None,
+            pages: Vec::new(),
+            fetch: BTreeMap::new(),
+            pushes: Vec::new(),
+            outcomes: Vec::new(),
+            events,
+            parked: None,
+            unlisted: None,
+            failed: unread,
         }
     }
 
@@ -587,7 +1330,7 @@ impl Model {
         filed: &Filed,
         source: &str,
         events: &mut Vec<Event>,
-    ) {
+    ) -> bool {
         let carried = member.carries.then(|| ObjectName::of(&member.meta));
         if let Some(name) = &carried {
             self.objects.insert(name.clone(), member.meta.clone());
@@ -623,14 +1366,12 @@ impl Model {
             (Some(object), _) if !mutable => Some(object.clone()),
             (Some(object), Some(incoming)) if object == incoming => carried,
             (None, None) => None,
-            _ => {
-                self.diverge(index, member, filed, carried, source, events);
-                return;
-            }
+            _ => return self.diverge(index, member, filed, carried, source, events),
         };
         let binding = item.bound_mut(source).expect("a joined item");
         binding.base_object = agreed.clone();
         binding.shared_object = agreed;
+        false
     }
 
     /// An upsert diverging from the shared item (SYNC §9): recorded on the
@@ -639,6 +1380,9 @@ impl Model {
     /// incoming body or keeps the item's, the body not adopted kept as a
     /// retained item over the member's handle. The binding's base moves to
     /// the incoming body; its shared body only to the one the item settles
+    /// on, and not while the item is conflicted. Answers whether the fold
+    /// leaves the binding owing the item's body, which the source's next
+    /// run pushes (SYNC §5).
     /// on, and not while the item is conflicted.
     fn diverge(
         &mut self,
@@ -648,7 +1392,7 @@ impl Model {
         carried: Option<ObjectName>,
         source: &str,
         events: &mut Vec<Event>,
-    ) {
+    ) -> bool {
         let item = &self.items[index];
         let policy = self.collections[&item.collection].conflict.clone();
         let unread = carried.is_none() || item.object.is_none();
@@ -678,6 +1422,7 @@ impl Model {
                 sort_key: filed.sort_key.clone(),
             }),
             _ => {
+                self.remember(carried.as_ref(), filed);
                 let item = &mut self.items[index];
                 item.conflicted = true;
                 item.conflict_object = carried.clone();
@@ -689,6 +1434,7 @@ impl Model {
         let item = &mut self.items[index];
         let shared = settled.is_some().then(|| item.object.clone()).flatten();
         let binding = item.bound_mut(source).expect("a bound item");
+        let owing = shared.is_some() && shared != carried;
         binding.base_object = carried;
         binding.base_revision = member.revision.clone();
         if shared.is_some() {
@@ -701,6 +1447,7 @@ impl Model {
                 link_id,
             });
         }
+        owing
     }
 
     /// Lands a create on the member naming it: its binding moved to the
@@ -730,7 +1477,7 @@ impl Model {
         source: &str,
         policy: Policy,
         events: &mut Vec<Event>,
-    ) {
+    ) -> bool {
         let item = &mut self.items[index];
         let flags = item.flags.clone();
         let binding = item.bound_mut(source).expect("a bound item");
@@ -743,11 +1490,22 @@ impl Model {
         }
 
         if member.revision.is_none() || member.revision == base_revision {
-            return;
+            return false;
         }
         let carried = member.carries.then(|| ObjectName::of(&member.meta));
         if let Some(name) = &carried {
             self.objects.insert(name.clone(), member.meta.clone());
+        }
+        if carried.is_some() && carried == self.items[index].object {
+            let item = &mut self.items[index];
+            let binding = item.bound_mut(source).expect("a bound item");
+            binding.base_object = carried.clone();
+            binding.base_revision = member.revision.clone();
+            binding.shared_object = carried;
+            binding.conflicted = false;
+            binding.conflict_revision = None;
+            binding.conflict_object = None;
+            return false;
         }
         let item = &self.items[index];
         let binding = item.bound(source).expect("a bound item");
@@ -769,6 +1527,7 @@ impl Model {
 
         match settle {
             Settle::Record => {
+                self.remember(carried.as_ref(), filed);
                 let binding = self.items[index].bound_mut(source).expect("a bound item");
                 binding.conflicted = true;
                 binding.conflict_revision = member.revision.clone();
@@ -785,8 +1544,7 @@ impl Model {
                 let fills = item.object.is_none() && binding.base_object.is_none();
                 let changed = item.object != agreed;
                 if !fills && carried != binding.base_object && changed && carried != item.object {
-                    self.diverge(index, member, filed, carried, source, events);
-                    return;
+                    return self.diverge(index, member, filed, carried, source, events);
                 }
                 let dropped = settle == Settle::PullKeepingLocal && !changed;
                 let kept = dropped.then(|| {
@@ -839,6 +1597,7 @@ impl Model {
                 });
             }
         }
+        false
     }
 
     /// Keeps a body a policy did not adopt as a retained item, keyed by
@@ -1251,6 +2010,15 @@ fn declared(summary: &Summary) -> Option<String> {
         Value::Text(hint) if !hint.trim_matches([' ', '\t']).is_empty() => Some(hint),
         _ => None,
     }
+}
+
+/// What a round listed, as its absences read it: its pages, whether a head
+/// named a member, and the scope it lists, a band or not.
+struct Listing<'a> {
+    pages: &'a [Page],
+    named: bool,
+    scope: &'a Scope,
+    band: bool,
 }
 
 /// How a run settles a remote revision its base does not hold.

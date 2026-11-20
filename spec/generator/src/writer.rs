@@ -77,6 +77,13 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
             "storage/owner/set_conflict",
             &[("conflict", &conflict), ("collection", &id)],
         )?;
+        for _ in 1..collection.generation {
+            run(
+                store,
+                "storage/owner/bump_generation",
+                &[("collection", &id)],
+            )?;
+        }
         if let Some(role) = &collection.role {
             let role = Value::Text(role.clone());
             run(
@@ -98,6 +105,28 @@ pub fn materialise(model: &Model, store: &Store) -> Result<()> {
                 ],
             )?;
         }
+    }
+
+    for collection in model.collections.values() {
+        let id = Value::Text(collection.id.clone());
+        let parent = text(collection.parent.as_deref());
+        run(
+            store,
+            "storage/owner/set_collection_parent",
+            &[("parent", &parent), ("collection", &id)],
+        )?;
+        let shown = &collection.presentation;
+        let sort_order = shown.sort_order.map_or(Value::Null, Value::Integer);
+        run(
+            store,
+            "storage/owner/set_collection_presentation",
+            &[
+                ("color", &text(shown.color.as_deref())),
+                ("description", &text(shown.description.as_deref())),
+                ("sort_order", &sort_order),
+                ("collection", &id),
+            ],
+        )?;
     }
 
     let sources: BTreeSet<&String> = model.capabilities.iter().map(|row| &row.source).collect();
@@ -349,6 +378,7 @@ fn write_rounds(store: &Store, stamped: &Stamps, collection: &Collection) -> Res
         for round in 1..=sync.rounds {
             let open = sync.open.as_ref().filter(|_| round == sync.rounds);
             let (since, until) = open.map_or(&covered, |open| &open.scope).values();
+            let band = Value::Integer(i64::from(open.is_some_and(|open| open.band)));
             run(
                 store,
                 "storage/owner/open_round",
@@ -357,7 +387,7 @@ fn write_rounds(store: &Store, stamped: &Stamps, collection: &Collection) -> Res
                     ("source", &source),
                     ("since", &since),
                     ("until", &until),
-                    ("band", &Value::Integer(0)),
+                    ("band", &band),
                 ],
             )?;
             let key = (collection.id.as_str(), name.as_str(), round);
@@ -370,11 +400,15 @@ fn write_rounds(store: &Store, stamped: &Stamps, collection: &Collection) -> Res
             )?;
             if let Some(open) = open {
                 let checkpoint = open.checkpoint.clone().map_or(Value::Null, Value::Blob);
+                let cursor = open
+                    .cursor
+                    .clone()
+                    .map_or(Value::Null, |cursor| Value::Blob(cursor.into_bytes()));
                 run(
                     store,
                     "storage/owner/set_round_cursor",
                     &[
-                        ("cursor", &Value::Null),
+                        ("cursor", &cursor),
                         ("checkpoint", &checkpoint),
                         ("collection", &id),
                         ("source", &source),

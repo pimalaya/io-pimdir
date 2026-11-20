@@ -60,6 +60,25 @@ pub struct Collection {
     /// Its cross-source conflict policy, `manual`, `prefer-incoming` or
     /// `prefer-existing` (STORAGE §13).
     pub conflict: String,
+    /// Its handle-space epoch, from 1, bumped by a rekey (STORAGE §12).
+    pub generation: i64,
+    /// The collection it sits under in its account's hierarchy, none at
+    /// the top (STORAGE §14).
+    pub parent: Option<String>,
+    /// How it is shown, as its source states it.
+    pub presentation: Presentation,
+}
+
+/// How a collection is shown, each part as its source states it or none
+/// (STORAGE §14).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Presentation {
+    /// A color as written.
+    pub color: Option<String>,
+    /// A description.
+    pub description: Option<String>,
+    /// Its position among its siblings.
+    pub sort_order: Option<i64>,
 }
 
 impl Collection {
@@ -91,6 +110,11 @@ pub struct OpenRound {
     pub scope: Scope,
     /// The checkpoint its pages landed, the source's once it closes.
     pub checkpoint: Option<Vec<u8>>,
+    /// The resume cursor its last page landed, none for a parked round,
+    /// which resumes from its first page.
+    pub cursor: Option<String>,
+    /// Whether it lists only the band its coverage lacks (SYNC §5).
+    pub band: bool,
 }
 
 /// `[since, until)` on a message's summary `date`, either bound open (SYNC
@@ -131,6 +155,34 @@ impl Scope {
         floor && ceiling
     }
 
+    /// The band it adds to `coverage` on one side, adjoining it, which a
+    /// round may list alone when its source's checkpoint is bound to no
+    /// scope (SYNC §5); none when it widens both sides or none.
+    pub fn band(&self, coverage: &Scope) -> Option<Scope> {
+        let lower = match (self.since, coverage.since) {
+            (None, Some(floor)) => Some((None, floor)),
+            (Some(own), Some(floor)) if own < floor => Some((Some(own), floor)),
+            _ => None,
+        };
+        let upper = match (self.until, coverage.until) {
+            (None, Some(ceiling)) => Some((ceiling, None)),
+            (Some(own), Some(ceiling)) if own > ceiling => Some((ceiling, Some(own))),
+            _ => None,
+        };
+        let same_floor = self.since == coverage.since;
+        let same_ceiling = self.until == coverage.until;
+        match (lower, upper) {
+            (Some((since, floor)), None) if same_ceiling => Some(Scope {
+                since,
+                until: Some(floor),
+            }),
+            (None, Some((ceiling, until))) if same_floor => Some(Scope {
+                since: Some(ceiling),
+                until,
+            }),
+            _ => None,
+        }
+    }
     /// Its bounds as the store holds them, `NULL` for an open one.
     pub fn values(&self) -> (Value, Value) {
         let bound = |instant: Option<Instant>| {
@@ -393,6 +445,9 @@ pub struct Model {
     pub objects: BTreeMap<ObjectName, Vec<u8>>,
     /// The bodies too large to hold, by name, rendered when written.
     pub streams: BTreeMap<ObjectName, Stream>,
+    /// The rows the bodies an item does not hold derive, a diverging one
+    /// kept for an item that may adopt it later.
+    pub rows: BTreeMap<ObjectName, Derived>,
     /// The next `seq` to draw, `store_meta.next_seq`.
     pub next_seq: i64,
     /// The rows purged, objects collected and collections deleted or
@@ -406,6 +461,17 @@ pub struct Model {
     pub performers: BTreeMap<(Option<String>, String), String>,
     /// The references between items (STORAGE §14.2).
     pub references: Vec<Reference>,
+}
+
+/// What Annex A derives from a body, kept apart from any item.
+#[derive(Clone, Debug)]
+pub struct Derived {
+    /// Its summary row.
+    pub summary: Summary,
+    /// Its address rows.
+    pub addresses: Vec<Address>,
+    /// Its sort key.
+    pub sort_key: String,
 }
 
 /// One row a source declares (STORAGE §15.6, Annex B).

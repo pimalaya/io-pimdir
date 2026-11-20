@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     body::{Card, Mail, fnv1a64},
     engine::{Options, Push, Run},
-    model::{Collection, Kind, Model, Scope, synced_by},
+    model::{Collection, Kind, Model, Presentation, Scope, synced_by},
     name::ObjectName,
     profile::Draw,
     queue::{Action, RowState},
@@ -51,6 +51,21 @@ const SHARED: [(&str, &str, bool); 4] = [
     ("work/agreeing", "manual", true),
 ];
 
+/// The address books [`History::sources`] has `b` join unread, and the
+/// conflict policy of each.
+const UNREAD: [(&str, &str); 2] = [
+    ("work/unread", "manual"),
+    ("work/unread-incoming", "prefer-incoming"),
+];
+
+/// The address books [`History::bodies`] fills, and the conflict policy of
+/// each.
+const FILLS: [(&str, &str); 3] = [
+    ("work/fill", "manual"),
+    ("work/fill-incoming", "prefer-incoming"),
+    ("work/fill-existing", "prefer-existing"),
+];
+
 impl History {
     /// One source and one mailbox (README.md, "Events and histories"): a
     /// first round in pages, an upgrade, remote changes, local changes
@@ -67,6 +82,9 @@ impl History {
             role: Some(String::from("inbox")),
             sources: synced_by(&[&String::from("work-imap")]),
             conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
         });
         let mut remote = Remote::new("work-imap", "work/INBOX");
         for index in 0..7 {
@@ -195,6 +213,9 @@ impl History {
             role: Some(String::from("default")),
             sources: synced_by(&[&String::from("work-carddav")]),
             conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
         });
         let mut remote = Remote::dav("work-carddav", "work/contacts");
         let mut cards = Vec::new();
@@ -336,6 +357,9 @@ impl History {
                 role: Some(String::from(role)),
                 sources: synced_by(&[&String::from("work-imap")]),
                 conflict: String::from("manual"),
+                generation: 1,
+                parent: None,
+                presentation: Presentation::default(),
             });
             remotes.insert(String::from(id), Remote::new("work-imap", id));
         }
@@ -445,6 +469,9 @@ impl History {
             role: Some(String::from("default")),
             sources: synced_by(&[&String::from("work-carddav")]),
             conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
         });
         let mut remote = Remote::dav("work-carddav", "work/contacts");
         let mut cards = Vec::new();
@@ -604,6 +631,9 @@ impl History {
             role: Some(String::from("sent")),
             sources: synced_by(&[&String::from("work-imap")]),
             conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
         });
         let mut remote = Remote::new("work-imap", "work/Sent");
         remote.uidplus = false;
@@ -686,6 +716,9 @@ impl History {
                 role: None,
                 sources: synced_by(&[&format!("dav-{id}")]),
                 conflict: String::from("manual"),
+                generation: 1,
+                parent: None,
+                presentation: Presentation::default(),
             });
             let mut remote = Remote::dav(&format!("dav-{id}"), id);
             remote.policy = policy;
@@ -740,10 +773,13 @@ impl History {
     /// holding the same body, one holding another, and names one of its
     /// own, each lacking what the other holds offered it but the `hash:`
     /// one; `a` pulls an edit `b` then owes, `b`'s server edits the card too,
-    /// its pull diverging from the item or agreeing with it, then edits it
-    /// again; `a`'s server deletes a card, which `b` then removes. On a
+    /// its pull diverging from the item or agreeing with it, its next run
+    /// pushing what the fold left it owing, then edits it again; `a`'s server deletes a card, which `b` then removes. On a
     /// mailbox: `b` joins a message `a` holds and mints another reusing its
-    /// `Message-ID`, and a flag one server sets reaches the other.
+    /// `Message-ID`, and a flag one server sets reaches the other. On the
+    /// address books of `UNREAD`: `b` joins two cards without their bodies,
+    /// recorded in conflict, and its upgrade reads one equal to the item's,
+    /// clearing it, and one differing, settled by the policy.
     pub fn sources(seed: u64) -> Self {
         let mut draw = Draw::new(seed);
         let mut model = Model::new();
@@ -770,6 +806,9 @@ impl History {
                 role: None,
                 sources: synced_by(&[&a, &b]),
                 conflict: String::from(conflict),
+                generation: 1,
+                parent: None,
+                presentation: Presentation::default(),
             });
             let mut ra = Remote::dav(&a, id);
             let mut rb = Remote::dav(&b, id);
@@ -815,6 +854,8 @@ impl History {
             rb.edit("r1.vcf", other.file());
             let run = model.sync(&mut rb, PAGE);
             record(format!("{id}: b's edit meets the item"), Some(run), &model);
+            let run = model.sync(&mut rb, PAGE);
+            record(format!("{id}: b's next run"), Some(run), &model);
             let again = Card {
                 name: String::from("Edited Again At B"),
                 ..cards[0].clone()
@@ -847,6 +888,9 @@ impl History {
             role: Some(String::from("inbox")),
             sources: synced_by(&["imap-a", "imap-b"]),
             conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
         });
         let mut ra = Remote::new("imap-a", id);
         ra.carries = true;
@@ -872,6 +916,43 @@ impl History {
         record(format!("{id}: b pulls a flag"), Some(run), &model);
         let run = model.sync(&mut ra, PAGE);
         record(format!("{id}: a pushes it"), Some(run), &model);
+
+        for (id, conflict) in UNREAD {
+            let (a, b) = (format!("{id}-a"), format!("{id}-b"));
+            model.declare(Collection {
+                id: String::from(id),
+                account: Some(String::from("work")),
+                kind: Some(Kind::Contact),
+                name: String::from(id),
+                role: None,
+                sources: synced_by(&[&a, &b]),
+                conflict: String::from(conflict),
+                generation: 1,
+                parent: None,
+                presentation: Presentation::default(),
+            });
+            let mut ra = Remote::dav(&a, id);
+            let mut rb = Remote::dav(&b, id);
+            rb.carries = false;
+            let cards: Vec<Card> = (0..2).map(|_| draw.card()).collect();
+            for card in &cards {
+                ra.deliver(card.file(), BTreeSet::new());
+            }
+            let theirs = Card {
+                name: String::from("Their Copy"),
+                ..cards[1].clone()
+            };
+            rb.deliver(cards[0].file(), BTreeSet::new());
+            rb.deliver(theirs.file(), BTreeSet::new());
+
+            let run = model.sync(&mut ra, PAGE);
+            record(format!("{id}: a's first round"), Some(run), &model);
+            let run = model.sync(&mut rb, PAGE);
+            record(format!("{id}: b joins unread"), Some(run), &model);
+            let handles = [String::from("r1.vcf"), String::from("r2.vcf")];
+            let run = model.upgrade(&rb, &handles);
+            record(format!("{id}: b's upgrade reads them"), Some(run), &model);
+        }
 
         Self { steps }
     }
@@ -922,6 +1003,9 @@ impl History {
                 role: None,
                 sources: synced_by(&[source]),
                 conflict: String::from("manual"),
+                generation: 1,
+                parent: None,
+                presentation: Presentation::default(),
             });
             Remote::new(source, id)
         };
@@ -1075,6 +1159,633 @@ impl History {
 
         Self { steps }
     }
+
+    /// One source renumbering its members (SYNC §8). On work/INBOX, 25
+    /// messages, one filed twice under one `Message-ID`: a renumbering from
+    /// one with the first message gone, its handle handed to another; one
+    /// carrying every message and the minted copy; a delta after it; one
+    /// missing most messages, parked, then accepted; and a capped one
+    /// missing some, parked. On work/contacts: a renumbering over a card the
+    /// server edited and one edited on both sides, then an edit over the
+    /// card pulled unread, its upgrade reading the base, its push.
+    pub fn rekeys(seed: u64) -> Self {
+        let mut draw = Draw::new(seed);
+        let mut model = Model::new();
+        let mut steps = vec![Step {
+            label: String::from("an empty store"),
+            run: None,
+            model: model.clone(),
+        }];
+        let mut record = |label: String, run: Option<Run>, model: &Model| {
+            steps.push(Step {
+                label,
+                run,
+                model: model.clone(),
+            });
+        };
+        let accepting = Options {
+            accept_absences: true,
+            ..Options::default()
+        };
+
+        let id = "work/INBOX";
+        model.declare(Collection {
+            id: String::from(id),
+            account: Some(String::from("work")),
+            kind: Some(Kind::Mail),
+            name: String::from("INBOX"),
+            role: Some(String::from("inbox")),
+            sources: synced_by(&["work-imap"]),
+            conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
+        });
+        let mut remote = Remote::new("work-imap", id);
+        let messages: Vec<Mail> = (0..24).map(|_| draw.message(false)).collect();
+        for message in &messages {
+            remote.deliver(message.file(), set(&["\\Seen"]));
+        }
+        remote.deliver(messages[5].file(), BTreeSet::new());
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: a first round"), Some(run), &model);
+
+        remote.forget("1");
+        remote.renumber(1);
+        let run = model.rekey(&remote, &Options::default());
+        record(
+            format!("{id}: renumbered from one, a message gone"),
+            Some(run),
+            &model,
+        );
+        remote.renumber(200);
+        let run = model.rekey(&remote, &Options::default());
+        record(
+            format!("{id}: renumbered, every message carried"),
+            Some(run),
+            &model,
+        );
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: a delta after it"), Some(run), &model);
+
+        for number in 200..215 {
+            remote.forget(&number.to_string());
+        }
+        remote.renumber(300);
+        let run = model.rekey(&remote, &Options::default());
+        record(
+            format!("{id}: renumbered, most messages missing"),
+            Some(run),
+            &model,
+        );
+        let run = model.rekey(&remote, &accepting);
+        record(format!("{id}: the absences accepted"), Some(run), &model);
+        remote.cap = Some(5);
+        remote.renumber(400);
+        let run = model.rekey(&remote, &Options::default());
+        record(format!("{id}: renumbered, capped"), Some(run), &model);
+
+        let id = "work/contacts";
+        model.declare(Collection {
+            id: String::from(id),
+            account: Some(String::from("work")),
+            kind: Some(Kind::Contact),
+            name: String::from("contacts"),
+            role: None,
+            sources: synced_by(&["work-carddav"]),
+            conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
+        });
+        let mut remote = Remote::dav("work-carddav", id);
+        let cards: Vec<Card> = (0..3).map(|_| draw.card()).collect();
+        for card in &cards {
+            remote.deliver(card.file(), BTreeSet::new());
+        }
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: a first round"), Some(run), &model);
+
+        let (seq, object) = model.bound_card(id, "r1.vcf");
+        let ours = Card {
+            name: String::from("Our Version"),
+            ..cards[0].clone()
+        };
+        let row = model.enqueue(
+            "cardamum",
+            id,
+            Action::Update {
+                seq,
+                filed: ours.file(),
+                if_match: Some(object),
+                resolves: None,
+            },
+        );
+        model.drain(row);
+        for (handle, card) in [("r1.vcf", &cards[0]), ("r2.vcf", &cards[1])] {
+            let theirs = Card {
+                name: String::from("Their Version"),
+                ..card.clone()
+            };
+            remote.edit(handle, theirs.file());
+        }
+        remote.renumber(10);
+        let run = model.rekey(&remote, &Options::default());
+        record(format!("{id}: renumbered over edits"), Some(run), &model);
+
+        let (seq, _) = model.bound_seq(id, "r11.vcf");
+        let edited = Card {
+            name: String::from("Edited Unread"),
+            ..cards[1].clone()
+        };
+        let row = model.enqueue(
+            "cardamum",
+            id,
+            Action::Update {
+                seq,
+                filed: edited.file(),
+                if_match: None,
+                resolves: None,
+            },
+        );
+        model.drain(row);
+        record(format!("{id}: an edit over a body unread"), None, &model);
+        let run = model.upgrade(&remote, &[String::from("r11.vcf")]);
+        record(
+            format!("{id}: the upgrade reads the base"),
+            Some(run),
+            &model,
+        );
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: the edit pushed"), Some(run), &model);
+
+        Self { steps }
+    }
+
+    /// Runs cut by a crash (SYNC §5). On work/INBOX, eight messages: a first
+    /// round interrupted after its first page, resumed from its cursor;
+    /// then a staged add and two flag changes whose run is cut after the
+    /// add was taken and before its outcome was written, the next run
+    /// landing the add on its arrival and pushing the flags. On two address
+    /// books, one listing bodies and one not: a staged edit whose run is cut
+    /// after the server took it, the next run meeting the pushed body.
+    pub fn crashes(seed: u64) -> Self {
+        let mut draw = Draw::new(seed);
+        let mut model = Model::new();
+        let mut steps = vec![Step {
+            label: String::from("an empty store"),
+            run: None,
+            model: model.clone(),
+        }];
+        let mut record = |label: String, run: Option<Run>, model: &Model| {
+            steps.push(Step {
+                label,
+                run,
+                model: model.clone(),
+            });
+        };
+
+        let id = "work/INBOX";
+        model.declare(Collection {
+            id: String::from(id),
+            account: Some(String::from("work")),
+            kind: Some(Kind::Mail),
+            name: String::from("INBOX"),
+            role: Some(String::from("inbox")),
+            sources: synced_by(&["work-imap"]),
+            conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
+        });
+        let mut remote = Remote::new("work-imap", id);
+        for _ in 0..8 {
+            remote.deliver(draw.message(false).file(), BTreeSet::new());
+        }
+        remote.interrupt = Some(1);
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: a round cut after its first page"),
+            Some(run),
+            &model,
+        );
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: the round resumed"), Some(run), &model);
+
+        let message = draw.message(false);
+        let row = model.enqueue(
+            "himalaya",
+            id,
+            Action::Add {
+                link_id: message.message_id.clone().unwrap_or_default(),
+                flags: set(&["\\Seen"]),
+                filed: message.file(),
+            },
+        );
+        model.drain(row);
+        for handle in ["1", "2"] {
+            let (seq, _) = model.bound_seq(id, handle);
+            let row = model.enqueue(
+                "himalaya",
+                id,
+                Action::SetFlags {
+                    seq,
+                    flags: set(&["\\Flagged"]),
+                    base: None,
+                },
+            );
+            model.drain(row);
+        }
+        remote.crash = Some(1);
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: a run cut after its add was taken"),
+            Some(run),
+            &model,
+        );
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: the next run"), Some(run), &model);
+
+        for (id, carries) in [("work/contacts", true), ("work/directory", false)] {
+            let source = format!("{}-carddav", &id[5..]);
+            model.declare(Collection {
+                id: String::from(id),
+                account: Some(String::from("work")),
+                kind: Some(Kind::Contact),
+                name: String::from(&id[5..]),
+                role: None,
+                sources: synced_by(&[&source]),
+                conflict: String::from("manual"),
+                generation: 1,
+                parent: None,
+                presentation: Presentation::default(),
+            });
+            let mut remote = Remote::dav(&source, id);
+            let card = draw.card();
+            remote.deliver(card.file(), BTreeSet::new());
+            let run = model.sync(&mut remote, PAGE);
+            record(format!("{id}: a first round"), Some(run), &model);
+            remote.carries = carries;
+
+            let (seq, object) = model.bound_card(id, "r1.vcf");
+            let ours = Card {
+                name: String::from("Our Version"),
+                ..card
+            };
+            let row = model.enqueue(
+                "cardamum",
+                id,
+                Action::Update {
+                    seq,
+                    filed: ours.file(),
+                    if_match: Some(object),
+                    resolves: None,
+                },
+            );
+            model.drain(row);
+            remote.crash = Some(1);
+            let run = model.sync(&mut remote, PAGE);
+            record(
+                format!("{id}: a run cut after its edit was taken"),
+                Some(run),
+                &model,
+            );
+            let run = model.sync(&mut remote, PAGE);
+            record(format!("{id}: the next run"), Some(run), &model);
+            let run = model.upgrade(&remote, &[String::from("r1.vcf")]);
+            record(format!("{id}: an upgrade"), Some(run), &model);
+        }
+
+        Self { steps }
+    }
+
+    /// Rounds resumed, restarted and banded (SYNC §4, §5). On work/INBOX, a
+    /// connector listing delta heads: a round cut after its first page,
+    /// then an arrival, a flag change and a stated removal, the round
+    /// resumed after a head naming them. On work/Archive: a round cut, a
+    /// message its first page named lost unannounced, and the cursor
+    /// rejected, the round restarted under a new id finding it absent. On
+    /// work/Sent Items: a page handing no cursor, refused, the round resumed
+    /// after. On work/Lists, a checkpoint bound to no scope: a round over
+    /// October, then a widening to September listing the band alone, cut,
+    /// resumed after a head from the source's checkpoint, an undated message
+    /// lost unannounced kept.
+    pub fn heads(seed: u64) -> Self {
+        let mut draw = Draw::new(seed);
+        let mut model = Model::new();
+        let mut steps = vec![Step {
+            label: String::from("an empty store"),
+            run: None,
+            model: model.clone(),
+        }];
+        let mut record = |label: String, run: Option<Run>, model: &Model| {
+            steps.push(Step {
+                label,
+                run,
+                model: model.clone(),
+            });
+        };
+        let mut dated = |date: Option<Instant>| Mail {
+            date,
+            ..draw.message(false)
+        };
+        let day = |month: u32, day: u32| Some(Instant::at(2026, month, day, 9, 0, 0));
+        let from = |month: u32| Options {
+            scope: Scope {
+                since: Some(Instant::at(2026, month, 1, 0, 0, 0)),
+                until: None,
+            },
+            accept_absences: false,
+        };
+        let mailbox = |model: &mut Model, id: &str, source: &str| {
+            model.declare(Collection {
+                id: String::from(id),
+                account: Some(String::from("work")),
+                kind: Some(Kind::Mail),
+                name: String::from(id),
+                role: None,
+                sources: synced_by(&[source]),
+                conflict: String::from("manual"),
+                generation: 1,
+                parent: None,
+                presentation: Presentation::default(),
+            });
+            Remote::new(source, id)
+        };
+
+        let id = "work/INBOX";
+        let mut remote = mailbox(&mut model, id, "inbox-imap");
+        remote.delta_heads = true;
+        for date in 1..=9 {
+            remote.deliver(dated(day(10, date)).file(), BTreeSet::new());
+        }
+        remote.interrupt = Some(1);
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: a round cut after its first page"),
+            Some(run),
+            &model,
+        );
+        remote.deliver(dated(day(10, 20)).file(), BTreeSet::new());
+        remote.set_flags("1", set(&["\\Flagged"]));
+        remote.expunge("8");
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: the round resumed after a head"),
+            Some(run),
+            &model,
+        );
+
+        let id = "work/Archive";
+        let mut remote = mailbox(&mut model, id, "archive-imap");
+        for date in 1..=7 {
+            remote.deliver(dated(day(9, date)).file(), BTreeSet::new());
+        }
+        remote.interrupt = Some(1);
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: a round cut after its first page"),
+            Some(run),
+            &model,
+        );
+        remote.forget("7");
+        remote.reject_cursor = true;
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: the cursor rejected, the round restarted"),
+            Some(run),
+            &model,
+        );
+
+        let id = "work/Sent Items";
+        let mut remote = mailbox(&mut model, id, "sent-imap");
+        for date in 1..=7 {
+            remote.deliver(dated(day(8, date)).file(), BTreeSet::new());
+        }
+        remote.drop_cursor = Some(1);
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: a page handing no cursor"), Some(run), &model);
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: the round resumed"), Some(run), &model);
+
+        let id = "work/Lists";
+        let mut remote = mailbox(&mut model, id, "lists-imap");
+        remote.scope_bound = false;
+        remote.delta_heads = true;
+        remote.deliver(dated(None).file(), BTreeSet::new());
+        for date in [
+            day(10, 2),
+            day(10, 3),
+            day(9, 2),
+            day(9, 3),
+            day(9, 4),
+            day(9, 5),
+        ] {
+            remote.deliver(dated(date).file(), BTreeSet::new());
+        }
+        let run = model.sync_with(&mut remote, PAGE, &from(10));
+        record(format!("{id}: a round over October"), Some(run), &model);
+        remote.forget("1");
+        remote.deliver(dated(day(10, 9)).file(), BTreeSet::new());
+        remote.interrupt = Some(1);
+        let run = model.sync_with(&mut remote, PAGE, &from(9));
+        record(
+            format!("{id}: a band over September, cut"),
+            Some(run),
+            &model,
+        );
+        let run = model.sync_with(&mut remote, PAGE, &from(9));
+        record(
+            format!("{id}: the band resumed after a head"),
+            Some(run),
+            &model,
+        );
+
+        Self { steps }
+    }
+
+    /// Bodies read late, revived and overruled (SYNC §6, §7, §9). On each
+    /// address book of `FILLS`: `a` and `b` agree on a card, `a`'s pull of
+    /// its server's edit carries no body, `b`'s upgrade reads its server's
+    /// edit over the emptied item, recorded in conflict, and `a`'s upgrade
+    /// fills the item, settled by the policy. On work/revived: a card its
+    /// server deleted, restored unread. On work/revived-mail: two messages
+    /// deleted, one restored as it was and one under its `Message-ID` at
+    /// another size. On work/overruled and work/overruled-unread: `b`
+    /// records its server's edit in conflict over `a`'s, carried or not,
+    /// and an engine overrules it with the item's body.
+    pub fn bodies(seed: u64) -> Self {
+        let mut draw = Draw::new(seed);
+        let mut model = Model::new();
+        let mut steps = vec![Step {
+            label: String::from("an empty store"),
+            run: None,
+            model: model.clone(),
+        }];
+        let mut record = |label: String, run: Option<Run>, model: &Model| {
+            steps.push(Step {
+                label,
+                run,
+                model: model.clone(),
+            });
+        };
+        let declare =
+            |model: &mut Model, id: &str, kind: Kind, sources: &[String], conflict: &str| {
+                model.declare(Collection {
+                    id: String::from(id),
+                    account: Some(String::from("work")),
+                    kind: Some(kind),
+                    name: String::from(id),
+                    role: None,
+                    sources: synced_by(sources),
+                    conflict: String::from(conflict),
+                    generation: 1,
+                    parent: None,
+                    presentation: Presentation::default(),
+                });
+            };
+        let renamed = |card: &Card, name: &str| Card {
+            name: String::from(name),
+            ..card.clone()
+        };
+
+        for (id, conflict) in FILLS {
+            let (a, b) = (format!("{id}-a"), format!("{id}-b"));
+            declare(
+                &mut model,
+                id,
+                Kind::Contact,
+                &[a.clone(), b.clone()],
+                conflict,
+            );
+            let mut ra = Remote::dav(&a, id);
+            let mut rb = Remote::dav(&b, id);
+            let card = draw.card();
+            ra.deliver(card.file(), BTreeSet::new());
+            rb.deliver(card.file(), BTreeSet::new());
+            let run = model.sync(&mut ra, PAGE);
+            record(format!("{id}: a's first round"), Some(run), &model);
+            let run = model.sync(&mut rb, PAGE);
+            record(format!("{id}: b joins"), Some(run), &model);
+            ra.carries = false;
+            ra.edit("r1.vcf", renamed(&card, "Edited At A").file());
+            let run = model.sync(&mut ra, PAGE);
+            record(format!("{id}: a pulls its edit unread"), Some(run), &model);
+            rb.edit("r1.vcf", renamed(&card, "Edited At B").file());
+            let run = model.upgrade(&rb, &[String::from("r1.vcf")]);
+            record(
+                format!("{id}: b's upgrade reads its edit"),
+                Some(run),
+                &model,
+            );
+            let run = model.upgrade(&ra, &[String::from("r1.vcf")]);
+            record(
+                format!("{id}: a's upgrade fills the item"),
+                Some(run),
+                &model,
+            );
+        }
+
+        let id = "work/revived";
+        declare(
+            &mut model,
+            id,
+            Kind::Contact,
+            &[String::from("revived-dav")],
+            "manual",
+        );
+        let mut remote = Remote::dav("revived-dav", id);
+        let cards: Vec<Card> = (0..2).map(|_| draw.card()).collect();
+        for card in &cards {
+            remote.deliver(card.file(), BTreeSet::new());
+        }
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: a first round"), Some(run), &model);
+        remote.expunge("r1.vcf");
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: its server deletes a card"),
+            Some(run),
+            &model,
+        );
+        remote.carries = false;
+        remote.deliver(renamed(&cards[0], "Restored").file(), BTreeSet::new());
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: the card restored unread"), Some(run), &model);
+
+        let id = "work/revived-mail";
+        declare(
+            &mut model,
+            id,
+            Kind::Mail,
+            &[String::from("revived-imap")],
+            "manual",
+        );
+        let mut remote = Remote::new("revived-imap", id);
+        remote.carries = true;
+        let messages: Vec<Mail> = (0..2).map(|_| draw.message(false)).collect();
+        for message in &messages {
+            remote.deliver(message.file(), BTreeSet::new());
+        }
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: a first round"), Some(run), &model);
+        remote.expunge("1");
+        remote.expunge("2");
+        let run = model.sync(&mut remote, PAGE);
+        record(format!("{id}: its server deletes both"), Some(run), &model);
+        remote.carries = false;
+        remote.deliver(messages[0].file(), BTreeSet::new());
+        let longer = Mail {
+            text: format!("{} and more", messages[1].text),
+            ..messages[1].clone()
+        };
+        remote.deliver(longer.file(), BTreeSet::new());
+        let run = model.sync(&mut remote, PAGE);
+        record(
+            format!("{id}: one restored, one resent longer"),
+            Some(run),
+            &model,
+        );
+
+        for (id, carries) in [("work/overruled", true), ("work/overruled-unread", false)] {
+            let (a, b) = (format!("{id}-a"), format!("{id}-b"));
+            declare(
+                &mut model,
+                id,
+                Kind::Contact,
+                &[a.clone(), b.clone()],
+                "manual",
+            );
+            let mut ra = Remote::dav(&a, id);
+            let mut rb = Remote::dav(&b, id);
+            let card = draw.card();
+            ra.deliver(card.file(), BTreeSet::new());
+            rb.deliver(card.file(), BTreeSet::new());
+            let run = model.sync(&mut ra, PAGE);
+            record(format!("{id}: a's first round"), Some(run), &model);
+            let run = model.sync(&mut rb, PAGE);
+            record(format!("{id}: b joins"), Some(run), &model);
+            let ours = renamed(&card, "Edited At A");
+            ra.edit("r1.vcf", ours.file());
+            let run = model.sync(&mut ra, PAGE);
+            record(format!("{id}: a pulls its edit"), Some(run), &model);
+            rb.carries = carries;
+            rb.edit("r1.vcf", renamed(&card, "Edited At B").file());
+            let run = model.sync(&mut rb, PAGE);
+            record(
+                format!("{id}: b records its edit in conflict"),
+                Some(run),
+                &model,
+            );
+            let (seq, _) = model.bound_card(id, "r1.vcf");
+            let run = model.overrule(id, &b, seq, ours.file());
+            record(format!("{id}: an engine overrules it"), Some(run), &model);
+            let run = model.sync(&mut rb, PAGE);
+            record(format!("{id}: b's next run"), Some(run), &model);
+        }
+
+        Self { steps }
+    }
 }
 
 impl Model {
@@ -1125,14 +1836,17 @@ pub fn drained(model: &Model) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, env, fs, process};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        env, fs, process,
+    };
 
     use rusqlite::types::Value;
 
     use crate::{
         body::Card,
         engine::{Answer, Event, Push, Run},
-        history::{History, PAGE, SHARED, drained, set},
+        history::{FILLS, History, PAGE, SHARED, UNREAD, drained, set},
         model::{Item, Model, Scope, State},
         name::ObjectName,
         oracle,
@@ -1161,6 +1875,10 @@ mod tests {
             History::policies(29),
             History::sources(31),
             History::scopes(37),
+            History::rekeys(41),
+            History::crashes(43),
+            History::heads(47),
+            History::bodies(53),
         ];
         for (index, step) in histories
             .iter()
@@ -1850,7 +2568,7 @@ mod tests {
     }
 
     fn shared(history: &History, book: usize, step: usize) -> (&Model, &Run) {
-        let step = &history.steps[1 + 8 * book + step];
+        let step = &history.steps[1 + 9 * book + step];
         (&step.model, step.run.as_ref().unwrap())
     }
 
@@ -1974,8 +2692,13 @@ mod tests {
         assert_ne!(loser.object, item.object);
         let binding = item.bound("work/existing-b").unwrap();
         assert_eq!(binding.shared_object, item.object);
-        let Some(Push::Update { object, .. }) = pushed(run, "update", "r2.vcf") else {
-            panic!("b pushes the body the item kept");
+        assert!(
+            pushed(run, "update", "r2.vcf").is_none(),
+            "a change is derived before the fold"
+        );
+        let (_, next) = shared(&history, 2, 4);
+        let Some(Push::Update { object, .. }) = pushed(next, "update", "r2.vcf") else {
+            panic!("b's next run pushes the body the item kept");
         };
         assert_eq!(Some(object), item.object.as_ref());
     }
@@ -2003,9 +2726,9 @@ mod tests {
             );
         }
 
-        let (model, _) = shared(&history, 1, 5);
+        let (model, _) = shared(&history, 1, 6);
         let adopted = held_by(model, 1, "a", "r1.vcf").object.clone();
-        let (_, run) = shared(&history, 1, 6);
+        let (_, run) = shared(&history, 1, 7);
         let Some(Push::Update { object, .. }) = pushed(run, "update", "r1.vcf") else {
             panic!("a owes the edit b folded");
         };
@@ -2029,7 +2752,7 @@ mod tests {
         );
         assert_eq!(run.events, [Event::Conflicted(String::from("r1.vcf"))]);
         assert!(run.pushes.is_empty());
-        let (_, next) = shared(&history, 0, 6);
+        let (_, next) = shared(&history, 0, 7);
         assert!(pushed(next, "update", "r1.vcf").is_none());
 
         let (before, _) = shared(&history, 1, 3);
@@ -2051,10 +2774,24 @@ mod tests {
         assert_eq!(item.object, held_by(before, 2, "a", "r1.vcf").object);
         let loser = kept(model, item, "r1.vcf");
         assert_ne!(loser.object, item.object);
-        let Some(Push::Update { object, .. }) = pushed(run, "update", "r1.vcf") else {
-            panic!("b pushes the body the item kept");
+        assert!(
+            pushed(run, "update", "r1.vcf").is_none(),
+            "a change is derived before the fold"
+        );
+        let binding = item.bound("work/existing-b").unwrap();
+        assert_eq!(binding.shared_object, item.object);
+        assert_ne!(binding.base_object, item.object);
+
+        let (after, next) = shared(&history, 2, 5);
+        let Some(Push::Update {
+            object, if_match, ..
+        }) = pushed(next, "update", "r1.vcf")
+        else {
+            panic!("b's next run pushes the body the item kept");
         };
         assert_eq!(Some(object), item.object.as_ref());
+        assert_eq!(if_match, &binding.base_revision);
+        let item = held_by(after, 2, "a", "r1.vcf");
         assert_eq!(base(item, 2, "b"), item.object);
     }
 
@@ -2062,7 +2799,7 @@ mod tests {
     fn a_delete_one_source_finds_is_pushed_by_the_other() {
         let history = History::sources(31);
         for (book, (id, _, _)) in SHARED.iter().enumerate() {
-            let (model, run) = shared(&history, book, 6);
+            let (model, run) = shared(&history, book, 7);
             assert!(
                 run.events
                     .contains(&Event::Vanished(String::from("r3.vcf")))
@@ -2071,7 +2808,7 @@ mod tests {
             assert_eq!(item.state, State::Tombstone);
             assert_eq!(item.bindings.len(), 1);
 
-            let (after, run) = shared(&history, book, 7);
+            let (after, run) = shared(&history, book, 8);
             assert!(pushed(run, "remove", "r4.vcf").is_some());
             let item = after
                 .items
@@ -2136,6 +2873,12 @@ mod tests {
     fn a_pull_agreeing_with_the_item_settles_without_a_conflict() {
         let history = History::sources(31);
         let (model, run) = shared(&history, 3, 4);
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, Event::ContentChanged(_))),
+            "a body the item already holds is none it took"
+        );
         let item = held_by(model, 3, "b", "r1.vcf");
         assert!(!item.conflicted);
         assert_eq!(item.object, base(item, 3, "a"));
@@ -2158,7 +2901,7 @@ mod tests {
     fn a_server_edit_over_an_item_conflict_is_recorded_on_its_binding() {
         let history = History::sources(31);
         let (before, _) = shared(&history, 0, 4);
-        let (model, run) = shared(&history, 0, 5);
+        let (model, run) = shared(&history, 0, 6);
         let was = held_by(before, 0, "b", "r1.vcf");
         let item = held_by(model, 0, "b", "r1.vcf");
         assert!(item.conflicted);
@@ -2171,7 +2914,7 @@ mod tests {
         assert!(run.pushes.is_empty());
 
         for book in 1..SHARED.len() {
-            let (model, run) = shared(&history, book, 5);
+            let (model, run) = shared(&history, book, 6);
             let item = held_by(model, book, "b", "r1.vcf");
             assert!(!item.conflicted);
             assert_eq!(item.object, base(item, book, "b"));
@@ -2180,7 +2923,7 @@ mod tests {
     }
 
     fn inbox(history: &History, step: usize) -> (&Model, &Run) {
-        let step = &history.steps[1 + 8 * SHARED.len() + step];
+        let step = &history.steps[1 + 9 * SHARED.len() + step];
         (&step.model, step.run.as_ref().unwrap())
     }
 
@@ -2239,7 +2982,7 @@ mod tests {
     #[test]
     fn a_resolution_runs_through_the_binding_whose_conflict_it_names() {
         let history = History::sources(31);
-        let (before, _) = shared(&history, 0, 5);
+        let (before, _) = shared(&history, 0, 6);
         let item = held_by(before, 0, "b", "r1.vcf");
         let binding = item.bound("work/shared-b").unwrap().clone();
         let filed = Card {
@@ -2440,5 +3183,731 @@ mod tests {
             assert!(state.open.is_none());
             assert_eq!(state.coverage, Some(Scope::default()));
         }
+    }
+
+    #[test]
+    fn a_round_left_undecided_reports_what_it_left_unlisted() {
+        let history = History::scopes(37);
+        let (_, run) = scoped(&history, 9);
+        assert_eq!(run.unlisted, Some(2), "narrowed, handing no enumeration");
+        let (_, run) = scoped(&history, 11);
+        assert_eq!(run.unlisted, None, "narrowed, enumerating");
+        let (_, run) = scoped(&history, 14);
+        assert_eq!(run.unlisted, Some(2), "capped");
+        for step in [1, 5, 6, 17] {
+            let (_, run) = scoped(&history, step);
+            assert_eq!(run.unlisted, None, "step {step}");
+        }
+    }
+
+    #[test]
+    fn a_member_joining_an_item_is_reported_added_alone() {
+        let history = History::sources(31);
+        let naming = |run: &Run, handle: &str| -> Vec<Event> {
+            run.events
+                .iter()
+                .filter(|event| match event {
+                    Event::Added(named)
+                    | Event::Created(named)
+                    | Event::FlagsChanged(named)
+                    | Event::ContentChanged(named) => named == handle,
+                    _ => false,
+                })
+                .cloned()
+                .collect()
+        };
+        let (_, run) = shared(&history, 0, 1);
+        assert_eq!(
+            naming(run, "r1.vcf"),
+            [Event::Added(String::from("r1.vcf"))]
+        );
+        let (_, run) = inbox(&history, 1);
+        assert_eq!(naming(run, "1"), [Event::Added(String::from("1"))]);
+    }
+
+    fn unread(history: &History, book: usize, step: usize) -> (&Model, &Run) {
+        let step = &history.steps[1 + 9 * SHARED.len() + 5 + 3 * book + step];
+        (&step.model, step.run.as_ref().unwrap())
+    }
+
+    #[test]
+    fn a_member_joining_unread_is_recorded_until_its_upgrade_reads_it() {
+        let history = History::sources(31);
+        for (book, (id, _)) in UNREAD.iter().enumerate() {
+            let b = format!("{id}-b");
+            let card = |model: &Model, handle: &str| -> Item {
+                let found = model.items.iter().find(|item| {
+                    item.collection == *id
+                        && item
+                            .bound(&b)
+                            .is_some_and(|binding| binding.handle == handle)
+                });
+                found.cloned().unwrap()
+            };
+
+            let (model, run) = unread(&history, book, 1);
+            for handle in ["r1.vcf", "r2.vcf"] {
+                let item = card(model, handle);
+                assert!(item.conflicted && item.conflict_object.is_none(), "{id}");
+                let binding = item.bound(&b).unwrap();
+                assert!(binding.base_object.is_none() && binding.base_revision.is_some());
+                assert_eq!(binding.shared_object, None);
+                let named: Vec<&Event> = run
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, Event::Added(h) | Event::Conflicted(h) if h == handle)
+                    })
+                    .collect();
+                assert_eq!(
+                    named,
+                    [
+                        &Event::Added(String::from(handle)),
+                        &Event::Conflicted(String::from(handle))
+                    ]
+                );
+            }
+
+            let (before, _) = unread(&history, book, 1);
+            let (model, run) = unread(&history, book, 2);
+            assert_eq!(run.handles, ["r1.vcf", "r2.vcf"]);
+            let same = card(model, "r1.vcf");
+            assert!(!same.conflicted, "a body read equal to the item's");
+            let binding = same.bound(&b).unwrap();
+            assert_eq!(binding.base_object, same.object);
+            assert_eq!(binding.shared_object, same.object);
+
+            let was = card(before, "r2.vcf");
+            let other = card(model, "r2.vcf");
+            let read = other.bound(&b).unwrap().base_object.clone();
+            assert!(read.is_some() && read != was.object);
+            match book {
+                0 => {
+                    assert!(other.conflicted);
+                    assert_eq!(other.conflict_object, read);
+                    assert_eq!(other.object, was.object);
+                    assert!(run.events.is_empty());
+                }
+                _ => {
+                    assert!(!other.conflicted);
+                    assert_eq!(other.object, read);
+                    let loser = kept(model, &other, "r2.vcf");
+                    assert_eq!(loser.object, was.object);
+                    assert_eq!(
+                        run.events,
+                        [Event::Overruled {
+                            handle: String::from("r2.vcf"),
+                            link_id: loser.link_id.clone(),
+                        }]
+                    );
+                }
+            }
+        }
+    }
+
+    fn rekeyed(history: &History, step: usize) -> (&Model, &Run) {
+        let step = &history.steps[step];
+        (&step.model, step.run.as_ref().unwrap())
+    }
+
+    /// The `seq`, the key and the flags of each live item of `collection`,
+    /// by its handle.
+    fn spine(
+        model: &Model,
+        collection: &str,
+    ) -> BTreeMap<String, (i64, String, Option<BTreeSet<String>>)> {
+        model
+            .live(collection)
+            .filter_map(|item| {
+                let binding = item.bindings.first()?;
+                Some((
+                    binding.handle.clone(),
+                    (item.seq, item.link_id.clone(), item.flags.clone()),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rekey_carries_every_placement_onto_its_new_handle_by_link_id() {
+        let history = History::rekeys(41);
+        let inbox = "work/INBOX";
+
+        let (before, _) = rekeyed(&history, 2);
+        let (model, run) = rekeyed(&history, 3);
+        assert!(run.events.is_empty() && run.pushes.is_empty() && run.parked.is_none());
+        let old: BTreeSet<_> = spine(before, inbox).into_values().collect();
+        let new: BTreeSet<_> = spine(model, inbox).into_values().collect();
+        assert_eq!(old, new, "every seq, key and flag set carried");
+        assert!(
+            spine(model, inbox)
+                .keys()
+                .all(|handle| handle.parse::<u64>().unwrap() >= 200)
+        );
+        assert!(
+            new.iter()
+                .any(|(_, link_id, _)| link_id.starts_with("dup:"))
+        );
+        let collection = &model.collections[inbox];
+        assert_eq!(
+            collection.generation,
+            before.collections[inbox].generation + 1
+        );
+        let checkpoint = collection.sources["work-imap"].checkpoint.clone();
+        assert_eq!(
+            checkpoint,
+            run.pages[0].checkpoint.clone().map(String::into_bytes)
+        );
+
+        let (_, run) = rekeyed(&history, 4);
+        assert!(
+            run.events.is_empty() && run.pushes.is_empty(),
+            "the new space's delta"
+        );
+    }
+
+    #[test]
+    fn a_rekey_drops_a_binding_no_member_resolves_to_though_its_handle_is_reused() {
+        let history = History::rekeys(41);
+        let inbox = "work/INBOX";
+        let (before, _) = rekeyed(&history, 1);
+        let (model, _) = rekeyed(&history, 2);
+        let gone = handled(before, inbox, "1").unwrap();
+        let retained = model
+            .items
+            .iter()
+            .find(|item| item.collection == inbox && item.link_id == gone.link_id)
+            .unwrap();
+        assert_eq!(
+            retained.state,
+            State::Retained {
+                by: Some(String::from("work-imap"))
+            }
+        );
+        let second = handled(before, inbox, "2").unwrap();
+        let moved = handled(model, inbox, "1").unwrap();
+        assert_eq!((moved.seq, &moved.link_id), (second.seq, &second.link_id));
+    }
+
+    #[test]
+    fn a_rekey_missing_most_or_capped_parks_until_accepted() {
+        let history = History::rekeys(41);
+        let inbox = "work/INBOX";
+        let (before, _) = rekeyed(&history, 4);
+        let (model, run) = rekeyed(&history, 5);
+        assert_eq!(run.parked, Some((15, 24)));
+        assert_eq!(spine(model, inbox), spine(before, inbox), "nothing written");
+        assert_eq!(
+            model.collections[inbox].generation,
+            before.collections[inbox].generation
+        );
+
+        let (model, run) = rekeyed(&history, 6);
+        assert_eq!(run.parked, None);
+        assert_eq!(model.live(inbox).count(), 9);
+
+        let (after, run) = rekeyed(&history, 7);
+        assert_eq!(
+            run.parked,
+            Some((4, 9)),
+            "a capped rekey parks on any absence"
+        );
+        assert_eq!(spine(after, inbox), spine(model, inbox));
+    }
+
+    #[test]
+    fn a_rekey_pulls_a_server_edit_and_records_one_over_a_local_edit() {
+        let history = History::rekeys(41);
+        let id = "work/contacts";
+        let (before, _) = rekeyed(&history, 8);
+        let (model, run) = rekeyed(&history, 9);
+        let revision = |handle: &str| -> Option<String> {
+            run.pages
+                .iter()
+                .flat_map(|page| page.items.iter())
+                .find(|member| member.handle == handle)
+                .and_then(|member| member.revision.clone())
+        };
+        let was = |handle: &str| card_in(before, id, handle);
+
+        let both = card_in(model, id, "r10.vcf");
+        let binding = both.bindings[0].clone();
+        assert!(binding.conflicted);
+        assert_eq!(binding.conflict_revision, revision("r10.vcf"));
+        assert_eq!(
+            binding.base_revision,
+            was("r1.vcf").bindings[0].base_revision
+        );
+        assert!(
+            both.object.is_some() && both.object != binding.base_object,
+            "the local edit stands"
+        );
+        assert_eq!(binding.base_object, was("r1.vcf").bindings[0].base_object);
+
+        let pulled = card_in(model, id, "r11.vcf");
+        assert_eq!((pulled.object.clone(), pulled.level), (None, 1));
+        let binding = &pulled.bindings[0];
+        assert_eq!(binding.base_object, None);
+        assert_eq!(binding.base_revision, revision("r11.vcf"));
+
+        let carried = card_in(model, id, "r12.vcf");
+        assert_eq!(
+            carried.bindings[0].base_revision,
+            was("r3.vcf").bindings[0].base_revision
+        );
+        assert_eq!(carried.object, was("r3.vcf").object);
+    }
+
+    #[test]
+    fn an_upgrade_no_item_conflict_waits_on_only_moves_the_base() {
+        let history = History::rekeys(41);
+        let id = "work/contacts";
+        let staged = &history.steps[10].model;
+        let (model, run) = rekeyed(&history, 11);
+        let before = card_in(staged, id, "r11.vcf");
+        let after = card_in(model, id, "r11.vcf");
+        assert!(run.events.is_empty());
+        assert!(!after.conflicted && after.conflict_object.is_none());
+        let binding = &after.bindings[0];
+        assert!(!binding.conflicted);
+        assert_eq!(
+            after.object, before.object,
+            "the local edit stays the item's body"
+        );
+        let read = run.fetch.get("r11.vcf").map(|bytes| ObjectName::of(bytes));
+        assert_eq!(binding.base_object, read);
+        assert_eq!(binding.base_revision, before.bindings[0].base_revision);
+        assert_eq!(binding.shared_object, before.bindings[0].shared_object);
+
+        let (_, run) = rekeyed(&history, 12);
+        let Some(Push::Update {
+            object, if_match, ..
+        }) = pushed(run, "update", "r11.vcf")
+        else {
+            panic!("the edit, now over a body read, is pushed");
+        };
+        assert_eq!(Some(object), after.object.as_ref());
+        assert_eq!(if_match, &binding.base_revision);
+    }
+
+    #[test]
+    fn an_interrupted_round_keeps_what_landed_and_resumes_from_its_cursor() {
+        let history = History::crashes(43);
+        let inbox = "work/INBOX";
+        let (model, run) = rekeyed(&history, 1);
+        assert!(run.failed && run.pushes.is_empty());
+        let state = &model.collections[inbox].sources["work-imap"];
+        let open = state.open.as_ref().unwrap();
+        assert_eq!(open.cursor.as_deref(), run.pages[0].cursor.as_deref());
+        assert_eq!(
+            open.checkpoint,
+            run.pages[0].checkpoint.clone().map(String::into_bytes)
+        );
+        assert_eq!(
+            (state.checkpoint.clone(), state.coverage.clone()),
+            (None, None)
+        );
+        let landed: Vec<_> = model.live(inbox).collect();
+        assert_eq!(landed.len(), run.pages[0].items.len());
+        assert!(
+            landed
+                .iter()
+                .all(|item| item.bindings[0].round == Some(state.rounds))
+        );
+
+        let (after, run) = rekeyed(&history, 2);
+        assert!(!run.failed);
+        assert!(
+            run.pages[0].checkpoint.is_none(),
+            "resumed past the first page"
+        );
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, Event::Vanished(_)))
+        );
+        let state_after = &after.collections[inbox].sources["work-imap"];
+        assert_eq!(state_after.rounds, state.rounds, "the same round");
+        assert!(state_after.open.is_none());
+        assert_eq!(state_after.checkpoint, open.checkpoint);
+        assert_eq!(state_after.coverage, Some(Scope::default()));
+        assert_eq!(after.live(inbox).count(), 8);
+        assert!(
+            after
+                .live(inbox)
+                .all(|item| item.bindings[0].round == Some(state.rounds))
+        );
+    }
+
+    #[test]
+    fn a_push_whose_record_was_lost_is_landed_or_met_not_pushed_again() {
+        let history = History::crashes(43);
+        let inbox = "work/INBOX";
+        let (model, run) = rekeyed(&history, 3);
+        assert!(run.failed);
+        assert!(matches!(run.pushes[..], [(Push::Add { .. }, _)]));
+        assert_eq!(run.outcomes[0].answer, Answer::Accepted);
+        let create = model
+            .live(inbox)
+            .find(|item| item.bindings[0].handle.starts_with('\u{1}'))
+            .unwrap();
+        assert!(
+            !create.bindings[0].base_present,
+            "the outcome was never written"
+        );
+
+        let (after, run) = rekeyed(&history, 4);
+        assert!(
+            run.events
+                .iter()
+                .any(|event| matches!(event, Event::Created(_)))
+        );
+        assert!(
+            run.pushes
+                .iter()
+                .all(|(push, _)| push.name() == "set-flags")
+        );
+        assert_eq!(run.pushes.len(), 2);
+        let landed = after
+            .live(inbox)
+            .find(|item| item.link_id == create.link_id)
+            .unwrap();
+        assert!(landed.bindings[0].base_present);
+
+        for (base, id) in [(5, "work/contacts"), (9, "work/directory")] {
+            let (model, run) = rekeyed(&history, base + 1);
+            assert!(run.failed && run.outcomes[0].answer == Answer::Accepted);
+            let staged = card_in(model, id, "r1.vcf");
+            let (after, run) = rekeyed(&history, base + 2);
+            assert!(run.pushes.is_empty(), "{id}: the edit is not pushed again");
+            let (settled, _) = rekeyed(&history, base + 3);
+            let card = card_in(settled, id, "r1.vcf");
+            let binding = &card.bindings[0];
+            assert!(!binding.conflicted, "{id}");
+            assert_eq!(card.object, staged.object, "{id}: the edit stands");
+            assert_eq!(binding.base_object, card.object);
+            assert_ne!(binding.base_revision, staged.bindings[0].base_revision);
+            let met = card_in(after, id, "r1.vcf");
+            match id {
+                "work/contacts" => assert!(!met.bindings[0].conflicted, "a body listed"),
+                _ => assert!(
+                    met.bindings[0].conflicted,
+                    "a body unread until the upgrade"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_resumed_round_lists_its_head_first_and_closes_on_its_checkpoint() {
+        let history = History::heads(47);
+        let inbox = "work/INBOX";
+        let (before, _) = rekeyed(&history, 1);
+        let (model, run) = rekeyed(&history, 2);
+        let head = run.head.as_ref().expect("a delta head");
+        let round = before.collections[inbox].sources["inbox-imap"].rounds;
+        assert_eq!(head.vanished, ["8"]);
+        assert!(run.events.contains(&Event::Vanished(String::from("8"))));
+        for member in &head.items {
+            let item = handled(model, inbox, &member.handle).unwrap();
+            assert_eq!(item.bindings[0].round, Some(round), "a head stamps");
+        }
+        assert_eq!(
+            handled(model, inbox, "1").unwrap().flags,
+            Some(set(&["\\Flagged"]))
+        );
+        let state = &model.collections[inbox].sources["inbox-imap"];
+        assert_eq!(state.rounds, round);
+        assert_eq!(
+            state.checkpoint,
+            head.checkpoint.clone().map(String::into_bytes)
+        );
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| matches!(event, Event::Vanished(_)))
+                .count(),
+            1,
+            "nothing a head or a page named is found absent"
+        );
+    }
+
+    #[test]
+    fn a_rejected_cursor_restarts_the_round_under_a_new_id() {
+        let history = History::heads(47);
+        let archive = "work/Archive";
+        let (before, _) = rekeyed(&history, 3);
+        let (model, run) = rekeyed(&history, 4);
+        let old = before.collections[archive].sources["archive-imap"].rounds;
+        let state = &model.collections[archive].sources["archive-imap"];
+        assert_eq!(state.rounds, old + 1);
+        assert!(run.pages[0].checkpoint.is_some(), "from the first page");
+        assert!(run.head.is_none());
+        assert!(
+            run.events.contains(&Event::Vanished(String::from("7"))),
+            "the abandoned listing's stamps protect nothing"
+        );
+        assert!(
+            model
+                .live(archive)
+                .all(|item| item.bindings[0].round == Some(old + 1))
+        );
+    }
+
+    #[test]
+    fn a_page_handing_no_cursor_fails_the_run_before_its_write() {
+        let history = History::heads(47);
+        let sent = "work/Sent Items";
+        let (model, run) = rekeyed(&history, 5);
+        assert!(run.failed);
+        assert_eq!(run.pages.len(), 1);
+        let open = model.collections[sent].sources["sent-imap"]
+            .open
+            .clone()
+            .unwrap();
+        assert_eq!(open.cursor, run.pages[0].cursor);
+        assert_eq!(model.live(sent).count(), run.pages[0].items.len());
+
+        let (model, run) = rekeyed(&history, 6);
+        assert!(!run.failed);
+        assert_eq!(model.live(sent).count(), 7);
+        assert!(model.collections[sent].sources["sent-imap"].open.is_none());
+    }
+
+    #[test]
+    fn a_widening_lists_the_band_alone_and_keeps_an_undated_member() {
+        let history = History::heads(47);
+        let lists = "work/Lists";
+        let (covered, _) = rekeyed(&history, 7);
+        let (model, run) = rekeyed(&history, 8);
+        assert_eq!(run.options.scope, since(9));
+        let open = model.collections[lists].sources["lists-imap"]
+            .open
+            .clone()
+            .unwrap();
+        assert!(open.band);
+        assert_eq!(
+            open.scope,
+            Scope {
+                since: since(9).since,
+                until: since(10).since,
+            }
+        );
+        assert!(run.pages.iter().all(|page| page.checkpoint.is_none()));
+        for member in run.pages.iter().flat_map(|page| page.items.iter()) {
+            let item = handled(model, lists, &member.handle).unwrap();
+            assert!(open.scope.holds(item.date().as_deref()) && item.date().is_some());
+        }
+
+        let (model, run) = rekeyed(&history, 9);
+        let head = run
+            .head
+            .as_ref()
+            .expect("a head from the source's checkpoint");
+        let state = &model.collections[lists].sources["lists-imap"];
+        assert_eq!(state.coverage, Some(since(9)));
+        assert_eq!(
+            state.checkpoint,
+            head.checkpoint.clone().map(String::into_bytes)
+        );
+        let undated = covered
+            .live(lists)
+            .find(|item| item.date().is_none())
+            .unwrap();
+        assert!(
+            model
+                .live(lists)
+                .any(|item| item.link_id == undated.link_id),
+            "a band round finds no undated member absent"
+        );
+    }
+
+    fn bodied<'a>(model: &'a Model, collection: &str) -> &'a Item {
+        model
+            .items
+            .iter()
+            .find(|item| item.collection == collection && !item.link_id.starts_with("dup:"))
+            .unwrap()
+    }
+
+    fn kept_in<'a>(model: &'a Model, collection: &str) -> Option<&'a Item> {
+        model
+            .items
+            .iter()
+            .find(|item| item.collection == collection && item.link_id.starts_with("dup:"))
+    }
+
+    #[test]
+    fn an_upgrade_reading_a_change_over_an_emptied_item_records_it() {
+        let history = History::bodies(53);
+        for (book, (id, _)) in FILLS.iter().enumerate() {
+            let (model, run) = rekeyed(&history, 5 * book + 4);
+            let item = bodied(model, id);
+            let b = item.bound(&format!("{id}-b")).unwrap();
+            assert_eq!(item.object, None, "{id}: the item's own body is unread");
+            assert!(item.conflicted && item.conflict_object.is_some());
+            assert_eq!(item.conflict_object, b.base_object);
+            assert_eq!(run.events, [Event::Conflicted(String::from("r1.vcf"))]);
+            assert!(
+                kept_in(model, id).is_none(),
+                "nothing kept against a body unread"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fill_adopts_its_body_and_the_policy_settles_the_conflict_waiting() {
+        let history = History::bodies(53);
+        for (book, (id, conflict)) in FILLS.iter().enumerate() {
+            let (before, _) = rekeyed(&history, 5 * book + 4);
+            let (model, run) = rekeyed(&history, 5 * book + 5);
+            let diverging = bodied(before, id).conflict_object.clone();
+            let item = bodied(model, id);
+            let a = item.bound(&format!("{id}-a")).unwrap();
+            let filled = a.base_object.clone();
+            assert!(filled.is_some() && filled != diverging, "{id}");
+            match *conflict {
+                "manual" => {
+                    assert_eq!(item.object, filled);
+                    assert!(item.conflicted && item.conflict_object == diverging);
+                    assert_eq!(
+                        a.shared_object,
+                        bodied(before, id)
+                            .bound(&format!("{id}-a"))
+                            .unwrap()
+                            .shared_object
+                    );
+                    assert!(run.events.is_empty());
+                }
+                _ => {
+                    let (adopted, lost) = match *conflict {
+                        "prefer-incoming" => (diverging.clone(), filled.clone()),
+                        _ => (filled.clone(), diverging.clone()),
+                    };
+                    assert!(!item.conflicted && item.conflict_object.is_none());
+                    assert_eq!(item.object, adopted, "{id}");
+                    assert_eq!(a.shared_object, adopted);
+                    let loser = kept_in(model, id).unwrap();
+                    assert_eq!(loser.object, lost);
+                    assert_eq!(
+                        run.events,
+                        [Event::Overruled {
+                            handle: String::from("r1.vcf"),
+                            link_id: loser.link_id.clone(),
+                        }]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_retained_row_revives_under_the_member_naming_it() {
+        let history = History::bodies(53);
+        let (before, _) = rekeyed(&history, 17);
+        let (model, run) = rekeyed(&history, 18);
+        let id = "work/revived";
+        let was = before
+            .items
+            .iter()
+            .find(|item| item.collection == id && matches!(item.state, State::Retained { .. }))
+            .unwrap();
+        let revived = model
+            .items
+            .iter()
+            .find(|item| item.link_id == was.link_id)
+            .unwrap();
+        assert_eq!((revived.state.clone(), revived.seq), (State::Live, was.seq));
+        assert_eq!(
+            (revived.object.clone(), revived.level),
+            (None, 1),
+            "unread, at Meta"
+        );
+        let loser = kept_in(model, id).unwrap();
+        assert_eq!(loser.object, was.object, "the body it held is kept apart");
+        assert_eq!(
+            run.events,
+            [
+                Event::Added(String::from("r3.vcf")),
+                Event::Overruled {
+                    handle: String::from("r3.vcf"),
+                    link_id: loser.link_id.clone(),
+                }
+            ]
+        );
+
+        let (before, _) = rekeyed(&history, 20);
+        let (model, run) = rekeyed(&history, 21);
+        let id = "work/revived-mail";
+        assert_eq!(run.events.len(), 2);
+        let retained: Vec<&Item> = before
+            .items
+            .iter()
+            .filter(|item| item.collection == id)
+            .collect();
+        let same = model
+            .items
+            .iter()
+            .find(|item| item.link_id == retained[0].link_id)
+            .unwrap();
+        assert_eq!(same.state, State::Live);
+        assert_eq!(same.object, retained[0].object, "a message keeps its body");
+        assert_eq!(same.bindings[0].base_object, same.object);
+        let other = model
+            .items
+            .iter()
+            .find(|item| item.link_id == retained[1].link_id)
+            .unwrap();
+        assert!(
+            matches!(other.state, State::Retained { .. }),
+            "another size mints"
+        );
+        assert!(model.live(id).any(|item| item.link_id.starts_with("dup:")));
+    }
+
+    #[test]
+    fn an_overruling_edit_keeps_the_diverging_body_or_is_refused_unread() {
+        let history = History::bodies(53);
+        let id = "work/overruled";
+        let (before, _) = rekeyed(&history, 25);
+        let (model, run) = rekeyed(&history, 26);
+        let was = bodied(before, id)
+            .bound("work/overruled-b")
+            .unwrap()
+            .clone();
+        let item = bodied(model, id);
+        let b = item.bound("work/overruled-b").unwrap();
+        assert!(!b.conflicted);
+        assert_eq!(
+            (b.base_object.clone(), b.base_revision.clone()),
+            (was.conflict_object.clone(), was.conflict_revision.clone())
+        );
+        assert_eq!(b.shared_object, item.object);
+        let loser = kept_in(model, id).unwrap();
+        assert_eq!(loser.object, was.conflict_object);
+        assert_eq!(
+            run.events,
+            [Event::Overruled {
+                handle: String::from("r1.vcf"),
+                link_id: loser.link_id.clone(),
+            }]
+        );
+        let (_, run) = rekeyed(&history, 27);
+        let Some(Push::Update { if_match, .. }) = pushed(run, "update", "r1.vcf") else {
+            panic!("b owes the item's body");
+        };
+        assert_eq!(if_match, &was.conflict_revision);
+
+        let id = "work/overruled-unread";
+        let (before, _) = rekeyed(&history, 31);
+        let (model, run) = rekeyed(&history, 32);
+        assert!(run.failed && run.events.is_empty());
+        let item = bodied(model, id);
+        assert_eq!(
+            format!("{:?}", item.bindings),
+            format!("{:?}", bodied(before, id).bindings),
+            "refused, staging nothing"
+        );
+        assert!(kept_in(model, id).is_none());
     }
 }

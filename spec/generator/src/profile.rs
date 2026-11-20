@@ -17,8 +17,8 @@ use crate::{
     error::{Error, Result},
     fixture,
     model::{
-        Capability, Collection, Item, Kind, Model, Placement, Reference, Refusal, SourceState,
-        State, Summary, Table,
+        Capability, Collection, Item, Kind, Model, Placement, Presentation, Reference, Refusal,
+        SourceState, State, Summary, Table,
     },
     name::ObjectName,
     queue::{Action, Outcome, RowState},
@@ -153,6 +153,32 @@ impl Draw {
             None,
             None,
         ));
+        let shown = [
+            ("work/INBOX", None, None, Some(0)),
+            (
+                "work/calendar",
+                Some("#1e88e5"),
+                Some("The team's meetings"),
+                Some(1),
+            ),
+            ("work/holidays", Some("#43a047"), None, Some(2)),
+        ];
+        for (id, color, description, sort_order) in shown {
+            let collection = model
+                .collections
+                .get_mut(id)
+                .expect("a declared collection");
+            collection.presentation = Presentation {
+                color: color.map(String::from),
+                description: description.map(String::from),
+                sort_order,
+            };
+        }
+        let archive = model
+            .collections
+            .get_mut("work/Archive")
+            .expect("an archive");
+        archive.parent = Some(String::from("work/INBOX"));
         model.declare(Collection {
             id: String::from("home/x-vlist"),
             account: Some(String::from("home")),
@@ -161,6 +187,9 @@ impl Draw {
             role: None,
             sources: BTreeMap::new(),
             conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
         });
 
         self.mail(&mut model);
@@ -191,6 +220,9 @@ impl Draw {
             role: Some(String::from("attachments")),
             sources: BTreeMap::new(),
             conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
         });
 
         for fixture in fixture::load(spec)? {
@@ -1252,6 +1284,9 @@ fn collection(
             })
             .unwrap_or_default(),
         conflict: String::from("manual"),
+        generation: 1,
+        parent: None,
+        presentation: Presentation::default(),
     }
 }
 
