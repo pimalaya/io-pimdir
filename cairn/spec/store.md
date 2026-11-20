@@ -358,13 +358,13 @@ The store schema is version 1 (`user_version` 1), migrations/storage/0001_init.s
 `PRAGMA journal_mode = WAL` is set after the creation commits, by the owner alone ("The journal mode is chosen when the store is created").
 
 #### Scenario: A fresh store
-- tests/store_version.rs `a_fresh_store_names_this_draft_and_an_identity`: `storage-draft-14`, the three versions at 1, a 32-digit id, incarnation 1, `blake3`, derivation 3, no sync version, `auto_vacuum` INCREMENTAL (0 under an immediate transaction, before the change)
+- tests/store_version.rs `a_fresh_store_names_this_draft_and_an_identity`: `storage-draft-15`, the three versions at 1, a 32-digit id, incarnation 1, `blake3`, derivation 3, no sync version, `auto_vacuum` INCREMENTAL (0 under an immediate transaction, before the change)
 
 ### Requirement: A store of another draft is refused
 Every profile (the owner's `open` and `open_current`, the reader, the producer, and the index, which opens the store through a reader first) SHALL run STORAGE §6's open contract (`schema::check`) before it reads or writes anything, refusing, writing nothing, in this order: a database declaring tables at `user_version` 0, or whose `store_meta` names another `format` or holds no row (`PimdirError::Foreign`, `store-foreign`); one holding no schema (`Uncreated`, or `NotCurrent(Version { found: 0 })` from `open_current`); a store whose `store_meta.format_version` is not `sql::FORMAT_VERSION`, `storage-draft-08`, or which lacks the column, as every draft before 08 wrote (`PimdirError::Version { found }`, `store-version`, naming both versions, `found` `None` for the missing column); disagreeing stamps (`VersionMismatch`, `store-corrupt`); a `hash_algo` other than `blake3` (`HashAlgo`, `store-hash-algo`); then a schema whose text is not the canonical one ("The schema check covers the triggers"). Nothing is reconciled, migrated nor rebuilt, whatever the profile: a store of another draft is set aside and a new one synced, which the CHANGELOG says first (STORAGE §4.2).
 
 #### Scenario: Another draft, a release, a draft-07 store, the released crates' stores
-- GIVEN a store marked `storage-v1`, `storage-draft-07`, `storage-draft-10`, `storage-draft-11`, `storage-draft-12`, `storage-draft-13` or `storage-draft-15`; a store built from pimdir 9606b43's schema verbatim (tests/fixtures/storage-draft-07.sql); a store marked `storage-v2` at version 2 holding a table this crate does not know; and the stores io-pimdir 0.5.1, 0.7.0 and 0.8.0 wrote
+- GIVEN a store marked `storage-v1`, `storage-draft-07`, `storage-draft-10`, `storage-draft-11`, `storage-draft-12`, `storage-draft-13`, `storage-draft-14` or `storage-draft-16`; a store built from pimdir 9606b43's schema verbatim (tests/fixtures/storage-draft-07.sql); a store marked `storage-v2` at version 2 holding a table this crate does not know; and the stores io-pimdir 0.5.1, 0.7.0 and 0.8.0 wrote
 - WHEN the owner's two opens, a reader and a producer open each
 - THEN each is refused as `Version`, naming both versions, and pimdir.db is byte for byte as it was (tests/store_version.rs `a_store_of_another_version_is_refused_by_every_profile_and_never_written`, `a_draft_07_store_is_refused_by_every_profile_and_never_written`, `a_store_a_release_of_this_crate_wrote_is_refused_by_every_profile`, `a_later_store_is_refused_for_its_marker`; with `search`, the indexer and the query client too, no index.db made, `the_index_refuses_a_store_of_another_version_and_makes_nothing`); every one fails with the marker check removed
 
@@ -403,10 +403,10 @@ The crate SHALL answer `store_id` and `incarnation` with the change cursor (`Pim
 - tests/store_version.rs `two_restores_of_one_backup_answer_two_incarnations`: two copies of one store, each raised with no replaced store read, keep one id and answer two incarnations
 
 ### Requirement: The store records the sync version that wrote its sync state
-The engine's first write through `PimdirSourceStore::write` SHALL record `sync::SYNC_VERSION`, `sync-draft-14`, with `set_sync_version` in the write's transaction, and `load` and `write` SHALL refuse a store naming another sync version as `PimdirError::SyncVersion { found }` (`sync-version`) before any verb reads or writes (STORAGE §4.3, SYNC §10). The owner's drain, unbound and file writes are no engine's and record nothing. Departure: the engine still follows sync-draft-06's rules until phase 5 of the-crate-follows-storage-draft-08; no store this crate wrote before carries a sync version, being refused for its marker.
+The engine's first write through `PimdirSourceStore::write` SHALL record `sync::SYNC_VERSION`, `sync-draft-15`, with `set_sync_version` in the write's transaction, and `load` and `write` SHALL refuse a store naming another sync version as `PimdirError::SyncVersion { found }` (`sync-version`) before any verb reads or writes (STORAGE §4.3, SYNC §10). The owner's drain, unbound and file writes are no engine's and record nothing. Departure: the engine still follows sync-draft-06's rules until phase 5 of the-crate-follows-storage-draft-08; no store this crate wrote before carries a sync version, being refused for its marker.
 
 #### Scenario: Another engine's sync state
-- tests/store_version.rs `the_engine_records_its_sync_version_and_refuses_another`: a load records nothing, the first write records `sync-draft-14`; a store naming `sync-draft-06` refuses the load and the write, pimdir.db unchanged
+- tests/store_version.rs `the_engine_records_its_sync_version_and_refuses_another`: a load records nothing, the first write records `sync-draft-15`; a store naming `sync-draft-06` refuses the load and the write, pimdir.db unchanged
 
 ### Requirement: Every writing connection deletes securely and syncs fully
 Every connection the crate opens on pimdir.db or index.db (`prepare_connection`: the owner's, the reader's, the producer's, the index's, the store attached there included) SHALL set `foreign_keys = ON`, `synchronous = FULL` and `secure_delete = ON`, with `fullfsync = ON` where `target_vendor` is `apple`, whose `fsync` leaves the drive's cache unflushed, and a busy timeout, `BUSY_TIMEOUT`, 30 s, so a reader or a producer waits out the owner's write transaction (STORAGE §4.1, §11.5). A read-only connection sets them too: a pragma it cannot use costs nothing.
@@ -737,7 +737,7 @@ process owns SHALL fail fast rather than wait.
 It SHALL open the store through `open_current`, never `open`: a consumer cancelling a row owns the store for one write and SHALL NOT create it. A store the open contract refuses is refused here too, left as it was.
 
 #### Scenario: A cancel on a store of another draft
-- GIVEN a store marked `storage-draft-15` whose `task_summary` carries a column that draft added, and a queued row
+- GIVEN a store marked `storage-draft-16` whose `task_summary` carries a column that draft added, and a queued row
 - WHEN a consumer cancels the row through `cancel_action`
 - THEN it answers `Version`, and pimdir.db, the row included, is left byte for byte as it was (tests/open_current.rs `a_cancel_leaves_a_store_of_another_draft_as_it_was`)
 
@@ -1349,7 +1349,7 @@ No message SHALL advise deleting the store: a resync restores neither the queue,
 #### Scenario: A later store
 - GIVEN a store marked `storage-v2` at version 2
 - WHEN an owner, a producer or a reader opens it
-- THEN the error's code is `store-version` and its message names `storage-draft-14` (tests/queue.rs `a_store_of_a_later_version_is_refused`); a damaged store is `store-corrupt` (tests/stale_store.rs)
+- THEN the error's code is `store-version` and its message names `storage-draft-15` (tests/queue.rs `a_store_of_a_later_version_is_refused`); a damaged store is `store-corrupt` (tests/stale_store.rs)
 
 ### Requirement: The public API names no foreign error type
 `PimdirError::Sql`, `Unanswerable` and `Json` SHALL wrap the opaque `PimdirSqlError` and `PimdirJsonError`, which display the cause and give it through `Error::source` without naming rusqlite or serde_json types, so a major of either is not one of this crate. The `From` conversions the crate's own `?` relies on are hidden from the documentation and are no contract.

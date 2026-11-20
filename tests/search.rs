@@ -1848,12 +1848,12 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
     for (altered, version, shape) in [
         (
             "UPDATE index_meta SET shape = 'fts4'",
-            Some("search-draft-14"),
+            Some("search-draft-15"),
             Some("fts4"),
         ),
         (
-            "UPDATE index_meta SET format_version = 'search-draft-15'",
-            Some("search-draft-15"),
+            "UPDATE index_meta SET format_version = 'search-draft-16'",
+            Some("search-draft-16"),
             Some("canonical"),
         ),
         (
@@ -1907,6 +1907,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         "UPDATE index_meta SET format_version = 'search-draft-11'",
         "UPDATE index_meta SET format_version = 'search-draft-12'",
         "UPDATE index_meta SET format_version = 'search-draft-13'",
+        "UPDATE index_meta SET format_version = 'search-draft-14'",
         "ALTER TABLE index_meta DROP COLUMN format_version",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1923,7 +1924,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         drop(index);
         assert_eq!(
             index_meta(dir.path(), "format_version"),
-            rusqlite::types::Value::Text("search-draft-14".into()),
+            rusqlite::types::Value::Text("search-draft-15".into()),
             "{altered}"
         );
     }

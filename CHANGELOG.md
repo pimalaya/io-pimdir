@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **BREAKING**: Added pimdir storage-draft-15, sync-draft-15 and search-draft-15, vendored from the pimdir working tree of 2026-11-20: a store or a sync state of draft-14 is refused, never migrated, and an index of draft-14 is rebuilt.
+
+### Changed
+
+- Changed the documentation of the search layer: it follows the crate's versioning like the store and the engine, SEARCH being released together with STORAGE and SYNC.
+- Changed `pimdir --help` and README.md to state that the `pimdir` binary is outside the crate's 1.0 contract: its commands, flags and output may change in any release.
+
 ### Fixed
 
 - Fixed `PimdirIndex::search`, `threads` and `thread` failing the whole page when one hit's blob cannot be read: that hit lists without a snippet.

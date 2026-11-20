@@ -27,6 +27,9 @@ never compile clap or any terminal dependency. The command modules SHALL hang
 off the binary crate root, not off `lib.rs`, so the library's public API is
 unchanged by the presence of the CLI.
 
+### Requirement: The CLI is outside the crate's 1.0 contract
+The binary's commands, flags and output SHALL be outside the semver contract io-pimdir 1.0 makes for its library (pimdir the-freeze-plan, D4), and `pimdir --help` and README.md SHALL say so: they may change in any release, so a program depends on the library, never on the binary.
+
 ### Requirement: Reads open the store through the reader role
 Every inspection verb SHALL open the store through the reader role
 (`PimdirReader`), so inspecting a store while a sync is running is always safe
@@ -85,9 +88,9 @@ or debug error dump.
 The CLI's owner role SHALL open the store through `open_current`: the CLI is never the store's sync engine, so it SHALL NOT create a store. A store of another draft, a damaged one or a foreign one fails every verb, whatever its role, with the library's sentence, which names both versions for another draft, written nothing. A verb that enqueues then drains (`item restore`, `tag`) SHALL leave its action queued and report it `queued` when another process owns the store or the database holds no schema yet.
 
 #### Scenario: A binary over another draft's store
-- GIVEN a store marked `storage-draft-15` whose `task_summary` carries a column that draft added
+- GIVEN a store marked `storage-draft-16` whose `task_summary` carries a column that draft added
 - WHEN `pimdir queue cancel`, `pimdir gc` or `pimdir item restore` runs
-- THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`, `a_restore_over_a_store_of_another_draft_is_refused`, its error naming `storage-draft-15`)
+- THEN it fails and the store is left as it was (tests/cli_owner.rs `an_owner_verb_leaves_a_store_of_another_revision_as_it_was`, `a_restore_over_a_store_of_another_draft_is_refused`, its error naming `storage-draft-16`)
 
 ### Requirement: Destroying data is confirmed
 `item purge`, `item erase`, `quarantine empty`, `queue cancel`, `store restore` over a directory holding a store, and `queue retry` of an unconfirmed intent, which may perform it a second time, SHALL confirm interactively before destroying

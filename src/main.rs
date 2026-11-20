@@ -83,6 +83,9 @@ fn main() {
 #[derive(Parser, Debug)]
 #[command(name = env!("CARGO_BIN_NAME"))]
 #[command(about = "CLI to inspect, repair and recover a pimdir store")]
+#[command(long_about = "CLI to inspect, repair and recover a pimdir store\n\n\
+    An operator tool outside io-pimdir's 1.0 contract: its commands, flags \
+    and output may change in any release.")]
 #[command(author, version, long_version = long_version!())]
 #[command(after_help = footer!())]
 #[command(propagate_version = true, infer_subcommands = true)]

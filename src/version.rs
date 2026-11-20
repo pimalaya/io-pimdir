@@ -42,7 +42,7 @@ pub enum PimdirProfile {
 /// The storage part a program implements (STORAGE §4.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PimdirFormat<'a> {
-    /// A draft, by the name its stores carry (`storage-draft-14`).
+    /// A draft, by the name its stores carry (`storage-draft-15`).
     Draft(&'a str),
     /// A released version.
     Release,
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn a_release_refuses_a_draft_store() {
         for profile in PROFILES {
-            for format in ["storage-draft-14", "storage-v", "storage-v1.0.0", "pimdir"] {
+            for format in ["storage-draft-15", "storage-v", "storage-v1.0.0", "pimdir"] {
                 assert_eq!(
                     store(format, (1, 1, 1)).opens(&release(profile, 1)),
                     Err(PimdirVersionRefusal::Format {
@@ -579,13 +579,13 @@ mod tests {
             let draft = PimdirProgram {
                 profile,
                 version: 1,
-                format: PimdirFormat::Draft("storage-draft-14"),
+                format: PimdirFormat::Draft("storage-draft-15"),
                 hash_algos: &["blake3"],
             };
 
-            assert_eq!(store("storage-draft-14", (1, 1, 1)).opens(&draft), Ok(()));
-            assert_eq!(store("storage-draft-14", (2, 2, 2)).opens(&draft), Ok(()));
-            for format in ["storage-draft-13", "storage-draft-15", "storage-v1"] {
+            assert_eq!(store("storage-draft-15", (1, 1, 1)).opens(&draft), Ok(()));
+            assert_eq!(store("storage-draft-15", (2, 2, 2)).opens(&draft), Ok(()));
+            for format in ["storage-draft-14", "storage-draft-16", "storage-v1"] {
                 assert_eq!(
                     store(format, (1, 1, 1)).opens(&draft),
                     Err(PimdirVersionRefusal::Format {
@@ -600,7 +600,7 @@ mod tests {
                 format: None,
                 user_version: 7,
                 hash_algo: "sha256",
-                ..store("storage-draft-14", (1, 1, 1))
+                ..store("storage-draft-15", (1, 1, 1))
             };
             assert_eq!(other.opens(&draft), Ok(()));
         }

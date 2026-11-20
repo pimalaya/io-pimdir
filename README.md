@@ -6,7 +6,7 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 - Low-level **I/O-free** core: no_std-compatible schema, encodings, per-kind summaries and the five sync verbs as coroutines, usable anywhere (always built)
 - Mid-level **std client**: the three profiles the standard names, reader, producer and owner, as handles running the statements against SQLite and the blob files, the owner running the verbs against a connector you provide (requires the `client` feature, enabled by default)
-- High-level **CLI**: the `pimdir` binary, the operator tool over a store (requires the `cli` feature)
+- High-level **CLI**: the `pimdir` binary, the operator tool over a store, outside the crate's 1.0 contract (requires the `cli` feature)
 
 ## Table of contents
 
@@ -44,12 +44,12 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard. As STORAGE.md §17, SYNC.md §12 and SEARCH.md §12 ask, it states its conformance as:
 
-> storage-draft-14 owner, sync-draft-14 engine, search-draft-14 indexer (canonical) and query client
+> storage-draft-15 owner, sync-draft-15 engine, search-draft-15 indexer (canonical) and query client
 
-The owner profile holds the reader's and the producer's, and the crate offers each as a handle of its own (`PimdirReader`, `PimdirProducer`, `PimdirStore`); the engine runs the five verbs against a connector you provide, which owes SYNC.md §4 and is not part of this crate. The canonical schema, statements, payload schemas and vectors are vendored under spec/ byte for byte at the pimdir revision spec/REVISION names, the statements generated into the crate at build time, and every vector case passes, tests/pending_vectors.txt naming none. The search index ships behind the `search` feature (off by default, enabled by the operator CLI): with `search` alone the query language, the extraction and the refresh, an I/O-free coroutine yielding typed reads and writes, build without SQLite, so an app holding its own database keeps the same index, and with `client` too `PimdirIndex` runs it over SQLite; it is **experimental**, its API and index build free to change in a minor release.
+The owner profile holds the reader's and the producer's, and the crate offers each as a handle of its own (`PimdirReader`, `PimdirProducer`, `PimdirStore`); the engine runs the five verbs against a connector you provide, which owes SYNC.md §4 and is not part of this crate. The canonical schema, statements, payload schemas and vectors are vendored under spec/ byte for byte at the pimdir revision spec/REVISION names, the statements generated into the crate at build time, and every vector case passes, tests/pending_vectors.txt naming none. The search index ships behind the `search` feature (off by default, enabled by the operator CLI): with `search` alone the query language, the extraction and the refresh, an I/O-free coroutine yielding typed reads and writes, build without SQLite, so an app holding its own database keeps the same index, and with `client` too `PimdirIndex` runs it over SQLite; it follows the crate's versioning like the store and the engine, SEARCH.md being released together with STORAGE.md and SYNC.md.
 
 > [!IMPORTANT]
-> Drafts are exact: a store opens under storage-draft-14 alone, and its sync state under sync-draft-14. A store of any earlier draft, which every earlier release of this crate wrote, is refused by every profile and never migrated: move it aside and let its sync engine create and sync a new one.
+> Drafts are exact: a store opens under storage-draft-15 alone, and its sync state under sync-draft-15. A store of any earlier draft, which every earlier release of this crate wrote, is refused by every profile and never migrated: move it aside and let its sync engine create and sync a new one.
 
 Known deviation, bounded and stated in cairn/spec/store.md:
 
@@ -80,7 +80,7 @@ To use io-pimdir as a library, add it to your Cargo.toml: the `cli` feature is n
 
 ## Usage
 
-The `pimdir` binary is to a store what `sqlite3` is to a database: an operator tool, not an end-user client. Reads open the store read-only, so inspecting a store mid-sync is always safe. A few real-world invocations:
+The `pimdir` binary is to a store what `sqlite3` is to a database: an operator tool, not an end-user client. It is outside io-pimdir's 1.0 contract: its commands, flags and output may change in any release, so a program depends on the library, never on the binary. Reads open the store read-only, so inspecting a store mid-sync is always safe. A few real-world invocations:
 
 ```sh
 pimdir -s ~/mail store info
