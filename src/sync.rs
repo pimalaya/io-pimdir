@@ -1023,7 +1023,9 @@ impl PimdirSync {
         let mut tail = Vec::new();
         match (kind, &self.plan) {
             (PageKind::Delta, plan) => {
-                if let Some(checkpoint) = page.checkpoint {
+                if let Some(checkpoint) = page.checkpoint
+                    && self.checkpoint.as_ref() != Some(&checkpoint)
+                {
                     tail.push(PimdirWriteOp::SetCheckpoint {
                         collection: self.collection.clone(),
                         checkpoint,
@@ -1465,6 +1467,9 @@ impl PimdirSync {
     }
 
     /// Yields the next push chunk, or the write recording the last one.
+    ///
+    /// A last write with nothing to apply is not asked for: a delta that
+    /// found nothing, its checkpoint unmoved, takes no transaction.
     fn step(
         &mut self,
     ) -> PimdirCoroutineState<PimdirYield, Result<PimdirSyncReport, PimdirArgError>> {
@@ -1472,6 +1477,9 @@ impl PimdirSync {
             debug!("write {} storage ops", self.writes.len());
             self.state = State::Writing;
             let batch = self.batch();
+            if batch.is_empty() {
+                return self.landed(PimdirWritten::default());
+            }
             return PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(batch));
         }
 
@@ -1490,6 +1498,44 @@ impl PimdirSync {
         }
 
         self.push_chunk(changes)
+    }
+
+    /// Goes on once a write has landed, `written` what it recorded: the
+    /// next push chunk; after a head, the round from the cursor it kept;
+    /// after a page before the last, the next page from its cursor; else
+    /// the report.
+    fn landed(
+        &mut self,
+        written: PimdirWritten,
+    ) -> PimdirCoroutineState<PimdirYield, Result<PimdirSyncReport, PimdirArgError>> {
+        self.commit(written);
+        if !self.pushes.is_empty() {
+            return self.step();
+        }
+
+        let landing = self.landing.take();
+        if landing.as_ref().is_some_and(|landing| landing.resume) {
+            self.metas.clear();
+            return self.enumerate();
+        }
+
+        let next = landing.and_then(|landing| landing.next);
+        if let (Some(cursor), Plan::Round(round)) = (next, &mut self.plan) {
+            round.cursor = Some(cursor);
+            self.metas.clear();
+            return self.enumerate();
+        }
+
+        debug!(
+            "sync done: {} pulled, {} pushed, {} refreshed, {} conflicts, {} rejected",
+            self.report.pulled,
+            self.report.pushed,
+            self.report.refreshed,
+            self.report.conflicts,
+            self.report.rejected,
+        );
+        self.state = State::Done;
+        PimdirCoroutineState::Complete(Ok(self.report.clone()))
     }
 
     /// Withholds the changes of the verified chunk whose body failed, then
@@ -2719,43 +2765,11 @@ impl PimdirCoroutine for PimdirSync {
                 PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(batch))
             }
 
-            (State::Writing, Some(arg @ (PimdirArg::Write | PimdirArg::Written(_)))) => {
-                self.commit(match arg {
+            (State::Writing, Some(arg @ (PimdirArg::Write | PimdirArg::Written(_)))) => self
+                .landed(match arg {
                     PimdirArg::Written(written) => written,
                     _ => PimdirWritten::default(),
-                });
-                if !self.pushes.is_empty() {
-                    return self.step();
-                }
-
-                // NOTE: a head landed: the round resumes from the cursor it
-                // kept.
-                let landing = self.landing.take();
-                if landing.as_ref().is_some_and(|landing| landing.resume) {
-                    self.metas.clear();
-                    return self.enumerate();
-                }
-
-                // NOTE: a page before the last landed with its cursor; the
-                // next one resumes from it.
-                let next = landing.and_then(|landing| landing.next);
-                if let (Some(cursor), Plan::Round(round)) = (next, &mut self.plan) {
-                    round.cursor = Some(cursor);
-                    self.metas.clear();
-                    return self.enumerate();
-                }
-
-                debug!(
-                    "sync done: {} pulled, {} pushed, {} refreshed, {} conflicts, {} rejected",
-                    self.report.pulled,
-                    self.report.pushed,
-                    self.report.refreshed,
-                    self.report.conflicts,
-                    self.report.rejected,
-                );
-                self.state = State::Done;
-                PimdirCoroutineState::Complete(Ok(self.report.clone()))
-            }
+                }),
 
             (State::Done, _) | (_, Some(_)) => {
                 PimdirCoroutineState::Complete(Err(PimdirArgError::UnexpectedArg))
@@ -3950,6 +3964,97 @@ mod tests {
         assert!(
             !selections.contains(&PimdirLoadSelection::All),
             "{selections:?}"
+        );
+    }
+
+    /// Runs a delta over a source holding checkpoint `c0` and the whole
+    /// scope's coverage, the remote answering `page`; the writes asked for
+    /// and how the run ended.
+    fn run_delta_from_c0(
+        local: Vec<PimdirPlacement>,
+        page: PimdirRemoteSnapshot,
+    ) -> (
+        Vec<Vec<PimdirWriteOp>>,
+        Result<PimdirSyncReport, PimdirArgError>,
+    ) {
+        crate::testlog::init();
+        let mut sync = PimdirSync::new("inbox", PimdirSyncOptions::default());
+        let mut page = Some(page);
+        let mut writes = Vec::new();
+        let mut arg = None;
+
+        loop {
+            match sync.resume(arg.take()) {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsLoad { .. }) => {
+                    arg = Some(PimdirArg::Load(PimdirLoaded {
+                        placements: local.clone(),
+                        checkpoint: Some(PimdirCheckpoint(b"c0".to_vec())),
+                        coverage: coverage(PimdirScope::unbounded()),
+                        ..Default::default()
+                    }));
+                }
+                PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { request, .. }) => {
+                    assert!(matches!(request.listing, PimdirListing::Delta(_)));
+                    let page = page.take().expect("one page to enumerate");
+                    arg = Some(PimdirArg::Enumerate(PimdirEnumerated::Page(page)));
+                }
+                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(batch)) => {
+                    writes.push(batch);
+                    arg = Some(PimdirArg::Write);
+                }
+                PimdirCoroutineState::Complete(result) => return (writes, result),
+                state => panic!("unexpected {state:?}"),
+            }
+        }
+    }
+
+    /// A delta finding nothing, its checkpoint the one the source holds,
+    /// asks for no write: no transaction for a collection nothing moved in.
+    #[test]
+    fn a_delta_finding_nothing_under_the_same_checkpoint_writes_nothing() {
+        let page = PimdirRemoteSnapshot::delta(vec![], vec![], PimdirCheckpoint(b"c0".to_vec()));
+        let (writes, result) = run_delta_from_c0(vec![synced("1", &["seen"])], page);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(writes.is_empty(), "{writes:?}");
+    }
+
+    /// A delta finding nothing under a checkpoint that moved lands it.
+    #[test]
+    fn a_delta_finding_nothing_under_a_new_checkpoint_lands_it() {
+        let page = PimdirRemoteSnapshot::delta(vec![], vec![], PimdirCheckpoint(b"c1".to_vec()));
+        let (writes, result) = run_delta_from_c0(vec![synced("1", &["seen"])], page);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            writes,
+            vec![vec![PimdirWriteOp::SetCheckpoint {
+                collection: "inbox".into(),
+                checkpoint: PimdirCheckpoint(b"c1".to_vec()),
+            }]],
+        );
+    }
+
+    /// A delta pulling a change under the same checkpoint writes the pull
+    /// alone, the checkpoint already the source's.
+    #[test]
+    fn a_delta_pulling_under_the_same_checkpoint_writes_the_pull_alone() {
+        let page = PimdirRemoteSnapshot::delta(
+            vec![remote("1", &["seen", "flagged"])],
+            vec![],
+            PimdirCheckpoint(b"c0".to_vec()),
+        );
+        let (writes, result) = run_delta_from_c0(vec![synced("1", &["seen"])], page);
+        assert!(result.is_ok(), "{result:?}");
+        let ops: Vec<&PimdirWriteOp> = writes.iter().flatten().collect();
+        assert!(
+            ops.iter().any(
+                |op| matches!(op, PimdirWriteOp::UpsertPlacement(p) if p.handle.as_str() == "1")
+            ),
+            "{ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, PimdirWriteOp::SetCheckpoint { .. })),
+            "{ops:?}"
         );
     }
 

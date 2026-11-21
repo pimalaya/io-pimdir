@@ -6,7 +6,7 @@ This directory is a crate of its own (an empty `[workspace]`, `publish = false`)
 
 ## What is here
 
-- src/main.rs: `pimbench`, a Maildir connector (`PimdirRemote`) driving io-pimdir's real sync engine, one round per folder in pages of 1,000, each member listed with its body; then `PimdirIndex::refresh`; then queries timed in process.
+- src/main.rs: `pimbench`, a Maildir connector (`PimdirRemote`) driving io-pimdir's real sync engine, one round per folder in pages of 1,000, each member listed with its body; then `PimdirIndex::refresh`; then queries timed in process. A delta skips a folder whose `cur/` and `new/` modification times are those of its last listing, as `notmuch new` does, and hands back the checkpoint it was given when it finds nothing, as a server whose state did not move does (below).
 - src/measure.rs: what each phase costs, read from the process itself.
 - scripts/lib.sh: the paths every script shares, each overridable from the environment, and `measure`, which wraps a command with GNU time and the bytes it wrote.
 - scripts/setup.sh: the tools rooted under `$B` and the two builds.
@@ -70,6 +70,10 @@ pimbench sync  STORE MAILDIR_ROOT STATE_DIR [PAGE]
 pimbench index STORE
 pimbench query STORE REPEATS QUERY...
 ```
+
+`STATE_DIR` is the connector's own state, what a server would remember for a client: a file per folder naming the members it last listed (the folder's path with `/` as `%`), and `%mtimes`, a line per folder with the modification times, in nanoseconds, of its `cur/` and `new/` when last listed. A delta whose folder still shows those times answers nothing without reading the directory: a delivery, a deletion and a flag change each add, remove or rename a file, which moves its directory's time. The times are taken before the listing and kept only once the folder's sync landed, and only when at least 2 s old, so a change made in the same clock tick as a listing is caught next time. Like notmuch, it misses an edit of a message file in place (Maildir never does one) and a tree restored with its old times over other content; delete `%mtimes` to list every folder again.
+
+A delta finding nothing hands back the checkpoint it was given, so the engine writes nothing for that folder. On the 517k tier's 3,311 folders a no-op sync went from 5.0 s wall, 2.6 s of CPU and 3,325 `fsync`s (io-pimdir 78483f0) to 0.49 s, 0.48 s and none (notmuch's no-op `new`: 0.07 s), of which the engine's delta loads take 0.43 s, almost all `list_owing_bindings` and `list_lacking_items` walking every binding and item of each collection.
 
 `pimbench index` reads three knobs from the environment, so a refresh setting is measured before it is changed in the crate: `PIMBENCH_BATCH` the rows per transaction (`PimdirIndexRefreshOptions::batch`), `PIMBENCH_FTS` FTS5 settings written into both full-text tables once index.db is built (`automerge=8,crisismerge=64`, `pgsz=8000`), and `PIMBENCH_END` what follows the refresh inside the phase: `optimize`, a `merge` of that many pages repeated until done, or `checkpoint`, each ending with a `TRUNCATE` checkpoint.
 

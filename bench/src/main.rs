@@ -17,7 +17,7 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use io_pimdir::{
@@ -51,13 +51,33 @@ struct Entry {
 
 /// A Maildir as a pimdir source: handles are the unique part of the file
 /// name, flags its info suffix, every listed member carries its body.
+///
+/// A delta skips a folder whose `cur/` and `new/` kept the modification
+/// times they had when it was last listed, as `notmuch new` does: a
+/// delivery, a deletion and a flag change each add, remove or rename a
+/// file, which moves its directory's time. Those times live in the state
+/// directory's `%mtimes`, taken before a listing and kept only for a
+/// folder whose sync landed, and only when older than [`SETTLED`]: a
+/// change in the same clock tick as a listing would leave the time
+/// unmoved, so a folder changed that recently is listed again next time.
+/// A delta finding nothing hands back the checkpoint it was given, as a
+/// server whose state did not move does.
 struct Maildir {
     root: PathBuf,
     state: PathBuf,
     page: usize,
     listings: BTreeMap<String, Vec<Entry>>,
     read_bytes: u64,
+    mtimes: BTreeMap<String, Mtimes>,
+    seen: BTreeMap<String, Option<Mtimes>>,
 }
+
+/// The modification times of a folder's `cur/` and `new/`, in nanoseconds
+/// since the epoch, `None` for a directory missing.
+type Mtimes = (Option<i128>, Option<i128>);
+
+/// How old a directory's time must be to be trusted as unmoved later.
+const SETTLED: Duration = Duration::from_secs(2);
 
 fn handle_of(name: &str) -> &str {
     name.split(':').next().unwrap_or(name)
@@ -104,6 +124,66 @@ impl Maildir {
         entries.sort_by(|a, b| a.handle.cmp(&b.handle));
         entries.dedup_by(|a, b| a.handle == b.handle);
         Ok(entries)
+    }
+
+    /// The times of `collection`'s `cur/` and `new/`, and whether both are
+    /// old enough to be trusted unmoved next time ([`SETTLED`]).
+    fn stat(&self, collection: &str) -> (Mtimes, bool) {
+        let now = SystemTime::now();
+        let mut settled = true;
+        let mut time = |sub: &str| {
+            let modified = fs::metadata(self.root.join(collection).join(sub))
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            let age = now.duration_since(modified).unwrap_or_default();
+            settled &= age >= SETTLED;
+            let since = modified.duration_since(UNIX_EPOCH).ok()?;
+            Some(since.as_nanos() as i128)
+        };
+        let mtimes = (time("cur"), time("new"));
+        (mtimes, settled)
+    }
+
+    /// Keeps the times `collection` was listed at, once its sync landed;
+    /// forgets them when they were too recent to trust, or not taken.
+    fn settle(&mut self, collection: &str) {
+        match self.seen.remove(collection).flatten() {
+            Some(mtimes) => self.mtimes.insert(collection.to_string(), mtimes),
+            None => self.mtimes.remove(collection),
+        };
+    }
+
+    fn mtimes_path(state: &Path) -> PathBuf {
+        state.join("%mtimes")
+    }
+
+    /// The `%mtimes` file, named apart from every sidecar (a folder's path
+    /// never starts with `/`): a line per folder, its name then the two
+    /// times, tab-separated, `-` for a directory missing.
+    fn load_mtimes(state: &Path) -> BTreeMap<String, Mtimes> {
+        let text = fs::read_to_string(Self::mtimes_path(state)).unwrap_or_default();
+        let time = |field: &str| field.parse().ok();
+        text.lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let (folder, cur, new) = (fields.next()?, fields.next()?, fields.next()?);
+                Some((folder.to_string(), (time(cur), time(new))))
+            })
+            .collect()
+    }
+
+    /// Writes `%mtimes` whole, through a rename, so a run cut short leaves
+    /// the last one.
+    fn save_mtimes(&self) -> io::Result<()> {
+        let time = |t: Option<i128>| t.map_or_else(|| "-".to_string(), |t| t.to_string());
+        let mut text = String::new();
+        for (folder, (cur, new)) in &self.mtimes {
+            text.push_str(&format!("{folder}\t{}\t{}\n", time(*cur), time(*new)));
+        }
+        let path = Self::mtimes_path(&self.state);
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, text)?;
+        fs::rename(tmp, path)
     }
 
     fn sidecar(&self, collection: &str) -> PathBuf {
@@ -154,6 +234,8 @@ impl PimdirRemote for Maildir {
             PimdirListing::Round { cursor, .. } => {
                 let start = match &cursor {
                     None => {
+                        let (mtimes, settled) = self.stat(&name);
+                        self.seen.insert(name.clone(), settled.then_some(mtimes));
                         let listing = self.list(&name)?;
                         self.listings.insert(name.clone(), listing);
                         0
@@ -182,6 +264,14 @@ impl PimdirRemote for Maildir {
                 Ok(PimdirRemoteSnapshot::page(items, cursor, checkpoint).into())
             }
             PimdirListing::Delta(PimdirCheckpoint(old)) => {
+                let (mtimes, settled) = self.stat(&name);
+                if self.mtimes.get(&name) == Some(&mtimes) {
+                    self.seen.insert(name, Some(mtimes));
+                    let snapshot =
+                        PimdirRemoteSnapshot::delta(vec![], vec![], PimdirCheckpoint(old));
+                    return Ok(snapshot.into());
+                }
+                self.seen.insert(name.clone(), settled.then_some(mtimes));
                 let known = self.load_names(&name)?;
                 let listing = self.list(&name)?;
                 let mut items = Vec::new();
@@ -192,20 +282,23 @@ impl PimdirRemote for Maildir {
                         items.push(self.item(entry)?);
                     }
                 }
-                let vanished = known
+                let vanished: Vec<PimdirHandle> = known
                     .keys()
                     .filter(|h| !present.contains(*h))
                     .map(|h| PimdirHandle(h.clone()))
                     .collect();
-                self.save_names(&name, &listing)?;
-                let next: u64 = String::from_utf8_lossy(&old).parse().unwrap_or(0) + 1;
+                let checkpoint = match items.is_empty() && vanished.is_empty() {
+                    true => old,
+                    false => {
+                        self.save_names(&name, &listing)?;
+                        let next = String::from_utf8_lossy(&old).parse().unwrap_or(0u64) + 1;
+                        next.to_string().into_bytes()
+                    }
+                };
                 self.listings.insert(name, listing);
-                Ok(PimdirRemoteSnapshot::delta(
-                    items,
-                    vanished,
-                    PimdirCheckpoint(next.to_string().into_bytes()),
-                )
-                .into())
+                let snapshot =
+                    PimdirRemoteSnapshot::delta(items, vanished, PimdirCheckpoint(checkpoint));
+                Ok(snapshot.into())
             }
             PimdirListing::Head(_) => Ok(PimdirEnumerated::NoHead),
         }
@@ -308,11 +401,13 @@ fn cmd_sync(args: &[String]) {
     let folders = folders(&root).unwrap();
     let mut store = PimdirStore::open(&store_dir).unwrap().for_source("maildir");
     let mut remote = Maildir {
+        mtimes: Maildir::load_mtimes(&state),
         root,
         state,
         page,
         listings: BTreeMap::new(),
         read_bytes: 0,
+        seen: BTreeMap::new(),
     };
     let phase = Phase::start();
     let (mut pulled, mut unreadable) = (0, 0);
@@ -328,7 +423,9 @@ fn cmd_sync(args: &[String]) {
         pulled += report.pulled;
         unreadable += report.unreadable;
         remote.listings.remove(folder);
+        remote.settle(folder);
     }
+    remote.save_mtimes().unwrap();
     println!(
         "sync folders={} pulled={pulled} unreadable={unreadable} read_mib={:.1} secs={:.2} peak_rss_mib={:.0}",
         folders.len(),

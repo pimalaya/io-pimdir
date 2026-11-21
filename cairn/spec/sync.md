@@ -207,6 +207,24 @@ Only the handles of the chunk being serviced SHALL be resolved when its outcomes
 ### Requirement: The checkpoint lands in the last write
 The checkpoint, a delta's or the one a round closes with (`CloseRound`), SHALL land in the write that follows the final chunk, and SHALL stay the pre-push one, which is what makes the engine's own echo re-listed by the next delta enumeration. An intermediate chunk's write SHALL NOT carry it, so an interrupted run resumes from the same cursor rather than from one claiming its unrecorded pushes were seen. A page's resume cursor and the checkpoint an open round carries are not the source's checkpoint: they land with their page (`SetRoundCursor`), in the write after its last chunk.
 
+### Requirement: A delta that moved nothing writes nothing
+A delta's `SetCheckpoint` SHALL be left out when the checkpoint its page carries is the one the source holds, which the write would set to itself. A last write left with no op, a delta that found nothing under an unmoved checkpoint, SHALL NOT be yielded: the run goes on as if an empty write had landed, so it takes no transaction, no lock and no `fsync`. A write before the last, a push chunk's and a round page's, is yielded as before. A delta whose checkpoint moved still lands it, and one pulling or pushing under an unmoved checkpoint writes its placements alone.
+
+A connector whose source's state did not move hands back the checkpoint it was given (an IMAP `HIGHESTMODSEQ`, a JMAP state, a DAV sync token unchanged), so a sync over many collections that finds nothing costs reads alone: on the 517k Enron bench (3,311 Maildir folders), one `fsync` and one write transaction per collection had been 3,312 `fsync`s, 1.2 s of the no-op's 5 s.
+
+#### Scenario: A mailbox nothing happened in
+- GIVEN a source holding checkpoint `c0` and a delta answering no member, no vanished handle and `c0`
+- WHEN the run completes
+- THEN it yielded no `WantsWrite` (src/sync.rs `a_delta_finding_nothing_under_the_same_checkpoint_writes_nothing`, which failed before the change: one write holding `SetCheckpoint` to `c0`)
+
+#### Scenario: The checkpoint moved, nothing else
+- GIVEN the same source and a delta answering nothing but `c1`
+- THEN the run yields one write, `SetCheckpoint` to `c1` (src/sync.rs `a_delta_finding_nothing_under_a_new_checkpoint_lands_it`)
+
+#### Scenario: A pull under an unmoved checkpoint
+- GIVEN the same source and a delta answering a flag change and `c0`
+- THEN the write upserts the placement and carries no `SetCheckpoint` (src/sync.rs `a_delta_pulling_under_the_same_checkpoint_writes_the_pull_alone`)
+
 ### Requirement: Every change carries an idempotency key
 A `PimdirChange` SHALL be a `PimdirChangeKind` (what the remote is asked to do, the four verbs that were the change itself) plus the `PimdirChangeKey` naming it. The key SHALL be derived as pimdir SYNC §4 fixes it, so two engines over one store key one change alike and every vector's key reproduces: FNV-1a 64 bits over fields each followed by one `0x00` byte, rendered as sixteen lowercase hexadecimal digits; the fields being the collection id, the handle, the kind as `add`, `remove`, `set-flags` or `update`, then the kind's own, an optional value as the field `1` followed by the value or the field `0` alone, and a flag set as the field `unknown` or the field `known`, the count in decimal ASCII, then each flag in code point order. `add` folds the link id, the flags, the origin as `1`, its collection and its handle or `0` alone, then the object hash; `remove` the destination; `set-flags` its `add` set then its `remove` set, each a known flag set; `update` the object hash. The same derived change SHALL key the same on every run, and changes differing in any of those SHALL key differently.
 

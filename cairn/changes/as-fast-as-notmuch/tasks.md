@@ -20,7 +20,7 @@ change: as-fast-as-notmuch
 
 - [ ] Prototype the-write-path-before-the-freeze 1 to 4, numbers to the owner
 - [ ] Profile the index refresh (0.5 ms a message), then batch size, FTS5 merges, parallel extraction, summary text rewritten only when it changed (F6)
-- [ ] The no-op sync's fixed cost per collection
+- [x] The no-op sync's fixed cost per collection: QPSG on every connection, no write for a delta that moved nothing, the bench connector skipping folders by mtime; 5.0 s to 0.49 s at 517k (log 2026-11-21-a-sync-that-finds-nothing); `list_owing_bindings` and `list_lacking_items` left to the owner
 - [ ] The import gates
 
 ## Phase 4, the spec's additions

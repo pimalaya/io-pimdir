@@ -1793,6 +1793,9 @@ fn last_link(_meta: &fs::Metadata) -> bool {
 /// `sqlite3_libversion_number` spells it: an older one has no such flag.
 const DEFENSIVE_MIN: i32 = 3_026_000;
 
+/// The SQLite version `SQLITE_DBCONFIG_ENABLE_QPSG` arrived in.
+const QPSG_MIN: i32 = 3_020_000;
+
 /// Sets up a connection to a store or an index as every role does
 /// (STORAGE §4.1, §4.4): foreign keys on, the durability pragmas, the
 /// size a checkpointed WAL keeps, a busy timeout, and the list
@@ -1803,10 +1806,21 @@ const DEFENSIVE_MIN: i32 = 3_026_000;
 /// canonical schemas and statements run, so a crafted trigger or view
 /// calls no function with side effects and no write reaches the file
 /// behind SQLite's back.
+///
+/// The query planner stability guarantee is on, so a cached statement
+/// keeps its plan whatever it is bound to. Without it SQLite compiles
+/// again, on its next step, every statement binding a column a partial
+/// index's condition compares with a literal (`items_deleted`'s
+/// `deleted = 1` beside a `collection = :collection`), whose plan the
+/// bound value might change: once per collection a sync loads, three
+/// quarters of a sync's CPU when nothing moved.
 pub(crate) fn prepare_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON;")?;
     if rusqlite::version_number() >= DEFENSIVE_MIN {
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    }
+    if rusqlite::version_number() >= QPSG_MIN {
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
     }
     conn.execute_batch(DURABILITY)?;
     conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
@@ -2776,9 +2790,12 @@ pub(crate) fn is_stamp(value: &str) -> bool {
 mod tests {
     use std::{sync::Arc, thread, time::Duration};
 
-    use rusqlite::{Connection, config::DbConfig};
+    use rusqlite::{Connection, StatementStatus, config::DbConfig, named_params};
 
-    use crate::client::{PimdirError, PimdirStore, prepare_connection};
+    use crate::{
+        client::{PimdirError, PimdirStore, prepare_connection, rows},
+        sql,
+    };
 
     /// A collection never runs beside a verb it did not see (STORAGE §5):
     /// the collector reads the in-flight count once it holds the process's
@@ -2870,5 +2887,27 @@ mod tests {
             .unwrap();
         let edited = conn.execute("UPDATE sqlite_schema SET sql = '' WHERE name = 't'", []);
         assert!(edited.is_err(), "the schema table is not writable");
+    }
+
+    /// A cached statement bound to another collection runs as compiled,
+    /// though a partial index's condition compares a literal on its table.
+    #[test]
+    fn a_cached_statement_is_not_compiled_again_per_binding() {
+        let conn = Connection::open_in_memory().unwrap();
+        prepare_connection(&conn).unwrap();
+        conn.execute_batch(sql::MIGRATION_0001).unwrap();
+        for collection in ["a", "b", "c"] {
+            rows(
+                &conn,
+                sql::LOAD_MAIL_SUMMARIES_BY_LINK,
+                named_params! { ":collection": collection },
+                |_| Ok(()),
+            )
+            .unwrap();
+        }
+        let statement = conn
+            .prepare_cached(sql::LOAD_MAIL_SUMMARIES_BY_LINK)
+            .unwrap();
+        assert_eq!(statement.get_status(StatementStatus::RePrepare), 0);
     }
 }

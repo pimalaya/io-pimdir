@@ -408,6 +408,12 @@ The engine's first write through `PimdirSourceStore::write` SHALL record `sync::
 #### Scenario: Another engine's sync state
 - tests/store_version.rs `the_engine_records_its_sync_version_and_refuses_another`: a load records nothing, the first write records `sync-draft-15`; a store naming `sync-draft-06` refuses the load and the write, pimdir.db unchanged
 
+### Requirement: A cached statement keeps its plan
+Every connection `prepare_connection` sets up SHALL turn on the query planner stability guarantee (`SQLITE_DBCONFIG_ENABLE_QPSG`, SQLite 3.20 or later), so a statement the connection caches runs as compiled whatever it is bound to. Without it SQLite compiles a statement again on its next step whenever a parameter it binds sits in a term the planner compared with a partial index's literal condition (`collection = :collection` beside `items_deleted`'s `deleted = 1` once constant propagation fixes the column), in case the value lets the index serve: no canonical statement binds a value such a condition could match, no store carries `sqlite_stat4`, and the `LIKE :pattern` reads open with a wildcard, so the guarantee changes no plan and only stops the recompiling. On the 517k Enron bench it was every load statement of every collection: 55% of a no-op sync's instructions (2.5 s of CPU to 1.05 s), and the query table's pages and threaded pages 5 to 60% faster, no count slower.
+
+#### Scenario: A statement bound to three collections
+- src/client.rs `a_cached_statement_is_not_compiled_again_per_binding`: `load_mail_summaries_by_link` run for three collections on a prepared connection over the schema reports no re-preparation (`SQLITE_STMTSTATUS_REPREPARE` 0, which it was not before the change)
+
 ### Requirement: Every writing connection deletes securely and syncs fully
 Every connection the crate opens on pimdir.db or index.db (`prepare_connection`: the owner's, the reader's, the producer's, the index's, the store attached there included) SHALL set `foreign_keys = ON`, `synchronous = FULL` and `secure_delete = ON`, with `fullfsync = ON` where `target_vendor` is `apple`, whose `fsync` leaves the drive's cache unflushed, and a busy timeout, `BUSY_TIMEOUT`, 30 s, so a reader or a producer waits out the owner's write transaction (STORAGE §4.1, §11.5). A read-only connection sets them too: a pragma it cannot use costs nothing.
 

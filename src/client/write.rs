@@ -64,13 +64,43 @@ impl PimdirSourceStore {
     ///
     /// A store whose sync state an engine of another version wrote is
     /// refused as [`PimdirError::SyncVersion`], before any verb reads it.
+    ///
+    /// The load reads one snapshot, in one read transaction, rather than
+    /// one per statement. A `Handles` selection naming no handle, a sync's
+    /// first load, reads the sync state and the refusals alone: it
+    /// projects no placement, so nothing else it would read could answer
+    /// anything.
     pub fn load(
         &self,
         collection: &PimdirCollectionId,
         selection: &PimdirLoadSelection,
     ) -> Result<PimdirLoaded, PimdirError> {
-        let conn = &self.store.reader.conn;
+        let tx = self.store.reader.conn.unchecked_transaction()?;
+        let loaded = self.load_in(&tx, collection, selection)?;
+        tx.commit()?;
+        Ok(loaded)
+    }
+
+    /// [`load`](Self::load) inside the caller's read transaction.
+    fn load_in(
+        &self,
+        conn: &Connection,
+        collection: &PimdirCollectionId,
+        selection: &PimdirLoadSelection,
+    ) -> Result<PimdirLoaded, PimdirError> {
         schema::sync_version(conn)?;
+        if let PimdirLoadSelection::Handles(handles) = selection
+            && handles.is_empty()
+        {
+            let state = sync_state(conn, &collection.0, &self.source)?;
+            return Ok(PimdirLoaded {
+                checkpoint: state.checkpoint,
+                coverage: state.coverage,
+                round: state.round,
+                refused: refusals(conn, collection, &self.source)?,
+                ..Default::default()
+            });
+        }
         let hub = match selection {
             PimdirLoadSelection::All | PimdirLoadSelection::LastPage { .. } => {
                 read_hub(conn, &collection.0, None)?
@@ -203,28 +233,7 @@ impl PimdirSourceStore {
         let conflicted = hub.conflicted(&placements);
         let offered = hub.offered(&self.source, &placements);
         let folded = hub.folded(&self.source, &placements);
-        // NOTE: the source's refusals, on every selection, so a change it
-        // derives under a refused key is held wherever it is derived
-        // (SYNC §5).
-        let refused = rows(
-            conn,
-            sql::LIST_REFUSALS,
-            named_params! { ":collection": collection.0 },
-            |r| {
-                Ok((
-                    r.get::<_, String>(1)?,
-                    PimdirHandle(r.get(2)?),
-                    PimdirRefusal {
-                        key: PimdirChangeKey(r.get(4)?),
-                        reason: r.get(3)?,
-                    },
-                ))
-            },
-        )?
-        .into_iter()
-        .filter(|(source, ..)| *source == self.source.0)
-        .map(|(_, handle, refusal)| (handle, refusal))
-        .collect();
+        let refused = refusals(conn, collection, &self.source)?;
 
         Ok(PimdirLoaded {
             placements,
@@ -727,6 +736,36 @@ fn ensure_collection(
         named_params! { ":collection": collection, ":account": account },
     )?;
     Ok(())
+}
+
+/// The refusals standing on `source`'s bindings in `collection`, read on
+/// every selection, so a change it derives under a refused key is held
+/// wherever it is derived (SYNC §5).
+fn refusals(
+    conn: &Connection,
+    collection: &PimdirCollectionId,
+    source: &PimdirSourceId,
+) -> rusqlite::Result<Vec<(PimdirHandle, PimdirRefusal)>> {
+    let refused = rows(
+        conn,
+        sql::LIST_REFUSALS,
+        named_params! { ":collection": collection.0 },
+        |r| {
+            Ok((
+                r.get::<_, String>(1)?,
+                PimdirHandle(r.get(2)?),
+                PimdirRefusal {
+                    key: PimdirChangeKey(r.get(4)?),
+                    reason: r.get(3)?,
+                },
+            ))
+        },
+    )?;
+    Ok(refused
+        .into_iter()
+        .filter(|(by, ..)| *by == source.0)
+        .map(|(_, handle, refusal)| (handle, refusal))
+        .collect())
 }
 
 /// One source's sync state of a collection (SYNC §5): its checkpoint,
