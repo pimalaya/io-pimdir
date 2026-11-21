@@ -541,7 +541,9 @@ impl PimdirPlan {
                         PimdirQueryKind::Mail | PimdirQueryKind::Contact | PimdirQueryKind::File
                     ),
                     PimdirQueryPredicate::Account(_) => true,
-                    PimdirQueryPredicate::Collection(_) => !core::mem::replace(&mut collection, true),
+                    PimdirQueryPredicate::Collection(_) => {
+                        !core::mem::replace(&mut collection, true)
+                    }
                     _ => false,
                 };
                 if implied {
