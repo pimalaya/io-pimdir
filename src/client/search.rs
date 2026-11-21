@@ -30,9 +30,9 @@ mod refresh;
 mod summary;
 mod tag;
 
-use core::cmp::Ordering;
 #[cfg(feature = "indexer")]
 use core::mem;
+use core::{cell::RefCell, cmp::Ordering};
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -65,7 +65,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params_fr
 use crate::{
     client::{
         PimdirError, PreparedCached, bind_list, busy_or_sql, modes, prepare_connection,
-        reader::PimdirReader,
+        reader::{PimdirReader, rolled_temporal},
         rows, schema,
         search::compile::{Categories, Compiled, Ends, Probe},
     },
@@ -112,6 +112,117 @@ pub struct PimdirIndex {
     /// §6), so the chunk offsets it stores index the text this build
     /// extracts; a query client re-chunks its own text otherwise.
     own_extraction: bool,
+    /// The coverages answered since index.db and the store last moved.
+    coverages: RefCell<PimdirCoverageCache>,
+}
+
+/// The most coverages a handle keeps between two moves of index.db or the
+/// store, the cache emptied when one more is read.
+const COVERAGES_MAX: usize = 64;
+
+/// What a query's coverage is read over (SEARCH §8.2): the conjuncts
+/// narrowing its collections, the date range they narrow it to and
+/// whether a date term stands anywhere in it. Queries of one scope read
+/// one coverage from the store and the index, so it keys the cache.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PimdirCoverageScope {
+    /// The conjuncts ruling collections out, in reading order.
+    terms: Vec<PimdirCoverageTerm>,
+    /// The range's start, RFC 3339, `None` open.
+    since: Option<String>,
+    /// The range's end, exclusive, `None` open.
+    until: Option<String>,
+    /// Whether a date term stands in the query, wherever it stands.
+    dated: bool,
+}
+
+/// A conjunct ruling collections out of a coverage (SEARCH §8.2).
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PimdirCoverageTerm {
+    /// `account:`, the account's name.
+    Account(String),
+    /// `collection:` or `folder:`, the collection's id.
+    Collection(String),
+    /// `kind:`, the media type it names.
+    Kind(&'static str),
+}
+
+impl PimdirCoverageScope {
+    /// The scope of `query`, its dates resolved against `now` in `zone`.
+    fn of(query: &PimdirQuery, now: i64, zone: &TimeZone) -> Self {
+        let mut terms = Vec::new();
+        let mut since: Option<String> = None;
+        let mut until: Option<String> = None;
+        for term in query.conjuncts() {
+            match &term.predicate {
+                PimdirQueryPredicate::Account(account) => {
+                    terms.push(PimdirCoverageTerm::Account(account.clone()))
+                }
+                PimdirQueryPredicate::Collection(id) => {
+                    terms.push(PimdirCoverageTerm::Collection(id.clone()))
+                }
+                PimdirQueryPredicate::Kind(kind) => {
+                    terms.push(PimdirCoverageTerm::Kind(compile::media_type(*kind)))
+                }
+                PimdirQueryPredicate::Date(range) => {
+                    let (start, end) = compile::bounds(range, now, zone);
+                    if start > since {
+                        since = start;
+                    }
+                    if let Some(end) = end
+                        && until.as_ref().is_none_or(|until| &end < until)
+                    {
+                        until = Some(end);
+                    }
+                }
+                _ => (),
+            }
+        }
+        let dated = query
+            .terms()
+            .into_iter()
+            .any(|(term, _)| matches!(term.predicate, PimdirQueryPredicate::Date(_)));
+        Self {
+            terms,
+            since,
+            until,
+            dated,
+        }
+    }
+
+    /// Whether the collection of `id`, `account` and `kind` stands in the
+    /// scope.
+    fn holds(&self, id: &str, account: Option<&str>, kind: &str) -> bool {
+        self.terms.iter().all(|term| match term {
+            PimdirCoverageTerm::Account(name) => account == Some(name.as_str()),
+            PimdirCoverageTerm::Collection(name) => id == name,
+            PimdirCoverageTerm::Kind(media_type) => kind == *media_type,
+        })
+    }
+}
+
+/// A coverage as the store and the index hold it, before the query's own
+/// reads and zone.
+#[derive(Clone, Debug)]
+struct PimdirCoverageHeld {
+    /// The coverage, its `reads` and `zone_differs` left to the query.
+    coverage: PimdirSearchCoverage,
+    /// `index_meta.floating_zone`, read when a date term of the query can
+    /// reach a calendar collection of its scope, `None` otherwise.
+    floating: Option<String>,
+}
+
+/// The coverages one handle read since index.db and the store last moved,
+/// by scope: a second answer over a scope with no commit between reads no
+/// row of either (SEARCH §8.2).
+#[derive(Debug, Default)]
+struct PimdirCoverageCache {
+    /// `PRAGMA data_version` of index.db and of the store when the held
+    /// coverages were read: another connection's commit moves either,
+    /// this one's own writes being forgotten by the refresh making them.
+    versions: Option<(i64, i64)>,
+    /// The coverages read since, by scope.
+    held: BTreeMap<PimdirCoverageScope, PimdirCoverageHeld>,
 }
 
 /// How far one refresh goes.
@@ -616,6 +727,7 @@ impl PimdirIndex {
             #[cfg(feature = "indexer")]
             query_only: false,
             own_extraction: true,
+            coverages: RefCell::default(),
         })
     }
 
@@ -675,6 +787,7 @@ impl PimdirIndex {
             #[cfg(feature = "indexer")]
             query_only: true,
             own_extraction: held == PimdirIndexHeld::Current,
+            coverages: RefCell::default(),
         })
     }
 
@@ -727,6 +840,7 @@ impl PimdirIndex {
         if self.query_only {
             return Err(PimdirError::IndexQueryOnly(self.dir.join("index.db")));
         }
+        *self.coverages.get_mut() = PimdirCoverageCache::default();
         let zone = options.floating_zone.as_str();
         if zone != coverage::FLOATING_ZONE && TimeZone::get(zone).is_err() {
             return Err(PimdirError::IndexZone(zone.into()));
@@ -1517,6 +1631,10 @@ impl PimdirIndex {
     /// (`cut_before`), and whether `clock` states another zone than the
     /// index's where a date term can reach a calendar item. Its dates
     /// resolve against `now` in `zone`, as the query's did.
+    ///
+    /// A handle answering a scope again with no commit to index.db or the
+    /// store between (their `data_version`) answers what it read, reading
+    /// no row of either.
     fn coverage(
         &self,
         query: &PimdirQuery,
@@ -1524,42 +1642,82 @@ impl PimdirIndex {
         clock: &PimdirSearchClock,
         zone: &TimeZone,
     ) -> Result<PimdirSearchCoverage, PimdirError> {
-        let mut collections = self.reader.list_collections()?;
-        let mut since: Option<String> = None;
-        let mut until: Option<String> = None;
-        for term in query.conjuncts() {
-            match &term.predicate {
-                PimdirQueryPredicate::Account(account) => {
-                    collections.retain(|c| c.account.as_deref() == Some(account.as_str()))
-                }
-                PimdirQueryPredicate::Collection(id) => collections.retain(|c| &c.id == id),
-                PimdirQueryPredicate::Kind(kind) => {
-                    collections.retain(|c| c.kind == compile::media_type(*kind))
-                }
-                PimdirQueryPredicate::Date(range) => {
-                    let (start, end) = compile::bounds(range, now, zone);
-                    if start > since {
-                        since = start;
-                    }
-                    if let Some(end) = end
-                        && until.as_ref().is_none_or(|until| &end < until)
-                    {
-                        until = Some(end);
-                    }
-                }
-                _ => (),
+        let scope = PimdirCoverageScope::of(query, now, zone);
+        let versions = (
+            self.conn
+                .query_row_cached(search::INDEX_DATA_VERSION, [], |r| r.get(0))?,
+            self.conn
+                .query_row_cached(search::STORE_DATA_VERSION, [], |r| r.get(0))?,
+        );
+        let cached = {
+            let mut cache = self.coverages.borrow_mut();
+            if cache.versions != Some(versions) {
+                cache.versions = Some(versions);
+                cache.held.clear();
             }
-        }
+            cache.held.get(&scope).cloned()
+        };
+        let held = match cached {
+            Some(held) => held,
+            None => {
+                let held = self.read_coverage(&scope)?;
+                let mut cache = self.coverages.borrow_mut();
+                if cache.held.len() >= COVERAGES_MAX {
+                    cache.held.clear();
+                }
+                cache.held.insert(scope, held.clone());
+                held
+            }
+        };
 
-        let ids: Vec<&str> = collections.iter().map(|c| c.id.as_str()).collect();
+        let mut coverage = held.coverage;
+        coverage.local.reads = query.reads();
+        if let Some(floating) = held.floating {
+            let stated = clock.zone.as_deref().unwrap_or(coverage::FLOATING_ZONE);
+            coverage.zone_differs = stated != floating;
+        }
+        Ok(coverage)
+    }
+
+    /// The coverage of `scope` as the store and the index hold it, its
+    /// `reads` and `zone_differs` left to the query.
+    ///
+    /// The scope's collections' ids are bound once, every statement reading
+    /// the slot, the canonical ones run as their text stands. The sources
+    /// are rolled up in
+    /// one statement (`ROLL_COVERAGE`), and the unindexed items are counted
+    /// only while the index is behind, none being stamped above its cursor
+    /// otherwise.
+    ///
+    /// A range leaves the horizon when it starts before it or ends after
+    /// it, an open side always (SEARCH §8.1), a date term under `or` or
+    /// `not` counting as open on both sides. Zones are compared as names, a
+    /// client stating none stating `UTC` (SEARCH §8.1).
+    fn read_coverage(
+        &self,
+        scope: &PimdirCoverageScope,
+    ) -> Result<PimdirCoverageHeld, PimdirError> {
+        let collections = rows(&self.conn, search::SCOPE_COLLECTIONS, [], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let held: Vec<(String, Option<String>, String)> = collections
+            .into_iter()
+            .filter(|(id, account, kind)| scope.holds(id, account.as_deref(), kind))
+            .collect();
+        bind_list(&self.conn, "collections", held.iter().map(|(id, _, _)| id))?;
+        let calendar = held.iter().any(|(_, _, kind)| kind == "text/calendar");
+
+        let since = scope.since.as_deref();
+        let until = scope.until.as_deref();
         let mut coverage = PimdirSearchCoverage {
-            temporal: self
-                .reader
-                .search_temporal(&ids, since.as_deref(), until.as_deref())?,
+            temporal: rolled_temporal(&self.conn, search::ROLL_COVERAGE, since, until)?,
             ..Default::default()
         };
 
-        bind_list(&self.conn, "collections", &ids)?;
         let kinds = rows(&self.conn, search::COVERAGE, [], |r| {
             let count = |column| r.get::<_, i64>(column).map(|count| count.max(0) as u64);
             Ok((
@@ -1573,28 +1731,24 @@ impl PimdirIndex {
             ))
         })?;
         coverage.local.kinds = kinds.into_iter().collect();
-        coverage.local.reads = query.reads();
-        let unindexed: i64 = self.conn.query_row_cached(
-            search::COUNT_UNINDEXED,
-            named_params! { ":since": self.cursor()? },
-            |r| r.get(0),
-        )?;
-        coverage.local.unindexed = unindexed as u64;
         let behind: i64 = self
             .conn
             .query_row_cached(search::BEHIND, [], |r| r.get(0))?;
         coverage.local.behind = behind.max(0) as u64;
+        if behind > 0 {
+            let unindexed: i64 = self.conn.query_row_cached(
+                search::COUNT_UNINDEXED,
+                named_params! { ":since": self.cursor()? },
+                |r| r.get(0),
+            )?;
+            coverage.local.unindexed = unindexed as u64;
+        }
 
-        // NOTE: a range leaves the horizon when it starts before it or ends
-        // after it, an open side always (SEARCH §8.1); a date term under
-        // `or` or `not` counts as open on both sides.
-        let dated = query
-            .terms()
-            .into_iter()
-            .any(|(term, _)| matches!(term.predicate, PimdirQueryPredicate::Date(_)));
-        let calendar = collections.iter().any(|c| c.kind == "text/calendar");
-        if !(dated && calendar) {
-            return Ok(coverage);
+        if !(scope.dated && calendar) {
+            return Ok(PimdirCoverageHeld {
+                coverage,
+                floating: None,
+            });
         }
 
         let cut: i64 = self.conn.query_row_cached(
@@ -1608,17 +1762,12 @@ impl PimdirIndex {
                 .query_row_cached(search::LOAD_INDEX_META, [], |r| {
                     Ok((r.get(4)?, r.get(5)?, r.get(11)?))
                 })?;
-        coverage.horizon_left = since
-            .as_ref()
-            .is_none_or(|since| since.as_str() < start.as_str())
-            || until
-                .as_ref()
-                .is_none_or(|until| until.as_str() > end.as_str());
-        // NOTE: compared as names, a client stating none stating `UTC`
-        // (SEARCH §8.1).
-        let stated = clock.zone.as_deref().unwrap_or(coverage::FLOATING_ZONE);
-        coverage.zone_differs = stated != floating;
-        Ok(coverage)
+        coverage.horizon_left = since.is_none_or(|since| since < start.as_str())
+            || until.is_none_or(|until| until > end.as_str());
+        Ok(PimdirCoverageHeld {
+            coverage,
+            floating: Some(floating),
+        })
     }
 }
 
@@ -2012,6 +2161,56 @@ fn unanswerable(err: rusqlite::Error) -> PimdirError {
 #[cfg(test)]
 mod tests {
     use crate::client::search::*;
+
+    /// A second answer over a scope, with no commit to the store or the
+    /// index between, is the coverage the handle holds, here marked by a
+    /// cut no statement answers; a commit to the store, or a refresh, has
+    /// it read again (SEARCH §8.2).
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn a_coverage_is_read_again_once_the_store_or_the_index_moved() {
+        use crate::client::PimdirStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let collection = |name: &str| {
+            PimdirStore::open(dir.path())
+                .unwrap()
+                .for_source("local")
+                .ensure_collection(name, "message/rfc822")
+                .unwrap();
+        };
+        collection("INBOX");
+        let mut index = PimdirIndex::open(dir.path()).unwrap();
+        index
+            .refresh(&PimdirIndexRefreshOptions::default())
+            .unwrap();
+
+        let clock = PimdirSearchClock::default();
+        let mark = |index: &PimdirIndex| {
+            for held in index.coverages.borrow_mut().held.values_mut() {
+                held.coverage.cut = 7;
+            }
+        };
+        let cut = |index: &PimdirIndex, query: &str| {
+            let query = PimdirQuery::parse(query).unwrap();
+            index.count(&query, &clock).unwrap().coverage.cut
+        };
+
+        for (query, added) in [("kind:mail", "Archive"), ("anything", "Sent")] {
+            assert_eq!(cut(&index, query), 0, "{query}");
+            mark(&index);
+            assert_eq!(cut(&index, query), 7, "{query}: the coverage held");
+
+            collection(added);
+            assert_eq!(cut(&index, query), 0, "{query}: read after a commit");
+
+            mark(&index);
+            index
+                .refresh(&PimdirIndexRefreshOptions::default())
+                .unwrap();
+            assert_eq!(cut(&index, query), 0, "{query}: read after a refresh");
+        }
+    }
 
     /// A page selected then sorted is the slice of the whole answer sorted
     /// after the cursor, in every order, at every cursor and limit, ties

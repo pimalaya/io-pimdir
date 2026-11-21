@@ -308,6 +308,28 @@ impl PimdirSearchTemporal {
         temporal
     }
 
+    /// The axis over the range `[since, until)` of collections whose
+    /// sources, rolled up, closed rounds over scopes whose highest floor is
+    /// `floor` and lowest ceiling `ceiling`, one never closing a round when
+    /// `filling`: what [`over`](Self::over) answers for every source one by
+    /// one, a floor or a ceiling being a cause exactly when the highest or
+    /// the lowest is.
+    #[cfg(feature = "client")]
+    pub(crate) fn rolled(
+        floor: Option<String>,
+        ceiling: Option<String>,
+        filling: bool,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Self {
+        let scope = PimdirScope {
+            since: floor,
+            until: ceiling,
+        };
+        let never = filling.then_some(None);
+        Self::over(core::iter::once(Some(&scope)).chain(never), since, until)
+    }
+
     /// Narrows this axis by another: the highest floor, the lowest
     /// ceiling, either filling.
     pub fn merge(&mut self, other: &Self) {
@@ -384,6 +406,61 @@ mod tests {
             since: since.map(ToString::to_string),
             until: until.map(ToString::to_string),
             filling,
+        }
+    }
+
+    /// The sources' coverages rolled up in one row answer the axis each
+    /// source answers in turn, over every range: up to three sources, each
+    /// filling or closed over any pair of bounds.
+    #[cfg(feature = "client")]
+    #[test]
+    fn the_rolled_sources_answer_what_each_answers() {
+        use alloc::{vec, vec::Vec};
+
+        let instants = [None, Some("2026-01"), Some("2026-06"), Some("2027-01")];
+        let mut sources: Vec<Option<PimdirScope>> = vec![None];
+        for since in instants {
+            for until in instants {
+                sources.push(Some(PimdirScope {
+                    since: since.map(ToString::to_string),
+                    until: until.map(ToString::to_string),
+                }));
+            }
+        }
+
+        let mut sets: Vec<Vec<&Option<PimdirScope>>> = vec![Vec::new()];
+        for a in &sources {
+            sets.push(vec![a]);
+            for b in &sources {
+                sets.push(vec![a, b]);
+                for c in sources.iter().step_by(3) {
+                    sets.push(vec![a, b, c]);
+                }
+            }
+        }
+
+        for set in &sets {
+            let closed = set.iter().filter_map(|source| source.as_ref());
+            let floor = closed.clone().filter_map(|s| s.since.clone()).max();
+            let ceiling = closed.filter_map(|s| s.until.clone()).min();
+            let filling = set.iter().any(|source| source.is_none());
+            for since in instants {
+                for until in instants {
+                    let each = PimdirSearchTemporal::over(
+                        set.iter().map(|source| source.as_ref()),
+                        since,
+                        until,
+                    );
+                    let rolled = PimdirSearchTemporal::rolled(
+                        floor.clone(),
+                        ceiling.clone(),
+                        filling,
+                        since,
+                        until,
+                    );
+                    assert_eq!(rolled, each, "{set:?} over {since:?}..{until:?}");
+                }
+            }
         }
     }
 

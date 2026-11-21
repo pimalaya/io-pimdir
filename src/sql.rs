@@ -112,6 +112,17 @@ WHERE i.object_hash IS NULL AND i.deleted = 0 AND i.retained_at IS NULL
   AND c.kind <> 'application/octet-stream'
   AND i.collection IN (SELECT value FROM temp.param WHERE slot = 'collections')
 GROUP BY c.kind;"#;
+
+/// The coverage of the sources of the collections of the `collections`
+/// slot (STORAGE §4.4) rolled up in one row, the temporal axis of a search
+/// (SEARCH §8.2): the highest floor and the lowest ceiling of those that
+/// closed a round, and how many never closed one. What `list_coverage`
+/// answers one collection at a time, read in one statement.
+ROLL_COVERAGE = r#"SELECT max(covered_since) FILTER (WHERE covered_at IS NOT NULL),
+       min(covered_until) FILTER (WHERE covered_at IS NOT NULL),
+       count(*) - count(covered_at)
+FROM sources
+WHERE collection IN (SELECT value FROM temp.param WHERE slot = 'collections');"#;
 }
 
 #[cfg(test)]

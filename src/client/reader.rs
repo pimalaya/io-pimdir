@@ -1900,17 +1900,17 @@ impl PimdirReader {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<PimdirSearchCoverage, PimdirError> {
-        let mut coverage = PimdirSearchCoverage {
-            temporal: self.search_temporal(collections, since, until)?,
-            ..Default::default()
-        };
-        coverage.local.reads = PimdirSearchReads::text();
-
         bind_list(
             &self.conn,
             "collections",
             collections.iter().map(|c| c.as_ref()),
         )?;
+        let mut coverage = PimdirSearchCoverage {
+            temporal: rolled_temporal(&self.conn, sql::ROLL_COVERAGE, since, until)?,
+            ..Default::default()
+        };
+        coverage.local.reads = PimdirSearchReads::text();
+
         let bodiless = rows(&self.conn, sql::COUNT_BODILESS, [], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -1919,26 +1919,6 @@ impl PimdirReader {
         }
 
         Ok(coverage)
-    }
-
-    /// Whether every collection's coverage (§10) holds the range `[since,
-    /// until)`, RFC 3339 instants with either side open: the temporal axis
-    /// of a search's coverage (SEARCH §8.2).
-    pub(crate) fn search_temporal(
-        &self,
-        collections: &[impl AsRef<str>],
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> Result<PimdirSearchTemporal, PimdirError> {
-        let mut temporal = PimdirSearchTemporal::Full;
-        for collection in collections {
-            let sources = self.list_coverage(collection)?;
-            let scopes = sources
-                .iter()
-                .map(|source| source.coverage.as_ref().map(|coverage| &coverage.scope));
-            temporal.merge(&PimdirSearchTemporal::over(scopes, since, until));
-        }
-        Ok(temporal)
     }
 
     /// Joins the address rows onto a page spanning collections, read for
@@ -1982,6 +1962,27 @@ pub fn like_pattern(words: &str) -> String {
     }
     pattern.push('%');
     pattern
+}
+
+/// Whether every collection's coverage (§10) holds the range `[since,
+/// until)`, RFC 3339 instants with either side open: the temporal axis of
+/// a search's coverage (SEARCH §8.2), read from the one row `statement`
+/// rolls the collections' sources up in (`ROLL_COVERAGE`).
+pub(crate) fn rolled_temporal(
+    conn: &Connection,
+    statement: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<PimdirSearchTemporal, PimdirError> {
+    let (floor, ceiling, filling): (Option<String>, Option<String>, i64) =
+        conn.query_row_cached(statement, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(PimdirSearchTemporal::rolled(
+        floor,
+        ceiling,
+        filling > 0,
+        since,
+        until,
+    ))
 }
 
 /// Maps an `item_reference` row in its canonical column order.

@@ -50,10 +50,36 @@ pub const CLEAR_TERM_MATCH: &str = r#"DELETE FROM temp.term_match;"#;
 
 /// The live items of the collections of the `collections` slot (STORAGE
 /// §4.4) stamped above the index cursor: what an answer may see stale or
-/// not at all.
-pub const COUNT_UNINDEXED: &str = r#"SELECT count(*) FROM store.items
+/// not at all. It seeks the change stamps past the cursor, never every
+/// item of the collections (`items_by_seq`), and a client asks it only
+/// while `behind` is above 0, no item being stamped above the cursor
+/// otherwise.
+pub const COUNT_UNINDEXED: &str = r#"SELECT count(*) FROM store.items INDEXED BY items_by_changed
 WHERE changed > :since AND deleted = 0 AND retained_at IS NULL
   AND collection IN (SELECT value FROM temp.param WHERE slot = 'collections');"#;
+
+/// The coverage of the sources of the collections of the `collections`
+/// slot rolled up in one row (SEARCH §8.2): the highest floor and the
+/// lowest ceiling of those that closed a round, and how many never closed
+/// one. What `list_coverage` answers one collection at a time, read in
+/// one statement for every collection of a query.
+pub const ROLL_COVERAGE: &str = r#"SELECT max(covered_since) FILTER (WHERE covered_at IS NOT NULL),
+       min(covered_until) FILTER (WHERE covered_at IS NOT NULL),
+       count(*) - count(covered_at)
+FROM store.sources
+WHERE collection IN (SELECT value FROM temp.param WHERE slot = 'collections');"#;
+
+/// Every collection's id, account and kind: what a query's conjuncts
+/// narrow its coverage's collections by (SEARCH §8.2).
+pub const SCOPE_COLLECTIONS: &str = r#"SELECT id, account, kind FROM store.collections;"#;
+
+/// The version of index.db as this connection sees it, moved by every
+/// commit of another connection.
+pub const INDEX_DATA_VERSION: &str = r#"PRAGMA main.data_version;"#;
+
+/// The version of the attached store as this connection sees it, moved by
+/// every commit of another connection.
+pub const STORE_DATA_VERSION: &str = r#"PRAGMA store.data_version;"#;
 
 /// The items an `id:` value names, every kind each is held under (SEARCH
 /// §8): the item of `seq`, `NULL` for a value not of digits, and every
@@ -128,6 +154,10 @@ WHERE m.thread = :thread AND c.account IS :account AND c.kind = 'message/rfc822'
 /// Every statement of this crate's own, paired with its constant name.
 pub const OWN: &[(&str, &str)] = &[
     ("COUNT_UNINDEXED", COUNT_UNINDEXED),
+    ("ROLL_COVERAGE", ROLL_COVERAGE),
+    ("SCOPE_COLLECTIONS", SCOPE_COLLECTIONS),
+    ("INDEX_DATA_VERSION", INDEX_DATA_VERSION),
+    ("STORE_DATA_VERSION", STORE_DATA_VERSION),
     ("LOAD_ENDS", LOAD_ENDS),
     ("LOAD_PLACEMENT", LOAD_PLACEMENT),
     ("TASK_CATEGORY_VALUES", TASK_CATEGORY_VALUES),
@@ -144,4 +174,67 @@ pub const OWN: &[(&str, &str)] = &[
 /// its name.
 pub fn all() -> impl Iterator<Item = (&'static str, &'static str)> {
     CANONICAL.iter().chain(OWN).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{format, string::String, vec, vec::Vec};
+
+    use rusqlite::{Connection, params_from_iter, types::Null};
+
+    use crate::sql::{self, search::*};
+
+    /// An index database with the store attached as `store`, both at the
+    /// inlined schemas, and the connection's temporary tables.
+    fn index() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("pimdir.db");
+        Connection::open(&store)
+            .unwrap()
+            .execute_batch(sql::MIGRATION_0001)
+            .unwrap();
+        let conn = Connection::open(dir.path().join("index.db")).unwrap();
+        conn.execute_batch(MIGRATION_0001).unwrap();
+        conn.execute("ATTACH DATABASE ?1 AS store", [store.to_str().unwrap()])
+            .unwrap();
+        conn.execute_batch(sql::CREATE_PARAM).unwrap();
+        (dir, conn)
+    }
+
+    /// The steps of a statement's query plan, its parameters `NULL`.
+    fn plan(conn: &Connection, statement: &str) -> Vec<String> {
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+            .unwrap();
+        let nulls = vec![Null; plan.parameter_count()];
+        plan.query_map(params_from_iter(nulls), |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The unindexed count seeks the change stamps past the cursor, never
+    /// walking each collection's items (`items_by_seq`, 41 ms at 3,311
+    /// collections).
+    #[test]
+    fn the_unindexed_count_seeks_the_change_stamp() {
+        let (_dir, conn) = index();
+        let steps = plan(&conn, COUNT_UNINDEXED);
+        let seek = "store.items USING INDEX items_by_changed (changed>?)";
+        assert!(steps.iter().any(|step| step.contains(seek)), "{steps:?}");
+        assert!(
+            !steps.iter().any(|step| step.contains("items_by_seq")),
+            "{steps:?}"
+        );
+    }
+
+    /// The temporal axis reads the sources of a scope's collections by
+    /// their key, in one statement.
+    #[test]
+    fn the_rolled_coverage_seeks_the_sources_by_collection() {
+        let (_dir, conn) = index();
+        let steps = plan(&conn, ROLL_COVERAGE);
+        let seek = "store.sources USING INDEX sqlite_autoindex_sources_1 (collection=?)";
+        assert!(steps.iter().any(|step| step.contains(seek)), "{steps:?}");
+    }
 }
