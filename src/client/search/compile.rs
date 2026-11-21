@@ -491,6 +491,42 @@ impl Compiled {
         )
     }
 
+    /// Every live placement of the scope with its system flags, its
+    /// collection by rowid, its public id and `items.marks`, collection
+    /// after collection, read off `items_by_sort` alone, which holds the
+    /// bits of every live row.
+    pub(crate) fn scope_marks(&self) -> String {
+        format!(
+            "SELECT c.rowid, y.seq, y.marks FROM store.collections c CROSS JOIN store.items y \
+             INDEXED BY items_by_sort ON y.collection = c.id AND y.deleted = 0 WHERE {}",
+            self.at_scope("c")
+        )
+    }
+
+    /// The bit of `items.marks` each leaf tests, `None` for one the scope
+    /// implies, when the query is system flags alone over a scope of kinds
+    /// and accounts: every placement of a hit then lies in the scope, a
+    /// public id spanning no kind and a hit being one account's, so the
+    /// scope's placements tell whether any of a hit's holds a bit (SEARCH
+    /// §8.2). `None` otherwise.
+    pub(crate) fn flagwise(&self) -> Option<Vec<Option<i64>>> {
+        if self.plan.scope.collections.is_some() {
+            return None;
+        }
+        let bits: Vec<Option<i64>> = self
+            .plan
+            .leaves
+            .iter()
+            .enumerate()
+            .map(|(at, leaf)| match &leaf.predicate {
+                _ if self.plan.scoped.contains(&at) => Some(None),
+                PimdirQueryPredicate::Flag(flag) => codec::mark_of(flag).map(Some),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        bits.iter().any(Option::is_some).then_some(bits)
+    }
+
     /// How many collections the scope holds.
     pub(crate) fn collections(&self) -> String {
         format!(

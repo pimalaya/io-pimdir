@@ -441,6 +441,15 @@ pub struct PimdirPlanCosts {
     pub seek: u64,
     /// The head of one collection a walk reads before it starts.
     pub head: u64,
+    /// A live placement of the scope read off `items_by_sort` with its
+    /// system flags and marked in bitmaps, a count of system flags alone
+    /// passing over every one.
+    pub flags_row: u64,
+    /// A row of `unread` a count reads, each of its hits seeking its other
+    /// placements for `\Seen`.
+    pub unread_row: u64,
+    /// A row of `marked` a count reads, made distinct per hit.
+    pub marked_row: u64,
 }
 
 impl Default for PimdirPlanCosts {
@@ -453,6 +462,9 @@ impl Default for PimdirPlanCosts {
             source_probe: 4_000,
             seek: 1_500,
             head: 1_000,
+            flags_row: 104,
+            unread_row: 785,
+            marked_row: 330,
         }
     }
 }
@@ -657,6 +669,38 @@ impl PimdirPlan {
         };
         let access = self.access(&driver, bounds, costs, force, None);
         PimdirPlanChoice { driver, access }
+    }
+
+    /// Whether a count of system flags alone over a scope of about `items`
+    /// rows passes over them once rather than reading its cheapest set:
+    /// when no term has a set a driver could read, or that set costs as
+    /// much as the pass, a set its estimate capped counting the whole
+    /// store. A store mostly read keeps reading its few unread rows.
+    pub fn scans_flags(
+        &self,
+        bounds: &[Option<PimdirPlanBound>],
+        items: u64,
+        costs: &PimdirPlanCosts,
+    ) -> bool {
+        let cheapest = self
+            .leaves
+            .iter()
+            .zip(bounds)
+            .filter_map(|(leaf, bound)| {
+                let bound = bound.as_ref()?;
+                let rows = match bound.capped {
+                    true => items,
+                    false => bound.rows,
+                };
+                let row = match leaf.estimate {
+                    PimdirPlanEstimate::Unread => costs.unread_row,
+                    PimdirPlanEstimate::Marked => costs.marked_row,
+                    _ => return None,
+                };
+                Some(rows.saturating_mul(row))
+            })
+            .min();
+        cheapest.is_none_or(|cost| cost >= items.saturating_mul(costs.flags_row))
     }
 
     /// The driver of a page of `limit` hits in `sort` over a scope of
@@ -1349,6 +1393,21 @@ mod tests {
 
     fn plan(query: &str) -> PimdirPlan {
         PimdirPlan::new(&PimdirQuery::parse(query).unwrap(), 0, &TimeZone::UTC)
+    }
+
+    #[test]
+    fn a_flag_count_passes_over_the_store_unless_its_set_is_cheaper() {
+        let costs = PimdirPlanCosts::default();
+        let unread = plan("is:unread");
+        assert!(unread.scans_flags(&[bound(149_041)], 520_000, &costs));
+        assert!(!unread.scans_flags(&[bound(2_000)], 520_000, &costs));
+        assert!(unread.scans_flags(&[bound(CAP)], 520_000, &costs));
+        let flagged = plan("is:flagged");
+        assert!(!flagged.scans_flags(&[bound(20_399)], 520_000, &costs));
+        assert!(flagged.scans_flags(&[bound(CAP)], 520_000, &costs));
+        let both = plan("is:unread is:flagged");
+        assert!(!both.scans_flags(&[bound(149_041), bound(20_399)], 520_000, &costs));
+        assert!(plan("not is:unread").scans_flags(&[None], 520_000, &costs));
     }
 
     /// A scope of `collections` collections in a store of 520k rows.

@@ -15,6 +15,7 @@ change: as-fast-as-notmuch
 - [x] A page in the store's order with probes for a broad driver, a keyset cursor; threads grouped for the page alone, 1098b16
 - [x] Coverage once per query, cached per index handle on data_version (the per-collection stale set left); `COUNT_UNINDEXED` on `items_by_changed`; the temporal axis in one statement (F8), cac005d
 - [ ] Every search vector green; the bench's query table against the gates
+- [x] Counts of system flags alone over a scope of kinds and accounts by one pass over `items_by_sort` when it costs less than the cheapest flag set (`PimdirPlan::scans_flags`): `is:unread` 126 to 69 ms (notmuch 13), `kind:mail is:unread` 201 to 54, `is:read` 167 to 60, `not is:unread` 462 to 57; a store mostly read keeps walking its few unread rows (log 2026-11-21-flag-counts-in-one-pass)
 - [x] Text counts off the full-text index once it is current: one read transaction, no store seek per text hit, text terms alone combined as bitmaps per account; `enron` 506 to 107 ms, `california` 60 to 21, `power california` 125 to 44 (log 2026-11-21-text-counts-off-the-index). Left: the seek from a body to its placement, about 0.2 µs a matched row; FTS5's own `and` answers `power california` in 6 ms but is exact per hit only where a hit's placements name one document
 - [x] System flags read from the store's marks (decided 2026-11-21, pimdir e2b7f49): the unread count at 518k from 572 to 116 ms, not the 45 expected, `is:flagged` from 28 to 45 (log 2026-11-21-system-flags-from-the-store)
 

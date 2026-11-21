@@ -360,8 +360,10 @@ fn every_driver_answers_alike_and_seeks() {
     );
     let (_, plan) = ran("is:unread").last().unwrap();
     assert!(
-        plan.iter().any(|step| step.contains("INDEX items_unread")),
-        "an unread count reads the unread rows off items_unread\n{}",
+        plan.iter()
+            .any(|step| step.contains("y USING COVERING INDEX items_by_sort")),
+        "an unread count over a store two thirds unread passes over the \
+         items by their sort index alone\n{}",
         plan.join("\n")
     );
 

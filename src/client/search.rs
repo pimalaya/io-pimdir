@@ -110,6 +110,88 @@ const LOCK: &str = "index.lock";
 /// each); a store past it counts each placement's representative by a seek.
 const BITMAP_SEQ_MAX: i64 = 1 << 26;
 
+/// Hits as bitmaps of public ids, one per account by its number.
+type Hits = Vec<Vec<u64>>;
+
+/// Marks the hit `seq` of account `account`.
+fn hit(hits: &mut Hits, account: usize, seq: i64) {
+    let Some(bits) = hits.get_mut(account) else {
+        return;
+    };
+    let seq = seq.max(0) as usize;
+    let word = seq / 64;
+    if bits.len() <= word {
+        bits.resize(word + 1, 0);
+    }
+    bits[word] |= 1u64 << (seq % 64);
+}
+
+/// Adds the hits of `other` to `hits`.
+fn unite(hits: &mut Hits, other: &Hits) {
+    for (bits, other) in hits.iter_mut().zip(other) {
+        if bits.len() < other.len() {
+            bits.resize(other.len(), 0);
+        }
+        for (word, other) in bits.iter_mut().zip(other) {
+            *word |= other;
+        }
+    }
+}
+
+/// Keeps the hits of `hits` that `other` holds.
+fn intersect(hits: &mut Hits, other: &Hits) {
+    for (bits, other) in hits.iter_mut().zip(other) {
+        bits.truncate(other.len());
+        for (word, other) in bits.iter_mut().zip(other) {
+            *word &= other;
+        }
+    }
+}
+
+/// Takes the hits of `other` away from `hits`.
+fn subtract(hits: &mut Hits, other: &Hits) {
+    for (bits, other) in hits.iter_mut().zip(other) {
+        for (word, other) in bits.iter_mut().zip(other) {
+            *word &= !other;
+        }
+    }
+}
+
+/// How many hits `hits` holds.
+fn hits_counted(hits: &Hits) -> u64 {
+    hits.iter()
+        .flatten()
+        .map(|word| u64::from(word.count_ones()))
+        .sum()
+}
+
+/// The hits of `node` among `every`, each leaf's from `leaf`: `not`
+/// the hits of `every` its operand leaves out.
+fn flagged(node: &PimdirPlanNode, every: &Hits, leaf: &impl Fn(usize) -> Hits) -> Hits {
+    match node {
+        PimdirPlanNode::Leaf(at) => leaf(*at),
+        PimdirPlanNode::Not(operand) => {
+            let mut hits = every.clone();
+            subtract(&mut hits, &flagged(operand, every, leaf));
+            hits
+        }
+        PimdirPlanNode::And(operands) => {
+            let mut hits = every.clone();
+            for operand in operands {
+                intersect(&mut hits, &flagged(operand, every, leaf));
+            }
+            hits
+        }
+        PimdirPlanNode::Or(operands) => {
+            let mut hits = vec![Vec::new(); every.len()];
+            for operand in operands {
+                unite(&mut hits, &flagged(operand, every, leaf));
+            }
+            hits
+        }
+    }
+}
+
 /// The collections of the store by id, each with its account's number,
 /// for a count marking hits per account; none read when the store holds
 /// one account, every row then being its.
@@ -1165,6 +1247,20 @@ impl PimdirIndex {
         }
 
         let bounds = self.estimate(&compiled)?;
+        if self.force.get().is_none()
+            && let Some(bits) = compiled.flagwise()
+        {
+            let items = self.items_held()?;
+            if items <= BITMAP_SEQ_MAX
+                && compiled.plan.scans_flags(
+                    &bounds,
+                    items.max(0) as u64,
+                    &PimdirPlanCosts::default(),
+                )
+            {
+                return self.count_flagwise(&compiled, &bits);
+            }
+        }
         let choice = compiled
             .plan
             .count(&bounds, &PimdirPlanCosts::default(), self.force.get());
@@ -1660,12 +1756,11 @@ impl PimdirIndex {
             collections: held,
             accounts: counted.max(0) as usize,
         };
-        let marked = self.marked(compiled, &compiled.plan.root, &held)?;
-        Ok(marked
-            .iter()
-            .flatten()
-            .map(|word| u64::from(word.count_ones()))
-            .sum())
+        Ok(hits_counted(&self.marked(
+            compiled,
+            &compiled.plan.root,
+            &held,
+        )?))
     }
 
     /// The hits of `node` as bitmaps of public ids per account, under the
@@ -1677,22 +1772,15 @@ impl PimdirIndex {
         compiled: &Compiled,
         node: &PimdirPlanNode,
         held: &Held,
-    ) -> Result<Vec<Vec<u64>>, PimdirError> {
+    ) -> Result<Hits, PimdirError> {
         match node {
             PimdirPlanNode::Leaf(at) => {
                 let mut marked = vec![Vec::new(); held.accounts];
                 for sql in compiled.placements(*at) {
                     self.run(sql, &compiled.values, &[], |row| {
-                        let Some(account) = held.account(row)? else {
-                            return Ok(());
-                        };
-                        let seq = row.get::<_, i64>(1)?.max(0) as usize;
-                        let bits = &mut marked[account];
-                        let word = seq / 64;
-                        if bits.len() <= word {
-                            bits.resize(word + 1, 0);
+                        if let Some(account) = held.account(row)? {
+                            hit(&mut marked, account, row.get(1)?);
                         }
-                        bits[word] |= 1u64 << (seq % 64);
                         Ok(())
                     })?;
                 }
@@ -1701,59 +1789,101 @@ impl PimdirIndex {
             PimdirPlanNode::Or(operands) => {
                 let mut marked = vec![Vec::new(); held.accounts];
                 for operand in operands {
-                    for (bits, other) in
-                        marked.iter_mut().zip(self.marked(compiled, operand, held)?)
-                    {
-                        if bits.len() < other.len() {
-                            bits.resize(other.len(), 0);
-                        }
-                        for (word, other) in bits.iter_mut().zip(other) {
-                            *word |= other;
-                        }
-                    }
+                    unite(&mut marked, &self.marked(compiled, operand, held)?);
                 }
                 Ok(marked)
             }
             PimdirPlanNode::And(operands) => {
-                let mut marked: Option<Vec<Vec<u64>>> = None;
+                let mut marked: Option<Hits> = None;
                 for operand in operands {
                     if matches!(operand, PimdirPlanNode::Not(_)) {
                         continue;
                     }
                     let other = self.marked(compiled, operand, held)?;
-                    marked = Some(match marked {
-                        None => other,
-                        Some(mut marked) => {
-                            for (bits, other) in marked.iter_mut().zip(other) {
-                                bits.truncate(other.len());
-                                for (word, other) in bits.iter_mut().zip(other) {
-                                    *word &= other;
-                                }
-                            }
-                            marked
-                        }
-                    });
+                    match &mut marked {
+                        None => marked = Some(other),
+                        Some(marked) => intersect(marked, &other),
+                    }
                 }
                 let mut marked = marked.unwrap_or_else(|| vec![Vec::new(); held.accounts]);
                 for operand in operands {
                     let PimdirPlanNode::Not(negated) = operand else {
                         continue;
                     };
-                    if marked.iter().flatten().all(|word| *word == 0) {
+                    if hits_counted(&marked) == 0 {
                         break;
                     }
-                    for (bits, other) in
-                        marked.iter_mut().zip(self.marked(compiled, negated, held)?)
-                    {
-                        for (word, other) in bits.iter_mut().zip(other) {
-                            *word &= !other;
-                        }
-                    }
+                    subtract(&mut marked, &self.marked(compiled, negated, held)?);
                 }
                 Ok(marked)
             }
             PimdirPlanNode::Not(_) => Ok(vec![Vec::new(); held.accounts]),
         }
+    }
+
+    /// How many hits a query of system flags alone has over a scope of
+    /// kinds and accounts, `bits` the bit each leaf tests
+    /// ([`flagwise`](Compiled::flagwise)): the scope's live placements
+    /// read once off `items_by_sort` with their `items.marks`, each hit
+    /// marked in a bitmap per account, and per bit whether any of its
+    /// placements holds it (SEARCH §8.2), the bitmaps then combined as the
+    /// query combines its terms, a term the scope implies holding for
+    /// every hit.
+    fn count_flagwise(
+        &self,
+        compiled: &Compiled,
+        bits: &[Option<i64>],
+    ) -> Result<u64, PimdirError> {
+        let mut accounts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut held: BTreeMap<i64, usize> = BTreeMap::new();
+        for (rowid, account) in
+            self.run(&compiled.scope_accounts(), &compiled.values, &[], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+        {
+            let next = accounts.len();
+            held.insert(rowid, *accounts.entry(account).or_insert(next));
+        }
+        let wanted: Vec<i64> = bits
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut every: Hits = vec![Vec::new(); accounts.len()];
+        let mut holding: Vec<Hits> = vec![vec![Vec::new(); accounts.len()]; wanted.len()];
+        let mut last: Option<(i64, usize)> = None;
+        self.run(&compiled.scope_marks(), &compiled.values, &[], |row| {
+            let rowid: i64 = row.get(0)?;
+            let account = match last {
+                Some((at, account)) if at == rowid => account,
+                _ => {
+                    let Some(account) = held.get(&rowid).copied() else {
+                        return Ok(());
+                    };
+                    last = Some((rowid, account));
+                    account
+                }
+            };
+            let seq: i64 = row.get(1)?;
+            let marks: i64 = row.get(2)?;
+            hit(&mut every, account, seq);
+            for (bit, hits) in wanted.iter().zip(holding.iter_mut()) {
+                if marks & bit == *bit {
+                    hit(hits, account, seq);
+                }
+            }
+            Ok(())
+        })?;
+        let leaf = |at: usize| match bits[at] {
+            Some(bit) => wanted
+                .iter()
+                .position(|wanted| *wanted == bit)
+                .map_or_else(|| every.clone(), |at| holding[at].clone()),
+            None => every.clone(),
+        };
+        Ok(hits_counted(&flagged(&compiled.plan.root, &every, &leaf)))
     }
 
     /// Reads what each text term needs under the plan's access: its
