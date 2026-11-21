@@ -59,6 +59,7 @@ use alloc::{
 use log::{debug, trace};
 
 use crate::{
+    codec,
     coroutine::{PimdirArgError, PimdirCoroutineState},
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLinkId},
@@ -525,7 +526,8 @@ impl PimdirIndexRefresh {
     /// placement, a live one has its body indexed when new, its placement
     /// upserted, its summary text written while it has no body and dropped
     /// once it has one, its occurrences re-expanded when its body changed
-    /// and its flags replaced. A message placed, rebodied, rekeyed or
+    /// and its keywords replaced, never its system flags, which a query
+    /// reads from the store. A message placed, rebodied, rekeyed or
     /// dropped is touched, to be rethreaded before the run completes.
     ///
     /// Summary text is held exactly while a placement names no body, so
@@ -664,7 +666,14 @@ impl PimdirIndexRefresh {
             self.ops.push(PimdirIndexOp::ReplaceFlags {
                 collection: row.collection,
                 seq: row.seq,
-                flags: row.flags.known().cloned().unwrap_or_default(),
+                flags: row
+                    .flags
+                    .known()
+                    .into_iter()
+                    .flatten()
+                    .filter(|flag| codec::mark_of(flag).is_none())
+                    .cloned()
+                    .collect(),
             });
         }
         self.drop_unplaced();
@@ -976,7 +985,7 @@ pub enum PimdirIndexOp {
     DropUnplaced(PimdirHash),
     /// Puts a placement, or updates its key and body (`upsert_placement`).
     PutPlacement(PimdirIndexPlacement),
-    /// Drops a placement, its flags and occurrences with it, and its
+    /// Drops a placement, its keywords and occurrences with it, and its
     /// summary text (`delete_placement`, then `delete_summary_text` by the
     /// id it returned).
     DropPlacement {
@@ -1003,14 +1012,16 @@ pub enum PimdirIndexOp {
         /// The placement's `seq` there.
         seq: i64,
     },
-    /// Replaces a placement's flags (`replace_flags`, then `insert_flag`),
-    /// an unknown set as none.
+    /// Replaces a placement's keywords (`replace_flags`, then
+    /// `insert_flag`), an unknown set as none: its flags but the five
+    /// system flags, which `items.marks` holds and the index refuses
+    /// (SEARCH §3, §4).
     ReplaceFlags {
         /// The collection.
         collection: String,
         /// The placement's `seq` there.
         seq: i64,
-        /// The flags.
+        /// The keywords.
         flags: BTreeSet<String>,
     },
     /// Replaces a placement's occurrences and records its cut

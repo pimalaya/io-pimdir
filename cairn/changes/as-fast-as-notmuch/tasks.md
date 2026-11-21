@@ -15,6 +15,7 @@ change: as-fast-as-notmuch
 - [x] A page in the store's order with probes for a broad driver, a keyset cursor; threads grouped for the page alone, 1098b16
 - [x] Coverage once per query, cached per index handle on data_version (the per-collection stale set left); `COUNT_UNINDEXED` on `items_by_changed`; the temporal axis in one statement (F8), cac005d
 - [ ] Every search vector green; the bench's query table against the gates
+- [x] System flags read from the store's marks (decided 2026-11-21, pimdir e2b7f49): the unread count at 518k from 572 to 116 ms, not the 45 expected, `is:flagged` from 28 to 45 (log 2026-11-21-system-flags-from-the-store)
 
 ## Phase 3, writes and the index
 

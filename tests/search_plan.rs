@@ -181,11 +181,16 @@ fn statements(dir: &Path, run: impl FnOnce()) -> Vec<(String, Vec<String>)> {
 }
 
 /// Whether a plan step reads every row of the store's items, or of one
-/// of their indexes whole: a `SCAN` of an alias the compiler gives them.
+/// of their indexes whole: a `SCAN` of an alias the compiler gives them,
+/// but of `items_unread`, which holds the unread rows alone, the set
+/// `unread` answers (SEARCH §8).
 fn scans_items(step: &str) -> bool {
     let Some(rest) = step.strip_prefix("SCAN ") else {
         return false;
     };
+    if rest.ends_with("INDEX items_unread") {
+        return false;
+    }
     let alias = rest.split_whitespace().next().unwrap_or_default();
     ["y", "i", "s", "r", "ei", "items"].contains(&alias)
         || (alias.starts_with('j') && alias[1..].bytes().all(|b| b.is_ascii_digit()))
@@ -298,13 +303,14 @@ fn every_driver_answers_alike_and_seeks() {
         ("from:user1@example.org", false),
         ("is:unread", true),
         ("is:unread", false),
+        ("-is:flagged", true),
     ] {
         let parsed = PimdirQuery::parse(query).unwrap();
         let ran = statements(dir.path(), || match count {
             true => drop(index.count(&parsed, &clock).unwrap()),
             false => drop(index.search(&parsed, &page).unwrap()),
         });
-        if query != "is:unread" || !count {
+        if query != "-is:flagged" {
             seeks(query, &ran);
         }
         for (sql, plan) in &ran {
@@ -338,15 +344,24 @@ fn every_driver_answers_alike_and_seeks() {
     assert!(walks("folder:home/INBOX") >= 1, "one collection walked");
     assert_eq!(walks("kiwi"), 0, "five hits read as a set");
 
-    let (_, _, unread) = shown
-        .iter()
-        .find(|(query, count, _)| *query == "is:unread" && *count)
-        .unwrap();
-    let (_, plan) = unread.last().unwrap();
+    let ran = |query: &str| {
+        shown
+            .iter()
+            .find(|(shown, count, _)| *shown == query && *count)
+            .map(|(_, _, ran)| ran)
+            .unwrap()
+    };
+    let (_, plan) = ran("-is:flagged").last().unwrap();
     assert!(
         plan.iter()
             .any(|step| step.contains("y USING COVERING INDEX items_by_sort")),
         "a scope count reads the items by their sort index alone\n{}",
+        plan.join("\n")
+    );
+    let (_, plan) = ran("is:unread").last().unwrap();
+    assert!(
+        plan.iter().any(|step| step.contains("INDEX items_unread")),
+        "an unread count reads the unread rows off items_unread\n{}",
         plan.join("\n")
     );
 

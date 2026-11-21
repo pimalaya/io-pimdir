@@ -24,6 +24,7 @@ use core::cmp::Ordering;
 use jiff::tz::TimeZone;
 
 use crate::{
+    codec,
     coroutine::PimdirCoroutineState,
     search::query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
     summary::file,
@@ -41,6 +42,9 @@ const SET_PAGES: u64 = 20;
 /// a walk is expected to examine, its hits clustering rather than spread
 /// evenly.
 const WALK_SPREAD: u64 = 4;
+
+/// The bit of `\Seen` in `items.marks` (STORAGE §13).
+const SEEN: i64 = 1;
 
 /// The most rows one walk step examines.
 const STEP_MAX: usize = 4_096;
@@ -377,8 +381,16 @@ pub enum PimdirPlanEstimate {
     Text,
     /// The `item_address` rows of one address.
     Address,
-    /// The `flag` rows of one flag.
+    /// The index's `flag` rows of one keyword (`flagged`).
     Flag,
+    /// The store's live rows holding one system flag's bit in
+    /// `items.marks` (`marked`, SEARCH §8), read off `items_by_sort`.
+    Marked,
+    /// The store's live rows lacking `\Seen` (`unread`, SEARCH §8), a seek
+    /// on `items_unread`: the set of `is:unread`, holding every hit of it
+    /// and those of which another placement holds the bit, which the term,
+    /// still probed per hit, leaves out (SEARCH §8.2).
+    Unread,
     /// The live items of one collection.
     Collection,
     /// The items stamped within the range.
@@ -584,20 +596,16 @@ impl PimdirPlan {
                 }
             }
             match conjunct {
-                PimdirPlanNode::Leaf(at) if plan.is_set(*at) => sets.push(vec![*at]),
                 PimdirPlanNode::Or(operands) => {
                     let leaves: Option<Vec<usize>> = operands
                         .iter()
-                        .map(|operand| match operand {
-                            PimdirPlanNode::Leaf(at) if plan.is_set(*at) => Some(*at),
-                            _ => None,
-                        })
+                        .map(|operand| plan.set_of(operand))
                         .collect();
                     if let Some(leaves) = leaves {
                         sets.push(leaves);
                     }
                 }
-                _ => (),
+                conjunct => sets.extend(plan.set_of(conjunct).map(|at| vec![at])),
             }
         }
         plan.sets = sets;
@@ -851,7 +859,7 @@ impl PimdirPlan {
     ) -> u64 {
         let mut row = costs.seek;
         for (at, (leaf, access)) in self.leaves.iter().zip(access).enumerate() {
-            if self.scoped.contains(&at) || skip.contains(&at) {
+            if self.scoped.contains(&at) || (skip.contains(&at) && self.are_exact(skip)) {
                 continue;
             }
             row = row.saturating_add(match (leaf.is_text(), access) {
@@ -894,11 +902,34 @@ impl PimdirPlan {
         (0..self.leaves.len()).all(|at| self.scoped.contains(&at))
     }
 
-    /// Whether a leaf's set may drive the query: a positive term a
-    /// client measures.
-    fn is_set(&self, at: usize) -> bool {
-        let leaf = &self.leaves[at];
-        !leaf.negated && leaf.estimate != PimdirPlanEstimate::None
+    /// Whether the union of the sets of `set` holds exactly the hits
+    /// meeting its terms, so a statement reading it need not probe them:
+    /// every set but `is:unread`'s, which holds a hit one placement of
+    /// which lacks `\Seen` while another holds it (SEARCH §8.2).
+    pub fn are_exact(&self, set: &[usize]) -> bool {
+        set.iter()
+            .all(|at| self.leaves[*at].estimate != PimdirPlanEstimate::Unread)
+    }
+
+    /// The leaf whose set may drive the query as `node`, a conjunct or an
+    /// operand of a conjunct `or`: a positive term a client measures, or
+    /// `is:unread`, a negated `\Seen` read off `items_unread`.
+    fn set_of(&self, node: &PimdirPlanNode) -> Option<usize> {
+        match node {
+            PimdirPlanNode::Leaf(at) => {
+                let leaf = &self.leaves[*at];
+                (!leaf.negated && leaf.estimate != PimdirPlanEstimate::None).then_some(*at)
+            }
+            PimdirPlanNode::Not(operand) => match **operand {
+                PimdirPlanNode::Leaf(at)
+                    if self.leaves[at].estimate == PimdirPlanEstimate::Unread =>
+                {
+                    Some(at)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Lifts one node of the query to the plan, its terms appended to
@@ -932,7 +963,7 @@ impl PimdirPlan {
                     PimdirQueryPredicate::Date(range) => Some(range.bounds(now, zone)),
                     _ => None,
                 };
-                let estimate = estimate(&term.predicate, &self.undated);
+                let estimate = estimate(&term.predicate, negated, &self.undated);
                 self.leaves.push(PimdirPlanLeaf {
                     predicate: term.predicate.clone(),
                     negated,
@@ -1251,9 +1282,17 @@ pub fn is_undated(media_type: &str) -> bool {
     media_type == "text/vcard" || media_type == file::KIND
 }
 
-/// What a client measures of a term's set, `undated` the undated kinds
-/// the query names, every item of which a date term holds.
-fn estimate(predicate: &PimdirQueryPredicate, undated: &[&str]) -> PimdirPlanEstimate {
+/// What a client measures of a term's set, `negated` when an odd number
+/// of negations applies to it, `undated` the undated kinds the query
+/// names, every item of which a date term holds. A system flag reads the
+/// store's `items.marks` (SEARCH §8): `\Seen` negated, `is:unread`, its
+/// `unread` rows, any other its `marked` rows; a keyword the index's
+/// `flag` rows.
+fn estimate(
+    predicate: &PimdirQueryPredicate,
+    negated: bool,
+    undated: &[&str],
+) -> PimdirPlanEstimate {
     match predicate {
         PimdirQueryPredicate::Text { .. } => PimdirPlanEstimate::Text,
         PimdirQueryPredicate::Address { text, .. } => match text.text.contains('@') {
@@ -1261,7 +1300,11 @@ fn estimate(predicate: &PimdirQueryPredicate, undated: &[&str]) -> PimdirPlanEst
             true => PimdirPlanEstimate::Address,
             false => PimdirPlanEstimate::Text,
         },
-        PimdirQueryPredicate::Flag(_) => PimdirPlanEstimate::Flag,
+        PimdirQueryPredicate::Flag(flag) => match codec::mark_of(flag) {
+            Some(SEEN) if negated => PimdirPlanEstimate::Unread,
+            Some(_) => PimdirPlanEstimate::Marked,
+            None => PimdirPlanEstimate::Flag,
+        },
         PimdirQueryPredicate::Collection(_) => PimdirPlanEstimate::Collection,
         PimdirQueryPredicate::Changed { .. } => PimdirPlanEstimate::Changed,
         PimdirQueryPredicate::Date(_) if undated.is_empty() => PimdirPlanEstimate::Date,
@@ -1344,8 +1387,9 @@ mod tests {
     #[test]
     fn a_set_is_a_positive_conjunct_a_client_reads_whole() {
         assert_eq!(plan("kiwi").sets, vec![vec![0]]);
-        assert_eq!(plan("kind:mail is:unread").sets, Vec::<Vec<usize>>::new());
         assert_eq!(plan("kind:mail is:read").sets, vec![vec![1]]);
+        assert_eq!(plan("not tag:t").sets, Vec::<Vec<usize>>::new());
+        assert_eq!(plan("-is:flagged").sets, Vec::<Vec<usize>>::new());
         assert_eq!(plan("california not gas").sets, vec![vec![0]]);
         assert_eq!(
             plan("from:a@x.org (from:b@x.org or tag:t) kiwi").sets,
@@ -1364,6 +1408,31 @@ mod tests {
             vec![vec![1]],
             "a label or a property is a set, read by seek"
         );
+    }
+
+    #[test]
+    fn a_system_flag_reads_the_store_and_unread_is_a_set_still_probed() {
+        let unread = plan("kind:mail is:unread");
+        assert_eq!(unread.sets, vec![vec![1]], "is:unread reads items_unread");
+        assert_eq!(unread.leaves[1].estimate, PimdirPlanEstimate::Unread);
+        assert!(!unread.are_exact(&[1]), "a hit read elsewhere is probed");
+        assert_eq!(plan("-is:read").sets, vec![vec![0]]);
+        assert_eq!(plan("x or is:unread").sets, vec![vec![0, 1]]);
+        assert!(!plan("x or is:unread").are_exact(&[0, 1]));
+
+        let read = plan("is:read tag:\\Deleted tag:$todo tag:\\seen");
+        let estimates: Vec<_> = read.leaves.iter().map(|leaf| leaf.estimate).collect();
+        assert_eq!(
+            estimates,
+            vec![
+                PimdirPlanEstimate::Marked,
+                PimdirPlanEstimate::Marked,
+                PimdirPlanEstimate::Flag,
+                PimdirPlanEstimate::Flag,
+            ],
+            "the five by their exact bytes, any other a keyword"
+        );
+        assert!(read.are_exact(&[0]));
     }
 
     #[test]

@@ -17,7 +17,10 @@
 //!
 //! A `label:` or `property:` term reads the store's `item_property`, never
 //! the index: a property is the item's, so it holds for the hit of every
-//! account filing the seq (STORAGE §4.3).
+//! account filing the seq (STORAGE §4.3). A system flag reads the store's
+//! `items.marks` as it stands, never the index (SEARCH §8): its set the
+//! rows `unread` or `marked` answers, its probe the bit of the hit's live
+//! placements; a keyword reads the index's `flag` table.
 //!
 //! Every value is bound by name, the n-th `:vn`, so one fragment renders
 //! into any statement; a statement's own values take other names.
@@ -35,12 +38,12 @@ use rusqlite::types::Value;
 #[cfg(test)]
 use crate::search::query::PimdirQuery;
 use crate::{
-    property,
+    codec, property,
     search::{
         fold,
         plan::{
             self, CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanBound, PimdirPlanEstimate,
-            PimdirPlanNode, PimdirSearchSort, PimdirWalkStep,
+            PimdirPlanNode, PimdirPlanScope, PimdirSearchSort, PimdirWalkStep,
         },
         query::{
             PimdirQueryDateRange, PimdirQueryId, PimdirQueryKind, PimdirQueryPredicate,
@@ -212,12 +215,23 @@ impl Compiled {
     }
 
     /// How many hits the union of the sets of `set` holds that have a
-    /// live placement in the scope and meet the query.
+    /// live placement in the scope and meet the query. A set of system
+    /// flags reads live placements off the store as it stands, so over an
+    /// unbounded scope each of its hits has one and none is sought.
     pub(crate) fn count_set(&self, set: &[usize]) -> String {
+        let live = set.iter().all(|at| {
+            matches!(
+                self.plan.leaves[*at].estimate,
+                PimdirPlanEstimate::Marked | PimdirPlanEstimate::Unread
+            )
+        });
+        let placed = match live && self.plan.scope == PimdirPlanScope::default() {
+            true => String::from("1"),
+            false => self.placed("h.akey", "h.seq"),
+        };
         format!(
-            "SELECT count(*) FROM ({}) h WHERE {} AND {}",
+            "SELECT count(*) FROM ({}) h WHERE {placed} AND {}",
             self.driven(set),
-            self.placed("h.akey", "h.seq"),
             self.condition("h.akey", "h.seq", &self.skip(set)),
         )
     }
@@ -447,9 +461,14 @@ impl Compiled {
 
     /// The leaves a statement over the scope's placements, reading the
     /// sets of `set`, need not probe: those the scope implies and those
-    /// of the sets read.
+    /// of the sets read, unless one of them holds more hits than meet it
+    /// (`is:unread`).
     pub(crate) fn skip(&self, set: &[usize]) -> Vec<usize> {
-        self.plan.scoped.iter().chain(set).copied().collect()
+        let read = match self.plan.are_exact(set) {
+            true => set,
+            false => &[],
+        };
+        self.plan.scoped.iter().chain(read).copied().collect()
     }
 
     /// Renders one node over the hit `(akey, seq)`.
@@ -589,7 +608,10 @@ impl Compiled {
     /// item whose link id it is (SEARCH §8). `label:` and `property:` read
     /// the store's `item_property` by the hit's seq, whatever its account
     /// (STORAGE §4.3): `property:` its value byte for byte, `label:` the
-    /// spellings the caller found folding to the term's.
+    /// spellings the caller found folding to the term's. A system flag
+    /// reads `items.marks` (SEARCH §8): `is:unread`, a negated `\Seen`, its
+    /// set from `unread`, a hit of which another placement holds the bit
+    /// then left out by the term's probe; another its set from `marked`.
     fn leaf(&mut self, at: usize, ends: &Ends, categories: &Categories, labels: &Labels) -> Leaf {
         let predicate = self.plan.leaves[at].predicate.clone();
         let negated = self.plan.leaves[at].negated;
@@ -722,20 +744,35 @@ impl Compiled {
                 }
                 small(&mut leaf, &linked.join(" UNION "), &j)
             }
-            PimdirQueryPredicate::Flag(flag) => {
-                let flag = self.bind(flag.clone());
-                leaf.set = Some(format!(
-                    "SELECT ifnull(c.account, '') AS akey, f.seq AS seq FROM flag f \
-                     JOIN store.collections c ON c.id = f.collection WHERE f.flag = {flag}"
-                ));
-                leaf.estimate = Some(format!(
-                    "SELECT count(*) FROM (SELECT 1 FROM flag WHERE flag = {flag} LIMIT {CAP})"
-                ));
-                format!(
-                    "EXISTS (SELECT 1 FROM flag f{at} WHERE f{at}.flag = {flag} \
-                     AND f{at}.collection = {j}.collection AND f{at}.seq = {j}.seq)"
-                )
-            }
+            PimdirQueryPredicate::Flag(flag) => match codec::mark_of(flag) {
+                Some(bit) => {
+                    let set = match self.plan.leaves[at].estimate {
+                        PimdirPlanEstimate::Unread => self.embed(search::UNREAD, Vec::new()),
+                        _ => self.embed(search::MARKED, vec![(":mark", bit.into())]),
+                    };
+                    leaf.set = Some(format!(
+                        "SELECT ifnull(c.account, '') AS akey, m.seq AS seq FROM ({set}) m \
+                         JOIN store.collections c ON c.id = m.collection"
+                    ));
+                    leaf.estimate = Some(format!("SELECT count(*) FROM ({set} LIMIT {CAP})"));
+                    format!("{j}.marks & {bit} = {bit}")
+                }
+                None => {
+                    let flag = self.bind(flag.clone());
+                    leaf.set = Some(format!(
+                        "SELECT ifnull(c.account, '') AS akey, f.seq AS seq FROM flag f \
+                         JOIN store.collections c ON c.id = f.collection WHERE f.flag = {flag}"
+                    ));
+                    leaf.estimate = Some(format!(
+                        "SELECT count(*) FROM (SELECT 1 FROM flag WHERE flag = {flag} \
+                         LIMIT {CAP})"
+                    ));
+                    format!(
+                        "EXISTS (SELECT 1 FROM flag f{at} WHERE f{at}.flag = {flag} \
+                         AND f{at}.collection = {j}.collection AND f{at}.seq = {j}.seq)"
+                    )
+                }
+            },
             PimdirQueryPredicate::Encrypted => {
                 leaf.set = Some(String::from(
                     "SELECT ifnull(c.account, '') AS akey, p.seq AS seq FROM object o \

@@ -318,12 +318,14 @@ fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> 
 
 /// The refresh cases of vectors/search/refresh.json (SEARCH §11, STORAGE
 /// §4.5): after each write, the feed above the cursor read before it, then
-/// the answers of the refreshed index and of one rebuilt from the store.
+/// the answers of the refreshed index and of one rebuilt from the store,
+/// those of a `lagging` step also asked before the refresh, the index one
+/// write behind.
 #[test]
 fn every_refresh_vector_answers() {
     let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/refresh.json"));
-    assert_eq!(vectors["v"], 3, "refresh.json at another version");
+    assert_eq!(vectors["v"], 4, "refresh.json at another version");
     let now = unix(
         json(&spec.join("vectors/search/queries.json"))["now"]
             .as_str()
@@ -372,6 +374,14 @@ fn every_refresh_vector_answers() {
                 apply(&spec, dir.path(), &mut kinds, &step["write"]);
                 feed(dir.path(), &cursor, &step["changed"]);
 
+                let lagging = step["lagging"].as_bool() == Some(true);
+                if lagging {
+                    for query in step["queries"].as_array().unwrap() {
+                        let text = query["query"].as_str().unwrap();
+                        let want: BTreeSet<_> = pairs(&query["hits"]).into_iter().collect();
+                        refreshed_hits(&index, text, &want, "lagging");
+                    }
+                }
                 index.refresh(&refreshed).unwrap();
                 let rebuilt = tempfile::tempdir().unwrap();
                 PimdirReader::open(dir.path())
@@ -399,14 +409,53 @@ fn every_refresh_vector_answers() {
                         continue;
                     }
                     let want: BTreeSet<_> = pairs(&query["hits"]).into_iter().collect();
-                    assert_eq!(hit_set(&index, text), want, "{text:?}: refreshed");
-                    assert_eq!(hit_set(&fresh, text), want, "{text:?}: rebuilt");
+                    refreshed_hits(&index, text, &want, "refreshed");
+                    refreshed_hits(&fresh, text, &want, "rebuilt");
                 }
             });
             outcomes.push((name, outcome));
         }
     }
     pending::settle("refresh", outcomes);
+}
+
+/// One refresh query answers `want`, its hits listed and counted, under
+/// the plan's own driver and under each driver forced, `how` naming the
+/// index asked.
+fn refreshed_hits(index: &PimdirIndex, text: &str, want: &BTreeSet<(String, i64)>, how: &str) {
+    let parsed = PimdirQuery::parse(text).unwrap_or_else(|err| panic!("{text:?}: {err}"));
+    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
+        .sets
+        .is_empty();
+    let forces = [
+        None,
+        Some(PimdirPlanForce::Set),
+        Some(PimdirPlanForce::Walk),
+        Some(PimdirPlanForce::Scope),
+        Some(PimdirPlanForce::Fallback),
+    ];
+    for force in forces {
+        if matches!(
+            force,
+            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
+        ) && !sets
+        {
+            continue;
+        }
+        let _unforced = Unforced(index);
+        index.force_driver(force);
+        assert_eq!(
+            hit_set(index, text),
+            *want,
+            "{text:?}: {how} under {force:?}"
+        );
+        let count = index.count(&parsed, &PimdirSearchClock::default()).unwrap();
+        assert_eq!(
+            count.count as usize,
+            want.len(),
+            "{text:?}: {how} count under {force:?}"
+        );
+    }
 }
 
 /// Applies one refresh write as an owner makes it.
