@@ -126,6 +126,9 @@ struct Leaf {
     /// The statements reading those bodies and summaries into
     /// `temp.term_source`, by id.
     sources: Vec<String>,
+    /// A text term's FTS5 expression and whether a summary holds its
+    /// field, which it then matches too.
+    fts: Option<(String, bool)>,
 }
 
 /// A positive text term, probed against one hit's body or summary.
@@ -280,6 +283,63 @@ impl Compiled {
     /// `SELECT collection, seq`.
     pub(crate) fn placements(&self, at: usize) -> &[String] {
         &self.leaves[at].placements
+    }
+
+    /// Text term `at`'s FTS5 expression and whether a summary holds its
+    /// field.
+    pub(crate) fn text_of(&self, at: usize) -> Option<(&str, bool)> {
+        let (expression, summary) = self.leaves[at].fts.as_ref()?;
+        Some((expression, *summary))
+    }
+
+    /// A query [`bitwise`](Self::bitwise) admits as one FTS5 expression
+    /// over the bodies, or over the summaries when `summary`: an `and` its
+    /// positive operands joined by `AND`, `NOT` the `OR` of its negated
+    /// ones, an `or` its operands joined by `OR`. A term whose field no
+    /// summary holds matches none, so over the summaries an `and` holding
+    /// it as a positive operand matches none, and it leaves an `or` and
+    /// the negated operands of an `and`. `None` for an expression that
+    /// matches no document.
+    pub(crate) fn joint(&self, summary: bool) -> Option<String> {
+        self.jointly(&self.plan.root, summary)
+    }
+
+    /// [`joint`](Self::joint) of one node.
+    fn jointly(&self, node: &PimdirPlanNode, summary: bool) -> Option<String> {
+        match node {
+            PimdirPlanNode::Leaf(at) => {
+                let (expression, held) = self.text_of(*at)?;
+                (held || !summary).then(|| format!("({expression})"))
+            }
+            PimdirPlanNode::Or(operands) => {
+                let joined: Vec<String> = operands
+                    .iter()
+                    .filter_map(|operand| self.jointly(operand, summary))
+                    .collect();
+                (!joined.is_empty()).then(|| format!("({})", joined.join(" OR ")))
+            }
+            PimdirPlanNode::And(operands) => {
+                let mut positive = Vec::new();
+                let mut negated = Vec::new();
+                for operand in operands {
+                    match operand {
+                        PimdirPlanNode::Not(operand) => {
+                            negated.extend(self.jointly(operand, summary));
+                        }
+                        operand => positive.push(self.jointly(operand, summary)?),
+                    }
+                }
+                if positive.is_empty() {
+                    return None;
+                }
+                let positive = positive.join(" AND ");
+                Some(match negated.is_empty() {
+                    true => format!("({positive})"),
+                    false => format!("(({positive}) NOT ({}))", negated.join(" OR ")),
+                })
+            }
+            PimdirPlanNode::Not(_) => None,
+        }
     }
 
     /// How many hits the scope's live placements hold that meet the
@@ -707,6 +767,7 @@ impl Compiled {
             placements: Vec::new(),
             source: None,
             sources: Vec::new(),
+            fts: None,
         };
         let (j, c) = (format!("j{at}"), format!("c{at}"));
 
@@ -1143,6 +1204,7 @@ impl Compiled {
             leaf.set = Some(String::from("SELECT '' AS akey, 0 AS seq WHERE 0"));
             return;
         };
+        leaf.fts = Some((expression.clone(), summary));
         self.read_matches(leaf, at, search::MATCH_OBJECTS, "body", &expression, None);
         if summary {
             self.read_matches(

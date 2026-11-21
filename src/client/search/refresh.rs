@@ -39,8 +39,10 @@ pub(crate) struct Statements<'a> {
 
 impl Statements<'_> {
     /// Answers one yield, writing a [`Writes`] yield's ops in order, their
-    /// full-text rows last ([`TextWrite`]). A body that cannot be read is
-    /// answered as a gone one (SEARCH §4).
+    /// full-text rows last ([`TextWrite`]), then whether each public id a
+    /// placement was put or dropped for is split (`split_forget`,
+    /// `split_mark`, SEARCH §4). A body that cannot be read is answered as a
+    /// gone one (SEARCH §4).
     ///
     /// [`Writes`]: PimdirIndexRefreshYield::Writes
     pub(crate) fn answer(
@@ -181,10 +183,25 @@ impl Statements<'_> {
             }
             PimdirIndexRefreshYield::Writes(ops) => {
                 let mut texts = Vec::new();
+                let mut placed = BTreeSet::new();
                 for op in ops {
+                    match &op {
+                        PimdirIndexOp::PutPlacement(placement) => {
+                            placed.insert(placement.seq);
+                        }
+                        PimdirIndexOp::DropPlacement { seq, .. } => {
+                            placed.insert(*seq);
+                        }
+                        _ => (),
+                    }
                     self.write(op, &mut texts)?;
                 }
                 self.write_texts(texts)?;
+                for seq in placed {
+                    let key = named_params! { ":seq": seq };
+                    tx.execute_cached(search::SPLIT_FORGET, key)?;
+                    tx.execute_cached(search::SPLIT_MARK, key)?;
+                }
                 PimdirIndexRefreshArg::Written
             }
         };

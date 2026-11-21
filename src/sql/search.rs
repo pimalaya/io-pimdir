@@ -30,6 +30,11 @@ pub const FORMAT_DRAFT: u32 = 16;
 /// `init_index_meta` writes in `index_meta.shape`.
 pub const SHAPE: &str = "canonical";
 
+/// How many public ids the index records as split (`split`, SEARCH §3),
+/// counted up to `:limit`: a text count evaluates that many hits per
+/// placement (`split_seqs`) or reads each term's placements whole.
+pub const SPLIT_HELD: &str = r#"SELECT count(*) FROM (SELECT 1 FROM split LIMIT :limit);"#;
+
 /// The matches of a query's text terms (SEARCH §8.5), each read once
 /// through `match_objects` or `match_summaries` before the query runs and
 /// numbered by the term, so a query of many terms joins one table rather
@@ -236,6 +241,7 @@ pub const OWN: &[(&str, &str)] = &[
     ("MESSAGE_CHILDREN", MESSAGE_CHILDREN),
     ("HIT_THREAD", HIT_THREAD),
     ("THREAD_SPAN", THREAD_SPAN),
+    ("SPLIT_HELD", SPLIT_HELD),
 ];
 
 /// Every search statement, canonical then this crate's own, paired with

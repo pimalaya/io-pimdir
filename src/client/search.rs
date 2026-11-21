@@ -126,6 +126,30 @@ fn hit(hits: &mut Hits, account: usize, seq: i64) {
     bits[word] |= 1u64 << (seq % 64);
 }
 
+/// The most split public ids a text count evaluates per placement (`split`,
+/// SEARCH §3); past it each term's placements are read whole.
+const SPLIT_MAX: i64 = 1024;
+
+/// Unmarks the hit `seq` of every account.
+fn forget(hits: &mut Hits, seq: i64) {
+    let seq = seq.max(0) as usize;
+    for bits in hits {
+        if let Some(word) = bits.get_mut(seq / 64) {
+            *word &= !(1u64 << (seq % 64));
+        }
+    }
+}
+
+/// Whether `node` holds for a hit whose leaves hold as `terms` says.
+fn holds(node: &PimdirPlanNode, terms: &[bool]) -> bool {
+    match node {
+        PimdirPlanNode::Leaf(at) => terms[*at],
+        PimdirPlanNode::Not(operand) => !holds(operand, terms),
+        PimdirPlanNode::And(operands) => operands.iter().all(|operand| holds(operand, terms)),
+        PimdirPlanNode::Or(operands) => operands.iter().any(|operand| holds(operand, terms)),
+    }
+}
+
 /// Adds the hits of `other` to `hits`.
 fn unite(hits: &mut Hits, other: &Hits) {
     for (bits, other) in hits.iter_mut().zip(other) {
@@ -214,8 +238,16 @@ impl Held {
         };
         Ok(core::str::from_utf8(collection)
             .ok()
-            .and_then(|collection| self.collections.get(collection))
-            .copied())
+            .and_then(|collection| self.of(collection)))
+    }
+
+    /// The number of the account collection `collection` belongs to;
+    /// `None` for a collection the store does not hold.
+    fn of(&self, collection: &str) -> Option<usize> {
+        if self.accounts == 1 {
+            return Some(0);
+        }
+        self.collections.get(collection).copied()
     }
 }
 
@@ -1756,11 +1788,114 @@ impl PimdirIndex {
             collections: held,
             accounts: counted.max(0) as usize,
         };
+        if let Some(marked) = self.marked_jointly(compiled, &held)? {
+            return Ok(hits_counted(&marked));
+        }
         Ok(hits_counted(&self.marked(
             compiled,
             &compiled.plan.root,
             &held,
         )?))
+    }
+
+    /// The hits of a query [`bitwise`](Compiled::bitwise) admits as bitmaps
+    /// of public ids per account, its terms matched together by one FTS5
+    /// expression over the bodies and one over the summaries
+    /// ([`joint`](Compiled::joint)), each matching document's placements
+    /// marked; then each split public id (`split_seqs`, SEARCH §3) taken
+    /// away and evaluated per account, each term holding when any of its
+    /// placements there matches it (SEARCH §8.2), its body by `match_object`
+    /// and its summary by `match_summary`. `None` past [`SPLIT_MAX`] split
+    /// ids.
+    fn marked_jointly(
+        &self,
+        compiled: &Compiled,
+        held: &Held,
+    ) -> Result<Option<Hits>, PimdirError> {
+        let split: i64 = self.conn.query_row_cached(
+            search::SPLIT_HELD,
+            named_params! { ":limit": SPLIT_MAX + 1 },
+            |row| row.get(0),
+        )?;
+        if split > SPLIT_MAX {
+            return Ok(None);
+        }
+
+        let mut marked = vec![Vec::new(); held.accounts];
+        for (statement, summary) in [
+            (search::MATCH_OBJECTS, false),
+            (search::MATCH_SUMMARIES, true),
+        ] {
+            let Some(expression) = compiled.joint(summary) else {
+                continue;
+            };
+            let sql = statement
+                .replace("bm25(object_text)", "NULL")
+                .replace("bm25(summary_text)", "NULL");
+            let bound = [(String::from(":match"), Value::from(expression))];
+            self.run(&sql, &[], &bound, |row| {
+                if let Some(account) = held.account(row)? {
+                    hit(&mut marked, account, row.get(1)?);
+                }
+                Ok(())
+            })?;
+        }
+
+        let leaves = compiled.plan.leaves.len();
+        let placements = self.run(search::SPLIT_SEQS, &[], &[], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut split: BTreeMap<i64, Vec<(String, Option<String>)>> = BTreeMap::new();
+        for (seq, collection, hash) in placements {
+            split.entry(seq).or_default().push((collection, hash));
+        }
+        for (seq, placements) in split {
+            forget(&mut marked, seq);
+            let mut holding: BTreeMap<usize, Vec<bool>> = BTreeMap::new();
+            for (collection, hash) in placements {
+                let Some(account) = held.of(&collection) else {
+                    continue;
+                };
+                let terms = holding
+                    .entry(account)
+                    .or_insert_with(|| vec![false; leaves]);
+                for (at, term) in terms.iter_mut().enumerate() {
+                    let Some((expression, summary)) = compiled.text_of(at) else {
+                        continue;
+                    };
+                    let expression = Value::from(String::from(expression));
+                    if let Some(hash) = &hash {
+                        let probe = [
+                            (String::from(":match"), expression.clone()),
+                            (String::from(":hash"), Value::from(hash.clone())),
+                        ];
+                        *term |= !self
+                            .run(search::MATCH_OBJECT, &[], &probe, |_| Ok(()))?
+                            .is_empty();
+                    }
+                    if summary && !*term {
+                        let probe = [
+                            (String::from(":match"), expression),
+                            (String::from(":collection"), Value::from(collection.clone())),
+                            (String::from(":seq"), Value::from(seq)),
+                        ];
+                        *term |= !self
+                            .run(search::MATCH_SUMMARY, &[], &probe, |_| Ok(()))?
+                            .is_empty();
+                    }
+                }
+            }
+            for (account, terms) in holding {
+                if holds(&compiled.plan.root, &terms) {
+                    hit(&mut marked, account, seq);
+                }
+            }
+        }
+        Ok(Some(marked))
     }
 
     /// The hits of `node` as bitmaps of public ids per account, under the

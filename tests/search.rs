@@ -325,7 +325,7 @@ fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> 
 fn every_refresh_vector_answers() {
     let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/refresh.json"));
-    assert_eq!(vectors["v"], 4, "refresh.json at another version");
+    assert_eq!(vectors["v"], 5, "refresh.json at another version");
     let now = unix(
         json(&spec.join("vectors/search/queries.json"))["now"]
             .as_str()
@@ -399,6 +399,19 @@ fn every_refresh_vector_answers() {
                     };
                     assert_eq!(held(dir.path()), objects, "object rows: refreshed");
                     assert_eq!(held(rebuilt.path()), objects, "object rows: rebuilt");
+                }
+                if let Some(split) = step["split"].as_array() {
+                    let want: Vec<i64> = split.iter().map(|seq| seq.as_i64().unwrap()).collect();
+                    let held = |dir: &Path| -> Vec<i64> {
+                        let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+                        let mut seqs = conn.prepare("SELECT seq FROM split ORDER BY seq").unwrap();
+                        seqs.query_map([], |r| r.get(0))
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .collect()
+                    };
+                    assert_eq!(held(dir.path()), want, "split rows: refreshed");
+                    assert_eq!(held(rebuilt.path()), want, "split rows: rebuilt");
                 }
                 for query in step["queries"].as_array().unwrap() {
                     let text = query["query"].as_str().unwrap();
@@ -1301,6 +1314,90 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
     );
     assert_eq!(report.removed, 1);
     assert_eq!(hits(&index, "beta"), Vec::<i64>::new());
+}
+
+/// A hit whose placements in one account hold two bodies meets a term when
+/// any of them matches it (SEARCH §8.2), so its terms are counted across
+/// the bodies, never within each one: `apple banana` holds for it though
+/// neither body holds both words, and `apple not banana` does not. The
+/// index keeps the public ids so split as their placements move.
+#[test]
+fn a_hit_holding_two_bodies_counts_its_terms_across_them() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(dir.path(), "INBOX", message("a@x", "Alpha", "apple"), &[]);
+    file_message(
+        dir.path(),
+        "Archive",
+        message("a@x", "Alpha", "banana"),
+        &[],
+    );
+    file_message(
+        dir.path(),
+        "INBOX",
+        message("b@x", "Beta", "apple banana"),
+        &[],
+    );
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let refresh = |index: &mut PimdirIndex| {
+        assert!(
+            index
+                .refresh(&PimdirIndexRefreshOptions::default())
+                .unwrap()
+                .is_current()
+        );
+    };
+    let count = |index: &PimdirIndex, query: &str| {
+        index
+            .count(
+                &PimdirQuery::parse(query).unwrap(),
+                &PimdirSearchClock::default(),
+            )
+            .unwrap()
+            .count
+    };
+    let split = || -> Vec<i64> {
+        let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+        let mut statement = conn.prepare("SELECT seq FROM split ORDER BY seq").unwrap();
+        statement
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    refresh(&mut index);
+    let seq = hits(&index, "banana not beta")[0];
+
+    assert_eq!(split(), vec![seq]);
+    assert_eq!(count(&index, "apple banana"), 2);
+    assert_eq!(count(&index, "body:apple body:banana"), 2);
+    assert_eq!(count(&index, "apple not banana"), 0);
+    assert_eq!(count(&index, "alpha not (apple or banana)"), 0);
+    assert_eq!(count(&index, "apple or banana"), 2);
+
+    file_message(dir.path(), "Archive", message("a@x", "Alpha", "apple"), &[]);
+    refresh(&mut index);
+    assert_eq!(split(), Vec::<i64>::new(), "both name one body now");
+    assert_eq!(count(&index, "apple banana"), 1);
+    assert_eq!(count(&index, "apple not banana"), 1);
+
+    file_message(
+        dir.path(),
+        "Archive",
+        message("a@x", "Alpha", "banana"),
+        &[],
+    );
+    refresh(&mut index);
+    assert_eq!(split(), vec![seq]);
+    assert_eq!(count(&index, "apple banana"), 2);
+
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .delete_collection("Archive")
+        .unwrap();
+    refresh(&mut index);
+    assert_eq!(split(), Vec::<i64>::new(), "its other placement went");
+    assert_eq!(count(&index, "apple banana"), 1);
+    assert_eq!(count(&index, "apple not banana"), 1);
 }
 
 /// A batch writes the text of its bodies as one full-text segment: FTS5
