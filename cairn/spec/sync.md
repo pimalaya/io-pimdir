@@ -239,7 +239,7 @@ This is a shape requirement rather than a behaviour one, and it is stated becaus
 A delta snapshot keeps its own rule for which of the joined handles is a candidate: the ones it reported changed or vanished, plus every locally non-clean handle, whose pending push it would otherwise never revisit. A never-based one (a staged create) is a candidate with no remote state to merge against, since the enumeration will not mention it until it lands.
 
 ### Requirement: A write batch is bounded and cut between candidates
-The merge SHALL hand a write batch over once it holds `PimdirSync::WRITE_CHUNK` writes, rather than holding one write per member until the last candidate is resolved. What this bounds is memory rather than a crash window: a lost batch costs a re-merge, where a lost push costs a round trip.
+The merge SHALL hand a write batch over once it holds `PimdirSync::WRITE_CHUNK` writes, rather than holding one write per member until the last candidate is resolved. What this bounds is memory rather than a crash window: a lost batch costs a re-merge, where a lost push costs a round trip. It is 4,096 (1,024 until 2026-11-21), above a page of 1,000 new members, two writes each plus the round's, so such a page lands in one transaction (pimdir GUIDE §10); at 1,024 a page past about 510 new members split in two, 3,925 transactions for 3,535 pages on the 517k bench (pimdir the-write-path-before-the-freeze, prototypes-2026-11-21.md, item 4).
 
 A batch SHALL be cut between candidates and never inside one. The writes one candidate derives are consistent only together: a vanished local edit is a `Superseded` drop of its handle beside the `Created` upsert carrying its body, and a cut between them would lose that body if the next batch never landed.
 

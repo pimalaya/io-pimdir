@@ -466,8 +466,11 @@ impl PimdirSync {
     ///
     /// Bounds memory rather than a crash window: a lost batch costs a free
     /// re-merge. A floor, not a ceiling, since it never cuts through the
-    /// writes of one candidate.
-    pub const WRITE_CHUNK: usize = 1024;
+    /// writes of one candidate. Above a page of 1,000 new members (two
+    /// writes each, plus the round's), so such a page lands in one
+    /// transaction as pimdir GUIDE §10 writes it; the page's bodies are held
+    /// already, so the batch adds no memory of its own.
+    pub const WRITE_CHUNK: usize = 4096;
 
     /// Creates a coroutine that reconciles `collection`.
     pub fn new(collection: impl Into<PimdirCollectionId>, opts: PimdirSyncOptions) -> Self {
