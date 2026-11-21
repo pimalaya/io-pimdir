@@ -24,7 +24,7 @@ This directory is a crate of its own (an empty `[workspace]`, `publish = false`)
 Every script reads `B` (default /home/soywod/code/pimalaya/.bench-notmuch) and keeps everything under it: the tools, the builds, the archive, the corpus and the runs. `B` must be on ext4: /tmp is a tmpfs shared by every session, so a store or a build there measures memory, not a disk, and fills a space others need.
 
 ```text
-$B/tools, tools-1, tools-2, tools-eat, tools-jq   notmuch, GNU time, hyperfine, libeatmydata, jq (GC roots)
+$B/tools, tools-1, tools-2, tools-eat, tools-jq-bin   notmuch, GNU time, hyperfine, libeatmydata, jq (GC roots)
 $B/target/release/pimbench              this crate
 $B/target-cli/release/pimdir            the pimdir CLI (--features cli)
 $B/versions                             what setup.sh built and with which tools

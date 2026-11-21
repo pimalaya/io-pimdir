@@ -11,7 +11,7 @@ HYPERFINE=${HYPERFINE:-$B/tools-2/bin/hyperfine}
 EATMYDATA=${EATMYDATA:-$B/tools-eat/bin/eatmydata}
 PIMBENCH=${PIMBENCH:-$B/target/release/pimbench}
 PIMDIR=${PIMDIR:-$B/target-cli/release/pimdir}
-JQ=${JQ:-$B/tools-jq/bin/jq}
+JQ=${JQ:-$B/tools-jq-bin/bin/jq}
 
 # measure LOG LABEL CMD...: appends "== LABEL", the command's output, an
 # "io ..." line (the bytes of /proc/PID/io of a shell that reaped the
