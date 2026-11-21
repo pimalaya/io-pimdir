@@ -32,7 +32,10 @@ mod tag;
 
 #[cfg(feature = "indexer")]
 use core::mem;
-use core::{cell::RefCell, cmp::Ordering};
+use core::{
+    cell::{Cell, RefCell},
+    cmp::Ordering,
+};
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -60,8 +63,9 @@ use jiff::tz::TimeZone;
 use log::{debug, trace};
 #[cfg(feature = "indexer")]
 use rusqlite::TransactionBehavior;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params, types::Value};
 
+pub use crate::search::plan::{PimdirSearchCursor, PimdirSearchSort};
 use crate::{
     client::{
         PimdirError, PreparedCached, bind_list, busy_or_sql, modes, prepare_connection,
@@ -70,12 +74,17 @@ use crate::{
         search::compile::{Categories, Compiled, Ends, Probe},
     },
     codec,
+    coroutine::PimdirCoroutineState,
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
     search::{
         coverage::{self, PimdirSearchCoverage, PimdirSearchUnread},
         extract::{self, PimdirChunk, PimdirExtract, PimdirExtractStatus},
         fold,
+        plan::{
+            CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanBound, PimdirPlanCosts, PimdirPlanDriver,
+            PimdirPlanForce, PimdirWalk, PimdirWalkCollection, PimdirWalkOutput, PimdirWalkRow,
+        },
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
     },
     sql::{self, search},
@@ -83,7 +92,6 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::{
     client::{checkpoint, lock, search::refresh::Statements},
-    coroutine::PimdirCoroutineState,
     search::refresh::PimdirIndexRefresh,
 };
 
@@ -114,6 +122,9 @@ pub struct PimdirIndex {
     own_extraction: bool,
     /// The coverages answered since index.db and the store last moved.
     coverages: RefCell<PimdirCoverageCache>,
+    /// The driver every answer takes in place of the plan's, set by
+    /// [`force_driver`](PimdirIndex::force_driver).
+    force: Cell<Option<PimdirPlanForce>>,
 }
 
 /// The most coverages a handle keeps between two moves of index.db or the
@@ -290,49 +301,6 @@ impl PimdirIndexReport {
     }
 }
 
-/// The order of a hit list (SEARCH §8.2).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PimdirSearchSort {
-    /// `newest-first`: `sort_key` descending, the undated last.
-    #[default]
-    NewestFirst,
-    /// `oldest-first`: `sort_key` ascending, the undated last.
-    OldestFirst,
-    /// `title`: the title folded, A to Z, a title-less item first.
-    Title,
-    /// `sender`: a message's sender folded, A to Z, the rest last by date.
-    Sender,
-    /// `relevance`: FTS5 `bm25`, best first, the unranked last by date.
-    Relevance,
-}
-
-impl PimdirSearchSort {
-    /// Every order, in SEARCH §8.2's.
-    pub const ALL: [Self; 5] = [
-        Self::NewestFirst,
-        Self::OldestFirst,
-        Self::Title,
-        Self::Sender,
-        Self::Relevance,
-    ];
-
-    /// The order's name in SEARCH §8.2.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::NewestFirst => "newest-first",
-            Self::OldestFirst => "oldest-first",
-            Self::Title => "title",
-            Self::Sender => "sender",
-            Self::Relevance => "relevance",
-        }
-    }
-
-    /// The inverse of [`as_str`](Self::as_str).
-    pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|sort| sort.as_str() == name)
-    }
-}
-
 /// One page of a search.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirSearchOptions {
@@ -354,137 +322,6 @@ impl Default for PimdirSearchOptions {
             limit: 50,
             after: None,
             clock: PimdirSearchClock::default(),
-        }
-    }
-}
-
-/// The place of the last hit a page answered in its query's order, the
-/// cursor the next page starts after (SEARCH §8.2): a hit arriving or
-/// leaving between two pages neither repeats nor hides another, every
-/// page walked to the end answering the hits one whole answer does as
-/// the index stood when each was read.
-///
-/// Opaque: [`token`](Self::token) writes it as printable ASCII and
-/// [`from_token`](Self::from_token) reads it back.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PimdirSearchCursor {
-    /// Whether the hit is undated, the dated orders' first key.
-    undated: bool,
-    /// Its sort key, their second.
-    sort_key: Option<String>,
-    /// The bits of its rank, the `relevance` order's first, `None` last.
-    rank: Option<u64>,
-    /// Its title or its sender folded, the `title` or `sender` order's first.
-    title: String,
-    /// Its public id, every order's tie-break.
-    seq: i64,
-    /// Its account, empty for none, the last tie-break.
-    account: String,
-}
-
-impl PimdirSearchCursor {
-    /// The cursor as a token: its six fields, each hex or decimal, after
-    /// a `1` naming the form.
-    pub fn token(&self) -> String {
-        let hex =
-            |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
-        format!(
-            "1.{}.{}.{}.{}.{}.{}",
-            u8::from(self.undated),
-            self.sort_key
-                .as_deref()
-                .map_or(String::from("-"), |key| hex(key.as_bytes())),
-            self.rank
-                .map_or(String::from("-"), |rank| format!("{rank:016x}")),
-            hex(self.title.as_bytes()),
-            self.seq,
-            hex(self.account.as_bytes()),
-        )
-    }
-
-    /// Reads a token [`token`](Self::token) wrote, `None` for any other
-    /// text.
-    pub fn from_token(token: &str) -> Option<Self> {
-        let unhex = |text: &str| -> Option<String> {
-            if !text.len().is_multiple_of(2) {
-                return None;
-            }
-            let bytes = (0..text.len())
-                .step_by(2)
-                .map(|at| u8::from_str_radix(text.get(at..at + 2)?, 16).ok())
-                .collect::<Option<Vec<u8>>>()?;
-            String::from_utf8(bytes).ok()
-        };
-        let mut fields = token.split('.');
-        if fields.next()? != "1" {
-            return None;
-        }
-        let undated = match fields.next()? {
-            "0" => false,
-            "1" => true,
-            _ => return None,
-        };
-        let sort_key = match fields.next()? {
-            "-" => None,
-            key => Some(unhex(key)?),
-        };
-        let rank = match fields.next()? {
-            "-" => None,
-            rank if rank.len() == 16 => Some(u64::from_str_radix(rank, 16).ok()?),
-            _ => return None,
-        };
-        let title = unhex(fields.next()?)?;
-        let seq = fields.next()?.parse().ok()?;
-        let account = unhex(fields.next()?)?;
-        if fields.next().is_some() {
-            return None;
-        }
-        Some(Self {
-            undated,
-            sort_key,
-            rank,
-            title,
-            seq,
-            account,
-        })
-    }
-
-    /// The order of two places under `sort`, the one the statement and
-    /// the title fold give a whole answer.
-    fn compare(&self, other: &Self, sort: PimdirSearchSort) -> Ordering {
-        let ties = || {
-            self.seq
-                .cmp(&other.seq)
-                .then_with(|| self.account.cmp(&other.account))
-        };
-        let dated = |newest: bool| {
-            self.undated
-                .cmp(&other.undated)
-                .then_with(|| match (self.undated, newest) {
-                    (false, true) => other.sort_key.cmp(&self.sort_key),
-                    _ => self.sort_key.cmp(&other.sort_key),
-                })
-                .then_with(ties)
-        };
-        match sort {
-            PimdirSearchSort::NewestFirst => dated(true),
-            PimdirSearchSort::OldestFirst => dated(false),
-            PimdirSearchSort::Sender => match (self.title.is_empty(), other.title.is_empty()) {
-                (false, false) => self.title.cmp(&other.title).then_with(ties),
-                (true, true) => dated(true),
-                (left, right) => left.cmp(&right),
-            },
-            PimdirSearchSort::Relevance => {
-                let rank = |rank: Option<u64>| rank.map(f64::from_bits);
-                match (rank(self.rank), rank(other.rank)) {
-                    (Some(left), Some(right)) => left.total_cmp(&right),
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => Ordering::Equal,
-                }
-                .then_with(ties)
-            }
-            PimdirSearchSort::Title => self.title.cmp(&other.title).then_with(ties),
         }
     }
 }
@@ -728,6 +565,7 @@ impl PimdirIndex {
             query_only: false,
             own_extraction: true,
             coverages: RefCell::default(),
+            force: Cell::new(None),
         })
     }
 
@@ -788,6 +626,7 @@ impl PimdirIndex {
             query_only: true,
             own_extraction: held == PimdirIndexHeld::Current,
             coverages: RefCell::default(),
+            force: Cell::new(None),
         })
     }
 
@@ -956,6 +795,11 @@ impl PimdirIndex {
 
     /// One page of the hits of a query (SEARCH §8.2), with what it could
     /// not see. Answers from the index as it stands: refresh first.
+    ///
+    /// The plan reads the query's smallest set when a page of it costs
+    /// less than a walk, else walks the scope's collections in the
+    /// store's order until the page is full ([`PimdirWalk`]); the
+    /// `title`, `sender` and `relevance` orders read every hit.
     pub fn search(
         &self,
         query: &PimdirQuery,
@@ -963,9 +807,14 @@ impl PimdirIndex {
     ) -> Result<PimdirSearchOutput, PimdirError> {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
-        let mut compiled = self.compile(query, now, &zone)?;
-        let found = self.unsorted(&mut compiled, options.sort)?;
-        let (page, more) = Self::page(found, options.after.as_ref(), options.sort, options.limit);
+        let (mut compiled, driver) = self.planned(query, now, &zone, options)?;
+        let (page, more) = self.ordered(
+            &mut compiled,
+            &driver,
+            options.after.as_ref(),
+            options.sort,
+            options.limit,
+        )?;
         let next = match more {
             true => page
                 .last()
@@ -993,6 +842,11 @@ impl PimdirIndex {
     /// first hit and paged by `options.limit` after `options.after`, the
     /// first hit of the last thread an earlier page answered. A hit no
     /// thread holds, an item other than mail, stands alone.
+    ///
+    /// The hits are read in order a batch at a time, as a page is, until
+    /// the page holds its threads and one more: each thread met is read
+    /// whole, its hits among its members, and one whose first hit stands
+    /// at or before the cursor is an earlier page's.
     pub fn threads(
         &self,
         query: &PimdirQuery,
@@ -1000,43 +854,62 @@ impl PimdirIndex {
     ) -> Result<PimdirSearchThreadsOutput, PimdirError> {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
-        let mut compiled = self.compile(query, now, &zone)?;
-        let found = self.found(&mut compiled, options.sort)?;
+        let (mut compiled, driver) = self.planned(query, now, &zone, options)?;
+        let sort = options.sort;
+        let batch = match sort.is_dated() {
+            true => options.limit.saturating_mul(2).max(1),
+            false => usize::MAX - 1,
+        };
+        let wanted = options.limit.saturating_add(1);
 
         let mut groups: Vec<(Option<String>, Vec<Found>)> = Vec::new();
-        let mut known: BTreeMap<(Option<String>, String), usize> = BTreeMap::new();
-        for hit in found {
-            let thread: Option<String> = self
-                .conn
-                .query_row_cached(
-                    search::HIT_THREAD,
-                    named_params! { ":seq": hit.seq, ":account": hit.account },
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(thread) = thread else {
-                groups.push((None, vec![hit]));
-                continue;
-            };
-            let key = (hit.account.clone(), thread.clone());
-            match known.get(&key) {
-                Some(at) => groups[*at].1.push(hit),
-                None => {
-                    known.insert(key, groups.len());
-                    groups.push((Some(thread), vec![hit]));
+        let mut met: BTreeSet<(Option<String>, String)> = BTreeSet::new();
+        let mut cursor = options.after.clone();
+        'batches: loop {
+            let (found, more) =
+                self.ordered(&mut compiled, &driver, cursor.as_ref(), sort, batch)?;
+            for hit in found {
+                cursor = Some(hit.place.clone());
+                let thread: Option<String> = self
+                    .conn
+                    .query_row_cached(
+                        search::HIT_THREAD,
+                        named_params! { ":seq": hit.seq, ":account": hit.account },
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(thread) = thread else {
+                    groups.push((None, vec![hit]));
+                    if groups.len() >= wanted {
+                        break 'batches;
+                    }
+                    continue;
+                };
+                if !met.insert((hit.account.clone(), thread.clone())) {
+                    continue;
+                }
+                let members = self.members(&compiled, &thread, hit.account.as_deref(), sort)?;
+                let earlier = options.after.as_ref().is_some_and(|after| {
+                    members
+                        .first()
+                        .is_some_and(|first| first.place.compare(after, sort) != Ordering::Greater)
+                });
+                if earlier || members.is_empty() {
+                    continue;
+                }
+                groups.push((Some(thread), members));
+                if groups.len() >= wanted {
+                    break 'batches;
                 }
             }
+            if !more {
+                break;
+            }
         }
-        let start = options.after.as_ref().map_or(0, |after| {
-            groups.partition_point(|(_, hits)| {
-                hits[0].place.compare(after, options.sort) != Ordering::Greater
-            })
-        });
-        let more = groups.len() > start.saturating_add(options.limit);
-        let page: Vec<(Option<String>, Vec<Found>)> =
-            groups.into_iter().skip(start).take(options.limit).collect();
+        let more = groups.len() > options.limit;
+        groups.truncate(options.limit);
         let next = match more {
-            true => page
+            true => groups
                 .last()
                 .map(|(_, hits)| hits[0].place.clone())
                 .or(options.after.clone()),
@@ -1044,7 +917,7 @@ impl PimdirIndex {
         };
 
         let mut threads = Vec::new();
-        for (thread, found) in page {
+        for (thread, found) in groups {
             let account = found[0].account.clone();
             let (count, first, last) = match &thread {
                 Some(thread) => self.conn.query_row_cached(
@@ -1074,6 +947,14 @@ impl PimdirIndex {
             next,
             coverage: self.coverage(query, now, &options.clock, &zone)?,
         })
+    }
+
+    /// Forces a driver on every later answer of this handle, `None`
+    /// restoring the plan's own choice: what runs each query under each
+    /// driver, so a choice of plan never changes an answer.
+    #[doc(hidden)]
+    pub fn force_driver(&self, force: Option<PimdirPlanForce>) {
+        self.force.set(force);
     }
 
     /// The thread of one item, `(account, seq)` (SEARCH §9): its id
@@ -1192,7 +1073,9 @@ impl PimdirIndex {
     }
 
     /// How many hits a query has, with what the count could not see, its
-    /// dates resolved against `clock`.
+    /// dates resolved against `clock`: its smallest set read and every
+    /// other term probed per hit, or every live item of its scope when
+    /// no positive term has a set.
     pub fn count(
         &self,
         query: &PimdirQuery,
@@ -1200,18 +1083,21 @@ impl PimdirIndex {
     ) -> Result<PimdirSearchCountOutput, PimdirError> {
         let now = clock.now();
         let zone = clock.time_zone()?;
-        let compiled = self.compile(query, now, &zone)?;
-        let count: i64 = self
-            .conn
-            .query_row(
-                &compiled.count(),
-                params_from_iter(compiled.params.iter()),
-                |row| row.get(0),
-            )
-            .map_err(unanswerable)?;
+        let mut compiled = self.compile(query, now, &zone)?;
+        let bounds = self.estimate(&compiled)?;
+        let choice = compiled
+            .plan
+            .count(&bounds, &PimdirPlanCosts::default(), self.force.get());
+        compiled.access = choice.access;
+        self.materialize(&compiled, &compiled.materialized())?;
+        let sql = match &choice.driver {
+            PimdirPlanDriver::Set(set) => compiled.count_set(set),
+            _ => compiled.count_scope(),
+        };
+        let count = self.run(&sql, &compiled.values, &[], |row| row.get::<_, i64>(0))?;
 
         Ok(PimdirSearchCountOutput {
-            count: count as u64,
+            count: count.first().copied().unwrap_or(0).max(0) as u64,
             coverage: self.coverage(query, now, clock, &zone)?,
         })
     }
@@ -1265,60 +1151,360 @@ impl PimdirIndex {
         }))
     }
 
-    /// Every hit of a compiled query in `sort` order, each with its place
-    /// in it. Sorted here by that place, the `name` order folding titles
-    /// as STORAGE Annex A.2 folds `fn`, which SQL cannot, so a page's
-    /// cursor compares in the very order the answer is in.
-    fn found(
+    /// Every hit of a query in `sort` order, each with its place in it,
+    /// read through the driver a count takes: what a tag stages its
+    /// actions over.
+    fn every(
         &self,
-        compiled: &mut Compiled,
+        query: &PimdirQuery,
+        now: i64,
+        zone: &TimeZone,
         sort: PimdirSearchSort,
     ) -> Result<Vec<Found>, PimdirError> {
-        let mut found = self.unsorted(compiled, sort)?;
+        let mut compiled = self.compile(query, now, zone)?;
+        let bounds = self.estimate(&compiled)?;
+        let choice = compiled
+            .plan
+            .count(&bounds, &PimdirPlanCosts::default(), self.force.get());
+        compiled.access = choice.access;
+        self.materialize(&compiled, &compiled.materialized())?;
+        self.whole(&compiled, &choice.driver, sort)
+    }
+
+    /// A query compiled and planned for a page of `options`, its text
+    /// terms read into `temp.term_match` as the plan chose, with the
+    /// driver it takes.
+    fn planned(
+        &self,
+        query: &PimdirQuery,
+        now: i64,
+        zone: &TimeZone,
+        options: &PimdirSearchOptions,
+    ) -> Result<(Compiled, PimdirPlanDriver), PimdirError> {
+        let mut compiled = self.compile(query, now, zone)?;
+        let bounds = self.estimate(&compiled)?;
+        let force = self.force.get();
+        let collections = match options.sort.is_dated() && force.is_none() {
+            true => self
+                .run(&compiled.collections(), &compiled.values, &[], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .first()
+                .copied()
+                .unwrap_or(0)
+                .max(0) as u64,
+            false => 0,
+        };
+        let choice = compiled.plan.page(
+            options.sort,
+            options.limit,
+            collections,
+            &bounds,
+            &PimdirPlanCosts::default(),
+            force,
+        );
+        debug!("search plan: {:?}", choice.driver);
+        compiled.access = choice.access;
+        self.materialize(&compiled, &compiled.materialized())?;
+        Ok((compiled, choice.driver))
+    }
+
+    /// The first `limit` hits after `after` in `sort` order, and whether
+    /// more follow, as `driver` reads them: a dated order's page cut by
+    /// the statement or the walk, another's from every hit sorted here.
+    fn ordered(
+        &self,
+        compiled: &mut Compiled,
+        driver: &PimdirPlanDriver,
+        after: Option<&PimdirSearchCursor>,
+        sort: PimdirSearchSort,
+        limit: usize,
+    ) -> Result<(Vec<Found>, bool), PimdirError> {
+        if !sort.is_dated() {
+            let found = self.whole(compiled, driver, sort)?;
+            return Ok(Self::page(found, after, sort, limit));
+        }
+
+        let need = limit.saturating_add(1);
+        let mut found = match driver {
+            PimdirPlanDriver::Set(set) => self.set_page(compiled, set, after, sort, need)?,
+            PimdirPlanDriver::Walk { budget, fallback } => {
+                match (self.walk(compiled, after, sort, need, *budget)?, fallback) {
+                    (Some(found), _) => found,
+                    (None, Some(set)) => {
+                        debug!("search walk past its budget, reading set {set:?}");
+                        let mut read = Vec::new();
+                        for at in set {
+                            if compiled.access[*at] == PimdirPlanAccess::Probe {
+                                compiled.access[*at] = PimdirPlanAccess::Materialize;
+                                read.push(*at);
+                            }
+                        }
+                        self.materialize(compiled, &read)?;
+                        self.set_page(compiled, set, after, sort, need)?
+                    }
+                    (None, None) => Vec::new(),
+                }
+            }
+            PimdirPlanDriver::Scope => self
+                .walk(compiled, after, sort, need, None)?
+                .unwrap_or_default(),
+        };
+        let more = found.len() > limit;
+        found.truncate(limit);
+        Ok((found, more))
+    }
+
+    /// Every hit `driver` reads, in `sort` order: its set's, or the
+    /// scope's, each with its place.
+    fn whole(
+        &self,
+        compiled: &Compiled,
+        driver: &PimdirPlanDriver,
+        sort: PimdirSearchSort,
+    ) -> Result<Vec<Found>, PimdirError> {
+        let sql = match driver {
+            PimdirPlanDriver::Set(set) => compiled.rows(&compiled.driven(set), set, sort, None),
+            _ => compiled.rows(&compiled.scoped(), &[], sort, None),
+        };
+        let mut found = self.run(&sql, &compiled.values, &[], |row| found(row, sort))?;
         found.sort_by(|left, right| left.place.compare(&right.place, sort));
-
         Ok(found)
     }
 
-    /// Every hit of a compiled query with its place in `sort` order, in no
-    /// order.
-    fn unsorted(
+    /// The first `need` hits after `after` in a dated `sort`, read from
+    /// the union of the sets of `set`, joined to the store, sorted and cut
+    /// by one statement.
+    fn set_page(
         &self,
-        compiled: &mut Compiled,
+        compiled: &Compiled,
+        set: &[usize],
+        after: Option<&PimdirSearchCursor>,
+        sort: PimdirSearchSort,
+        need: usize,
+    ) -> Result<Vec<Found>, PimdirError> {
+        let sql = compiled.rows(&compiled.driven(set), set, sort, Some(after.is_some()));
+        let mut extra = vec![(
+            String::from(":limit"),
+            Value::Integer(need.min(i64::MAX as usize) as i64),
+        )];
+        if let Some(after) = after {
+            extra.extend([
+                (
+                    String::from(":after_undated"),
+                    Value::Integer(i64::from(after.undated)),
+                ),
+                (
+                    String::from(":after_key"),
+                    Value::from(after.sort_key.clone()),
+                ),
+                (String::from(":after_seq"), Value::Integer(after.seq)),
+                (
+                    String::from(":after_account"),
+                    Value::from(after.account.clone()),
+                ),
+            ]);
+        }
+        self.run(&sql, &compiled.values, &extra, |row| found(row, sort))
+    }
+
+    /// The first `need` hits after `after` in a dated `sort`, walked from
+    /// the scope's collections in the store's order ([`PimdirWalk`]);
+    /// `None` when the walk examined more than `budget` rows first.
+    fn walk(
+        &self,
+        compiled: &Compiled,
+        after: Option<&PimdirSearchCursor>,
+        sort: PimdirSearchSort,
+        need: usize,
+        budget: Option<u64>,
+    ) -> Result<Option<Vec<Found>>, PimdirError> {
+        let dated = PimdirWalk::head_bound(sort, after, false);
+        let undated = PimdirWalk::head_bound(sort, after, true);
+        let phase = |bound: Option<(bool, Option<&str>)>| {
+            bound.map(|(ascending, key)| (ascending, key.is_some()))
+        };
+        let key = |bound: Option<(bool, Option<&str>)>| {
+            Value::from(bound.and_then(|(_, key)| key.map(String::from)))
+        };
+        let extra = [
+            (String::from(":dated_key"), key(dated)),
+            (String::from(":undated_key"), key(undated)),
+        ];
+        let sql = compiled.heads(phase(dated), phase(undated));
+        let collections = self.run(&sql, &compiled.values, &extra, |row| {
+            Ok(PimdirWalkCollection {
+                id: row.get(0)?,
+                account: row.get(1)?,
+                undated: row.get(2)?,
+                head: row.get(3)?,
+            })
+        })?;
+
+        let mut walk = PimdirWalk::new(sort, after, need, collections.clone(), budget);
+        let mut arg = None;
+        loop {
+            match walk.resume(arg.take()) {
+                PimdirCoroutineState::Yielded(step) => {
+                    let collection = &collections[step.collection];
+                    let account = Value::from(
+                        (!collection.account.is_empty()).then(|| collection.account.clone()),
+                    );
+                    let (key, seq) = match &step.after {
+                        Some((key, seq)) => (Value::from(key.clone()), Value::Integer(*seq)),
+                        None => (Value::Null, Value::Null),
+                    };
+                    let extra = [
+                        (
+                            String::from(":collection"),
+                            Value::from(collection.id.clone()),
+                        ),
+                        (String::from(":account"), account),
+                        (
+                            String::from(":akey"),
+                            Value::from(collection.account.clone()),
+                        ),
+                        (String::from(":key"), key),
+                        (String::from(":seq"), seq),
+                        (String::from(":floor"), Value::from(step.floor.clone())),
+                        (
+                            String::from(":rows"),
+                            Value::Integer(step.rows.min(i64::MAX as usize) as i64),
+                        ),
+                    ];
+                    let rows =
+                        self.run(&compiled.step(&step), &compiled.values, &extra, |row| {
+                            Ok(PimdirWalkRow {
+                                sort_key: row.get(0)?,
+                                seq: row.get(1)?,
+                                pass: row.get::<_, i64>(2)? != 0,
+                            })
+                        })?;
+                    arg = Some(rows);
+                }
+                PimdirCoroutineState::Complete(PimdirWalkOutput::Page(places)) => {
+                    let found = places
+                        .into_iter()
+                        .map(|place| Found {
+                            account: (!place.account.is_empty()).then(|| place.account.clone()),
+                            seq: place.seq,
+                            place,
+                        })
+                        .collect();
+                    return Ok(Some(found));
+                }
+                PimdirCoroutineState::Complete(PimdirWalkOutput::Exceeded) => return Ok(None),
+            }
+        }
+    }
+
+    /// The hits of one thread in an account (SEARCH §9), in `sort` order:
+    /// its live members there (`thread_members`) meeting the query, each
+    /// with its place.
+    fn members(
+        &self,
+        compiled: &Compiled,
+        thread: &str,
+        account: Option<&str>,
         sort: PimdirSearchSort,
     ) -> Result<Vec<Found>, PimdirError> {
-        let sql = compiled.select(sort, None);
-        trace!("search statement: {sql}");
-
-        // NOTE: prepared uncached, its text being this query's alone.
-        let mut statement = self.conn.prepare(&sql).map_err(unanswerable)?;
-        let found = statement
-            .query_map(params_from_iter(compiled.params.iter()), |row| {
-                let account = row.get::<_, Option<String>>(0)?;
-                let title = row.get::<_, String>(5)?;
-                let place = PimdirSearchCursor {
-                    undated: row.get::<_, Option<bool>>(4)?.unwrap_or_default(),
-                    sort_key: row.get(3)?,
-                    rank: row.get::<_, Option<f64>>(2)?.map(f64::to_bits),
-                    title: match sort {
-                        PimdirSearchSort::Title | PimdirSearchSort::Sender => fold::value(&title),
-                        _ => String::new(),
-                    },
-                    seq: row.get(1)?,
-                    account: account.clone().unwrap_or_default(),
-                };
-                Ok(Found {
-                    account,
-                    seq: place.seq,
-                    place,
-                })
-            })
-            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-            .map_err(unanswerable)?;
-
+        let seqs: BTreeSet<i64> = rows(
+            &self.conn,
+            search::THREAD_MEMBERS,
+            named_params! { ":thread": thread, ":account": account },
+            |row| row.get::<_, i64>(1),
+        )?
+        .into_iter()
+        .collect();
+        if seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut extra = vec![(
+            String::from(":akey"),
+            Value::from(account.unwrap_or_default().to_string()),
+        )];
+        let mut listed = Vec::new();
+        for (at, seq) in seqs.into_iter().enumerate() {
+            listed.push(format!("(:m{at})"));
+            extra.push((format!(":m{at}"), Value::Integer(seq)));
+        }
+        let hits = format!(
+            "SELECT :akey AS akey, column1 AS seq FROM (VALUES {})",
+            listed.join(", ")
+        );
+        let sql = compiled.rows(&hits, &[], sort, None);
+        let mut found = self.run(&sql, &compiled.values, &extra, |row| found(row, sort))?;
+        found.sort_by(|left, right| left.place.compare(&right.place, sort));
         Ok(found)
     }
 
+    /// What the plan measures of each leaf's set, `None` for a leaf it
+    /// does not.
+    fn estimate(&self, compiled: &Compiled) -> Result<Vec<Option<PimdirPlanBound>>, PimdirError> {
+        let mut bounds = vec![None; compiled.plan.leaves.len()];
+        for at in compiled.plan.measured() {
+            let Some(sql) = compiled.estimate(at) else {
+                continue;
+            };
+            let rows = self.run(sql, &compiled.values, &[], |row| row.get::<_, i64>(0))?;
+            let rows = rows.first().copied().unwrap_or(0).max(0) as u64;
+            bounds[at] = Some(PimdirPlanBound {
+                rows,
+                capped: rows >= CAP,
+            });
+        }
+        trace!("search estimates: {bounds:?}");
+        Ok(bounds)
+    }
+
+    /// Reads the matches of the leaves `leaves` into `temp.term_match`.
+    fn materialize(&self, compiled: &Compiled, leaves: &[usize]) -> Result<(), PimdirError> {
+        for at in leaves {
+            for sql in compiled.matches(*at) {
+                self.run(sql, &compiled.values, &[], |_| Ok(()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs one statement of a compiled query, every `:vn` it names bound
+    /// to the n-th of `values` and every other name to its value in
+    /// `extra`, collecting each row through `map`. Prepared once per
+    /// connection, a walk running its step again and again.
+    fn run<T>(
+        &self,
+        sql: &str,
+        values: &[Value],
+        extra: &[(String, Value)],
+        mut map: impl FnMut(&Row) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, PimdirError> {
+        trace!("search statement: {sql}");
+        let mut statement = self.conn.prepare_cached(sql).map_err(unanswerable)?;
+        let names: Vec<(usize, String)> = (1..=statement.parameter_count())
+            .filter_map(|at| Some((at, statement.parameter_name(at)?.to_string())))
+            .collect();
+        for (at, name) in names {
+            let value = match name
+                .strip_prefix(":v")
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(n) => values.get(n.wrapping_sub(1)).cloned(),
+                None => extra
+                    .iter()
+                    .find(|(named, _)| *named == name)
+                    .map(|(_, value)| value.clone()),
+            };
+            statement
+                .raw_bind_parameter(at, value.unwrap_or(Value::Null))
+                .map_err(unanswerable)?;
+        }
+        let mut rows = statement.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(unanswerable)? {
+            out.push(map(row).map_err(unanswerable)?);
+        }
+        Ok(out)
+    }
     /// The first `limit` hits of `found` following `after`, in `sort`
     /// order, and whether more follow: the page is selected before it is
     /// sorted, so a hit it skips costs a comparison or two and only the
@@ -1425,8 +1611,9 @@ impl PimdirIndex {
         Ok(matched)
     }
 
-    /// A query compiled with its `linked:` ends and its `category:` values
-    /// resolved, its text terms' matches read into `temp.term_match`.
+    /// A query planned and compiled, its dates resolved against `now` in
+    /// `zone`, its `linked:` ends and its `category:` values resolved, and
+    /// `temp.term_match` emptied for the matches it reads.
     fn compile(
         &self,
         query: &PimdirQuery,
@@ -1435,16 +1622,9 @@ impl PimdirIndex {
     ) -> Result<Compiled, PimdirError> {
         let ends = self.ends(query)?;
         let categories = self.categories(query)?;
-        let compiled = Compiled::new(query, ends, categories, now, zone.clone());
-
+        let plan = PimdirPlan::new(query, now, zone);
         self.conn.execute_cached(search::CLEAR_TERM_MATCH, [])?;
-        for matches in &compiled.matches {
-            trace!("text term statement: {}", matches.sql);
-            self.conn
-                .execute(&matches.sql, params_from_iter(matches.params.iter()))
-                .map_err(unanswerable)?;
-        }
-        Ok(compiled)
+        Ok(Compiled::new(plan, &ends, &categories))
     }
 
     /// The task categories each `category:` term of a query names (SEARCH
@@ -2145,6 +2325,31 @@ fn trim(text: &str, at: usize) -> String {
         snippet.push('…');
     }
     snippet
+}
+
+/// A hit as [`Compiled::rows`] answers it, its place in `sort`: the
+/// `title` and `sender` orders fold its title as STORAGE Annex A.2 folds
+/// `fn`, which SQL cannot, so a page's cursor compares in the very order
+/// the answer is in.
+fn found(row: &Row, sort: PimdirSearchSort) -> rusqlite::Result<Found> {
+    let akey: String = row.get(0)?;
+    let title: String = row.get(5)?;
+    let place = PimdirSearchCursor {
+        undated: row.get::<_, Option<bool>>(3)?.unwrap_or_default(),
+        sort_key: row.get(2)?,
+        rank: row.get::<_, Option<f64>>(4)?.map(f64::to_bits),
+        title: match sort {
+            PimdirSearchSort::Title | PimdirSearchSort::Sender => fold::value(&title),
+            _ => String::new(),
+        },
+        seq: row.get(1)?,
+        account: akey.clone(),
+    };
+    Ok(Found {
+        account: (!akey.is_empty()).then_some(akey),
+        seq: place.seq,
+        place,
+    })
 }
 
 /// Maps a failure of a compiled query's statement: a busy store stays

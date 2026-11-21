@@ -43,6 +43,7 @@ use io_pimdir::{
         chunk,
         coverage::{PimdirSearchTemporal, PimdirSearchUnread},
         extract,
+        plan::{PimdirPlan, PimdirPlanForce},
         query::{PimdirQuery, PimdirQueryPredicate},
         tag::{PimdirSearchTagError, PimdirSearchTagPlan},
     },
@@ -754,7 +755,19 @@ fn occurs(index: &PimdirIndex, window: &Value) {
     assert_eq!(found, expected, "occurrences {start}..{end}");
 }
 
-/// One case answers the hits, the coverage and the refusal it states.
+/// Restores a handle's own choice of plan when dropped, a failed case
+/// included.
+struct Unforced<'a>(&'a PimdirIndex);
+
+impl Drop for Unforced<'_> {
+    fn drop(&mut self) {
+        self.0.force_driver(None);
+    }
+}
+
+/// One case answers alike under the plan's own driver and under each
+/// driver forced that can answer it, a set only where a positive term has
+/// one, so a choice of plan never changes an answer.
 fn answers(
     index: &PimdirIndex,
     spec: &Path,
@@ -763,6 +776,45 @@ fn answers(
     case: &Value,
 ) {
     let query = case["query"].as_str().unwrap();
+    let Ok(parsed) = PimdirQuery::parse(query) else {
+        return answers_under(index, spec, store, clock, case, None);
+    };
+    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
+        .sets
+        .is_empty();
+    let forces = [
+        None,
+        Some(PimdirPlanForce::Set),
+        Some(PimdirPlanForce::Walk),
+        Some(PimdirPlanForce::Scope),
+        Some(PimdirPlanForce::Fallback),
+    ];
+    for force in forces {
+        if matches!(
+            force,
+            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
+        ) && !sets
+        {
+            continue;
+        }
+        let _unforced = Unforced(index);
+        index.force_driver(force);
+        answers_under(index, spec, store, clock, case, force);
+    }
+}
+
+/// One case answers the hits, the coverage and the refusal it states,
+/// under `force`.
+fn answers_under(
+    index: &PimdirIndex,
+    spec: &Path,
+    store: &Value,
+    clock: &PimdirSearchClock,
+    case: &Value,
+    force: Option<PimdirPlanForce>,
+) {
+    let query = case["query"].as_str().unwrap();
+    let named = format!("{query:?} under {force:?}");
 
     if let Some(error) = case.get("error") {
         let refused = PimdirQuery::parse(query).expect_err(query);
@@ -773,15 +825,15 @@ fn answers(
                 error["start"].as_u64().unwrap() as usize,
                 error["end"].as_u64().unwrap() as usize,
             ),
-            "{query:?}: refusal"
+            "{named}: refusal"
         );
         if refused.code.as_str() == "unknown-field" {
-            assert!(!refused.fields.is_empty(), "{query:?}: the known fields");
+            assert!(!refused.fields.is_empty(), "{named}: the known fields");
         }
         return;
     }
 
-    let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{query:?}: {err}"));
+    let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{named}: {err}"));
 
     let options = PimdirSearchOptions {
         sort: case["sort"]
@@ -796,7 +848,7 @@ fn answers(
     if let Some(want) = case.get("threads") {
         let answer = index
             .threads(&parsed, &options)
-            .unwrap_or_else(|err| panic!("{query:?}: {err}"));
+            .unwrap_or_else(|err| panic!("{named}: {err}"));
         let got: BTreeSet<_> = answer
             .threads
             .iter()
@@ -829,12 +881,12 @@ fn answers(
                 )
             })
             .collect();
-        assert_eq!(got, want, "{query:?}: threads");
+        assert_eq!(got, want, "{named}: threads");
         return;
     }
     let answer = index
         .search(&parsed, &options)
-        .unwrap_or_else(|err| panic!("{query:?}: {err}"));
+        .unwrap_or_else(|err| panic!("{named}: {err}"));
     let got: Vec<(String, i64)> = answer
         .hits
         .iter()
@@ -858,46 +910,46 @@ fn answers(
             None => break,
         }
     }
-    assert_eq!(walked, got, "{query:?}: the pages walked one by one");
+    assert_eq!(walked, got, "{named}: the pages walked one by one");
     let want = pairs(&case["hits"]);
 
     if case["ordered"].as_bool() == Some(true) {
-        assert_eq!(got, want, "{query:?}: ordered hits");
+        assert_eq!(got, want, "{named}: ordered hits");
     } else {
         assert_eq!(
             got.iter().collect::<BTreeSet<_>>(),
             want.iter().collect::<BTreeSet<_>>(),
-            "{query:?}: hits"
+            "{named}: hits"
         );
     }
 
     let count = index.count(&parsed, clock).unwrap();
-    assert_eq!(count.count as usize, want.len(), "{query:?}: count");
+    assert_eq!(count.count as usize, want.len(), "{named}: count");
 
     let expected = unread(spec, store, &parsed);
-    assert_eq!(answer.coverage.local.kinds, expected, "{query:?}: coverage");
-    assert_eq!(count.coverage, answer.coverage, "{query:?}: a count's");
+    assert_eq!(answer.coverage.local.kinds, expected, "{named}: coverage");
+    assert_eq!(count.coverage, answer.coverage, "{named}: a count's");
     if let Some(stated) = case.get("coverage") {
         assert_eq!(
             answer.coverage.local.kinds,
             counts(stated),
-            "{query:?}: the coverage the case states"
+            "{named}: the coverage the case states"
         );
     }
-    assert_eq!(answer.coverage.local.unindexed, 0, "{query:?}: unindexed");
-    assert_eq!(answer.coverage.local.behind, 0, "{query:?}: behind");
+    assert_eq!(answer.coverage.local.unindexed, 0, "{named}: unindexed");
+    assert_eq!(answer.coverage.local.behind, 0, "{named}: behind");
     if let Some(complete) = case.get("complete") {
         assert_eq!(
             Some(answer.coverage.is_complete()),
             complete.as_bool(),
-            "{query:?}: complete, over {:?}",
+            "{named}: complete, over {:?}",
             answer.coverage
         );
     }
     assert_eq!(
         answer.coverage.zone_differs,
         case["zone_differs"].as_bool().unwrap_or(false),
-        "{query:?}: zone_differs"
+        "{named}: zone_differs"
     );
     if let Some(temporal) = case.get("temporal") {
         let expected = match temporal.as_str() {
@@ -908,19 +960,19 @@ fn answers(
                 filling: temporal["filling"].as_bool().unwrap(),
             },
         };
-        assert_eq!(answer.coverage.temporal, expected, "{query:?}: temporal");
+        assert_eq!(answer.coverage.temporal, expected, "{named}: temporal");
     }
 
     assert_eq!(
         answer.coverage.horizon_left,
         case["horizon_left"].as_bool().unwrap_or(false),
-        "{query:?}: horizon_left"
+        "{named}: horizon_left"
     );
     if let Some(cut) = case.get("cut") {
         assert_eq!(
             Some(answer.coverage.cut),
             cut.as_u64(),
-            "{query:?}: the series cut before the range's end"
+            "{named}: the series cut before the range's end"
         );
     }
 }

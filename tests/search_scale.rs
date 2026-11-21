@@ -242,7 +242,7 @@ fn fifty_thousand_summaries_index_and_answer() {
         let parsed = PimdirQuery::parse(query).unwrap();
         STATEMENTS.lock().unwrap().clear();
         let (page, hits) = median(|| index.search(&parsed, &options).unwrap().hits.len());
-        let sql = STATEMENTS.lock().unwrap().first().cloned().unwrap();
+        let sql = STATEMENTS.lock().unwrap().last().cloned().unwrap();
         let (count, total) =
             median(|| index.count(&parsed, &options.clock).unwrap().count as usize);
         eprintln!("`{query}`: page of {hits} in {page:?}, count {total} in {count:?}");

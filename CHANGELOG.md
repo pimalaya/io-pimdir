@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added `PimdirQueryDateRange::bounds`, a range's instants in Unix seconds, for a client translating a query to a server.
 - Added `PimdirQueryPredicate::name()`, the name a client's capability table keys a term on.
 - Added `PimdirSearchSort::as_str`, `parse` and `ALL`.
+- Added `search::plan`, the I/O-free query planner (scope, estimates, drivers, `PimdirWalk`), `PimdirSearchSort::is_dated`, and `PimdirSearchCursor::{compare, dated, is_undated, sort_key, seq, account}`; `PimdirSearchSort` and `PimdirSearchCursor` now build without `client`.
 - Added the refusal `reserved-form` (`PimdirQueryErrorCode::ReservedForm`, pimdir SEARCH §8.3): a text or a value beginning with `~`, a text or a value of two characters or more beginning with `/` and a value beginning with `{` are kept for stemming, regular expressions and subqueries, where they answered as plain words before. Quote them to search the characters.
 
 ### Changed
@@ -25,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **BREAKING**: Changed `PimdirSearchSort` to SEARCH §8.2's five orders, `NewestFirst` (was `Date`, the default), `OldestFirst`, `Title` (was `Name`), `Sender` and `Relevance`, and the CLI's `--sort` to `newest-first`, `oldest-first`, `title`, `sender` and `relevance`.
 - **BREAKING**: Added the variants `PimdirQueryPredicate::Mid`, `PimdirQueryDate::Instant` and `PimdirQueryDateUnit::{Minute, Hour, Month}`, which an exhaustive match names.
 - **BREAKING**: Removed `#[non_exhaustive]` from `PimdirQueryErrorCode`, so a match names every code.
+- Changed `search`, `count` and threaded pages to run on the planner: a query reads what its driving set or its page needs, never every live item (performance-audit F1). A hit's key is read among its placements in the query's collections, which only differs where one item's placements hold different keys.
+- Changed `PimdirSync::WRITE_CHUNK` from 1,024 to 4,096, so a page of 1,000 new members lands in one transaction.
 - Changed a search answer's coverage, and `PimdirReader::search_coverage`'s temporal axis, to read once per answer: the scope's ids bound once, the sources rolled up in one statement instead of `list_coverage` per collection, the unindexed count seeking `items_by_changed` and skipped while the index is not behind, a repeated answer on one `PimdirIndex` served until index.db or the store moves (performance-audit F8: 69 ms per answer at 3,311 collections).
 - Changed coverage to count a body under an extraction status it does not know as `unparseable` (pimdir SEARCH §6, an open vocabulary).
 - **BREAKING**: Changed the index to search-draft-16 (`sql::search::FORMAT_VERSION`): an index of search-draft-15 is rebuilt by the indexer and refused by a query client until then.

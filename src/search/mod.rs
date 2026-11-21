@@ -1,8 +1,9 @@
 //! # Search
 //!
-//! The I/O-free half of pimdir SEARCH.md: [`query`] and [`coverage`] need
-//! no feature, the text layer comes with `search` or any domain, `mail`
-//! and `card` with their domains, and the refresh with `indexer`.
+//! The I/O-free half of pimdir SEARCH.md: [`query`], [`plan`] and
+//! [`coverage`] need no feature, the text layer comes with `search` or any
+//! domain, `mail` and `card` with their domains, and the refresh with
+//! `indexer`.
 
 #[cfg(feature = "contact")]
 pub mod card;
@@ -34,6 +35,7 @@ mod html;
 pub mod mail;
 #[cfg(feature = "indexer")]
 pub mod occurrence;
+pub mod plan;
 pub mod query;
 #[cfg(feature = "indexer")]
 pub mod refresh;

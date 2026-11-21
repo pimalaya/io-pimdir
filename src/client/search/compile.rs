@@ -1,14 +1,19 @@
 //! # Compiler
 //!
-//! A [`PimdirQuery`] compiled to SQL over index.db with the store attached
-//! (SEARCH §8): every text term an FTS5 `MATCH` built from escaped tokens,
-//! read once through the canonical `match_objects` and `match_summaries`
-//! into `temp.term_match` before the query runs, so a query of many terms
-//! stays one shallow statement; every structured term a set of
-//! placements, through the canonical statements where one exists. A hit
-//! is `(account, seq)`, so each term is lifted to the hits any live
-//! placement of which it holds for, and `not` is the hits none does: the
-//! union rule SEARCH §8.2 states for tags, kept for every term.
+//! A [`PimdirPlan`] rendered as SQL over index.db with the store attached
+//! (SEARCH §8). A hit is `(account, seq)`; each term is a condition over
+//! a hit, holding when any live placement of it in the account does (the
+//! union rule SEARCH §8.2 states for tags, kept for every term), and
+//! `not` when none does. A term whose set a driver reads also renders
+//! that set, its hits as `(akey, seq)` pairs, the account empty for none.
+//!
+//! A text term is an FTS5 `MATCH` built from escaped tokens, either read
+//! once through the canonical `match_objects` and `match_summaries` into
+//! `temp.term_match`, each hit then probed by a seek, or probed against
+//! each candidate placement's body and summary, as the plan says.
+//!
+//! Every value is bound by name, the n-th `:vn`, so one fragment renders
+//! into any statement; a statement's own values take other names.
 
 use alloc::{
     format,
@@ -20,18 +25,22 @@ use alloc::{
 use jiff::tz::TimeZone;
 use rusqlite::types::Value;
 
+#[cfg(test)]
+use crate::search::query::PimdirQuery;
 use crate::{
-    client::search::PimdirSearchSort,
     search::{
         fold,
+        plan::{
+            self, CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanEstimate, PimdirPlanNode,
+            PimdirSearchSort, PimdirWalkStep,
+        },
         query::{
-            PimdirQuery, PimdirQueryDateRange, PimdirQueryId, PimdirQueryKind,
-            PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm, PimdirQueryText,
-            PimdirQueryTextField,
+            PimdirQueryDateRange, PimdirQueryId, PimdirQueryKind, PimdirQueryPredicate,
+            PimdirQueryPriority, PimdirQueryProperty, PimdirQueryText, PimdirQueryTextField,
         },
     },
-    sql::{self, search},
-    summary::{file, time},
+    sql::search,
+    summary::time,
 };
 
 /// The items each `linked:` term names, as `(kind, link id)` pairs per
@@ -43,238 +52,477 @@ pub(crate) type Ends = Vec<(PimdirQueryId, Vec<(String, String)>)>;
 /// to it, as stated.
 pub(crate) type Categories = Vec<(String, Vec<String>)>;
 
-/// A compiled query: the statements filling `temp.term_match` with its
-/// text terms' matches, the condition a live hit meets, the parameters it
-/// binds, and what an answer reports beside its hits.
+/// The media types of the undated kinds, as SQL.
+const UNDATED: &str = "('text/vcard', 'application/octet-stream')";
+
+/// The titles a hit's placements carry, joined for the `name` order.
+const TITLES: &str = "FROM store.items i JOIN store.collections c ON c.id = i.collection
+   LEFT JOIN store.mail_summary ms ON ms.item = i.id
+   LEFT JOIN store.contact_summary cs ON cs.item = i.id
+   LEFT JOIN store.event_summary es ON es.item = i.id
+   LEFT JOIN store.task_summary ts ON ts.item = i.id
+   LEFT JOIN store.journal_summary js ON js.item = i.id
+   LEFT JOIN store.file_summary fs ON fs.item = i.id";
+
+/// A compiled query: its plan, the fragments each of its terms renders
+/// to, the values they bind, and what an answer reports beside its hits.
 pub(crate) struct Compiled {
-    /// The statements reading each text term's matches into
-    /// `temp.term_match`, run before the query, in order.
-    pub(crate) matches: Vec<Matches>,
-    /// The text terms read so far, each numbered by its position.
-    terms: usize,
-    /// The text terms no `not` negates, whose matches say what a hit
-    /// matched on and rank it.
-    positive: Vec<usize>,
-    /// The condition over `live(akey, account, seq)`.
-    condition: String,
-    /// The parameters, bound by position.
-    pub(crate) params: Vec<Value>,
+    /// The plan rendered.
+    pub(crate) plan: PimdirPlan,
+    /// How each leaf's text is tested, as the plan chose.
+    pub(crate) access: Vec<PimdirPlanAccess>,
+    /// Every value a fragment binds, the n-th named `:vn`.
+    pub(crate) values: Vec<Value>,
     /// The positive text terms' expressions, each probed against a page's
     /// hits to tell what they matched (`match_object`, `match_summary`).
     pub(crate) probes: Vec<Probe>,
     /// The words a snippet looks for: the positive text terms'.
     pub(crate) words: Vec<String>,
-    /// The items each `linked:` term names, as `(kind, link id)` pairs
-    /// (STORAGE §14.2), resolved against the store by the caller.
-    ends: Ends,
-    /// The task categories each `category:` term names, resolved against
-    /// the store by the caller.
-    categories: Categories,
-    /// The instant relative dates resolve against, Unix seconds.
-    now: i64,
-    /// The zone calendar spans are read in.
-    zone: TimeZone,
+    /// Each leaf rendered.
+    leaves: Vec<Leaf>,
+    /// The condition a collection `{c}` of the scope meets.
+    scope: String,
+}
+
+/// One leaf rendered.
+struct Leaf {
+    /// The condition over the hit `({akey}, {seq})`, a text term's read
+    /// from its matches in `temp.term_match`.
+    hit: String,
+    /// A text term's condition probing its expression against each live
+    /// placement of the hit.
+    probe: Option<String>,
+    /// Its set, `SELECT akey, seq`, when a driver may read it.
+    set: Option<String>,
+    /// The statement counting its set up to [`CAP`].
+    estimate: Option<String>,
+    /// The statements reading its matches into `temp.term_match`.
+    matches: Vec<String>,
+}
+
+/// A positive text term, probed against one hit's body or summary.
+pub(crate) struct Probe {
+    /// Its FTS5 expression (SEARCH §8.5).
+    pub(crate) expression: String,
+    /// Whether its field exists in a summary, which it then matches too.
+    pub(crate) summary: bool,
 }
 
 impl Compiled {
-    /// Compiles a query, `ends` holding the items each `linked:` term
-    /// names and `categories` the task categories each `category:` term
-    /// names, its dates resolved against `now` (Unix seconds) in `zone`.
-    pub(crate) fn new(
-        query: &PimdirQuery,
-        ends: Ends,
-        categories: Categories,
-        now: i64,
-        zone: TimeZone,
-    ) -> Self {
-        let undated: Vec<&str> = query
-            .terms()
-            .into_iter()
-            .filter_map(|(term, _)| match &term.predicate {
-                PimdirQueryPredicate::Kind(kind) if !kind.is_dated() => Some(media_type(*kind)),
-                _ => None,
-            })
-            .collect();
-
+    /// Renders a plan, `ends` holding the items each `linked:` term names
+    /// and `categories` the task categories each `category:` term names.
+    pub(crate) fn new(plan: PimdirPlan, ends: &Ends, categories: &Categories) -> Self {
         let mut compiled = Self {
-            matches: Vec::new(),
-            terms: 0,
-            positive: Vec::new(),
+            access: vec![PimdirPlanAccess::Materialize; plan.leaves.len()],
+            values: Vec::new(),
             probes: Vec::new(),
-            condition: String::new(),
-            params: Vec::new(),
             words: Vec::new(),
-            ends,
-            categories,
-            now,
-            zone,
+            leaves: Vec::new(),
+            scope: String::new(),
+            plan,
         };
-        compiled.condition = compiled.node(query, false, &undated);
+        compiled.scope = compiled.render_scope();
+        for at in 0..compiled.plan.leaves.len() {
+            let leaf = compiled.leaf(at, ends, categories);
+            compiled.leaves.push(leaf);
+        }
         compiled
     }
 
-    /// The hits in `sort` order (SEARCH §8.2), `limit` of them after
-    /// `offset`, every one with `None`: account, seq, rank, sort key,
-    /// whether undated, title. The `name` order folds
-    /// titles as SQL cannot, so its caller sorts the whole set itself;
-    /// another order leaves the title empty, read for no hit.
-    pub(crate) fn select(
-        &mut self,
-        sort: PimdirSearchSort,
-        page: Option<(usize, usize)>,
-    ) -> String {
-        let newest = "undated ASC, CASE WHEN undated = 0 THEN sort_key END DESC, \
-             CASE WHEN undated = 1 THEN sort_key END ASC, h.seq ASC, h.akey ASC";
-        let order = match sort {
-            PimdirSearchSort::NewestFirst => String::from(newest),
-            PimdirSearchSort::OldestFirst => {
-                String::from("undated ASC, sort_key ASC, h.seq ASC, h.akey ASC")
-            }
-            PimdirSearchSort::Title => String::from("h.seq ASC, h.akey ASC"),
-            PimdirSearchSort::Sender => format!("title = '' ASC, title ASC, {newest}"),
-            PimdirSearchSort::Relevance => {
-                String::from("rank ASC NULLS LAST, h.seq ASC, h.akey ASC")
-            }
+    /// The statements reading leaf `at`'s matches into `temp.term_match`.
+    pub(crate) fn matches(&self, at: usize) -> &[String] {
+        &self.leaves[at].matches
+    }
+
+    /// The leaves whose matches a statement reads from `temp.term_match`
+    /// under the current access: every text term read into a set, and
+    /// every `person:`, whose contacts are.
+    pub(crate) fn materialized(&self) -> Vec<usize> {
+        (0..self.leaves.len())
+            .filter(|at| {
+                !self.leaves[*at].matches.is_empty()
+                    && (self.leaves[*at].probe.is_none()
+                        || self.access[*at] == PimdirPlanAccess::Materialize)
+            })
+            .collect()
+    }
+
+    /// The statement measuring leaf `at`'s set, `None` for a leaf of no
+    /// set.
+    pub(crate) fn estimate(&self, at: usize) -> Option<&str> {
+        self.leaves[at].estimate.as_deref()
+    }
+
+    /// How many hits the union of the sets of `set` holds that have a
+    /// live placement in the scope and meet the query.
+    pub(crate) fn count_set(&self, set: &[usize]) -> String {
+        format!(
+            "SELECT count(*) FROM ({}) h WHERE {} AND {}",
+            self.driven(set),
+            self.placed("h.akey", "h.seq"),
+            self.condition("h.akey", "h.seq", &self.skip(set)),
+        )
+    }
+
+    /// How many hits the scope's live placements hold that meet the
+    /// query, each counted at its representative placement.
+    pub(crate) fn count_scope(&self) -> String {
+        let rep = match self.plan.scope.is_one_collection() {
+            true => String::new(),
+            false => format!(" AND {}", self.representative("y", "c.account")),
         };
-        let (limit, offset) = page.unwrap_or((i64::MAX as usize, 0));
-        let limit = self.bind(Value::Integer(limit.min(i64::MAX as usize) as i64));
-        let offset = self.bind(Value::Integer(offset as i64));
-        let placements = "FROM store.items i JOIN store.collections c ON c.id = i.collection \
-            WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey \
-            AND i.deleted = 0 AND i.retained_at IS NULL";
-        // NOTE: the title joins six summary tables per hit, before the order
-        // and the page cut: only the `title` and `sender` orders read it.
+        format!(
+            "SELECT count(*) FROM store.collections c \
+             JOIN store.items y ON y.collection = c.id AND y.deleted = 0 \
+             WHERE {}{rep} AND {}",
+            self.at_scope("c"),
+            self.condition("ifnull(c.account, '')", "y.seq", &self.skip(&[])),
+        )
+    }
+
+    /// The hits of the union of the sets of `set`, `SELECT akey, seq`,
+    /// each once.
+    pub(crate) fn driven(&self, set: &[usize]) -> String {
+        let sets: Vec<&str> = set
+            .iter()
+            .filter_map(|at| self.leaves[*at].set.as_deref())
+            .collect();
+        match sets.as_slice() {
+            [one] => format!("SELECT DISTINCT akey, seq FROM ({one})"),
+            many => many.join(" UNION "),
+        }
+    }
+
+    /// Every hit with a live placement in the scope, `SELECT akey, seq`,
+    /// each once.
+    pub(crate) fn scoped(&self) -> String {
+        format!(
+            "SELECT DISTINCT ifnull(c.account, '') AS akey, i.seq AS seq FROM store.collections c \
+             JOIN store.items i ON i.collection = c.id AND i.deleted = 0 WHERE {}",
+            self.at_scope("c")
+        )
+    }
+
+    /// The hits among `hits` (`SELECT akey, seq`, read from the sets of
+    /// `set`) meeting the query, each with its place in `sort` (SEARCH
+    /// §8.2): akey, seq, the greatest sort key of its live placements in
+    /// the scope, whether undated, its rank and its title. With `page`,
+    /// a dated order's page: those after the cursor named
+    /// `:after_undated`, `:after_key`, `:after_seq` and `:after_account`
+    /// when `page` holds true, ordered and cut at `:limit`.
+    pub(crate) fn rows(
+        &self,
+        hits: &str,
+        set: &[usize],
+        sort: PimdirSearchSort,
+        page: Option<bool>,
+    ) -> String {
         let rank = match sort {
             PimdirSearchSort::Relevance => {
-                "(SELECT min(m.rank) FROM matched m WHERE m.akey = h.akey AND m.seq = h.seq)"
+                let positive: Vec<String> = self
+                    .plan
+                    .leaves
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, leaf)| leaf.is_text() && !leaf.negated)
+                    .map(|(at, _)| at.to_string())
+                    .collect();
+                format!(
+                    "(SELECT min(m.rank) FROM temp.term_match m WHERE m.term IN ({}) \
+                     AND m.akey = h.akey AND m.seq = h.seq)",
+                    positive.join(", ")
+                )
             }
-            _ => "NULL",
+            _ => String::from("NULL"),
         };
         let title = match sort {
             PimdirSearchSort::Title => format!(
                 "(SELECT coalesce(ms.subject, cs.fn, es.summary, ts.summary, js.summary, fs.name, '') \
                  {TITLES} WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0 \
-                 AND i.retained_at IS NULL ORDER BY i.collection LIMIT 1)"
+                 ORDER BY i.collection LIMIT 1)"
             ),
             PimdirSearchSort::Sender => String::from(
                 "(SELECT coalesce(ms.sender, '') FROM store.items i \
                  JOIN store.collections c ON c.id = i.collection \
                  LEFT JOIN store.mail_summary ms ON ms.item = i.id \
                  WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0 \
-                 AND i.retained_at IS NULL ORDER BY i.collection LIMIT 1)",
+                 ORDER BY i.collection LIMIT 1)",
             ),
             _ => String::from("''"),
         };
+        let mut sql = format!(
+            "SELECT h.akey, h.seq, max(s.sort_key) AS k, max(sc.kind IN {UNDATED}) AS u, \
+             {rank} AS rank, {title} AS title \
+             FROM ({hits}) h \
+             JOIN store.items s ON s.seq = h.seq AND s.deleted = 0 \
+             JOIN store.collections sc ON sc.id = s.collection \
+             AND ifnull(sc.account, '') = h.akey AND {} \
+             WHERE {} GROUP BY h.akey, h.seq",
+            self.at_scope("sc"),
+            self.condition("h.akey", "h.seq", &self.skip(set)),
+        );
+        if let Some(after) = page {
+            let newest = sort == PimdirSearchSort::NewestFirst;
+            if after {
+                let beyond = match newest {
+                    true => "CASE WHEN u = 0 THEN k < :after_key ELSE k > :after_key END",
+                    false => "k > :after_key",
+                };
+                sql += &format!(
+                    " HAVING u > :after_undated OR (u = :after_undated AND ({beyond} \
+                     OR (k = :after_key AND (h.seq > :after_seq \
+                     OR (h.seq = :after_seq AND h.akey > :after_account)))))"
+                );
+            }
+            sql += match newest {
+                true => {
+                    " ORDER BY u, CASE WHEN u = 0 THEN k END DESC, CASE WHEN u = 1 THEN k END, \
+                     h.seq, h.akey LIMIT :limit"
+                }
+                false => " ORDER BY u, k, h.seq, h.akey LIMIT :limit",
+            };
+        }
+        sql
+    }
 
+    /// Every collection of the scope with the head a walk starts it
+    /// from: id, account (empty for none), whether undated, and the key
+    /// of its first live row in its phase's direction, at or beyond
+    /// `:dated_key` or `:undated_key` where the phase is bounded. Each
+    /// phase is `Some((ascending, bounded))`, `None` for one the walk
+    /// skips.
+    pub(crate) fn heads(
+        &self,
+        dated: Option<(bool, bool)>,
+        undated: Option<(bool, bool)>,
+    ) -> String {
+        let head = |phase: Option<(bool, bool)>, bound: &str| match phase {
+            None => String::from("NULL"),
+            Some((ascending, bounded)) => {
+                let (order, compare) = match ascending {
+                    true => ("ASC", ">="),
+                    false => ("DESC", "<="),
+                };
+                let bound = match bounded {
+                    true => format!(" AND y.sort_key {compare} {bound}"),
+                    false => String::new(),
+                };
+                format!(
+                    "(SELECT y.sort_key FROM store.items y WHERE y.collection = c.id \
+                     AND y.deleted = 0{bound} ORDER BY y.sort_key {order} LIMIT 1)"
+                )
+            }
+        };
         format!(
-            "{}
-SELECT h.account, h.seq,
-  {rank} AS rank,
-  (SELECT max(i.sort_key) {placements}) AS sort_key,
-  (SELECT max(c.kind IN ('text/vcard', 'application/octet-stream')) {placements}) AS undated,
-  {title} AS title
-FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
-            self.with(),
+            "SELECT c.id, ifnull(c.account, ''), c.kind IN {UNDATED}, \
+             CASE WHEN c.kind IN {UNDATED} THEN {} ELSE {} END \
+             FROM store.collections c WHERE {} ORDER BY c.id",
+            head(undated, ":undated_key"),
+            head(dated, ":dated_key"),
+            self.at_scope("c"),
         )
     }
 
-    /// How many hits the query has.
-    pub(crate) fn count(&self) -> String {
-        format!("{}\nSELECT count(*) FROM hits;", self.with())
-    }
-
-    /// The common table expressions every statement starts with: the live
-    /// hits, the hits meeting the condition, and the matches of the
-    /// positive text terms.
-    fn with(&self) -> String {
-        let mut ctes = Vec::new();
-        ctes.push(
-            "live(akey, account, seq) AS (SELECT DISTINCT ifnull(c.account, ''), c.account, i.seq \
-             FROM store.items i JOIN store.collections c ON c.id = i.collection \
-             WHERE i.deleted = 0 AND i.retained_at IS NULL)"
-                .into(),
-        );
-        ctes.push(format!(
-            "hits(akey, account, seq) AS (SELECT akey, account, seq FROM live WHERE {})",
-            self.condition
-        ));
-
-        let positive: Vec<String> = self.positive.iter().map(ToString::to_string).collect();
-        let matched = format!(
-            "SELECT akey, seq, src, rank FROM temp.term_match WHERE term IN ({})",
-            positive.join(", ")
-        );
-        ctes.push(format!("matched(akey, seq, src, rank) AS ({matched})"));
-
-        format!("WITH {}", ctes.join(",\n"))
-    }
-
-    /// Binds one parameter, answering its position.
-    fn bind(&mut self, value: Value) -> String {
-        self.params.push(value);
-        format!("?{}", self.params.len())
-    }
-
-    /// Embeds a canonical statement as a subquery of the query, each named
-    /// parameter bound by position.
-    fn embed(&mut self, statement: &str, binds: Vec<(&str, Value)>) -> String {
-        embed(statement, binds, &mut self.params)
-    }
-
-    /// Reads a text term's matches into `temp.term_match` before the query
-    /// runs, through `statement` (`match_objects` or `match_summaries`),
-    /// what matched named `src`, those of collections of another kind than
-    /// `kind` left out.
-    fn matches(
-        &mut self,
-        term: usize,
-        statement: &str,
-        src: &str,
-        expression: String,
-        kind: Option<&str>,
-    ) {
-        let mut params = Vec::new();
-        let matched = embed(statement, vec![(":match", expression.into())], &mut params);
-        let kind = match kind {
-            Some(kind) => format!(" WHERE c.kind = '{kind}'"),
-            None => String::new(),
+    /// The rows one walk step examines: those of collection
+    /// `:collection`, of account `:account` (`NULL` for none) and akey
+    /// `:akey`, after `(:key, :seq)` and within `:floor` where `step`
+    /// holds them, at most `:rows`, each with whether it places a hit.
+    pub(crate) fn step(&self, step: &PimdirWalkStep) -> String {
+        let (order, beyond, within) = match step.ascending {
+            true => ("ASC", ">", "<="),
+            false => ("DESC", "<", ">="),
         };
-        let sql = format!(
-            "INSERT INTO temp.term_match(term, collection, akey, seq, src, rank) \
-             SELECT {term}, m.collection, ifnull(c.account, ''), m.seq, '{src}', m.rank \
-             FROM ({matched}) m JOIN store.collections c ON c.id = m.collection{kind}"
-        );
-        self.matches.push(Matches { sql, params });
+        let mut bounds = String::new();
+        if step.after.is_some() {
+            bounds += &format!(
+                " AND y.sort_key {beyond}= :key AND (y.sort_key {beyond} :key OR y.seq > :seq)"
+            );
+        }
+        if step.floor.is_some() {
+            bounds += &format!(" AND y.sort_key {within} :floor");
+        }
+        let rep = match self.plan.scope.is_one_collection() {
+            true => String::from("1"),
+            false => self.representative("y", ":account"),
+        };
+        format!(
+            "SELECT y.sort_key, y.seq, CASE WHEN {rep} THEN {} ELSE 0 END \
+             FROM store.items y INDEXED BY items_by_sort \
+             WHERE y.collection = :collection AND y.deleted = 0{bounds} \
+             ORDER BY y.sort_key {order}, y.seq LIMIT :rows",
+            self.condition(":akey", "y.seq", &self.skip(&[])),
+        )
     }
 
-    /// Compiles one node to a condition over `live`.
-    fn node(&mut self, node: &PimdirQuery, negated: bool, undated: &[&str]) -> String {
+    /// How many collections the scope holds.
+    pub(crate) fn collections(&self) -> String {
+        format!(
+            "SELECT count(*) FROM store.collections c WHERE {}",
+            self.at_scope("c")
+        )
+    }
+
+    /// The condition a hit `(akey, seq)` meets, the leaves of `skip`
+    /// taken as holding.
+    pub(crate) fn condition(&self, akey: &str, seq: &str, skip: &[usize]) -> String {
+        self.node(&self.plan.root, akey, seq, skip)
+    }
+
+    /// The leaves a statement over the scope's placements, reading the
+    /// sets of `set`, need not probe: those the scope implies and those
+    /// of the sets read.
+    pub(crate) fn skip(&self, set: &[usize]) -> Vec<usize> {
+        self.plan.scoped.iter().chain(set).copied().collect()
+    }
+
+    /// Renders one node over the hit `(akey, seq)`.
+    fn node(&self, node: &PimdirPlanNode, akey: &str, seq: &str, skip: &[usize]) -> String {
         match node {
-            PimdirQuery::And(operands) | PimdirQuery::Or(operands) => {
+            PimdirPlanNode::And(operands) | PimdirPlanNode::Or(operands) => {
                 let operator = match node {
-                    PimdirQuery::And(_) => " AND ",
+                    PimdirPlanNode::And(_) => " AND ",
                     _ => " OR ",
                 };
-                let mut conditions = Vec::new();
-                for operand in operands {
-                    conditions.push(self.node(operand, negated, undated));
+                let rendered: Vec<String> = operands
+                    .iter()
+                    .map(|operand| self.node(operand, akey, seq, skip))
+                    .collect();
+                match rendered.is_empty() {
+                    true => String::from("1"),
+                    false => format!("({})", rendered.join(operator)),
                 }
-                format!("({})", conditions.join(operator))
             }
-            PimdirQuery::Not(operand) => {
-                format!("(NOT {})", self.node(operand, !negated, undated))
+            PimdirPlanNode::Not(operand) => {
+                format!("(NOT {})", self.node(operand, akey, seq, skip))
             }
-            PimdirQuery::Group(operand) => self.node(operand, negated, undated),
-            PimdirQuery::Term(term) => self.term(term, negated, undated),
+            PimdirPlanNode::Leaf(at) if skip.contains(at) => String::from("1"),
+            PimdirPlanNode::Leaf(at) => {
+                let leaf = &self.leaves[*at];
+                let template = match (&leaf.probe, self.access[*at]) {
+                    (Some(probe), PimdirPlanAccess::Probe) => probe,
+                    _ => &leaf.hit,
+                };
+                template.replace("{akey}", akey).replace("{seq}", seq)
+            }
         }
     }
 
-    /// Compiles one term to a condition over `live`.
-    fn term(&mut self, term: &PimdirQueryTerm, negated: bool, undated: &[&str]) -> String {
-        let live = "FROM store.items i JOIN store.collections c ON c.id = i.collection \
-                    WHERE i.deleted = 0 AND i.retained_at IS NULL";
+    /// The condition that the hit `(akey, seq)` has a live placement in
+    /// the scope.
+    fn placed(&self, akey: &str, seq: &str) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM store.items s JOIN store.collections sc ON sc.id = s.collection \
+             WHERE s.seq = {seq} AND s.deleted = 0 AND ifnull(sc.account, '') = {akey} AND {})",
+            self.at_scope("sc")
+        )
+    }
 
-        let placements = match &term.predicate {
+    /// The condition that placement `y`, of account `account`, is its
+    /// hit's representative in the scope: no other live placement of it
+    /// there holds a greater key, nor an equal one in an earlier
+    /// collection.
+    fn representative(&self, y: &str, account: &str) -> String {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM store.items r \
+             JOIN store.collections rc ON rc.id = r.collection \
+             WHERE r.seq = {y}.seq AND r.deleted = 0 AND r.id <> {y}.id \
+             AND rc.account IS {account} AND {} AND (r.sort_key > {y}.sort_key \
+             OR (r.sort_key = {y}.sort_key AND r.collection < {y}.collection)))",
+            self.at_scope("rc")
+        )
+    }
+
+    /// The scope's condition over collection `c`.
+    fn at_scope(&self, c: &str) -> String {
+        self.scope.replace("{c}", c)
+    }
+
+    /// Binds one value, answering its name.
+    fn bind(&mut self, value: impl Into<Value>) -> String {
+        self.values.push(value.into());
+        format!(":v{}", self.values.len())
+    }
+
+    /// Embeds a canonical statement as a subquery, its comments and final
+    /// semicolon stripped, each named parameter bound.
+    fn embed(&mut self, statement: &str, binds: Vec<(&str, Value)>) -> String {
+        let mut text: String = statement
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text = text.trim().trim_end_matches(';').to_string();
+        for (name, value) in binds {
+            let named = self.bind(value);
+            text = replace_param(&text, name, &named);
+        }
+        text
+    }
+
+    /// The scope's condition over a collection `{c}`: its kinds as
+    /// constants, its accounts and ids bound.
+    fn render_scope(&mut self) -> String {
+        let scope = self.plan.scope.clone();
+        let mut parts = Vec::new();
+        if let Some(kinds) = &scope.kinds {
+            let kinds: Vec<String> = kinds.iter().map(|kind| format!("'{kind}'")).collect();
+            parts.push(match kinds.is_empty() {
+                true => String::from("0"),
+                false => format!("{{c}}.kind IN ({})", kinds.join(", ")),
+            });
+        }
+        if let Some(accounts) = scope.accounts {
+            let named: Vec<String> = accounts.into_iter().map(|a| self.bind(a)).collect();
+            parts.push(match named.is_empty() {
+                true => String::from("0"),
+                false => format!("{{c}}.account IN ({})", named.join(", ")),
+            });
+        }
+        if let Some(ids) = scope.collections {
+            let named: Vec<String> = ids.into_iter().map(|id| self.bind(id)).collect();
+            parts.push(match named.is_empty() {
+                true => String::from("0"),
+                false => format!("{{c}}.id IN ({})", named.join(", ")),
+            });
+        }
+        match parts.is_empty() {
+            true => String::from("1"),
+            false => format!("({})", parts.join(" AND ")),
+        }
+    }
+
+    /// Renders one leaf: its condition over a hit, as a placement
+    /// predicate lifted to the hit's live placements in its account where
+    /// the term is one, and its set and estimate where it has them.
+    ///
+    /// `thread:` reaches the members of the thread any message of it
+    /// names, so a thread id still reaches them after a join renamed it
+    /// (SEARCH §9). `has:attachment` reads a calendar item by the mark its
+    /// body's extraction recorded, and `has:phone` and the others a card
+    /// by theirs (SEARCH §6). `priority:` reads a column a store whose
+    /// owner predates it holds `NULL` (STORAGE §6), every task then of no
+    /// priority. `category:` folds both sides as STORAGE Annex A.2 folds
+    /// `fn`, in Rust: a task by the `task_category` values the caller found
+    /// folding to the term's, compared as stated, a card by the folded
+    /// values its extraction recorded. A date term's open side is the
+    /// earliest or the latest instant an RFC 3339 string spells, and it
+    /// holds every item of an undated kind a `kind:` term names (SEARCH
+    /// §8.1). An `id:` value of digits names the item of that seq and every
+    /// item whose link id it is (SEARCH §8).
+    fn leaf(&mut self, at: usize, ends: &Ends, categories: &Categories) -> Leaf {
+        let predicate = self.plan.leaves[at].predicate.clone();
+        let negated = self.plan.leaves[at].negated;
+        let dates = self.plan.leaves[at].dates;
+        let mut leaf = Leaf {
+            hit: String::new(),
+            probe: None,
+            set: None,
+            estimate: None,
+            matches: Vec::new(),
+        };
+        let (j, c) = (format!("j{at}"), format!("c{at}"));
+
+        let placement: String = match &predicate {
             PimdirQueryPredicate::Text { field, text } => {
                 let (column, summary) = match field {
                     PimdirQueryTextField::Any => (None, true),
@@ -283,53 +531,96 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                     PimdirQueryTextField::Attachment => (Some("attachment"), false),
                     PimdirQueryTextField::Place => (Some("place"), false),
                 };
-                return self.text(column, summary, text, negated);
+                self.text(&mut leaf, at, column, summary, text, negated);
+                return leaf;
             }
-            PimdirQueryPredicate::Address { role, text } if text.text.contains('@') => {
-                let address = text.text.to_lowercase();
-                let role = Value::from(role.map(|role| role.as_str().to_string()));
-                match address.strip_prefix('@') {
-                    Some(domain) => self.embed(
-                        sql::LIST_DOMAIN_PLACEMENTS,
-                        vec![(":domain", domain.to_string().into()), (":role", role)],
-                    ),
-                    // NOTE: one page holding every placement, a `LIMIT` of
-                    // -1 being SQLite's unbounded one: the term is a set,
-                    // which the query's own order pages.
-                    None => self.embed(
-                        sql::LIST_ADDRESS_PLACEMENTS,
-                        vec![
-                            (":address", address.into()),
-                            (":role", role),
-                            (":after_key", Value::Null),
-                            (":after_seq", Value::Null),
-                            (":after_collection", Value::Null),
-                            (":after_role", Value::Null),
-                            (":limit", Value::Integer(-1)),
-                        ],
-                    ),
-                }
+            PimdirQueryPredicate::Address { role, text } if !text.text.contains('@') => {
+                let column = role.map(|role| role.as_str()).unwrap_or("people");
+                self.text(&mut leaf, at, Some(column), true, text, negated);
+                return leaf;
             }
             PimdirQueryPredicate::Address { role, text } => {
-                let column = role.map(|role| role.as_str()).unwrap_or("people");
-                return self.text(Some(column), true, text, negated);
+                let address = text.text.to_lowercase();
+                let role = role.map(|role| self.bind(role.as_str().to_string()));
+                let roled = |alias: &str| match &role {
+                    Some(role) => format!(" AND {alias}.role = {role}"),
+                    None => String::new(),
+                };
+                match address.strip_prefix('@') {
+                    Some(domain) => {
+                        let domain = self.bind(domain.to_string());
+                        format!(
+                            "EXISTS (SELECT 1 FROM store.item_address a{at} \
+                             WHERE a{at}.item = {j}.id AND lower(substr(a{at}.address, \
+                             -length({domain}) - 1)) = '@' || lower({domain}){})",
+                            roled(&format!("a{at}"))
+                        )
+                    }
+                    None => {
+                        let address = self.bind(address);
+                        leaf.set = Some(format!(
+                            "SELECT ifnull(c.account, '') AS akey, i.seq AS seq \
+                             FROM store.item_address a \
+                             JOIN store.items i ON i.id = a.item AND i.deleted = 0 \
+                             JOIN store.collections c ON c.id = i.collection \
+                             WHERE a.address = {address}{}",
+                            roled("a")
+                        ));
+                        leaf.estimate = Some(format!(
+                            "SELECT count(*) FROM (SELECT 1 FROM store.item_address a \
+                             WHERE a.address = {address}{} LIMIT {CAP})",
+                            roled("a")
+                        ));
+                        format!(
+                            "EXISTS (SELECT 1 FROM store.item_address a{at} \
+                             WHERE a{at}.item = {j}.id AND a{at}.address = {address}{})",
+                            roled(&format!("a{at}"))
+                        )
+                    }
+                }
             }
-            PimdirQueryPredicate::Person(text) => self.person(text),
+            PimdirQueryPredicate::Person(text) => {
+                if let Some(expression) = fts(Some("title"), text) {
+                    let card = Some("text/vcard");
+                    self.read_matches(
+                        &mut leaf,
+                        at,
+                        search::MATCH_OBJECTS,
+                        "body",
+                        &expression,
+                        card,
+                    );
+                    self.read_matches(
+                        &mut leaf,
+                        at,
+                        search::MATCH_SUMMARIES,
+                        "summary",
+                        &expression,
+                        card,
+                    );
+                }
+                let named = format!(
+                    "EXISTS (SELECT 1 FROM store.item_address a{at} WHERE a{at}.item = {j}.id \
+                     AND a{at}.address IN (SELECT e.address FROM store.item_address e \
+                     JOIN store.items ei ON ei.id = e.item WHERE e.role = 'email' \
+                     AND (ei.collection, ei.seq) IN (SELECT t.collection, t.seq \
+                     FROM temp.term_match t WHERE t.term = {at})))"
+                );
+                leaf.hit = format!("({} OR {})", matched(at), has(at, &named));
+                return leaf;
+            }
             PimdirQueryPredicate::Thread(id) => {
-                // NOTE: the thread any message of it names, so a thread
-                // id still reaches its members after a join renamed it,
-                // the old id being one of theirs (SEARCH §9).
                 let thread = self.embed(search::THREAD_OF, vec![(":link_id", id.clone().into())]);
-                format!(
+                let members = format!(
                     "SELECT p.collection, p.seq FROM message m \
                      JOIN placement p ON p.link_id = m.link_id \
                      JOIN store.collections c ON c.id = p.collection \
                      WHERE c.kind = 'message/rfc822' AND m.thread = ({thread})"
-                )
+                );
+                small(&mut leaf, &members, &j)
             }
             PimdirQueryPredicate::Linked { role, id } => {
-                let ends = self
-                    .ends
+                let ends = ends
                     .iter()
                     .find(|(named, _)| named == id)
                     .map(|(_, ends)| ends.clone())
@@ -346,37 +637,45 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                         ],
                     ));
                 }
-                linked.join(" UNION ")
+                small(&mut leaf, &linked.join(" UNION "), &j)
             }
             PimdirQueryPredicate::Flag(flag) => {
-                self.embed(search::FLAGGED, vec![(":flag", flag.clone().into())])
-            }
-            PimdirQueryPredicate::Encrypted => {
-                "SELECT p.collection, p.seq FROM placement p JOIN object o ON o.hash = p.hash \
-                 WHERE o.status = 'encrypted'"
-                    .into()
-            }
-            PimdirQueryPredicate::HasBody => {
-                format!("SELECT i.collection, i.seq {live} AND i.object_hash IS NOT NULL")
-            }
-            PimdirQueryPredicate::HasAttachment => {
-                // NOTE: a calendar item by the mark its body's extraction
-                // recorded (SEARCH §6), the FTS rows keeping no text.
-                let attached = self.embed(search::ATTACHED, Vec::new());
+                let flag = self.bind(flag.clone());
+                leaf.set = Some(format!(
+                    "SELECT ifnull(c.account, '') AS akey, f.seq AS seq FROM flag f \
+                     JOIN store.collections c ON c.id = f.collection WHERE f.flag = {flag}"
+                ));
+                leaf.estimate = Some(format!(
+                    "SELECT count(*) FROM (SELECT 1 FROM flag WHERE flag = {flag} LIMIT {CAP})"
+                ));
                 format!(
-                    "SELECT i.collection, i.seq {live} AND (EXISTS (SELECT 1 FROM store.mail_summary m \
-                     WHERE m.item = i.id AND m.attachment = 1) \
-                     OR (c.kind = 'text/calendar' AND (i.collection, i.seq) IN ({attached})))"
+                    "EXISTS (SELECT 1 FROM flag f{at} WHERE f{at}.flag = {flag} \
+                     AND f{at}.collection = {j}.collection AND f{at}.seq = {j}.seq)"
                 )
             }
+            PimdirQueryPredicate::Encrypted => {
+                leaf.set = Some(String::from(
+                    "SELECT ifnull(c.account, '') AS akey, p.seq AS seq FROM object o \
+                     JOIN placement p ON p.hash = o.hash \
+                     JOIN store.collections c ON c.id = p.collection \
+                     WHERE o.status = 'encrypted'",
+                ));
+                object(at, &j, &format!("o{at}.status = 'encrypted'"))
+            }
+            PimdirQueryPredicate::HasBody => format!("{j}.object_hash IS NOT NULL"),
+            PimdirQueryPredicate::HasAttachment => format!(
+                "(EXISTS (SELECT 1 FROM store.mail_summary m{at} WHERE m{at}.item = {j}.id \
+                 AND m{at}.attachment = 1) OR ({c}.kind = 'text/calendar' AND {}))",
+                object(at, &j, &format!("o{at}.attachment = 1"))
+            ),
             PimdirQueryPredicate::HasProperty(property) => {
-                // NOTE: a card by the mark its body's extraction recorded
-                // (SEARCH §6); every other kind records none.
-                let held = self.embed(
-                    search::HOLDING,
-                    vec![(":property", property.as_str().to_string().into())],
-                );
-                format!("SELECT i.collection, i.seq {live} AND (i.collection, i.seq) IN ({held})")
+                let column = match property {
+                    PimdirQueryProperty::Phone => "tel",
+                    PimdirQueryProperty::Address => "adr",
+                    PimdirQueryProperty::Birthday => "bday",
+                    PimdirQueryProperty::Photo => "photo",
+                };
+                object(at, &j, &format!("o{at}.{column} = 1"))
             }
             PimdirQueryPredicate::Kind(kind) => match kind {
                 PimdirQueryKind::Event | PimdirQueryKind::Task | PimdirQueryKind::Journal => {
@@ -385,276 +684,337 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                         PimdirQueryKind::Task => "task_summary",
                         _ => "journal_summary",
                     };
-                    format!(
-                        "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.{table} s \
-                         WHERE s.item = i.id)"
-                    )
+                    format!("EXISTS (SELECT 1 FROM store.{table} s{at} WHERE s{at}.item = {j}.id)")
                 }
-                kind => {
-                    let kind = self.bind(media_type(*kind).to_string().into());
-                    format!("SELECT i.collection, i.seq {live} AND c.kind = {kind}")
-                }
+                kind => format!("{c}.kind = '{}'", plan::media_type(*kind)),
             },
             PimdirQueryPredicate::Status(status) => {
-                let status = self.bind(status.clone().into());
+                let status = self.bind(status.clone());
                 format!(
-                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
-                     WHERE s.item = i.id \
-                     AND s.status = {status})"
+                    "EXISTS (SELECT 1 FROM store.task_summary s{at} WHERE s{at}.item = {j}.id \
+                     AND s{at}.status = {status})"
                 )
             }
             PimdirQueryPredicate::Mid(id) => {
-                let id = self.bind(id.clone().into());
+                let id = self.bind(id.clone());
                 format!(
-                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.mail_summary s \
-                     WHERE s.item = i.id \
-                     AND s.message_id = {id})"
+                    "EXISTS (SELECT 1 FROM store.mail_summary s{at} WHERE s{at}.item = {j}.id \
+                     AND s{at}.message_id = {id})"
                 )
             }
             PimdirQueryPredicate::Priority(priority) => {
                 let band = match priority {
-                    PimdirQueryPriority::High => "s.priority BETWEEN 1 AND 4",
-                    PimdirQueryPriority::Medium => "s.priority = 5",
-                    PimdirQueryPriority::Low => "s.priority BETWEEN 6 AND 9",
-                    PimdirQueryPriority::None => "ifnull(s.priority, 0) = 0",
+                    PimdirQueryPriority::High => format!("s{at}.priority BETWEEN 1 AND 4"),
+                    PimdirQueryPriority::Medium => format!("s{at}.priority = 5"),
+                    PimdirQueryPriority::Low => format!("s{at}.priority BETWEEN 6 AND 9"),
+                    PimdirQueryPriority::None => format!("ifnull(s{at}.priority, 0) = 0"),
                 };
-                // NOTE: a store whose owner predates the column reads it as
-                // NULL (STORAGE §6), every task then of no priority.
                 format!(
-                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
-                         WHERE s.item = i.id AND {band})"
+                    "EXISTS (SELECT 1 FROM store.task_summary s{at} WHERE s{at}.item = {j}.id \
+                     AND {band})"
                 )
             }
             PimdirQueryPredicate::Category(category) => {
-                // NOTE: both sides folded as STORAGE Annex A.2 folds `fn`,
-                // in Rust: a task by the `task_category` values the caller
-                // found folding to the term's, compared as stated.
-                // NOTE: a card by the values its body's extraction recorded
-                // (SEARCH §6), folded already, contact_summary keeping none.
                 let folded = fold::value(category);
-                let stated: Vec<String> = self
-                    .categories
+                let stated: Vec<String> = categories
                     .iter()
                     .find(|(term, _)| *term == folded)
                     .map(|(_, values)| values.clone())
                     .unwrap_or_default();
-                let carded =
-                    self.embed(search::CATEGORISED, vec![(":value", folded.clone().into())]);
+                let folded = self.bind(folded);
                 let stated = match stated.is_empty() {
                     true => String::from("0"),
                     false => {
-                        let values: Vec<String> = stated
-                            .into_iter()
-                            .map(|value| self.bind(value.into()))
-                            .collect();
-                        format!("s.value IN ({})", values.join(", "))
+                        let values: Vec<String> =
+                            stated.into_iter().map(|value| self.bind(value)).collect();
+                        format!("s{at}.value IN ({})", values.join(", "))
                     }
                 };
                 format!(
-                    "SELECT i.collection, i.seq {live} AND (EXISTS (SELECT 1 FROM store.task_category s \
-                         WHERE s.item = i.id \
-                         AND {stated}) OR (i.collection, i.seq) IN ({carded}))"
+                    "(EXISTS (SELECT 1 FROM store.task_category s{at} WHERE s{at}.item = {j}.id \
+                     AND {stated}) OR EXISTS (SELECT 1 FROM placement p{at} \
+                     JOIN object o{at} ON o{at}.hash = p{at}.hash \
+                     JOIN object_category k{at} ON k{at}.object = o{at}.id \
+                     WHERE p{at}.collection = {j}.collection AND p{at}.seq = {j}.seq \
+                     AND k{at}.value = {folded}))"
                 )
             }
             PimdirQueryPredicate::Account(account) => {
-                return format!("(akey = {})", self.bind(account.clone().into()));
+                leaf.hit = format!("({{akey}} = {})", self.bind(account.clone()));
+                return leaf;
             }
             PimdirQueryPredicate::Collection(collection) => {
-                let collection = self.bind(collection.clone().into());
-                format!("SELECT i.collection, i.seq {live} AND i.collection = {collection}")
+                let collection = self.bind(collection.clone());
+                leaf.set = Some(format!(
+                    "SELECT ifnull(c.account, '') AS akey, i.seq AS seq FROM store.items i \
+                     JOIN store.collections c ON c.id = i.collection \
+                     WHERE i.collection = {collection} AND i.deleted = 0"
+                ));
+                leaf.estimate = Some(format!(
+                    "SELECT count(*) FROM (SELECT 1 FROM store.items \
+                     WHERE collection = {collection} AND deleted = 0 LIMIT {CAP})"
+                ));
+                format!("{j}.collection = {collection}")
             }
-            PimdirQueryPredicate::Date(range) => {
-                let (since, until) = bounds(range, self.now, &self.zone);
-                // NOTE: an open side is the earliest or the latest instant an
-                // RFC 3339 string can spell.
-                let occurring = self.embed(
-                    search::OCCURRING_BETWEEN,
-                    vec![
-                        (":start", since.clone().unwrap_or_default().into()),
-                        (
-                            ":end",
-                            until
-                                .clone()
-                                .unwrap_or_else(|| "9999-12-31T23:59:59Z".into())
-                                .into(),
-                        ),
-                    ],
-                );
-                let since = self.bind(since.into());
-                let until = self.bind(until.into());
-                // NOTE: the undated kinds a `kind:` term names, each bound,
-                // `NULL` alone for none, which no kind equals.
-                let mut kinds = Vec::new();
-                for kind in undated {
-                    kinds.push(self.bind(kind.to_string().into()));
-                }
-                let undated = match kinds.is_empty() {
-                    true => String::from("NULL"),
-                    false => kinds.join(", "),
-                };
-                format!(
-                    "SELECT i.collection, i.seq {live} AND ((c.kind = 'message/rfc822' \
-                     OR (c.kind = 'text/calendar' AND i.object_hash IS NULL)) \
-                     AND i.sort_key != '' AND ({since} IS NULL OR i.sort_key >= {since}) \
-                     AND ({until} IS NULL OR i.sort_key < {until})) \
-                     UNION SELECT collection, seq FROM ({occurring}) \
-                     UNION SELECT i.collection, i.seq {live} \
-                     AND c.kind IN ({undated})"
-                )
-            }
+            PimdirQueryPredicate::Date(_) => self.date(&mut leaf, at, dates.unwrap_or_default()),
             PimdirQueryPredicate::Changed { since, until } => {
-                let since = self.bind((*since).into());
-                let until = self.bind((*until).into());
-                format!(
-                    "SELECT i.collection, i.seq {live} AND ({since} IS NULL OR i.changed >= {since}) \
-                     AND ({until} IS NULL OR i.changed <= {until})"
-                )
+                let mut range = String::new();
+                if let Some(since) = since {
+                    range += &format!(" AND {{x}}.changed >= {}", self.bind(*since));
+                }
+                if let Some(until) = until {
+                    range += &format!(" AND {{x}}.changed <= {}", self.bind(*until));
+                }
+                leaf.set = Some(format!(
+                    "SELECT ifnull(c.account, '') AS akey, i.seq AS seq FROM store.items i \
+                     JOIN store.collections c ON c.id = i.collection WHERE i.deleted = 0{}",
+                    range.replace("{x}", "i")
+                ));
+                format!("1{}", range.replace("{x}", &j))
             }
             PimdirQueryPredicate::Id(id) => {
-                // NOTE: a value of digits names the item of that seq and
-                // every item whose link id it is (SEARCH §8).
-                let link = self.bind(id.as_str().to_string().into());
-                let linked = member(&format!(
-                    "SELECT ifnull(c.account, ''), i.seq {live} AND i.link_id = {link}"
-                ));
-                return match id.seq() {
-                    Some(seq) => format!("((seq = {}) OR {linked})", self.bind(seq.into())),
-                    None => linked,
+                let link = self.bind(id.as_str().to_string());
+                let linked = has(at, &format!("{j}.link_id = {link}"));
+                let seq = id.seq().map(|seq| self.bind(seq));
+                let (hit, matching) = match &seq {
+                    Some(seq) => (
+                        format!("({{seq}} = {seq} OR {linked})"),
+                        format!("(i.seq = {seq} OR i.link_id = {link})"),
+                    ),
+                    None => (linked, format!("i.link_id = {link}")),
                 };
+                leaf.set = Some(format!(
+                    "SELECT ifnull(c.account, '') AS akey, i.seq AS seq FROM store.items i \
+                     JOIN store.collections c ON c.id = i.collection \
+                     WHERE i.deleted = 0 AND {matching}"
+                ));
+                leaf.hit = hit;
+                self.estimated(&mut leaf, at);
+                return leaf;
             }
         };
 
-        member(&format!(
-            "SELECT ifnull(c.account, ''), x.seq FROM ({placements}) x \
-             JOIN store.collections c ON c.id = x.collection"
-        ))
+        leaf.hit = has(at, &placement);
+        self.estimated(&mut leaf, at);
+        leaf
     }
 
-    /// The placements of `person:` (SEARCH §8): the contacts whose title
-    /// matches, and every item naming one of their addresses in any role.
-    fn person(&mut self, text: &PimdirQueryText) -> String {
-        let at = self.terms;
-        self.terms += 1;
-        if let Some(expression) = fts(Some("title"), text) {
-            let card = Some("text/vcard");
-            self.matches(at, search::MATCH_OBJECTS, "body", expression.clone(), card);
-            self.matches(at, search::MATCH_SUMMARIES, "summary", expression, card);
+    /// Renders a date term spanning `[since, until)`: its condition over
+    /// placement `j{at}`, and its set when the plan measures one.
+    fn date(&mut self, leaf: &mut Leaf, at: usize, dates: (Option<i64>, Option<i64>)) -> String {
+        let (j, c) = (format!("j{at}"), format!("c{at}"));
+        let since = dates.0.map(time::rfc3339);
+        let until = dates.1.map(time::rfc3339);
+        let start = self.bind(since.clone().unwrap_or_default());
+        let end = self.bind(
+            until
+                .clone()
+                .unwrap_or_else(|| "9999-12-31T23:59:59Z".into()),
+        );
+        let mut range = String::new();
+        if let Some(since) = since {
+            range += &format!(" AND {{x}}.sort_key >= {}", self.bind(since));
         }
-        let contacts = format!("SELECT collection, seq FROM temp.term_match WHERE term = {at}");
-
+        if let Some(until) = until {
+            range += &format!(" AND {{x}}.sort_key < {}", self.bind(until));
+        }
+        let dated = |x: &str, c: &str| {
+            format!(
+                "({c}.kind = 'message/rfc822' OR ({c}.kind = 'text/calendar' \
+                 AND {x}.object_hash IS NULL)) AND {x}.sort_key != ''{}",
+                range.replace("{x}", x)
+            )
+        };
+        let occurring =
+            |o: &str| format!("{o}.start < {end} AND ({o}.end > {start} OR {o}.start >= {start})");
+        let undated = match self.plan.undated.is_empty() {
+            true => String::new(),
+            false => {
+                let kinds: Vec<String> = self
+                    .plan
+                    .undated
+                    .iter()
+                    .map(|kind| format!("'{kind}'"))
+                    .collect();
+                format!(" OR {c}.kind IN ({})", kinds.join(", "))
+            }
+        };
+        leaf.set = Some(format!(
+            "SELECT ifnull(c.account, '') AS akey, i.seq AS seq FROM store.collections c \
+             JOIN store.items i ON i.collection = c.id AND i.deleted = 0 WHERE {} \
+             UNION ALL SELECT ifnull(c.account, '') AS akey, o.seq AS seq FROM occurrence o \
+             JOIN store.collections c ON c.id = o.collection WHERE {}",
+            dated("i", "c"),
+            occurring("o"),
+        ));
         format!(
-            "{contacts} UNION \
-             SELECT i.collection, i.seq FROM store.item_address a \
-             JOIN store.items i ON i.id = a.item \
-             WHERE i.deleted = 0 AND i.retained_at IS NULL AND a.address IN ( \
-               SELECT e.address FROM store.item_address e \
-               JOIN store.items ei ON ei.id = e.item \
-               WHERE e.role = 'email' AND (ei.collection, ei.seq) IN ({contacts}))"
+            "(({}) OR EXISTS (SELECT 1 FROM occurrence o{at} \
+             WHERE o{at}.collection = {j}.collection AND o{at}.seq = {j}.seq AND {}){undated})",
+            dated(&j, &c),
+            occurring(&format!("o{at}")),
         )
     }
 
-    /// Compiles a text term to its matches over bodies and, when the field
-    /// exists there, over summaries, read into `temp.term_match` under the
-    /// term's number, answering the condition over `live`.
+    /// Gives a leaf the estimate of its set, counted up to [`CAP`], when
+    /// the plan measures one, and drops its set when the plan reads none.
+    fn estimated(&self, leaf: &mut Leaf, at: usize) {
+        if self.plan.leaves[at].estimate == PimdirPlanEstimate::None {
+            leaf.set = None;
+            leaf.estimate = None;
+            return;
+        }
+        if leaf.estimate.is_none()
+            && let Some(set) = &leaf.set
+        {
+            leaf.estimate = Some(format!("SELECT count(*) FROM ({set} LIMIT {CAP})"));
+        }
+    }
+
+    /// Renders a text term: its matches read into `temp.term_match` under
+    /// the leaf's number from bodies and, when its field exists there,
+    /// from summaries; the condition reading them, the one probing its
+    /// expression per placement, its set and its estimate.
     fn text(
         &mut self,
+        leaf: &mut Leaf,
+        at: usize,
         column: Option<&str>,
         summary: bool,
         text: &PimdirQueryText,
         negated: bool,
-    ) -> String {
-        let at = self.terms;
-        self.terms += 1;
-        if let Some(expression) = fts(column, text) {
-            self.matches(at, search::MATCH_OBJECTS, "body", expression.clone(), None);
-            if summary {
-                self.matches(at, search::MATCH_SUMMARIES, "summary", expression, None);
-            }
+    ) {
+        let Some(expression) = fts(column, text) else {
+            leaf.hit = String::from("0");
+            leaf.probe = Some(String::from("0"));
+            leaf.estimate = Some(String::from("SELECT 0"));
+            leaf.set = Some(String::from("SELECT '' AS akey, 0 AS seq WHERE 0"));
+            return;
+        };
+        self.read_matches(leaf, at, search::MATCH_OBJECTS, "body", &expression, None);
+        if summary {
+            self.read_matches(
+                leaf,
+                at,
+                search::MATCH_SUMMARIES,
+                "summary",
+                &expression,
+                None,
+            );
         }
-
         if !negated {
-            self.positive.push(at);
             self.words.push(text.text.clone());
-            if let Some(expression) = fts(column, text) {
-                self.probes.push(Probe {
-                    expression,
-                    summary,
-                });
-            }
+            self.probes.push(Probe {
+                expression: expression.clone(),
+                summary,
+            });
         }
 
-        member(&format!(
+        let named = self.bind(expression);
+        let (j, p) = (format!("j{at}"), format!("p{at}"));
+        let summarised = match summary {
+            true => format!(
+                " OR EXISTS (SELECT 1 FROM summary_text WHERE summary_text MATCH {named} \
+                 AND rowid = {p}.id)"
+            ),
+            false => String::new(),
+        };
+        let probed = format!(
+            "EXISTS (SELECT 1 FROM placement {p} WHERE {p}.collection = {j}.collection \
+             AND {p}.seq = {j}.seq AND (EXISTS (SELECT 1 FROM object o{at} \
+             WHERE o{at}.hash = {p}.hash AND EXISTS (SELECT 1 FROM object_text \
+             WHERE object_text MATCH {named} AND rowid = o{at}.id)){summarised}))"
+        );
+        leaf.hit = matched(at);
+        leaf.probe = Some(has(at, &probed));
+        leaf.set = Some(format!(
             "SELECT akey, seq FROM temp.term_match WHERE term = {at}"
-        ))
+        ));
+        let counted = |table: &str| {
+            format!(
+                "(SELECT count(*) FROM (SELECT 1 FROM {table} WHERE {table} MATCH {named} \
+                 LIMIT {CAP}))"
+            )
+        };
+        leaf.estimate = Some(match summary {
+            true => format!(
+                "SELECT {} + {}",
+                counted("object_text"),
+                counted("summary_text")
+            ),
+            false => format!("SELECT {}", counted("object_text")),
+        });
+    }
+
+    /// Gives a leaf the statement reading a text term's matches into
+    /// `temp.term_match`, through `statement` (`match_objects` or
+    /// `match_summaries`), what matched named `src`, those of collections
+    /// of another kind than `kind` left out.
+    fn read_matches(
+        &mut self,
+        leaf: &mut Leaf,
+        at: usize,
+        statement: &str,
+        src: &str,
+        expression: &str,
+        kind: Option<&str>,
+    ) {
+        let matched = self.embed(statement, vec![(":match", expression.to_string().into())]);
+        let kind = match kind {
+            Some(kind) => format!(" WHERE c.kind = '{kind}'"),
+            None => String::new(),
+        };
+        leaf.matches.push(format!(
+            "INSERT INTO temp.term_match(term, collection, akey, seq, src, rank) \
+             SELECT {at}, m.collection, ifnull(c.account, ''), m.seq, '{src}', m.rank \
+             FROM ({matched}) m JOIN store.collections c ON c.id = m.collection{kind}"
+        ));
     }
 }
 
-/// A positive text term, probed against one hit's body or summary.
-pub(crate) struct Probe {
-    /// Its FTS5 expression (SEARCH §8.5).
-    pub(crate) expression: String,
-    /// Whether its field exists in a summary, which it then matches too.
-    pub(crate) summary: bool,
+/// The condition that the hit `({akey}, {seq})` has a live placement
+/// meeting `placement`, a condition over placement `j{at}` of collection
+/// `c{at}`.
+fn has(at: usize, placement: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM store.items j{at} \
+         JOIN store.collections c{at} ON c{at}.id = j{at}.collection \
+         WHERE j{at}.seq = {{seq}} AND j{at}.deleted = 0 \
+         AND ifnull(c{at}.account, '') = {{akey}} AND {placement})"
+    )
 }
 
-/// A statement filling `temp.term_match`, run before the query.
-pub(crate) struct Matches {
-    /// The statement.
-    pub(crate) sql: String,
-    /// Its parameters, bound by position.
-    pub(crate) params: Vec<Value>,
+/// The condition that the hit `({akey}, {seq})` is among the matches of
+/// text term `at` in `temp.term_match`.
+fn matched(at: usize) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM temp.term_match t{at} WHERE t{at}.term = {at} \
+         AND t{at}.akey = {{akey}} AND t{at}.seq = {{seq}})"
+    )
 }
 
-/// Embeds a canonical statement as a subquery: its comments and final
-/// semicolon stripped, each named parameter bound by position after those
-/// `params` holds.
-fn embed(statement: &str, binds: Vec<(&str, Value)>, params: &mut Vec<Value>) -> String {
-    let mut text: String = statement
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    text = text.trim().trim_end_matches(';').to_string();
-
-    for (name, value) in binds {
-        params.push(value);
-        let position = format!("?{}", params.len());
-        text = replace_param(&text, name, &position);
-    }
-    text
+/// The condition that placement `j` holds a body whose `object` row
+/// `o{at}` meets `condition`.
+fn object(at: usize, j: &str, condition: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM placement p{at} JOIN object o{at} ON o{at}.hash = p{at}.hash \
+         WHERE p{at}.collection = {j}.collection AND p{at}.seq = {j}.seq AND {condition})"
+    )
 }
 
-/// The condition that a hit of `live` is among `hits`, a statement
-/// answering `(akey, seq)` pairs, as 1 or 0 and never `NULL`.
-///
-/// A bare `(akey, seq) IN (...)` may be `NULL` as far as SQLite knows, so
-/// under `not`, where `NULL` and false part ways, it walks every row of the
-/// set for each hit it does not hold, to tell a partial `NULL` match from
-/// none: `is:unread`, no `\Seen`, took 24 s over 50,000 messages. Read as
-/// the test of a `CASE`, where `NULL` is false, it is one probe of the set.
-fn member(hits: &str) -> String {
-    format!("(CASE WHEN (akey, seq) IN ({hits}) THEN 1 ELSE 0 END)")
+/// A small set of placements, `SELECT collection, seq`, given to a leaf
+/// as its set, answering the condition over placement `j` that it holds
+/// it.
+fn small(leaf: &mut Leaf, placements: &str, j: &str) -> String {
+    leaf.set = Some(format!(
+        "SELECT ifnull(c.account, '') AS akey, x.seq AS seq FROM ({placements}) x \
+         JOIN store.collections c ON c.id = x.collection"
+    ));
+    format!("({j}.collection, {j}.seq) IN ({placements})")
 }
-
-/// The titles a hit's placements carry, joined for the `name` order.
-const TITLES: &str = "FROM store.items i JOIN store.collections c ON c.id = i.collection
-   LEFT JOIN store.mail_summary ms ON ms.item = i.id
-   LEFT JOIN store.contact_summary cs ON cs.item = i.id
-   LEFT JOIN store.event_summary es ON es.item = i.id
-   LEFT JOIN store.task_summary ts ON ts.item = i.id
-   LEFT JOIN store.journal_summary js ON js.item = i.id
-   LEFT JOIN store.file_summary fs ON fs.item = i.id";
 
 /// The collection media type of a kind.
 pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
-    match kind {
-        PimdirQueryKind::Mail => "message/rfc822",
-        PimdirQueryKind::Contact => "text/vcard",
-        PimdirQueryKind::Event | PimdirQueryKind::Task | PimdirQueryKind::Journal => {
-            "text/calendar"
-        }
-        PimdirQueryKind::File => file::KIND,
-    }
+    plan::media_type(kind)
 }
 
 /// The instants a range spans as RFC 3339 in UTC, either side `None` open
@@ -672,14 +1032,14 @@ pub(crate) fn bounds(
 /// folds it (SEARCH §5) and written as one escaped string, so the
 /// tokenizer reads its words as a phrase and nothing as syntax, a prefix
 /// starred, filtered to a column. `None` for a text holding no word,
-/// which matches nothing.
+/// which matches nothing. U+0000 separates tokens as any character the
+/// tokenizer keeps in none, and FTS5 reads no expression past one, so it
+/// is written as a space (SEARCH §8.5).
 fn fts(column: Option<&str>, text: &PimdirQueryText) -> Option<String> {
     if !text.text.chars().any(char::is_alphanumeric) {
         return None;
     }
 
-    // NOTE: U+0000 separates tokens as any character the tokenizer keeps
-    // in none, and FTS5 reads no expression past one (SEARCH §8.5).
     let folded = fold::text(&text.text).replace('\0', " ");
     let mut expression = format!("\"{}\"", folded.replace('"', "\"\""));
     if text.prefix {
@@ -691,8 +1051,8 @@ fn fts(column: Option<&str>, text: &PimdirQueryText) -> Option<String> {
     })
 }
 
-/// Replaces a named parameter by a positional one wherever it stands
-/// whole, so `:role` leaves `:roles` alone.
+/// Replaces a named parameter by another name wherever it stands whole,
+/// so `:role` leaves `:roles` alone.
 fn replace_param(text: &str, name: &str, position: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
