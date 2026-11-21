@@ -39,9 +39,9 @@ use io_pimdir::{
     sync::{PimdirConflictPolicy, PimdirSyncEvent, PimdirSyncOptions},
 };
 use pimdir_generator::{
-    engine::{self, Answer, Event, Outcome, Push, Run},
+    engine::{Answer, Event, Outcome, Push, Run},
     history::{History, Step},
-    model::{Collection, Model, Scope, SourceState, State, Table},
+    model::{Collection, Model, Scope, SourceState},
     oracle::Expectation,
     queue::RowState,
     remote::Page,
@@ -98,48 +98,6 @@ const G16: &str = "G16: a fold's debt pushed in the run that folds it";
 /// took).
 const G17: &str = "G17: ContentChanged for a body the item already holds";
 
-/// Finding G14 (the generator's since sync-draft-15): a source whose binding
-/// owes a change another source folded (`Dirty`, SYNC §9 propagation) and
-/// whose server changed the body too. SYNC §5 states it now ("A local body
-/// another source folded into the item since [...] is propagation it owes:
-/// [...] the member is pulled and the write folds it, the divergence settled
-/// by the collection's `conflict`"), which io-pimdir follows, recording the
-/// item's divergence; the generator records the binding's conflict under
-/// the source's policy (`History::bodies`, b recording its edit in
-/// conflict), as io-pimdir once did.
-const G14: &str = "G14: a propagated change meeting a server edit";
-
-/// Finding G23 (spec, reads two ways): a rekey carrying a member whose
-/// listing states other flags than its old base. SYNC §8 says the rekey
-/// "carries each placement's [...] flags, base and pending state onto its
-/// new handle", which the generator reads as the flags and the base kept as
-/// they stood; io-pimdir merges the listed flags over the old base as §5's
-/// flag axis does and takes them as the base, which the rekey's checkpoint
-/// never lists again (`History::rekeys`, two copies of one message under
-/// one `Message-ID` swapped by handle order, their flags apart).
-const G23: &str = "G23: the flags a rekey's listing states";
-
-/// Finding G24 (the generator's): a rekey carrying a mutable member its
-/// server edited as the pull SYNC §8 asks for ("carry it as a pull (§5)",
-/// "The sort key is carried, preferring the fetch's") keeps the old body's
-/// summary and sort key, where §5's pull makes "the member's meta [...] the
-/// summary, address rows and sort key", as io-pimdir does.
-const G24: &str = "G24: a rekey's pull keeps the old summary";
-
-/// Finding G25 (the generator's): an upgrade whose fetched body the
-/// collection's policy records as the item's divergence reports
-/// `Conflicted`, where SYNC §5 says "Only a sync and a rekey report events
-/// [...] an upgrade and a mutation report none, save `Overruled`", as
-/// io-pimdir reports none.
-const G25: &str = "G25: an upgrade reporting Conflicted";
-
-/// Finding G26 (the generator's, minor): a message listed without its body
-/// reviving a retained row sets the binding's `shared_object` to the row's
-/// body, where STORAGE §10 moves it only "by an absorbed upsert carrying a
-/// body [...], never by a pull carrying none", as io-pimdir leaves it
-/// `NULL`, the sync base standing in (SYNC §9).
-const G26: &str = "G26: a bodiless revive moving shared_object";
-
 #[test]
 fn every_generated_history_replays_as_its_model_states() {
     for seed in SEEDS {
@@ -154,7 +112,7 @@ fn every_generated_history_replays_as_its_model_states() {
 }
 
 #[test]
-#[ignore = "G12 to G17, G23 to G26: the replay findings of the generated suite"]
+#[ignore = "G12, G13, G15 to G17: the replay findings of the generated suite"]
 fn every_generated_history_replays_as_its_model_states_known_included() {
     let differences: Vec<(u64, Option<&str>, String)> = SEEDS
         .into_iter()
@@ -214,7 +172,7 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
         let (before, step) = (&pair[0], &pair[1]);
         let root = generated.root();
         let at = format!("step {} ({})", index + 1, step.label);
-        let mut diverging = diverges(before, step).then_some(G14);
+        let mut standing = None;
         let mut found: Vec<(Option<&'static str>, String)> = produce(&root, before, step)
             .into_iter()
             .map(|text| (None, text))
@@ -224,7 +182,7 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
         if let Some(run) = &step.run {
             let (ran, known) = replay_run(&root, before, step, run, &mut revisions);
             found.extend(ran);
-            diverging = diverging.or(known);
+            standing = standing.or(known);
         }
         let (_, mut read) = reader::compare(&spec, &step.model, &root, retained_sort_key);
         if !read.is_empty() {
@@ -234,20 +192,6 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
                 for (known, _) in &mut read {
                     *known = known.or(Some(G15));
                 }
-            }
-        }
-        if let Some(run) = &step.run
-            && read.iter().any(|(known, _)| known.is_none())
-        {
-            let reading = readings(before, step, run).into_iter().find(|(_, model)| {
-                let (_, again) = reader::compare(&spec, model, &root, retained_sort_key);
-                again.iter().all(|(known, _)| known.is_some())
-            });
-            let finding = reading
-                .map(|(finding, _)| finding)
-                .or_else(|| rekey_pulls(before, step, run).then_some(G24));
-            for (known, _) in &mut read {
-                *known = known.or(finding);
             }
         }
         found.extend(read);
@@ -281,7 +225,7 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
             continue;
         }
         differences.extend(found.into_iter().map(|(known, text)| {
-            let known = known.or(diverging);
+            let known = known.or(standing);
             (known, format!("{at}: {text}"))
         }));
         generated = Generated::write(Spec::load_default().unwrap(), step.model.clone());
@@ -307,110 +251,6 @@ fn renumbered(before: &Step, step: &Step, root: &Path) -> Model {
         }
     }
     model
-}
-
-/// Whether the step records an item conflict across sources the store did
-/// not hold before it, or a conflict on a binding owing the body another
-/// source folded into the item, G14's case.
-fn diverges(before: &Step, step: &Step) -> bool {
-    step.model.items.iter().any(|item| {
-        let held = before
-            .model
-            .items
-            .iter()
-            .find(|held| held.collection == item.collection && held.link_id == item.link_id);
-        let shared =
-            item.conflicted && item.bindings.len() > 1 && !held.is_some_and(|held| held.conflicted);
-        let owing = item.bindings.len() > 1
-            && item.bindings.iter().any(|binding| {
-                let was = held.and_then(|held| {
-                    held.bound(&binding.source)
-                        .map(|was| (held.object.clone(), was.clone()))
-                });
-                binding.conflicted
-                    && was.is_some_and(|(object, was)| {
-                        let agreed = was.shared_object.or(was.base_object);
-                        !was.conflicted && object.is_some() && object != agreed
-                    })
-            });
-        shared || owing
-    })
-}
-
-/// The step's model read another way, each with the finding the reading
-/// is: G23's, the flags a rekey carries merged with the listed ones over
-/// the old base, the listed ones the base; G26's, a binding a bodiless
-/// message revived holding no `shared_object`.
-fn readings(before: &Step, step: &Step, run: &Run) -> Vec<(&'static str, Model)> {
-    let listed: BTreeMap<&str, &BTreeSet<String>> = run
-        .pages
-        .iter()
-        .flat_map(|page| &page.items)
-        .map(|member| (member.handle.as_str(), &member.flags))
-        .collect();
-    let held = |item: &pimdir_generator::model::Item| {
-        before
-            .model
-            .items
-            .iter()
-            .find(|held| held.collection == item.collection && held.link_id == item.link_id)
-            .cloned()
-    };
-
-    let mut readings = Vec::new();
-    if run.verb == "rekey" {
-        let mut model = step.model.clone();
-        for item in &mut model.items {
-            let Some(was) = held(item) else {
-                continue;
-            };
-            let Some(base) = was.bound(&run.source).map(|b| b.base_flags.clone()) else {
-                continue;
-            };
-            if item.collection != run.collection {
-                continue;
-            }
-            let Some(binding) = item.bound_mut(&run.source) else {
-                continue;
-            };
-            let Some(flags) = listed.get(binding.handle.as_str()) else {
-                continue;
-            };
-            binding.base_flags = Some((*flags).clone());
-            item.flags = Some(engine::merge(was.flags.as_ref(), base.as_ref(), flags));
-        }
-        readings.push((G23, model));
-    }
-    if run.verb == "sync" {
-        let mut model = step.model.clone();
-        for item in &mut model.items {
-            let revived = held(item).is_some_and(|was| matches!(was.state, State::Retained { .. }));
-            if item.collection != run.collection || item.summary.table != Table::Mail || !revived {
-                continue;
-            }
-            if let Some(binding) = item.bound_mut(&run.source) {
-                binding.shared_object = None;
-            }
-        }
-        readings.push((G26, model));
-    }
-    readings
-}
-
-/// Whether the rekey carried a mutable member its server edited as a
-/// pull, emptying the item, G24's case.
-fn rekey_pulls(before: &Step, step: &Step, run: &Run) -> bool {
-    run.verb == "rekey"
-        && step.model.items.iter().any(|item| {
-            let moved = before.model.items.iter().any(|held| {
-                held.collection == item.collection
-                    && held.link_id == item.link_id
-                    && held.object.is_some()
-                    && held.bound(&run.source).map(|b| &b.base_revision)
-                        != item.bound(&run.source).map(|b| &b.base_revision)
-            });
-            item.collection == run.collection && item.object.is_none() && moved
-        })
 }
 
 /// Whether a disagreement is G12's: a retained row read alike but for its
@@ -531,21 +371,11 @@ fn replay_run(
     got.sort();
     want.sort();
     if got != want && !run.failed {
-        let shared = step.model.collections[&run.collection].sources.len() > 1;
-        let conflicted = got
-            .iter()
-            .any(|event| event.starts_with("Conflicted ") && !want.contains(event));
         let unchanged: Vec<&String> = want
             .iter()
             .filter(|event| !event.starts_with("ContentChanged "))
             .collect();
-        let reported: Vec<&String> = want
-            .iter()
-            .filter(|event| !event.starts_with("Conflicted "))
-            .collect();
         let events = match () {
-            _ if run.verb == "upgrade" && got.iter().collect::<Vec<_>>() == reported => Some(G25),
-            _ if shared && conflicted => Some(G14),
             _ if unchanged.len() < want.len() && got.iter().collect::<Vec<_>>() == unchanged => {
                 Some(G17)
             }
