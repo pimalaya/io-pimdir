@@ -496,6 +496,16 @@ fn summary(action: &PimdirAction) -> String {
         PimdirAction::SetPerformer { capability, source } => {
             format!("{capability} -> {}", source.as_deref().unwrap_or("none"))
         }
+        PimdirAction::SetProperty {
+            seq,
+            key,
+            add,
+            remove,
+        } => format!(
+            "seq {seq}, key {key}, {} added, {} removed",
+            add.len(),
+            remove.len()
+        ),
         // NOTE: an owner-defined intent this build has no semantics for,
         // so its payload is printed verbatim.
         PimdirAction::Unknown { payload, .. } => payload.clone(),

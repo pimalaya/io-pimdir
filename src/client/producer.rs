@@ -37,7 +37,7 @@ use crate::{
         blobs::{self, PimdirBlobCheck, PimdirBlobStage, PimdirBlobWriter, PimdirBlobs},
         busy_or_sql, capability,
         lock::PimdirLock,
-        modes, prepare_connection,
+        modes, prepare_connection, property,
         reader::{PimdirItem, item_from_row},
         record_failure, record_receipt, rows, schema, write,
     },
@@ -923,10 +923,11 @@ pub enum PimdirActionStatus {
         /// once that collection is gone, a `collection-delete` applied
         /// included (§15.4).
         collection: Option<String>,
-        /// The item the row acted on: the one a `set-flags`, an `update` or
-        /// a `remove` names, the one an `add` created, or a `move` or a
-        /// `copy` left in its target; or the item an acknowledged intent
-        /// left when its performer knew it; `None` otherwise.
+        /// The item the row acted on: the one a `set-flags`, a
+        /// `set-property`, an `update` or a `remove` names, the one an
+        /// `add` created, or a `move` or a `copy` left in its target; or
+        /// the item an acknowledged intent left when its performer knew it;
+        /// `None` otherwise.
         seq: Option<i64>,
         /// The refusals standing on that item (`load_receipt_refusals`,
         /// §15.4): a source whose remote refused the change the row led to
@@ -1602,6 +1603,20 @@ fn apply_claimed(
         return outcome(PimdirOutcome::Applied);
     }
 
+    if let PimdirAction::SetProperty {
+        seq,
+        key,
+        add,
+        remove,
+    } = action
+    {
+        if let Err(reason) = property::apply(tx, collection, *seq, key, remove, add)? {
+            return outcome(PimdirOutcome::Parked(reason));
+        }
+        record_receipt(tx, row.id, &row.collection, Some(*seq))?;
+        return outcome(PimdirOutcome::Applied);
+    }
+
     // NOTE: the owner's backstop (§15.6): what a producer should have
     // refused is parked here rather than pushed and rejected later.
     match capability::gate(tx, blobs, collection, action, None) {
@@ -1984,6 +1999,7 @@ fn stage_action(
         PimdirAction::Remove { seq, .. } => (*seq, true),
         PimdirAction::Add { .. } => unreachable!("add staged above"),
         PimdirAction::SetPerformer { .. } => unreachable!("set-performer applied above"),
+        PimdirAction::SetProperty { .. } => unreachable!("set-property applied above"),
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
     let item: Option<PimdirItem> = tx
@@ -2159,6 +2175,7 @@ fn stage_action(
         }
         PimdirAction::Add { .. } => unreachable!("add staged above"),
         PimdirAction::SetPerformer { .. } => unreachable!("set-performer applied above"),
+        PimdirAction::SetProperty { .. } => unreachable!("set-property applied above"),
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
 

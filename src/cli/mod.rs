@@ -1,9 +1,10 @@
 //! The `pimdir` command tree, one module per verb group.
 //!
 //! Each module owns one group of subcommands ([`collection`], [`item`],
-//! [`queue`], [`store`], [`check`], [`gc`], [`quarantine`], [`export`],
-//! [`search`]) and renders its own output as both text and JSON, with
-//! [`json_schema`] indexing every output type. This module holds what they
+//! [`property`], [`queue`], [`store`], [`check`], [`gc`], [`quarantine`],
+//! [`export`], [`search`]) and renders its own output as both text and
+//! JSON, with [`json_schema`] indexing every output type. This module holds
+//! what they
 //! share: the global store flags, the roles a verb may open the store with,
 //! the error mapping, the confirmation prompt guarding destructive verbs
 //! and the formatting helpers.
@@ -19,6 +20,7 @@ pub mod export;
 pub mod gc;
 pub mod item;
 pub mod json_schema;
+pub mod property;
 pub mod quarantine;
 pub mod queue;
 pub mod search;

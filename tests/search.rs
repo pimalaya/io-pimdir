@@ -32,12 +32,14 @@ use io_pimdir::{
             PimdirSearchMatched, PimdirSearchOptions, PimdirSearchSort,
         },
     },
+    codec::PimdirAction,
     collection::{PimdirCollectionId, PimdirScope},
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey,
         PimdirStatus,
     },
+    property,
     reference::{PimdirEndpoint, PimdirReferenceOrigin, PimdirReferenceRole},
     search::{
         chunk,
@@ -140,12 +142,14 @@ fn mail_summary(row: &Value, addresses: &[Value]) -> PimdirSummary {
 /// directory the body of each item stating `unreadable` (SEARCH §11).
 fn build(spec: &Path, dir: &Path) {
     let store = json(&spec.join("vectors/search/store.json"));
-    assert_eq!(store["v"], 2, "store.json at another version");
+    assert_eq!(store["v"], 3, "store.json at another version");
     build_store(spec, dir, &store);
 }
 
 /// A store as store.json states one, built through the owner, a stand-in
-/// written as an owner recording attachments leaves it (STORAGE §14.3).
+/// written as an owner recording attachments leaves it (STORAGE §14.3),
+/// and each property it states added by the owner on its own account
+/// (STORAGE §4.3).
 fn build_store(spec: &Path, dir: &Path, store: &Value) {
     let mut unreadable = Vec::new();
 
@@ -228,6 +232,14 @@ fn build_store(spec: &Path, dir: &Path, store: &Value) {
             )
             .unwrap()
             .expect("the reference links");
+    }
+
+    for property in store["properties"].as_array().into_iter().flatten() {
+        let seq = property["seq"].as_i64().unwrap();
+        let key = property["key"].as_str().unwrap();
+        let value = property["value"].as_str().unwrap();
+        let added = store_handle.add_property(seq, key, value).unwrap();
+        assert!(added, "{key}={value:?} lands on seq {seq}");
     }
     drop(store_handle);
 
@@ -312,7 +324,7 @@ fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> 
 fn every_refresh_vector_answers() {
     let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/refresh.json"));
-    assert_eq!(vectors["v"], 2, "refresh.json at another version");
+    assert_eq!(vectors["v"], 3, "refresh.json at another version");
     let now = unix(
         json(&spec.join("vectors/search/queries.json"))["now"]
             .as_str()
@@ -449,8 +461,90 @@ fn apply(spec: &Path, dir: &Path, kinds: &mut BTreeMap<String, String>, write: &
                 ])
                 .unwrap();
         }
+        "property" => {
+            let action = PimdirAction::SetProperty {
+                seq: seq(),
+                key: write["key"].as_str().unwrap().into(),
+                add: strings(&write["add"]),
+                remove: strings(&write["remove"]),
+            };
+            PimdirProducer::open(dir, "vectors")
+                .unwrap()
+                .enqueue(collection(), &action, None)
+                .unwrap();
+            let report = store.drain().unwrap();
+            assert_eq!(report.applied, 1, "the set-property applies: {report:?}");
+        }
         kind => panic!("no refresh write {kind}"),
     }
+}
+
+/// The store's half of the refresh case "an item keeps local state" while
+/// its queries wait on `label:` and `property:` (tests/pending_vectors.txt):
+/// each `set-property` queued and drained, the feed it leaves, and each
+/// one-term `label:` or `property:` query answered from the store's own
+/// reads as SEARCH §8 states them, `list_property_values` then
+/// `list_value_holders` per spelling a label folds to (STORAGE §4.3, §14.1).
+#[test]
+fn the_local_state_refresh_case_holds_in_the_store() {
+    let spec = spec_dir();
+    let vectors = json(&spec.join("vectors/search/refresh.json"));
+    let case = vectors["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["label"] == "an item keeps local state")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    build_store(&spec, dir.path(), &case["store"]);
+    let accounts: BTreeMap<String, String> = case["store"]["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            let id = c["id"].as_str().unwrap().to_string();
+            (id, c["account"].as_str().unwrap().to_string())
+        })
+        .collect();
+    let mut kinds = BTreeMap::new();
+
+    let mut asked = 0;
+    for step in case["steps"].as_array().unwrap() {
+        let cursor = PimdirReader::open(dir.path())
+            .unwrap()
+            .change_cursor()
+            .unwrap();
+        apply(&spec, dir.path(), &mut kinds, &step["write"]);
+        feed(dir.path(), &cursor, &step["changed"]);
+
+        let reader = PimdirReader::open(dir.path()).unwrap();
+        for query in step["queries"].as_array().unwrap() {
+            let text = query["query"].as_str().unwrap();
+            let holders = if let Some(label) = text.strip_prefix("label:") {
+                let label = label.trim_matches('"');
+                let mut holders = Vec::new();
+                for held in reader.list_property_values(property::LABEL).unwrap() {
+                    if property::fold(&held) == property::fold(label) {
+                        holders.extend(reader.list_value_holders(property::LABEL, &held).unwrap());
+                    }
+                }
+                holders
+            } else if let Some(term) = text.strip_prefix("property:") {
+                let (key, value) = term.split_once('=').unwrap();
+                reader.list_value_holders(key, value).unwrap()
+            } else {
+                continue;
+            };
+            let hits: BTreeSet<(String, i64)> = holders
+                .into_iter()
+                .map(|holder| (accounts[&holder.collection].clone(), holder.seq))
+                .collect();
+            let want: BTreeSet<_> = pairs(&query["hits"]).into_iter().collect();
+            assert_eq!(hits, want, "{text:?}");
+            asked += 1;
+        }
+    }
+    assert_eq!(asked, 10, "every label: and property: query of the case");
 }
 
 /// What the feed lists above `cursor` against what a step states.

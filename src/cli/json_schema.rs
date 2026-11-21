@@ -25,6 +25,7 @@ use crate::cli::{
         ItemEraseOutput, ItemExportOutput, ItemPurgeOutput, ItemRestoreOutput, ItemShowOutput,
         ItemsOutput,
     },
+    property::{PropertiesOutput, PropertyChangeOutput},
     quarantine::QuarantineEmptyOutput,
     queue::{QueueCancelOutput, QueueOutput, QueueRetryOutput, QueueStatusOutput},
     search::{
@@ -49,6 +50,9 @@ pub fn registry() -> JsonSchemaRegistry {
     registry.insert::<ItemRestoreOutput>("pimdir-item-restore");
     registry.insert::<ItemPurgeOutput>("pimdir-item-purge");
     registry.insert::<ItemEraseOutput>("pimdir-item-erase");
+    registry.insert::<PropertiesOutput>("pimdir-property-list");
+    registry.insert::<PropertyChangeOutput>("pimdir-property-add");
+    registry.insert::<PropertyChangeOutput>("pimdir-property-remove");
     registry.insert::<QueueOutput>("pimdir-queue-list");
     registry.insert::<QueueCancelOutput>("pimdir-queue-cancel");
     registry.insert::<QueueRetryOutput>("pimdir-queue-retry");

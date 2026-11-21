@@ -10,3 +10,45 @@
 # payloads (vectors/payloads.json), sync (vectors/sync/, by file stem),
 # queries, chunks and refresh (vectors/search/).
 
+
+# label:/property: wait for the planner merge (as-fast-as-notmuch), the
+# number before each being that change's phase 2, queries: the store
+# holds the properties (an-item-keeps-local-state), the compiler reads no
+# such field yet.
+2 refresh: refresh "an item keeps local state" step 1
+2 refresh: refresh "an item keeps local state" step 2
+2 refresh: refresh "an item keeps local state" step 3
+2 refresh: refresh "an item keeps local state" step 4
+2 refresh: refresh "an item keeps local state" step 5
+2 refresh: refresh "an item keeps local state" step 6
+2 refresh: refresh "an item keeps local state" step 7
+2 queries: "label:receipts"
+2 queries: "label:RECEIPTS"
+2 queries: "label:\" Receipts \""
+2 queries: "label:résumé"
+2 queries: "label:resume"
+2 queries: "label:\"tax returns\""
+2 queries: "label:tax"
+2 queries: "label:family"
+2 queries: "property:pimdir/label=Receipts"
+2 queries: "property:pimdir/label=receipts"
+2 queries: "property:\"pimdir/label=Tax returns\""
+2 queries: "property:himalaya/snooze-until=2026-12-01T09:00:00Z"
+2 queries: "property:himalaya/muted=1"
+2 queries: "property:himalaya/xxxxxxxxxxxxxxxxxxxxxx" and 35 more characters
+2 queries: "property:pimdir/session-key=x"
+2 queries: "label:receipts kind:mail"
+2 queries: "kind:contact -label:family"
+2 queries: "label:"
+2 queries: "label:\"\""
+2 queries: "label:€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€" and 307 more characters
+2 queries: "label:€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€" and 308 more characters
+2 queries: "property:himalaya"
+2 queries: "property:=1"
+2 queries: "property:himalaya=1"
+2 queries: "property:Himalaya/muted=1"
+2 queries: "property:himalaya/xxxxxxxxxxxxxxxxxxxxxx" and 36 more characters
+2 queries: "property:himalaya/muted="
+2 queries: "label:rec*"
+2 queries: "label:~receipts"
+2 queries: "property:/x=1"

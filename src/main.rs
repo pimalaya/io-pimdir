@@ -59,6 +59,7 @@ use crate::cli::{
     gc::GcCommand,
     item::ItemCommand,
     json_schema,
+    property::PropertyCommand,
     quarantine::QuarantineCommand,
     queue::QueueCommand,
     search::{CountCommand, IndexCommand, SearchCommand, ShowCommand, TagCommand, ThreadCommand},
@@ -113,6 +114,9 @@ enum Command {
     /// Inspect, restore, purge and erase items.
     #[command(subcommand, alias = "items")]
     Item(ItemCommand),
+    /// List, add and remove an item's properties, its local state.
+    #[command(subcommand, alias = "properties")]
+    Property(PropertyCommand),
     /// Inspect and prune the action queue.
     #[command(subcommand, alias = "queues")]
     Queue(QueueCommand),
@@ -154,6 +158,7 @@ impl Command {
         match self {
             Self::Collection(cmd) => cmd.execute(printer, store),
             Self::Item(cmd) => cmd.execute(printer, store),
+            Self::Property(cmd) => cmd.execute(printer, store),
             Self::Queue(cmd) => cmd.execute(printer, store),
             Self::Store(cmd) => cmd.execute(printer, store),
             Self::Check(cmd) => cmd.execute(printer, store),

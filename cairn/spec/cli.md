@@ -41,7 +41,7 @@ as it stands, and reads what is queued through `queue list`, where a pending row
 shows as a row rather than as a fact about an item.
 
 ### Requirement: Item mutations enqueue, then drain when the owner role is free
-An item mutation requested from the CLI (today: `item restore` and `tag`) SHALL be
+An item mutation requested from the CLI (today: `item restore`, `tag` and `property add|remove`) SHALL be
 appended to the action queue through the producer role, exactly as any other
 non-owner process does. The CLI SHALL then attempt to take the owner role and
 drain the queue itself, store-wide in append order, reporting **applied** when the item is live again
@@ -131,6 +131,7 @@ The CLI SHALL expose, at minimum:
 - `item purge`: destroy retained items, one `seq`, everything older than a
   human duration, or all of them. A live item SHALL be refused: purge empties
   the trash, it does not delete synced data.
+- `property list SEQ`: an item's properties as the store holds them (`pimdir-property-list`). `property add|remove SEQ KEY VALUE...`: one `set-property` staged through the producer role on `--collection`, else on the first collection holding the item live, then drained when the owner role is free and a source to drain as resolves (`--source`, or the store's one source), its outcome read from the row's status: applied, queued, or refused with exit status 3 (`pimdir-property-add`, `pimdir-property-remove`). A value is user content, printed through the text sanitiser; `queue list` prints a `set-property` by its seq, key and value counts alone (tests/cli_property.rs).
 - `item erase`: erase one item's bytes from the store's files (STORAGE §11.5): `PimdirStore::erase` (the purge of a retained item, or the delete of a live one no source binds, the collector, a `TRUNCATE` checkpoint of pimdir.db), then, when index.db exists, `PimdirIndex::erase` (the refresh with its thread prune, `optimize_text`, a `TRUNCATE` checkpoint of index.db), reporting the blob files unlinked and whether the index was erased (`pimdir-item-erase`). A live item a source binds SHALL be refused: remove it first.
 - `queue list`: pending actions, or parked ones with `--parked`, each row stating `unconfirmed`, true for a parked intent whose outcome is unknown (STORAGE §15.2), which the text prints as the record's state word.
 - `queue retry`: put one parked row back among the pending ones (`PimdirStore::retry_action`, STORAGE §15.5), by id or by handle, answering `row` and `unconfirmed` (`pimdir-queue-retry`); a row pending or gone fails with `row-not-found`. An unconfirmed intent is confirmed first, or takes `--yes`.

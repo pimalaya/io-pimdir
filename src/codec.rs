@@ -26,6 +26,7 @@ use crate::{
     },
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
+    property,
 };
 
 /// A flag set as a read statement answers it (STORAGE §4.4, §13): the
@@ -322,6 +323,22 @@ pub enum PimdirAction {
         /// The source the user chose.
         source: Option<String>,
     },
+    /// Change the item's properties under one key (§4.3, §15.3): local
+    /// state the owner applies to the store alone, as no source, needing
+    /// no capability and deriving no push. Its removes apply before its
+    /// adds, a label compared folded ([`crate::property::change`]).
+    SetProperty {
+        /// The item's public id.
+        seq: i64,
+        /// The key, [`crate::property::LABEL`] or one outside `pimdir/`.
+        key: String,
+        /// The values added, in order; empty for a payload stating no
+        /// `add`.
+        add: Vec<String>,
+        /// The values removed; empty for a payload stating no `remove`.
+        /// A payload states one or both.
+        remove: Vec<String>,
+    },
     /// An intent, of Annex B.2 or an application's own, which the store
     /// skips rather than applies.
     ///
@@ -351,6 +368,7 @@ impl PimdirAction {
             Self::Copy { .. } => "copy",
             Self::Update { .. } => "update",
             Self::SetPerformer { .. } => "set-performer",
+            Self::SetProperty { .. } => "set-property",
             Self::Unknown { kind, .. } => kind,
         }
     }
@@ -394,7 +412,8 @@ impl PimdirAction {
             | Self::Remove { .. }
             | Self::Move { .. }
             | Self::Copy { .. }
-            | Self::SetPerformer { .. } => None,
+            | Self::SetPerformer { .. }
+            | Self::SetProperty { .. } => None,
         }
     }
 }
@@ -533,6 +552,21 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
                 map.insert("source".into(), json!(source));
             }
         }
+        PimdirAction::SetProperty {
+            seq,
+            key,
+            add,
+            remove,
+        } => {
+            map.insert("seq".into(), json!(seq));
+            map.insert("key".into(), json!(key));
+            if !add.is_empty() {
+                map.insert("add".into(), json!(add));
+            }
+            if !remove.is_empty() {
+                map.insert("remove".into(), json!(remove));
+            }
+        }
         PimdirAction::Unknown { .. } => {}
     }
 
@@ -541,7 +575,7 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
 
 /// The actions this crate holds a schema for at `v: 1` (STORAGE §15.3,
 /// Annex B.2): the store's own and the intents.
-const KNOWN_ACTIONS: [&str; 13] = [
+const KNOWN_ACTIONS: [&str; 14] = [
     "add",
     "set-flags",
     "remove",
@@ -549,6 +583,7 @@ const KNOWN_ACTIONS: [&str; 13] = [
     "copy",
     "update",
     "set-performer",
+    "set-property",
     intent::SUBMIT,
     intent::CALENDAR_REPLY,
     intent::CALENDAR_CANCEL,
@@ -692,6 +727,28 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
             PimdirAction::SetPerformer {
                 capability,
                 source: label(map.get("source"), "source")?,
+            }
+        }
+        "set-property" => {
+            let map = members(payload, &["seq", "key", "add", "remove"])?;
+            let seq = required(seq(map.get("seq"), "seq")?, "seq")?;
+            let key = required(text(map.get("key"), "key")?, "key")?;
+            if !property::is_writable_key(&key) {
+                return Err(PimdirActionError::Invalid {
+                    field: "key",
+                    reason: "a key is pimdir/label or <namespace>/<name> outside pimdir/, each part of a to z, 0 to 9, '.', '_' and '-', at most 64 bytes",
+                });
+            }
+            let add = values(map.get("add"), "add")?;
+            let remove = values(map.get("remove"), "remove")?;
+            if add.is_none() && remove.is_none() {
+                return Err(PimdirActionError::MissingField("add"));
+            }
+            PimdirAction::SetProperty {
+                seq,
+                key,
+                add: add.unwrap_or_default(),
+                remove: remove.unwrap_or_default(),
             }
         }
         _ => {
@@ -865,6 +922,39 @@ fn hashes(
         names.push(name);
     }
     Ok(Some(names))
+}
+
+/// A `[value…]` member (§15.3): 1 to 64 distinct property values, each 1
+/// to 1,024 bytes of UTF-8 holding no NUL, the bytes being the text's rule
+/// where the schema counts characters.
+fn values(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, PimdirActionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let invalid = PimdirActionError::Invalid {
+        field,
+        reason: "1 to 64 distinct values are expected, each 1 to 1024 bytes of UTF-8 without NUL",
+    };
+    let Value::Array(items) = value else {
+        return Err(invalid);
+    };
+    if !(1..=property::MAX_VALUES).contains(&items.len()) {
+        return Err(invalid);
+    }
+
+    let mut values: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_str() {
+            Some(value) if property::is_value(value) && !values.iter().any(|v| v == value) => {
+                values.push(value.to_string());
+            }
+            _ => return Err(invalid),
+        }
+    }
+    Ok(Some(values))
 }
 
 /// A `[…]` member: a flag set as distinct flags, each one the store holds
@@ -1108,6 +1198,18 @@ mod tests {
                 capability: "mail.submit".into(),
                 source: Some("smtp".into()),
             },
+            PimdirAction::SetProperty {
+                seq: 10,
+                key: property::LABEL.into(),
+                add: vec!["Receipts".into(), "Tax".into()],
+                remove: vec!["receipts".into()],
+            },
+            PimdirAction::SetProperty {
+                seq: 11,
+                key: "himalaya/snooze-until".into(),
+                add: Vec::new(),
+                remove: vec!["2026-12-01T09:00:00Z".into()],
+            },
         ];
         for action in actions {
             let payload = action_to_payload(&action);
@@ -1142,6 +1244,14 @@ mod tests {
             refused(unread),
             PimdirActionError::Invalid { field: "flags", .. }
         ));
+
+        let changeless = PimdirAction::SetProperty {
+            seq: 1,
+            key: property::LABEL.into(),
+            add: Vec::new(),
+            remove: Vec::new(),
+        };
+        assert_eq!(refused(changeless), PimdirActionError::MissingField("add"));
     }
 
     /// A payload is valid whole or malformed (§15.3), the error naming the

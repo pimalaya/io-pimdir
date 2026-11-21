@@ -281,6 +281,36 @@ fn answer(reader: &PimdirReader, expectation: &Expectation) -> Result<Option<Ans
                 .map(|account| vec![Value::Text(account)])
                 .collect(),
         ),
+        "list_item_properties" => Answer::new(
+            &["key", "value"],
+            reader
+                .list_item_properties(at.int("seq").unwrap())?
+                .into_iter()
+                .map(|property| vec![Value::Text(property.key), Value::Text(property.value)])
+                .collect(),
+        ),
+        "list_property_values" => Answer::new(
+            &["value"],
+            reader
+                .list_property_values(&at.string("key"))?
+                .into_iter()
+                .map(|value| vec![Value::Text(value)])
+                .collect(),
+        ),
+        "list_property_holders" | "list_value_holders" => {
+            let key = at.string("key");
+            let holders = match name {
+                "list_property_holders" => reader.list_property_holders(&key)?,
+                _ => reader.list_value_holders(&key, &at.string("value"))?,
+            };
+            Answer::new(
+                &["collection", "seq"],
+                holders
+                    .into_iter()
+                    .map(|holder| vec![Value::Text(holder.collection), Value::Integer(holder.seq)])
+                    .collect(),
+            )
+        }
         "list_sources" => Answer::new(
             &["source"],
             reader

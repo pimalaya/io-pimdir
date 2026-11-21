@@ -64,6 +64,7 @@ mod capability;
 pub mod diagnostics;
 pub mod modes;
 pub mod producer;
+mod property;
 pub mod reader;
 #[cfg(feature = "search")]
 pub mod search;
@@ -2211,6 +2212,11 @@ pub enum PimdirError {
     /// holding a space, a control or a non-ASCII character. Refused before
     /// anything is written or queued.
     Flag(String),
+    /// A property the owner cannot write (STORAGE §4.3, §13): a key or a
+    /// value past its bounds, a key under `pimdir/` the standard does not
+    /// define, or more than 64 values under one key of one item. Refused
+    /// before anything is written.
+    Property(String),
     /// A purge cutoff is not an instant written as the store's stamps are,
     /// UTC with milliseconds (§11.2), which a textual comparison needs.
     Cutoff(String),
@@ -2347,6 +2353,7 @@ impl PimdirError {
     /// | `ambiguous-performer` | [`Ambiguous`](Self::Ambiguous) |
     /// | `cutoff-invalid` | [`Cutoff`](Self::Cutoff) |
     /// | `flag-invalid` | [`Flag`](Self::Flag) |
+    /// | `property-invalid` | [`Property`](Self::Property) |
     /// | `query-refused` | `Query` (feature `search`) |
     /// | `tag-refused` | `Tag` (feature `search`) |
     /// | `index-fts5-missing` | `Fts5` (feature `search`) |
@@ -2400,6 +2407,7 @@ impl PimdirError {
             Self::Ambiguous { .. } => "ambiguous-performer",
             Self::Cutoff(_) => "cutoff-invalid",
             Self::Flag(_) => "flag-invalid",
+            Self::Property(_) => "property-invalid",
             #[cfg(feature = "search")]
             Self::Query(_) => "query-refused",
             #[cfg(feature = "search")]
@@ -2601,6 +2609,7 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir flag {flag:?} refused: a flag is printable ASCII without a space"
             ),
+            Self::Property(reason) => write!(f, "Pimdir property refused: {reason}"),
             #[cfg(feature = "search")]
             Self::Query(err) => write!(f, "Pimdir search query refused: {err}"),
             #[cfg(feature = "search")]

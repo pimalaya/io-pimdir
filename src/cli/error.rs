@@ -128,6 +128,10 @@ pub enum ErrorCode {
     /// The store cannot hold the flag: empty, or holding a space, a control
     /// or a non-ASCII character.
     FlagInvalid,
+    /// The store cannot hold the property: a key or a value past its
+    /// bounds, a key under `pimdir/` other than `pimdir/label`, or a 65th
+    /// value under one key.
+    PropertyInvalid,
     /// The search query is malformed or names an unknown field or value:
     /// nothing was searched.
     QueryRefused,
@@ -191,6 +195,7 @@ const PIMDIR_CODES: &[(&str, ErrorCode)] = &[
     ("ambiguous-performer", ErrorCode::AmbiguousPerformer),
     ("cutoff-invalid", ErrorCode::CutoffInvalid),
     ("flag-invalid", ErrorCode::FlagInvalid),
+    ("property-invalid", ErrorCode::PropertyInvalid),
     ("query-refused", ErrorCode::QueryRefused),
     ("tag-refused", ErrorCode::TagRefused),
     ("index-fts5-missing", ErrorCode::IndexFts5Missing),

@@ -15,6 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added `PimdirQueryDateRange::bounds`, a range's instants in Unix seconds, for a client translating a query to a server.
 - Added `PimdirQueryPredicate::name()`, the name a client's capability table keys a term on.
 - Added `PimdirSearchSort::as_str`, `parse` and `ALL`.
+- Added an item's properties, local state keyed by its public id that no source carries, a local label (`pimdir/label`) among it (pimdir STORAGE §4.3, storage-draft-15 edited in place at pimdir daec31a): the module `property` (`PimdirProperty`, `PimdirPropertyHolder`, `PimdirPropertyChange`, the bounds, `is_key`, `is_writable_key`, `is_value`, `fold`, `same` and `change`), the reads `PimdirReader::list_item_properties`, `list_property_values`, `list_property_holders` and `list_value_holders`, the overlay `PimdirReader::item_properties` (§15.4), and the owner's own writes `PimdirStore::add_property` and `remove_property`.
+- **BREAKING**: Added `PimdirAction::SetProperty`, the `set-property` action (pimdir STORAGE §15.3): one key, its removes applied before its adds, a label compared folded, applied by the drain as no source with a receipt, parked when no live row of its collection holds the item or past 64 values under the key. An exhaustive `match` on the enum needs the arm.
+- **BREAKING**: Added `PimdirError::Property` (`property-invalid`): a property the owner cannot write, past a bound or under a key `pimdir/` keeps.
+- Added the `pimdir property list|add|remove` verbs, staging a `set-property` through the queue as `tag` stages its flags.
 - Added `search::plan`, the I/O-free query planner (scope, estimates, drivers, `PimdirWalk`), `PimdirSearchSort::is_dated`, and `PimdirSearchCursor::{compare, dated, is_undated, sort_key, seq, account}`; `PimdirSearchSort` and `PimdirSearchCursor` now build without `client`.
 - Added the refusal `reserved-form` (`PimdirQueryErrorCode::ReservedForm`, pimdir SEARCH §8.3): a text or a value beginning with `~`, a text or a value of two characters or more beginning with `/` and a value beginning with `{` are kept for stemming, regular expressions and subqueries, where they answered as plain words before. Quote them to search the characters.
 
@@ -31,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Changed a search answer's coverage, and `PimdirReader::search_coverage`'s temporal axis, to read once per answer: the scope's ids bound once, the sources rolled up in one statement instead of `list_coverage` per collection, the unindexed count seeking `items_by_changed` and skipped while the index is not behind, a repeated answer on one `PimdirIndex` served until index.db or the store moves (performance-audit F8: 69 ms per answer at 3,311 collections).
 - Changed coverage to count a body under an extraction status it does not know as `unparseable` (pimdir SEARCH §6, an open vocabulary).
 - **BREAKING**: Changed the index to search-draft-16 (`sql::search::FORMAT_VERSION`): an index of search-draft-15 is rebuilt by the indexer and refused by a query client until then.
+- **BREAKING**: Changed the vendored storage-draft-15 to pimdir daec31a's, edited in place: the table `item_property`, its index and triggers, and `evict_before` keeping an item holding a property. A store created by an earlier build of this draft lacks the table and is refused by the schema check; drafts are exact, so it is moved aside and synced again.
 
 ## [0.19.1] - 2026-11-21
 

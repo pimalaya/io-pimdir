@@ -315,7 +315,7 @@ fn gate_by_kind(
     action: &PimdirAction,
 ) -> Result<Vec<PimdirPartial>, PimdirError> {
     match action {
-        PimdirAction::SetPerformer { .. } => Ok(Vec::new()),
+        PimdirAction::SetPerformer { .. } | PimdirAction::SetProperty { .. } => Ok(Vec::new()),
         PimdirAction::Unknown { kind, payload, .. } => {
             // NOTE: a payload unknown to this crate is read no further,
             // an intent at a later version included (§15.3).

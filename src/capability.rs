@@ -376,6 +376,7 @@ pub fn required(kind: &str, action: &PimdirAction, current: &PimdirFlags) -> Vec
         }
         PimdirAction::Update { .. }
         | PimdirAction::SetPerformer { .. }
+        | PimdirAction::SetProperty { .. }
         | PimdirAction::Unknown { .. } => {}
     }
 
