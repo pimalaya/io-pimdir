@@ -1010,7 +1010,6 @@ impl core::error::Error for PimdirQueryError {}
 
 /// The faults a refusal names (SEARCH §8.4), each spelled as its code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum PimdirQueryErrorCode {
     /// No term in the query, or in a group: `empty-query`.
     EmptyQuery,
@@ -1027,6 +1026,9 @@ pub enum PimdirQueryErrorCode {
     UnbalancedParenthesis,
     /// An operator missing a side: `dangling-operator`.
     DanglingOperator,
+    /// A text or a value spelling a form a later version gives a meaning
+    /// (SEARCH §8.3): `reserved-form`.
+    ReservedForm,
     /// A `*` other than a trailing prefix wildcard: `invalid-wildcard`.
     InvalidWildcard,
     /// A query past a bound of SEARCH §8.3, its length, its nesting or
@@ -1045,6 +1047,7 @@ impl PimdirQueryErrorCode {
             Self::UnterminatedPhrase => "unterminated-phrase",
             Self::UnbalancedParenthesis => "unbalanced-parenthesis",
             Self::DanglingOperator => "dangling-operator",
+            Self::ReservedForm => "reserved-form",
             Self::InvalidWildcard => "invalid-wildcard",
             Self::LimitExceeded => "limit-exceeded",
         }
@@ -1341,6 +1344,7 @@ impl Parser<'_> {
                 &token,
             )),
             TokenKind::Text(word) => {
+                reserved(&word, token.start, token.end, false)?;
                 let (text, prefix) = wildcard(&word, token.start, true)?;
                 Ok(term(
                     PimdirQueryPredicate::Text {
@@ -1370,6 +1374,28 @@ fn term(predicate: PimdirQueryPredicate, token: &Token) -> PimdirQuery {
     })
 }
 
+/// Refuses a form SEARCH §8.3 keeps for a later operator: a word
+/// beginning with `~` (a stemmed word), one of two characters or more
+/// beginning with `/` (a regular expression), and a field's `value`
+/// beginning with `{` (a subquery). A phrase is never one.
+fn reserved(word: &str, start: usize, end: usize, value: bool) -> Result<(), PimdirQueryError> {
+    let form = match word.chars().next() {
+        Some('~') => "~ is kept for a stemmed word: quote it to search the text",
+        Some('/') if word.chars().nth(1).is_some() => {
+            "/ is kept for a regular expression: quote it to search the text"
+        }
+        Some('{') if value => "{ is kept for a subquery: quote it to search the text",
+        _ => return Ok(()),
+    };
+    Err(PimdirQueryError::new(
+        PimdirQueryErrorCode::ReservedForm,
+        form,
+        start,
+        end,
+        &[],
+    ))
+}
+
 /// Checks a word's `*` (SEARCH §8.3): only as its last character after
 /// two or more, and only where `allowed`. Answers the word without it and
 /// whether it was there.
@@ -1394,8 +1420,8 @@ fn wildcard(word: &str, offset: usize, allowed: bool) -> Result<(&str, bool), Pi
     ))
 }
 
-/// Reads a field term, checking its field, then an empty value, then the
-/// wildcard, then the value (SEARCH §8.4).
+/// Reads a field term, checking its field, then an empty value, then a
+/// reserved form, then the wildcard, then the value (SEARCH §8.4).
 fn field(
     chars: &[char],
     token: &Token,
@@ -1432,6 +1458,10 @@ fn field(
             token.end,
             &["value"],
         ));
+    }
+
+    if !phrase {
+        reserved(&value, value_start, token.end, true)?;
     }
 
     let address = ADDRESS_FIELDS.contains(&name) && value.contains('@');

@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added `PimdirQueryDateRange::bounds`, a range's instants in Unix seconds, for a client translating a query to a server.
 - Added `PimdirQueryPredicate::name()`, the name a client's capability table keys a term on.
 - Added `PimdirSearchSort::as_str`, `parse` and `ALL`.
+- Added the refusal `reserved-form` (`PimdirQueryErrorCode::ReservedForm`, pimdir SEARCH §8.3): a text or a value beginning with `~`, a text or a value of two characters or more beginning with `/` and a value beginning with `{` are kept for stemming, regular expressions and subqueries, where they answered as plain words before. Quote them to search the characters.
 
 ### Changed
 
@@ -23,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **BREAKING**: Moved `search::occurrence::FLOATING_ZONE` to `search::coverage::FLOATING_ZONE`.
 - **BREAKING**: Changed `PimdirSearchSort` to SEARCH §8.2's five orders, `NewestFirst` (was `Date`, the default), `OldestFirst`, `Title` (was `Name`), `Sender` and `Relevance`, and the CLI's `--sort` to `newest-first`, `oldest-first`, `title`, `sender` and `relevance`.
 - **BREAKING**: Added the variants `PimdirQueryPredicate::Mid`, `PimdirQueryDate::Instant` and `PimdirQueryDateUnit::{Minute, Hour, Month}`, which an exhaustive match names.
+- **BREAKING**: Removed `#[non_exhaustive]` from `PimdirQueryErrorCode`, so a match names every code.
+- Changed coverage to count a body under an extraction status it does not know as `unparseable` (pimdir SEARCH §6, an open vocabulary).
 - **BREAKING**: Changed the index to search-draft-16 (`sql::search::FORMAT_VERSION`): an index of search-draft-15 is rebuilt by the indexer and refused by a query client until then.
 
 ## [0.19.1] - 2026-11-21
