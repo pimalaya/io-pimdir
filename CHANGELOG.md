@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-11-21
+
 ### Fixed
 
 - Fixed a rekey carrying a local edit in conflict onto its new handle with the summary and sort key of the server's body, which the item does not hold (pimdir SYNC §8).
@@ -1332,7 +1334,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.19.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..HEAD
+[0.19.1]: https://github.com/pimalaya/io-pimdir/compare/v0.19.0..v0.19.1
 [0.19.0]: https://github.com/pimalaya/io-pimdir/compare/v0.18.1..v0.19.0
 [0.18.1]: https://github.com/pimalaya/io-pimdir/compare/v0.18.0..v0.18.1
 [0.18.0]: https://github.com/pimalaya/io-pimdir/compare/v0.17.0..v0.18.0
