@@ -159,16 +159,7 @@ fn an_engine_run_cut_after_any_commit_finishes_as_the_uncut_run() {
                 let Some(run) = &step.run else {
                     continue;
                 };
-                for page in &run.pages {
-                    for item in &page.items {
-                        if let Some(revision) = &item.revision {
-                            revisions.insert(
-                                (run.collection.clone(), item.handle.clone()),
-                                revision.clone(),
-                            );
-                        }
-                    }
-                }
+                replay::remember(run, &mut revisions);
                 let at = format!("seed {seed} {name} {}", step.label);
                 differences.extend(
                     cut_run(before, step, run, &revisions)
@@ -205,7 +196,7 @@ fn cut_run(
     keeper
         .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    let mut remote = Scripted::of(step, run, revisions, false);
+    let mut remote = Scripted::of(before, step, run, revisions, false);
     let uncut = replay::run_verb(&root, before, step, run, &mut remote);
     let log = log_of(&root, "pimdir.db", &start.path().join("store"), held.path());
     drop(keeper);
@@ -214,7 +205,7 @@ fn cut_run(
         let copy = tempfile::tempdir().unwrap();
         let store = copy.path().join("store");
         index::copy_store(&root, &store, true);
-        let mut remote = Scripted::of(step, run, revisions, true);
+        let mut remote = Scripted::of(before, step, run, revisions, true);
         let _ = replay::run_verb(&store, before, step, run, &mut remote);
         store_rows(&store)
     };
@@ -227,7 +218,8 @@ fn cut_run(
         let cut = cut(start.path(), held.path(), "pimdir.db-wal", end);
         let store = cut.path().join("store");
         held_objects(&root.join("objects"), &store.join("objects"));
-        let mut remote = Scripted::of(step, run, revisions, true);
+        let moved = round(&store, run) != round(&start.path().join("store"), run);
+        let mut remote = Scripted::of(before, step, run, revisions, true).restarted(moved);
         let again = replay::run_verb(&store, before, step, run, &mut remote);
         let got = store_rows(&store);
         if got != want && got != next {
@@ -240,6 +232,18 @@ fn cut_run(
         }
     }
     found
+}
+
+/// The round the run's source holds open or last closed in the store at
+/// `root`.
+fn round(root: &Path, run: &Run) -> i64 {
+    let conn = Connection::open(root.join("pimdir.db")).unwrap();
+    conn.query_row(
+        "SELECT round FROM sources WHERE collection = ?1 AND source = ?2",
+        [run.collection.as_str(), run.source.as_str()],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
 }
 
 /// Copies into `to` each blob of `from` it lacks: the bodies a run wrote
@@ -379,8 +383,9 @@ fn walk(dir: &Path, files: &mut Vec<Vec<Value>>) {
     }
 }
 
-/// The tables two dumps hold apart, each with the rows only one holds.
-fn apart(
+/// The tables two dumps hold apart, each with the rows only one holds, the
+/// first named `cut`, the second `uncut`.
+pub fn apart(
     got: &BTreeMap<String, Vec<Vec<Value>>>,
     want: &BTreeMap<String, Vec<Vec<Value>>>,
 ) -> String {

@@ -181,6 +181,10 @@ impl PimdirUpgrade {
     }
 
     /// Applies the fetched items and yields the write batch.
+    ///
+    /// A body fetched under a local edit lands as the base or as the
+    /// diverging body, the edit staying the item's (SYNC §6), so the
+    /// summary and sort key the edit states stay with it.
     fn write_fetched(
         &mut self,
     ) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
@@ -323,12 +327,17 @@ impl PimdirUpgrade {
                     object: None,
                 });
             }
+            let keeps_edit = self.tier == PimdirTier::Full
+                && item.body.is_some()
+                && patched.staged_edit().is_some();
             let holds_body = item.body.is_none() && patched.object.is_some();
-            patched.summary =
-                summary::without_body(patched.summary.as_ref(), item.summary, holds_body);
             // NOTE: unlike the link id, the sort key is a projection of the
             // content, not an identity, so the latest derivation wins.
-            patched.sort_key = item.sort_key;
+            if !keeps_edit {
+                patched.summary =
+                    summary::without_body(patched.summary.as_ref(), item.summary, holds_body);
+                patched.sort_key = item.sort_key;
+            }
 
             match (self.tier, item.body) {
                 (PimdirTier::Full, Some(body)) => {

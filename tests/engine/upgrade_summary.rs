@@ -10,6 +10,8 @@ use io_pimdir::{
     client::PimdirStore,
     collection::PimdirCollectionId,
     hub::{PimdirHubConflict, PimdirHubItem},
+    mutate::PimdirMutation,
+    object::PimdirObject,
     placement::{PimdirHandle, PimdirLinkId},
     remote::{
         PimdirEnumerate, PimdirEnumerated, PimdirFetchedItem, PimdirPushResult, PimdirRemote,
@@ -163,4 +165,54 @@ fn an_upgrade_keeping_the_items_body_keeps_its_summary() {
             "{conflict:?}",
         );
     }
+}
+
+/// A card pulled unread, edited offline, then upgraded (SYNC §6): the
+/// fetched body lands as the base and the local edit stays the item's
+/// body, so the item keeps the summary and sort key the edit states, not
+/// the fetch's, which describe the base.
+#[test]
+fn an_upgrade_reading_the_base_under_an_edit_keeps_its_summary() {
+    let mut client = Client::new(Cards::new(false));
+    client.store.ensure_collection("cards", KIND).unwrap();
+    client
+        .remote_mut()
+        .inner
+        .seed("cards", "r1", "card-1", &[], &card("Ines Simon"));
+    client.sync("cards", PimdirSyncOptions::default()).unwrap();
+
+    let edit = card("Our Edit");
+    let want = derived(&edit);
+    client
+        .mutate(
+            "cards",
+            PimdirMutation::Edit {
+                handle: PimdirHandle::from("r1"),
+                object: PimdirObject {
+                    hash: hash(&edit),
+                    size: edit.len(),
+                },
+                body: edit.clone(),
+                summary: want.summary.clone(),
+                sort_key: Some(want.sort_key.clone()),
+                if_match: None,
+                overrule: false,
+                resolves: None,
+            },
+        )
+        .unwrap();
+    client
+        .upgrade("cards", vec![PimdirHandle::from("r1")], PimdirTier::Full)
+        .unwrap();
+
+    let placement = client.storage().placement("cards", "r1");
+    let base = placement.base.as_ref().expect("a base");
+    assert_eq!(
+        base.object,
+        Some(hash(&card("Ines Simon"))),
+        "the base read"
+    );
+    assert_eq!(placement.object, Some(hash(&edit)), "the edit stays");
+    assert_eq!(placement.sort_key, want.sort_key);
+    assert_eq!(placement.summary, want.summary.map(PimdirSummary::stored));
 }

@@ -784,7 +784,7 @@ impl PimdirHub {
         // NOTE: the summary and sort key describe the item's body, so an
         // upsert whose body the item did not take leaves them as they
         // were (SYNC §5, §9).
-        let elsewhere = !immutable && placement.object.is_some() && item.object != placement.object;
+        let elsewhere = !immutable && item.object.is_some() && item.object != placement.object;
         if verdict.kept_shared || elsewhere {
             item.summary = held_summary.clone();
             item.sort_key = held_sort_key.clone();
@@ -2479,6 +2479,81 @@ mod tests {
             let item = &hub.items[&PimdirLinkId::from("uid:card-1")];
             assert_eq!(item.level, PimdirLevel::Full);
             assert_eq!(item.stored_level(), PimdirLevel::Full);
+        }
+    }
+
+    mod summary_kept_tests {
+
+        use crate::{
+            change::PimdirWriteOp,
+            hub::*,
+            object::PimdirHash,
+            placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement},
+        };
+
+        /// A placement of the card on `handle` holding `object`, its base at
+        /// `revision` holding `base`, described by `subject`.
+        fn upsert(
+            handle: &str,
+            object: Option<&str>,
+            (revision, base): (&str, Option<&str>),
+            subject: &str,
+        ) -> PimdirWriteOp {
+            PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                collection: PimdirCollectionId::from("contacts"),
+                handle: PimdirHandle::from(handle),
+                link_id: Some(PimdirLinkId::from("uid:card-1")),
+                object: object.map(PimdirHash::from),
+                level: match object {
+                    Some(_) => PimdirLevel::Full,
+                    None => PimdirLevel::Meta,
+                },
+                summary: Some(crate::summary::stub(subject)),
+                sort_key: PimdirSortKey::from(subject),
+                flags: PimdirFlags::default(),
+                status: PimdirStatus::Clean,
+                conflict_revision: None,
+                conflict_object: None,
+                base: Some(PimdirBase {
+                    flags: PimdirFlags::default(),
+                    revision: Some(revision.into()),
+                    object: base.map(PimdirHash::from),
+                }),
+                origin: None,
+            })
+        }
+
+        /// A source owing a body another folded, its server's edit pulled
+        /// unread and written twice in one batch (its content, then its
+        /// flags): the item keeps its body under `manual`, so it keeps the
+        /// summary and sort key that body states, never the pulled meta,
+        /// which describes a body nobody has read (SYNC §5, §9).
+        #[test]
+        fn a_bodiless_upsert_over_a_kept_body_keeps_its_summary() {
+            let mut hub = PimdirHub::default();
+            let a = PimdirSourceId::from("a");
+            let b = PimdirSourceId::from("b");
+            hub.absorb(
+                &a,
+                &[upsert("a1", Some("orig"), ("e1", Some("orig")), "orig")],
+            );
+            hub.absorb(
+                &b,
+                &[upsert("b1", Some("orig"), ("e1", Some("orig")), "orig")],
+            );
+            hub.absorb(
+                &a,
+                &[upsert("a1", Some("ours"), ("e2", Some("ours")), "ours")],
+            );
+
+            let pulled = upsert("b1", None, ("e3", None), "theirs");
+            hub.absorb(&b, &[pulled.clone(), pulled]);
+
+            let item = &hub.items[&PimdirLinkId::from("uid:card-1")];
+            assert_eq!(item.object, Some(PimdirHash::from("ours")));
+            assert!(item.conflicted, "recorded for want of the body");
+            assert_eq!(item.summary, Some(crate::summary::stub("ours").stored()));
+            assert_eq!(item.sort_key, PimdirSortKey::from("ours"));
         }
     }
 }

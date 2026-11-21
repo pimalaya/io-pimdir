@@ -179,7 +179,7 @@ Without this the merge cannot honour its own rule that an unresolved conflict is
 - THEN the base adopts the recorded remote state, the binding is no longer conflicted, and the next sync pushes the resolution against the revision it was measured on
 
 ### Requirement: An unknown sort key never erases a known one
-Absorbing an upsert whose sort key is unknown SHALL leave the shared key alone, on the same terms as an absent summary. A source that read no key for an item, or whose kind defines no key, MUST NOT un-sort an item another source has already placed. A known key SHALL replace another known key.
+Absorbing an upsert whose sort key is unknown SHALL leave the shared key alone, on the same terms as an absent summary. A source that read no key for an item, or whose kind defines no key, MUST NOT un-sort an item another source has already placed. A known key SHALL replace another known key. An upsert of a mutable kind whose body the item did not take, one carrying none over a body the item keeps included (a pull recorded as the item's divergence for want of its body), SHALL leave the summary and sort key as they were: they describe the item's body (pimdir SYNC §5, §9; the hub's `summary_kept_tests`, failing before it).
 
 #### Scenario: A second source reads no key for an item the first summarised
 - GIVEN a hub item whose key one source derived

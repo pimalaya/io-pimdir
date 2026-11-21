@@ -423,8 +423,9 @@ impl PimdirRekey {
     /// at it with its base untouched, a tombstone is revived as a sync
     /// would, and anything else is carried as the pull a sync would make,
     /// body dropped and base at the fetched revision. A local edit of a
-    /// mutable kind the remote did not edit keeps its own summary and sort
-    /// key, the fetch's describing the server's body (SYNC §5).
+    /// mutable kind the item keeps, the remote having edited it too or not,
+    /// keeps its own summary and sort key, the fetch's describing the
+    /// server's body (SYNC §5, §8).
     fn carry(
         &self,
         old: PimdirPlacement,
@@ -444,7 +445,8 @@ impl PimdirRekey {
         let local_edit = old.object.is_some() && old_base.is_none_or(|b| b.object != old.object);
 
         let mutable = observed.is_some() || base_revision.is_some();
-        let kept_edit = local_edit && !remote_edited && mutable;
+        let revived = remote_edited && old.status == PimdirStatus::Tombstone;
+        let kept_edit = local_edit && mutable && !revived;
         let summary = match kept_edit {
             true => old.summary.clone(),
             false => summary::without_body(

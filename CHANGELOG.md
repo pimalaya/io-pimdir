@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a rekey carrying a local edit in conflict onto its new handle with the summary and sort key of the server's body, which the item does not hold (pimdir SYNC §8).
+- Fixed an upgrade reading the base under a local edit giving the item the summary and sort key of the base, the edit staying its body (pimdir SYNC §6).
+- Fixed a bodiless pull recorded as an item divergence, written twice in one batch, giving the item the summary and sort key of the unread body it kept apart (pimdir SYNC §5, §9).
+
 ## [0.19.0] - 2026-11-20
 
 ### Added

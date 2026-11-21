@@ -6,7 +6,7 @@
 use io_pimdir::{
     mutate::PimdirMutation,
     object::PimdirObject,
-    placement::{PimdirHandle, PimdirSortKey},
+    placement::{PimdirHandle, PimdirSortKey, PimdirStatus},
     summary::{PimdirSummary, mail::PimdirMailSummary},
     sync::PimdirSyncOptions,
 };
@@ -97,5 +97,23 @@ fn a_rekeyed_edit_keeps_its_summary() {
     let mut client = edited();
     client.remote_mut().renumber("book", 1);
     client.rekey("book").unwrap();
+    assert_eq!(described(&client, "v1-0"), the_edit());
+}
+
+/// A rekey carrying the edit in conflict onto its new handle, the server
+/// having edited the member too (SYNC §8): the item keeps the edit's body,
+/// so it keeps the summary and sort key that body states, not the fetch's,
+/// which describe the server's body nobody adopted.
+#[test]
+fn a_rekeyed_edit_in_conflict_keeps_its_summary() {
+    let mut client = edited();
+    client
+        .remote_mut()
+        .edit("book", "c1.vcf", b"FN:Alice On The Server");
+    client.remote_mut().renumber("book", 1);
+    client.rekey("book").unwrap();
+    let placement = client.storage().placement("book", "v1-0");
+    assert_eq!(placement.status, PimdirStatus::Conflict);
+    assert_eq!(placement.object, Some(hash(b"FN:Alice Edited")));
     assert_eq!(described(&client, "v1-0"), the_edit());
 }

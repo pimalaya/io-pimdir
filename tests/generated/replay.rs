@@ -1,13 +1,15 @@
 //! # The engine replaying generated histories
 //!
 //! Each history of the generator (`History::mail`, `cards`, `moves`,
-//! `refusals`, `appends`, `policies`, `sources`, `scopes`) replayed through
-//! io-pimdir from the store of its first step: a run answered by a scripted
-//! connector from the run's own pages, fetches and outcomes, a producer's
-//! rows enqueued through io-pimdir's producer and drained by its owner, a
-//! remote's change left to the next run's pages. After each step the store
-//! is read against the oracle of the step's model; a run's pushes, in
-//! order, its events and the listing it asked for are held to the run's.
+//! `refusals`, `appends`, `policies`, `sources`, `scopes`, `rekeys`,
+//! `crashes`, `heads`, `bodies`) replayed through io-pimdir from the store
+//! of its first step: a run answered by a scripted connector from the run's
+//! own head, pages, fetches and outcomes, a run the model says failed cut
+//! where it failed, a producer's rows enqueued through io-pimdir's producer
+//! and drained by its owner, a remote's change left to the next run's
+//! pages. After each step the store is read against the oracle of the
+//! step's model; a run's pushes, in order, its events and the listing it
+//! asked for are held to the run's.
 //! Beside the model, every step holds what a run must whatever the model
 //! says: no row names a body the store lacks (no loss), a run the model
 //! finds nothing to do in leaves every row as it stood (convergence), and
@@ -15,6 +17,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    mem,
     path::Path,
 };
 
@@ -24,20 +27,21 @@ use io_pimdir::{
     codec,
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     hash,
+    mutate::PimdirMutation,
     object::PimdirObject,
     placement::{PimdirFlags, PimdirHandle},
     remote::{
-        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome,
-        PimdirPushResult, PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot,
-        PimdirTier,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirHeads,
+        PimdirPushOutcome, PimdirPushResult, PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta,
+        PimdirRemoteSnapshot, PimdirTier,
     },
     summary::{self, mail},
     sync::{PimdirConflictPolicy, PimdirSyncEvent, PimdirSyncOptions},
 };
 use pimdir_generator::{
-    engine::{Answer, Event, Outcome, Push, Run},
+    engine::{self, Answer, Event, Outcome, Push, Run},
     history::{History, Step},
-    model::{Collection, Model, Scope, SourceState},
+    model::{Collection, Model, Scope, SourceState, State, Table},
     oracle::Expectation,
     queue::RowState,
     remote::Page,
@@ -94,13 +98,47 @@ const G16: &str = "G16: a fold's debt pushed in the run that folds it";
 /// took).
 const G17: &str = "G17: ContentChanged for a body the item already holds";
 
-/// Finding G14 (spec minor, reads two ways): a source whose binding owes a
-/// change another source folded (`Dirty`, SYNC §9 propagation) and whose
-/// server changed the body too: the generator reads SYNC §9's three facts
-/// and records the item's divergence under the collection's policy,
-/// io-pimdir reads SYNC §5's both-changed case and records the binding's
-/// conflict under the source's.
+/// Finding G14 (the generator's since sync-draft-15): a source whose binding
+/// owes a change another source folded (`Dirty`, SYNC §9 propagation) and
+/// whose server changed the body too. SYNC §5 states it now ("A local body
+/// another source folded into the item since [...] is propagation it owes:
+/// [...] the member is pulled and the write folds it, the divergence settled
+/// by the collection's `conflict`"), which io-pimdir follows, recording the
+/// item's divergence; the generator records the binding's conflict under
+/// the source's policy (`History::bodies`, b recording its edit in
+/// conflict), as io-pimdir once did.
 const G14: &str = "G14: a propagated change meeting a server edit";
+
+/// Finding G23 (spec, reads two ways): a rekey carrying a member whose
+/// listing states other flags than its old base. SYNC §8 says the rekey
+/// "carries each placement's [...] flags, base and pending state onto its
+/// new handle", which the generator reads as the flags and the base kept as
+/// they stood; io-pimdir merges the listed flags over the old base as §5's
+/// flag axis does and takes them as the base, which the rekey's checkpoint
+/// never lists again (`History::rekeys`, two copies of one message under
+/// one `Message-ID` swapped by handle order, their flags apart).
+const G23: &str = "G23: the flags a rekey's listing states";
+
+/// Finding G24 (the generator's): a rekey carrying a mutable member its
+/// server edited as the pull SYNC §8 asks for ("carry it as a pull (§5)",
+/// "The sort key is carried, preferring the fetch's") keeps the old body's
+/// summary and sort key, where §5's pull makes "the member's meta [...] the
+/// summary, address rows and sort key", as io-pimdir does.
+const G24: &str = "G24: a rekey's pull keeps the old summary";
+
+/// Finding G25 (the generator's): an upgrade whose fetched body the
+/// collection's policy records as the item's divergence reports
+/// `Conflicted`, where SYNC §5 says "Only a sync and a rekey report events
+/// [...] an upgrade and a mutation report none, save `Overruled`", as
+/// io-pimdir reports none.
+const G25: &str = "G25: an upgrade reporting Conflicted";
+
+/// Finding G26 (the generator's, minor): a message listed without its body
+/// reviving a retained row sets the binding's `shared_object` to the row's
+/// body, where STORAGE §10 moves it only "by an absorbed upsert carrying a
+/// body [...], never by a pull carrying none", as io-pimdir leaves it
+/// `NULL`, the sync base standing in (SYNC §9).
+const G26: &str = "G26: a bodiless revive moving shared_object";
 
 #[test]
 fn every_generated_history_replays_as_its_model_states() {
@@ -116,7 +154,7 @@ fn every_generated_history_replays_as_its_model_states() {
 }
 
 #[test]
-#[ignore = "G12 to G17: the replay findings of the generated suite"]
+#[ignore = "G12 to G17, G23 to G26: the replay findings of the generated suite"]
 fn every_generated_history_replays_as_its_model_states_known_included() {
     let differences: Vec<(u64, Option<&str>, String)> = SEEDS
         .into_iter()
@@ -143,7 +181,7 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
 }
 
 /// Every history of the generator at `seed`, by name.
-pub fn histories(seed: u64) -> [(&'static str, History); 8] {
+pub fn histories(seed: u64) -> [(&'static str, History); 12] {
     [
         ("mail", History::mail(seed)),
         ("cards", History::cards(seed)),
@@ -153,6 +191,10 @@ pub fn histories(seed: u64) -> [(&'static str, History); 8] {
         ("policies", History::policies(seed)),
         ("sources", History::sources(seed)),
         ("scopes", History::scopes(seed)),
+        ("rekeys", History::rekeys(seed)),
+        ("crashes", History::crashes(seed)),
+        ("heads", History::heads(seed)),
+        ("bodies", History::bodies(seed)),
     ]
 }
 
@@ -178,7 +220,7 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
             .map(|text| (None, text))
             .collect();
 
-        let rows = crash::store_rows(&root);
+        let rows = unstamped(&root);
         if let Some(run) = &step.run {
             let (ran, known) = replay_run(&root, before, step, run, &mut revisions);
             found.extend(ran);
@@ -194,6 +236,20 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
                 }
             }
         }
+        if let Some(run) = &step.run
+            && read.iter().any(|(known, _)| known.is_none())
+        {
+            let reading = readings(before, step, run).into_iter().find(|(_, model)| {
+                let (_, again) = reader::compare(&spec, model, &root, retained_sort_key);
+                again.iter().all(|(known, _)| known.is_some())
+            });
+            let finding = reading
+                .map(|(finding, _)| finding)
+                .or_else(|| rekey_pulls(before, step, run).then_some(G24));
+            for (known, _) in &mut read {
+                *known = known.or(finding);
+            }
+        }
         found.extend(read);
         for hash in unheld(&root) {
             found.push((None, format!("a row names {hash}, a body the store lacks")));
@@ -207,9 +263,15 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
                 .iter()
                 .all(|page| page.items.is_empty() && page.vanished.is_empty())
             && format!("{:?}", before.model.collections) == format!("{:?}", step.model.collections)
-            && crash::store_rows(&root) != rows
+            && unstamped(&root) != rows
         {
-            found.push((None, String::from("a run with nothing to do moved a row")));
+            found.push((
+                None,
+                format!(
+                    "a run with nothing to do moved a row: {}",
+                    crash::apart(&unstamped(&root), &rows)
+                ),
+            ));
         }
         if let Some(order) = out_of_order(&root) {
             found.push((None, order));
@@ -248,17 +310,107 @@ fn renumbered(before: &Step, step: &Step, root: &Path) -> Model {
 }
 
 /// Whether the step records an item conflict across sources the store did
-/// not hold before it, G14's case.
+/// not hold before it, or a conflict on a binding owing the body another
+/// source folded into the item, G14's case.
 fn diverges(before: &Step, step: &Step) -> bool {
     step.model.items.iter().any(|item| {
-        item.conflicted
-            && item.bindings.len() > 1
-            && !before.model.items.iter().any(|held| {
+        let held = before
+            .model
+            .items
+            .iter()
+            .find(|held| held.collection == item.collection && held.link_id == item.link_id);
+        let shared =
+            item.conflicted && item.bindings.len() > 1 && !held.is_some_and(|held| held.conflicted);
+        let owing = item.bindings.len() > 1
+            && item.bindings.iter().any(|binding| {
+                let was = held.and_then(|held| {
+                    held.bound(&binding.source)
+                        .map(|was| (held.object.clone(), was.clone()))
+                });
+                binding.conflicted
+                    && was.is_some_and(|(object, was)| {
+                        let agreed = was.shared_object.or(was.base_object);
+                        !was.conflicted && object.is_some() && object != agreed
+                    })
+            });
+        shared || owing
+    })
+}
+
+/// The step's model read another way, each with the finding the reading
+/// is: G23's, the flags a rekey carries merged with the listed ones over
+/// the old base, the listed ones the base; G26's, a binding a bodiless
+/// message revived holding no `shared_object`.
+fn readings(before: &Step, step: &Step, run: &Run) -> Vec<(&'static str, Model)> {
+    let listed: BTreeMap<&str, &BTreeSet<String>> = run
+        .pages
+        .iter()
+        .flat_map(|page| &page.items)
+        .map(|member| (member.handle.as_str(), &member.flags))
+        .collect();
+    let held = |item: &pimdir_generator::model::Item| {
+        before
+            .model
+            .items
+            .iter()
+            .find(|held| held.collection == item.collection && held.link_id == item.link_id)
+            .cloned()
+    };
+
+    let mut readings = Vec::new();
+    if run.verb == "rekey" {
+        let mut model = step.model.clone();
+        for item in &mut model.items {
+            let Some(was) = held(item) else {
+                continue;
+            };
+            let Some(base) = was.bound(&run.source).map(|b| b.base_flags.clone()) else {
+                continue;
+            };
+            if item.collection != run.collection {
+                continue;
+            }
+            let Some(binding) = item.bound_mut(&run.source) else {
+                continue;
+            };
+            let Some(flags) = listed.get(binding.handle.as_str()) else {
+                continue;
+            };
+            binding.base_flags = Some((*flags).clone());
+            item.flags = Some(engine::merge(was.flags.as_ref(), base.as_ref(), flags));
+        }
+        readings.push((G23, model));
+    }
+    if run.verb == "sync" {
+        let mut model = step.model.clone();
+        for item in &mut model.items {
+            let revived = held(item).is_some_and(|was| matches!(was.state, State::Retained { .. }));
+            if item.collection != run.collection || item.summary.table != Table::Mail || !revived {
+                continue;
+            }
+            if let Some(binding) = item.bound_mut(&run.source) {
+                binding.shared_object = None;
+            }
+        }
+        readings.push((G26, model));
+    }
+    readings
+}
+
+/// Whether the rekey carried a mutable member its server edited as a
+/// pull, emptying the item, G24's case.
+fn rekey_pulls(before: &Step, step: &Step, run: &Run) -> bool {
+    run.verb == "rekey"
+        && step.model.items.iter().any(|item| {
+            let moved = before.model.items.iter().any(|held| {
                 held.collection == item.collection
                     && held.link_id == item.link_id
-                    && held.conflicted
-            })
-    })
+                    && held.object.is_some()
+                    && held.bound(&run.source).map(|b| &b.base_revision)
+                        != item.bound(&run.source).map(|b| &b.base_revision)
+            });
+            item.collection == run.collection && item.object.is_none() && moved
+        })
 }
 
 /// Whether a disagreement is G12's: a retained row read alike but for its
@@ -278,15 +430,22 @@ fn retained_sort_key(
 }
 
 /// The history with every collection it ever declares declared from its
-/// first step, never synced there: a declaration writes nothing but its
-/// row and its sources' (STORAGE §14), which io-pimdir's owner would
-/// write as the configuration it is, so a step's run finds them as the
-/// model's did.
+/// first step as it was first declared, never synced there: a declaration
+/// writes nothing but its row and its sources' (STORAGE §14), which
+/// io-pimdir's owner would write as the configuration it is, so a step's
+/// run finds them as the model's did.
 pub fn declared(history: &History) -> History {
-    let last = &history.steps[history.steps.len() - 1].model;
+    let mut first = BTreeMap::new();
+    for step in &history.steps {
+        for (id, collection) in &step.model.collections {
+            first
+                .entry(id.clone())
+                .or_insert_with(|| collection.clone());
+        }
+    }
     let mut history = history.clone();
     for step in &mut history.steps {
-        for (id, collection) in &last.collections {
+        for (id, collection) in &first {
             step.model
                 .collections
                 .entry(id.clone())
@@ -311,34 +470,26 @@ fn replay_run(
     run: &Run,
     revisions: &mut BTreeMap<(String, String), String>,
 ) -> (Vec<(Option<&'static str>, String)>, Option<&'static str>) {
-    for page in &run.pages {
-        for item in &page.items {
-            if let Some(revision) = &item.revision {
-                revisions.insert(
-                    (run.collection.clone(), item.handle.clone()),
-                    revision.clone(),
-                );
-            }
-        }
-    }
-    let mut remote = Scripted::of(step, run, revisions, false);
+    remember(run, revisions);
+    let mut remote = Scripted::of(before, step, run, revisions, false);
     let events = run_verb(root, before, step, run, &mut remote);
 
     let mut found = Vec::new();
-    let events = match events {
-        Ok(events) => events,
-        Err(err) => {
+    let events = match (events, run.failed) {
+        (Ok(events), false) => events,
+        (Ok(_), true) => {
+            found.push((None, format!("the {} passes, the model's fails", run.verb)));
+            Vec::new()
+        }
+        (Err(err), false) => {
             found.push((None, format!("the {} fails: {err}", run.verb)));
             Vec::new()
         }
+        (Err(_), true) => Vec::new(),
     };
 
-    let listing = match run.pages.first() {
-        Some(page) if page.complete => vec!["round"; run.pages.len()],
-        Some(_) => vec!["delta"],
-        None => Vec::new(),
-    };
-    if run.verb == "sync" && remote.requests != listing {
+    let listing = listing(before, step, run);
+    if matches!(run.verb, "sync" | "rekey") && remote.requests != listing {
         found.push((
             None,
             format!(
@@ -379,7 +530,7 @@ fn replay_run(
     let mut want: Vec<String> = run.events.iter().map(model_event).collect();
     got.sort();
     want.sort();
-    if got != want {
+    if got != want && !run.failed {
         let shared = step.model.collections[&run.collection].sources.len() > 1;
         let conflicted = got
             .iter()
@@ -388,7 +539,12 @@ fn replay_run(
             .iter()
             .filter(|event| !event.starts_with("ContentChanged "))
             .collect();
+        let reported: Vec<&String> = want
+            .iter()
+            .filter(|event| !event.starts_with("Conflicted "))
+            .collect();
         let events = match () {
+            _ if run.verb == "upgrade" && got.iter().collect::<Vec<_>>() == reported => Some(G25),
             _ if shared && conflicted => Some(G14),
             _ if unchanged.len() < want.len() && got.iter().collect::<Vec<_>>() == unchanged => {
                 Some(G17)
@@ -402,6 +558,82 @@ fn replay_run(
         ));
     }
     (found, known)
+}
+
+/// Keeps the revision of each member the run's head and pages list, which
+/// a later fetch answers.
+pub fn remember(run: &Run, revisions: &mut BTreeMap<(String, String), String>) {
+    for page in run.head.iter().chain(&run.pages) {
+        for item in &page.items {
+            if let Some(revision) = &item.revision {
+                revisions.insert(
+                    (run.collection.clone(), item.handle.clone()),
+                    revision.clone(),
+                );
+            }
+        }
+    }
+}
+
+/// The requests a run's listing makes: its head, a cursor the source
+/// rejects, each page landed, and the page whose request failed the run
+/// between two pages.
+fn listing(before: &Step, step: &Step, run: &Run) -> Vec<&'static str> {
+    let mut listing = Vec::new();
+    if run.head.is_some() {
+        listing.push("head");
+    }
+    if restarted(before, step, run) {
+        listing.push("round");
+    }
+    match run.pages.first() {
+        Some(page) if page.complete => listing.extend(vec!["round"; run.pages.len()]),
+        Some(_) => listing.push("delta"),
+        None => {}
+    }
+    if cut_between_pages(run) {
+        listing.push("round");
+    }
+    listing
+}
+
+/// Whether the run failed between two pages of its round, a connection lost
+/// or a page handing no cursor, rather than after a push.
+fn cut_between_pages(run: &Run) -> bool {
+    run.verb == "sync" && run.failed && run.pushes.is_empty()
+}
+
+/// Whether the run restarted the round it resumed, the source rejecting
+/// its cursor, which the run does not state (G11): the open round it found
+/// over the scope it asks, a cursor to resume from, and a new round id.
+fn restarted(before: &Step, step: &Step, run: &Run) -> bool {
+    let state = |step: &Step| {
+        step.model.collections[&run.collection]
+            .sources
+            .get(&run.source)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let was = state(before);
+    run.verb == "sync"
+        && was.open.as_ref().is_some_and(|open| {
+            open.cursor.is_some() && !open.band && open.scope == run.options.scope
+        })
+        && run.pages.first().is_some_and(|page| page.complete)
+        && state(step).rounds == was.rounds + 1
+}
+
+/// Whether the run's connector lists a band its scope-bound checkpoint
+/// does not cover, which the run does not state (G11): the round it opens
+/// or resumes is a band's.
+fn unbound(before: &Step, step: &Step, run: &Run) -> bool {
+    [before, step].into_iter().any(|step| {
+        step.model.collections[&run.collection]
+            .sources
+            .get(&run.source)
+            .and_then(|state| state.open.as_ref())
+            .is_some_and(|open| open.band)
+    })
 }
 
 /// The options a run ran under, read where the run states none (G11).
@@ -499,11 +731,19 @@ pub fn run_verb(
             .sync(run.collection.as_str(), options, remote)
             .map(|report| report.events)
             .map_err(|err| err.to_string()),
+        "rekey" => owner
+            .rekey(run.collection.as_str(), run.options.accept_absences, remote)
+            .map(|report| report.events)
+            .map_err(|err| err.to_string()),
+        "mutate" => owner
+            .mutate(run.collection.as_str(), overrule(before, step, run))
+            .map(|report| report.events)
+            .map_err(|err| err.to_string()),
         _ => owner
             .upgrade(
                 run.collection.as_str(),
-                run.fetch
-                    .keys()
+                run.handles
+                    .iter()
                     .map(|handle| PimdirHandle::from(handle.as_str()))
                     .collect(),
                 PimdirTier::Full,
@@ -515,15 +755,66 @@ pub fn run_verb(
     }
 }
 
-/// The connector a run answers from: its pages, its fetched bodies, its
-/// outcomes by handle; recording the listing asked for and each push
-/// handed. Served in order, or, `resuming` a run a crash cut, by what each
-/// request asks: a round from its start or after its cursor, a delta from
-/// the checkpoint the run delivers answered with nothing changed, an
-/// outcome answered again for a push made again.
+/// The `Edit` an engine overrules a conflict with, the generator's only
+/// `mutate` run (SYNC §7): the body the item takes, which the run does not
+/// state (G11), read from the item after the run, or before it where the
+/// run is refused and the item keeps the body it held.
+fn overrule(before: &Step, step: &Step, run: &Run) -> PimdirMutation {
+    let handle = &run.handles[0];
+    let model = match run.failed {
+        true => &before.model,
+        false => &step.model,
+    };
+    let item = model
+        .items
+        .iter()
+        .find(|item| {
+            item.collection == run.collection
+                && item
+                    .bound(&run.source)
+                    .is_some_and(|binding| &binding.handle == handle)
+        })
+        .expect("a bound item");
+    let body = model.objects[item.object.as_ref().expect("a held body")].clone();
+    let kind = model.collections[&run.collection]
+        .kind
+        .map(|kind| String::from(kind.media_type()))
+        .unwrap_or_default();
+    let derivation = summary::derive(&kind, &body).expect("a known kind");
+    PimdirMutation::Edit {
+        handle: PimdirHandle::from(handle.as_str()),
+        object: PimdirObject {
+            hash: hash::hash(&body),
+            size: body.len(),
+        },
+        body,
+        summary: derivation.summary,
+        sort_key: Some(derivation.sort_key),
+        if_match: None,
+        overrule: true,
+        resolves: None,
+    }
+}
+
+/// The connector a run answers from: its head, its pages, its fetched
+/// bodies, its outcomes by handle; recording the listing asked for and each
+/// push handed. Served in order, or, `resuming` a run a crash cut, by what
+/// each request asks: a round from its start or after its cursor, a delta
+/// from the checkpoint the run delivers answered with nothing changed, an
+/// outcome answered again for a push made again. A run the model says
+/// failed fails where the model's did: a round cut between two pages
+/// answers the request after its last page landed with a page before the
+/// last handing no cursor, which fails the run as a connection lost there
+/// would, nothing of it written; a run cut after a push the remote took
+/// fails that push, its outcome never written.
 pub struct Scripted {
     kind: String,
     collection: String,
+    head: Option<PimdirRemoteSnapshot>,
+    reject_cursor: bool,
+    scope_bound: bool,
+    cut: bool,
+    crash: Option<usize>,
     pages: VecDeque<PimdirRemoteSnapshot>,
     all: Vec<PimdirRemoteSnapshot>,
     resuming: bool,
@@ -537,6 +828,7 @@ pub struct Scripted {
 impl Scripted {
     /// The connector of `run`, the revisions of earlier listings at hand.
     pub fn of(
+        before: &Step,
         step: &Step,
         run: &Run,
         revisions: &BTreeMap<(String, String), String>,
@@ -546,14 +838,16 @@ impl Scripted {
             .kind
             .map(|kind| String::from(kind.media_type()))
             .unwrap_or_default();
-        let all: Vec<PimdirRemoteSnapshot> = run
-            .pages
-            .iter()
-            .map(snapshot_of(&step.model, &run.collection))
-            .collect();
+        let snapshot = snapshot_of(&step.model, &run.collection);
+        let all: Vec<PimdirRemoteSnapshot> = run.pages.iter().map(&snapshot).collect();
         Self {
             kind,
             collection: run.collection.clone(),
+            head: run.head.as_ref().map(&snapshot),
+            reject_cursor: restarted(before, step, run),
+            scope_bound: !unbound(before, step, run),
+            cut: cut_between_pages(run),
+            crash: (run.failed && !run.pushes.is_empty()).then_some(run.pushes.len()),
             pages: all.iter().cloned().collect(),
             all,
             resuming,
@@ -565,14 +859,28 @@ impl Scripted {
         }
     }
 
-    /// The page a resumed run's request asks for.
+    /// The connector of a run resumed past the restart its source made,
+    /// the cursor it rejected long gone: one cursor is rejected once, and a
+    /// store a crash left holding the restarted round resumes it.
+    pub fn restarted(mut self, restarted: bool) -> Self {
+        if restarted {
+            self.reject_cursor = false;
+        }
+        self
+    }
+
+    /// The page a resumed run's request asks for: after the page whose
+    /// cursor it names, the first for the cursor the run resumed from.
     fn resumed(&self, request: &PimdirEnumerate) -> Option<PimdirRemoteSnapshot> {
         if let Some(cursor) = request.cursor() {
-            let at = self
+            return match self
                 .all
                 .iter()
-                .position(|page| page.cursor.as_ref() == Some(cursor))?;
-            return self.all.get(at + 1).cloned();
+                .position(|page| page.cursor.as_ref() == Some(cursor))
+            {
+                Some(at) => self.all.get(at + 1).cloned(),
+                None => self.all.first().cloned(),
+            };
         }
         let delivered = self.all.iter().find_map(|page| page.checkpoint.as_ref());
         if let Some(checkpoint) = request.checkpoint()
@@ -592,6 +900,22 @@ impl Scripted {
         }
         self.all.first().cloned()
     }
+
+    /// The page a round cut between two pages answers once its last page
+    /// landed.
+    fn cut_page() -> PimdirRemoteSnapshot {
+        PimdirRemoteSnapshot {
+            items: Vec::new(),
+            vanished: Vec::new(),
+            complete: true,
+            last: false,
+            cursor: None,
+            checkpoint: None,
+            narrowed: false,
+            capped: false,
+            enumerated: None,
+        }
+    }
 }
 
 impl PimdirRemote for Scripted {
@@ -609,18 +933,23 @@ impl PimdirRemote for Scripted {
                 (None, None) => "round",
             });
         if request.head().is_some() {
-            return Ok(PimdirEnumerated::NoHead);
+            return Ok(match &self.head {
+                Some(head) => PimdirEnumerated::Page(head.clone()),
+                None => PimdirEnumerated::NoHead,
+            });
         }
-        if self.resuming {
-            return self
-                .resumed(&request)
-                .map(PimdirEnumerated::Page)
-                .ok_or_else(|| String::from("no page scripted"));
+        if request.cursor().is_some() && mem::take(&mut self.reject_cursor) {
+            return Ok(PimdirEnumerated::CursorRejected);
         }
-        self.pages
-            .pop_front()
-            .map(PimdirEnumerated::Page)
-            .ok_or_else(|| String::from("no page scripted"))
+        let page = match self.resuming {
+            true => self.resumed(&request),
+            false => self.pages.pop_front(),
+        };
+        match (page, self.cut) {
+            (Some(page), _) => Ok(PimdirEnumerated::Page(page)),
+            (None, true) => Ok(PimdirEnumerated::Page(Self::cut_page())),
+            (None, false) => Err(String::from("no page scripted")),
+        }
     }
 
     fn fetch(
@@ -662,6 +991,9 @@ impl PimdirRemote for Scripted {
         let mut results = Vec::new();
         for change in changes {
             self.pushes.push(change_text(&change));
+            if self.crash == Some(self.pushes.len()) {
+                return Err(String::from("cut after a push the remote took"));
+            }
             let handle = change.handle().clone();
             let Some(at) = self
                 .outcomes
@@ -687,6 +1019,17 @@ impl PimdirRemote for Scripted {
             });
         }
         Ok(results)
+    }
+
+    fn scope_bound(&self) -> bool {
+        self.scope_bound
+    }
+
+    fn heads(&self) -> PimdirHeads {
+        match self.head {
+            Some(_) => PimdirHeads::DELTA,
+            None => PimdirHeads::NONE,
+        }
     }
 }
 
@@ -917,4 +1260,24 @@ fn out_of_order(root: &Path) -> Option<String> {
             )
         })
     })
+}
+
+/// Every row of the store at `root` as [`crash::store_rows`] dumps it, the
+/// SYNC version an engine's first run stamps on a store the generator
+/// wrote left out: a stamp, no row a run moves.
+fn unstamped(root: &Path) -> BTreeMap<String, Vec<Vec<Value>>> {
+    let conn = Connection::open(root.join("pimdir.db")).unwrap();
+    let at: i64 = conn
+        .query_row(
+            "SELECT cid FROM pragma_table_info('store_meta') WHERE name = 'sync_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    let mut rows = crash::store_rows(root);
+    for row in rows.get_mut("store_meta").into_iter().flatten() {
+        row[at as usize] = Value::Null;
+    }
+    rows
 }
