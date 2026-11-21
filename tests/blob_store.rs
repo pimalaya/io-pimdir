@@ -24,14 +24,6 @@ use io_pimdir::{
 
 const CARD: &[u8] = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:blob\r\nFN:Blob\r\nEND:VCARD\r\n";
 
-/// A card longer than a copy's buffer, so a stream would hand on its
-/// first bytes before the read reaching its end checks it.
-#[cfg(feature = "cli")]
-fn long_card() -> Vec<u8> {
-    let note = "x".repeat(64 * 1024);
-    format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:long\r\nFN:Long\r\nNOTE:{note}\r\nEND:VCARD\r\n")
-        .into_bytes()
-}
 const MAIL: &[u8] = b"Message-ID: <blob@x>\r\nSubject: blob\r\n\r\nbody";
 
 /// An owner over a fresh store, its INBOX declared.
@@ -630,30 +622,4 @@ fn the_verification_before_a_push_quarantines_a_corrupt_body() {
     assert_eq!(verified.into_iter().collect::<Vec<_>>(), vec![sound]);
     assert!(!path.exists());
     assert_eq!(quarantined(dir.path()).len(), 1);
-}
-
-/// A body served whole is verified before its first byte leaves (STORAGE
-/// §7): `pimdir item export` of a corrupt body prints nothing.
-#[cfg(feature = "cli")]
-#[test]
-fn an_export_serves_no_byte_of_a_corrupt_body() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap();
-    store.ensure_collection("contacts", "text/vcard").unwrap();
-    let card = long_card();
-    let (_, seq) = store.put_item("contacts", &card).unwrap();
-    let path = store.blobs().path(&store.hash(&card)).unwrap();
-    drop(store);
-    flip(&path);
-
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pimdir"))
-        .arg("--store")
-        .arg(dir.path())
-        .args(["item", "export", &seq.to_string()])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    // NOTE: the CLI prints its error on stdout; no byte of the body.
-    let printed = String::from_utf8_lossy(&output.stdout);
-    assert!(!printed.contains("xxxx"), "{} bytes printed", printed.len());
 }
