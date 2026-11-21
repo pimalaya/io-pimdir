@@ -1,0 +1,22 @@
+[package]
+name = "io-pimdir-bench"
+description = "io-pimdir against notmuch on the Enron corpus: the Maildir connector, the import, index and query runs"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "pimbench"
+path = "src/main.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = false
+
+[dependencies]
+io-pimdir = { path = "..", default-features = false, features = ["client", "search", "indexer", "vendored"] }
+libc = { version = "0.2", default-features = false }
