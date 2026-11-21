@@ -42,6 +42,7 @@ fn placement(handle: &str, link: &str, hash: &str) -> PimdirPlacement {
             object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

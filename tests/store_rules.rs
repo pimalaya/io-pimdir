@@ -110,6 +110,7 @@ fn a_stated_size_no_integer_holds_is_unknown() {
                 object: None,
             }),
             origin: None,
+            server_object_id: None,
         })
     };
     store
@@ -168,6 +169,7 @@ fn a_stated_date_of_another_shape_is_no_date() {
                 object: None,
             }),
             origin: None,
+            server_object_id: None,
         })
     };
     let stated = [
@@ -263,6 +265,7 @@ fn a_domain_is_compared_never_a_pattern() {
                 object: None,
             }),
             origin: None,
+            server_object_id: None,
         })
     };
     store

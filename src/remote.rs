@@ -78,6 +78,12 @@ pub struct PimdirRemoteMeta {
     pub sort_key: PimdirSortKey,
     /// The body, when the listing read it (DAV); `None` otherwise.
     pub body: Option<PimdirFetchedBody>,
+    /// The id the source's server gives the member's content, where it
+    /// states one (SYNC §4): RFC 8474's `EMAILID`, Gmail's `X-GM-MSGID`,
+    /// JMAP's `Email/id`. Opaque, comparable only between members of one
+    /// source; never one the connector derives itself. An upgrade links no
+    /// body between two bindings stating different ones (SYNC §6).
+    pub server_object_id: Option<String>,
 }
 
 impl PimdirRemoteMeta {
@@ -88,12 +94,20 @@ impl PimdirRemoteMeta {
             summary: derivation.summary,
             sort_key: derivation.sort_key,
             body: None,
+            server_object_id: None,
         }
     }
 
     /// The same meta carrying the body it was derived from.
     pub fn with_body(mut self, body: PimdirFetchedBody) -> Self {
         self.body = Some(body);
+        self
+    }
+
+    /// The same meta stating the server object id its source gives the
+    /// member's content (SYNC §4).
+    pub fn with_server_object_id(mut self, id: impl Into<String>) -> Self {
+        self.server_object_id = Some(id.into());
         self
     }
 }
@@ -522,7 +536,13 @@ pub struct PimdirPushResult {
     pub handle: PimdirHandle,
     /// Whether the remote accepted it.
     pub outcome: PimdirPushOutcome,
-    /// The server-assigned handle of an accepted add, `None` otherwise.
+    /// The server-assigned handle of an accepted add, or the handle an
+    /// accepted `Remove` that relocated gave its member in `to` (an IMAP
+    /// `COPYUID`, RFC 4315), `None` where the source states none.
+    ///
+    /// A relocation stating one has the destination's create landed on it
+    /// in the write recording the outcome (SYNC §4), so no later listing
+    /// lands it on another member stating its hint.
     pub assigned: Option<PimdirHandle>,
     /// The revision the remote now holds after an accepted content push.
     ///

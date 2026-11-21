@@ -478,6 +478,7 @@ impl PimdirRekey {
                 object: old_base.and_then(|b| b.object.clone()),
             }),
             origin: old.origin.clone(),
+            server_object_id: item.meta.server_object_id.clone(),
         };
 
         // NOTE: a delivered create carried onto its member is landed there,
@@ -579,6 +580,7 @@ impl PimdirRekey {
                 object: None,
             }),
             origin: None,
+            server_object_id: item.meta.server_object_id.clone(),
         }
     }
 }
@@ -783,6 +785,7 @@ mod tests {
                 object: None,
             }),
             origin: None,
+            server_object_id: None,
         }
     }
 
@@ -796,6 +799,7 @@ mod tests {
                 summary: None,
                 sort_key: Default::default(),
                 body: None,
+                server_object_id: None,
             },
         }
     }
@@ -826,6 +830,7 @@ mod tests {
                         summary: meta.summary.clone(),
                         sort_key: meta.sort_key.clone(),
                         body: None,
+                        server_object_id: None,
                     };
                     item.revision = item.revision.or_else(|| meta.revision.clone());
                 }

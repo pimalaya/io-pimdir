@@ -733,6 +733,7 @@ impl PimdirMutate {
             conflict_object: None,
             base: None,
             origin,
+            server_object_id: None,
         }
     }
 
@@ -767,6 +768,7 @@ impl PimdirMutate {
             conflict_object: None,
             base: None,
             origin: None,
+            server_object_id: None,
         };
         vec![
             PimdirWriteOp::StoreObject {
@@ -1031,6 +1033,7 @@ mod tests {
                     object: None,
                 }),
                 origin: None,
+                server_object_id: None,
             }],
             checkpoint: None,
             ..Default::default()

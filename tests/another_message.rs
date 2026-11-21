@@ -55,6 +55,7 @@ fn named(handle: &str, subject: &str, sender: &str) -> PimdirWriteOp {
             object: None,
         }),
         origin: None,
+        server_object_id: None,
     })
 }
 

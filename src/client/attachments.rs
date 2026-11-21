@@ -134,6 +134,7 @@ pub(crate) fn gaining(
                 subject: row.get(3)?,
                 date: row.get(4)?,
                 sender: row.get(5)?,
+                server_object_id: None,
             },
         ))
     })?;

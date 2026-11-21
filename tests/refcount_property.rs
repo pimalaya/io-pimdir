@@ -399,6 +399,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     object: body.map(|body| harness.hash(body)),
                 }),
                 origin: None,
+                server_object_id: None,
             }));
 
             match harness.sources[source].write(batch).map(|_| ()) {
@@ -469,6 +470,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                         object: object.map(|body| harness.hash(body)),
                     }),
                     origin: None,
+                    server_object_id: None,
                 }));
             }
 
@@ -534,6 +536,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     object: object.map(|body| harness.hash(body)),
                 }),
                 origin: None,
+                server_object_id: None,
             }));
 
             match harness.sources[source].write(batch).map(|_| ()) {

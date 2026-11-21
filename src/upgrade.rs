@@ -880,8 +880,11 @@ fn is_mutable(placement: &PimdirPlacement) -> bool {
 
 /// Whether a body may be linked from the row `held` (SYNC §6, STORAGE
 /// §9): a message's only from a row agreeing with the summary the source
-/// served ([`PimdirHeldObject::agrees`]), and on the size where the
-/// placement states one, against the body's octets.
+/// served ([`PimdirHeldObject::agrees`]), on the size where the placement
+/// states one, against the body's octets, and on the server object id
+/// where both the placement's binding and the row's state one: two
+/// contents its source names apart are never one body, whatever else
+/// agrees.
 fn agrees(placement: &PimdirPlacement, held: &PimdirHeldObject) -> bool {
     let sized = match &placement.summary {
         Some(PimdirSummary::Mail(mail)) => mail
@@ -889,8 +892,12 @@ fn agrees(placement: &PimdirPlacement, held: &PimdirHeldObject) -> bool {
             .is_none_or(|served| served == held.object.size as u64),
         _ => true,
     };
+    let same_content = match (&placement.server_object_id, &held.server_object_id) {
+        (Some(stated), Some(held)) => stated == held,
+        _ => true,
+    };
 
-    held.agrees(placement.summary.as_ref()) && sized
+    held.agrees(placement.summary.as_ref()) && sized && same_content
 }
 
 /// What the coroutine is doing while it waits for the caller.
@@ -940,6 +947,7 @@ mod tests {
             conflict_object: None,
             base: None,
             origin: None,
+            server_object_id: None,
         }
     }
 
@@ -954,6 +962,7 @@ mod tests {
             subject: None,
             date: None,
             sender: None,
+            server_object_id: None,
         }]
     }
 
@@ -1939,6 +1948,55 @@ mod tests {
             Some(PimdirHash::from("h-a")),
             "the base holds the linked body, so nothing reads as edited"
         );
+    }
+
+    /// Runs a full upgrade of a placement stating the server object id
+    /// `stated` past a lookup answering a holder stating `holder`.
+    fn upgrade_with_ids(
+        stated: Option<&str>,
+        holder: Option<&str>,
+    ) -> PimdirCoroutineState<PimdirYield, Result<PimdirUpgradeReport, PimdirArgError>> {
+        let mut placement = based("2", "msg-a", None);
+        placement.server_object_id = stated.map(String::from);
+        let mut held = held("h-a");
+        held[0].server_object_id = holder.map(String::from);
+        let known = BTreeMap::from([(PimdirLinkId::from("msg-a"), held)]);
+        let loaded = PimdirLoaded {
+            placements: vec![placement],
+            checkpoint: None,
+            ..Default::default()
+        };
+        let mut up = PimdirUpgrade::new("inbox", vec![PimdirHandle::from("2")], PimdirTier::Full);
+        let _ = up.resume(None);
+        match up.resume(Some(PimdirArg::Load(loaded))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsLookupObject(_)) => {
+                up.resume(Some(PimdirArg::LookupObject(known)))
+            }
+            state => state,
+        }
+    }
+
+    /// Two contents the source names apart are never one body (SYNC §6):
+    /// another server object id fetches, an equal one links, and one
+    /// stated on a side alone leaves the agreement to decide.
+    #[test]
+    fn a_body_links_only_under_an_equal_server_object_id() {
+        match upgrade_with_ids(Some("M-1"), Some("M-2")) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsFetch { handles, .. }) => {
+                assert_eq!(handles, vec![PimdirHandle::from("2")]);
+            }
+            state => panic!("expected WantsFetch, got {state:?}"),
+        }
+        for (stated, holder) in [
+            (Some("M-1"), Some("M-1")),
+            (Some("M-1"), None),
+            (None, Some("M-2")),
+        ] {
+            match upgrade_with_ids(stated, holder) {
+                PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(_)) => {}
+                state => panic!("{stated:?} {holder:?}: expected WantsWrite, got {state:?}"),
+            }
+        }
     }
 
     #[test]

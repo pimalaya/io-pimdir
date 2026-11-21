@@ -53,6 +53,7 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> PimdirPlac
             object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 
@@ -731,6 +732,7 @@ impl PimdirRemote for MemRemote {
                         summary: None,
                         sort_key: Default::default(),
                         body: None,
+                        server_object_id: None,
                     },
                 })
                 .collect(),

@@ -41,6 +41,7 @@ fn reply(collection: &str, handle: &str, id: &str, parent: &str) -> PimdirWriteO
             object: None,
         }),
         origin: None,
+        server_object_id: None,
     })
 }
 

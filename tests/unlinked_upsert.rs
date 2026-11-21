@@ -45,6 +45,7 @@ fn placement(handle: &str, link: &str) -> PimdirPlacement {
             object: None,
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn unnamed(handle: &str, revision: &str) -> PimdirPlacement {
             object: None,
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

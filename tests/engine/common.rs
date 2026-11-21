@@ -359,6 +359,7 @@ impl MemRemote {
                     hash: hash(&item.body),
                     bytes: item.body.clone(),
                 }),
+                server_object_id: None,
             },
         }
     }

@@ -130,6 +130,7 @@ fn a_restore_over_a_store_of_another_draft_is_refused() {
                     object: Some(hash),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

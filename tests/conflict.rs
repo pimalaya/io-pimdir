@@ -73,6 +73,7 @@ fn card(
             object: Some(hashed("0rig")),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

@@ -291,6 +291,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":conflict_revision": binding["conflict_revision"].as_str(),
                 ":conflict_object": bodies.hash(&binding["conflict_object"]),
                 ":shared_object": shared_object,
+                ":server_object_id": binding["server_object_id"].as_str(),
             },
         )
         .unwrap();
@@ -516,10 +517,11 @@ fn stated_file(meta: &Value) -> PimdirDerivation {
 impl Scripted {
     /// The meta a member carries, read from its fixture (SYNC §11): for
     /// mail without the body, the attachment mark and the size the source
-    /// states where the case states them (Annex A.1); for a file, the key
-    /// and summary its source states, the bytes saying nothing (A.7). A
-    /// member stating `carries` carries the fixture as its body, as a DAV
-    /// listing may (SYNC §4).
+    /// states where the case states them (Annex A.1), and the server object
+    /// id it gives the content where the case states one (SYNC §4); for a
+    /// file, the key and summary its source states, the bytes saying
+    /// nothing (A.7). A member stating `carries` carries the fixture as its
+    /// body, as a DAV listing may (SYNC §4).
     fn meta(spec: &Path, kind: &str, member: &Value) -> PimdirRemoteMeta {
         let meta = &member["meta"];
         if kind == file::KIND {
@@ -534,7 +536,10 @@ impl Scripted {
             ),
             _ => summary::derive(kind, &body).expect("a known kind"),
         };
-        let carried = PimdirRemoteMeta::new(derivation);
+        let carried = match meta["server_object_id"].as_str() {
+            Some(id) => PimdirRemoteMeta::new(derivation).with_server_object_id(id),
+            None => PimdirRemoteMeta::new(derivation),
+        };
         match member["carries"].as_bool() {
             Some(true) => carried.with_body(PimdirFetchedBody::Inline {
                 hash: hash::hash(&body),
@@ -1102,7 +1107,7 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
             "SELECT i.collection, i.link_id, i.seq, CASE WHEN i.flags_known = 1 THEN trim(CASE WHEN i.marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN i.marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN i.marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN i.marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN i.marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(f.flag, ' ') FROM placement_flag f WHERE f.item = i.id), '')) END, (SELECT o.hash FROM objects o WHERE o.id = i.object), i.level, i.deleted, i.retained_at, i.retained_by, i.sort_key, i.conflicted, (SELECT o.hash FROM objects o WHERE o.id = i.conflict_object) FROM items i ORDER BY i.collection, i.link_id"
         }
         "bindings" => {
-            "SELECT b.collection, i.link_id, b.source, b.handle, CASE WHEN b.base_flags_known = 1 THEN trim(CASE WHEN b.base_marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN b.base_marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN b.base_marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN b.base_marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN b.base_marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.item = b.item AND g.source = b.source), '')) END, (SELECT o.hash FROM objects o WHERE o.id = b.base_object), b.base_revision, b.base_present, b.conflicted, b.conflict_revision, (SELECT o.hash FROM objects o WHERE o.id = b.conflict_object), (SELECT o.hash FROM objects o WHERE o.id = b.shared_object), b.round, b.refusal, b.refused_key FROM bindings b JOIN items i ON i.id = b.item ORDER BY b.collection, i.link_id, b.source"
+            "SELECT b.collection, i.link_id, b.source, b.handle, CASE WHEN b.base_flags_known = 1 THEN trim(CASE WHEN b.base_marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN b.base_marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN b.base_marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN b.base_marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN b.base_marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.item = b.item AND g.source = b.source), '')) END, (SELECT o.hash FROM objects o WHERE o.id = b.base_object), b.base_revision, b.base_present, b.conflicted, b.conflict_revision, (SELECT o.hash FROM objects o WHERE o.id = b.conflict_object), (SELECT o.hash FROM objects o WHERE o.id = b.shared_object), b.round, b.refusal, b.refused_key, b.server_object_id FROM bindings b JOIN items i ON i.id = b.item ORDER BY b.collection, i.link_id, b.source"
         }
         "sources" => {
             "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until, round_band FROM sources ORDER BY collection, source"
@@ -1165,6 +1170,7 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
                     get("round", json!(row.get::<_, Option<i64>>(12)?));
                     get("refusal", json!(row.get::<_, Option<String>>(13)?));
                     get("refused_key", json!(row.get::<_, Option<String>>(14)?));
+                    get("server_object_id", json!(row.get::<_, Option<String>>(15)?));
                 }
                 "sources" => {
                     get("collection", json!(row.get::<_, String>(0)?));

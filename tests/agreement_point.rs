@@ -67,6 +67,7 @@ fn card(
             object: Some(PimdirHash(base.into())),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

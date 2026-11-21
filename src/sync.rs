@@ -1189,6 +1189,18 @@ impl PimdirSync {
 
             // NOTE: a content change is the content axis's, which takes the
             // meta on a pull and keeps the local body's summary otherwise.
+            if placement.server_object_id != meta.server_object_id {
+                let mut stated = placement.clone();
+                stated.server_object_id = meta.server_object_id.clone();
+                self.local.insert(item.handle.clone(), stated);
+                self.fresh
+                    .entry(item.handle.clone())
+                    .or_insert(Fresh::Refreshed);
+            }
+            let Some(placement) = self.local.get(&item.handle) else {
+                continue;
+            };
+
             let base_revision = placement.base.as_ref().and_then(|b| b.revision.as_ref());
             if item.revision.is_some() && item.revision.as_ref() != base_revision {
                 continue;
@@ -1230,7 +1242,8 @@ impl PimdirSync {
                 create.flags =
                     PimdirFlags::merge(&PimdirFlags::Unknown, &create.flags, &item.flags);
             }
-            let landed = self.land(create, item, offered);
+            let mut landed = self.land(create, item, offered);
+            landed.server_object_id = meta.server_object_id.clone();
             let conflicted = landed.status == PimdirStatus::Conflict;
             self.local.insert(item.handle.clone(), landed);
             self.fresh.insert(
@@ -1275,6 +1288,7 @@ impl PimdirSync {
                 object,
             }),
             origin: None,
+            server_object_id: meta.server_object_id.clone(),
         };
         self.local.insert(item.handle.clone(), named);
         self.fresh
@@ -1850,8 +1864,13 @@ impl PimdirSync {
                         .strip_prefix('\u{1}')
                         .is_some_and(|key| PimdirLinkId::from(key).is_landable())
                 });
-                self.pending
-                    .insert(handle.clone(), Pending::Remove(delivered));
+                self.pending.insert(
+                    handle.clone(),
+                    Pending::Remove {
+                        destination: local.origin.clone(),
+                        delivered,
+                    },
+                );
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
                 // NOTE: a destination keyed by a minted key held the
                 // identity before the move, so holding it proves no
@@ -2314,20 +2333,12 @@ impl PimdirSync {
             Pending::Content(placement) => {
                 self.rebase_content(&placement, result.revision.clone());
             }
-            Pending::Remove(destination) => {
+            Pending::Remove {
+                destination,
+                delivered,
+            } => {
                 self.drop(&result.handle, PimdirDropReason::Deleted);
-                // NOTE: a relocation the outcome states delivered the create
-                // its destination names, which derives nothing until the
-                // target's listing lands it, so an action on it waits for
-                // that landing rather than withdrawing it (SYNC §4, §5). One
-                // the connector deleted, the target already holding the
-                // identity, delivered nothing: the create stays pending.
-                if let Some(destination) = destination.filter(|_| result.relocated) {
-                    self.writes.push(PimdirWriteOp::DeliverPlacement {
-                        collection: destination.collection,
-                        handle: destination.handle,
-                    });
-                }
+                self.relocated(destination, delivered, result);
             }
             Pending::Create(placeholder) => match result.assigned.clone() {
                 Some(assigned) => {
@@ -2355,6 +2366,48 @@ impl PimdirSync {
                     }
                 }
             },
+        }
+    }
+
+    /// Records what an accepted remove did to the create its destination
+    /// names (SYNC §4, §5). A relocation stating the handle it gave its
+    /// member lands the create on it at once, whatever its key, so no later
+    /// listing lands it on another member stating its hint. One stating
+    /// none delivers it where a listing can land it, so an action on it
+    /// waits for that landing rather than withdrawing it. A delete, the
+    /// target already holding the identity, delivered nothing: the create
+    /// stays pending.
+    fn relocated(
+        &mut self,
+        destination: Option<PimdirOrigin>,
+        delivered: Option<PimdirOrigin>,
+        result: &PimdirPushResult,
+    ) {
+        if !result.relocated {
+            return;
+        }
+        match (destination, result.assigned.clone()) {
+            (Some(destination), Some(landed)) => {
+                debug!(
+                    "land the relocated create {} on {}",
+                    destination.handle.as_str(),
+                    landed.as_str(),
+                );
+                self.writes.push(PimdirWriteOp::LandPlacement {
+                    collection: destination.collection,
+                    handle: destination.handle,
+                    landed,
+                    revision: result.revision.clone(),
+                });
+            }
+            _ => {
+                if let Some(delivered) = delivered {
+                    self.writes.push(PimdirWriteOp::DeliverPlacement {
+                        collection: delivered.collection,
+                        handle: delivered.handle,
+                    });
+                }
+            }
         }
     }
 
@@ -2996,8 +3049,14 @@ enum Pending {
     /// the pushed body and the reported revision.
     Content(PimdirPlacement),
     /// A delete: the tombstone is dropped once confirmed, and the create
-    /// its destination names, when it relocated, delivered.
-    Remove(Option<PimdirOrigin>),
+    /// its destination names, when it relocated, landed on the handle the
+    /// outcome states, else delivered where a listing can land it.
+    Remove {
+        /// The create the relocation offers, whatever its key.
+        destination: Option<PimdirOrigin>,
+        /// The same create where a listing can land it.
+        delivered: Option<PimdirOrigin>,
+    },
     /// A create: the placeholder is superseded by the assigned handle.
     Create(PimdirPlacement),
 }
@@ -3049,6 +3108,7 @@ mod tests {
                 collection: "sent".into(),
                 handle: PimdirHandle::from("9"),
             }),
+            server_object_id: None,
         }
     }
 
@@ -3071,6 +3131,7 @@ mod tests {
                 object: None,
             }),
             origin: None,
+            server_object_id: None,
         }
     }
 
@@ -3082,6 +3143,7 @@ mod tests {
             summary: None,
             sort_key: Default::default(),
             body: None,
+            server_object_id: None,
         }
     }
 

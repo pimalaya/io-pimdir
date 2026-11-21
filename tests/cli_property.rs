@@ -54,6 +54,7 @@ fn store(dir: &Path) -> i64 {
                     object: Some(PimdirHash(BODY.into())),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

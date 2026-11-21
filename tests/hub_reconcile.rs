@@ -39,6 +39,7 @@ fn item(shared: Option<&str>, agreed: &str) -> PimdirHubItem {
         conflict_revision: None,
         conflict_object: None,
         shared_object: Some(hash(agreed)),
+        server_object_id: None,
     };
     PimdirHubItem {
         flags: PimdirFlags::default(),
@@ -72,6 +73,7 @@ fn pulled(object: Option<&str>, base_object: &str) -> PimdirPlacement {
         conflict_object: None,
         base: Some(base("r2", base_object)),
         origin: None,
+        server_object_id: None,
     }
 }
 

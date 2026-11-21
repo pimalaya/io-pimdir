@@ -77,6 +77,7 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> PimdirPlac
             object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 
@@ -105,6 +106,7 @@ fn meta_placement(handle: &str, link: &str, subject: &str) -> PimdirPlacement {
             object: None,
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 
@@ -963,6 +965,7 @@ fn a_handles_load_reads_only_its_own_handles() {
         conflict_object: None,
         base: None,
         origin: None,
+        server_object_id: None,
     };
     store
         .write(vec![

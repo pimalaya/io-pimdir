@@ -81,6 +81,7 @@ fn card(store: &PimdirSourceStore, handle: &str, bytes: &[u8], revision: &str) -
             object: Some(store.hash(bytes)),
         }),
         origin: None,
+        server_object_id: None,
     })
 }
 

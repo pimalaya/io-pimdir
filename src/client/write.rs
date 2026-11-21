@@ -252,7 +252,8 @@ impl PimdirSourceStore {
 
     /// Resolves which link ids already hold a body, within this handle's
     /// account (§14): each row holding one, with the body, its size and
-    /// the `subject`, `date` and `sender` its mail summary states, the
+    /// the `subject`, `date` and `sender` its mail summary states and the
+    /// server object id this source's binding of it states, the
     /// witnesses a link is checked against (SYNC §6), one per holder
     /// stating another; a writer-derived key never matches (§9). A body is
     /// answered only once read whole and found to hash to its name (STORAGE
@@ -267,7 +268,10 @@ impl PimdirSourceStore {
         let found = rows(
             conn,
             sql::LOOKUP_OBJECTS,
-            named_params! { ":account": self.store.account.as_deref() },
+            named_params! {
+                ":account": self.store.account.as_deref(),
+                ":source": self.source.0,
+            },
             |r| {
                 Ok((
                     PimdirLinkId(r.get::<_, String>(0)?),
@@ -279,6 +283,7 @@ impl PimdirSourceStore {
                         subject: r.get(3)?,
                         date: r.get(4)?,
                         sender: r.get(5)?,
+                        server_object_id: r.get(6)?,
                     },
                 ))
             },
@@ -437,6 +442,29 @@ pub(crate) fn apply(
                     .entry(collection.0.clone())
                     .or_default()
                     .push(PimdirWriteOp::DeliverPlacement { collection, handle });
+            }
+            PimdirWriteOp::LandPlacement {
+                collection,
+                handle,
+                landed,
+                revision,
+            } => {
+                let taken = link_for_handle(tx, &collection.0, source, &landed)?.is_some();
+                let ops = hub_ops.entry(collection.0.clone()).or_default();
+                if taken {
+                    ops.push(PimdirWriteOp::DeliverPlacement { collection, handle });
+                    continue;
+                }
+                licensed
+                    .entry(collection.0.clone())
+                    .or_default()
+                    .insert(handle.clone());
+                ops.push(PimdirWriteOp::LandPlacement {
+                    collection,
+                    handle,
+                    landed,
+                    revision,
+                });
             }
             // NOTE: the bytes landed before the transaction opened
             // (`PimdirBlobs::stage`); writing them again would read the
@@ -999,7 +1027,8 @@ fn batch_links(
                 &placement.handle
             }
             PimdirWriteOp::DropPlacement { handle, .. }
-            | PimdirWriteOp::DeliverPlacement { handle, .. } => handle,
+            | PimdirWriteOp::DeliverPlacement { handle, .. }
+            | PimdirWriteOp::LandPlacement { handle, .. } => handle,
             _ => continue,
         };
         match bound.get(&(String::from(collection), handle.clone())) {
@@ -2434,6 +2463,7 @@ fn insert_binding(
             ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
             ":conflict_object": conflict_object(binding).map(|hash| hash.0.as_str()),
             ":shared_object": binding.shared_object.as_ref().map(|hash| hash.0.as_str()),
+            ":server_object_id": binding.server_object_id.as_deref(),
         },
     )?;
     write_flags(
@@ -2467,6 +2497,7 @@ fn update_binding(
             ":conflict_revision": binding.conflicted.then_some(binding.conflict_revision.as_deref()).flatten(),
             ":conflict_object": conflict_object(binding).map(|hash| hash.0.as_str()),
             ":shared_object": binding.shared_object.as_ref().map(|hash| hash.0.as_str()),
+            ":server_object_id": binding.server_object_id.as_deref(),
         },
     )?;
     write_flags(
@@ -2583,7 +2614,8 @@ fn item_from_row(row: &Row) -> rusqlite::Result<(PimdirLinkId, PimdirHubItem)> {
     ))
 }
 
-/// Maps a `load_bindings`-shaped row.
+/// Maps a `load_bindings`-shaped row: `list_item_bindings`, a reader's,
+/// answers no server object id, read as none.
 pub(crate) fn binding_from_row(
     row: &Row,
 ) -> rusqlite::Result<(PimdirLinkId, PimdirSourceId, PimdirBinding)> {
@@ -2598,6 +2630,10 @@ pub(crate) fn binding_from_row(
     let conflict_revision: Option<String> = row.get(8)?;
     let conflict_object: Option<String> = row.get(9)?;
     let shared_object: Option<String> = row.get(10)?;
+    let server_object_id: Option<String> = match row.as_ref().column_count() > 11 {
+        true => row.get(11)?,
+        false => None,
+    };
 
     // NOTE: the one witness (§13): the schema lets no value column state
     // a base without it.
@@ -2625,6 +2661,7 @@ pub(crate) fn binding_from_row(
                 .flatten()
                 .map(PimdirHash),
             shared_object: shared_object.map(PimdirHash),
+            server_object_id,
         },
     ))
 }

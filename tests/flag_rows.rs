@@ -49,6 +49,7 @@ fn placement(flags: PimdirFlags) -> PimdirPlacement {
             )),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

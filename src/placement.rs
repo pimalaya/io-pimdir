@@ -414,6 +414,12 @@ pub struct PimdirPlacement {
     /// Where a [`PimdirStatus::Created`] body lives, `None` for an append;
     /// on a [`PimdirStatus::Tombstone`] the destination its remove offers.
     pub origin: Option<PimdirOrigin>,
+    /// The id the source's server gives the member's content (RFC 8474
+    /// `EMAILID`, Gmail's `X-GM-MSGID`, JMAP's `Email/id`), as its binding
+    /// last recorded it from a listing (SYNC §4); `None` where the source
+    /// stated none. An upgrade links no body from a row whose binding of
+    /// the same source states another one (SYNC §6).
+    pub server_object_id: Option<String>,
 }
 
 impl PimdirPlacement {

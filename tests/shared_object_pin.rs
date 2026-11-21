@@ -69,6 +69,7 @@ fn card(
             object: Some(store.hash(bytes)),
         }),
         origin: None,
+        server_object_id: None,
     })
 }
 
@@ -186,6 +187,7 @@ fn the_conflict_body_is_pinned_as_the_agreement_point_is() {
                 object: Some(left.hash(b"one")),
             }),
             origin: None,
+            server_object_id: None,
         }),
     ])
     .unwrap();

@@ -149,6 +149,7 @@ fn seed(dir: &Path, n: usize) {
                         object: None,
                     }),
                     origin: None,
+                    server_object_id: None,
                 })
             })
             .collect();

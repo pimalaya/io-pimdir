@@ -43,6 +43,7 @@ fn placement(handle: &str, local: &[&str], base: &[&str]) -> PimdirPlacement {
             object: None,
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

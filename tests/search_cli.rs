@@ -83,6 +83,7 @@ fn file_message_as(
                 conflict_object: None,
                 base: None,
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

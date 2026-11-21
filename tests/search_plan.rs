@@ -137,6 +137,7 @@ fn seed(dir: &Path) {
                         object: None,
                     }),
                     origin: None,
+                    server_object_id: None,
                 })
             })
             .collect();
@@ -156,7 +157,8 @@ fn plan(dir: &Path, sql: &str) -> Vec<String> {
          akey TEXT NOT NULL, seq INTEGER NOT NULL, src TEXT NOT NULL, rank REAL); \
          CREATE INDEX temp.term_match_by_term ON term_match(term, akey, seq); \
          CREATE TEMP TABLE term_source (term INTEGER NOT NULL, src INTEGER NOT NULL, \
-         id INTEGER NOT NULL, PRIMARY KEY (term, src, id)) WITHOUT ROWID;",
+         id INTEGER NOT NULL, PRIMARY KEY (term, src, id)) WITHOUT ROWID; \
+         CREATE TEMP TABLE hit_page (akey TEXT NOT NULL, seq INTEGER NOT NULL);",
     )
     .unwrap();
     let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();

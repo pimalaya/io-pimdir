@@ -65,6 +65,7 @@ fn file(handle: usize, link: &str, body: &[u8]) -> Vec<PimdirWriteOp> {
                 object: Some(hash),
             }),
             origin: None,
+            server_object_id: None,
         }),
     ]
 }

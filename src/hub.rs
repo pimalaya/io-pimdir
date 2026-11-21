@@ -65,6 +65,9 @@ pub struct PimdirBinding {
     /// only on a sync and would make a source disagree with a body it
     /// folded in itself. `None` until first folded; the sync base stands in.
     pub shared_object: Option<PimdirHash>,
+    /// The server object id this source last stated for the member with
+    /// its meta (SYNC §4), `None` where it stated none.
+    pub server_object_id: Option<String>,
 }
 
 /// How the hub resolves a cross-source content conflict.
@@ -323,6 +326,7 @@ impl PimdirHubItem {
             conflict_object: None,
             base: None,
             origin: None,
+            server_object_id: None,
         }
     }
 }
@@ -566,6 +570,7 @@ impl PimdirHub {
         placement.conflict_revision = binding.conflict_revision.clone();
         placement.conflict_object = binding.conflict_object.clone();
         placement.base = binding.base.clone();
+        placement.server_object_id = binding.server_object_id.clone();
         placement
     }
 
@@ -584,6 +589,7 @@ impl PimdirHub {
         let mut placement = item.project(collection, link, binding.handle.clone());
         placement.status = PimdirStatus::Tombstone;
         placement.base = binding.base.clone();
+        placement.server_object_id = binding.server_object_id.clone();
         placement.conflict_revision = binding.conflict_revision.clone();
         placement.conflict_object = binding.conflict_object.clone();
         placement
@@ -638,6 +644,20 @@ impl PimdirHub {
                 }
                 PimdirWriteOp::DeliverPlacement { handle, .. } => {
                     self.absorb_delivery(source, bound.get(handle), handle)
+                }
+                PimdirWriteOp::LandPlacement {
+                    handle,
+                    landed,
+                    revision,
+                    ..
+                } => {
+                    let Some(link) = bound.get(handle).cloned() else {
+                        continue;
+                    };
+                    if self.absorb_landing(source, &link, handle, landed, revision) {
+                        bound.remove(handle);
+                        bound.insert(landed.clone(), link);
+                    }
                 }
                 PimdirWriteOp::Overrule { handle, .. } => {
                     self.overruling.insert(handle.clone());
@@ -870,6 +890,7 @@ impl PimdirHub {
                 .then(|| placement.conflict_object.clone())
                 .flatten(),
             shared_object,
+            server_object_id: placement.server_object_id.clone(),
         }
     }
 
@@ -945,6 +966,53 @@ impl PimdirHub {
                 object: None,
             });
         }
+    }
+
+    /// Lands the create `source` binds under the provisional `handle`, found
+    /// through `link`, on the handle a relocation stated (SYNC §4): the
+    /// binding moves to `landed`, its base the item's flags and body and
+    /// `revision`, as an add accepted with its handle rebases. A binding
+    /// holding a base naming anything is left as it is. Whether it landed.
+    fn absorb_landing(
+        &mut self,
+        source: &PimdirSourceId,
+        link: &PimdirLinkId,
+        handle: &PimdirHandle,
+        landed: &PimdirHandle,
+        revision: &Option<String>,
+    ) -> bool {
+        if !handle.is_provisional() {
+            return false;
+        }
+        let Some(item) = self.items.get_mut(link) else {
+            return false;
+        };
+        let flags = item.flags.clone();
+        let object = item.object.clone();
+        let Some(binding) = item
+            .sources
+            .get_mut(source)
+            .filter(|binding| &binding.handle == handle)
+        else {
+            return false;
+        };
+        let landable = binding.base.as_ref().is_none_or(|base| {
+            base.flags.is_unknown() && base.revision.is_none() && base.object.is_none()
+        });
+        if !landable {
+            return false;
+        }
+        binding.handle = landed.clone();
+        binding.base = Some(PimdirBase {
+            flags,
+            revision: revision.clone(),
+            object: object.clone(),
+        });
+        binding.server_object_id = None;
+        if object.is_some() {
+            binding.shared_object = object;
+        }
+        true
     }
 
     /// Drops the binding of `source` under `handle`, found through `link`,
@@ -1052,6 +1120,7 @@ mod tests {
                 conflict_revision: None,
                 conflict_object: None,
                 shared_object: None,
+                server_object_id: None,
             },
         );
         let item = PimdirHubItem {
@@ -1090,6 +1159,7 @@ mod tests {
                     conflict_revision: None,
                     conflict_object: None,
                     shared_object: None,
+                    server_object_id: None,
                 },
             );
     }
@@ -1124,6 +1194,7 @@ mod tests {
                 conflict_revision: None,
                 conflict_object: None,
                 shared_object: None,
+                server_object_id: None,
             },
         )]
         .into_iter()
@@ -1149,6 +1220,7 @@ mod tests {
                     conflict_revision: None,
                     conflict_object: None,
                     shared_object: None,
+                    server_object_id: None,
                 },
             );
 
@@ -1206,6 +1278,7 @@ mod tests {
                     conflict_revision: None,
                     conflict_object: None,
                     shared_object: None,
+                    server_object_id: None,
                 },
             );
 
@@ -1314,6 +1387,7 @@ mod tests {
                     conflict_revision: None,
                     conflict_object: None,
                     shared_object: None,
+                    server_object_id: None,
                 },
             );
 
@@ -1367,6 +1441,7 @@ mod tests {
                 conflict_revision: None,
                 conflict_object: None,
                 shared_object: None,
+                server_object_id: None,
             },
         );
 
@@ -1563,6 +1638,7 @@ mod tests {
             conflict_object: None,
             base: Some(base(&["seen", "flagged"])),
             origin: None,
+            server_object_id: None,
         };
         hub.absorb(
             &PimdirSourceId::from("left"),
@@ -1597,6 +1673,7 @@ mod tests {
             conflict_revision: None,
             conflict_object: None,
             shared_object: Some(PimdirHash::from("o0")),
+            server_object_id: None,
         };
         let mut sources = BTreeMap::new();
         sources.insert(PimdirSourceId::from("left"), based("l1"));
@@ -1639,6 +1716,7 @@ mod tests {
                 object: Some(PimdirHash::from(object)),
             }),
             origin: None,
+            server_object_id: None,
         })
     }
 
@@ -2019,6 +2097,7 @@ mod tests {
                 object: Some(PimdirHash::from("o0")),
             }),
             origin: None,
+            server_object_id: None,
         })
     }
 
@@ -2289,6 +2368,7 @@ mod tests {
                 conflict_object: None,
                 base: None,
                 origin: None,
+                server_object_id: None,
             })
         }
 
@@ -2361,6 +2441,7 @@ mod tests {
                 conflict_object: None,
                 base: None,
                 origin: None,
+                server_object_id: None,
             })
         }
 
@@ -2424,6 +2505,7 @@ mod tests {
                     object: base.map(PimdirHash::from),
                 }),
                 origin: None,
+                server_object_id: None,
             })
         }
 
@@ -2520,6 +2602,7 @@ mod tests {
                     object: base.map(PimdirHash::from),
                 }),
                 origin: None,
+                server_object_id: None,
             })
         }
 

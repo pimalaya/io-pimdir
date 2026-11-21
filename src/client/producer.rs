@@ -1984,6 +1984,7 @@ fn stage_action(
             conflict_object: None,
             base: None,
             origin: None,
+            server_object_id: None,
         };
         return Ok(Ok((
             source.clone(),

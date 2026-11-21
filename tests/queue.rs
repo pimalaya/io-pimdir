@@ -66,6 +66,7 @@ fn placement(handle: &str, link: &str, hash: &str, flags: &[&str]) -> PimdirPlac
             object: Some(PimdirHash(hash.into())),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 
@@ -1528,6 +1529,7 @@ fn a_body_a_policy_overrules_during_a_drain_is_reported() {
                     object: Some(hash),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ]
     };

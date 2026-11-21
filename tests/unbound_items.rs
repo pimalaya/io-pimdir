@@ -139,6 +139,7 @@ fn a_collection_a_source_syncs_is_refused() {
                     object: Some(hash),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

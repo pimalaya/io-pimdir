@@ -54,6 +54,7 @@ fn an_overruling_edit_over_an_unread_item_conflict_is_refused() {
                     object: Some(hash),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

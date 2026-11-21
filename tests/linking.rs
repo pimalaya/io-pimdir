@@ -71,6 +71,7 @@ fn placement(
             object,
         }),
         origin: None,
+        server_object_id: None,
     })
 }
 

@@ -83,6 +83,7 @@ fn placement(
             object: Some(store.hash(object)),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

@@ -63,6 +63,7 @@ fn file(store: &mut PimdirSourceStore, id: &str, subject: &str, from: &str, text
                 conflict_object: None,
                 base: None,
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

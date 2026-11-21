@@ -319,6 +319,22 @@ pub enum PimdirWriteOp {
         /// The create's provisional handle.
         handle: PimdirHandle,
     },
+    /// Land a relocation's destination create on the handle the relocation
+    /// stated (SYNC §4): a `Superseded` drop of the provisional `handle`,
+    /// the binding moved to `landed`, its base the item's flags and body
+    /// and `revision`. A binding holding a base naming anything, or none
+    /// under `handle`, is left as it is; one whose `landed` the source
+    /// already binds in the collection is recorded delivered instead.
+    LandPlacement {
+        /// The collection holding the create, the relocation's destination.
+        collection: PimdirCollectionId,
+        /// The create's provisional handle.
+        handle: PimdirHandle,
+        /// The handle the relocation stated its member has there.
+        landed: PimdirHandle,
+        /// The revision the outcome stated, `None` for mail.
+        revision: Option<String>,
+    },
     /// Record a refusal (SYNC §4, §5): the remote refused for good the
     /// change keyed `key` the source pushed for its binding under
     /// `handle`, giving `reason`. The binding keeps it, replacing one

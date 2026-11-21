@@ -51,6 +51,7 @@ fn card(handle: &str, status: PimdirStatus) -> PimdirPlacement {
             )),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

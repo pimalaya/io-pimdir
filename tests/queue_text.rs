@@ -56,6 +56,7 @@ fn seeded(dir: &Path, items: usize) -> (PimdirSourceStore, Vec<i64>) {
                 object: Some(PimdirHash(SEEDED.into())),
             }),
             origin: None,
+            server_object_id: None,
         }));
     }
     store.write(ops).unwrap();

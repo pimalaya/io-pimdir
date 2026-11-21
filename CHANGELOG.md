@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- **BREAKING**: Added `PimdirWriteOp::LandPlacement`: a relocation stating the handle it gave its member (`PimdirPushResult::assigned` on an accepted relocating `Remove`, an IMAP `COPYUID`) lands the destination's create on it in the write recording the outcome, so a later listing never lands it on another message stating the same `Message-ID` (pimdir SYNC §4, sync-draft-15 edited in place). An exhaustive `match` on the enum needs the arm.
+- Added the server object id (pimdir SYNC §4, §6; STORAGE `bindings.server_object_id`, storage-draft-15 edited in place): `PimdirRemoteMeta::server_object_id` and `with_server_object_id` for a connector stating RFC 8474's `EMAILID`, Gmail's `X-GM-MSGID` or JMAP's `Email/id`, recorded on the member's binding; a `Full` upgrade links no body from a holder whose binding of the same source states another id, where the agreement on subject, date, sender and size alone linked two different messages sharing a `Message-ID`.
+- **BREAKING**: Added the field `server_object_id` to `PimdirRemoteMeta`, `PimdirPlacement`, `PimdirBinding` and `PimdirHeldObject`; a struct literal of any of them states it (`None` where the source states no id).
 - Added the features `mail`, `contact` and `calendar`, each compiling its domain's extraction alone (and `contact` the card matcher), and `indexer`, the I/O-free index refresh over the three, without `client`.
 - Added `search::mail::PimdirMail`, `PimdirQuery::match_mails` and `PimdirQuery::mail_terms`: a query matched over messages held in memory, read with their bodies or from their header alone, as an index holding them answers, under `mail` without `client`.
 - Added the `mid:` field, matching a message's `Message-ID` whole, with or without its angle brackets (`PimdirQueryPredicate::Mid`, pimdir SEARCH §8 in search-draft-16).

@@ -71,6 +71,7 @@ fn filed(dir: &Path, id: &str) -> i64 {
                 conflict_object: None,
                 base: None,
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

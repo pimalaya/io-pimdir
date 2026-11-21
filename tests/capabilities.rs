@@ -64,6 +64,7 @@ fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
                     )),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();
@@ -259,6 +260,7 @@ fn seeded_event(dir: &Path, source: &str, collection: &str, uid: &str) -> i64 {
                     object: Some(hash),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();
@@ -946,6 +948,7 @@ fn events_only(dir: &Path) -> i64 {
                     object: Some(hash),
                 }),
                 origin: None,
+                server_object_id: None,
             }),
         ])
         .unwrap();

@@ -35,6 +35,7 @@ fn placement(collection: &str, handle: &str, link_id: &str, hash: &str) -> Pimdi
         conflict_object: None,
         base: None,
         origin: None,
+        server_object_id: None,
     }
 }
 

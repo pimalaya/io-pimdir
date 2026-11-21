@@ -36,6 +36,7 @@ fn placement(collection: &str, handle: &str, link_id: &str) -> PimdirPlacement {
         conflict_object: None,
         base: None,
         origin: None,
+        server_object_id: None,
     }
 }
 

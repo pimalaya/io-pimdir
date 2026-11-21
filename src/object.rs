@@ -72,6 +72,9 @@ pub struct PimdirHeldObject {
     pub date: Option<String>,
     /// The `sender` the row's mail summary states.
     pub sender: Option<String>,
+    /// The server object id the asking source's binding of the row states
+    /// (SYNC §4), `None` where that source binds it not or states none.
+    pub server_object_id: Option<String>,
 }
 
 impl PimdirHeldObject {

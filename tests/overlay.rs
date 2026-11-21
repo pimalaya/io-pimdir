@@ -46,6 +46,7 @@ fn placement(collection: &str, handle: &str, link: &str, key: &str) -> PimdirPla
             )),
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 

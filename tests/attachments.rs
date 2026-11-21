@@ -113,6 +113,7 @@ fn placement(collection: &str, handle: &str, link: &str, body: Option<&[u8]>) ->
             object,
         }),
         origin: None,
+        server_object_id: None,
     }
 }
 
