@@ -39,7 +39,6 @@ use io_pimdir::{
         PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey,
         PimdirStatus,
     },
-    property,
     reference::{PimdirEndpoint, PimdirReferenceOrigin, PimdirReferenceRole},
     search::{
         chunk,
@@ -477,74 +476,6 @@ fn apply(spec: &Path, dir: &Path, kinds: &mut BTreeMap<String, String>, write: &
         }
         kind => panic!("no refresh write {kind}"),
     }
-}
-
-/// The store's half of the refresh case "an item keeps local state" while
-/// its queries wait on `label:` and `property:` (tests/pending_vectors.txt):
-/// each `set-property` queued and drained, the feed it leaves, and each
-/// one-term `label:` or `property:` query answered from the store's own
-/// reads as SEARCH §8 states them, `list_property_values` then
-/// `list_value_holders` per spelling a label folds to (STORAGE §4.3, §14.1).
-#[test]
-fn the_local_state_refresh_case_holds_in_the_store() {
-    let spec = spec_dir();
-    let vectors = json(&spec.join("vectors/search/refresh.json"));
-    let case = vectors["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|case| case["label"] == "an item keeps local state")
-        .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    build_store(&spec, dir.path(), &case["store"]);
-    let accounts: BTreeMap<String, String> = case["store"]["collections"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| {
-            let id = c["id"].as_str().unwrap().to_string();
-            (id, c["account"].as_str().unwrap().to_string())
-        })
-        .collect();
-    let mut kinds = BTreeMap::new();
-
-    let mut asked = 0;
-    for step in case["steps"].as_array().unwrap() {
-        let cursor = PimdirReader::open(dir.path())
-            .unwrap()
-            .change_cursor()
-            .unwrap();
-        apply(&spec, dir.path(), &mut kinds, &step["write"]);
-        feed(dir.path(), &cursor, &step["changed"]);
-
-        let reader = PimdirReader::open(dir.path()).unwrap();
-        for query in step["queries"].as_array().unwrap() {
-            let text = query["query"].as_str().unwrap();
-            let holders = if let Some(label) = text.strip_prefix("label:") {
-                let label = label.trim_matches('"');
-                let mut holders = Vec::new();
-                for held in reader.list_property_values(property::LABEL).unwrap() {
-                    if property::fold(&held) == property::fold(label) {
-                        holders.extend(reader.list_value_holders(property::LABEL, &held).unwrap());
-                    }
-                }
-                holders
-            } else if let Some(term) = text.strip_prefix("property:") {
-                let (key, value) = term.split_once('=').unwrap();
-                reader.list_value_holders(key, value).unwrap()
-            } else {
-                continue;
-            };
-            let hits: BTreeSet<(String, i64)> = holders
-                .into_iter()
-                .map(|holder| (accounts[&holder.collection].clone(), holder.seq))
-                .collect();
-            let want: BTreeSet<_> = pairs(&query["hits"]).into_iter().collect();
-            assert_eq!(hits, want, "{text:?}");
-            asked += 1;
-        }
-    }
-    assert_eq!(asked, 10, "every label: and property: query of the case");
 }
 
 /// What the feed lists above `cursor` against what a step states.

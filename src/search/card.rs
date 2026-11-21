@@ -11,7 +11,8 @@
 //! tokens and every other character separating them. Its addresses are
 //! the store's rows of it (STORAGE Annex A.6). A term reading what the
 //! store alone holds, a flag, an account, a collection, a change stamp,
-//! a thread, an item or its references, is answered by no card:
+//! a thread, an item, its references or its local state (`label:`,
+//! `property:`), is answered by no card:
 //! [`PimdirQuery::store_terms`] names them, and a match meeting one is
 //! refused.
 //!
@@ -149,6 +150,8 @@ fn reads_store(predicate: &PimdirQueryPredicate) -> bool {
             | PimdirQueryPredicate::Thread(_)
             | PimdirQueryPredicate::Id(_)
             | PimdirQueryPredicate::Linked { .. }
+            | PimdirQueryPredicate::Label(_)
+            | PimdirQueryPredicate::Property { .. }
     )
 }
 
@@ -228,7 +231,9 @@ impl Matcher<'_> {
             | PimdirQueryPredicate::Changed { .. }
             | PimdirQueryPredicate::Thread(_)
             | PimdirQueryPredicate::Id(_)
-            | PimdirQueryPredicate::Linked { .. } => false,
+            | PimdirQueryPredicate::Linked { .. }
+            | PimdirQueryPredicate::Label(_)
+            | PimdirQueryPredicate::Property { .. } => false,
         }
     }
 }

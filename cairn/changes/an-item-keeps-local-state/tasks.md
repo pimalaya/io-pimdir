@@ -14,4 +14,4 @@ change: an-item-keeps-local-state
 - [x] The `label:` and `property:` vector cases listed in tests/pending_vectors.txt (30 queries, the 7 steps of the refresh case)
 - [x] `pimdir property list|add|remove`, tests/cli_property.rs
 - [x] cairn/spec folded (store.md, cli.md, spec-fidelity.md), the log, CHANGELOG.md
-- [ ] `label:` and `property:` in the query compiler, the pending cases off the list (as-fast-as-notmuch, phase 2)
+- [x] `label:` and `property:` in the query compiler, the pending cases off the list (as-fast-as-notmuch, phase 2)

@@ -71,12 +71,13 @@ use crate::{
         PimdirError, PreparedCached, bind_list, busy_or_sql, modes, prepare_connection,
         reader::{PimdirReader, rolled_temporal},
         rows, schema,
-        search::compile::{Categories, Compiled, Ends, Probe},
+        search::compile::{Categories, Compiled, Ends, Labels, Probe},
     },
     codec,
     coroutine::PimdirCoroutineState,
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
+    property,
     search::{
         coverage::{self, PimdirSearchCoverage, PimdirSearchUnread},
         extract::{self, PimdirChunk, PimdirExtract, PimdirExtractStatus},
@@ -1612,8 +1613,9 @@ impl PimdirIndex {
     }
 
     /// A query planned and compiled, its dates resolved against `now` in
-    /// `zone`, its `linked:` ends and its `category:` values resolved, and
-    /// `temp.term_match` emptied for the matches it reads.
+    /// `zone`, its `linked:` ends, its `category:` values and its `label:`
+    /// spellings resolved, and `temp.term_match` emptied for the matches it
+    /// reads.
     fn compile(
         &self,
         query: &PimdirQuery,
@@ -1622,9 +1624,50 @@ impl PimdirIndex {
     ) -> Result<Compiled, PimdirError> {
         let ends = self.ends(query)?;
         let categories = self.categories(query)?;
+        let labels = self.labels(query)?;
         let plan = PimdirPlan::new(query, now, zone);
         self.conn.execute_cached(search::CLEAR_TERM_MATCH, [])?;
-        Ok(Compiled::new(plan, &ends, &categories))
+        Ok(Compiled::new(plan, &ends, &categories, &labels))
+    }
+
+    /// The labels each `label:` term of a query names (SEARCH §8, STORAGE
+    /// §4.3): every spelling the store holds under
+    /// [`LABEL`](property::LABEL) whose [`fold`](property::fold) is the
+    /// term's, read by `list_property_values`, one seek per spelling the
+    /// key holds, once per query that names a label. Both sides are folded
+    /// here, in Rust, so no SQL function folds the stored side (SEARCH §5).
+    fn labels(&self, query: &PimdirQuery) -> Result<Labels, PimdirError> {
+        let mut labels = Vec::new();
+        let mut held: Option<Vec<(String, String)>> = None;
+        for (term, _) in query.terms() {
+            let PimdirQueryPredicate::Label(label) = &term.predicate else {
+                continue;
+            };
+            let held = match &mut held {
+                Some(held) => held,
+                None => {
+                    let values: Vec<String> = rows(
+                        &self.conn,
+                        sql::LIST_PROPERTY_VALUES,
+                        named_params! { ":key": property::LABEL },
+                        |row| row.get(0),
+                    )?;
+                    let folded = values
+                        .into_iter()
+                        .map(|value| (property::fold(&value), value))
+                        .collect();
+                    held.insert(folded)
+                }
+            };
+            let folded = property::fold(label);
+            let spellings = held
+                .iter()
+                .filter(|(held, _)| *held == folded)
+                .map(|(_, value)| value.clone())
+                .collect();
+            labels.push((folded, spellings));
+        }
+        Ok(labels)
     }
 
     /// The task categories each `category:` term of a query names (SEARCH

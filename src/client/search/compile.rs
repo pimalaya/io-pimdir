@@ -12,6 +12,10 @@
 //! `temp.term_match`, each hit then probed by a seek, or probed against
 //! each candidate placement's body and summary, as the plan says.
 //!
+//! A `label:` or `property:` term reads the store's `item_property`, never
+//! the index: a property is the item's, so it holds for the hit of every
+//! account filing the seq (STORAGE §4.3).
+//!
 //! Every value is bound by name, the n-th `:vn`, so one fragment renders
 //! into any statement; a statement's own values take other names.
 
@@ -28,6 +32,7 @@ use rusqlite::types::Value;
 #[cfg(test)]
 use crate::search::query::PimdirQuery;
 use crate::{
+    property,
     search::{
         fold,
         plan::{
@@ -51,6 +56,11 @@ pub(crate) type Ends = Vec<(PimdirQueryId, Vec<(String, String)>)>;
 /// STORAGE Annex A.2 folds `fn`, and every value a task states that folds
 /// to it, as stated.
 pub(crate) type Categories = Vec<(String, Vec<String>)>;
+
+/// The labels each `label:` term names: its value folded as STORAGE Annex
+/// A.2 folds `fn`, and every spelling the store holds under
+/// [`LABEL`](property::LABEL) that folds to it, as held.
+pub(crate) type Labels = Vec<(String, Vec<String>)>;
 
 /// The media types of the undated kinds, as SQL.
 const UNDATED: &str = "('text/vcard', 'application/octet-stream')";
@@ -110,8 +120,14 @@ pub(crate) struct Probe {
 
 impl Compiled {
     /// Renders a plan, `ends` holding the items each `linked:` term names
-    /// and `categories` the task categories each `category:` term names.
-    pub(crate) fn new(plan: PimdirPlan, ends: &Ends, categories: &Categories) -> Self {
+    /// `categories` the task categories each `category:` term names and
+    /// `labels` the spellings each `label:` term names.
+    pub(crate) fn new(
+        plan: PimdirPlan,
+        ends: &Ends,
+        categories: &Categories,
+        labels: &Labels,
+    ) -> Self {
         let mut compiled = Self {
             access: vec![PimdirPlanAccess::Materialize; plan.leaves.len()],
             values: Vec::new(),
@@ -123,7 +139,7 @@ impl Compiled {
         };
         compiled.scope = compiled.render_scope();
         for at in 0..compiled.plan.leaves.len() {
-            let leaf = compiled.leaf(at, ends, categories);
+            let leaf = compiled.leaf(at, ends, categories, labels);
             compiled.leaves.push(leaf);
         }
         compiled
@@ -508,8 +524,11 @@ impl Compiled {
     /// earliest or the latest instant an RFC 3339 string spells, and it
     /// holds every item of an undated kind a `kind:` term names (SEARCH
     /// §8.1). An `id:` value of digits names the item of that seq and every
-    /// item whose link id it is (SEARCH §8).
-    fn leaf(&mut self, at: usize, ends: &Ends, categories: &Categories) -> Leaf {
+    /// item whose link id it is (SEARCH §8). `label:` and `property:` read
+    /// the store's `item_property` by the hit's seq, whatever its account
+    /// (STORAGE §4.3): `property:` its value byte for byte, `label:` the
+    /// spellings the caller found folding to the term's.
+    fn leaf(&mut self, at: usize, ends: &Ends, categories: &Categories, labels: &Labels) -> Leaf {
         let predicate = self.plan.leaves[at].predicate.clone();
         let negated = self.plan.leaves[at].negated;
         let dates = self.plan.leaves[at].dates;
@@ -739,6 +758,20 @@ impl Compiled {
                      AND k{at}.value = {folded}))"
                 )
             }
+            PimdirQueryPredicate::Label(label) => {
+                let folded = property::fold(label);
+                let spellings = labels
+                    .iter()
+                    .find(|(term, _)| *term == folded)
+                    .map(|(_, held)| held.clone())
+                    .unwrap_or_default();
+                self.property(&mut leaf, at, property::LABEL, spellings);
+                return leaf;
+            }
+            PimdirQueryPredicate::Property { key, value } => {
+                self.property(&mut leaf, at, key, vec![value.clone()]);
+                return leaf;
+            }
             PimdirQueryPredicate::Account(account) => {
                 leaf.hit = format!("({{akey}} = {})", self.bind(account.clone()));
                 return leaf;
@@ -853,6 +886,38 @@ impl Compiled {
             dated(&j, &c),
             occurring(&format!("o{at}")),
         )
+    }
+
+    /// Renders a term holding one of `values` under `key` (STORAGE §4.3):
+    /// its set, the live placements of the items holding one, as
+    /// `list_value_holders` reads each, the values bound as one list; its
+    /// estimate, the items holding one, a seek on `item_property_by_value`
+    /// per value; and its condition over a hit, a seek on the table's key
+    /// by the hit's seq. No value matches nothing.
+    fn property(&mut self, leaf: &mut Leaf, at: usize, key: &str, values: Vec<String>) {
+        if values.is_empty() {
+            leaf.hit = String::from("0");
+            leaf.estimate = Some(String::from("SELECT 0"));
+            leaf.set = Some(String::from("SELECT '' AS akey, 0 AS seq WHERE 0"));
+            return;
+        }
+        let key = self.bind(key.to_string());
+        let values: Vec<String> = values.into_iter().map(|value| self.bind(value)).collect();
+        let values = values.join(", ");
+        leaf.set = Some(format!(
+            "SELECT ifnull(c.account, '') AS akey, i.seq AS seq FROM store.item_property p \
+             JOIN store.items i ON i.seq = p.seq AND i.deleted = 0 \
+             JOIN store.collections c ON c.id = i.collection \
+             WHERE p.key = {key} AND p.value IN ({values})"
+        ));
+        leaf.estimate = Some(format!(
+            "SELECT count(*) FROM (SELECT 1 FROM store.item_property \
+             WHERE key = {key} AND value IN ({values}) LIMIT {CAP})"
+        ));
+        leaf.hit = format!(
+            "EXISTS (SELECT 1 FROM store.item_property p{at} WHERE p{at}.seq = {{seq}} \
+             AND p{at}.key = {key} AND p{at}.value IN ({values}))"
+        );
     }
 
     /// Gives a leaf the estimate of its set, counted up to [`CAP`], when

@@ -383,6 +383,10 @@ pub enum PimdirPlanEstimate {
     /// A set a few seeks read: `id:`, `thread:`, `linked:`,
     /// `is:encrypted`.
     Seek,
+    /// The items holding one value under a key, or one of the spellings
+    /// a label folds to: `label:`, `property:`, a seek on
+    /// `item_property_by_value` per value.
+    Property,
     /// None: the term is probed per hit, never read whole.
     None,
 }
@@ -1119,6 +1123,9 @@ fn estimate(predicate: &PimdirQueryPredicate, undated: &[&str]) -> PimdirPlanEst
         | PimdirQueryPredicate::Thread(_)
         | PimdirQueryPredicate::Id(_)
         | PimdirQueryPredicate::Linked { .. } => PimdirPlanEstimate::Seek,
+        PimdirQueryPredicate::Label(_) | PimdirQueryPredicate::Property { .. } => {
+            PimdirPlanEstimate::Property
+        }
         _ => PimdirPlanEstimate::None,
     }
 }
@@ -1198,6 +1205,11 @@ mod tests {
         );
         assert_eq!(plan("date:2026 kind:mail").sets, vec![vec![0]]);
         assert_eq!(plan("folder:a").sets, vec![vec![0]]);
+        assert_eq!(
+            plan("kind:contact label:x -property:a/b=c").sets,
+            vec![vec![1]],
+            "a label or a property is a set, read by seek"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ use core::fmt;
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 
 use crate::{
+    property,
     reference::PimdirReferenceRole,
     search::coverage::PimdirSearchReads,
     summary::{PimdirAddressRole, time},
@@ -86,6 +87,8 @@ pub const FIELDS: &[&str] = &[
     "status",
     "priority",
     "category",
+    "label",
+    "property",
     "account",
     "collection",
     "folder",
@@ -329,7 +332,8 @@ impl PimdirQuery {
     /// ([`mark`](PimdirSearchReads::mark)); `thread:` a message's, whose
     /// `References` name its thread where its summary names a parent
     /// alone; `has:phone`, `has:address`, `has:birthday`, `has:photo` and
-    /// `category:` a card's; `is:encrypted` a message's. Free text,
+    /// `category:` a card's; `is:encrypted` a message's; `label:` and
+    /// `property:` none, the store answering them whole. Free text,
     /// `body:`, `attachment:` and `mimetype:` are matched in the fields
     /// an encrypted body gives none of.
     pub fn reads(&self) -> PimdirSearchReads {
@@ -353,6 +357,7 @@ impl PimdirQuery {
                 PimdirQueryPredicate::Date(_) | PimdirQueryPredicate::HasAttachment => &[CALENDAR],
                 PimdirQueryPredicate::HasProperty(_) | PimdirQueryPredicate::Category(_) => &[CARD],
                 PimdirQueryPredicate::Encrypted | PimdirQueryPredicate::Thread(_) => &[MAIL],
+                PimdirQueryPredicate::Label(_) | PimdirQueryPredicate::Property { .. } => &[],
                 _ => &[],
             };
             reads
@@ -426,6 +431,18 @@ pub enum PimdirQueryPredicate {
     /// One of a task's or a card's `CATEGORIES`, whole, as written
     /// (`category:`).
     Category(String),
+    /// An item's label (`label:`, STORAGE §4.3), as written: a value held
+    /// under [`LABEL`](property::LABEL) whose [`fold`](property::fold) is
+    /// this one's, read from the store.
+    Label(String),
+    /// An item's property (`property:`, STORAGE §4.3): `value` held under
+    /// `key`, compared byte for byte, read from the store.
+    Property {
+        /// The key, `<namespace>/<name>`.
+        key: String,
+        /// The value, whole.
+        value: String,
+    },
     /// One account (`account:`).
     Account(String),
     /// One collection, by id or by name (`collection:`, `folder:`).
@@ -495,6 +512,8 @@ impl PimdirQueryPredicate {
             Self::Status(_) => "status",
             Self::Priority(_) => "priority",
             Self::Category(_) => "category",
+            Self::Label(_) => "label",
+            Self::Property { .. } => "property",
             Self::Account(_) => "account",
             Self::Collection(_) => "collection",
             Self::Date(range) => {
@@ -1545,6 +1564,35 @@ fn field(
             None => return Err(invalid(PimdirQueryErrorCode::InvalidValue, PRIORITY_VALUES)),
         },
         "category" => PimdirQueryPredicate::Category(value),
+        "label" => match property::is_value(&value) {
+            true => PimdirQueryPredicate::Label(value),
+            false => {
+                return Err(PimdirQueryError::new(
+                    PimdirQueryErrorCode::InvalidValue,
+                    "label: takes a value of 1 to 1024 bytes of UTF-8 holding no NUL",
+                    value_start,
+                    token.end,
+                    &["value"],
+                ));
+            }
+        },
+        "property" => match value.split_once('=') {
+            Some((key, held)) if property::is_key(key) && property::is_value(held) => {
+                PimdirQueryPredicate::Property {
+                    key: key.into(),
+                    value: held.into(),
+                }
+            }
+            _ => {
+                return Err(PimdirQueryError::new(
+                    PimdirQueryErrorCode::InvalidValue,
+                    "property: takes <key>=<value>, a key <namespace>/<name> of a to z, 0 to 9, '.', '_' and '-' of at most 64 bytes, a value of 1 to 1024 bytes of UTF-8 holding no NUL",
+                    value_start,
+                    token.end,
+                    &["<namespace>/<name>=<value>"],
+                ));
+            }
+        },
         "account" => PimdirQueryPredicate::Account(value),
         "collection" | "folder" => PimdirQueryPredicate::Collection(value),
         "date" | "when" => match date_range(&value) {
@@ -2118,6 +2166,8 @@ mod tests {
             ("tag:work", "tag"),
             ("has:attachment", "has.attachment"),
             ("mid:<a@b>", "mid"),
+            ("label:x", "label"),
+            ("property:a/b=c", "property"),
             ("date:2026-08", "date"),
             ("date:3d", "date"),
             ("date:5h", "date.instant"),

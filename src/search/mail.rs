@@ -10,9 +10,10 @@
 //! them, its summary and address rows as the store derives them (STORAGE
 //! Annex A.1, A.6), and the flags its placement carries. A term reading
 //! what neither a message nor its flags hold, an account, a collection, a
-//! change stamp, a thread, an item, its references or a person's cards, is
-//! answered by no message: [`PimdirQuery::mail_terms`] names them, and a
-//! match meeting one is refused.
+//! change stamp, a thread, an item, its references, its local state
+//! (`label:`, `property:`) or a person's cards, is answered by no
+//! message: [`PimdirQuery::mail_terms`] names them, and a match meeting
+//! one is refused.
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
@@ -127,7 +128,8 @@ impl PimdirMail {
 }
 
 /// A term no message answers alone (`account:`, `collection:`,
-/// `folder:`, `changed:`, `thread:`, `id:`, `linked:`, `person:`).
+/// `folder:`, `changed:`, `thread:`, `id:`, `linked:`, `person:`,
+/// `label:`, `property:`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirMailMatchError {
     /// The term's first offset, in Unicode scalar values.
@@ -165,6 +167,8 @@ impl PimdirQuery {
                         | PimdirQueryPredicate::Id(_)
                         | PimdirQueryPredicate::Linked { .. }
                         | PimdirQueryPredicate::Person(_)
+                        | PimdirQueryPredicate::Label(_)
+                        | PimdirQueryPredicate::Property { .. }
                 )
             })
             .collect()
@@ -243,7 +247,9 @@ fn term(predicate: &PimdirQueryPredicate, mail: &PimdirMail, now: i64, zone: &Ti
         | PimdirQueryPredicate::Changed { .. }
         | PimdirQueryPredicate::Thread(_)
         | PimdirQueryPredicate::Id(_)
-        | PimdirQueryPredicate::Linked { .. } => false,
+        | PimdirQueryPredicate::Linked { .. }
+        | PimdirQueryPredicate::Label(_)
+        | PimdirQueryPredicate::Property { .. } => false,
     }
 }
 
