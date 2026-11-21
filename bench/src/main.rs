@@ -353,10 +353,56 @@ fn cmd_sync(args: &[String]) {
 fn cmd_index(args: &[String]) {
     let store_dir = PathBuf::from(&args[0]);
     let phase = Phase::start();
-    let report = PimdirIndex::open(&store_dir)
-        .unwrap()
-        .refresh(&PimdirIndexRefreshOptions::default())
-        .unwrap();
+    let mut index = PimdirIndex::open(&store_dir).unwrap();
+    if let Ok(fts) = env::var("PIMBENCH_FTS") {
+        let conn = rusqlite::Connection::open(store_dir.join("index.db")).unwrap();
+        for setting in fts.split(',').filter(|s| !s.is_empty()) {
+            let (key, value) = setting.split_once('=').unwrap();
+            for table in ["object_text", "summary_text"] {
+                conn.execute(
+                    &format!("INSERT INTO {table}({table}, rank) VALUES (?1, ?2)"),
+                    rusqlite::params![key, value.parse::<i64>().unwrap()],
+                )
+                .unwrap();
+            }
+        }
+    }
+    let mut options = PimdirIndexRefreshOptions::default();
+    if let Some(batch) = env::var("PIMBENCH_BATCH").ok().and_then(|b| b.parse().ok()) {
+        options.batch = batch;
+    }
+    let report = index.refresh(&options).unwrap();
+    if let Ok(end) = env::var("PIMBENCH_END") {
+        let conn = rusqlite::Connection::open(store_dir.join("index.db")).unwrap();
+        for table in ["object_text", "summary_text"] {
+            match end.as_str() {
+                "optimize" => conn
+                    .execute(
+                        &format!("INSERT INTO {table}({table}) VALUES ('optimize')"),
+                        [],
+                    )
+                    .map(|_| ())
+                    .unwrap(),
+                "checkpoint" => (),
+                _ => {
+                    let pages: i64 = end.parse().unwrap();
+                    loop {
+                        let before = conn.total_changes();
+                        conn.execute(
+                            &format!("INSERT INTO {table}({table}, rank) VALUES ('merge', ?1)"),
+                            [pages],
+                        )
+                        .unwrap();
+                        if conn.total_changes() - before <= 1 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
     println!(
         "index folded={} indexed={} secs={:.2} peak_rss_mib={:.0}",
         report.folded,

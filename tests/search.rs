@@ -1254,6 +1254,36 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
     assert_eq!(hits(&index, "beta"), Vec::<i64>::new());
 }
 
+/// A batch writes the text of its bodies as one full-text segment: FTS5
+/// flushes its pending terms at every statement savepoint, which the
+/// placement, flag and thread writes between two bodies each open, so
+/// interleaved they would write a segment per body and merge them again.
+#[test]
+fn a_batch_writes_its_text_as_one_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..32 {
+        let body = message(&format!("{n}@x"), "Alpha", &format!("body {n}"));
+        file_message(dir.path(), "INBOX", body, &["\\Seen"]);
+    }
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let report = index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(report.indexed, 32);
+    assert_eq!(hits(&index, "body").len(), 32);
+
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    let segments: i64 = conn
+        .query_row(
+            "SELECT count(DISTINCT segid) FROM object_text_idx",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(segments, 1);
+}
+
 #[test]
 fn a_hit_whose_body_cannot_be_read_lists_without_a_snippet() {
     use std::os::unix::fs::PermissionsExt;

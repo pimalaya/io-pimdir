@@ -107,6 +107,9 @@ pub struct PimdirIndexRefresh {
     /// The bodies a placement of the page left or moved off, dropped once
     /// the page placed what it holds if none names them (SEARCH §4).
     unplaced: BTreeSet<PimdirHash>,
+    /// The parents the messages extracted this run name, by body, so the
+    /// relink reads none of them again (SEARCH §9).
+    heads: Heads,
 }
 
 impl PimdirIndexRefresh {
@@ -128,6 +131,7 @@ impl PimdirIndexRefresh {
             put: BTreeSet::new(),
             touched: BTreeSet::new(),
             unplaced: BTreeSet::new(),
+            heads: Heads::new(),
         }
     }
 
@@ -225,7 +229,7 @@ impl PimdirIndexRefresh {
                 self.bodies(fold)
             }
             (State::ReadingBodies(mut fold), Some(PimdirIndexRefreshArg::Bodies(bodies))) => {
-                fold.read(&bodies, &self.horizon, &self.floating_zone);
+                fold.read(&bodies, &self.horizon, &self.floating_zone, &mut self.heads);
                 self.bodies(fold)
             }
             (State::ReadingSummaries(mut fold), Some(PimdirIndexRefreshArg::Summaries(found))) => {
@@ -524,6 +528,10 @@ impl PimdirIndexRefresh {
     /// and its flags replaced. A message placed, rebodied, rekeyed or
     /// dropped is touched, to be rethreaded before the run completes.
     ///
+    /// Summary text is held exactly while a placement names no body, so
+    /// only a placement held bodiless has any to drop: a new one, or one
+    /// whose body the index held already, drops none.
+    ///
     /// A calendar row recorded missing is expanded whatever the index
     /// holds of it, and one whose expansion could not read its body stays
     /// recorded, keeping the occurrences of that same body.
@@ -627,10 +635,13 @@ impl PimdirIndexRefresh {
                         text: PimdirIndexText::summary(&extract),
                     });
                 }
-                Some(_) => self.ops.push(PimdirIndexOp::DropSummaryText {
-                    collection: row.collection.clone(),
-                    seq: row.seq,
-                }),
+                Some(_) if matches!(held_hash, Some(None)) => {
+                    self.ops.push(PimdirIndexOp::DropSummaryText {
+                        collection: row.collection.clone(),
+                        seq: row.seq,
+                    })
+                }
+                Some(_) => (),
             }
 
             if row.kind == CALENDAR {
@@ -697,7 +708,7 @@ impl PimdirIndexRefresh {
         debug!("relink {} message(s)", self.touched.len());
         let relink = Relink {
             nodes: BTreeMap::new(),
-            heads: BTreeMap::new(),
+            heads: mem::take(&mut self.heads),
             messages: self.touched.iter().cloned().collect(),
             bodies: Vec::new(),
             pruned: false,
@@ -1523,13 +1534,22 @@ impl Fold {
     }
 
     /// Extracts and expands the bodies asked, a missing one recorded as
-    /// such.
-    fn read(&mut self, bodies: &BTreeMap<PimdirHash, Vec<u8>>, horizon: &Horizon, zone: &str) {
+    /// such, the parent each message names kept in `heads`.
+    fn read(
+        &mut self,
+        bodies: &BTreeMap<PimdirHash, Vec<u8>>,
+        horizon: &Horizon,
+        zone: &str,
+        heads: &mut Heads,
+    ) {
         for hash in mem::take(&mut self.asked) {
             let body = bodies.get(&hash);
             if let Some((kind, key)) = self.extract.get(&hash) {
                 match body {
                     Some(body) => {
+                        if kind == MAIL {
+                            heads.insert(hash.clone(), thread::parent(body));
+                        }
                         let parsed = PimdirExtract::body(kind, body);
                         let extracted = match parsed {
                             Some(extract) if extract.status != PimdirExtractStatus::Unparseable => {

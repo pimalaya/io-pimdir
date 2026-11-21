@@ -25,8 +25,12 @@ use crate::search::query::PimdirQueryText;
 
 /// A text folded under SEARCH §5: `Réunion`, `REUNION` and `réunion` fold
 /// alike, and a mark outside U+0300 to U+036F (a Devanagari vowel sign, a
-/// Hebrew point) is kept.
+/// Hebrew point) is kept. ASCII text, which no normalisation moves, is
+/// only lowercased.
 pub fn text(value: &str) -> String {
+    if value.is_ascii() {
+        return value.to_ascii_lowercase();
+    }
     value
         .to_lowercase()
         .nfd()

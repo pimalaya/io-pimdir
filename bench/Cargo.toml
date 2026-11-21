@@ -20,3 +20,4 @@ debug = false
 [dependencies]
 io-pimdir = { path = "..", default-features = false, features = ["client", "search", "indexer", "vendored"] }
 libc = { version = "0.2", default-features = false }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }

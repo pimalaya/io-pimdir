@@ -71,6 +71,8 @@ pimbench index STORE
 pimbench query STORE REPEATS QUERY...
 ```
 
+`pimbench index` reads three knobs from the environment, so a refresh setting is measured before it is changed in the crate: `PIMBENCH_BATCH` the rows per transaction (`PimdirIndexRefreshOptions::batch`), `PIMBENCH_FTS` FTS5 settings written into both full-text tables once index.db is built (`automerge=8,crisismerge=64`, `pgsz=8000`), and `PIMBENCH_END` what follows the refresh inside the phase: `optimize`, a `merge` of that many pages repeated until done, or `checkpoint`, each ending with a `TRUNCATE` checkpoint.
+
 ## What a phase prints
 
 Each phase ends with one line of `key=value` pairs, here from a 14-message smoke Maildir:

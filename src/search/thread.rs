@@ -249,22 +249,25 @@ impl<'a> Graph<'a> {
     }
 
     /// The ids naming a read one as their parent, as changed so far.
-    fn children(&self, link_id: &str) -> Vec<String> {
+    ///
+    /// `named` maps each parent to the ids whose changed row named it
+    /// when the rethread began: a row the rethread changes keeps its
+    /// parent or loses its row, so the rows changed since add no parent
+    /// the read ones do not name already.
+    fn children(&self, link_id: &str, named: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+        let changed = |child: &str| match self.current.get(child) {
+            Some(Some(row)) => Some(row.parent.as_deref() == Some(link_id)),
+            Some(None) => Some(false),
+            None => None,
+        };
         let mut children: Vec<String> = self.nodes[link_id]
             .children
             .iter()
-            .filter(|child| match self.current.get(*child) {
-                Some(Some(row)) => row.parent.as_deref() == Some(link_id),
-                Some(None) => false,
-                None => true,
-            })
+            .filter(|child| changed(child).unwrap_or(true))
             .cloned()
             .collect();
-        for (child, row) in &self.current {
-            if let Some(row) = row
-                && row.parent.as_deref() == Some(link_id)
-                && !children.contains(child)
-            {
+        for child in named.get(link_id).into_iter().flatten() {
+            if changed(child) == Some(true) && !children.contains(child) {
                 children.push(child.clone());
             }
         }
@@ -282,6 +285,12 @@ impl<'a> Graph<'a> {
         let mut stale = BTreeSet::new();
         let mut pruned = BTreeSet::new();
         let mut ops = Vec::new();
+        let mut named: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (child, row) in &self.current {
+            if let Some(parent) = row.as_ref().and_then(|row| row.parent.clone()) {
+                named.entry(parent).or_default().push(child.clone());
+            }
+        }
 
         for seed in seeds {
             if done.contains(seed) {
@@ -303,7 +312,7 @@ impl<'a> Graph<'a> {
                     continue;
                 };
                 queue.extend(row.parent.clone());
-                queue.extend(self.children(&link_id));
+                queue.extend(self.children(&link_id, &named));
                 members.insert(link_id, row);
             }
             if !whole {

@@ -38,8 +38,9 @@ pub(crate) struct Statements<'a> {
 }
 
 impl Statements<'_> {
-    /// Answers one yield, writing a [`Writes`] yield's ops in order. A body
-    /// that cannot be read is answered as a gone one (SEARCH §4).
+    /// Answers one yield, writing a [`Writes`] yield's ops in order, their
+    /// full-text rows last ([`TextWrite`]). A body that cannot be read is
+    /// answered as a gone one (SEARCH §4).
     ///
     /// [`Writes`]: PimdirIndexRefreshYield::Writes
     pub(crate) fn answer(
@@ -179,9 +180,11 @@ impl Statements<'_> {
                 })
             }
             PimdirIndexRefreshYield::Writes(ops) => {
+                let mut texts = Vec::new();
                 for op in ops {
-                    self.write(op)?;
+                    self.write(op, &mut texts)?;
                 }
+                self.write_texts(texts)?;
                 PimdirIndexRefreshArg::Written
             }
         };
@@ -327,14 +330,15 @@ impl Statements<'_> {
         })
     }
 
-    /// Writes one op through its statements.
-    fn write(&self, op: PimdirIndexOp) -> Result<(), PimdirError> {
+    /// Writes one op through its statements, its full-text writes held
+    /// back in `texts`, in order, for [`write_texts`](Self::write_texts).
+    fn write(&self, op: PimdirIndexOp, texts: &mut Vec<TextWrite>) -> Result<(), PimdirError> {
         let tx = self.tx;
         match op {
-            PimdirIndexOp::PutObject(object) => self.put_object(object)?,
+            PimdirIndexOp::PutObject(object) => self.put_object(object, texts)?,
             PimdirIndexOp::DropObject(hash) => {
                 if let Some(id) = self.object(&hash)? {
-                    tx.execute_cached(search::DELETE_OBJECT, named_params! { ":rowid": id })?;
+                    texts.push(TextWrite::DropObject(id));
                 }
                 tx.execute_cached(search::DELETE_OBJECT_ROW, named_params! { ":hash": hash.0 })?;
             }
@@ -345,7 +349,7 @@ impl Statements<'_> {
                     |r| r.get(0),
                 )?;
                 if !placed {
-                    return self.write(PimdirIndexOp::DropObject(hash));
+                    return self.write(PimdirIndexOp::DropObject(hash), texts);
                 }
             }
             PimdirIndexOp::PutPlacement(placement) => {
@@ -368,9 +372,7 @@ impl Statements<'_> {
                         |r| r.get(0),
                     )
                     .optional()?;
-                if let Some(id) = id {
-                    tx.execute_cached(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
-                }
+                texts.extend(id.map(TextWrite::DropSummary));
             }
             PimdirIndexOp::PutSummaryText {
                 collection,
@@ -378,13 +380,13 @@ impl Statements<'_> {
                 text,
             } => {
                 if let Some(id) = self.placement_id(&collection, seq)? {
-                    tx.execute_cached(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
-                    self.put_summary_text(id, &text)?;
+                    texts.push(TextWrite::DropSummary(id));
+                    texts.push(TextWrite::PutSummary(id, text));
                 }
             }
             PimdirIndexOp::DropSummaryText { collection, seq } => {
                 if let Some(id) = self.placement_id(&collection, seq)? {
-                    tx.execute_cached(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
+                    texts.push(TextWrite::DropSummary(id));
                 }
             }
             PimdirIndexOp::ReplaceFlags {
@@ -510,8 +512,13 @@ impl Statements<'_> {
     }
 
     /// Writes a body indexed for the first time: its `object` row, its
-    /// categories, its text keyed on the row's id, and its chunks.
-    fn put_object(&self, object: PimdirIndexObject) -> Result<(), PimdirError> {
+    /// categories and its chunks, its text keyed on the row's id held back
+    /// in `texts`.
+    fn put_object(
+        &self,
+        object: PimdirIndexObject,
+        texts: &mut Vec<TextWrite>,
+    ) -> Result<(), PimdirError> {
         let tx = self.tx;
         let id: i64 = tx.query_row_cached(
             search::INSERT_OBJECT,
@@ -532,28 +539,6 @@ impl Statements<'_> {
                 named_params! { ":object": id, ":value": value },
             )?;
         }
-
-        let text = &object.text;
-        tx.execute_cached(
-            search::INSERT_OBJECT_TEXT,
-            named_params! {
-                ":rowid": id,
-                ":title": text.title,
-                ":people": text.people,
-                ":body": text.body,
-                ":attachment": text.attachment,
-                ":place": text.place,
-                ":org": text.org,
-                ":note": text.note,
-                ":from": text.from,
-                ":to": text.to,
-                ":cc": text.cc,
-                ":bcc": text.bcc,
-                ":email": text.email,
-                ":organizer": text.organizer,
-                ":attendee": text.attendee,
-            },
-        )?;
         for (ord, chunk) in object.chunks.iter().enumerate() {
             tx.execute_cached(
                 search::INSERT_CHUNK,
@@ -566,26 +551,82 @@ impl Statements<'_> {
                 },
             )?;
         }
+        texts.push(TextWrite::PutObject(id, object.text));
         Ok(())
     }
 
-    /// Writes a placement's summary text keyed on its row's id.
-    fn put_summary_text(&self, id: i64, text: &PimdirIndexText) -> Result<(), PimdirError> {
-        self.tx.execute_cached(
-            search::INSERT_SUMMARY_TEXT,
-            named_params! {
-                ":rowid": id,
-                ":title": text.title,
-                ":people": text.people,
-                ":from": text.from,
-                ":to": text.to,
-                ":cc": text.cc,
-                ":bcc": text.bcc,
-                ":email": text.email,
-                ":organizer": text.organizer,
-                ":attendee": text.attendee,
-            },
-        )?;
+    /// Writes the full-text rows a yield's ops held back, in their order.
+    fn write_texts(&self, texts: Vec<TextWrite>) -> Result<(), PimdirError> {
+        let tx = self.tx;
+        for write in texts {
+            match write {
+                TextWrite::PutObject(id, text) => {
+                    tx.execute_cached(
+                        search::INSERT_OBJECT_TEXT,
+                        named_params! {
+                            ":rowid": id,
+                            ":title": text.title,
+                            ":people": text.people,
+                            ":body": text.body,
+                            ":attachment": text.attachment,
+                            ":place": text.place,
+                            ":org": text.org,
+                            ":note": text.note,
+                            ":from": text.from,
+                            ":to": text.to,
+                            ":cc": text.cc,
+                            ":bcc": text.bcc,
+                            ":email": text.email,
+                            ":organizer": text.organizer,
+                            ":attendee": text.attendee,
+                        },
+                    )?;
+                }
+                TextWrite::DropObject(id) => {
+                    tx.execute_cached(search::DELETE_OBJECT, named_params! { ":rowid": id })?;
+                }
+                TextWrite::PutSummary(id, text) => {
+                    tx.execute_cached(
+                        search::INSERT_SUMMARY_TEXT,
+                        named_params! {
+                            ":rowid": id,
+                            ":title": text.title,
+                            ":people": text.people,
+                            ":from": text.from,
+                            ":to": text.to,
+                            ":cc": text.cc,
+                            ":bcc": text.bcc,
+                            ":email": text.email,
+                            ":organizer": text.organizer,
+                            ":attendee": text.attendee,
+                        },
+                    )?;
+                }
+                TextWrite::DropSummary(id) => {
+                    tx.execute_cached(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// One write to a full-text table, held back until the other ops of its
+/// yield are written.
+///
+/// A statement that may abort after changing a row, which the foreign
+/// keys make of most writes here, opens a statement savepoint, and FTS5
+/// flushes its pending terms to a new segment at each one: interleaved,
+/// every body indexed would be a segment of its own, merged again and
+/// again. No other op reads the full-text tables, so writing them last,
+/// in their order, ends at the same rows.
+enum TextWrite {
+    /// A body's text, keyed on its `object` row (`insert_object_text`).
+    PutObject(i64, PimdirIndexText),
+    /// A body's text dropped (`delete_object`).
+    DropObject(i64),
+    /// A placement's summary text, keyed on its row (`insert_summary_text`).
+    PutSummary(i64, PimdirIndexText),
+    /// A placement's summary text dropped (`delete_summary_text`).
+    DropSummary(i64),
 }
