@@ -18,7 +18,7 @@
 //! query's collections, in both dated orders, so a walk over those
 //! collections places it where a set read whole does.
 
-use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeSet, format, string::String, vec, vec::Vec};
 use core::cmp::Ordering;
 
 use jiff::tz::TimeZone;
@@ -37,12 +37,17 @@ pub const CAP: u64 = 100_001;
 /// rather than walked.
 const SET_PAGES: u64 = 20;
 
-/// How many rows a walk is expected to examine per hit of its page, what
-/// a probed text term is weighed against.
-const WALK_ROWS: u64 = 20;
+/// How many times the rows a page's hits stand apart in the walk's order
+/// a walk is expected to examine, its hits clustering rather than spread
+/// evenly.
+const WALK_SPREAD: u64 = 4;
 
 /// The most rows one walk step examines.
 const STEP_MAX: usize = 4_096;
+
+/// The most rows the first step of a collection examines, each later one
+/// asking for twice its last.
+const STEP_FIRST: usize = 8;
 
 /// The order of a hit list (SEARCH §8.2).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -401,17 +406,25 @@ pub struct PimdirPlanBound {
 }
 
 /// What one row costs each way, in nanoseconds: what weighs a set read
-/// whole against a walk, and a text term read into a set against probed.
-/// The defaults are FTS5's on SQLite 3.51; an FTS4 shape states its own
-/// text probe (86 µs).
+/// whole against a walk, and a text term read into a set, read as its
+/// sources or probed. The defaults were measured on FTS5 under SQLite
+/// 3.51 on a store of 517k messages (io-pimdir as-fast-as-notmuch); an
+/// FTS4 shape states its own text probe (86 µs).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PimdirPlanCosts {
     /// A hit of a set read whole, joined to the store and sorted.
     pub set_row: u64,
-    /// A full-text match read into a set.
+    /// A full-text match read into a set of hits: its body's placements
+    /// joined by hash.
     pub match_row: u64,
-    /// A full-text expression probed against one placement.
+    /// A full-text match read as a source, a body or summary id off the
+    /// doclist.
+    pub source_row: u64,
+    /// A full-text expression probed against one hit's placements.
     pub text_probe: u64,
+    /// A hit probed against a term's sources: its placements' bodies
+    /// sought by hash.
+    pub source_probe: u64,
     /// An index seek: a structured term probed, a placement compared.
     pub seek: u64,
     /// The head of one collection a walk reads before it starts.
@@ -421,13 +434,25 @@ pub struct PimdirPlanCosts {
 impl Default for PimdirPlanCosts {
     fn default() -> Self {
         Self {
-            set_row: 1_000,
-            match_row: 150,
-            text_probe: 6_000,
-            seek: 1_000,
+            set_row: 1_300,
+            match_row: 2_500,
+            source_row: 150,
+            text_probe: 40_000,
+            source_probe: 4_000,
+            seek: 1_500,
             head: 1_000,
         }
     }
+}
+
+/// How large a page's scope is, what a walk is weighed by.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirPlanExtent {
+    /// The collections a walk reads the head of.
+    pub collections: u64,
+    /// About how many rows the scope holds: the store's highest public id
+    /// will do.
+    pub items: u64,
 }
 
 /// How the hits of a count or a page are found.
@@ -455,6 +480,10 @@ pub enum PimdirPlanDriver {
 pub enum PimdirPlanAccess {
     /// Its matches read once into a set, each hit probed by a seek.
     Materialize,
+    /// The bodies and summaries it matches read once by id off the
+    /// full-text index, each candidate's placements probed against them
+    /// by seeks.
+    Sources,
     /// Its expression probed against each candidate's placements.
     Probe,
 }
@@ -473,8 +502,8 @@ pub enum PimdirPlanForce {
     /// text term read into a set.
     Scope,
     /// A walk of the smallest set's page that gives up after its first
-    /// step and reads the set, every text term probed until then; the
-    /// smallest set for a count.
+    /// step and reads the set, every other text term read as its sources;
+    /// the smallest set for a count.
     Fallback,
 }
 
@@ -623,14 +652,14 @@ impl PimdirPlan {
     }
 
     /// The driver of a page of `limit` hits in `sort` over a scope of
-    /// `collections` collections: in a dated order, the smallest set when
-    /// it holds few pages or costs less than a walk, else a walk falling
-    /// back to it; in another, the smallest set or the scope, read whole.
+    /// `extent`: in a dated order, the smallest set when it holds few
+    /// pages or costs less than a walk, else a walk falling back to it; in
+    /// another, the smallest set or the scope, read whole.
     pub fn page(
         &self,
         sort: PimdirSearchSort,
         limit: usize,
-        collections: u64,
+        extent: PimdirPlanExtent,
         bounds: &[Option<PimdirPlanBound>],
         costs: &PimdirPlanCosts,
         force: Option<PimdirPlanForce>,
@@ -656,6 +685,7 @@ impl PimdirPlan {
         }
 
         let page = (limit as u64).saturating_add(1);
+        let rows = self.walked(page, extent.items, bounds);
         let walk = PimdirPlanDriver::Walk {
             budget: None,
             fallback: None,
@@ -672,29 +702,74 @@ impl PimdirPlan {
                     budget: None,
                     fallback: Some(set.clone()),
                 };
-                let access = self.access(&walking, bounds, costs, None, Some(page));
-                let row = self.probe_row(&access, costs);
-                let rows = match self.is_scoped() {
-                    true => page,
-                    false => page.saturating_mul(WALK_ROWS),
-                };
-                let walked = collections
+                let access = self.access(&walking, bounds, costs, None, Some(rows));
+                let row = self.probe_row(&access, costs, &[]);
+                let started = extent
+                    .collections
                     .saturating_mul(costs.head)
-                    .saturating_add(rows.saturating_mul(row));
-                let read = bound.rows.saturating_mul(costs.set_row);
+                    .saturating_add(self.reading(&access, bounds, costs));
+                let walked = started.saturating_add(rows.saturating_mul(row));
+                let setting = PimdirPlanDriver::Set(set.clone());
+                let access = self.access(&setting, bounds, costs, None, None);
+                let read = self.reading(&access, bounds, costs).saturating_add(
+                    bound.rows.saturating_mul(
+                        costs
+                            .set_row
+                            .saturating_add(self.probe_row(&access, costs, &set))
+                            .saturating_sub(costs.seek),
+                    ),
+                );
                 match !bound.capped
                     && (bound.rows <= page.saturating_mul(SET_PAGES) || read <= walked)
                 {
-                    true => PimdirPlanDriver::Set(set),
+                    true => setting,
                     false => PimdirPlanDriver::Walk {
-                        budget: Some((read / row.max(1)).max(page)),
+                        budget: Some((read.saturating_sub(started) / row.max(1)).max(page)),
                         fallback: Some(set),
                     },
                 }
             }
         };
-        let access = self.access(&driver, bounds, costs, force, Some(page));
+        let access = self.access(&driver, bounds, costs, force, Some(rows));
         PimdirPlanChoice { driver, access }
+    }
+
+    /// How many rows a walk is expected to examine for a page of `page`
+    /// hits over a scope of `items` rows: one per hit when every term is
+    /// one the scope implies, else as many as the positive sets' measured
+    /// shares of the scope leave a hit apart, their terms taken as
+    /// independent, times [`WALK_SPREAD`] since hits cluster, and the
+    /// whole scope behind a date term, whose hits gather at one span of
+    /// the walk's order wherever it starts.
+    fn walked(&self, page: u64, items: u64, bounds: &[Option<PimdirPlanBound>]) -> u64 {
+        if self.is_scoped() {
+            return page;
+        }
+        let items = items.max(1);
+        let mut rows = u128::from(page.saturating_mul(WALK_SPREAD));
+        for set in &self.sets {
+            if set
+                .iter()
+                .any(|at| matches!(self.leaves[*at].predicate, PimdirQueryPredicate::Date(_)))
+            {
+                return items;
+            }
+            if set.iter().all(|at| self.scoped.contains(at)) {
+                continue;
+            }
+            let Some(bound) = Self::bound(set, bounds) else {
+                continue;
+            };
+            let share = match bound.capped {
+                true => CAP,
+                false => bound.rows,
+            };
+            rows = rows.saturating_mul(u128::from(items)) / u128::from(share.clamp(1, items));
+            if rows >= u128::from(items) {
+                return items;
+            }
+        }
+        u64::try_from(rows).unwrap_or(items).min(items)
     }
 
     /// The smallest set by its bound, a set not measured never chosen.
@@ -709,21 +784,21 @@ impl PimdirPlan {
     }
 
     /// How each leaf's text is tested under `driver`: a leaf of the
-    /// driving set read into one, another read into one when reading its
-    /// matches costs less than probing the candidates (a set's bound, a
-    /// walk's expected rows for a page of `page`, the scope's unknown
-    /// many), probed otherwise.
+    /// driving set read into one, another read as the cheapest of its
+    /// matches read into a set, its sources read, or a probe per candidate
+    /// (a set's bound, the `walked` rows a walk is expected to examine,
+    /// the scope's unknown many).
     fn access(
         &self,
         driver: &PimdirPlanDriver,
         bounds: &[Option<PimdirPlanBound>],
         costs: &PimdirPlanCosts,
         force: Option<PimdirPlanForce>,
-        page: Option<u64>,
+        walked: Option<u64>,
     ) -> Vec<PimdirPlanAccess> {
         let candidates = match driver {
             PimdirPlanDriver::Set(set) => Self::bound(set, bounds).map(|bound| bound.rows),
-            PimdirPlanDriver::Walk { .. } => page.map(|page| page.saturating_mul(WALK_ROWS)),
+            PimdirPlanDriver::Walk { .. } => walked,
             PimdirPlanDriver::Scope => None,
         };
         self.leaves
@@ -737,46 +812,85 @@ impl PimdirPlan {
                     return PimdirPlanAccess::Materialize;
                 }
                 match force {
-                    Some(PimdirPlanForce::Walk | PimdirPlanForce::Fallback) => {
-                        return PimdirPlanAccess::Probe;
-                    }
+                    Some(PimdirPlanForce::Walk) => return PimdirPlanAccess::Probe,
+                    Some(PimdirPlanForce::Fallback) => return PimdirPlanAccess::Sources,
                     Some(PimdirPlanForce::Scope) => return PimdirPlanAccess::Materialize,
                     _ => (),
                 }
-                match (bounds.get(at).copied().flatten(), candidates) {
-                    (Some(bound), Some(candidates))
-                        if bound.capped
-                            || bound.rows.saturating_mul(costs.match_row)
-                                > candidates.saturating_mul(costs.text_probe) =>
-                    {
-                        PimdirPlanAccess::Probe
-                    }
-                    _ => PimdirPlanAccess::Materialize,
+                let (bound, candidates) = match (bounds.get(at).copied().flatten(), candidates) {
+                    (Some(bound), Some(candidates)) if !bound.capped => (bound.rows, candidates),
+                    (Some(bound), Some(_)) if bound.capped => return PimdirPlanAccess::Probe,
+                    _ => return PimdirPlanAccess::Materialize,
+                };
+                let probe = candidates.saturating_mul(costs.text_probe);
+                let sources = bound
+                    .saturating_mul(costs.source_row)
+                    .saturating_add(candidates.saturating_mul(costs.source_probe));
+                let materialize = bound
+                    .saturating_mul(costs.match_row)
+                    .saturating_add(candidates.saturating_mul(costs.seek));
+                match (probe < sources.min(materialize), sources < materialize) {
+                    (true, _) => PimdirPlanAccess::Probe,
+                    (false, true) => PimdirPlanAccess::Sources,
+                    (false, false) => PimdirPlanAccess::Materialize,
                 }
             })
             .collect()
     }
 
-    /// What a walk pays per row it examines: a seek placing it, one per
-    /// structured term and per text term read into a set, a text probe
-    /// per one probed, none for a term the scope implies.
-    fn probe_row(&self, access: &[PimdirPlanAccess], costs: &PimdirPlanCosts) -> u64 {
+    /// What a row pays to be examined: a seek placing it, one per
+    /// structured term and per text term read into a set, a source probe
+    /// per one read as its sources, a text probe per one probed, none for
+    /// a term the scope implies nor one of `skip`, the set it was read
+    /// from.
+    fn probe_row(
+        &self,
+        access: &[PimdirPlanAccess],
+        costs: &PimdirPlanCosts,
+        skip: &[usize],
+    ) -> u64 {
         let mut row = costs.seek;
         for (at, (leaf, access)) in self.leaves.iter().zip(access).enumerate() {
-            if self.scoped.contains(&at) {
+            if self.scoped.contains(&at) || skip.contains(&at) {
                 continue;
             }
             row = row.saturating_add(match (leaf.is_text(), access) {
                 (true, PimdirPlanAccess::Probe) => costs.text_probe,
+                (true, PimdirPlanAccess::Sources) => costs.source_probe,
                 _ => costs.seek,
             });
         }
         row
     }
 
+    /// What reading the text terms costs before any row is examined: the
+    /// matches of each read into a set, the sources of each read as such,
+    /// nothing for one probed.
+    fn reading(
+        &self,
+        access: &[PimdirPlanAccess],
+        bounds: &[Option<PimdirPlanBound>],
+        costs: &PimdirPlanCosts,
+    ) -> u64 {
+        let mut read: u64 = 0;
+        for (at, (leaf, access)) in self.leaves.iter().zip(access).enumerate() {
+            let rows = bounds
+                .get(at)
+                .copied()
+                .flatten()
+                .map_or(0, |bound| bound.rows);
+            read = read.saturating_add(match (leaf.is_text(), access) {
+                (true, PimdirPlanAccess::Materialize) => rows.saturating_mul(costs.match_row),
+                (true, PimdirPlanAccess::Sources) => rows.saturating_mul(costs.source_row),
+                _ => 0,
+            });
+        }
+        read
+    }
+
     /// Whether every term is one the scope implies, so every live row a
     /// walk examines places a hit or another placement of one.
-    fn is_scoped(&self) -> bool {
+    pub fn is_scoped(&self) -> bool {
         (0..self.leaves.len()).all(|at| self.scoped.contains(&at))
     }
 
@@ -894,11 +1008,16 @@ pub enum PimdirWalkOutput {
 ///
 /// Each collection's rows come in the page's order, a hit placed by one
 /// row alone (its representative placement). The walk keeps the best
-/// hits so far, and steps next the collection whose next row ranks best;
-/// once the page is full, the key of its last hit is the floor below
-/// which no row is asked for, and it stops when no collection's next row
-/// can reach it. The dated collections are walked first, in the order's
-/// direction, then the undated by ascending key.
+/// hits so far, and steps next the collection whose next row ranks best,
+/// found in a queue ordered by those keys rather than among every
+/// collection; once the page is full, the key of its last hit is the
+/// floor below which no row is asked for, and it stops when no
+/// collection's next row can reach it. The dated collections are walked
+/// first, in the order's direction, then the undated by ascending key.
+///
+/// A collection's first step asks for [`STEP_FIRST`] rows and each later
+/// one for twice its last, so a walk spread over many collections reads
+/// few rows past the page in each while a deep one takes few steps.
 #[derive(Clone, Debug)]
 pub struct PimdirWalk {
     sort: PimdirSearchSort,
@@ -911,6 +1030,7 @@ pub struct PimdirWalk {
     undated: bool,
     examined: u64,
     budget: Option<u64>,
+    queue: BTreeSet<(String, usize)>,
     pending: Option<usize>,
     done: bool,
 }
@@ -938,10 +1058,11 @@ impl PimdirWalk {
                 },
             )
             .collect();
-        Self {
+        let count = collections.len();
+        let mut walk = Self {
             sort,
             need,
-            rows: vec![need.clamp(1, STEP_MAX); collections.len()],
+            rows: vec![need.clamp(1, STEP_FIRST); count],
             collections,
             after,
             next,
@@ -949,9 +1070,12 @@ impl PimdirWalk {
             undated: cursor.is_some_and(|cursor| cursor.undated),
             examined: 0,
             budget,
+            queue: BTreeSet::new(),
             pending: None,
             done: false,
-        }
+        };
+        walk.enqueue_phase();
+        walk
     }
 
     /// The bound of a collection's head: `Some((ascending, key))` when
@@ -992,19 +1116,16 @@ impl PimdirWalk {
         }
 
         loop {
-            let floor = match self.held.len() >= self.need {
+            let full = self.held.len() >= self.need;
+            let floor = match full {
                 true => self.held.last().and_then(|hit| hit.sort_key.clone()),
                 false => None,
             };
-            let full = self.held.len() >= self.need;
-            let ascending = self.undated || self.sort == PimdirSearchSort::OldestFirst;
-            let best = (0..self.collections.len())
-                .filter(|at| self.collections[*at].undated == self.undated)
-                .filter_map(|at| Some((at, self.next[at].as_ref()?)))
-                .reduce(|left, right| match (ascending, right.1.cmp(left.1)) {
-                    (true, Ordering::Less) | (false, Ordering::Greater) => right,
-                    _ => left,
-                });
+            let ascending = self.ascending();
+            let best = match ascending {
+                true => self.queue.first(),
+                false => self.queue.last(),
+            };
             let reaches = |key: &String| match (full, &floor) {
                 (false, _) => true,
                 (true, None) => false,
@@ -1014,17 +1135,21 @@ impl PimdirWalk {
                 },
             };
             match best {
-                Some((at, key)) if reaches(key) => {
+                Some((key, at)) if reaches(key) => {
+                    let at = *at;
                     self.pending = Some(at);
                     return PimdirCoroutineState::Yielded(PimdirWalkStep {
                         collection: at,
                         ascending,
                         after: self.after[at].clone(),
-                        floor: if full { floor } else { None },
+                        floor,
                         rows: self.rows[at],
                     });
                 }
-                _ if !self.undated && !full => self.undated = true,
+                _ if !self.undated && !full => {
+                    self.undated = true;
+                    self.enqueue_phase();
+                }
                 _ => {
                     self.done = true;
                     let held = core::mem::take(&mut self.held);
@@ -1032,6 +1157,19 @@ impl PimdirWalk {
                 }
             }
         }
+    }
+
+    /// Whether the phase walked reads rows by ascending sort key.
+    fn ascending(&self) -> bool {
+        self.undated || self.sort == PimdirSearchSort::OldestFirst
+    }
+
+    /// Queues every collection of the phase walked that has a next row.
+    fn enqueue_phase(&mut self) {
+        self.queue = (0..self.collections.len())
+            .filter(|at| self.collections[*at].undated == self.undated)
+            .filter_map(|at| Some((self.next[at].clone()?, at)))
+            .collect();
     }
 
     /// The row a collection's walk starts after: the cursor's place as a
@@ -1052,7 +1190,9 @@ impl PimdirWalk {
         }
     }
 
-    /// Takes in the rows one step of collection `at` examined.
+    /// Takes in the rows one step of collection `at` examined: one
+    /// answering fewer than asked read every row after the last that can
+    /// enter the page.
     fn absorb(&mut self, at: usize, rows: Vec<PimdirWalkRow>) {
         self.examined = self.examined.saturating_add(rows.len() as u64);
         let exhausted = rows.len() < self.rows[at];
@@ -1079,10 +1219,16 @@ impl PimdirWalk {
         if let Some(last) = rows.last() {
             self.after[at] = Some((last.sort_key.clone(), last.seq));
         }
+        if let Some(key) = self.next[at].take() {
+            self.queue.remove(&(key, at));
+        }
         self.next[at] = match exhausted {
             true => None,
             false => rows.last().map(|row| row.sort_key.clone()),
         };
+        if let Some(key) = &self.next[at] {
+            self.queue.insert((key.clone(), at));
+        }
         self.rows[at] = (self.rows[at] * 2).min(STEP_MAX);
     }
 }
@@ -1162,6 +1308,14 @@ mod tests {
         PimdirPlan::new(&PimdirQuery::parse(query).unwrap(), 0, &TimeZone::UTC)
     }
 
+    /// A scope of `collections` collections in a store of 520k rows.
+    fn extent(collections: u64) -> PimdirPlanExtent {
+        PimdirPlanExtent {
+            collections,
+            items: 520_000,
+        }
+    }
+
     fn bound(rows: u64) -> Option<PimdirPlanBound> {
         Some(PimdirPlanBound {
             rows,
@@ -1225,8 +1379,8 @@ mod tests {
         assert_eq!(choice.driver, PimdirPlanDriver::Set(vec![0]));
         assert_eq!(
             choice.access[1],
-            PimdirPlanAccess::Materialize,
-            "40k matches read cost less than 11k probes"
+            PimdirPlanAccess::Sources,
+            "40k sources read and 11k seeks cost less than 11k probes or 40k hits read"
         );
         let choice = both.count(&[bound(20), bound(CAP)], &costs, None);
         assert_eq!(choice.access[1], PimdirPlanAccess::Probe, "20 probes");
@@ -1251,11 +1405,11 @@ mod tests {
         let sort = PimdirSearchSort::NewestFirst;
         let kiwi = plan("kiwi");
         assert_eq!(
-            kiwi.page(sort, 50, 3_311, &[bound(35)], &costs, None)
+            kiwi.page(sort, 50, extent(3_311), &[bound(35)], &costs, None)
                 .driver,
             PimdirPlanDriver::Set(vec![0])
         );
-        let choice = kiwi.page(sort, 50, 3_311, &[bound(CAP)], &costs, None);
+        let choice = kiwi.page(sort, 50, extent(3_311), &[bound(CAP)], &costs, None);
         assert!(
             matches!(&choice.driver, PimdirPlanDriver::Walk { budget: Some(_), fallback: Some(set) } if *set == vec![0])
         );
@@ -1265,7 +1419,7 @@ mod tests {
             kiwi.page(
                 sort,
                 50,
-                1,
+                extent(1),
                 &[bound(35)],
                 &costs,
                 Some(PimdirPlanForce::Fallback)
@@ -1275,14 +1429,15 @@ mod tests {
                     budget: Some(0),
                     fallback: Some(vec![0])
                 },
-                access: vec![PimdirPlanAccess::Probe],
+                access: vec![PimdirPlanAccess::Sources],
             },
-            "a walk giving up at once, its text probed until it does"
+            "a walk giving up at once, its text read as sources until it does"
         );
 
         let mail = plan("kind:mail");
         assert_eq!(
-            mail.page(sort, 50, 3_311, &[None], &costs, None).driver,
+            mail.page(sort, 50, extent(3_311), &[None], &costs, None)
+                .driver,
             PimdirPlanDriver::Walk {
                 budget: None,
                 fallback: None
@@ -1292,7 +1447,7 @@ mod tests {
         assert!(
             matches!(
                 folder
-                    .page(sort, 50, 1, &[bound(1_500)], &costs, None)
+                    .page(sort, 50, extent(1), &[bound(1_500)], &costs, None)
                     .driver,
                 PimdirPlanDriver::Walk { .. }
             ),
@@ -1305,18 +1460,19 @@ mod tests {
         );
         let from = plan("from:a@x.org");
         assert_eq!(
-            from.page(sort, 50, 10, &[bound(900)], &costs, None).driver,
+            from.page(sort, 50, extent(10), &[bound(900)], &costs, None)
+                .driver,
             PimdirPlanDriver::Set(vec![0]),
             "under 20 pages"
         );
         assert_eq!(
-            from.page(sort, 50, 100_000, &[bound(50_000)], &costs, None)
+            from.page(sort, 50, extent(100_000), &[bound(50_000)], &costs, None)
                 .driver,
             PimdirPlanDriver::Set(vec![0]),
             "fewer rows than heads to read"
         );
         assert!(matches!(
-            from.page(sort, 50, 10, &[bound(50_000)], &costs, None)
+            from.page(sort, 50, extent(10), &[bound(50_000)], &costs, None)
                 .driver,
             PimdirPlanDriver::Walk { .. }
         ));
@@ -1325,7 +1481,7 @@ mod tests {
         let choice = relevance.page(
             PimdirSearchSort::Relevance,
             50,
-            1,
+            extent(1),
             &[bound(CAP), bound(CAP)],
             &costs,
             Some(PimdirPlanForce::Walk),

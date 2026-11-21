@@ -33,7 +33,8 @@ pub const SHAPE: &str = "canonical";
 /// The matches of a query's text terms (SEARCH §8.5), each read once
 /// through `match_objects` or `match_summaries` before the query runs and
 /// numbered by the term, so a query of many terms joins one table rather
-/// than nesting a full-text query per term. Temporary, per connection,
+/// than nesting a full-text query per term; and their sources
+/// (`term_source`, [`CLEAR_TERM_SOURCE`]). Temporary, per connection,
 /// written by a query client too.
 pub const CREATE_TERM_MATCH: &str = r#"CREATE TEMP TABLE IF NOT EXISTS term_match (
     term       INTEGER NOT NULL,
@@ -43,10 +44,40 @@ pub const CREATE_TERM_MATCH: &str = r#"CREATE TEMP TABLE IF NOT EXISTS term_matc
     src        TEXT    NOT NULL,
     rank       REAL
 );
-CREATE INDEX IF NOT EXISTS temp.term_match_by_term ON term_match(term, akey, seq);"#;
+CREATE INDEX IF NOT EXISTS temp.term_match_by_term ON term_match(term, akey, seq);
+CREATE TEMP TABLE IF NOT EXISTS term_source (
+    term INTEGER NOT NULL,
+    src  INTEGER NOT NULL,
+    id   INTEGER NOT NULL,
+    PRIMARY KEY (term, src, id)
+) WITHOUT ROWID;"#;
 
 /// Empties `temp.term_match` before a query reads its terms' matches.
 pub const CLEAR_TERM_MATCH: &str = r#"DELETE FROM temp.term_match;"#;
+
+/// Empties `temp.term_source` before a query reads its terms' sources:
+/// per text term, the bodies (`src` 0, `object.id`) and the summaries
+/// (`src` 1, `placement.id`) its expression matches, read from the
+/// full-text doclists alone, so a candidate is probed by a seek rather
+/// than a full-text query.
+pub const CLEAR_TERM_SOURCE: &str = r#"DELETE FROM temp.term_source;"#;
+
+/// The store's highest public id, by a seek on `items_by_seq_global`: about
+/// how many rows it holds, what a planner weighs a walk's rows by.
+pub const ITEMS_HELD: &str = r#"SELECT ifnull(max(seq), 0) FROM store.items;"#;
+
+/// `match_object` answered from a term's sources in `temp.term_source`:
+/// whether the body of hash `:hash` is among those text term `:term`
+/// matches.
+pub const SOURCE_OBJECT: &str = r#"SELECT 1 FROM temp.term_source
+WHERE term = :term AND src = 0 AND id = (SELECT id FROM object WHERE hash = :hash);"#;
+
+/// `match_summary` answered from a term's sources in `temp.term_source`:
+/// whether the summary of placement `(:collection, :seq)` is among those
+/// text term `:term` matches.
+pub const SOURCE_SUMMARY: &str = r#"SELECT 1 FROM temp.term_source
+WHERE term = :term AND src = 1
+  AND id = (SELECT id FROM placement WHERE collection = :collection AND seq = :seq);"#;
 
 /// The live items of the collections of the `collections` slot (STORAGE
 /// §4.4) stamped above the index cursor: what an answer may see stale or
@@ -69,9 +100,29 @@ pub const ROLL_COVERAGE: &str = r#"SELECT max(covered_since) FILTER (WHERE cover
 FROM store.sources
 WHERE collection IN (SELECT value FROM temp.param WHERE slot = 'collections');"#;
 
+/// [`ROLL_COVERAGE`] over every collection of the store, what a query no
+/// conjunct narrows reads: no slot bound, the sources read once.
+pub const ROLL_COVERAGE_ALL: &str = r#"SELECT max(covered_since) FILTER (WHERE covered_at IS NOT NULL),
+       min(covered_until) FILTER (WHERE covered_at IS NOT NULL),
+       count(*) - count(covered_at)
+FROM store.sources;"#;
+
 /// Every collection's id, account and kind: what a query's conjuncts
 /// narrow its coverage's collections by (SEARCH §8.2).
 pub const SCOPE_COLLECTIONS: &str = r#"SELECT id, account, kind FROM store.collections;"#;
+
+/// The id, account and kind of collection `?1`: a query naming one by a
+/// conjunct reads its coverage's collections from it alone.
+pub const SCOPE_COLLECTION: &str =
+    r#"SELECT id, account, kind FROM store.collections WHERE id = ?1;"#;
+
+/// Whether the store holds a calendar collection, what a query no conjunct
+/// narrows asks before reading its date range's cut items.
+pub const HOLDS_CALENDARS: &str =
+    r#"SELECT EXISTS (SELECT 1 FROM store.collections WHERE kind = 'text/calendar');"#;
+
+/// How many collections the store holds.
+pub const COUNT_COLLECTIONS: &str = r#"SELECT count(*) FROM store.collections;"#;
 
 /// The version of index.db as this connection sees it, moved by every
 /// commit of another connection.

@@ -154,7 +154,9 @@ fn plan(dir: &Path, sql: &str) -> Vec<String> {
     conn.execute_batch(
         "CREATE TEMP TABLE term_match (term INTEGER NOT NULL, collection TEXT NOT NULL, \
          akey TEXT NOT NULL, seq INTEGER NOT NULL, src TEXT NOT NULL, rank REAL); \
-         CREATE INDEX temp.term_match_by_term ON term_match(term, akey, seq);",
+         CREATE INDEX temp.term_match_by_term ON term_match(term, akey, seq); \
+         CREATE TEMP TABLE term_source (term INTEGER NOT NULL, src INTEGER NOT NULL, \
+         id INTEGER NOT NULL, PRIMARY KEY (term, src, id)) WITHOUT ROWID;",
     )
     .unwrap();
     let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();

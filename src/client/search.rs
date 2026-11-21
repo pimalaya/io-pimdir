@@ -54,6 +54,7 @@ use std::{
 };
 use std::{
     path::Path,
+    sync::LazyLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -84,7 +85,8 @@ use crate::{
         fold,
         plan::{
             CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanBound, PimdirPlanCosts, PimdirPlanDriver,
-            PimdirPlanForce, PimdirWalk, PimdirWalkCollection, PimdirWalkOutput, PimdirWalkRow,
+            PimdirPlanExtent, PimdirPlanForce, PimdirWalk, PimdirWalkCollection, PimdirWalkOutput,
+            PimdirWalkRow,
         },
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
     },
@@ -99,6 +101,15 @@ use crate::{
 /// The file a refresh locks exclusively (SEARCH §3).
 #[cfg(feature = "indexer")]
 const LOCK: &str = "index.lock";
+
+/// The highest public id a count marks in a bitmap per account (8 MiB
+/// each); a store past it counts each placement's representative by a seek.
+const BITMAP_SEQ_MAX: i64 = 1 << 26;
+
+/// The tables, indexes and triggers the index schema declares, by name,
+/// as [`shape`] reads them from an index.db (SEARCH §2).
+static SHAPE_DECLARED: LazyLock<BTreeMap<String, String>> =
+    LazyLock::new(|| schema::declared(search::MIGRATIONS));
 
 /// The SQLite version the index requires, for `contentless_delete`
 /// (SEARCH §2), as `sqlite3_libversion_number` spells it.
@@ -826,16 +837,18 @@ impl PimdirIndex {
             false => None,
         };
 
+        let probes = self.presented(&compiled, page.len())?;
         let mut hits = Vec::new();
         for hit in page {
-            hits.push(self.hit(hit, &compiled.probes, &compiled.words)?);
+            hits.push(self.hit(hit, &probes, &compiled.words)?);
         }
+        let coverage = self.coverage(query, now, &options.clock, &zone)?;
 
         Ok(PimdirSearchOutput {
             hits,
             more,
             next,
-            coverage: self.coverage(query, now, &options.clock, &zone)?,
+            coverage,
         })
     }
 
@@ -919,6 +932,8 @@ impl PimdirIndex {
             false => None,
         };
 
+        let shown = groups.iter().map(|(_, found)| found.len()).sum();
+        let probes = self.presented(&compiled, shown)?;
         let mut threads = Vec::new();
         for (thread, found) in groups {
             let account = found[0].account.clone();
@@ -932,7 +947,7 @@ impl PimdirIndex {
             };
             let mut hits = Vec::new();
             for hit in found {
-                hits.push(self.hit(hit, &compiled.probes, &compiled.words)?);
+                hits.push(self.hit(hit, &probes, &compiled.words)?);
             }
             threads.push(PimdirSearchThread {
                 account,
@@ -1078,7 +1093,8 @@ impl PimdirIndex {
     /// How many hits a query has, with what the count could not see, its
     /// dates resolved against `clock`: its smallest set read and every
     /// other term probed per hit, or every live item of its scope when
-    /// no positive term has a set.
+    /// no positive term has a set, each read once and marked per account
+    /// when every term is one the scope implies.
     pub fn count(
         &self,
         query: &PimdirQuery,
@@ -1092,16 +1108,31 @@ impl PimdirIndex {
             .plan
             .count(&bounds, &PimdirPlanCosts::default(), self.force.get());
         compiled.access = choice.access;
-        self.materialize(&compiled, &compiled.materialized())?;
-        let sql = match &choice.driver {
-            PimdirPlanDriver::Set(set) => compiled.count_set(set),
-            _ => compiled.count_scope(),
+        self.read_terms(&compiled, false)?;
+        let count = match &choice.driver {
+            PimdirPlanDriver::Set(set) => {
+                self.run(&compiled.count_set(set), &compiled.values, &[], |row| {
+                    row.get::<_, i64>(0)
+                })?
+            }
+            _ if compiled.plan.is_scoped()
+                && !compiled.plan.scope.is_one_collection()
+                && self
+                    .conn
+                    .query_row_cached(search::ITEMS_HELD, [], |row| row.get::<_, i64>(0))?
+                    <= BITMAP_SEQ_MAX =>
+            {
+                vec![self.count_placed(&compiled)? as i64]
+            }
+            _ => self.run(&compiled.count_scope(), &compiled.values, &[], |row| {
+                row.get::<_, i64>(0)
+            })?,
         };
-        let count = self.run(&sql, &compiled.values, &[], |row| row.get::<_, i64>(0))?;
+        let coverage = self.coverage(query, now, clock, &zone)?;
 
         Ok(PimdirSearchCountOutput {
             count: count.first().copied().unwrap_or(0).max(0) as u64,
-            coverage: self.coverage(query, now, clock, &zone)?,
+            coverage,
         })
     }
 
@@ -1170,7 +1201,7 @@ impl PimdirIndex {
             .plan
             .count(&bounds, &PimdirPlanCosts::default(), self.force.get());
         compiled.access = choice.access;
-        self.materialize(&compiled, &compiled.materialized())?;
+        self.read_terms(&compiled, sort == PimdirSearchSort::Relevance)?;
         self.whole(&compiled, &choice.driver, sort)
     }
 
@@ -1187,29 +1218,70 @@ impl PimdirIndex {
         let mut compiled = self.compile(query, now, zone)?;
         let bounds = self.estimate(&compiled)?;
         let force = self.force.get();
-        let collections = match options.sort.is_dated() && force.is_none() {
-            true => self
-                .run(&compiled.collections(), &compiled.values, &[], |row| {
-                    row.get::<_, i64>(0)
-                })?
-                .first()
-                .copied()
-                .unwrap_or(0)
-                .max(0) as u64,
-            false => 0,
+        let extent = match options.sort.is_dated() && force.is_none() {
+            true => PimdirPlanExtent {
+                collections: self
+                    .run(&compiled.collections(), &compiled.values, &[], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .first()
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as u64,
+                items: self
+                    .conn
+                    .query_row_cached(search::ITEMS_HELD, [], |row| row.get::<_, i64>(0))?
+                    .max(0) as u64,
+            },
+            false => PimdirPlanExtent::default(),
         };
         let choice = compiled.plan.page(
             options.sort,
             options.limit,
-            collections,
+            extent,
             &bounds,
             &PimdirPlanCosts::default(),
             force,
         );
         debug!("search plan: {:?}", choice.driver);
         compiled.access = choice.access;
-        self.materialize(&compiled, &compiled.materialized())?;
+        compiled.bounds = bounds;
+        self.read_terms(&compiled, options.sort == PimdirSearchSort::Relevance)?;
         Ok((compiled, choice.driver))
+    }
+
+    /// The positive text terms a page of `hits` hits tells the matches
+    /// of, each paired with whether `temp.term_source` holds its sources:
+    /// those read as such by the plan, and those whose sources cost less
+    /// to read now than a full-text probe per placement of the page, a
+    /// prefix expanding again in each.
+    fn presented<'a>(
+        &self,
+        compiled: &'a Compiled,
+        hits: usize,
+    ) -> Result<Vec<(&'a Probe, bool)>, PimdirError> {
+        let costs = PimdirPlanCosts::default();
+        let mut presented = Vec::new();
+        for probe in &compiled.probes {
+            let read = compiled.access.get(probe.term) == Some(&PimdirPlanAccess::Sources);
+            let cheap = compiled
+                .bounds
+                .get(probe.term)
+                .copied()
+                .flatten()
+                .is_some_and(|bound| {
+                    !bound.capped
+                        && bound.rows.saturating_mul(costs.source_row)
+                            < (hits as u64).saturating_mul(costs.text_probe)
+                });
+            if !read && cheap {
+                for sql in compiled.sources(probe.term) {
+                    self.run(sql, &compiled.values, &[], |_| Ok(()))?;
+                }
+            }
+            presented.push((probe, read || cheap));
+        }
+        Ok(presented)
     }
 
     /// The first `limit` hits after `after` in `sort` order, and whether
@@ -1238,12 +1310,12 @@ impl PimdirIndex {
                         debug!("search walk past its budget, reading set {set:?}");
                         let mut read = Vec::new();
                         for at in set {
-                            if compiled.access[*at] == PimdirPlanAccess::Probe {
+                            if compiled.access[*at] != PimdirPlanAccess::Materialize {
                                 compiled.access[*at] = PimdirPlanAccess::Materialize;
                                 read.push(*at);
                             }
                         }
-                        self.materialize(compiled, &read)?;
+                        self.materialize(compiled, &read, false)?;
                         self.set_page(compiled, set, after, sort, need)?
                     }
                     (None, None) => Vec::new(),
@@ -1460,11 +1532,76 @@ impl PimdirIndex {
         Ok(bounds)
     }
 
-    /// Reads the matches of the leaves `leaves` into `temp.term_match`.
-    fn materialize(&self, compiled: &Compiled, leaves: &[usize]) -> Result<(), PimdirError> {
-        for at in leaves {
-            for sql in compiled.matches(*at) {
+    /// How many hits the scope's live placements hold, for a query whose
+    /// every term the scope implies: each placement read once off
+    /// `items_by_sort`, its hit marked in a bitmap of public ids per
+    /// account, so a hit filed in several collections counts once without
+    /// a seek per placement for its representative.
+    fn count_placed(&self, compiled: &Compiled) -> Result<u64, PimdirError> {
+        let mut accounts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut held: BTreeMap<i64, usize> = BTreeMap::new();
+        for (rowid, account) in
+            self.run(&compiled.scope_accounts(), &compiled.values, &[], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+        {
+            let next = accounts.len();
+            held.insert(rowid, *accounts.entry(account).or_insert(next));
+        }
+        let mut marked: Vec<Vec<u64>> = vec![Vec::new(); accounts.len()];
+        let mut count = 0u64;
+        let mut last: Option<(i64, usize)> = None;
+        self.run(&compiled.scope_placements(), &compiled.values, &[], |row| {
+            let rowid: i64 = row.get(0)?;
+            let seq = row.get::<_, i64>(1)?.max(0) as usize;
+            let account = match last {
+                Some((at, account)) if at == rowid => account,
+                _ => {
+                    let account = held.get(&rowid).copied().unwrap_or(0);
+                    last = Some((rowid, account));
+                    account
+                }
+            };
+            let Some(bits) = marked.get_mut(account) else {
+                return Ok(());
+            };
+            let (word, bit) = (seq / 64, 1u64 << (seq % 64));
+            if bits.len() <= word {
+                bits.resize(word + 1, 0);
+            }
+            if bits[word] & bit == 0 {
+                bits[word] |= bit;
+                count += 1;
+            }
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    /// Reads what each text term needs under the plan's access: its
+    /// matches into `temp.term_match`, ranked when `ranked`, or its
+    /// bodies and summaries into `temp.term_source`.
+    fn read_terms(&self, compiled: &Compiled, ranked: bool) -> Result<(), PimdirError> {
+        self.materialize(compiled, &compiled.materialized(), ranked)?;
+        for at in compiled.sourced() {
+            for sql in compiled.sources(at) {
                 self.run(sql, &compiled.values, &[], |_| Ok(()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the matches of the leaves `leaves` into `temp.term_match`,
+    /// ranked when `ranked`.
+    fn materialize(
+        &self,
+        compiled: &Compiled,
+        leaves: &[usize],
+        ranked: bool,
+    ) -> Result<(), PimdirError> {
+        for at in leaves {
+            for sql in compiled.matches(*at, ranked) {
+                self.run(&sql, &compiled.values, &[], |_| Ok(()))?;
             }
         }
         Ok(())
@@ -1540,7 +1677,7 @@ impl PimdirIndex {
     fn hit(
         &self,
         found: Found,
-        probes: &[Probe],
+        probes: &[(&Probe, bool)],
         words: &[String],
     ) -> Result<PimdirSearchHit, PimdirError> {
         let Found { account, seq, .. } = found;
@@ -1567,34 +1704,49 @@ impl PimdirIndex {
     /// What a hit's text terms matched (SEARCH §8.2): a body one of its
     /// placements holds, probed by `match_object`, else the summary of one
     /// indexed bodiless, by `match_summary`; `None` when only structured
-    /// terms did. A page's hits alone are probed, never every hit.
+    /// terms did. A page's hits alone are probed, never every hit. A term
+    /// whose sources `temp.term_source` holds, paired with `true`, is
+    /// probed there by the same keys, a seek in place of a full-text query.
     fn matched(
         &self,
         seq: i64,
         placements: &[PimdirSearchPlacement],
-        probes: &[Probe],
+        probes: &[(&Probe, bool)],
     ) -> Result<Option<PimdirSearchMatched>, PimdirError> {
         let mut matched = None;
-        for probe in probes {
+        for (probe, sourced) in probes {
             for placement in placements {
                 if let Some(hash) = &placement.object {
-                    let body = self
-                        .conn
-                        .query_row_cached(
+                    let body = match sourced {
+                        true => self.conn.query_row_cached(
+                            search::SOURCE_OBJECT,
+                            named_params! { ":term": probe.term as i64, ":hash": hash.0 },
+                            |_| Ok(()),
+                        ),
+                        false => self.conn.query_row_cached(
                             search::MATCH_OBJECT,
                             named_params! { ":match": probe.expression, ":hash": hash.0 },
                             |_| Ok(()),
-                        )
-                        .optional()
-                        .map_err(unanswerable)?;
+                        ),
+                    }
+                    .optional()
+                    .map_err(unanswerable)?;
                     if body.is_some() {
                         return Ok(Some(PimdirSearchMatched::Body));
                     }
                 }
                 if probe.summary && matched.is_none() {
-                    let summary = self
-                        .conn
-                        .query_row_cached(
+                    let summary = match sourced {
+                        true => self.conn.query_row_cached(
+                            search::SOURCE_SUMMARY,
+                            named_params! {
+                                ":term": probe.term as i64,
+                                ":collection": placement.collection,
+                                ":seq": seq,
+                            },
+                            |_| Ok(()),
+                        ),
+                        false => self.conn.query_row_cached(
                             search::MATCH_SUMMARY,
                             named_params! {
                                 ":match": probe.expression,
@@ -1602,9 +1754,10 @@ impl PimdirIndex {
                                 ":seq": seq,
                             },
                             |_| Ok(()),
-                        )
-                        .optional()
-                        .map_err(unanswerable)?;
+                        ),
+                    }
+                    .optional()
+                    .map_err(unanswerable)?;
                     if summary.is_some() {
                         matched = Some(PimdirSearchMatched::Summary);
                     }
@@ -1629,6 +1782,7 @@ impl PimdirIndex {
         let labels = self.labels(query)?;
         let plan = PimdirPlan::new(query, now, zone);
         self.conn.execute_cached(search::CLEAR_TERM_MATCH, [])?;
+        self.conn.execute_cached(search::CLEAR_TERM_SOURCE, [])?;
         Ok(Compiled::new(plan, &ends, &categories, &labels))
     }
 
@@ -1907,12 +2061,16 @@ impl PimdirIndex {
     /// The coverage of `scope` as the store and the index hold it, its
     /// `reads` and `zone_differs` left to the query.
     ///
-    /// The scope's collections' ids are bound once, every statement reading
-    /// the slot, the canonical ones run as their text stands. The sources
-    /// are rolled up in
-    /// one statement (`ROLL_COVERAGE`), and the unindexed items are counted
-    /// only while the index is behind, none being stamped above its cursor
-    /// otherwise.
+    /// A scope holding every collection, no conjunct narrowing it or none
+    /// ruling one out, has its sources and bodies out of sight rolled up
+    /// over the whole store (`ROLL_COVERAGE_ALL`, the canonical `coverage_all`), no
+    /// collection bound, so the cost is the rows counted, not the
+    /// collections. Another reads its collections, one alone for a
+    /// `collection:` conjunct, binds their ids once, every statement
+    /// reading the slot, the canonical ones run as their text stands, and
+    /// rolls the sources up in one statement (`ROLL_COVERAGE`). The
+    /// unindexed items are counted only while the index is behind, none
+    /// being stamped above its cursor otherwise.
     ///
     /// A range leaves the horizon when it starts before it or ends after
     /// it, an open side always (SEARCH §8.1), a date term under `or` or
@@ -1922,28 +2080,83 @@ impl PimdirIndex {
         &self,
         scope: &PimdirCoverageScope,
     ) -> Result<PimdirCoverageHeld, PimdirError> {
-        let collections = rows(&self.conn, search::SCOPE_COLLECTIONS, [], |r| {
+        let named = scope.terms.iter().find_map(|term| match term {
+            PimdirCoverageTerm::Collection(id) => Some(id.as_str()),
+            _ => None,
+        });
+        let read = |r: &Row| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, String>(2)?,
             ))
-        })?;
-        let held: Vec<(String, Option<String>, String)> = collections
-            .into_iter()
-            .filter(|(id, account, kind)| scope.holds(id, account.as_deref(), kind))
-            .collect();
-        bind_list(&self.conn, "collections", held.iter().map(|(id, _, _)| id))?;
-        let calendar = held.iter().any(|(_, _, kind)| kind == "text/calendar");
+        };
+        let (held, all) = match (scope.terms.is_empty(), named) {
+            (true, _) => (None, true),
+            (false, Some(id)) => {
+                let every: i64 =
+                    self.conn
+                        .query_row_cached(search::COUNT_COLLECTIONS, [], |r| r.get(0))?;
+                let held: Vec<_> = rows(&self.conn, search::SCOPE_COLLECTION, [id], read)?
+                    .into_iter()
+                    .filter(|(id, account, kind)| scope.holds(id, account.as_deref(), kind))
+                    .collect();
+                let all = held.len() as i64 == every;
+                (Some(held), all)
+            }
+            (false, None) => {
+                let collections = rows(&self.conn, search::SCOPE_COLLECTIONS, [], read)?;
+                let every = collections.len();
+                let held: Vec<_> = collections
+                    .into_iter()
+                    .filter(|(id, account, kind)| scope.holds(id, account.as_deref(), kind))
+                    .collect();
+                let all = held.len() == every;
+                (Some(held), all)
+            }
+        };
+        let bound = Cell::new(false);
+        let bind = || -> Result<(), PimdirError> {
+            if bound.replace(true) {
+                return Ok(());
+            }
+            match &held {
+                Some(held) => {
+                    bind_list(&self.conn, "collections", held.iter().map(|(id, _, _)| id))?
+                }
+                None => {
+                    let ids: Vec<String> =
+                        rows(&self.conn, search::SCOPE_COLLECTIONS, [], |r| r.get(0))?;
+                    bind_list(&self.conn, "collections", ids.iter())?
+                }
+            }
+            Ok(())
+        };
+        let calendar = match &held {
+            Some(held) => held.iter().any(|(_, _, kind)| kind == "text/calendar"),
+            None => {
+                scope.dated
+                    && self
+                        .conn
+                        .query_row_cached(search::HOLDS_CALENDARS, [], |r| r.get::<_, bool>(0))?
+            }
+        };
 
         let since = scope.since.as_deref();
         let until = scope.until.as_deref();
+        let (roll, covered) = match all {
+            true => (search::ROLL_COVERAGE_ALL, search::COVERAGE_ALL),
+            false => {
+                bind()?;
+                (search::ROLL_COVERAGE, search::COVERAGE)
+            }
+        };
         let mut coverage = PimdirSearchCoverage {
-            temporal: rolled_temporal(&self.conn, search::ROLL_COVERAGE, since, until)?,
+            temporal: rolled_temporal(&self.conn, roll, since, until)?,
             ..Default::default()
         };
 
-        let kinds = rows(&self.conn, search::COVERAGE, [], |r| {
+        let kinds = rows(&self.conn, covered, [], |r| {
             let count = |column| r.get::<_, i64>(column).map(|count| count.max(0) as u64);
             Ok((
                 r.get::<_, String>(0)?,
@@ -1961,6 +2174,7 @@ impl PimdirIndex {
             .query_row_cached(search::BEHIND, [], |r| r.get(0))?;
         coverage.local.behind = behind.max(0) as u64;
         if behind > 0 {
+            bind()?;
             let unindexed: i64 = self.conn.query_row_cached(
                 search::COUNT_UNINDEXED,
                 named_params! { ":since": self.cursor()? },
@@ -1976,6 +2190,7 @@ impl PimdirIndex {
             });
         }
 
+        bind()?;
         let cut: i64 = self.conn.query_row_cached(
             search::CUT_BEFORE,
             named_params! { ":end": until },
@@ -2138,15 +2353,10 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
 
     // NOTE: before `load_index_meta`, which names columns an index of an
     // earlier schema text may lack.
-    let canonical = Connection::open_in_memory()?;
-    for migration in search::MIGRATIONS {
-        canonical.execute_batch(migration)?;
-    }
-    let wanted = shape(&canonical, "main")?;
     let declared: BTreeMap<String, String> = shape(conn, "main")?.into_iter().collect();
-    let same = wanted
-        .into_iter()
-        .all(|(name, sql)| declared.get(&name).is_some_and(|held| *held == sql));
+    let same = SHAPE_DECLARED
+        .iter()
+        .all(|(name, sql)| declared.get(name).is_some_and(|held| held == sql));
     if !same {
         return Ok(PimdirIndexHeld::Stale);
     }

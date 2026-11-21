@@ -9,8 +9,11 @@
 //!
 //! A text term is an FTS5 `MATCH` built from escaped tokens, either read
 //! once through the canonical `match_objects` and `match_summaries` into
-//! `temp.term_match`, each hit then probed by a seek, or probed against
-//! each candidate placement's body and summary, as the plan says.
+//! `temp.term_match`, each hit then probed by a seek, its rank left out
+//! unless the order reads it; or the ids of the bodies and summaries it
+//! matches read off the full-text index into `temp.term_source`, each
+//! candidate's placements then probed by seeks; or probed against each
+//! candidate placement's body and summary, as the plan says.
 //!
 //! A `label:` or `property:` term reads the store's `item_property`, never
 //! the index: a property is the item's, so it holds for the hit of every
@@ -36,8 +39,8 @@ use crate::{
     search::{
         fold,
         plan::{
-            self, CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanEstimate, PimdirPlanNode,
-            PimdirSearchSort, PimdirWalkStep,
+            self, CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanBound, PimdirPlanEstimate,
+            PimdirPlanNode, PimdirSearchSort, PimdirWalkStep,
         },
         query::{
             PimdirQueryDateRange, PimdirQueryId, PimdirQueryKind, PimdirQueryPredicate,
@@ -83,6 +86,9 @@ pub(crate) struct Compiled {
     pub(crate) access: Vec<PimdirPlanAccess>,
     /// Every value a fragment binds, the n-th named `:vn`.
     pub(crate) values: Vec<Value>,
+    /// What the client measured of each leaf's set, `None` where it did
+    /// not.
+    pub(crate) bounds: Vec<Option<PimdirPlanBound>>,
     /// The positive text terms' expressions, each probed against a page's
     /// hits to tell what they matched (`match_object`, `match_summary`).
     pub(crate) probes: Vec<Probe>,
@@ -108,6 +114,12 @@ struct Leaf {
     estimate: Option<String>,
     /// The statements reading its matches into `temp.term_match`.
     matches: Vec<String>,
+    /// A text term's condition reading the bodies and summaries it matches
+    /// from `temp.term_source`, per live placement of the hit.
+    source: Option<String>,
+    /// The statements reading those bodies and summaries into
+    /// `temp.term_source`, by id.
+    sources: Vec<String>,
 }
 
 /// A positive text term, probed against one hit's body or summary.
@@ -116,6 +128,8 @@ pub(crate) struct Probe {
     pub(crate) expression: String,
     /// Whether its field exists in a summary, which it then matches too.
     pub(crate) summary: bool,
+    /// The leaf it is, whose sources `temp.term_source` may hold.
+    pub(crate) term: usize,
 }
 
 impl Compiled {
@@ -132,6 +146,7 @@ impl Compiled {
             access: vec![PimdirPlanAccess::Materialize; plan.leaves.len()],
             values: Vec::new(),
             probes: Vec::new(),
+            bounds: Vec::new(),
             words: Vec::new(),
             leaves: Vec::new(),
             scope: String::new(),
@@ -145,9 +160,26 @@ impl Compiled {
         compiled
     }
 
-    /// The statements reading leaf `at`'s matches into `temp.term_match`.
-    pub(crate) fn matches(&self, at: usize) -> &[String] {
-        &self.leaves[at].matches
+    /// The statements reading leaf `at`'s matches into `temp.term_match`,
+    /// each with its rank when `ranked`, else none: `bm25` costs more than
+    /// the rest of the read, and only the `relevance` order reads it.
+    pub(crate) fn matches(&self, at: usize, ranked: bool) -> Vec<String> {
+        self.leaves[at]
+            .matches
+            .iter()
+            .map(|sql| match ranked {
+                true => sql.clone(),
+                false => sql
+                    .replace("bm25(object_text)", "NULL")
+                    .replace("bm25(summary_text)", "NULL"),
+            })
+            .collect()
+    }
+
+    /// The statements reading leaf `at`'s bodies and summaries into
+    /// `temp.term_source`.
+    pub(crate) fn sources(&self, at: usize) -> &[String] {
+        &self.leaves[at].sources
     }
 
     /// The leaves whose matches a statement reads from `temp.term_match`
@@ -159,6 +191,16 @@ impl Compiled {
                 !self.leaves[*at].matches.is_empty()
                     && (self.leaves[*at].probe.is_none()
                         || self.access[*at] == PimdirPlanAccess::Materialize)
+            })
+            .collect()
+    }
+
+    /// The leaves whose bodies and summaries a statement reads from
+    /// `temp.term_source` under the current access.
+    pub(crate) fn sourced(&self) -> Vec<usize> {
+        (0..self.leaves.len())
+            .filter(|at| {
+                self.leaves[*at].source.is_some() && self.access[*at] == PimdirPlanAccess::Sources
             })
             .collect()
     }
@@ -270,7 +312,7 @@ impl Compiled {
             "SELECT h.akey, h.seq, max(s.sort_key) AS k, max(sc.kind IN {UNDATED}) AS u, \
              {rank} AS rank, {title} AS title \
              FROM ({hits}) h \
-             JOIN store.items s ON s.seq = h.seq AND s.deleted = 0 \
+             CROSS JOIN store.items s ON s.seq = h.seq AND s.deleted = 0 \
              JOIN store.collections sc ON sc.id = s.collection \
              AND ifnull(sc.account, '') = h.akey AND {} \
              WHERE {} GROUP BY h.akey, h.seq",
@@ -370,6 +412,25 @@ impl Compiled {
         )
     }
 
+    /// The scope's collections, by rowid, with their account, empty for
+    /// none.
+    pub(crate) fn scope_accounts(&self) -> String {
+        format!(
+            "SELECT c.rowid, ifnull(c.account, '') FROM store.collections c WHERE {}",
+            self.at_scope("c")
+        )
+    }
+
+    /// Every live placement of the scope, its collection by rowid and its
+    /// public id, collection after collection, read off `items_by_sort`.
+    pub(crate) fn scope_placements(&self) -> String {
+        format!(
+            "SELECT c.rowid, y.seq FROM store.collections c CROSS JOIN store.items y \
+             INDEXED BY items_by_sort ON y.collection = c.id AND y.deleted = 0 WHERE {}",
+            self.at_scope("c")
+        )
+    }
+
     /// How many collections the scope holds.
     pub(crate) fn collections(&self) -> String {
         format!(
@@ -414,8 +475,9 @@ impl Compiled {
             PimdirPlanNode::Leaf(at) if skip.contains(at) => String::from("1"),
             PimdirPlanNode::Leaf(at) => {
                 let leaf = &self.leaves[*at];
-                let template = match (&leaf.probe, self.access[*at]) {
-                    (Some(probe), PimdirPlanAccess::Probe) => probe,
+                let template = match (&leaf.probe, &leaf.source, self.access[*at]) {
+                    (Some(probe), _, PimdirPlanAccess::Probe) => probe,
+                    (_, Some(source), PimdirPlanAccess::Sources) => source,
                     _ => &leaf.hit,
                 };
                 template.replace("{akey}", akey).replace("{seq}", seq)
@@ -538,6 +600,8 @@ impl Compiled {
             set: None,
             estimate: None,
             matches: Vec::new(),
+            source: None,
+            sources: Vec::new(),
         };
         let (j, c) = (format!("j{at}"), format!("c{at}"));
 
@@ -874,7 +938,7 @@ impl Compiled {
         };
         leaf.set = Some(format!(
             "SELECT ifnull(c.account, '') AS akey, i.seq AS seq FROM store.collections c \
-             JOIN store.items i ON i.collection = c.id AND i.deleted = 0 WHERE {} \
+             CROSS JOIN store.items i ON i.collection = c.id AND i.deleted = 0 WHERE {} \
              UNION ALL SELECT ifnull(c.account, '') AS akey, o.seq AS seq FROM occurrence o \
              JOIN store.collections c ON c.id = o.collection WHERE {}",
             dated("i", "c"),
@@ -951,6 +1015,7 @@ impl Compiled {
         let Some(expression) = fts(column, text) else {
             leaf.hit = String::from("0");
             leaf.probe = Some(String::from("0"));
+            leaf.source = Some(String::from("0"));
             leaf.estimate = Some(String::from("SELECT 0"));
             leaf.set = Some(String::from("SELECT '' AS akey, 0 AS seq WHERE 0"));
             return;
@@ -971,6 +1036,7 @@ impl Compiled {
             self.probes.push(Probe {
                 expression: expression.clone(),
                 summary,
+                term: at,
             });
         }
 
@@ -989,6 +1055,32 @@ impl Compiled {
              WHERE o{at}.hash = {p}.hash AND EXISTS (SELECT 1 FROM object_text \
              WHERE object_text MATCH {named} AND rowid = o{at}.id)){summarised}))"
         );
+        let (summarised, summaries) = match summary {
+            true => (
+                format!(
+                    " OR EXISTS (SELECT 1 FROM temp.term_source s{at} WHERE s{at}.term = {at} \
+                     AND s{at}.src = 1 AND s{at}.id = {p}.id)"
+                ),
+                Some(format!(
+                    "INSERT OR IGNORE INTO temp.term_source(term, src, id) SELECT {at}, 1, rowid \
+                     FROM summary_text WHERE summary_text MATCH {named}"
+                )),
+            ),
+            false => (String::new(), None),
+        };
+        let sourced = format!(
+            "EXISTS (SELECT 1 FROM placement {p} WHERE {p}.collection = {j}.collection \
+             AND {p}.seq = {j}.seq AND (EXISTS (SELECT 1 FROM object o{at} \
+             JOIN temp.term_source s{at} ON s{at}.term = {at} AND s{at}.src = 0 \
+             AND s{at}.id = o{at}.id WHERE o{at}.hash = {p}.hash){summarised}))"
+        );
+        leaf.sources = core::iter::once(format!(
+            "INSERT OR IGNORE INTO temp.term_source(term, src, id) SELECT {at}, 0, rowid \
+             FROM object_text WHERE object_text MATCH {named}"
+        ))
+        .chain(summaries)
+        .collect();
+        leaf.source = Some(has(at, &sourced));
         leaf.hit = matched(at);
         leaf.probe = Some(has(at, &probed));
         leaf.set = Some(format!(
