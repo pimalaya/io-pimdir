@@ -1820,7 +1820,7 @@ fn retryable(err: &PimdirError) -> bool {
 }
 
 /// Why a row whose payload restates a body other than its
-/// `queue.object_hash` parks, naming both (§15.3), the column `NULL`
+/// `queue.object` parks, naming both (§15.3), the column `NULL`
 /// included; `None` for a row restating its own or carrying none.
 fn restated(row: &PimdirQueueRow, action: &PimdirAction) -> Option<String> {
     let stated = match action {

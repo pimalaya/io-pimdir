@@ -588,7 +588,7 @@ fn the_user_empties_quarantine_under_the_staging_lock() {
     assert!(quarantined(dir.path()).is_empty());
 }
 
-/// The drain reads a queued body from `queue.object_hash` and parks a row
+/// The drain reads a queued body from `queue.object` and parks a row
 /// whose payload's `object` names another (§15.3), naming both, rather
 /// than reading the payload's.
 #[test]

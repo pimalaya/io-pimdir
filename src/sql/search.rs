@@ -142,9 +142,9 @@ WHERE (i.seq = :seq OR i.link_id = :link_id)
   AND i.deleted = 0 AND i.retained_at IS NULL;"#;
 
 /// One placement row as the index holds it: its id, the rowid its summary
-/// text is keyed on, its link id and the body indexed for it, `NULL` while
-/// bodiless (SEARCH §3).
-pub const LOAD_PLACEMENT: &str = r#"SELECT id, link_id, hash FROM placement
+/// text is keyed on, its link id and the hash of the body indexed for it,
+/// `NULL` while bodiless or once the body's row is gone (SEARCH §3).
+pub const LOAD_PLACEMENT: &str = r#"SELECT id, link_id, (SELECT o.hash FROM object o WHERE o.id = placement.object) FROM placement
 WHERE collection = :collection AND seq = :seq;"#;
 
 /// Every category a task states, each once: what `category:` folds in
@@ -163,9 +163,10 @@ WHERE p.link_id = :link_id AND c.kind = 'message/rfc822';"#;
 
 /// A body the index holds for one message id, the source of its
 /// `In-Reply-To` and `References` (SEARCH §9).
-pub const MESSAGE_HASH: &str = r#"SELECT p.hash FROM placement p
+pub const MESSAGE_HASH: &str = r#"SELECT o.hash FROM placement p
+JOIN object o ON o.id = p.object
 JOIN store.collections c ON c.id = p.collection
-WHERE p.link_id = :link_id AND c.kind = 'message/rfc822' AND p.hash IS NOT NULL
+WHERE p.link_id = :link_id AND c.kind = 'message/rfc822'
 ORDER BY p.collection, p.seq LIMIT 1;"#;
 
 /// The first `In-Reply-To` id of a message id's summary (STORAGE Annex

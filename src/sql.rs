@@ -50,28 +50,28 @@ OBJECT_STATS = r#"SELECT count(*), coalesce(sum(size), 0) FROM objects;"#;
 LIST_OBJECT_HASHES = r#"SELECT hash FROM objects;"#;
 
 /// The bytes held by objects at least one live item binds.
-LIVE_BYTES = r#"SELECT coalesce(sum(size), 0) FROM objects WHERE hash IN
-(SELECT object_hash FROM items WHERE object_hash IS NOT NULL AND retained_at IS NULL);"#;
+LIVE_BYTES = r#"SELECT coalesce(sum(size), 0) FROM objects WHERE id IN
+(SELECT object FROM items WHERE object IS NOT NULL AND retained_at IS NULL);"#;
 
 /// One object's stored size.
 OBJECT_SIZE = r#"SELECT size FROM objects WHERE hash = :hash;"#;
 
 /// What a purge with this cutoff would retire, and what its bodies weigh.
 COUNT_RETAINED_BEFORE = r#"SELECT count(*), coalesce(sum(o.size), 0) FROM items i
-LEFT JOIN objects o ON o.hash = i.object_hash
+LEFT JOIN objects o ON o.id = i.object
 WHERE i.retained_at IS NOT NULL AND i.retained_at < :before;"#;
 
 /// The objects whose stored refcount disagrees with the six pointer columns.
-REFCOUNT_DRIFT = r#"WITH refs(hash) AS (
-  SELECT object_hash FROM items WHERE object_hash IS NOT NULL
+REFCOUNT_DRIFT = r#"WITH refs(id) AS (
+  SELECT object FROM items WHERE object IS NOT NULL
   UNION ALL SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL
   UNION ALL SELECT base_object FROM bindings WHERE base_object IS NOT NULL
   UNION ALL SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL
   UNION ALL SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL
-  UNION ALL SELECT object_hash FROM queue WHERE object_hash IS NOT NULL
-), counted(hash, n) AS (SELECT hash, count(*) FROM refs GROUP BY hash)
+  UNION ALL SELECT object FROM queue WHERE object IS NOT NULL
+), counted(id, n) AS (SELECT id, count(*) FROM refs GROUP BY id)
 SELECT o.hash, o.refcount, coalesce(c.n, 0) FROM objects o
-LEFT JOIN counted c ON c.hash = o.hash
+LEFT JOIN counted c ON c.id = o.id
 WHERE o.refcount != coalesce(c.n, 0) ORDER BY o.hash;"#;
 
 /// How many minted keys (§9) each collection holds; `GLOB` since `LIKE`
@@ -87,14 +87,17 @@ DANGLING_BINDINGS = r#"SELECT b.collection, '#' || b.item, b.source FROM binding
 WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.id = b.item)
 ORDER BY b.collection, b.item, b.source;"#;
 
-/// The items whose body is not indexed; reported, never repaired.
-DANGLING_ITEM_OBJECTS = r#"SELECT collection, link_id, object_hash FROM items
-WHERE object_hash IS NOT NULL AND object_hash NOT IN (SELECT hash FROM objects)
+/// The items whose body is not indexed; reported, never repaired. The body
+/// is named by the object id the pointer holds, `#` before it, since no
+/// object row holds its hash.
+DANGLING_ITEM_OBJECTS = r#"SELECT collection, link_id, '#' || object FROM items
+WHERE object IS NOT NULL AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.id = items.object)
 ORDER BY collection, link_id;"#;
 
-/// The queue rows whose body is not indexed; reported, never repaired.
-DANGLING_QUEUE_OBJECTS = r#"SELECT id, collection, object_hash FROM queue
-WHERE object_hash IS NOT NULL AND object_hash NOT IN (SELECT hash FROM objects)
+/// The queue rows whose body is not indexed; reported, never repaired, the
+/// body named as [`DANGLING_ITEM_OBJECTS`] names it.
+DANGLING_QUEUE_OBJECTS = r#"SELECT id, collection, '#' || object FROM queue
+WHERE object IS NOT NULL AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.id = queue.object)
 ORDER BY id;"#;
 
 /// Deletes the bindings whose item is gone: unreachable rows, and the one
@@ -108,7 +111,7 @@ DELETE_DANGLING_BINDINGS = r#"DELETE FROM bindings WHERE NOT EXISTS (
 /// too. Files are read from their summary alone, so a bodiless one hides
 /// nothing.
 COUNT_BODILESS = r#"SELECT c.kind, count(*) FROM items i JOIN collections c ON c.id = i.collection
-WHERE i.object_hash IS NULL AND i.deleted = 0 AND i.retained_at IS NULL
+WHERE i.object IS NULL AND i.deleted = 0 AND i.retained_at IS NULL
   AND c.kind <> 'application/octet-stream'
   AND i.collection IN (SELECT value FROM temp.param WHERE slot = 'collections')
 GROUP BY c.kind;"#;

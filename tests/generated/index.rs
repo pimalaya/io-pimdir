@@ -288,15 +288,16 @@ pub fn copy_store(from: &Path, to: &Path, index: bool) {
 
 /// Every row of the index at `root` keyed by what it indexes: the bodies a
 /// placement names by hash, those none names apart, the placements by
-/// collection and `seq`, and the full-text tables as the tokens each
-/// document holds, read through `fts5vocab`.
+/// collection and `seq`, each body by its hash (`gone` for an id naming
+/// no row, ids differing between two indexes), and the full-text tables
+/// as the tokens each document holds, read through `fts5vocab`.
 pub fn dump(root: &Path) -> Dump {
     let conn = Connection::open(root.join("index.db")).unwrap();
     conn.execute_batch(
         "CREATE VIRTUAL TABLE temp.object_vocab USING fts5vocab(main, object_text, instance);
          CREATE VIRTUAL TABLE temp.summary_vocab USING fts5vocab(main, summary_text, instance);
          CREATE TEMP VIEW placed AS SELECT id, hash, status, attachment, tel, adr, bday, photo \
-         FROM object WHERE hash IN (SELECT hash FROM placement WHERE hash IS NOT NULL);",
+         FROM object WHERE id IN (SELECT object FROM placement WHERE object IS NOT NULL);",
     )
     .unwrap();
 
@@ -328,7 +329,9 @@ pub fn dump(root: &Path) -> Dump {
         ),
         (
             "placement",
-            "SELECT collection, seq, link_id, hash, cut FROM placement ORDER BY 1, 2",
+            "SELECT p.collection, p.seq, p.link_id, \
+             coalesce(o.hash, CASE WHEN p.object IS NOT NULL THEN 'gone' END), p.cut \
+             FROM placement p LEFT JOIN object o ON o.id = p.object ORDER BY 1, 2",
         ),
         (
             "missing",

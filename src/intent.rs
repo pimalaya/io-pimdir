@@ -214,7 +214,7 @@ impl PimdirCollectionDelete {
 
 /// A message to send (Annex B.2, `submit`, capability `mail.submit`).
 ///
-/// The message is the action's body, the row's `queue.object_hash`, never
+/// The message is the action's body, the row's `queue.object`, never
 /// a member of the payload, which carries the envelope it is sent with,
 /// its `Bcc` field removed before transmission. Anchored on the
 /// collection the sent copy belongs to.

@@ -69,3 +69,22 @@ fn a_draft_store_at_another_schema_version_is_damaged() {
     let dir = damaged("PRAGMA user_version = 2; UPDATE store_meta SET version = 2;");
     refused_by_every_profile(dir.path(), "user_version");
 }
+
+/// A store of storage-draft-15 as it stood before objects were keyed by an
+/// integer, its `objects` table keyed by the hash, is damaged: the draft
+/// was edited in place, so its marker is this one's.
+#[test]
+fn a_store_keying_objects_by_hash_is_damaged() {
+    let dir = damaged(
+        "PRAGMA foreign_keys = OFF;
+         DROP TABLE objects;
+         CREATE TABLE objects (
+             hash     TEXT PRIMARY KEY CHECK (typeof(hash) = 'text')
+                      CHECK (length(hash) = 52 AND hash NOT GLOB '*[^a-z2-7]*'),
+             size     INTEGER NOT NULL CHECK (typeof(size) = 'integer') CHECK (size >= 0),
+             refcount INTEGER NOT NULL DEFAULT 0 CHECK (typeof(refcount) = 'integer') CHECK (refcount >= 0)
+         );
+         CREATE INDEX objects_garbage ON objects(refcount) WHERE refcount <= 0;",
+    );
+    refused_by_every_profile(dir.path(), "objects");
+}

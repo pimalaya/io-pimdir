@@ -739,13 +739,13 @@ impl Compiled {
             PimdirQueryPredicate::Encrypted => {
                 leaf.set = Some(String::from(
                     "SELECT ifnull(c.account, '') AS akey, p.seq AS seq FROM object o \
-                     JOIN placement p ON p.hash = o.hash \
+                     JOIN placement p ON p.object = o.id \
                      JOIN store.collections c ON c.id = p.collection \
                      WHERE o.status = 'encrypted'",
                 ));
                 object(at, &j, &format!("o{at}.status = 'encrypted'"))
             }
-            PimdirQueryPredicate::HasBody => format!("{j}.object_hash IS NOT NULL"),
+            PimdirQueryPredicate::HasBody => format!("{j}.object IS NOT NULL"),
             PimdirQueryPredicate::HasAttachment => format!(
                 "(EXISTS (SELECT 1 FROM store.mail_summary m{at} WHERE m{at}.item = {j}.id \
                  AND m{at}.attachment = 1) OR ({c}.kind = 'text/calendar' AND {}))",
@@ -816,8 +816,7 @@ impl Compiled {
                 format!(
                     "(EXISTS (SELECT 1 FROM store.task_category s{at} WHERE s{at}.item = {j}.id \
                      AND {stated}) OR EXISTS (SELECT 1 FROM placement p{at} \
-                     JOIN object o{at} ON o{at}.hash = p{at}.hash \
-                     JOIN object_category k{at} ON k{at}.object = o{at}.id \
+                     JOIN object_category k{at} ON k{at}.object = p{at}.object \
                      WHERE p{at}.collection = {j}.collection AND p{at}.seq = {j}.seq \
                      AND k{at}.value = {folded}))"
                 )
@@ -918,7 +917,7 @@ impl Compiled {
         let dated = |x: &str, c: &str| {
             format!(
                 "({c}.kind = 'message/rfc822' OR ({c}.kind = 'text/calendar' \
-                 AND {x}.object_hash IS NULL)) AND {x}.sort_key != ''{}",
+                 AND {x}.object IS NULL)) AND {x}.sort_key != ''{}",
                 range.replace("{x}", x)
             )
         };
@@ -1003,6 +1002,10 @@ impl Compiled {
     /// the leaf's number from bodies and, when its field exists there,
     /// from summaries; the condition reading them, the one probing its
     /// expression per placement, its set and its estimate.
+    ///
+    /// The probe reads `object_text` by the placement's `object`, keeping
+    /// a bodiless placement out first: FTS5 reads `rowid = NULL` as no
+    /// bound, which would match every body the expression matches.
     fn text(
         &mut self,
         leaf: &mut Leaf,
@@ -1051,9 +1054,9 @@ impl Compiled {
         };
         let probed = format!(
             "EXISTS (SELECT 1 FROM placement {p} WHERE {p}.collection = {j}.collection \
-             AND {p}.seq = {j}.seq AND (EXISTS (SELECT 1 FROM object o{at} \
-             WHERE o{at}.hash = {p}.hash AND EXISTS (SELECT 1 FROM object_text \
-             WHERE object_text MATCH {named} AND rowid = o{at}.id)){summarised}))"
+             AND {p}.seq = {j}.seq AND (({p}.object IS NOT NULL AND EXISTS (SELECT 1 \
+             FROM object_text WHERE object_text MATCH {named} AND rowid = {p}.object))\
+             {summarised}))"
         );
         let (summarised, summaries) = match summary {
             true => (
@@ -1070,9 +1073,8 @@ impl Compiled {
         };
         let sourced = format!(
             "EXISTS (SELECT 1 FROM placement {p} WHERE {p}.collection = {j}.collection \
-             AND {p}.seq = {j}.seq AND (EXISTS (SELECT 1 FROM object o{at} \
-             JOIN temp.term_source s{at} ON s{at}.term = {at} AND s{at}.src = 0 \
-             AND s{at}.id = o{at}.id WHERE o{at}.hash = {p}.hash){summarised}))"
+             AND {p}.seq = {j}.seq AND (EXISTS (SELECT 1 FROM temp.term_source s{at} \
+             WHERE s{at}.term = {at} AND s{at}.src = 0 AND s{at}.id = {p}.object){summarised}))"
         );
         leaf.sources = core::iter::once(format!(
             "INSERT OR IGNORE INTO temp.term_source(term, src, id) SELECT {at}, 0, rowid \
@@ -1153,7 +1155,7 @@ fn matched(at: usize) -> String {
 /// `o{at}` meets `condition`.
 fn object(at: usize, j: &str, condition: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM placement p{at} JOIN object o{at} ON o{at}.hash = p{at}.hash \
+        "EXISTS (SELECT 1 FROM placement p{at} JOIN object o{at} ON o{at}.id = p{at}.object \
          WHERE p{at}.collection = {j}.collection AND p{at}.seq = {j}.seq AND {condition})"
     )
 }

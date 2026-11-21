@@ -350,7 +350,7 @@ pub enum PimdirAction {
         kind: String,
         /// The raw versioned JSON payload, verbatim.
         payload: String,
-        /// The body the row pins, its `queue.object_hash` (§15.3): what a
+        /// The body the row pins, its `queue.object` (§15.3): what a
         /// producer building the action and the queue reads set, `None`
         /// from [`action_from_payload`], which reads the payload alone.
         object_hash: Option<PimdirHash>,
@@ -661,7 +661,7 @@ fn unknown(kind: &str, payload: &str) -> Result<bool, PimdirActionError> {
 /// owner skips and a reader lists. An intent of Annex B.2 is read whole
 /// by its type in [`crate::intent`] and kept as [`PimdirAction::Unknown`]
 /// too. Neither names its body here: that is the row's
-/// `queue.object_hash`, which the queue reads fill in.
+/// `queue.object`, which the queue reads fill in.
 pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, PimdirActionError> {
     if unknown(kind, payload)? {
         return Ok(PimdirAction::Unknown {

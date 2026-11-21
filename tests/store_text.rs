@@ -724,7 +724,8 @@ fn item_row(dir: &Path) -> (i64, Option<String>, Option<String>, i64) {
     rusqlite::Connection::open(dir.join("pimdir.db"))
         .unwrap()
         .query_row(
-            "SELECT deleted, retained_by, object_hash, marks FROM items",
+            "SELECT i.deleted, i.retained_by, o.hash, i.marks FROM items i \
+             LEFT JOIN objects o ON o.id = i.object",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )

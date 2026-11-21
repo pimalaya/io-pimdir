@@ -1047,16 +1047,17 @@ fn model_event(event: &Event) -> String {
 }
 
 /// The bodies a row of the store at `root` names whose blob is not held:
-/// a body lost.
+/// a body lost. Each pointer is an object id, read as its row's hash.
 fn unheld(root: &Path) -> BTreeSet<String> {
     let conn = Connection::open(root.join("pimdir.db")).unwrap();
     let mut statement = conn
         .prepare(
-            "SELECT object_hash FROM items WHERE object_hash IS NOT NULL \
-             UNION SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
-             UNION SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
-             UNION SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL \
-             UNION SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL",
+            "SELECT o.hash FROM objects o WHERE o.id IN ( \
+               SELECT object FROM items WHERE object IS NOT NULL \
+               UNION SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
+               UNION SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
+               UNION SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL \
+               UNION SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL)",
         )
         .unwrap();
     let named: Vec<String> = statement

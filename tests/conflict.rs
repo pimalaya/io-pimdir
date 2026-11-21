@@ -179,7 +179,7 @@ fn a_conflict_survives_a_reopen() {
 /// resolving edit to be adopted as the shared body too, because a binding
 /// cleared of its conflict while the item still holds the body the merge
 /// replaced leaves the next run pushing the unmerged body over the remote
-/// the merge was made against. That is `items.object_hash` moving, and
+/// the merge was made against. That is `items.object` moving, and
 /// this is the only place a resolution is run through the store, so a
 /// resolution written at the body the conflict was filed at would assert
 /// the flags and nothing else.

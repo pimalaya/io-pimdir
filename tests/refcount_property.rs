@@ -683,17 +683,20 @@ fn peek(dir: &Path) -> Connection {
 }
 
 /// The hashes the six pointer columns name (spec §5), which is exactly
-/// the set the collector must not touch.
+/// the set the collector must not touch: each pointer is an object id,
+/// read as its row's hash, `#` and the id for one naming no row.
 fn reachable(dir: &Path) -> BTreeSet<String> {
     let conn = peek(dir);
     let mut stmt = conn
         .prepare(
-            "SELECT object_hash FROM items WHERE object_hash IS NOT NULL \
-             UNION SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
-             UNION SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
-             UNION SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL \
-             UNION SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL \
-             UNION SELECT object_hash FROM queue WHERE object_hash IS NOT NULL",
+            "SELECT coalesce(o.hash, '#' || r.id) FROM ( \
+               SELECT object AS id FROM items WHERE object IS NOT NULL \
+               UNION SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
+               UNION SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
+               UNION SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL \
+               UNION SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL \
+               UNION SELECT object FROM queue WHERE object IS NOT NULL \
+             ) r LEFT JOIN objects o ON o.id = r.id",
         )
         .unwrap();
     stmt.query_map([], |row| row.get::<_, String>(0))
@@ -707,15 +710,15 @@ fn indexed(dir: &Path) -> BTreeMap<String, i64> {
     let conn = peek(dir);
     let mut stmt = conn
         .prepare(
-            "WITH refs(hash) AS ( \
-               SELECT object_hash FROM items WHERE object_hash IS NOT NULL \
+            "WITH refs(id) AS ( \
+               SELECT object FROM items WHERE object IS NOT NULL \
                UNION ALL SELECT conflict_object FROM items WHERE conflict_object IS NOT NULL \
                UNION ALL SELECT base_object FROM bindings WHERE base_object IS NOT NULL \
                UNION ALL SELECT conflict_object FROM bindings WHERE conflict_object IS NOT NULL \
                UNION ALL SELECT shared_object FROM bindings WHERE shared_object IS NOT NULL \
-               UNION ALL SELECT object_hash FROM queue WHERE object_hash IS NOT NULL \
+               UNION ALL SELECT object FROM queue WHERE object IS NOT NULL \
              ) \
-             SELECT o.hash, (SELECT count(*) FROM refs WHERE refs.hash = o.hash) FROM objects o",
+             SELECT o.hash, (SELECT count(*) FROM refs WHERE refs.id = o.id) FROM objects o",
         )
         .unwrap();
     stmt.query_map([], |row| {
@@ -745,11 +748,11 @@ fn item_conflict_state(dir: &Path) -> (bool, bool) {
     let alone: i64 = conn
         .query_row(
             "SELECT count(*) FROM items i WHERE i.conflict_object IS NOT NULL \
-               AND NOT EXISTS (SELECT 1 FROM items x WHERE x.object_hash = i.conflict_object) \
+               AND NOT EXISTS (SELECT 1 FROM items x WHERE x.object = i.conflict_object) \
                AND NOT EXISTS (SELECT 1 FROM bindings b \
                  WHERE b.base_object = i.conflict_object \
                     OR b.conflict_object = i.conflict_object) \
-               AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.object_hash = i.conflict_object)",
+               AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.object = i.conflict_object)",
             [],
             |row| row.get(0),
         )

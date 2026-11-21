@@ -371,6 +371,17 @@ Every profile (the owner's `open` and `open_current`, the reader, the producer, 
 #### Scenario: A foreign database, another algorithm, disagreeing stamps
 - tests/store_version.rs `a_foreign_database_is_refused_by_every_profile_and_left_as_it_was`, `a_store_of_another_algorithm_is_refused_by_every_profile`, `disagreeing_stamps_are_refused_by_every_profile`; tests/queue.rs `a_store_lacking_store_meta_is_foreign`, `a_store_of_a_later_version_is_refused`
 
+#### Scenario: A store of storage-draft-15 keying its objects by hash
+- GIVEN a store marked `storage-draft-15` whose `objects` table is keyed by the hash, as the draft stood before pimdir 8b1523d edited it in place
+- WHEN the owner's two opens, a reader and a producer open it
+- THEN each refuses it as `Damaged` naming `objects`, and pimdir.db is byte for byte as it was (tests/stale_store.rs `a_store_keying_objects_by_hash_is_damaged`, which names `objects_count_collect` instead against the previous schema): such a store is set aside and a new one synced
+
+### Requirement: An object is keyed by an integer and named by its hash
+The store SHALL key an object by `objects.id`, an integer drawn above every one drawn before and never reused, the hash unique on the object row alone (`objects_by_hash`), and every pointer at a body (`items.object`, `items.conflict_object`, `bindings.base_object`, `bindings.conflict_object`, `bindings.shared_object`, `queue.object`) SHALL hold that id (STORAGE §4.3, §5, §13). The crate's API SHALL keep naming a body by its hash, as the canonical statements take and answer it (STORAGE §4.4): no public type carries an object's id. The crate's own statements SHALL join pointers to objects by the id, never by the hash: the recount behind `refcount_drift` (`REFCOUNT_DRIFT`), `live_bytes` (`LIVE_BYTES`), `retained_before` (`COUNT_RETAINED_BEFORE`), the coverage's bodiless count (`COUNT_BODILESS`), and the two dangling diagnoses, which name a pointer at no object row by its id, `#` before it (`DANGLING_ITEM_OBJECTS`, `DANGLING_QUEUE_OBJECTS`), no row holding its hash.
+
+#### Scenario: The vectors and the recount
+- every vector of vectors/ passes on the integer keys, no expectation moved (the suites of spec-fidelity.md), and tests/refcount_property.rs recounts the six pointers by id against the stored refcounts, reading each pointer back as its object's hash
+
 ### Requirement: The store reads three compatibility versions
 The crate SHALL read `version`, `read_version` and `produce_version` from `store_meta` (`PimdirReader::store_meta`, `PimdirStoreMeta`, `load_store_meta`'s fourteen columns); while the format is a draft the marker governs alone and the three stay 1 (STORAGE §4.2), so no profile compares them. `pimdir store info` prints the format version and the three (cli.md).
 
@@ -541,7 +552,7 @@ never parked, so another owner can perform it.
   draining source binds nothing there
 
 ### Requirement: Queued bodies are pinned
-An object referenced by a pending queue row's `object_hash` SHALL count as
+An object referenced by a pending queue row's `object` SHALL count as
 referenced under the incremental refcount scheme, so garbage collection never
 sweeps a body between enqueue and apply. The pin is taken at enqueue and released
 when the row is deleted, with the applied item's own reference taken in the same
@@ -618,8 +629,8 @@ through `PimdirBinding`. `conflict_revision` SHALL be written and read as
 meaningful only while `conflicted` is set, so a resolved binding cannot hand a
 stale revision to the next sync.
 
-The table SHALL additionally carry `conflict_object` (TEXT, nullable,
-referencing `objects(hash)`), round-tripped through `PimdirBinding` and,
+The table SHALL additionally carry `conflict_object` (INTEGER, nullable, an
+object's `id` referencing `objects(id)`, read and written as the body's hash), round-tripped through `PimdirBinding` and,
 like `conflict_revision`, meaningful only while `conflicted` is set. It holds
 the diverging remote body at the revision beside it, so that resolution can read
 base, local and remote from the store alone.
@@ -646,7 +657,7 @@ to the retiring body, so a holder of another body or none keeps the row,
 in `store_meta.purges` (STORAGE §11). Otherwise the retirement is: `deleted` set, `retained_at`
 stamped by SQLite (`strftime('%Y-%m-%dT%H:%M:%fZ','now')`, so the crate needs no
 clock), `retained_by` set to the source whose removal retired it, and
-`object_hash` kept. The item's now source-less bindings SHALL be deleted with it,
+its body (`object`) kept. The item's now source-less bindings SHALL be deleted with it,
 so a retained row carries `deleted = 1` and no binding at all: the persisted form
 of a removal that has finished propagating.
 
@@ -712,7 +723,7 @@ A bodiless placement of a mutable kind (a card, a calendar resource, a file) rev
 - THEN the row revives under its key and `seq` at `Meta`, its base at `e2` naming no body, `n1` is a retained item under `dup:<id>#<id>` reported `Overruled` after the member's `Added`, and nothing is pushed (vectors/sync/108)
 
 ### Requirement: An owner skips the actions it cannot apply
-An action kind the store does not recognise SHALL decode as an opaque action (kind and raw payload) rather than an error, so one queue can carry store mutations any owner applies beside capability-bound intents (a mail submission) only a specific owner can perform. An Annex B.2 intent SHALL decode the same way once its type has read it strictly, a malformed one parked (below). The opaque action's body is the row's `queue.object_hash`, which the queue reads fill in: `codec::action_from_payload`, reading the payload alone, names none, and an intent's payload never names its body. A payload unknown to this crate, its kind one it holds no schema for or an integer `v` other than 1 for a kind it knows, SHALL be kept the same way and read no further, whatever its other members hold (STORAGE §15.2, §15.3): the drain leaves its row pending and untouched, never parks it as malformed, and runs no gate nor backstop on it, an intent at a later version included. A payload of a known kind that is not a JSON object SHALL still park, there being no `v` to read, as SHALL one stating no `v` or one that is no integer, which names no version a later owner would know (tests/queue.rs `a_known_action_stating_no_usable_version_parks`; src/codec.rs `a_known_action_stating_no_usable_version_is_malformed`).
+An action kind the store does not recognise SHALL decode as an opaque action (kind and raw payload) rather than an error, so one queue can carry store mutations any owner applies beside capability-bound intents (a mail submission) only a specific owner can perform. An Annex B.2 intent SHALL decode the same way once its type has read it strictly, a malformed one parked (below). The opaque action's body is the row's `queue.object`, which the queue reads answer as its hash (`object_hash`) and fill in: `codec::action_from_payload`, reading the payload alone, names none, and an intent's payload never names its body. A payload unknown to this crate, its kind one it holds no schema for or an integer `v` other than 1 for a kind it knows, SHALL be kept the same way and read no further, whatever its other members hold (STORAGE §15.2, §15.3): the drain leaves its row pending and untouched, never parks it as malformed, and runs no gate nor backstop on it, an intent at a later version included. A payload of a known kind that is not a JSON object SHALL still park, there being no `v` to read, as SHALL one stating no `v` or one that is no integer, which names no version a later owner would know (tests/queue.rs `a_known_action_stating_no_usable_version_parks`; src/codec.rs `a_known_action_stating_no_usable_version_is_malformed`).
 
 The drain SHALL **skip** a row it cannot apply: the row stays pending, `error` `NULL` and `attempts` unbumped, is never parked (parking means permanently unappliable), and never blocks later actions in the same collection. The drain report SHALL count skips beside applies and parks.
 

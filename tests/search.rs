@@ -3686,7 +3686,8 @@ mod memory {
                     let mut rows = Vec::new();
                     for (collection, seq) in &self.missing {
                         rows.extend(self.feed(
-                            "SELECT i.collection, i.link_id, i.seq, i.object_hash, \
+                            "SELECT i.collection, i.link_id, i.seq, \
+                               (SELECT o.hash FROM store.objects o WHERE o.id = i.object), \
                                CASE WHEN i.flags_known = 1 THEN trim( \
                                  CASE WHEN i.marks & 1 THEN '\\Seen ' ELSE '' END \
                                  || CASE WHEN i.marks & 2 THEN '\\Answered ' ELSE '' END \
@@ -3989,11 +3990,13 @@ mod memory {
             value => Some(text(value)),
         };
 
-        let placements: BTreeMap<Key, (String, Option<String>)> =
-            rows("SELECT collection, seq, link_id, hash FROM placement")
-                .iter()
-                .map(|r| ((text(&r[0]), int(&r[1])), (text(&r[2]), maybe(&r[3]))))
-                .collect();
+        let placements: BTreeMap<Key, (String, Option<String>)> = rows(
+            "SELECT p.collection, p.seq, p.link_id, o.hash FROM placement p \
+                 LEFT JOIN object o ON o.id = p.object",
+        )
+        .iter()
+        .map(|r| ((text(&r[0]), int(&r[1])), (text(&r[2]), maybe(&r[3]))))
+        .collect();
         assert_eq!(placements, memory.placements, "placements");
 
         let objects: BTreeMap<String, Vec<i64>> =
