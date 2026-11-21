@@ -34,7 +34,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["client", "vendored"]
-client = ["dep:fs4", "dep:rusqlite", "dep:rustix"]
+client = ["dep:fs4", "dep:libc", "dep:rusqlite", "dep:rustix"]
 mail = ["dep:mime-rs", "dep:unicode-normalization"]
 contact = ["dep:unicode-normalization", "dep:vcard-rs"]
 calendar = ["dep:ical-rs", "dep:unicode-normalization"]
@@ -84,3 +84,6 @@ vcard-rs = { version = "0.6.1", default-features = false, features = ["parser"],
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", default-features = false, optional = true }

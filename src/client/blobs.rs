@@ -13,7 +13,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
     sync::Arc,
@@ -52,6 +52,62 @@ const CHUNK: usize = 64 * 1024;
 /// copied (§5).
 #[cfg(unix)]
 const CLAIMS_MAX: usize = 3;
+
+/// How many temporaries a deferred batch keeps open before it flushes and
+/// moves them, well under the usual limit of 1,024 descriptors.
+const DEFERRED_MAX: usize = 256;
+
+/// How a write batch makes its bodies durable before the rows naming them
+/// commit (STORAGE §5). Either way each temporary is flushed before its
+/// move, and every move and shard directory flush ends before the commit.
+///
+/// The default on Linux is [`Deferred`](Self::Deferred) with the writeback
+/// started by `sync_file_range` ([`start_writeback`]), which took a 517k
+/// message import's sync from 572 s to 305 s; [`Each`](Self::Each)
+/// elsewhere.
+#[derive(Clone, Copy, Debug)]
+pub enum PimdirBodyFlush {
+    /// Each temporary flushed as soon as it is written, then moved.
+    Each,
+    /// The temporaries of a batch written first, [`DEFERRED_MAX`] at most
+    /// open at once, then each flushed, then each moved: a flush finds
+    /// the writeback the hint started mostly done.
+    Deferred {
+        /// Called on each temporary once written, to start its writeback
+        /// without waiting for it (on Linux `sync_file_range` with
+        /// `SYNC_FILE_RANGE_WRITE`). A hint: the flush that follows
+        /// decides, so it answers nothing.
+        writeback: Option<fn(&fs::File)>,
+    },
+}
+
+impl Default for PimdirBodyFlush {
+    #[cfg(target_os = "linux")]
+    fn default() -> Self {
+        Self::Deferred {
+            writeback: Some(start_writeback),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn default() -> Self {
+        Self::Each
+    }
+}
+
+/// Starts the writeback of a written body without waiting for it
+/// (`sync_file_range` with `SYNC_FILE_RANGE_WRITE`): a hint, the flush
+/// that follows deciding, so its failure is ignored.
+#[cfg(target_os = "linux")]
+pub fn start_writeback(file: &fs::File) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: the descriptor is open for as long as `file` is borrowed,
+    // and the call reads no memory of this process.
+    unsafe {
+        libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
+    }
+}
 
 /// A read-only handle over a store's blob directory (STORAGE §5).
 ///
@@ -293,19 +349,51 @@ impl PimdirBlobs {
 
     /// Writes every body a batch carries, ahead of the transaction that
     /// indexes them (§14): a body is immutable, so writing it early leaves
-    /// at worst an orphan for the collector. Each shard directory the
-    /// batch wrote a body into, or kept one in, is flushed once, after
-    /// its last body, and objects/ once when a shard is new (§5).
-    pub(crate) fn stage(&self, ops: &[PimdirWriteOp]) -> io::Result<()> {
-        let mut shards: BTreeMap<PathBuf, bool> = BTreeMap::new();
-        for op in ops {
-            if let PimdirWriteOp::StoreObject {
+    /// at worst an orphan for the collector. Each temporary is flushed
+    /// before its move, as `flush` schedules it ([`PimdirBodyFlush`]).
+    /// Each shard directory the batch wrote a body into, or kept one in,
+    /// is flushed once, after its last body, and objects/ once when a
+    /// shard is new (§5).
+    pub(crate) fn stage(&self, ops: &[PimdirWriteOp], flush: PimdirBodyFlush) -> io::Result<()> {
+        let bodies = ops.iter().filter_map(|op| match op {
+            PimdirWriteOp::StoreObject {
                 object,
                 body: Some(body),
-            } = op
-            {
-                let (shard, created) = self.put(&object.hash, body)?;
-                *shards.entry(shard).or_default() |= created;
+            } => Some((&object.hash, body.as_slice())),
+            _ => None,
+        });
+
+        let mut shards: BTreeMap<PathBuf, bool> = BTreeMap::new();
+        match flush {
+            PimdirBodyFlush::Each => {
+                for (hash, body) in bodies {
+                    let (shard, created) = self.put(hash, body)?;
+                    *shards.entry(shard).or_default() |= created;
+                }
+            }
+            PimdirBodyFlush::Deferred { writeback } => {
+                let mut seen = BTreeSet::new();
+                let mut temps = Vec::new();
+                for (hash, body) in bodies {
+                    if !seen.insert(hash) {
+                        continue;
+                    }
+
+                    let (shard, created, temp) = self.open_temp(hash, body)?;
+                    *shards.entry(shard).or_default() |= created;
+                    let Some(temp) = temp else {
+                        continue;
+                    };
+
+                    if let (Some(writeback), Some(file)) = (writeback, &temp.file) {
+                        writeback(file);
+                    }
+                    temps.push(temp);
+                    if temps.len() >= DEFERRED_MAX {
+                        self.settle_temps(&mut temps)?;
+                    }
+                }
+                self.settle_temps(&mut temps)?;
             }
         }
 
@@ -381,6 +469,25 @@ impl PimdirBlobs {
     /// directory to flush and whether it is new, so a batch flushes each
     /// once.
     fn put(&self, hash: &PimdirHash, body: &[u8]) -> io::Result<(PathBuf, bool)> {
+        let (shard, created, temp) = self.open_temp(hash, body)?;
+        if let Some(mut temp) = temp {
+            temp.sync()?;
+            temp.settle(self)?;
+        }
+
+        Ok((shard, created))
+    }
+
+    /// The first half of [`put`](Self::put): the shard directory made
+    /// sure of, the name checked, then the body written to a temporary
+    /// of its own, neither flushed nor moved. Answers the shard, whether
+    /// it is new, and the temporary, `None` when the name already holds
+    /// the body.
+    fn open_temp(
+        &self,
+        hash: &PimdirHash,
+        body: &[u8],
+    ) -> io::Result<(PathBuf, bool, Option<PimdirBlobTemp>)> {
         let (shard, name) = self.locate(hash)?;
         let path = shard.join(name);
         // NOTE: the shard first, so a name is never looked up through a
@@ -388,7 +495,7 @@ impl PimdirBlobs {
         let created = self.shard(&shard)?;
         if fs::symlink_metadata(&path).is_ok() {
             match self.check(hash)? {
-                PimdirBlobCheck::Sound => return Ok((shard, created)),
+                PimdirBlobCheck::Sound => return Ok((shard, created, None)),
                 PimdirBlobCheck::Failing => return Err(held(hash)),
                 // NOTE: gone since it was found, so written after all.
                 PimdirBlobCheck::Missing => (),
@@ -398,26 +505,34 @@ impl PimdirBlobs {
         // NOTE: unique to this writer, so two processes storing one body
         // never write, then link, each other's bytes (§5).
         let tmp = shard.join(format!(".{name}.{}.tmp", unique()));
-        let written = modes::options()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .and_then(|mut file| {
-                file.write_all(body)?;
-                file.sync_all()
-            });
-        if let Err(err) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
+        let file = modes::options().write(true).create_new(true).open(&tmp)?;
+        let mut temp = PimdirBlobTemp {
+            file: Some(file),
+            tmp,
+            path,
+            hash: hash.clone(),
+            moved: false,
+        };
+        if let Some(file) = &mut temp.file {
+            file.write_all(body)?;
         }
 
-        let settled = self.settle(hash, &tmp, &path);
-        if settled.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        settled?;
+        Ok((shard, created, Some(temp)))
+    }
 
-        Ok((shard, created))
+    /// Flushes every temporary of `temps`, then moves each onto its name
+    /// (§5), leaving `temps` empty: no name takes a body before every
+    /// flush of the lot returned. A failure unlinks the temporaries not
+    /// moved yet.
+    fn settle_temps(&self, temps: &mut Vec<PimdirBlobTemp>) -> io::Result<()> {
+        for temp in temps.iter_mut() {
+            temp.sync()?;
+        }
+        for temp in temps.drain(..) {
+            temp.settle(self)?;
+        }
+
+        Ok(())
     }
 
     /// Moves a written temporary onto its final name without replacing a
@@ -865,6 +980,87 @@ pub enum PimdirBlobFiled {
     Moved,
     /// The name was already held, and kept: the file is where it was.
     Held,
+}
+
+/// A body's temporary in its shard directory, written and not yet moved
+/// onto its name: unlinked when dropped unmoved.
+struct PimdirBlobTemp {
+    /// `None` once flushed and closed.
+    file: Option<fs::File>,
+    tmp: PathBuf,
+    path: PathBuf,
+    hash: PimdirHash,
+    /// Whether the name holds the body, by this move or another writer's.
+    moved: bool,
+}
+
+impl PimdirBlobTemp {
+    /// Flushes the bytes written (§5), then closes the file.
+    fn sync(&mut self) -> io::Result<()> {
+        if let Some(file) = self.file.take() {
+            file.sync_all()?;
+            #[cfg(test)]
+            probe::fire(probe::PimdirBlobEvent::Flushed(self.hash.clone()));
+        }
+
+        Ok(())
+    }
+
+    /// Moves the flushed temporary onto its name, never replacing a file
+    /// there (§5).
+    fn settle(mut self, blobs: &PimdirBlobs) -> io::Result<()> {
+        blobs.settle(&self.hash, &self.tmp, &self.path)?;
+        self.moved = true;
+        #[cfg(test)]
+        probe::fire(probe::PimdirBlobEvent::Moved(self.hash.clone()));
+
+        Ok(())
+    }
+}
+
+impl Drop for PimdirBlobTemp {
+    fn drop(&mut self) {
+        self.file.take();
+        if !self.moved {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+/// What a test sees of a batch's bodies as they become durable.
+#[cfg(test)]
+pub(crate) mod probe {
+    use alloc::boxed::Box;
+
+    use std::cell::RefCell;
+
+    use crate::object::PimdirHash;
+
+    /// One step of a body on its way to its name.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum PimdirBlobEvent {
+        /// Its temporary's flush returned.
+        Flushed(PimdirHash),
+        /// Its name holds it.
+        Moved(PimdirHash),
+    }
+
+    /// A callback the events of a thread's writes reach.
+    pub(crate) type PimdirBlobProbe = Box<dyn FnMut(PimdirBlobEvent)>;
+
+    std::thread_local! {
+        /// The callback this thread's writes report to, if any.
+        pub(crate) static PROBE: RefCell<Option<PimdirBlobProbe>> = const { RefCell::new(None) };
+    }
+
+    /// Reports `event` to this thread's callback.
+    pub(crate) fn fire(event: PimdirBlobEvent) {
+        PROBE.with_borrow_mut(|probe| {
+            if let Some(probe) = probe {
+                probe(event);
+            }
+        });
+    }
 }
 
 /// What sits where a body belongs, opened without following a link.

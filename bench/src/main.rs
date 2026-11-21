@@ -24,6 +24,7 @@ use io_pimdir::{
     change::PimdirChange,
     client::{
         PimdirStore,
+        blobs::PimdirBodyFlush,
         search::{PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchOptions},
     },
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor},
@@ -392,6 +393,33 @@ fn folders(root: &Path) -> io::Result<Vec<String>> {
     Ok(out)
 }
 
+/// The body flush `PIMBENCH_FLUSH` names: `each` (the default), a flush
+/// per body as it is written; `deferred`, a page's bodies written, then
+/// each flushed, then each moved; `writeback`, `deferred` with each
+/// body's writeback started as it is written.
+fn body_flush() -> PimdirBodyFlush {
+    match env::var("PIMBENCH_FLUSH").as_deref() {
+        Err(_) => PimdirBodyFlush::default(),
+        Ok("each") => PimdirBodyFlush::Each,
+        Ok("deferred") => PimdirBodyFlush::Deferred { writeback: None },
+        Ok("writeback") => PimdirBodyFlush::Deferred {
+            writeback: Some(writeback),
+        },
+        Ok(other) => panic!("PIMBENCH_FLUSH: each, deferred or writeback, not {other}"),
+    }
+}
+
+/// Starts the writeback of a written body without waiting for it.
+fn writeback(file: &fs::File) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: the descriptor is open for as long as `file` is borrowed,
+    // and the call reads no memory of this process.
+    unsafe {
+        libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
+    }
+}
+
 fn cmd_sync(args: &[String]) {
     let store_dir = PathBuf::from(&args[0]);
     let root = PathBuf::from(&args[1]);
@@ -400,6 +428,8 @@ fn cmd_sync(args: &[String]) {
     fs::create_dir_all(&state).unwrap();
     let folders = folders(&root).unwrap();
     let mut store = PimdirStore::open(&store_dir).unwrap().for_source("maildir");
+    store.body_flush = body_flush();
+    let flush = env::var("PIMBENCH_FLUSH").unwrap_or_else(|_| "default".into());
     let mut remote = Maildir {
         mtimes: Maildir::load_mtimes(&state),
         root,
@@ -442,6 +472,7 @@ fn cmd_sync(args: &[String]) {
                 ("folders", folders.len().to_string()),
                 ("unreadable", unreadable.to_string()),
                 ("mail_bytes", remote.read_bytes.to_string()),
+                ("flush", flush),
             ],
         )
     );

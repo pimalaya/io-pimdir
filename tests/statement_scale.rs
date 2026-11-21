@@ -1,9 +1,11 @@
 //! The canonical statements the audit of 2026-11-12 rewrote for a large
 //! collection (its lines P1 to P3), timed over a store of 60,000 mail
 //! placements in one collection, built through the owner as a connector
-//! lists them: `list_owing_bindings`, `list_superseded_bindings`,
-//! `list_superseded_pending`, `collection_sources` and `count_unread`,
-//! as vendored, on the linked SQLite.
+//! lists them: `list_owing_bindings`, `list_lacking_items` (both seeking
+//! the owing marks since pimdir's the-owing-rows-are-marked),
+//! `list_superseded_bindings`, `list_superseded_pending`,
+//! `collection_sources` and `count_unread`, as vendored, on the linked
+//! SQLite.
 //!
 //! `PIMDIR_BEFORE` names a directory of statement files of an earlier
 //! revision of the specification (`<name>.sql`), timed beside the
@@ -181,6 +183,7 @@ fn the_rewritten_statements_at_sixty_thousand_placements() {
 
     let statements = [
         ("list_owing_bindings", sql::LIST_OWING_BINDINGS),
+        ("list_lacking_items", sql::LIST_LACKING_ITEMS),
         ("list_superseded_bindings", sql::LIST_SUPERSEDED_BINDINGS),
         ("list_superseded_pending", sql::LIST_SUPERSEDED_PENDING),
         ("collection_sources", sql::COLLECTION_SOURCES),

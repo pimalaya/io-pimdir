@@ -338,7 +338,7 @@ impl PimdirSourceStore {
         let mut moved = BTreeSet::new();
         let _writing = loop {
             let writing = lock.writing();
-            let staged = blobs.stage(&ops);
+            let staged = blobs.stage(&ops, self.body_flush);
             let Err(err) = staged else {
                 break writing;
             };
@@ -2753,4 +2753,143 @@ pub(crate) fn settle_unbound(
     new.items.insert(link.clone(), item);
     adjust_refcounts(conn, &object_refs(&old), &object_refs(&new))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{boxed::Box, format, rc::Rc, vec::Vec};
+
+    use core::{
+        cell::RefCell,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use std::fs;
+
+    use rusqlite::{Connection, OpenFlags};
+
+    use crate::{
+        change::PimdirWriteOp,
+        client::{
+            PimdirStore,
+            blobs::{
+                PimdirBodyFlush,
+                probe::{PROBE, PimdirBlobEvent},
+            },
+        },
+        hash,
+        object::{PimdirHash, PimdirObject},
+    };
+
+    /// How many temporaries the hint below was handed.
+    static HINTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// A writeback hint that checks it is handed the written bytes.
+    fn hint(file: &fs::File) {
+        assert!(file.metadata().unwrap().len() > 0);
+        HINTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether a committed row names the body under `hash`.
+    fn named(conn: &Connection, hash: &PimdirHash) -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM objects WHERE hash = ?1",
+            [&hash.0],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// Every way to flush a batch's bodies keeps STORAGE §5's order: a
+    /// body's temporary is flushed before its move, no committed row
+    /// names a body before its flush and its move returned, and once the
+    /// batch commits every body it names is on its name, whole. A batch
+    /// of more bodies than the 256 a deferred flush keeps open, one body
+    /// twice and one already stored cross every path of that flush.
+    #[test]
+    fn every_body_is_flushed_and_moved_before_a_row_names_it() {
+        let modes = [
+            PimdirBodyFlush::Each,
+            PimdirBodyFlush::Deferred { writeback: None },
+            PimdirBodyFlush::Deferred {
+                writeback: Some(hint),
+            },
+        ];
+
+        for mode in modes {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = PimdirStore::open(dir.path()).unwrap().for_source("test");
+            store.body_flush = mode;
+
+            let held = b"stored before the batch".to_vec();
+            let held_hash = hash::hash(&held);
+            store.blob_stage().stage_body(&held).unwrap();
+
+            let mut bodies: Vec<Vec<u8>> = (0..600)
+                .map(|n| format!("body {n} of the batch").into_bytes())
+                .collect();
+            bodies.push(bodies[7].clone());
+            bodies.push(held.clone());
+            let ops: Vec<PimdirWriteOp> = bodies
+                .iter()
+                .map(|body| PimdirWriteOp::StoreObject {
+                    object: PimdirObject {
+                        hash: hash::hash(body),
+                        size: body.len(),
+                    },
+                    body: Some(body.clone()),
+                })
+                .collect();
+
+            let conn = Connection::open_with_flags(
+                dir.path().join("pimdir.db"),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let seen = Rc::clone(&events);
+            PROBE.set(Some(Box::new(move |event| {
+                let (PimdirBlobEvent::Flushed(hash) | PimdirBlobEvent::Moved(hash)) = &event;
+                assert!(!named(&conn, hash), "{mode:?}: a row names {hash:?} early");
+                seen.borrow_mut().push(event);
+            })));
+            HINTED.store(0, Ordering::Relaxed);
+
+            store.write(ops).unwrap();
+            PROBE.set(None);
+
+            let events = events.borrow();
+            let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
+            for body in &bodies {
+                let hash = hash::hash(body);
+                assert!(named(&conn, &hash), "{mode:?}: the batch names {hash:?}");
+                assert_eq!(store.blobs().get(&hash).unwrap().as_ref(), Some(body));
+                if hash == held_hash {
+                    continue;
+                }
+
+                let at = |wanted: PimdirBlobEvent| events.iter().position(|e| *e == wanted);
+                let flushed = at(PimdirBlobEvent::Flushed(hash.clone())).unwrap();
+                let moved = at(PimdirBlobEvent::Moved(hash.clone())).unwrap();
+                assert!(flushed < moved, "{mode:?}: {hash:?} moved unflushed");
+            }
+
+            let first_move = events
+                .iter()
+                .position(|e| matches!(e, PimdirBlobEvent::Moved(_)))
+                .unwrap();
+            let (expected, hinted) = match mode {
+                PimdirBodyFlush::Each => (1, 0),
+                PimdirBodyFlush::Deferred { writeback: None } => (256, 0),
+                PimdirBodyFlush::Deferred { writeback: Some(_) } => (256, 600),
+            };
+            assert_eq!(first_move, expected, "{mode:?}: flushes before a move");
+            assert_eq!(HINTED.load(Ordering::Relaxed), hinted, "{mode:?}");
+            assert_eq!(events.len(), 2 * 600, "{mode:?}: each body once");
+
+            let strays = store.blobs().scan().unwrap().strays;
+            assert!(strays.is_empty(), "{mode:?}: {strays:?}");
+        }
+    }
 }

@@ -33,6 +33,7 @@ use crate::{
     client::{
         blobs::{
             PimdirBlobCheck, PimdirBlobStage, PimdirBlobStray, PimdirBlobStrayKind, PimdirBlobs,
+            PimdirBodyFlush,
         },
         lock::PimdirLock,
         reader::{PimdirReader, reference_from_row},
@@ -111,6 +112,8 @@ impl DerefMut for PimdirStore {
 pub struct PimdirSourceStore {
     store: PimdirStore,
     source: PimdirSourceId,
+    /// How a write batch flushes the bodies it carries.
+    pub body_flush: PimdirBodyFlush,
 }
 
 impl Deref for PimdirSourceStore {
@@ -426,6 +429,7 @@ impl PimdirStore {
         PimdirSourceStore {
             store: self,
             source: PimdirSourceId(source.into()),
+            body_flush: PimdirBodyFlush::default(),
         }
     }
 

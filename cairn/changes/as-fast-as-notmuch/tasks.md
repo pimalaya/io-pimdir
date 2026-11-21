@@ -22,9 +22,11 @@ change: as-fast-as-notmuch
 
 ## Phase 3, writes and the index
 
+- [x] Bodies written back early: a batch writes its temporaries, starts each one's writeback by `sync_file_range`, flushes them all, then moves each (`PimdirBodyFlush::Deferred`, the default on Linux); the 517k sync from 572 s to 305 s wall, `deferred` without the hint 512 s, one run each on core 12 (log 2026-11-21-bodies-written-back-early)
 - [ ] Prototype the-write-path-before-the-freeze 1 to 4, numbers to the owner
 - [ ] Profile the index refresh (0.5 ms a message), then batch size, FTS5 merges, parallel extraction, summary text rewritten only when it changed (F6)
 - [x] The no-op sync's fixed cost per collection: QPSG on every connection, no write for a delta that moved nothing, the bench connector skipping folders by mtime; 5.0 s to 0.49 s at 517k (log 2026-11-21-a-sync-that-finds-nothing); `list_owing_bindings` and `list_lacking_items` left to the owner
+- [x] The two delta reads seek the owing marks (pimdir the-owing-rows-are-marked, storage-draft-15 in place): the no-op sync 0.39 s to 0.12 s at 517k, a 1,000-flag change 0.48 s to 0.19 s, the import about 5% more CPU (log 2026-11-21-the-owing-rows-are-marked)
 - [ ] The import gates
 
 ## Phase 4, the spec's additions

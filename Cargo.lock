@@ -465,6 +465,7 @@ dependencies = [
  "fs4",
  "ical-rs",
  "jiff",
+ "libc",
  "log",
  "mime-rs",
  "pimalaya-cli",
