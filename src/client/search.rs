@@ -110,6 +110,37 @@ const LOCK: &str = "index.lock";
 /// each); a store past it counts each placement's representative by a seek.
 const BITMAP_SEQ_MAX: i64 = 1 << 26;
 
+/// The most hits a page of text terms alone reads from its bitmaps, a
+/// seek each for its sort key, rather than walking the store's order.
+const PAGE_HITS_MAX: u64 = 40_000;
+
+/// The values a dated page's statement binds beyond the query's: `:limit`
+/// the `need` rows it reads, and the cursor `after` names.
+fn page_params(after: Option<&PimdirSearchCursor>, need: usize) -> Vec<(String, Value)> {
+    let mut extra = vec![(
+        String::from(":limit"),
+        Value::Integer(need.min(i64::MAX as usize) as i64),
+    )];
+    if let Some(after) = after {
+        extra.extend([
+            (
+                String::from(":after_undated"),
+                Value::Integer(i64::from(after.undated)),
+            ),
+            (
+                String::from(":after_key"),
+                Value::from(after.sort_key.clone()),
+            ),
+            (String::from(":after_seq"), Value::Integer(after.seq)),
+            (
+                String::from(":after_account"),
+                Value::from(after.account.clone()),
+            ),
+        ]);
+    }
+    extra
+}
+
 /// Hits as bitmaps of public ids, one per account by its number.
 type Hits = Vec<Vec<u64>>;
 
@@ -1487,6 +1518,11 @@ impl PimdirIndex {
         }
 
         let need = limit.saturating_add(1);
+        if let Some(mut found) = self.bitmap_page(compiled, after, sort, need)? {
+            let more = found.len() > limit;
+            found.truncate(limit);
+            return Ok((found, more));
+        }
         let mut found = match driver {
             PimdirPlanDriver::Set(set) => self.set_page(compiled, set, after, sort, need)?,
             PimdirPlanDriver::Walk { budget, fallback } => {
@@ -1545,27 +1581,7 @@ impl PimdirIndex {
         need: usize,
     ) -> Result<Vec<Found>, PimdirError> {
         let sql = compiled.rows(&compiled.driven(set), set, sort, Some(after.is_some()));
-        let mut extra = vec![(
-            String::from(":limit"),
-            Value::Integer(need.min(i64::MAX as usize) as i64),
-        )];
-        if let Some(after) = after {
-            extra.extend([
-                (
-                    String::from(":after_undated"),
-                    Value::Integer(i64::from(after.undated)),
-                ),
-                (
-                    String::from(":after_key"),
-                    Value::from(after.sort_key.clone()),
-                ),
-                (String::from(":after_seq"), Value::Integer(after.seq)),
-                (
-                    String::from(":after_account"),
-                    Value::from(after.account.clone()),
-                ),
-            ]);
-        }
+        let extra = page_params(after, need);
         self.run(&sql, &compiled.values, &extra, |row| found(row, sort))
     }
 
@@ -1771,31 +1787,141 @@ impl PimdirIndex {
     /// account, the bitmaps combined as the query combines its terms, with
     /// no seek into the store and no table of matches.
     fn count_bitwise(&self, compiled: &Compiled) -> Result<u64, PimdirError> {
+        Ok(hits_counted(&self.bitwise_hits(compiled)?.0))
+    }
+
+    /// The hits of a query [`bitwise`](Compiled::bitwise) admits, as
+    /// bitmaps of public ids per account, with each account's name by its
+    /// number (empty for none): matched jointly when the split ids allow,
+    /// else term by term.
+    fn bitwise_hits(&self, compiled: &Compiled) -> Result<(Hits, Vec<String>), PimdirError> {
         let counted: i64 = self
             .conn
             .query_row_cached(search::COUNT_ACCOUNTS, [], |row| row.get(0))?;
         let mut accounts: BTreeMap<String, usize> = BTreeMap::new();
         let mut held: HashMap<String, usize> = HashMap::new();
-        if counted > 1 {
-            for (id, account) in self.run(search::COLLECTION_ACCOUNTS, &[], &[], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })? {
-                let next = accounts.len();
-                held.insert(id, *accounts.entry(account).or_insert(next));
+        let names = match counted > 1 {
+            true => {
+                for (id, account) in self.run(search::COLLECTION_ACCOUNTS, &[], &[], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })? {
+                    let next = accounts.len();
+                    held.insert(id, *accounts.entry(account).or_insert(next));
+                }
+                let mut names = vec![String::new(); accounts.len()];
+                for (name, at) in accounts {
+                    names[at] = name;
+                }
+                names
             }
-        }
+            false => self.run(search::ONE_ACCOUNT, &[], &[], |row| row.get::<_, String>(0))?,
+        };
         let held = Held {
             collections: held,
             accounts: counted.max(0) as usize,
         };
-        if let Some(marked) = self.marked_jointly(compiled, &held)? {
-            return Ok(hits_counted(&marked));
+        let hits = match self.marked_jointly(compiled, &held)? {
+            Some(hits) => hits,
+            None => self.marked(compiled, &compiled.plan.root, &held)?,
+        };
+        Ok((hits, names))
+    }
+
+    /// The first `need` hits after `after` in a dated `sort` of a query of
+    /// text terms alone ([`bitwise`](Compiled::bitwise)) over a current
+    /// index, read from its bitmaps rather than walked: its hits written
+    /// to `temp.hit_page`, then joined to the store, sorted and cut by one
+    /// statement, as [`set_page`](Self::set_page) cuts a set's. Only for
+    /// an `and` of two positive text terms or more, one of whose sets is
+    /// not capped, matching at most [`PAGE_HITS_MAX`] documents together
+    /// (`JOINT_BODIES`, `JOINT_SUMMARIES`, a count stopping there, so
+    /// `enron california`, about 78k hits on the 1M tier, never builds
+    /// its bitmaps) and holding at most as many hits: a walk probes
+    /// each row it meets against every term and meets many before an
+    /// intersection's page, where one term's page or an `or`'s is met
+    /// sooner than a seek per hit reads it (on the 1M tier `power
+    /// california` 337 to 111 ms, while `subject:meeting` went from 38 to
+    /// 105 ms and `california or texas` from 45 to 95 read this way).
+    fn bitmap_page(
+        &self,
+        compiled: &Compiled,
+        after: Option<&PimdirSearchCursor>,
+        sort: PimdirSearchSort,
+        need: usize,
+    ) -> Result<Option<Vec<Found>>, PimdirError> {
+        if self.force.get().is_some() || !compiled.bitwise() {
+            return Ok(None);
         }
-        Ok(hits_counted(&self.marked(
-            compiled,
-            &compiled.plan.root,
-            &held,
-        )?))
+        let positive: Vec<u64> = compiled
+            .plan
+            .leaves
+            .iter()
+            .zip(&compiled.bounds)
+            .filter(|(leaf, _)| leaf.is_text() && !leaf.negated)
+            .map(|(_, bound)| bound.map_or(CAP, |bound| bound.rows))
+            .collect();
+        let smallest = positive.iter().copied().min().unwrap_or(CAP);
+        let narrow = matches!(compiled.plan.root, PimdirPlanNode::And(_))
+            && positive.len() >= 2
+            && smallest < CAP;
+        if !narrow || self.items_held()? > BITMAP_SEQ_MAX {
+            return Ok(None);
+        }
+        let current = self
+            .conn
+            .query_row_cached(search::INDEX_CURRENT, [], |row| row.get::<_, bool>(0))?;
+        if !current {
+            return Ok(None);
+        }
+        let limit = PAGE_HITS_MAX as i64 + 1;
+        let mut documents = 0i64;
+        for (statement, summary) in [
+            (search::JOINT_BODIES, false),
+            (search::JOINT_SUMMARIES, true),
+        ] {
+            if let Some(expression) = compiled.joint(summary) {
+                documents += self.conn.query_row_cached(
+                    statement,
+                    named_params! { ":match": expression, ":limit": limit },
+                    |row| row.get::<_, i64>(0),
+                )?;
+            }
+        }
+        if documents > PAGE_HITS_MAX as i64 {
+            return Ok(None);
+        }
+        let (hits, names) = self.bitwise_hits(compiled)?;
+        if hits_counted(&hits) > PAGE_HITS_MAX {
+            return Ok(None);
+        }
+
+        self.conn.execute_batch(search::CREATE_HIT_PAGE)?;
+        self.conn.execute_cached(search::CLEAR_HIT_PAGE, [])?;
+        let mut insert = self.conn.prepare_cached(search::INSERT_HIT_PAGE)?;
+        for (account, bits) in hits.iter().enumerate() {
+            let Some(name) = names.get(account) else {
+                continue;
+            };
+            for (at, word) in bits.iter().enumerate() {
+                let mut word = *word;
+                while word != 0 {
+                    let seq = (at * 64 + word.trailing_zeros() as usize) as i64;
+                    insert.execute(named_params! { ":akey": name, ":seq": seq })?;
+                    word &= word - 1;
+                }
+            }
+        }
+        drop(insert);
+
+        let sql = compiled.met_rows(
+            "SELECT akey, seq FROM temp.hit_page",
+            sort,
+            Some(after.is_some()),
+        );
+        let extra = page_params(after, need);
+        Ok(Some(self.run(&sql, &compiled.values, &extra, |row| {
+            found(row, sort)
+        })?))
     }
 
     /// The hits of a query [`bitwise`](Compiled::bitwise) admits as bitmaps

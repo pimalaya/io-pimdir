@@ -76,6 +76,31 @@ pub const ITEMS_HELD: &str = r#"SELECT ifnull(max(seq), 0) FROM store.items;"#;
 pub const COUNT_ACCOUNTS: &str =
     r#"SELECT count(DISTINCT ifnull(account, '')) FROM store.collections;"#;
 
+/// The account of the store's collections when they hold one, empty for
+/// none; no row for a store holding no collection.
+pub const ONE_ACCOUNT: &str = r#"SELECT ifnull(account, '') FROM store.collections LIMIT 1;"#;
+
+/// How many bodies a query's terms match together (`Compiled::joint`),
+/// counted up to `:limit`.
+pub const JOINT_BODIES: &str = r#"SELECT count(*) FROM (SELECT 1 FROM object_text WHERE object_text MATCH :match LIMIT :limit);"#;
+
+/// How many bodiless placements' summaries a query's terms match together,
+/// counted up to `:limit`.
+pub const JOINT_SUMMARIES: &str = r#"SELECT count(*) FROM (SELECT 1 FROM summary_text WHERE summary_text MATCH :match LIMIT :limit);"#;
+
+/// The hits a page of text terms alone reads from its bitmaps, joined to
+/// the store by one statement. Temporary, per connection.
+pub const CREATE_HIT_PAGE: &str = r#"CREATE TEMP TABLE IF NOT EXISTS hit_page (
+    akey TEXT    NOT NULL,
+    seq  INTEGER NOT NULL
+);"#;
+
+/// Empties `temp.hit_page` before a page writes its hits.
+pub const CLEAR_HIT_PAGE: &str = r#"DELETE FROM temp.hit_page;"#;
+
+/// Writes one hit of a page into `temp.hit_page`.
+pub const INSERT_HIT_PAGE: &str = r#"INSERT INTO temp.hit_page(akey, seq) VALUES (:akey, :seq);"#;
+
 /// Every collection of the store with its account, empty for none.
 pub const COLLECTION_ACCOUNTS: &str = r#"SELECT id, ifnull(account, '') FROM store.collections;"#;
 

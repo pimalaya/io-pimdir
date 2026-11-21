@@ -395,6 +395,30 @@ impl Compiled {
         sort: PimdirSearchSort,
         page: Option<bool>,
     ) -> String {
+        let condition = self.condition("h.akey", "h.seq", &self.skip(set));
+        self.rows_where(hits, &condition, sort, page)
+    }
+
+    /// [`rows`](Self::rows) of `hits` that already meet the query, every
+    /// term read: none is probed again.
+    pub(crate) fn met_rows(
+        &self,
+        hits: &str,
+        sort: PimdirSearchSort,
+        page: Option<bool>,
+    ) -> String {
+        self.rows_where(hits, "1", sort, page)
+    }
+
+    /// [`rows`](Self::rows) of `hits` meeting `condition` over `(h.akey,
+    /// h.seq)`.
+    fn rows_where(
+        &self,
+        hits: &str,
+        condition: &str,
+        sort: PimdirSearchSort,
+        page: Option<bool>,
+    ) -> String {
         let rank = match sort {
             PimdirSearchSort::Relevance => {
                 let positive: Vec<String> = self
@@ -435,9 +459,8 @@ impl Compiled {
              CROSS JOIN store.items s ON s.seq = h.seq AND s.deleted = 0 \
              JOIN store.collections sc ON sc.id = s.collection \
              AND ifnull(sc.account, '') = h.akey AND {} \
-             WHERE {} GROUP BY h.akey, h.seq",
+             WHERE {condition} GROUP BY h.akey, h.seq",
             self.at_scope("sc"),
-            self.condition("h.akey", "h.seq", &self.skip(set)),
         );
         if let Some(after) = page {
             let newest = sort == PimdirSearchSort::NewestFirst;
