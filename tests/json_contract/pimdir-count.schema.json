@@ -1,0 +1,223 @@
+{
+  "$defs": {
+    "CoverageRow": {
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "cut": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "horizonLeft": {
+          "type": "boolean"
+        },
+        "local": {
+          "$ref": "#/$defs/LocalRow"
+        },
+        "remote": {
+          "$ref": "#/$defs/RemoteRow"
+        },
+        "temporal": {
+          "$ref": "#/$defs/TemporalRow"
+        },
+        "zoneDiffers": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "complete",
+        "local",
+        "temporal",
+        "remote",
+        "horizonLeft",
+        "cut",
+        "zoneDiffers"
+      ],
+      "type": "object"
+    },
+    "LocalRow": {
+      "properties": {
+        "behind": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kinds": {
+          "additionalProperties": {
+            "$ref": "#/$defs/UnreadRow"
+          },
+          "type": "object"
+        },
+        "reads": {
+          "$ref": "#/$defs/ReadsRow"
+        },
+        "unindexed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kinds",
+        "reads",
+        "unindexed",
+        "behind"
+      ],
+      "type": "object"
+    },
+    "ReadsRow": {
+      "properties": {
+        "content": {
+          "type": "boolean"
+        },
+        "kinds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mark": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kinds",
+        "content",
+        "mark"
+      ],
+      "type": "object"
+    },
+    "RemoteRow": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "local-only",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "exhaustive": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "augmented",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "exhaustive"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TemporalRow": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "full",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "filling": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "bounded",
+              "type": "string"
+            },
+            "since": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "until": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "since",
+            "until",
+            "filling"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UnreadRow": {
+      "properties": {
+        "bodiless": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "encrypted": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "missing": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unparseable": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bodiless",
+        "missing",
+        "unparseable",
+        "encrypted"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "coverage": {
+      "$ref": "#/$defs/CoverageRow"
+    },
+    "query": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "query",
+    "count",
+    "coverage"
+  ],
+  "title": "CountOutput",
+  "type": "object"
+}

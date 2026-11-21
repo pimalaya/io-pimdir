@@ -33,6 +33,7 @@ use crate::cli::{
         ThreadRow,
     },
     store::{StoreCopyOutput, StoreInfoOutput},
+    version::VersionOutput,
 };
 
 /// Builds the command-to-schema registry consumed by `json-schema`.
@@ -71,6 +72,7 @@ pub fn registry() -> JsonSchemaRegistry {
     registry.insert::<ShowOutput>("pimdir-show");
     registry.insert::<ThreadRow>("pimdir-thread");
     registry.insert::<TagOutput>("pimdir-tag");
+    registry.insert::<VersionOutput>("pimdir-version");
     registry.insert::<ErrorReport<ErrorCode>>("pimdir-error");
 
     registry

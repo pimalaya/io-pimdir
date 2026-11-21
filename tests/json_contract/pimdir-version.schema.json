@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "formatVersion": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "searchVersion": {
+      "type": "string"
+    },
+    "storageVersion": {
+      "type": "string"
+    },
+    "syncVersion": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "formatVersion",
+    "version",
+    "storageVersion",
+    "searchVersion",
+    "syncVersion"
+  ],
+  "title": "VersionOutput",
+  "type": "object"
+}

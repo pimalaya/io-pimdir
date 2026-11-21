@@ -1,0 +1,201 @@
+{
+  "$defs": {
+    "ChunkRow": {
+      "properties": {
+        "end": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "field": {
+          "type": "string"
+        },
+        "ord": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ord",
+        "field",
+        "start",
+        "end"
+      ],
+      "type": "object"
+    },
+    "FieldsRow": {
+      "properties": {
+        "attachment": {
+          "type": "string"
+        },
+        "attendee": {
+          "type": "string"
+        },
+        "bcc": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "cc": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "org": {
+          "type": "string"
+        },
+        "organizer": {
+          "type": "string"
+        },
+        "people": {
+          "type": "string"
+        },
+        "place": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "people",
+        "body",
+        "attachment",
+        "place",
+        "org",
+        "note",
+        "from",
+        "to",
+        "cc",
+        "bcc",
+        "email",
+        "organizer",
+        "attendee"
+      ],
+      "type": "object"
+    },
+    "Matched": {
+      "oneOf": [
+        {
+          "const": "body",
+          "type": "string"
+        },
+        {
+          "const": "summary",
+          "type": "string"
+        }
+      ]
+    },
+    "PlacementRow": {
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "flags": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "linkId": {
+          "type": "string"
+        },
+        "object": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sortKey": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "collection",
+        "linkId",
+        "flags",
+        "object",
+        "level",
+        "sortKey"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "account": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "chunks": {
+      "items": {
+        "$ref": "#/$defs/ChunkRow"
+      },
+      "type": "array"
+    },
+    "fields": {
+      "$ref": "#/$defs/FieldsRow"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "placements": {
+      "items": {
+        "$ref": "#/$defs/PlacementRow"
+      },
+      "type": "array"
+    },
+    "seq": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "source": {
+      "$ref": "#/$defs/Matched"
+    },
+    "status": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "account",
+    "seq",
+    "kind",
+    "title",
+    "source",
+    "status",
+    "placements",
+    "fields",
+    "chunks"
+  ],
+  "title": "ShowOutput",
+  "type": "object"
+}

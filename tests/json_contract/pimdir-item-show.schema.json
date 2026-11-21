@@ -1,0 +1,175 @@
+{
+  "$defs": {
+    "BindingRow": {
+      "properties": {
+        "base": {
+          "type": "boolean"
+        },
+        "baseFlags": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "baseObject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baseRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conflictObject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conflictRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conflicted": {
+          "type": "boolean"
+        },
+        "handle": {
+          "type": "string"
+        },
+        "sharedObject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "handle",
+        "base",
+        "baseFlags",
+        "baseObject",
+        "baseRevision",
+        "conflicted",
+        "conflictRevision",
+        "conflictObject",
+        "sharedObject"
+      ],
+      "type": "object"
+    },
+    "ItemPlacement": {
+      "properties": {
+        "bindings": {
+          "items": {
+            "$ref": "#/$defs/BindingRow"
+          },
+          "type": "array"
+        },
+        "collection": {
+          "type": "string"
+        },
+        "flags": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "linkId": {
+          "type": "string"
+        },
+        "object": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retainedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retainedBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sortKey": {
+          "type": "string"
+        },
+        "summary": {},
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "collection",
+        "seq",
+        "linkId",
+        "flags",
+        "level",
+        "object",
+        "size",
+        "sortKey",
+        "title",
+        "summary",
+        "retainedAt",
+        "retainedBy",
+        "bindings"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "placements": {
+      "items": {
+        "$ref": "#/$defs/ItemPlacement"
+      },
+      "type": "array"
+    },
+    "seq": {
+      "format": "int64",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "seq",
+    "placements"
+  ],
+  "title": "ItemShowOutput",
+  "type": "object"
+}

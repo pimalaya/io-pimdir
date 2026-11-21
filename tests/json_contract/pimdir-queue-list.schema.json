@@ -1,0 +1,77 @@
+{
+  "$defs": {
+    "QueueRow": {
+      "properties": {
+        "attempts": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "collection": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "payload": {
+          "type": "string"
+        },
+        "producer": {
+          "type": "string"
+        },
+        "row": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "unconfirmed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "createdAt",
+        "producer",
+        "collection",
+        "kind",
+        "payload",
+        "attempts",
+        "unconfirmed",
+        "error"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "actions": {
+      "items": {
+        "$ref": "#/$defs/QueueRow"
+      },
+      "type": "array"
+    },
+    "parked": {
+      "type": "boolean"
+    },
+    "undecodable": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "parked",
+    "actions",
+    "undecodable"
+  ],
+  "title": "QueueOutput",
+  "type": "object"
+}

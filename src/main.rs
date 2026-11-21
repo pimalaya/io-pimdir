@@ -64,6 +64,7 @@ use crate::cli::{
     queue::QueueCommand,
     search::{CountCommand, IndexCommand, SearchCommand, ShowCommand, TagCommand, ThreadCommand},
     store::StoreCommand,
+    version::VersionCommand,
 };
 
 fn main() {
@@ -85,8 +86,15 @@ fn main() {
 #[command(name = env!("CARGO_BIN_NAME"))]
 #[command(about = "CLI to inspect, repair and recover a pimdir store")]
 #[command(long_about = "CLI to inspect, repair and recover a pimdir store\n\n\
-    An operator tool outside io-pimdir's 1.0 contract: its commands, flags \
-    and output may change in any release.")]
+    An operator tool outside io-pimdir's 1.0 contract, but for its JSON \
+    output: its commands, flags, text output and operator verbs may change \
+    in any release.\n\n\
+    The contract is what --json prints for search, count, show, thread, \
+    tag, item list, item show, collection list, queue list, queue status and \
+    store info, and the failure object (pimdir-error): stable within a \
+    major, a minor only adding keys, and values to vocabularies declared \
+    open. `pimdir --json version` states that major as formatVersion, and \
+    `pimdir json-schema` describes each payload.")]
 #[command(author, version, long_version = long_version!())]
 #[command(after_help = footer!())]
 #[command(propagate_version = true, infer_subcommands = true)]
@@ -144,6 +152,7 @@ enum Command {
     Thread(ThreadCommand),
     /// Add or remove flags on every item a query matches.
     Tag(TagCommand),
+    Version(VersionCommand),
     #[command(alias = "completions")]
     Completion(CompletionCommand),
     #[command(alias = "manuals")]
@@ -171,6 +180,7 @@ impl Command {
             Self::Show(cmd) => cmd.execute(printer, store),
             Self::Thread(cmd) => cmd.execute(printer, store),
             Self::Tag(cmd) => cmd.execute(printer, store),
+            Self::Version(cmd) => cmd.execute(printer),
             Self::Completion(cmd) => cmd.execute(printer, Cli::command()),
             Self::Manual(cmd) => cmd.execute(printer, Cli::command()),
             Self::JsonSchema(cmd) => cmd.execute(printer, json_schema::registry()),

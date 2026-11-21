@@ -1,0 +1,290 @@
+{
+  "$defs": {
+    "CommonCode": {
+      "oneOf": [
+        {
+          "const": "usage-invalid",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorCode": {
+      "oneOf": [
+        {
+          "const": "item-not-found",
+          "type": "string"
+        },
+        {
+          "const": "collection-required",
+          "type": "string"
+        },
+        {
+          "const": "item-live",
+          "type": "string"
+        },
+        {
+          "const": "body-absent",
+          "type": "string"
+        },
+        {
+          "const": "body-missing",
+          "type": "string"
+        },
+        {
+          "const": "row-not-found",
+          "type": "string"
+        },
+        {
+          "const": "source-required",
+          "type": "string"
+        },
+        {
+          "const": "confirmation-required",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "type": "string"
+        },
+        {
+          "const": "page-token-invalid",
+          "type": "string"
+        },
+        {
+          "const": "dump-exists",
+          "type": "string"
+        },
+        {
+          "const": "action-malformed",
+          "type": "string"
+        },
+        {
+          "const": "binding-rebind",
+          "type": "string"
+        },
+        {
+          "const": "placement-unnamed",
+          "type": "string"
+        },
+        {
+          "const": "conflict-unread",
+          "type": "string"
+        },
+        {
+          "const": "scope-not-mail",
+          "type": "string"
+        },
+        {
+          "const": "collection-not-files",
+          "type": "string"
+        },
+        {
+          "const": "collection-synced",
+          "type": "string"
+        },
+        {
+          "const": "collection-not-unbound",
+          "type": "string"
+        },
+        {
+          "const": "collection-role",
+          "type": "string"
+        },
+        {
+          "const": "collection-parent",
+          "type": "string"
+        },
+        {
+          "const": "collection-undeclared",
+          "type": "string"
+        },
+        {
+          "const": "collection-queued",
+          "type": "string"
+        },
+        {
+          "const": "item-duplicate",
+          "type": "string"
+        },
+        {
+          "const": "store-version",
+          "type": "string"
+        },
+        {
+          "const": "store-uncreated",
+          "type": "string"
+        },
+        {
+          "const": "store-foreign",
+          "type": "string"
+        },
+        {
+          "const": "store-corrupt",
+          "type": "string"
+        },
+        {
+          "const": "store-not-current",
+          "type": "string"
+        },
+        {
+          "const": "store-hash-algo",
+          "type": "string"
+        },
+        {
+          "const": "sync-version",
+          "type": "string"
+        },
+        {
+          "const": "store-busy",
+          "type": "string"
+        },
+        {
+          "const": "store-owned",
+          "type": "string"
+        },
+        {
+          "const": "store-staging",
+          "type": "string"
+        },
+        {
+          "const": "store-in-flight",
+          "type": "string"
+        },
+        {
+          "const": "store-exposed",
+          "type": "string"
+        },
+        {
+          "const": "store-reset",
+          "type": "string"
+        },
+        {
+          "const": "action-not-intent",
+          "type": "string"
+        },
+        {
+          "const": "lock-replaced",
+          "type": "string"
+        },
+        {
+          "const": "backup-occupied",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "type": "string"
+        },
+        {
+          "const": "no-performer",
+          "type": "string"
+        },
+        {
+          "const": "ambiguous-performer",
+          "type": "string"
+        },
+        {
+          "const": "cutoff-invalid",
+          "type": "string"
+        },
+        {
+          "const": "flag-invalid",
+          "type": "string"
+        },
+        {
+          "const": "property-invalid",
+          "type": "string"
+        },
+        {
+          "const": "query-refused",
+          "type": "string"
+        },
+        {
+          "const": "tag-refused",
+          "type": "string"
+        },
+        {
+          "const": "index-fts5-missing",
+          "type": "string"
+        },
+        {
+          "const": "query-unanswerable",
+          "type": "string"
+        },
+        {
+          "const": "index-busy",
+          "type": "string"
+        },
+        {
+          "const": "index-missing",
+          "type": "string"
+        },
+        {
+          "const": "index-outdated",
+          "type": "string"
+        },
+        {
+          "const": "index-version",
+          "type": "string"
+        },
+        {
+          "const": "index-zone-unknown",
+          "type": "string"
+        },
+        {
+          "const": "index-query-only",
+          "type": "string"
+        },
+        {
+          "const": "index-refresh-broken",
+          "type": "string"
+        }
+      ]
+    },
+    "ReportCode": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        {
+          "$ref": "#/$defs/CommonCode"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "backtrace": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "code": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReportCode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "error": {
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "code",
+    "error",
+    "sources",
+    "backtrace"
+  ],
+  "title": "ErrorReport",
+  "type": "object"
+}

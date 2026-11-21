@@ -28,7 +28,23 @@ off the binary crate root, not off `lib.rs`, so the library's public API is
 unchanged by the presence of the CLI.
 
 ### Requirement: The CLI is outside the crate's 1.0 contract
-The binary's commands, flags and output SHALL be outside the semver contract io-pimdir 1.0 makes for its library (pimdir the-freeze-plan, D4), and `pimdir --help` and README.md SHALL say so: they may change in any release, so a program depends on the library, never on the binary.
+The binary's commands, flags, text output and operator verbs SHALL be outside the semver contract io-pimdir 1.0 makes for its library (pimdir the-freeze-plan D4, amended 2026-11-21), but for the JSON output the requirement "Integrators read the JSON output" names, and `pimdir --help` and README.md SHALL say which part is the contract.
+
+### Requirement: Integrators read the JSON output
+The `--json` output of `search`, `count`, `show`, `thread`, `tag`, `item list`, `item show`, `collection list`, `queue list`, `queue status`, `store info` and `version`, and the failure object `pimdir-error`, SHALL be stable within a contract major: a minor only adds keys, and values to vocabularies declared open; removing or renaming a key, changing a type or closing a vocabulary moves the major. The text output, the flags' spelling and the operator verbs (`item purge`, `item erase`, `gc`, `quarantine empty`, `check`, `store restore`, `store backup`) stay outside it. Each payload's schema SHALL be pinned by a test against a committed copy (tests/json_contract.rs over tests/json_contract/, one `<key>.schema.json` per payload, its `$id` and its `description` prose left out), so a change of shape fails until the copy is rewritten on purpose (`PIMDIR_BLESS_CONTRACT=1`), and the copies name no other payload.
+
+#### Scenario: A key renamed
+- GIVEN the committed schema of `pimdir-search`
+- WHEN a change renames one of its keys without moving the contract's major
+- THEN the schema test fails (tests/json_contract.rs `every_contract_payload_matches_its_committed_schema`)
+
+### Requirement: A program reads the contract's version from one probe
+`pimdir --json version` SHALL print `formatVersion`, the contract's major, beside `version` (the binary's, io-pimdir's), `storageVersion`, `searchVersion` and `syncVersion` (the drafts this build implements), and its text form those values as fields (`pimdir-version`). `formatVersion` SHALL be io-pimdir's major version, so a Rust API break moves it even when no payload changed; while the crate is below 1.0 it is `0`, which promises no stability: as Cargo reads a 0.x version, any minor may break the contract, and a program pins the binary's `version` until 1.0. No other payload SHALL carry the contract's version, and no `--format-version` flag SHALL be served until a second major exists. `version` opens no store.
+
+#### Scenario: The probe
+- GIVEN any build of the binary
+- WHEN `pimdir --json version` runs
+- THEN it prints `formatVersion` equal to the crate's major and `version` equal to the crate's version (tests/json_contract.rs `the_version_probe_states_the_crate_major`, src/cli/version.rs `the_versions_print_as_fields`)
 
 ### Requirement: Reads open the store through the reader role
 Every inspection verb SHALL open the store through the reader role
@@ -164,6 +180,7 @@ The CLI SHALL expose, at minimum:
   blob files and the temporary files a crash left, reporting what it freed, how many temporary files it unlinked (`temporaries`) and how many entries of objects/ it left as no body (`strays`).
 - `quarantine empty`: unlink every file of quarantine/ (STORAGE §7) through `PimdirStore::empty_quarantine`, under the staging lock, reporting the files and bytes freed and the entries left that are no file (`pimdir-quarantine-empty`). `gc` never touches quarantine/.
 - `export`: a portable dump of the store.
+- `version`: the contract's `formatVersion` and the drafts this build implements (see the one-probe requirement above).
 - `index` folds the store's change feed into index.db; `search` and `count` answer a SEARCH.md §8 query, each hit addressed as `(account, seq)` with its placements, what it matched (`body`, `summary` or none) and a snippet, every answer with its coverage (`complete`, which holds the lag; `local.kinds`, per media type the `bodiless`, `missing`, `unparseable` and `encrypted` counts; `local.reads`, what the terms read, its `mark` set by `has:attachment`; `zoneDiffers`; search.md), after refreshing the index within `--refresh-timeout`; `show SEQ --account ACCOUNT` prints a hit's item as extraction reads it. `search --threads` collapses hits to threads, printed under `threads` where hits print under `hits`, `--limit` and `--page-token` then counting threads. `thread SEQ --account ACCOUNT` prints the item's thread (`pimdir-thread`). `tag QUERY --add FLAG --remove FLAG` stages one `set-flags` per placement that changes, each as the source syncing its collection, previews it with `--dry-run`, and reads each placement's outcome back from the store (`pimdir-tag`). A refused query (SEARCH §8.4) fails with `query-refused`, its message naming the fault, where it lies and what would be valid there.
 
 Every command SHALL render as JSON under `--json`, write logs to stderr only,
@@ -173,7 +190,7 @@ and carry its own `--help` text. `item export` to stdout writes the body's raw b
 Every data command SHALL hand the printer one output type deriving `Display`, `Serialize` and `JsonSchema`, with camelCase keys on it and on every nested row and kebab-case values on every status enum, and a `json-schema` subcommand SHALL list every command's output type by its dash-joined path (`pimdir-item-list`), so a consumer can validate what `--json` prints. The summary row is the one value printed with the store's own column names, since it is printed as stored.
 
 ### Requirement: The JSON contract is described and versioned
-`pimdir json-schema` SHALL describe, under the key `pimdir-error`, the failure object every command prints under `--json`. Every generated schema SHALL carry an `$id` naming the contract version, which is the minor version while pimdir is below 1.0 (`v0.11`) and the major version after. Every registered payload SHALL be a JSON object, and every runnable command SHALL have a schema whose key names it, `pimdir-error` aside, both checked by a test with no exemption: a command printing one of two shapes (`search` with or without `--threads`, `item export` with or without `--output`) is described by both, their keys telling them apart. `pimdir-error` SHALL describe the failure object with its `code` typed by pimdir's code enum. A list SHALL be printed under a key naming its rows, `collection list` printing `{"collections": [...]}`. Piped `--json` output SHALL print one value per line.
+`pimdir json-schema` SHALL describe, under the key `pimdir-error`, the failure object every command prints under `--json`. Every generated schema SHALL carry an `$id` naming the contract version, which is the minor version while pimdir is below 1.0 (`v0.11`) and the major version after, `formatVersion` from 1.0 on. Every registered payload SHALL be a JSON object, and every runnable command SHALL have a schema whose key names it, `pimdir-error` aside, both checked by a test with no exemption: a command printing one of two shapes (`search` with or without `--threads`, `item export` with or without `--output`) is described by both, their keys telling them apart. `pimdir-error` SHALL describe the failure object with its `code` typed by pimdir's code enum. A list SHALL be printed under a key naming its rows, `collection list` printing `{"collections": [...]}`. Piped `--json` output SHALL print one value per line.
 
 #### Scenario: A caller reads a failure against its schema
 - GIVEN `pimdir json-schema pimdir-error`

@@ -2,12 +2,11 @@
 //!
 //! Each module owns one group of subcommands ([`collection`], [`item`],
 //! [`property`], [`queue`], [`store`], [`check`], [`gc`], [`quarantine`],
-//! [`export`], [`search`]) and renders its own output as both text and
-//! JSON, with [`json_schema`] indexing every output type. This module holds
-//! what they
-//! share: the global store flags, the roles a verb may open the store with,
-//! the error mapping, the confirmation prompt guarding destructive verbs
-//! and the formatting helpers.
+//! [`export`], [`search`], [`version`]) and renders its own output as both
+//! text and JSON, with [`json_schema`] indexing every output type. This
+//! module holds what they share: the global store flags, the roles a verb
+//! may open the store with, the error mapping, the confirmation prompt
+//! guarding destructive verbs and the formatting helpers.
 //!
 //! The modules hang off the binary crate root rather than the library's
 //! `lib.rs`: the command structs are the binary's business, so the
@@ -26,6 +25,7 @@ pub mod queue;
 pub mod search;
 pub mod store;
 pub mod summary;
+pub mod version;
 
 use std::{
     io::{IsTerminal, stdin, stdout},

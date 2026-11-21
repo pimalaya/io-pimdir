@@ -6,7 +6,7 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 - Low-level **I/O-free** core: no_std-compatible schema, encodings, per-kind summaries and the five sync verbs as coroutines, usable anywhere (always built)
 - Mid-level **std client**: the three profiles the standard names, reader, producer and owner, as handles running the statements against SQLite and the blob files, the owner running the verbs against a connector you provide (requires the `client` feature, enabled by default)
-- High-level **CLI**: the `pimdir` binary, the operator tool over a store, outside the crate's 1.0 contract (requires the `cli` feature)
+- High-level **CLI**: the `pimdir` binary, the operator tool over a store, outside the crate's 1.0 contract but for its JSON output, the integration point (requires the `cli` feature)
 
 ## Table of contents
 
@@ -80,7 +80,7 @@ To use io-pimdir as a library, add it to your Cargo.toml: the `cli` feature is n
 
 ## Usage
 
-The `pimdir` binary is to a store what `sqlite3` is to a database: an operator tool, not an end-user client. It is outside io-pimdir's 1.0 contract: its commands, flags and output may change in any release, so a program depends on the library, never on the binary. Reads open the store read-only, so inspecting a store mid-sync is always safe. A few real-world invocations:
+The `pimdir` binary is to a store what `sqlite3` is to a database: an operator tool, not an end-user client. It is outside io-pimdir's 1.0 contract but for its JSON output: its commands, flags, text output and operator verbs may change in any release. What `--json` prints for `search`, `count`, `show`, `thread`, `tag`, `item list`, `item show`, `collection list`, `queue list`, `queue status`, `store info` and `version`, and the failure object, is the contract a program builds on, in any language: stable within a major, a minor only adding keys, and values to vocabularies declared open. `pimdir --json version` states that major as `formatVersion`, io-pimdir's own major. Reads open the store read-only, so inspecting a store mid-sync is always safe. A few real-world invocations:
 
 ```sh
 pimdir -s ~/mail store info

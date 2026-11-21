@@ -1,0 +1,122 @@
+{
+  "$defs": {
+    "QueueRefusal": {
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "refusedAt": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "collection",
+        "source",
+        "reason",
+        "refusedAt"
+      ],
+      "type": "object"
+    },
+    "QueueStatus": {
+      "oneOf": [
+        {
+          "const": "pending",
+          "type": "string"
+        },
+        {
+          "const": "parked",
+          "type": "string"
+        },
+        {
+          "const": "unconfirmed",
+          "type": "string"
+        },
+        {
+          "const": "applied",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "type": "string"
+        },
+        {
+          "const": "reset",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "appliedAt": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "attempts": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "collection": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "refusals": {
+      "items": {
+        "$ref": "#/$defs/QueueRefusal"
+      },
+      "type": "array"
+    },
+    "row": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "seq": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/$defs/QueueStatus"
+    }
+  },
+  "required": [
+    "row",
+    "status",
+    "collection",
+    "kind",
+    "attempts",
+    "error",
+    "appliedAt",
+    "seq",
+    "refusals"
+  ],
+  "title": "QueueStatusOutput",
+  "type": "object"
+}

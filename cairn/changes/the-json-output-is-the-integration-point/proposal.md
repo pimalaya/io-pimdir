@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: the-json-output-is-the-integration-point
-status: draft
+status: landed
 created: 2026-11-21
 ---
 

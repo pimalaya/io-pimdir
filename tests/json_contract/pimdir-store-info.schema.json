@@ -1,0 +1,138 @@
+{
+  "$defs": {
+    "StoreCollectionCount": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "live": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retained": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "live",
+        "retained"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "collections": {
+      "items": {
+        "$ref": "#/$defs/StoreCollectionCount"
+      },
+      "type": "array"
+    },
+    "derivation": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "formatVersion": {
+      "type": "string"
+    },
+    "incarnation": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "lastChange": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "liveBytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "liveItems": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "objectBytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "objects": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "path": {
+      "type": "string"
+    },
+    "produceVersion": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "purges": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "readVersion": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "retainedBytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "retainedItems": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schemaVersion": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "sources": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "storeId": {
+      "type": "string"
+    },
+    "syncVersion": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "path",
+    "storeId",
+    "incarnation",
+    "formatVersion",
+    "schemaVersion",
+    "readVersion",
+    "produceVersion",
+    "derivation",
+    "syncVersion",
+    "sources",
+    "collections",
+    "liveItems",
+    "retainedItems",
+    "objects",
+    "objectBytes",
+    "liveBytes",
+    "retainedBytes",
+    "lastChange",
+    "purges"
+  ],
+  "title": "StoreInfoOutput",
+  "type": "object"
+}

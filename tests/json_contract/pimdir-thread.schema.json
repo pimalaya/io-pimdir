@@ -1,0 +1,160 @@
+{
+  "$defs": {
+    "HitRow": {
+      "properties": {
+        "account": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "matched": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Matched"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "placements": {
+          "items": {
+            "$ref": "#/$defs/PlacementRow"
+          },
+          "type": "array"
+        },
+        "seq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "snippet": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sortKey": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account",
+        "seq",
+        "kind",
+        "title",
+        "sortKey",
+        "matched",
+        "snippet",
+        "placements"
+      ],
+      "type": "object"
+    },
+    "Matched": {
+      "oneOf": [
+        {
+          "const": "body",
+          "type": "string"
+        },
+        {
+          "const": "summary",
+          "type": "string"
+        }
+      ]
+    },
+    "PlacementRow": {
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "flags": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "linkId": {
+          "type": "string"
+        },
+        "object": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sortKey": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "collection",
+        "linkId",
+        "flags",
+        "object",
+        "level",
+        "sortKey"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "account": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "count": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "first": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hits": {
+      "items": {
+        "$ref": "#/$defs/HitRow"
+      },
+      "type": "array"
+    },
+    "last": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thread": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "account",
+    "thread",
+    "count",
+    "first",
+    "last",
+    "hits"
+  ],
+  "title": "ThreadRow",
+  "type": "object"
+}

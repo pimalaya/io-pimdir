@@ -1,0 +1,110 @@
+{
+  "$defs": {
+    "ItemRow": {
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "flags": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "linkId": {
+          "type": "string"
+        },
+        "object": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retainedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retainedBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sortKey": {
+          "type": "string"
+        },
+        "summary": {},
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "collection",
+        "seq",
+        "linkId",
+        "flags",
+        "level",
+        "object",
+        "size",
+        "sortKey",
+        "title",
+        "summary",
+        "retainedAt",
+        "retainedBy"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "collection": {
+      "type": "string"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/ItemRow"
+      },
+      "type": "array"
+    },
+    "nextPage": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retained": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "collection",
+    "retained",
+    "items",
+    "nextPage"
+  ],
+  "title": "ItemsOutput",
+  "type": "object"
+}

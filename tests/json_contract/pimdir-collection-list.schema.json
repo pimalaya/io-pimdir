@@ -1,0 +1,103 @@
+{
+  "$defs": {
+    "CollectionRow": {
+      "properties": {
+        "color": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coveredAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coveredSince": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coveredUntil": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "live": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "retained": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "description",
+        "color",
+        "default",
+        "generation",
+        "role",
+        "live",
+        "coveredSince",
+        "coveredUntil",
+        "coveredAt",
+        "retained"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "collections": {
+      "items": {
+        "$ref": "#/$defs/CollectionRow"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "collections"
+  ],
+  "title": "CollectionsOutput",
+  "type": "object"
+}
