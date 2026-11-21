@@ -51,6 +51,13 @@ jobs:
       # proven by its unit tests alone.
       - run: cargo test --no-default-features --lib
         working-directory: io-pimdir
+      - name: Each search feature builds alone
+        working-directory: io-pimdir
+        run: |
+          set -eu
+          for features in mail contact calendar search indexer search,mail search,indexer; do
+            cargo clippy --no-default-features --features "vendored,$features" --all-targets -- -D warnings
+          done
       # spec_drift compares nothing when the checkout lacks the pinned
       # revision, so a green run proves nothing unless it compared.
       - name: The vendored copy was compared with pimdir

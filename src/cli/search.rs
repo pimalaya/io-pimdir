@@ -27,9 +27,8 @@ use io_pimdir::{
     placement::PimdirLevel,
     search::{
         coverage::{
-            PimdirSearchCoverage, PimdirSearchReads, PimdirSearchRemote, PimdirSearchTemporal,
+            self, PimdirSearchCoverage, PimdirSearchReads, PimdirSearchRemote, PimdirSearchTemporal,
         },
-        occurrence,
         query::PimdirQuery,
         tag::PimdirSearchTagSource,
     },
@@ -112,7 +111,7 @@ pub struct SearchCommand {
     pub query: String,
 
     /// The order of the hits.
-    #[arg(long, value_enum, default_value_t = SortArg::Date)]
+    #[arg(long, value_enum, default_value_t = SortArg::NewestFirst)]
     pub sort: SortArg,
 
     /// Maximum number of hits to print.
@@ -591,7 +590,7 @@ fn floating_zone(given: Option<String>, store: &StoreFlags) -> String {
     given.unwrap_or_else(|| {
         PimdirIndex::open_query(store.dir())
             .and_then(|index| index.floating_zone())
-            .unwrap_or_else(|_| occurrence::FLOATING_ZONE.into())
+            .unwrap_or_else(|_| coverage::FLOATING_ZONE.into())
     })
 }
 
@@ -599,9 +598,13 @@ fn floating_zone(given: Option<String>, store: &StoreFlags) -> String {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum SortArg {
     /// Newest first, undated items (contacts, files) last.
-    Date,
+    NewestFirst,
+    /// Oldest first, undated items last.
+    OldestFirst,
     /// By title.
-    Name,
+    Title,
+    /// By sender, other kinds last.
+    Sender,
     /// Best text match first.
     Relevance,
 }
@@ -609,8 +612,10 @@ pub enum SortArg {
 impl From<SortArg> for PimdirSearchSort {
     fn from(sort: SortArg) -> Self {
         match sort {
-            SortArg::Date => Self::Date,
-            SortArg::Name => Self::Name,
+            SortArg::NewestFirst => Self::NewestFirst,
+            SortArg::OldestFirst => Self::OldestFirst,
+            SortArg::Title => Self::Title,
+            SortArg::Sender => Self::Sender,
             SortArg::Relevance => Self::Relevance,
         }
     }

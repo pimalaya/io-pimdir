@@ -35,8 +35,12 @@ use alloc::{
 };
 use core::fmt;
 
+use jiff::{Timestamp, civil::Date, tz::TimeZone};
+
 use crate::{
-    reference::PimdirReferenceRole, search::coverage::PimdirSearchReads, summary::PimdirAddressRole,
+    reference::PimdirReferenceRole,
+    search::coverage::PimdirSearchReads,
+    summary::{PimdirAddressRole, time},
 };
 
 /// The most Unicode scalar values a query holds (SEARCH §8.3), refused
@@ -89,6 +93,7 @@ pub const FIELDS: &[&str] = &[
     "when",
     "thread",
     "id",
+    "mid",
     "linked",
     "attachment",
     "mimetype",
@@ -162,10 +167,17 @@ const DATE_FORMS: &[&str] = &[
     "YYYY",
     "YYYY-MM",
     "YYYY-MM-DD",
+    "YYYY-MM-DDThh:mm",
+    "YYYY-MM-DDThh:mm:ss",
+    "YYYY-MM-DDThh:mmZ",
+    "YYYY-MM-DDThh:mm+hh:mm",
     "today",
     "yesterday",
+    "<n>min",
+    "<n>h",
     "<n>d",
     "<n>w",
+    "<n>mo",
     "<n>y",
     "<point>..<point>",
     "<point>..",
@@ -431,6 +443,8 @@ pub enum PimdirQueryPredicate {
     Thread(String),
     /// One item (`id:`).
     Id(PimdirQueryId),
+    /// A message's `Message-ID`, without its angle brackets (`mid:`).
+    Mid(String),
     /// The items at the other end of an item's references (`linked:`).
     Linked {
         /// The role narrowed to, `None` for any.
@@ -438,6 +452,74 @@ pub enum PimdirQueryPredicate {
         /// The item at this end.
         id: PimdirQueryId,
     },
+}
+
+impl PimdirQueryPredicate {
+    /// The name a client's capability table keys the predicate on.
+    ///
+    /// The field it was written with (`subject:` and `title:` alike are
+    /// `title`), `text` for free text, `is.*` and `has.*` for each value,
+    /// `tag` for another flag, and `date.instant` for a range reaching
+    /// below the day (an instant, an amount of minutes or hours).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Text { field, .. } => match field {
+                PimdirQueryTextField::Any => "text",
+                PimdirQueryTextField::Title => "title",
+                PimdirQueryTextField::Body => "body",
+                PimdirQueryTextField::Attachment => "attachment",
+                PimdirQueryTextField::Place => "location",
+            },
+            Self::Address { role: None, .. } => "with",
+            Self::Address {
+                role: Some(role), ..
+            } => role.as_str(),
+            Self::Person(_) => "person",
+            Self::Flag(flag) => match flag.as_str() {
+                "\\Seen" => "is.read",
+                "\\Flagged" => "is.flagged",
+                "\\Answered" => "is.answered",
+                "\\Draft" => "is.draft",
+                _ => "tag",
+            },
+            Self::Encrypted => "is.encrypted",
+            Self::HasBody => "has.body",
+            Self::HasAttachment => "has.attachment",
+            Self::HasProperty(property) => match property {
+                PimdirQueryProperty::Phone => "has.phone",
+                PimdirQueryProperty::Address => "has.address",
+                PimdirQueryProperty::Birthday => "has.birthday",
+                PimdirQueryProperty::Photo => "has.photo",
+            },
+            Self::Kind(_) => "kind",
+            Self::Status(_) => "status",
+            Self::Priority(_) => "priority",
+            Self::Category(_) => "category",
+            Self::Account(_) => "account",
+            Self::Collection(_) => "collection",
+            Self::Date(range) => {
+                let fine = |point: &Option<PimdirQueryDate>| {
+                    matches!(
+                        point,
+                        Some(PimdirQueryDate::Instant { .. })
+                            | Some(PimdirQueryDate::Relative {
+                                unit: PimdirQueryDateUnit::Minute | PimdirQueryDateUnit::Hour,
+                                ..
+                            })
+                    )
+                };
+                match fine(&range.start) || fine(&range.end) {
+                    true => "date.instant",
+                    false => "date",
+                }
+            }
+            Self::Changed { .. } => "changed",
+            Self::Thread(_) => "thread",
+            Self::Id(_) => "id",
+            Self::Mid(_) => "mid",
+            Self::Linked { .. } => "linked",
+        }
+    }
 }
 
 /// The index field a text term searches (SEARCH §6).
@@ -601,6 +683,23 @@ pub enum PimdirQueryDate {
         /// The day, 1 to the month's last.
         day: u8,
     },
+    /// An instant, spanning its minute or its second.
+    Instant {
+        /// The year.
+        year: u16,
+        /// The month, 1 to 12.
+        month: u8,
+        /// The day, 1 to the month's last.
+        day: u8,
+        /// The hour, 0 to 23.
+        hour: u8,
+        /// The minute, 0 to 59.
+        minute: u8,
+        /// The second, 0 to 59, `None` for an instant spanning its minute.
+        second: Option<u8>,
+        /// Its offset from UTC in minutes, `None` for the query's zone.
+        offset: Option<i16>,
+    },
     /// `today`: the calendar day holding the query's now.
     Today,
     /// `yesterday`: the calendar day before it.
@@ -618,10 +717,16 @@ pub enum PimdirQueryDate {
 /// The unit of a relative date (SEARCH §8.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PimdirQueryDateUnit {
-    /// `d`: days.
+    /// `min`: minutes.
+    Minute,
+    /// `h`: hours.
+    Hour,
+    /// `d`: days of 24 hours.
     Day,
     /// `w`: weeks of seven days.
     Week,
+    /// `mo`: calendar months, a day the month lacks landing on its last.
+    Month,
     /// `y`: calendar years, a 29 February landing on the 28th.
     Year,
 }
@@ -663,6 +768,150 @@ impl PimdirQueryDate {
     }
 }
 
+impl PimdirQueryDateRange {
+    /// The instants the range spans (SEARCH §8.1), `[since, until)` in Unix
+    /// seconds, either side `None` open: from the start of its first point's
+    /// span to the end of its last's, a calendar point spanning its day,
+    /// month or year in `zone`, an instant its minute or second, `today`
+    /// and `yesterday` theirs around `now`, and a relative amount the
+    /// instant that long before `now`, its span alone running to `now`.
+    ///
+    /// A bound no instant of a four-digit year states is open: a start
+    /// before `0000-01-01T00:00:00Z` and an end past
+    /// `9999-12-31T23:59:59Z`. An end before year 0 is its first instant,
+    /// the range then holding nothing. A single point is parsed as a range
+    /// from it to itself, so `2w..2w` reads as `2w` alone.
+    pub fn bounds(&self, now: i64, zone: &TimeZone) -> (Option<i64>, Option<i64>) {
+        let single = self.start.is_some() && self.start == self.end;
+        let since = self.start.as_ref().map(|point| span(point, now, zone).0);
+        let until = self.end.as_ref().map(|point| match point {
+            PimdirQueryDate::Relative { .. } if single => now,
+            point => span(point, now, zone).1,
+        });
+        let since = since.filter(|since| *since >= YEAR_ZERO);
+        let until = until.filter(|until| *until <= YEAR_LAST);
+        (since, until.map(|until| until.max(YEAR_ZERO)))
+    }
+}
+
+/// Seconds in a day.
+const DAY: i64 = 86_400;
+
+/// The first instant of year 0, the earliest an RFC 3339 instant spells:
+/// `0000-01-01T00:00:00Z`.
+const YEAR_ZERO: i64 = -62_167_219_200;
+
+/// The last instant a four-digit year states: `9999-12-31T23:59:59Z`.
+const YEAR_LAST: i64 = 253_402_300_799;
+
+/// The span of one date point, `[start, end)` in Unix seconds, its days
+/// read in `zone`; a relative amount spans its instant, which may lie
+/// before year 0.
+fn span(point: &PimdirQueryDate, now: i64, zone: &TimeZone) -> (i64, i64) {
+    let day = |year: u16, month: u8, day: u8| {
+        time::days_from_civil(i32::from(year), u32::from(month), u32::from(day))
+    };
+    let start = |days: i64| start_of_day(days, zone);
+    let today = Timestamp::from_second(now).map_or(now.div_euclid(DAY), |instant| {
+        let date = instant.to_zoned_datetime(zone.clone()).date();
+        time::days_from_civil(
+            i32::from(date.year()),
+            date.month() as u32,
+            date.day() as u32,
+        )
+    });
+
+    match *point {
+        PimdirQueryDate::Year(year) => (start(day(year, 1, 1)), start(day(year + 1, 1, 1))),
+        PimdirQueryDate::Month { year, month } => {
+            let next = match month {
+                12 => day(year + 1, 1, 1),
+                month => day(year, month + 1, 1),
+            };
+            (start(day(year, month, 1)), start(next))
+        }
+        PimdirQueryDate::Day {
+            year,
+            month,
+            day: date,
+        } => {
+            let first = day(year, month, date);
+            (start(first), start(first + 1))
+        }
+        PimdirQueryDate::Instant {
+            year,
+            month,
+            day: date,
+            hour,
+            minute,
+            second,
+            offset,
+        } => {
+            let clock = i64::from(hour) * 3600 + i64::from(minute) * 60;
+            let clock = clock + i64::from(second.unwrap_or(0));
+            let first = match offset {
+                Some(offset) => day(year, month, date) * DAY + clock - i64::from(offset) * 60,
+                None => local(day(year, month, date), clock, zone),
+            };
+            let length = if second.is_some() { 1 } else { 60 };
+            (first, first + length)
+        }
+        PimdirQueryDate::Today => (start(today), start(today + 1)),
+        PimdirQueryDate::Yesterday => (start(today - 1), start(today)),
+        PimdirQueryDate::Relative { amount, unit } => {
+            let amount = i64::from(amount);
+            let months = |months: i64| {
+                let (year, month, date) = time::civil_from_days(now.div_euclid(DAY));
+                let months = i64::from(year) * 12 + i64::from(month) - 1 - months;
+                let (year, month) = (months.div_euclid(12), months.rem_euclid(12) as u32 + 1);
+                match i32::try_from(year) {
+                    Ok(year) if year >= 0 => {
+                        let date = date.min(time::days_in_month(year, month));
+                        time::days_from_civil(year, month, date) * DAY + now.rem_euclid(DAY)
+                    }
+                    _ => YEAR_ZERO - 1,
+                }
+            };
+            let instant = match unit {
+                PimdirQueryDateUnit::Minute => now - amount * 60,
+                PimdirQueryDateUnit::Hour => now - amount * 3600,
+                PimdirQueryDateUnit::Day => now - amount * DAY,
+                PimdirQueryDateUnit::Week => now - amount * 7 * DAY,
+                PimdirQueryDateUnit::Month => months(amount),
+                PimdirQueryDateUnit::Year => months(amount * 12),
+            };
+            (instant, instant)
+        }
+    }
+}
+
+/// The instant of a civil time in `zone`, a skipped one read at the earlier
+/// offset and a repeated one as its first (SEARCH §8.1).
+fn local(days: i64, clock: i64, zone: &TimeZone) -> i64 {
+    let (year, month, day) = time::civil_from_days(days);
+    i16::try_from(year)
+        .ok()
+        .and_then(|year| Date::new(year, month as i8, day as i8).ok())
+        .and_then(|date| {
+            let (hour, minute, second) = (clock / 3600, clock / 60 % 60, clock % 60);
+            date.at(hour as i8, minute as i8, second as i8, 0)
+                .to_zoned_datetime(zone.clone())
+                .ok()
+        })
+        .map_or(days * DAY + clock, |zoned| zoned.timestamp().as_second())
+}
+
+/// The first instant of a day counted from 1970-01-01 in `zone`, its UTC
+/// midnight past the years jiff places.
+fn start_of_day(days: i64, zone: &TimeZone) -> i64 {
+    let (year, month, day) = time::civil_from_days(days);
+    i16::try_from(year)
+        .ok()
+        .and_then(|year| Date::new(year, month as i8, day as i8).ok())
+        .and_then(|date| date.to_zoned_datetime(zone.clone()).ok())
+        .and_then(|zoned| zoned.start_of_day().ok())
+        .map_or(days * DAY, |zoned| zoned.timestamp().as_second())
+}
 /// An item named by `id:` or `linked:` (SEARCH §8): a value of digits,
 /// naming a public id and a link id at once, or any other link id.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1278,6 +1527,10 @@ fn field(
         },
         "thread" => PimdirQueryPredicate::Thread(value),
         "id" => PimdirQueryPredicate::Id(PimdirQueryId::parse(&value)),
+        "mid" => {
+            let id = value.strip_prefix('<').and_then(|id| id.strip_suffix('>'));
+            PimdirQueryPredicate::Mid(id.map_or(value.clone(), Into::into))
+        }
         "linked" => {
             let (role, id) = match value.split_once(':') {
                 Some((role, id)) if !id.is_empty() && is_reference_role(role) => {
@@ -1352,20 +1605,29 @@ fn date(value: &str) -> Option<PimdirQueryDate> {
     }
 
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-    let unit = match value.bytes().last() {
-        Some(b'd') => Some(PimdirQueryDateUnit::Day),
-        Some(b'w') => Some(PimdirQueryDateUnit::Week),
-        Some(b'y') => Some(PimdirQueryDateUnit::Year),
-        _ => None,
-    };
-    if let Some(unit) = unit {
-        let amount = &value[..value.len() - 1];
-        if digits(amount) && amount.len() <= RELATIVE_DIGITS_MAX {
-            return Some(PimdirQueryDate::Relative {
-                amount: amount.parse().ok()?,
-                unit,
-            });
-        }
+    let units = [
+        ("min", PimdirQueryDateUnit::Minute),
+        ("mo", PimdirQueryDateUnit::Month),
+        ("h", PimdirQueryDateUnit::Hour),
+        ("d", PimdirQueryDateUnit::Day),
+        ("w", PimdirQueryDateUnit::Week),
+        ("y", PimdirQueryDateUnit::Year),
+    ];
+    let relative = units
+        .into_iter()
+        .find_map(|(suffix, unit)| Some((value.strip_suffix(suffix)?, unit)));
+    if let Some((amount, unit)) = relative
+        && digits(amount)
+        && amount.len() <= RELATIVE_DIGITS_MAX
+    {
+        return Some(PimdirQueryDate::Relative {
+            amount: amount.parse().ok()?,
+            unit,
+        });
+    }
+
+    if let Some((day, time)) = value.split_once('T') {
+        return instant(day, time);
     }
 
     let number = |part: &str, len: usize| {
@@ -1391,6 +1653,57 @@ fn date(value: &str) -> Option<PimdirQueryDate> {
         }
         _ => None,
     }
+}
+
+/// Reads an `instant` from its day and the time after its `T`.
+fn instant(day: &str, time: &str) -> Option<PimdirQueryDate> {
+    let PimdirQueryDate::Day { year, month, day } = date(day)? else {
+        return None;
+    };
+    let two = |part: &str, max: u8| {
+        (part.len() == 2 && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u8>().ok())
+            .flatten()
+            .filter(|n| *n <= max)
+    };
+
+    let (clock, offset) = match time.strip_suffix('Z') {
+        Some(clock) => (clock, Some(0)),
+        None => match time
+            .len()
+            .checked_sub(6)
+            .and_then(|at| time.split_at_checked(at))
+        {
+            Some((clock, zone)) if zone.starts_with(['+', '-']) => {
+                let (hours, minutes) = zone[1..].split_once(':')?;
+                let minutes = i16::from(two(hours, 23)?) * 60 + i16::from(two(minutes, 59)?);
+                let sign = if zone.starts_with('-') { -1 } else { 1 };
+                (clock, Some(sign * minutes))
+            }
+            _ => (time, None),
+        },
+    };
+
+    let mut parts = clock.split(':');
+    let hour = two(parts.next()?, 23)?;
+    let minute = two(parts.next()?, 59)?;
+    let second = match parts.next() {
+        Some(second) => Some(two(second, 59)?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some(PimdirQueryDate::Instant {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        offset,
+    })
 }
 
 /// The days of a month in the proleptic Gregorian calendar.
@@ -1761,5 +2074,31 @@ mod tests {
         };
         assert_eq!(operands.len(), 3);
         assert_eq!(predicates(&scoped), [terms, vec![kind]].concat());
+    }
+
+    #[test]
+    fn a_predicate_names_the_field_a_client_serves() {
+        let names = [
+            ("meeting", "text"),
+            ("subject:x", "title"),
+            ("summary:x", "title"),
+            ("from:a@b", "from"),
+            ("with:jane", "with"),
+            ("is:read", "is.read"),
+            ("tag:work", "tag"),
+            ("has:attachment", "has.attachment"),
+            ("mid:<a@b>", "mid"),
+            ("date:2026-08", "date"),
+            ("date:3d", "date"),
+            ("date:5h", "date.instant"),
+            ("date:2026-08-01..2026-08-01T10:00Z", "date.instant"),
+        ];
+        for (query, name) in names {
+            let parsed = PimdirQuery::parse(query).unwrap();
+            let [(term, _)] = parsed.terms()[..] else {
+                panic!("{query}: one term");
+            };
+            assert_eq!(term.predicate.name(), name, "{query}");
+        }
     }
 }

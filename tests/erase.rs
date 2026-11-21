@@ -6,7 +6,7 @@
 //! their write-ahead logs included, while the handles that wrote them are
 //! still open.
 
-#![cfg(all(feature = "client", feature = "search"))]
+#![cfg(all(feature = "search", feature = "indexer"))]
 
 use std::{fs, path::Path};
 

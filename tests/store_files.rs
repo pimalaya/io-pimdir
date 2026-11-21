@@ -119,7 +119,7 @@ fn a_created_store_holds_directories_0700_and_files_0600() {
 
 /// index.db, its `-wal` and `-shm` and index.lock are `0600` too (SEARCH
 /// §3, STORAGE §18).
-#[cfg(feature = "search")]
+#[cfg(all(feature = "search", feature = "indexer"))]
 #[test]
 fn the_index_files_are_0600() {
     use io_pimdir::client::search::{PimdirIndex, PimdirIndexRefreshOptions};
@@ -232,7 +232,7 @@ fn a_link_where_a_lock_belongs_is_never_followed() {
 
 /// A link where index.lock belongs fails the refresh, naming it (STORAGE
 /// §18, SEARCH §3).
-#[cfg(feature = "search")]
+#[cfg(all(feature = "search", feature = "indexer"))]
 #[test]
 fn a_link_where_the_index_lock_belongs_is_never_followed() {
     use io_pimdir::client::search::{PimdirIndex, PimdirIndexRefreshOptions};

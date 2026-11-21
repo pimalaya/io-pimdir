@@ -9,14 +9,14 @@
 
 mod common;
 
-#[cfg(feature = "search")]
+#[cfg(all(feature = "search", feature = "indexer"))]
 mod crash;
 mod drain;
-#[cfg(feature = "search")]
+#[cfg(all(feature = "search", feature = "indexer"))]
 mod index;
 mod overlay;
 mod reader;
-#[cfg(feature = "search")]
+#[cfg(all(feature = "search", feature = "indexer"))]
 mod replay;
-#[cfg(feature = "search")]
+#[cfg(all(feature = "search", feature = "indexer"))]
 mod scale;

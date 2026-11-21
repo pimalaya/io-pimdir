@@ -25,10 +25,14 @@
 //! [`refresh`](PimdirIndex::refresh) whenever the store moves.
 
 mod compile;
+#[cfg(feature = "indexer")]
 mod refresh;
+mod summary;
 mod tag;
 
-use core::{cmp::Ordering, mem};
+use core::cmp::Ordering;
+#[cfg(feature = "indexer")]
+use core::mem;
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -38,46 +42,53 @@ use alloc::{
     vec::Vec,
 };
 
+#[cfg(feature = "indexer")]
 use std::{
     fs::{self, File},
     io,
-    path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    path::PathBuf,
+    time::Instant,
+};
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "indexer")]
 use fs4::FileExt;
 use jiff::tz::TimeZone;
 use log::{debug, trace};
-use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params, params_from_iter,
-};
+#[cfg(feature = "indexer")]
+use rusqlite::TransactionBehavior;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params_from_iter};
 
 use crate::{
     client::{
-        PimdirError, PreparedCached, bind_list, busy_or_sql, checkpoint, lock, modes,
-        prepare_connection,
+        PimdirError, PreparedCached, bind_list, busy_or_sql, modes, prepare_connection,
         reader::PimdirReader,
         rows, schema,
-        search::{
-            compile::{Categories, Compiled, Ends, Probe},
-            refresh::Statements,
-        },
+        search::compile::{Categories, Compiled, Ends, Probe},
     },
     codec,
-    coroutine::PimdirCoroutineState,
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
     search::{
-        coverage::{PimdirSearchCoverage, PimdirSearchUnread},
+        coverage::{self, PimdirSearchCoverage, PimdirSearchUnread},
         extract::{self, PimdirChunk, PimdirExtract, PimdirExtractStatus},
-        fold, occurrence,
+        fold,
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
-        refresh::PimdirIndexRefresh,
     },
     sql::{self, search},
 };
+#[cfg(feature = "indexer")]
+use crate::{
+    client::{checkpoint, lock, search::refresh::Statements},
+    coroutine::PimdirCoroutineState,
+    search::refresh::PimdirIndexRefresh,
+};
 
 /// The file a refresh locks exclusively (SEARCH §3).
+#[cfg(feature = "indexer")]
 const LOCK: &str = "index.lock";
 
 /// The SQLite version the index requires, for `contentless_delete`
@@ -91,9 +102,11 @@ const SNIPPET_LEN: usize = 200;
 pub struct PimdirIndex {
     conn: Connection,
     reader: PimdirReader,
+    #[cfg(feature = "indexer")]
     dir: PathBuf,
     /// Opened by [`open_query`](PimdirIndex::open_query): index.db read
     /// only, never refreshed.
+    #[cfg(feature = "indexer")]
     query_only: bool,
     /// Whether the index stands under this build's extraction (SEARCH §2,
     /// §6), so the chunk offsets it stores index the text this build
@@ -102,6 +115,7 @@ pub struct PimdirIndex {
 }
 
 /// How far one refresh goes.
+#[cfg(feature = "indexer")]
 #[derive(Clone, Debug)]
 pub struct PimdirIndexRefreshOptions {
     /// The most feed rows one transaction folds, so the store's WAL still
@@ -120,18 +134,20 @@ pub struct PimdirIndexRefreshOptions {
     pub floating_zone: String,
 }
 
+#[cfg(feature = "indexer")]
 impl Default for PimdirIndexRefreshOptions {
     fn default() -> Self {
         Self {
             batch: 256,
             deadline: None,
             now: None,
-            floating_zone: occurrence::FLOATING_ZONE.into(),
+            floating_zone: coverage::FLOATING_ZONE.into(),
         }
     }
 }
 
 /// What one refresh did.
+#[cfg(feature = "indexer")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirIndexReport {
     /// Feed rows folded.
@@ -154,6 +170,7 @@ pub struct PimdirIndexReport {
     pub busy: bool,
 }
 
+#[cfg(feature = "indexer")]
 impl PimdirIndexReport {
     /// Whether the index has folded every change the store had when the
     /// pass began.
@@ -165,13 +182,44 @@ impl PimdirIndexReport {
 /// The order of a hit list (SEARCH §8.2).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PimdirSearchSort {
-    /// `sort_key` descending, contacts last.
+    /// `newest-first`: `sort_key` descending, the undated last.
     #[default]
-    Date,
-    /// The title ascending, case folded.
-    Name,
-    /// FTS5 `bm25`, best first; hits no text term ranks after, by date.
+    NewestFirst,
+    /// `oldest-first`: `sort_key` ascending, the undated last.
+    OldestFirst,
+    /// `title`: the title folded, A to Z, a title-less item first.
+    Title,
+    /// `sender`: a message's sender folded, A to Z, the rest last by date.
+    Sender,
+    /// `relevance`: FTS5 `bm25`, best first, the unranked last by date.
     Relevance,
+}
+
+impl PimdirSearchSort {
+    /// Every order, in SEARCH §8.2's.
+    pub const ALL: [Self; 5] = [
+        Self::NewestFirst,
+        Self::OldestFirst,
+        Self::Title,
+        Self::Sender,
+        Self::Relevance,
+    ];
+
+    /// The order's name in SEARCH §8.2.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NewestFirst => "newest-first",
+            Self::OldestFirst => "oldest-first",
+            Self::Title => "title",
+            Self::Sender => "sender",
+            Self::Relevance => "relevance",
+        }
+    }
+
+    /// The inverse of [`as_str`](Self::as_str).
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|sort| sort.as_str() == name)
+    }
 }
 
 /// One page of a search.
@@ -191,7 +239,7 @@ pub struct PimdirSearchOptions {
 impl Default for PimdirSearchOptions {
     fn default() -> Self {
         Self {
-            sort: PimdirSearchSort::Date,
+            sort: PimdirSearchSort::NewestFirst,
             limit: 50,
             after: None,
             clock: PimdirSearchClock::default(),
@@ -209,13 +257,13 @@ impl Default for PimdirSearchOptions {
 /// [`from_token`](Self::from_token) reads it back.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirSearchCursor {
-    /// Whether the hit is undated, the `date` order's first key.
+    /// Whether the hit is undated, the dated orders' first key.
     undated: bool,
-    /// Its sort key, the `date` order's second.
+    /// Its sort key, their second.
     sort_key: Option<String>,
     /// The bits of its rank, the `relevance` order's first, `None` last.
     rank: Option<u64>,
-    /// Its title folded, the `name` order's first.
+    /// Its title or its sender folded, the `title` or `sender` order's first.
     title: String,
     /// Its public id, every order's tie-break.
     seq: i64,
@@ -291,22 +339,30 @@ impl PimdirSearchCursor {
     }
 
     /// The order of two places under `sort`, the one the statement and
-    /// the `name` fold give a whole answer.
+    /// the title fold give a whole answer.
     fn compare(&self, other: &Self, sort: PimdirSearchSort) -> Ordering {
         let ties = || {
             self.seq
                 .cmp(&other.seq)
                 .then_with(|| self.account.cmp(&other.account))
         };
-        match sort {
-            PimdirSearchSort::Date => self
-                .undated
+        let dated = |newest: bool| {
+            self.undated
                 .cmp(&other.undated)
-                .then_with(|| match self.undated {
-                    false => other.sort_key.cmp(&self.sort_key),
-                    true => self.sort_key.cmp(&other.sort_key),
+                .then_with(|| match (self.undated, newest) {
+                    (false, true) => other.sort_key.cmp(&self.sort_key),
+                    _ => self.sort_key.cmp(&other.sort_key),
                 })
-                .then_with(ties),
+                .then_with(ties)
+        };
+        match sort {
+            PimdirSearchSort::NewestFirst => dated(true),
+            PimdirSearchSort::OldestFirst => dated(false),
+            PimdirSearchSort::Sender => match (self.title.is_empty(), other.title.is_empty()) {
+                (false, false) => self.title.cmp(&other.title).then_with(ties),
+                (true, true) => dated(true),
+                (left, right) => left.cmp(&right),
+            },
             PimdirSearchSort::Relevance => {
                 let rank = |rank: Option<u64>| rank.map(f64::from_bits);
                 match (rank(self.rank), rank(other.rank)) {
@@ -317,7 +373,7 @@ impl PimdirSearchCursor {
                 }
                 .then_with(ties)
             }
-            PimdirSearchSort::Name => self.title.cmp(&other.title).then_with(ties),
+            PimdirSearchSort::Title => self.title.cmp(&other.title).then_with(ties),
         }
     }
 }
@@ -526,6 +582,7 @@ impl PimdirIndex {
     /// FTS5 or older than 3.43 is [`PimdirError::Fts5`]; another indexer
     /// holding index.lock while this one has to build is
     /// [`PimdirError::Indexing`].
+    #[cfg(feature = "indexer")]
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         debug!("opening search index at {}", dir.display());
@@ -554,7 +611,9 @@ impl PimdirIndex {
         Ok(Self {
             conn,
             reader,
+            #[cfg(feature = "indexer")]
             dir: dir.to_path_buf(),
+            #[cfg(feature = "indexer")]
             query_only: false,
             own_extraction: true,
         })
@@ -611,7 +670,9 @@ impl PimdirIndex {
         Ok(Self {
             conn,
             reader,
+            #[cfg(feature = "indexer")]
             dir: dir.to_path_buf(),
+            #[cfg(feature = "indexer")]
             query_only: true,
             own_extraction: held == PimdirIndexHeld::Current,
         })
@@ -635,7 +696,7 @@ impl PimdirIndex {
         let zone: Option<String> =
             self.conn
                 .query_row_cached(search::LOAD_INDEX_META, [], |row| row.get(11))?;
-        Ok(zone.unwrap_or_else(|| occurrence::FLOATING_ZONE.into()))
+        Ok(zone.unwrap_or_else(|| coverage::FLOATING_ZONE.into()))
     }
 
     /// Folds the store's change feed into the index (SEARCH §4), in
@@ -658,6 +719,7 @@ impl PimdirIndex {
     /// commits (SEARCH §4), so its lists' filters trail their rows by one
     /// batch. The store does not call it itself: the index is optional, a
     /// feature of its own, and a store never depends on it.
+    #[cfg(feature = "indexer")]
     pub fn refresh(
         &mut self,
         options: &PimdirIndexRefreshOptions,
@@ -666,7 +728,7 @@ impl PimdirIndex {
             return Err(PimdirError::IndexQueryOnly(self.dir.join("index.db")));
         }
         let zone = options.floating_zone.as_str();
-        if zone != occurrence::FLOATING_ZONE && TimeZone::get(zone).is_err() {
+        if zone != coverage::FLOATING_ZONE && TimeZone::get(zone).is_err() {
             return Err(PimdirError::IndexZone(zone.into()));
         }
         let mut report = PimdirIndexReport {
@@ -758,6 +820,7 @@ impl PimdirIndex {
     /// Another indexer holding index.lock is [`PimdirError::Indexing`]; a
     /// handle opened by [`open_query`](Self::open_query) is
     /// [`PimdirError::IndexQueryOnly`].
+    #[cfg(feature = "indexer")]
     pub fn erase(&mut self) -> Result<PimdirIndexReport, PimdirError> {
         let options = PimdirIndexRefreshOptions {
             floating_zone: self.floating_zone()?,
@@ -1124,7 +1187,7 @@ impl PimdirIndex {
                     sort_key: row.get(3)?,
                     rank: row.get::<_, Option<f64>>(2)?.map(f64::to_bits),
                     title: match sort {
-                        PimdirSearchSort::Name => fold::value(&title),
+                        PimdirSearchSort::Title | PimdirSearchSort::Sender => fold::value(&title),
                         _ => String::new(),
                     },
                     seq: row.get(1)?,
@@ -1553,7 +1616,7 @@ impl PimdirIndex {
                 .is_none_or(|until| until.as_str() > end.as_str());
         // NOTE: compared as names, a client stating none stating `UTC`
         // (SEARCH §8.1).
-        let stated = clock.zone.as_deref().unwrap_or(occurrence::FLOATING_ZONE);
+        let stated = clock.zone.as_deref().unwrap_or(coverage::FLOATING_ZONE);
         coverage.zone_differs = stated != floating;
         Ok(coverage)
     }
@@ -1751,6 +1814,7 @@ fn draft(version: &str) -> Option<u32> {
 
 /// Builds index.db afresh: the files of the one there removed, the schema
 /// applied and `index_meta` written (SEARCH §2).
+#[cfg(feature = "indexer")]
 fn build(dir: &Path) -> Result<Connection, PimdirError> {
     debug!("building search index at {}", dir.display());
     for name in ["index.db", "index.db-wal", "index.db-shm"] {
@@ -1797,6 +1861,7 @@ fn shape(conn: &Connection, schema: &str) -> Result<Vec<(String, String)>, Pimdi
 
 /// Applies the index schema to an empty index.db, refusing a SQLite that
 /// lacks FTS5 as [`PimdirError::Fts5`].
+#[cfg(feature = "indexer")]
 fn init(conn: &mut Connection) -> Result<(), PimdirError> {
     let tx = conn.transaction()?;
     for migration in search::MIGRATIONS {
@@ -1825,6 +1890,7 @@ fn init(conn: &mut Connection) -> Result<(), PimdirError> {
 
 /// Takes index.lock exclusively, `None` when another indexer holds it,
 /// opened `0600` without following a link (STORAGE §18).
+#[cfg(feature = "indexer")]
 fn lock(dir: &Path) -> Result<Option<File>, PimdirError> {
     let file = lock::open(&dir.join(LOCK))?;
     // NOTE: named through the trait, as the owner lock does: std's own
@@ -1875,8 +1941,8 @@ fn extract(
         return Ok(parsed.unwrap_or_default());
     }
 
-    let found = refresh::summary(conn, collection, seq, kind)?;
-    let mut extract = PimdirExtract::summary(found.summary.as_ref(), &found.addresses);
+    let (summary, addresses) = summary::summary(conn, collection, seq, kind)?;
+    let mut extract = PimdirExtract::summary(summary.as_ref(), &addresses);
     if parsed.is_some() {
         extract.status = PimdirExtractStatus::Unparseable;
     }
@@ -1971,9 +2037,11 @@ mod tests {
             .collect();
 
         for sort in [
-            PimdirSearchSort::Date,
+            PimdirSearchSort::NewestFirst,
+            PimdirSearchSort::OldestFirst,
             PimdirSearchSort::Relevance,
-            PimdirSearchSort::Name,
+            PimdirSearchSort::Title,
+            PimdirSearchSort::Sender,
         ] {
             let mut sorted = found.clone();
             sorted.sort_by(|left, right| left.place.compare(&right.place, sort));

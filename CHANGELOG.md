@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added the features `mail`, `contact` and `calendar`, each compiling its domain's extraction alone (and `contact` the card matcher), and `indexer`, the I/O-free index refresh over the three, without `client`.
+- Added `search::mail::PimdirMail`, `PimdirQuery::match_mails` and `PimdirQuery::mail_terms`: a query matched over messages held in memory, read with their bodies or from their header alone, as an index holding them answers, under `mail` without `client`.
+- Added the `mid:` field, matching a message's `Message-ID` whole, with or without its angle brackets (`PimdirQueryPredicate::Mid`, pimdir SEARCH §8 in search-draft-16).
+- Added instants to `date:` and `when:` (`2026-08-01T10:00`, with seconds, `Z` or an offset; `PimdirQueryDate::Instant`), read in the query's zone when they state no offset, and the relative units `min`, `h` and `mo` (pimdir SEARCH §8.1).
+- Added `PimdirQueryDateRange::bounds`, a range's instants in Unix seconds, for a client translating a query to a server.
+- Added `PimdirQueryPredicate::name()`, the name a client's capability table keys a term on.
+- Added `PimdirSearchSort::as_str`, `parse` and `ALL`.
+
+### Changed
+
+- **BREAKING**: Changed `search` to read the index alone: it implies `client` and compiles `PimdirIndex::open_query`, the queries, `item` and `tag`, no domain; `PimdirIndex::open`, `refresh` and `erase` need `search` and `indexer`. A reader takes the domains it shows (`item` and the snippets read a body of a domain left out from its summary). The card matcher moves to `contact`, the refresh coroutine to `indexer`.
+- **BREAKING**: Changed `search::query` and `search::coverage` to compile with no feature.
+- **BREAKING**: Moved `search::occurrence::FLOATING_ZONE` to `search::coverage::FLOATING_ZONE`.
+- **BREAKING**: Changed `PimdirSearchSort` to SEARCH §8.2's five orders, `NewestFirst` (was `Date`, the default), `OldestFirst`, `Title` (was `Name`), `Sender` and `Relevance`, and the CLI's `--sort` to `newest-first`, `oldest-first`, `title`, `sender` and `relevance`.
+- **BREAKING**: Added the variants `PimdirQueryPredicate::Mid`, `PimdirQueryDate::Instant` and `PimdirQueryDateUnit::{Minute, Hour, Month}`, which an exhaustive match names.
+- **BREAKING**: Changed the index to search-draft-16 (`sql::search::FORMAT_VERSION`): an index of search-draft-15 is rebuilt by the indexer and refused by a query client until then.
+
 ## [0.19.1] - 2026-11-21
 
 ### Fixed

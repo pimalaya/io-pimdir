@@ -6,7 +6,7 @@
 //! The vectors are the vendored copy under spec/vectors/, so the suite
 //! always runs.
 
-#![cfg(feature = "search")]
+#![cfg(feature = "contact")]
 
 use std::{collections::BTreeSet, fs, path::PathBuf};
 

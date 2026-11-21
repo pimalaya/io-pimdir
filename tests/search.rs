@@ -10,7 +10,7 @@
 //! The vectors are the vendored copy under spec/vectors/, so the suite
 //! always runs; a case a later phase fixes is on tests/pending_vectors.txt.
 
-#![cfg(all(feature = "client", feature = "search"))]
+#![cfg(all(feature = "search", feature = "indexer"))]
 
 mod pending;
 
@@ -585,7 +585,7 @@ fn every_search_vector_answers() {
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
     let vectors = json(&spec.join("vectors/search/queries.json"));
-    assert_eq!(vectors["v"], 4, "queries.json at another version");
+    assert_eq!(vectors["v"], 5, "queries.json at another version");
 
     // NOTE: the horizon is drawn around the vectors' now (SEARCH §11).
     let now = unix(vectors["now"].as_str().unwrap());
@@ -784,11 +784,11 @@ fn answers(
     let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{query:?}: {err}"));
 
     let options = PimdirSearchOptions {
-        sort: match case["sort"].as_str() {
-            Some("name") => PimdirSearchSort::Name,
-            Some("relevance") => PimdirSearchSort::Relevance,
-            _ => PimdirSearchSort::Date,
-        },
+        sort: case["sort"]
+            .as_str()
+            .map_or(PimdirSearchSort::NewestFirst, |sort| {
+                PimdirSearchSort::parse(sort).unwrap_or_else(|| panic!("{sort}: a known order"))
+            }),
         limit: 100,
         after: None,
         clock: clock.clone(),
@@ -1438,8 +1438,10 @@ fn every_field_alone_answers_in_every_order() {
         "not body:roadmap",
     ];
     let sorts = [
-        PimdirSearchSort::Date,
-        PimdirSearchSort::Name,
+        PimdirSearchSort::NewestFirst,
+        PimdirSearchSort::OldestFirst,
+        PimdirSearchSort::Title,
+        PimdirSearchSort::Sender,
         PimdirSearchSort::Relevance,
     ];
     for query in queries {
@@ -2127,12 +2129,12 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
     for (altered, version, shape) in [
         (
             "UPDATE index_meta SET shape = 'fts4'",
-            Some("search-draft-15"),
+            Some("search-draft-16"),
             Some("fts4"),
         ),
         (
-            "UPDATE index_meta SET format_version = 'search-draft-16'",
-            Some("search-draft-16"),
+            "UPDATE index_meta SET format_version = 'search-draft-17'",
+            Some("search-draft-17"),
             Some("canonical"),
         ),
         (
@@ -2187,6 +2189,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         "UPDATE index_meta SET format_version = 'search-draft-12'",
         "UPDATE index_meta SET format_version = 'search-draft-13'",
         "UPDATE index_meta SET format_version = 'search-draft-14'",
+        "UPDATE index_meta SET format_version = 'search-draft-15'",
         "ALTER TABLE index_meta DROP COLUMN format_version",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -2203,7 +2206,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         drop(index);
         assert_eq!(
             index_meta(dir.path(), "format_version"),
-            rusqlite::types::Value::Text("search-draft-15".into()),
+            rusqlite::types::Value::Text("search-draft-16".into()),
             "{altered}"
         );
     }

@@ -6,7 +6,7 @@ status: current
 
 # Search
 
-The reference implementation of pimdir SEARCH.md (`search-draft-15`, an indexer and a query client of the canonical shape), versioned with the crate like the store and the engine, SEARCH.md being released together with STORAGE.md and SYNC.md: index.db beside the store, its refresh from the change feed, extraction and the query language. It ships behind the `search` feature, which `cli` enables and the default leaves out, so a consumer that does not search carries none of it. `search` alone is I/O-free (src/search/: the query language, the folds, extraction, chunks, occurrences, tags, threads and the refresh coroutine); `search` with `client` adds `PimdirIndex`, index.db over rusqlite (src/client/search.rs). Milestones M1 to M4 of pimdir's search-milestones: every kind's extraction, every field, occurrences within the horizon, threads, relative dates, tagging and the thread verb; and search-draft-08's bounds, versions, retries and prune.
+The reference implementation of pimdir SEARCH.md (`search-draft-16`, an indexer and a query client of the canonical shape), versioned with the crate like the store and the engine, SEARCH.md being released together with STORAGE.md and SYNC.md: index.db beside the store, its refresh from the change feed, extraction and the query language. The query language and the coverage build with no feature; the rest ships behind `mail`, `contact`, `calendar` (each domain's extraction), `indexer` (the I/O-free refresh, occurrences and threads) and `search` (`PimdirIndex`, index.db over rusqlite, src/client/search.rs), which `cli` enables and the default leaves out, so a consumer carries the domains it reads alone. Milestones M1 to M4 of pimdir's search-milestones: every kind's extraction, every field, occurrences within the horizon, threads, relative dates, tagging and the thread verb; and search-draft-08's bounds, versions, retries and prune.
 
 ### Requirement: The index is derived and rebuilt, never migrated
 `PimdirIndex::open` SHALL open index.db as the main database with pimdir.db attached read-only as `store`, and SHALL read what it holds before writing anything (SEARCH §2, `PimdirIndexHeld` in src/client/search.rs). It SHALL refuse as `PimdirError::IndexVersion` (`index-version`, naming the index's version and shape) an index.db holding a schema and no `index_meta`, one whose `shape` is not `canonical`, and one whose `format_version` lies above `search-draft-10` or names no draft, never rebuilding, writing nor deleting it: the journal mode is set only once the index is found its own or built. It SHALL rebuild one of its shape whose `format_version` lies below its own or which lacks the column, one at another schema version, tokenizer or schema text (every table, index and trigger migrations/search/0001_init.sql creates, compared by its `sqlite_schema` text with `--` comments removed and whitespace collapsed, the shadow tables FTS5 creates and any other table left out), one built from another store or another copy of it (`index_meta.store_id` and `store_incarnation` against `load_change_cursor`'s), and one whose `store_change` lies above the store's last stamp. The schema text is compared before `load_index_meta` is run, which names columns an index of an earlier text lacks: one written under the first batches of draft-10, holding neither `index_meta.extraction` nor `extractor` nor the index `object_not_ok`, is rebuilt on that ground. `refresh` SHALL make the same check under index.lock and rebuild an index a store was restored under. Versions are ordered by their draft number below every release (`sql::search::FORMAT_DRAFT`). `PimdirIndex::open_query` SHALL refuse an index of another shape or version as `IndexVersion` and one this build would otherwise rebuild as `PimdirError::IndexOutdated`, but for the extraction's revisions (below). It SHALL refuse a SQLite without FTS5 or older than 3.43 (`PimdirError::Fts5`) rather than build a partial index.
@@ -20,8 +20,8 @@ The reference implementation of pimdir SEARCH.md (`search-draft-15`, an indexer 
 - WHEN `open` or `open_query` opens it, THEN each answers `IndexVersion` naming what it found, and index.db is byte for byte what it was, no WAL frame written (tests/search.rs `an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is`)
 
 #### Scenario: An earlier version
-- GIVEN an index.db at `search-draft-07`, `search-draft-09`, `search-draft-10`, `search-draft-11`, `search-draft-12`, `search-draft-13` or `search-draft-14`, or lacking `format_version`
-- WHEN `open_query` opens it, THEN it answers `IndexVersion`; WHEN `open` opens it, THEN it is rebuilt at `search-draft-15` (tests/search.rs `an_index_of_an_earlier_version_is_rebuilt_never_queried`)
+- GIVEN an index.db at `search-draft-07`, `search-draft-09`, `search-draft-10`, `search-draft-11`, `search-draft-12`, `search-draft-13`, `search-draft-14` or `search-draft-15`, or lacking `format_version`
+- WHEN `open_query` opens it, THEN it answers `IndexVersion`; WHEN `open` opens it, THEN it is rebuilt at `search-draft-16` (tests/search.rs `an_index_of_an_earlier_version_is_rebuilt_never_queried`)
 
 #### Scenario: Another store, another copy, a cursor ahead
 - GIVEN an index.db naming another `store_id` or `store_incarnation`, or a `store_change` above the store's last stamp, or a store whose incarnation `raise_incarnation` raised under an open index
@@ -39,7 +39,7 @@ The crate SHALL state the revision of SEARCH §6 it extracts and expands under, 
 - WHEN `open_query` opens it, THEN it answers `IndexOutdated`; WHEN `open` opens it, THEN it is rebuilt (tests/search.rs `an_index_of_the_earlier_draft_10_text_is_rebuilt`, which failed on "no such column" with `load_index_meta` read first)
 
 ### Requirement: The index statements are bound as re-signed
-The index SHALL bind the search statements as search-draft-15 signs them (SEARCH §2, §3): `init_index_meta` writing the format version, the shape, the revisions of the extraction and the store's id and incarnation off the attached store, `load_index_meta` read by its fourteen columns (`version`, `tokenizer`, `store_change`, `store_purges`, `horizon_start`, `horizon_end`, `tzdb_version`, `store_id`, `store_incarnation`, `format_version`, `shape`, `floating_zone`, `extraction`, `extractor`), `coverage` by its five (`kind`, `bodiless`, `missing`, `unparseable`, `encrypted`), `set_index_cursor` with `:store_change` and `:store_purges` alone, `items_to_reexpand` with `:floating_zone` bound to the zone the refresh states, `placements_gone` read by its three columns, the link id naming the thread to prune, `coverage` and `cut_before` with the `collections` slot, and `hit` with `:seq` and `:account`, read by its nine columns (`collection`, `link_id`, `flags`, `object_hash`, `sort_key`, `level`, `kind`, `kind_value`, `title`): every live placement of a hit in collection order, the first naming its kind (the `kind:` value, else the collection's media type for a calendar item holding no summary row) and its title. The crate keeps no text of its own for it. Every statement of SEARCH §3's table is run but `set_extraction`, which the rebuild makes needless (above). The order by relevance is the crate's own statement over the rank `match_objects` and `match_summaries` answer, the whole hit set in one statement, bodies and bodiless placements' summaries ranked together (SEARCH §8.2).
+The index SHALL bind the search statements as search-draft-16 signs them (SEARCH §2, §3): `init_index_meta` writing the format version, the shape, the revisions of the extraction and the store's id and incarnation off the attached store, `load_index_meta` read by its fourteen columns (`version`, `tokenizer`, `store_change`, `store_purges`, `horizon_start`, `horizon_end`, `tzdb_version`, `store_id`, `store_incarnation`, `format_version`, `shape`, `floating_zone`, `extraction`, `extractor`), `coverage` by its five (`kind`, `bodiless`, `missing`, `unparseable`, `encrypted`), `set_index_cursor` with `:store_change` and `:store_purges` alone, `items_to_reexpand` with `:floating_zone` bound to the zone the refresh states, `placements_gone` read by its three columns, the link id naming the thread to prune, `coverage` and `cut_before` with the `collections` slot, and `hit` with `:seq` and `:account`, read by its nine columns (`collection`, `link_id`, `flags`, `object_hash`, `sort_key`, `level`, `kind`, `kind_value`, `title`): every live placement of a hit in collection order, the first naming its kind (the `kind:` value, else the collection's media type for a calendar item holding no summary row) and its title. The crate keeps no text of its own for it. Every statement of SEARCH §3's table is run but `set_extraction`, which the rebuild makes needless (above). The order by relevance is the crate's own statement over the rank `match_objects` and `match_summaries` answer, the whole hit set in one statement, bodies and bodiless placements' summaries ranked together (SEARCH §8.2).
 
 #### Scenario: A roll over a recurring journal
 - GIVEN an index holding a journal with a yearly rule, expanded under a horizon
@@ -108,6 +108,10 @@ A query's dates SHALL resolve against `PimdirSearchClock`: `now`, the system clo
 #### Scenario: A day a transition moves
 - WHEN `2026-10-25` and `2027-03-28` are read in `Europe/Paris`, and `2026-03-08` in `America/Havana`
 - THEN they last 25 and 23 hours, and the Havana day starts at 01:00, its midnight skipped (src/client/search/compile.rs `a_day_a_transition_moves_is_23_or_25_hours`, `calendar_spans_start_at_the_zone_midnight`)
+
+#### Scenario: Instants and amounts below the day
+- WHEN an instant is read with an offset, `Z` or none, and `min`, `h` and `mo` amounts back from now
+- THEN it spans its minute or its second at its offset or in the zone, a skipped local time read at the offset before the transition and a repeated one as its first, and a month back lands on the last day the month has (tests/search.rs `every_search_vector_answers`; src/client/search/compile.rs `a_local_time_a_transition_skips_or_repeats_reads_as_the_spec_says`, `a_month_back_lands_on_the_last_day_the_month_has`)
 
 #### Scenario: The index's zone and an unknown one
 - WHEN a query client reads the floating zone before and after an indexer states `Europe/Paris`, then counts stating `Mars/Olympus`
@@ -187,13 +191,17 @@ Each `PimdirIndexOp` SHALL name SEARCH §3's rows, so a consumer of another shap
 - WHEN a consumer holding its index in plain maps answers every yield from the store and from its maps, in batches of four, then again after a collection rename and a horizon rolled a week later
 - THEN its placements, objects, card categories, chunks, the bodies and placements holding text, flags, occurrences, cuts, missing records, messages, threads, cursor, horizon, time zone database version and floating zone are the index.db `PimdirIndex` builds, row for row (tests/search.rs `memory::a_consumer_of_its_own_shape_folds_the_canonical_index`)
 
-### Requirement: Search compiles without the client
-The query language, the folds, extraction, chunks, occurrences, tags, thread derivation and the refresh coroutine SHALL build without the `client` feature, under src/search/, using neither std I/O nor rusqlite; occurrence and thread derivation stand apart from the statements writing them (src/client/search/refresh.rs).
+### Requirement: Search compiles by domain
+The query language and the coverage SHALL build with no feature. `mail`, `contact` and `calendar` SHALL each compile its domain's extraction alone (src/search/extract/), `contact` the card matcher too, over the text layer (folds, chunks, the core of `PimdirExtract`) that `search` or any domain compiles. `indexer` SHALL compile the refresh coroutine, occurrences and threading over the three domains without `client`, using neither std I/O nor rusqlite. `search` SHALL compile the index's read side (`PimdirIndex::open_query`, the queries, `item`, `tag`) over `client` and no domain, a body of a domain left out read from its summary; `open`, `refresh` and `erase` need `search` and `indexer` (src/client/search/refresh.rs).
 
 #### Scenario: A build without rusqlite
-- GIVEN the crate built with `--no-default-features --features search`
+- GIVEN the crate built with `--no-default-features --features indexer`
 - WHEN a caller parses a query, extracts a message and runs a refresh answering it by hand
-- THEN all three succeed (tests/search_pure.rs), and `cargo tree --no-default-features --features search -e normal` names no SQLite
+- THEN all three succeed (tests/search_pure.rs), and `cargo tree --no-default-features --features indexer -e normal` names no SQLite
+
+#### Scenario: A mail reader pulls no other parser
+- GIVEN the crate built with `--no-default-features --features search,mail`
+- THEN `cargo tree -e normal` names neither ical-rs nor vcard-rs
 
 ### Requirement: The index folds text before the tokenizer
 The index SHALL store and match text folded by SEARCH §5's rule (`search::fold::text`) before any tokenizer reads it, the refresh's ops carrying it folded already, and SHALL register no SQL function: `category:` and the `name` order fold both sides in Rust (`search::fold::value`, STORAGE Annex A.2), the `name` order sorting the hits' titles after reading them.
@@ -225,7 +233,7 @@ An item SHALL write at most 10,000 occurrences (`search::occurrence::OCCURRENCES
 - spec/vectors/search store item 35 (every second from 2025-04-26T19:13:20Z under `COUNT=4000000000`, cut at 2025-08-20T13:00:00Z, its 10,000,001st instance), its window and the case `kind:event date:2025-08-20` (tests/search.rs `every_search_vector_answers`, failing on io-pimdir d1051d8); src/search/occurrence.rs `a_rule_is_walked_for_at_most_the_instance_bound`, the PIM-15 rule from 1914 cut at its 10,000,001st second
 
 ### Requirement: An index names its version and shape
-The indexer SHALL write `search-draft-15` (`sql::search::FORMAT_VERSION`) and `canonical` (`SHAPE`) in `index_meta` through `init_index_meta`, refuse an index of another shape or a later version as `PimdirError::IndexVersion`, and rebuild an earlier one of its own shape (SEARCH §2, §3), as "The index is derived and rebuilt, never migrated" states.
+The indexer SHALL write `search-draft-16` (`sql::search::FORMAT_VERSION`) and `canonical` (`SHAPE`) in `index_meta` through `init_index_meta`, refuse an index of another shape or a later version as `PimdirError::IndexVersion`, and rebuild an earlier one of its own shape (SEARCH §2, §3), as "The index is derived and rebuilt, never migrated" states.
 
 ### Requirement: Floating times are read in a recorded zone
 The indexer SHALL state its floating zone, an IANA name, `UTC` by default (`PimdirIndexRefreshOptions::floating_zone`, `PimdirIndexRefresh::floating_zone`, `search::occurrence::FLOATING_ZONE`; the CLI's `--floating-zone`), read a floating time and a date in it, a wall time a transition repeats or skips taking the offset before it (`summary::calendar::iana`), and re-expand every live calendar item when it differs from `index_meta.floating_zone`, recording its own (`set_floating_zone`) in that pass (SEARCH §7). A zone the IANA database does not name SHALL be refused as `PimdirError::IndexZone` (`index-zone-unknown`) before the refresh reads anything.
@@ -310,7 +318,7 @@ The `text/html` reduction (`search::html::to_text`) SHALL close a comment at the
 `PimdirIndex::search` SHALL select a page's hits among those following its cursor before sorting them, sorting the page alone, and answer exactly the hits a whole sorted answer holds after the cursor, in its order. A reader's overlay SHALL read the conflicts an item stands in only when it folds that item and an `update`, a `remove` or a `move` pending on it meets them (STORAGE §15.3, §15.4).
 
 #### Scenario: Every order, cursor and limit
-- src/client/search.rs `a_page_is_the_slice_of_the_sorted_answer_after_its_cursor`: 40 hits tying on every key but the public id, in the `date`, `relevance` and `name` orders, at every cursor and at limits 0, 1, 3 and 40; the overlay's suites (tests/overlay.rs, tests/item_conflict_settle.rs) unchanged
+- src/client/search.rs `a_page_is_the_slice_of_the_sorted_answer_after_its_cursor`: 40 hits tying on every key but the public id, in every order of `PimdirSearchSort::ALL`, at every cursor and at limits 0, 1, 3 and 40; the overlay's suites (tests/overlay.rs, tests/item_conflict_settle.rs) unchanged
 
 ### Requirement: The index sets its own journal mode alone
 The indexer SHALL set the journal mode of index.db alone (`PRAGMA main.journal_mode`), never that of the store it attaches read-only, so a store its operator keeps on a rollback journal (STORAGE §8, a network filesystem) is indexed and searched as any other.
@@ -321,8 +329,28 @@ The indexer SHALL set the journal mode of index.db alone (`PRAGMA main.journal_m
 - THEN both answer (tests/search.rs `a_store_on_a_rollback_journal_is_indexed`; before, `attempt to write a readonly database` and a 0-byte index.db)
 
 ### Requirement: Cards are matched in memory as the index matches them
-Under the `search` feature, without `client`, `PimdirQuery::match_cards(&[PimdirCard])` SHALL answer, per card read by `PimdirCard::read`, whether it is a hit of the query as an index holding those cards alone answers (SEARCH §5, §6, §8, §8.5): text folded and split as `unicode61` splits it, matched consecutively in one column with a trailing prefix, the role fields and `with:` over the card's addresses, `person:` over every card given, `has:` from the card's marks, `category:` folded, `kind:contact` alone holding, a date reaching a card beside `kind:contact`. A term a store alone answers (`PimdirQuery::store_terms`) SHALL refuse the match, naming its span (`PimdirCardMatchError`).
+Under the `contact` feature, without `client`, `PimdirQuery::match_cards(&[PimdirCard])` SHALL answer, per card read by `PimdirCard::read`, whether it is a hit of the query as an index holding those cards alone answers (SEARCH §5, §6, §8, §8.5): text folded and split as `unicode61` splits it, matched consecutively in one column with a trailing prefix, the role fields and `with:` over the card's addresses, `person:` over every card given, `has:` from the card's marks, `category:` folded, `kind:contact` alone holding, a date reaching a card beside `kind:contact`. A term a store alone answers (`PimdirQuery::store_terms`) SHALL refuse the match, naming its span (`PimdirCardMatchError`).
 
 #### Scenario: The contact cases
 - tests/search_cards.rs `every_contact_case_answers_the_index_hits_among_the_cards`: every case of vectors/search/queries.json that parses and reads no store answers, over the fixture store's cards, the hits it expects among them (more than 100 cases); `has:phone` read from the `ADR` mark fails it
 - src/search/card.rs: text, addresses, `person:`, marks and the refusal of a store term
+
+### Requirement: Messages are matched in memory as the index matches them
+Under the `mail` feature, without `client`, `PimdirQuery::match_mails(&[PimdirMail], now, zone)` SHALL answer, per message read by `PimdirMail::read` (a body and its flags) or `PimdirMail::read_meta` (a header block, as a bodiless placement), whether it is a hit of the query as an index holding those messages alone answers (SEARCH §5, §6, §8, §8.1, §8.5). A term no message answers alone (`PimdirQuery::mail_terms`: `account:`, `collection:`, `folder:`, `changed:`, `thread:`, `id:`, `linked:`, `person:`) SHALL refuse the match, naming its span (`PimdirMailMatchError`).
+
+#### Scenario: The mail cases
+- tests/search_mails.rs `every_mail_case_answers_the_index_hits_among_the_messages`: every case of vectors/search/queries.json that parses and names no such term answers, over the fixture store's messages read with their bodies, a hit's placements merged with the union of their flags, the hits the case expects among them
+- src/search/mail.rs: a header block alone, and the refusal of a term no message answers
+
+### Requirement: A predicate names what a client serves
+`PimdirQueryPredicate::name()` SHALL name a term as a client's capability table keys it: the field it was written with (an alias by its field: `subject:` is `title`), `text` for free text, `is.read`, `is.flagged`, `is.answered`, `is.draft`, `is.encrypted`, `has.*` per value, `tag` for any other flag, and `date.instant` for a range reaching below the day (an instant, an amount of minutes or hours), `date` otherwise.
+
+#### Scenario: The names
+- src/search/query.rs `a_predicate_names_the_field_a_client_serves`
+
+### Requirement: A search answers SEARCH §8.2's five orders
+`PimdirSearchSort` SHALL be `NewestFirst` (the default), `OldestFirst`, `Title`, `Sender` and `Relevance`, named by `as_str` and `parse` as SEARCH §8.2 names them, each one statement order and one cursor comparison (`PimdirSearchCursor`, the sender in its title slot, an empty one last); the CLI's `--sort` takes the same names.
+
+#### Scenario: Each order
+- tests/search.rs `every_search_vector_answers`: the cases stating `oldest-first`, `title`, `sender` and `relevance`
+- src/client/search.rs `a_page_is_the_slice_of_the_sorted_answer_after_its_cursor`, over `PimdirSearchSort::ALL`

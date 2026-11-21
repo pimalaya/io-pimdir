@@ -135,7 +135,7 @@ fn refused_by_every_profile(dir: &Path, expected: impl Fn(&PimdirError) -> bool)
 
 /// The index's view of the store refuses what every profile does, before
 /// index.db is made: the indexer and the query client (SEARCH §2).
-#[cfg(feature = "search")]
+#[cfg(all(feature = "search", feature = "indexer"))]
 #[test]
 fn the_index_refuses_a_store_of_another_version_and_makes_nothing() {
     use io_pimdir::client::search::PimdirIndex;

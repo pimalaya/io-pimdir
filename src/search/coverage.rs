@@ -31,6 +31,9 @@ const CARD: &str = "text/vcard";
 /// The media type of a calendar collection.
 const CALENDAR: &str = "text/calendar";
 
+/// The zone of floating times and of unzoned query dates (SEARCH §7, §8.1).
+pub const FLOATING_ZONE: &str = "UTC";
+
 /// What a search answer could not see, on three axes (SEARCH §8.2).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirSearchCoverage {

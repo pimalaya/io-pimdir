@@ -17,7 +17,7 @@ use alloc::{
     vec::Vec,
 };
 
-use jiff::{Timestamp, civil::Date, tz::TimeZone};
+use jiff::tz::TimeZone;
 use rusqlite::types::Value;
 
 use crate::{
@@ -25,9 +25,9 @@ use crate::{
     search::{
         fold,
         query::{
-            PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryDateUnit, PimdirQueryId,
-            PimdirQueryKind, PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm,
-            PimdirQueryText, PimdirQueryTextField,
+            PimdirQuery, PimdirQueryDateRange, PimdirQueryId, PimdirQueryKind,
+            PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm, PimdirQueryText,
+            PimdirQueryTextField,
         },
     },
     sql::{self, search},
@@ -123,13 +123,18 @@ impl Compiled {
         sort: PimdirSearchSort,
         page: Option<(usize, usize)>,
     ) -> String {
+        let newest = "undated ASC, CASE WHEN undated = 0 THEN sort_key END DESC, \
+             CASE WHEN undated = 1 THEN sort_key END ASC, h.seq ASC, h.akey ASC";
         let order = match sort {
-            PimdirSearchSort::Date => {
-                "undated ASC, CASE WHEN undated = 0 THEN sort_key END DESC, \
-                 CASE WHEN undated = 1 THEN sort_key END ASC, h.seq ASC, h.akey ASC"
+            PimdirSearchSort::NewestFirst => String::from(newest),
+            PimdirSearchSort::OldestFirst => {
+                String::from("undated ASC, sort_key ASC, h.seq ASC, h.akey ASC")
             }
-            PimdirSearchSort::Name => "h.seq ASC, h.akey ASC",
-            PimdirSearchSort::Relevance => "rank ASC NULLS LAST, h.seq ASC, h.akey ASC",
+            PimdirSearchSort::Title => String::from("h.seq ASC, h.akey ASC"),
+            PimdirSearchSort::Sender => format!("title = '' ASC, title ASC, {newest}"),
+            PimdirSearchSort::Relevance => {
+                String::from("rank ASC NULLS LAST, h.seq ASC, h.akey ASC")
+            }
         };
         let (limit, offset) = page.unwrap_or((i64::MAX as usize, 0));
         let limit = self.bind(Value::Integer(limit.min(i64::MAX as usize) as i64));
@@ -138,7 +143,7 @@ impl Compiled {
             WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey \
             AND i.deleted = 0 AND i.retained_at IS NULL";
         // NOTE: the title joins six summary tables per hit, before the order
-        // and the page cut: only the `name` order reads it.
+        // and the page cut: only the `title` and `sender` orders read it.
         let rank = match sort {
             PimdirSearchSort::Relevance => {
                 "(SELECT min(m.rank) FROM matched m WHERE m.akey = h.akey AND m.seq = h.seq)"
@@ -146,10 +151,17 @@ impl Compiled {
             _ => "NULL",
         };
         let title = match sort {
-            PimdirSearchSort::Name => format!(
+            PimdirSearchSort::Title => format!(
                 "(SELECT coalesce(ms.subject, cs.fn, es.summary, ts.summary, js.summary, fs.name, '') \
                  {TITLES} WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0 \
                  AND i.retained_at IS NULL ORDER BY i.collection LIMIT 1)"
+            ),
+            PimdirSearchSort::Sender => String::from(
+                "(SELECT coalesce(ms.sender, '') FROM store.items i \
+                 JOIN store.collections c ON c.id = i.collection \
+                 LEFT JOIN store.mail_summary ms ON ms.item = i.id \
+                 WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0 \
+                 AND i.retained_at IS NULL ORDER BY i.collection LIMIT 1)",
             ),
             _ => String::from("''"),
         };
@@ -391,6 +403,14 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                      AND s.status = {status})"
                 )
             }
+            PimdirQueryPredicate::Mid(id) => {
+                let id = self.bind(id.clone().into());
+                format!(
+                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.mail_summary s \
+                     WHERE s.item = i.id \
+                     AND s.message_id = {id})"
+                )
+            }
             PimdirQueryPredicate::Priority(priority) => {
                 let band = match priority {
                     PimdirQueryPriority::High => "s.priority BETWEEN 1 AND 4",
@@ -625,16 +645,6 @@ const TITLES: &str = "FROM store.items i JOIN store.collections c ON c.id = i.co
    LEFT JOIN store.journal_summary js ON js.item = i.id
    LEFT JOIN store.file_summary fs ON fs.item = i.id";
 
-/// Seconds in a day.
-const DAY: i64 = 86_400;
-
-/// The first instant of year 0, the earliest an RFC 3339 instant spells:
-/// `0000-01-01T00:00:00Z`.
-const YEAR_ZERO: i64 = -62_167_219_200;
-
-/// The last instant a four-digit year states: `9999-12-31T23:59:59Z`.
-const YEAR_LAST: i64 = 253_402_300_799;
-
 /// The collection media type of a kind.
 pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
     match kind {
@@ -647,107 +657,15 @@ pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
     }
 }
 
-/// The instants a range spans (SEARCH §8.1), `[since, until)` as RFC 3339
-/// in UTC, either side `None` open: from the start of its first point's
-/// span to the end of its last's, a calendar point spanning its day,
-/// month or year in `zone`, `today` and `yesterday` theirs around `now`
-/// (Unix seconds), and a relative amount the instant that long before
-/// `now`, its span alone running from that instant to `now`.
-///
-/// A bound no instant of a four-digit year states is open: a start before
-/// `0000-01-01T00:00:00Z`, which a relative amount reaches, and an end
-/// past `9999-12-31T23:59:59Z`, which the year 9999 does. An end before
-/// year 0 is its first instant, the range then holding nothing.
-///
-/// A single point is parsed as a range from it to itself, so `2w..2w`
-/// reads as `2w` alone.
+/// The instants a range spans as RFC 3339 in UTC, either side `None` open
+/// ([`PimdirQueryDateRange::bounds`]).
 pub(crate) fn bounds(
     range: &PimdirQueryDateRange,
     now: i64,
     zone: &TimeZone,
 ) -> (Option<String>, Option<String>) {
-    let single = range.start.is_some() && range.start == range.end;
-    let since = range.start.as_ref().map(|point| span(point, now, zone).0);
-    let until = range.end.as_ref().map(|point| match point {
-        PimdirQueryDate::Relative { .. } if single => now,
-        point => span(point, now, zone).1,
-    });
-    let since = since.filter(|since| *since >= YEAR_ZERO);
-    let until = until.filter(|until| *until <= YEAR_LAST);
-    (
-        since.map(time::rfc3339),
-        until.map(|until| time::rfc3339(until.max(YEAR_ZERO))),
-    )
-}
-
-/// The span of one date point, `[start, end)` in Unix seconds, its days
-/// read in `zone`; a relative amount spans its instant, which may lie
-/// before year 0.
-fn span(point: &PimdirQueryDate, now: i64, zone: &TimeZone) -> (i64, i64) {
-    let day = |year: u16, month: u8, day: u8| {
-        time::days_from_civil(i32::from(year), u32::from(month), u32::from(day))
-    };
-    let start = |days: i64| start_of_day(days, zone);
-    let today = Timestamp::from_second(now).map_or(now.div_euclid(DAY), |instant| {
-        let date = instant.to_zoned_datetime(zone.clone()).date();
-        time::days_from_civil(
-            i32::from(date.year()),
-            date.month() as u32,
-            date.day() as u32,
-        )
-    });
-
-    match *point {
-        PimdirQueryDate::Year(year) => (start(day(year, 1, 1)), start(day(year + 1, 1, 1))),
-        PimdirQueryDate::Month { year, month } => {
-            let next = match month {
-                12 => day(year + 1, 1, 1),
-                month => day(year, month + 1, 1),
-            };
-            (start(day(year, month, 1)), start(next))
-        }
-        PimdirQueryDate::Day {
-            year,
-            month,
-            day: date,
-        } => {
-            let first = day(year, month, date);
-            (start(first), start(first + 1))
-        }
-        PimdirQueryDate::Today => (start(today), start(today + 1)),
-        PimdirQueryDate::Yesterday => (start(today - 1), start(today)),
-        PimdirQueryDate::Relative { amount, unit } => {
-            let amount = i64::from(amount);
-            let instant = match unit {
-                PimdirQueryDateUnit::Day => now - amount * DAY,
-                PimdirQueryDateUnit::Week => now - amount * 7 * DAY,
-                PimdirQueryDateUnit::Year => {
-                    let (year, month, date) = time::civil_from_days(now.div_euclid(DAY));
-                    let year = i64::from(year) - amount;
-                    match i32::try_from(year) {
-                        Ok(year) if year >= 0 => {
-                            let date = date.min(time::days_in_month(year, month));
-                            time::days_from_civil(year, month, date) * DAY + now.rem_euclid(DAY)
-                        }
-                        _ => YEAR_ZERO - 1,
-                    }
-                }
-            };
-            (instant, instant)
-        }
-    }
-}
-
-/// The first instant of a day counted from 1970-01-01 in `zone`, its UTC
-/// midnight past the years jiff places.
-fn start_of_day(days: i64, zone: &TimeZone) -> i64 {
-    let (year, month, day) = time::civil_from_days(days);
-    i16::try_from(year)
-        .ok()
-        .and_then(|year| Date::new(year, month as i8, day as i8).ok())
-        .and_then(|date| date.to_zoned_datetime(zone.clone()).ok())
-        .and_then(|zoned| zoned.start_of_day().ok())
-        .map_or(days * DAY, |zoned| zoned.timestamp().as_second())
+    let (since, until) = range.bounds(now, zone);
+    (since.map(time::rfc3339), until.map(time::rfc3339))
 }
 
 /// The FTS5 expression of a text term: the text folded as the indexer
@@ -968,6 +886,45 @@ mod tests {
             bounds_in("2026-03-08", now, "America/Havana"),
             span("2026-03-08T05:00:00Z", "2026-03-09T04:00:00Z"),
             "a transition skipping midnight: the day starts at 01:00"
+        );
+    }
+
+    #[test]
+    fn a_local_time_a_transition_skips_or_repeats_reads_as_the_spec_says() {
+        let span = |since: &str, until: &str| (Some(since.into()), Some(until.into()));
+        let now = time::unix(2026, 8, 20, 12, 0, 0);
+
+        assert_eq!(
+            bounds_in("2027-03-28T02:30", now, "Europe/Paris"),
+            span("2027-03-28T01:30:00Z", "2027-03-28T01:31:00Z"),
+            "skipped: read at the offset before, 03:30 after the transition"
+        );
+        assert_eq!(
+            bounds_in("2026-10-25T02:30", now, "Europe/Paris"),
+            span("2026-10-25T00:30:00Z", "2026-10-25T00:31:00Z"),
+            "repeated: its first occurrence, at +02:00"
+        );
+        assert_eq!(
+            bounds_in("2026-10-25T02:30:15-05:00", now, "Europe/Paris"),
+            span("2026-10-25T07:30:15Z", "2026-10-25T07:30:16Z"),
+            "an offset stated wins over the zone, a second spans itself"
+        );
+    }
+
+    #[test]
+    fn a_month_back_lands_on_the_last_day_the_month_has() {
+        let now = time::unix(2026, 3, 31, 12, 0, 0);
+        assert_eq!(
+            bounds_of("1mo", now).0.as_deref(),
+            Some("2026-02-28T12:00:00Z")
+        );
+        assert_eq!(
+            bounds_of("13mo", now).0.as_deref(),
+            Some("2025-02-28T12:00:00Z")
+        );
+        assert_eq!(
+            bounds_of("90min", now).0.as_deref(),
+            Some("2026-03-31T10:30:00Z")
         );
     }
 }

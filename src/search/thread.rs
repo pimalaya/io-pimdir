@@ -38,7 +38,7 @@ use mime::{
 use crate::{
     object::PimdirHash,
     search::{
-        extract::first,
+        extract::mail::first,
         refresh::{PimdirIndexMessage, PimdirIndexMessageRow, PimdirIndexOp},
     },
 };

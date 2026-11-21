@@ -27,7 +27,10 @@ use ical::{
     value::IcalValue,
 };
 
-use crate::summary::{calendar, time};
+use crate::{
+    search::coverage::FLOATING_ZONE,
+    summary::{calendar, time},
+};
 
 /// The most occurrences one calendar item writes (SEARCH §7): the first,
 /// by start then end, of those overlapping the horizon.
@@ -42,10 +45,6 @@ pub const PERIODS_MAX: i64 = 1_000_000;
 /// §7), each start the rule yields from its `DTSTART`, before the horizon
 /// or in it, whatever `COUNT` it states beyond them.
 pub const INSTANCES_MAX: usize = 10_000_000;
-
-/// The zone floating times and dates are read in when the indexer states
-/// none (SEARCH §7).
-pub const FLOATING_ZONE: &str = "UTC";
 
 /// The seconds a horizon has to move by before the index rolls it: a
 /// day, so a refresh re-expands at most once a day.

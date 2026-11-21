@@ -2,7 +2,7 @@
 //! extraction and the refresh coroutine, built with `search` alone, so no
 //! SQLite is linked and nothing touches a file.
 
-#![cfg(feature = "search")]
+#![cfg(feature = "indexer")]
 
 use std::{
     collections::{BTreeMap, BTreeSet},

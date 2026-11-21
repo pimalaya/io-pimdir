@@ -446,7 +446,7 @@ proptest! {
 /// occurrence, Annex A.1 from its first. The last child of a multipart
 /// no closing delimiter ends, ended by an outer delimiter or by the end
 /// of the message, is a part of both.
-#[cfg(feature = "search")]
+#[cfg(feature = "mail")]
 mod tree {
     use io_pimdir::summary::mail::{self, attachments};
     use mime::tree::{

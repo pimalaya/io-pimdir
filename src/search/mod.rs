@@ -1,38 +1,43 @@
 //! # Search
 //!
-//! The I/O-free half of pimdir SEARCH.md: what a search answers about
-//! what it could not see ([`coverage`]), and, behind the `search` feature,
-//! everything the index derives without a database. The query language
-//! parsed to an AST (`query`), the text folds (`fold`), a body's text by
-//! field (`extract`) cut into chunks (`chunk`), calendar occurrences
-//! within a horizon (`occurrence`), the plan of a tag (`tag`), and the
-//! refresh folding the store's feed into the index as an I/O-free
-//! coroutine yielding typed reads and writes (`refresh`), which threads
-//! the mail it touches, and a query matched over cards held in memory
-//! (`card`). The index over SQLite, index.db and its queries,
-//! is the client's (`client::search`, features `client` and `search`).
-//!
-//! [`coverage`] is outside the feature: the store's `LIKE` reads answer
-//! the same coverage before any index exists.
+//! The I/O-free half of pimdir SEARCH.md: [`query`] and [`coverage`] need
+//! no feature, the text layer comes with `search` or any domain, `mail`
+//! and `card` with their domains, and the refresh with `indexer`.
 
-#[cfg(feature = "search")]
+#[cfg(feature = "contact")]
 pub mod card;
-#[cfg(feature = "search")]
+#[cfg(any(
+    feature = "search",
+    feature = "mail",
+    feature = "contact",
+    feature = "calendar"
+))]
 pub mod chunk;
 pub mod coverage;
-#[cfg(feature = "search")]
+#[cfg(any(
+    feature = "search",
+    feature = "mail",
+    feature = "contact",
+    feature = "calendar"
+))]
 pub mod extract;
-#[cfg(feature = "search")]
+#[cfg(any(
+    feature = "search",
+    feature = "mail",
+    feature = "contact",
+    feature = "calendar"
+))]
 pub mod fold;
-#[cfg(feature = "search")]
+#[cfg(feature = "mail")]
 mod html;
-#[cfg(feature = "search")]
+#[cfg(feature = "mail")]
+pub mod mail;
+#[cfg(feature = "indexer")]
 pub mod occurrence;
-#[cfg(feature = "search")]
 pub mod query;
-#[cfg(feature = "search")]
+#[cfg(feature = "indexer")]
 pub mod refresh;
 #[cfg(feature = "search")]
 pub mod tag;
-#[cfg(feature = "search")]
+#[cfg(feature = "indexer")]
 mod thread;

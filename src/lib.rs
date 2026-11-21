@@ -51,15 +51,11 @@
 //!
 //! ## Search
 //!
-//! [`search`](mod@search) holds what a search answers about what it
-//! could not see, which the store's own reads answer too, and behind the
-//! `search` feature everything the index derives without a database: the
-//! query language of SEARCH.md parsed to an AST, the text folds, a body's
-//! text by field and its chunks, calendar occurrences, and the refresh
-//! folding the change feed into the index as an I/O-free coroutine
-//! yielding typed reads and writes. The index over SQLite, index.db beside
-//! the store, is `client::search` (features `client` and `search`), which
-//! answers that coroutine through the canonical statements.
+//! [`search`](mod@search) holds the query language of SEARCH.md and the
+//! coverage of an answer, with no feature. `mail`, `contact` and
+//! `calendar` add each domain's extraction (and `contact` the card
+//! matcher); `search` reads the index, `client::search`; `indexer` builds
+//! and refreshes it, over every domain.
 //!
 //! ## Conventions
 //!

@@ -23,11 +23,9 @@
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 
-use unicode_normalization::char::is_combining_mark;
-
 use crate::{
     search::{
-        extract::{PimdirExtract, PimdirExtractStatus},
+        extract::{self, PimdirExtract, PimdirExtractStatus},
         fold,
         query::{
             PimdirQuery, PimdirQueryKind, PimdirQueryPredicate, PimdirQueryProperty,
@@ -76,46 +74,10 @@ impl PimdirCard {
         Self { extract, emails }
     }
 
-    /// The text of the index column `name` (SEARCH §6), empty for one a
-    /// card never fills.
-    fn column(&self, name: &str) -> &str {
-        let extract = &self.extract;
-        match name {
-            "title" => &extract.title,
-            "people" => &extract.people,
-            "body" => &extract.body,
-            "attachment" => &extract.attachment,
-            "place" => &extract.place,
-            "org" => &extract.org,
-            "note" => &extract.note,
-            "from" => &extract.from,
-            "to" => &extract.to,
-            "cc" => &extract.cc,
-            "bcc" => &extract.bcc,
-            "email" => &extract.email,
-            "organizer" => &extract.organizer,
-            "attendee" => &extract.attendee,
-            _ => "",
-        }
-    }
-
     /// Whether the column `name` holds the tokens of `text` consecutively,
     /// its last one a prefix when the text is (SEARCH §8.5).
     fn holds(&self, name: &str, text: &PimdirQueryText) -> bool {
-        let wanted = tokens(&fold::text(&text.text));
-        let Some((last, first)) = wanted.split_last() else {
-            return false;
-        };
-
-        let held = tokens(&fold::text(self.column(name)));
-        held.windows(wanted.len()).any(|window| {
-            let (tail, head) = window.split_last().expect("a window of one token or more");
-            head == first
-                && match text.prefix {
-                    true => tail.starts_with(last.as_str()),
-                    false => tail == last,
-                }
-        })
+        fold::holds(self.extract.column(name), text)
     }
 }
 
@@ -141,25 +103,6 @@ impl fmt::Display for PimdirCardMatchError {
 }
 
 impl core::error::Error for PimdirCardMatchError {}
-
-/// The columns free text matches: every column of SEARCH §6.
-const COLUMNS: [&str; 14] = [
-    "title",
-    "people",
-    "body",
-    "attachment",
-    "place",
-    "org",
-    "note",
-    "from",
-    "to",
-    "cc",
-    "bcc",
-    "email",
-    "organizer",
-    "attendee",
-];
-
 impl PimdirQuery {
     /// The terms a store alone answers, in reading order: a client holding
     /// cards and no store refuses a query naming one before it lists any.
@@ -232,7 +175,9 @@ impl Matcher<'_> {
         let card = &self.cards[at];
         match predicate {
             PimdirQueryPredicate::Text { field, text } => match field {
-                PimdirQueryTextField::Any => COLUMNS.iter().any(|name| card.holds(name, text)),
+                PimdirQueryTextField::Any => {
+                    extract::COLUMNS.iter().any(|name| card.holds(name, text))
+                }
                 PimdirQueryTextField::Title => card.holds("title", text),
                 PimdirQueryTextField::Body => card.holds("body", text),
                 PimdirQueryTextField::Attachment => card.holds("attachment", text),
@@ -274,6 +219,7 @@ impl Matcher<'_> {
             PimdirQueryPredicate::Date(_) => self.dated,
             PimdirQueryPredicate::Encrypted
             | PimdirQueryPredicate::HasAttachment
+            | PimdirQueryPredicate::Mid(_)
             | PimdirQueryPredicate::Status(_)
             | PimdirQueryPredicate::Priority(_) => false,
             PimdirQueryPredicate::Flag(_)
@@ -285,29 +231,6 @@ impl Matcher<'_> {
             | PimdirQueryPredicate::Linked { .. } => false,
         }
     }
-}
-
-/// The tokens of a folded text as FTS5's `unicode61` splits it, its
-/// default categories: a run of letters, numbers and private-use
-/// characters is a token, and any other character separates two.
-fn tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !token_char(c))
-        .filter(|token| !token.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-/// Whether `c` is of a general category `unicode61` keeps in a token by
-/// default (`L*`, `N*`, `Co`): an alphanumeric character but a mark and
-/// the symbols the Alphabetic property counts (the circled and squared
-/// Latin letters), or a private-use one.
-fn token_char(c: char) -> bool {
-    let symbol = matches!(c, '\u{24B6}'..='\u{24E9}' | '\u{1F130}'..='\u{1F189}');
-    let private = matches!(
-        c,
-        '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}'
-    );
-    private || (c.is_alphanumeric() && !is_combining_mark(c) && !symbol)
 }
 
 #[cfg(test)]

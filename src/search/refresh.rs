@@ -63,6 +63,7 @@ use crate::{
     object::PimdirHash,
     placement::{PimdirFlags, PimdirLinkId},
     search::{
+        coverage,
         extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
         fold,
         occurrence::{self, Expansion, Horizon},
@@ -79,7 +80,7 @@ pub const BODIES_MAX: usize = 16;
 /// index (SEARCH §4).
 pub struct PimdirIndexRefresh {
     /// The IANA zone floating times and dates are read in (SEARCH §7),
-    /// [`FLOATING_ZONE`](occurrence::FLOATING_ZONE) unless the indexer
+    /// [`FLOATING_ZONE`](coverage::FLOATING_ZONE) unless the indexer
     /// states another: one other than the index records re-expands every
     /// live calendar item and records it.
     pub floating_zone: String,
@@ -113,7 +114,7 @@ impl PimdirIndexRefresh {
     /// around `now` (Unix seconds, SEARCH §7).
     pub fn new(now: i64, batch: usize) -> Self {
         Self {
-            floating_zone: occurrence::FLOATING_ZONE.into(),
+            floating_zone: coverage::FLOATING_ZONE.into(),
             missing: true,
             now,
             batch: batch.max(1),
