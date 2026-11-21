@@ -66,6 +66,22 @@ pub const CLEAR_TERM_SOURCE: &str = r#"DELETE FROM temp.term_source;"#;
 /// how many rows it holds, what a planner weighs a walk's rows by.
 pub const ITEMS_HELD: &str = r#"SELECT ifnull(max(seq), 0) FROM store.items;"#;
 
+/// How many accounts the store's collections belong to, none counting as
+/// one.
+pub const COUNT_ACCOUNTS: &str =
+    r#"SELECT count(DISTINCT ifnull(account, '')) FROM store.collections;"#;
+
+/// Every collection of the store with its account, empty for none.
+pub const COLLECTION_ACCOUNTS: &str = r#"SELECT id, ifnull(account, '') FROM store.collections;"#;
+
+/// Whether the index holds the store as it stands: no stamp drawn above
+/// its cursor (`behind`, SEARCH §8.2) and no purge, collection removal or
+/// rename it has not reconciled. Its placements are then the store's live
+/// ones (SEARCH §3), so a hit read from them needs no seek into the store.
+pub const INDEX_CURRENT: &str = r#"SELECT (SELECT next_change - 1 FROM store.store_meta WHERE id = 1) <= store_change
+   AND (SELECT purges FROM store.store_meta WHERE id = 1) = store_purges
+FROM index_meta WHERE id = 1;"#;
+
 /// `match_object` answered from a term's sources in `temp.term_source`:
 /// whether the body of hash `:hash` is among those text term `:term`
 /// matches.

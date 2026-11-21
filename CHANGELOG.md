@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Changed `PimdirIndex::count` to run in one read transaction, its coverage included, and, while the index holds the store as it stands, to seek no live placement in the store for a hit a text term drives; a query of text terms alone over every collection is counted off the full-text index, each term's placements marked once in a bitmap per account and the bitmaps combined (`enron` at 517k messages from 506 to 107 ms, `power california` from 125 to 44). The vendored copy follows pimdir c5f1e85, which pins a negated text term beside text terms alone.
 - **BREAKING**: Changed `search` to read the index alone: it implies `client` and compiles `PimdirIndex::open_query`, the queries, `item` and `tag`, no domain; `PimdirIndex::open`, `refresh` and `erase` need `search` and `indexer`. A reader takes the domains it shows (`item` and the snippets read a body of a domain left out from its summary). The card matcher moves to `contact`, the refresh coroutine to `indexer`.
 - **BREAKING**: Changed `search::query` and `search::coverage` to compile with no feature.
 - **BREAKING**: Moved `search::occurrence::FLOATING_ZONE` to `search::coverage::FLOATING_ZONE`.

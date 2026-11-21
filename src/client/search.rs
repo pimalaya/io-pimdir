@@ -45,17 +45,18 @@ use alloc::{
     vec::Vec,
 };
 
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 #[cfg(feature = "indexer")]
 use std::{
     fs::{self, File},
     io,
     path::PathBuf,
     time::Instant,
-};
-use std::{
-    path::Path,
-    sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(feature = "indexer")]
@@ -64,7 +65,10 @@ use jiff::tz::TimeZone;
 use log::{debug, trace};
 #[cfg(feature = "indexer")]
 use rusqlite::TransactionBehavior;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params, types::Value};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, named_params,
+    types::{Value, ValueRef},
+};
 
 pub use crate::search::plan::{PimdirSearchCursor, PimdirSearchSort};
 use crate::{
@@ -85,8 +89,8 @@ use crate::{
         fold,
         plan::{
             CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanBound, PimdirPlanCosts, PimdirPlanDriver,
-            PimdirPlanExtent, PimdirPlanForce, PimdirWalk, PimdirWalkCollection, PimdirWalkOutput,
-            PimdirWalkRow,
+            PimdirPlanExtent, PimdirPlanForce, PimdirPlanNode, PimdirWalk, PimdirWalkCollection,
+            PimdirWalkOutput, PimdirWalkRow,
         },
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
     },
@@ -105,6 +109,33 @@ const LOCK: &str = "index.lock";
 /// The highest public id a count marks in a bitmap per account (8 MiB
 /// each); a store past it counts each placement's representative by a seek.
 const BITMAP_SEQ_MAX: i64 = 1 << 26;
+
+/// The collections of the store by id, each with its account's number,
+/// for a count marking hits per account; none read when the store holds
+/// one account, every row then being its.
+struct Held {
+    /// The number of each collection's account.
+    collections: HashMap<String, usize>,
+    /// How many accounts there are.
+    accounts: usize,
+}
+
+impl Held {
+    /// The number of the account a row's collection, its first column,
+    /// belongs to; `None` for a collection the store does not hold.
+    fn account(&self, row: &Row) -> rusqlite::Result<Option<usize>> {
+        if self.accounts == 1 {
+            return Ok(Some(0));
+        }
+        let ValueRef::Text(collection) = row.get_ref(0)? else {
+            return Ok(None);
+        };
+        Ok(core::str::from_utf8(collection)
+            .ok()
+            .and_then(|collection| self.collections.get(collection))
+            .copied())
+    }
+}
 
 /// The tables, indexes and triggers the index schema declares, by name,
 /// as [`shape`] reads them from an index.db (SEARCH §2).
@@ -1091,10 +1122,9 @@ impl PimdirIndex {
     }
 
     /// How many hits a query has, with what the count could not see, its
-    /// dates resolved against `clock`: its smallest set read and every
-    /// other term probed per hit, or every live item of its scope when
-    /// no positive term has a set, each read once and marked per account
-    /// when every term is one the scope implies.
+    /// dates resolved against `clock`. One read transaction holds the
+    /// count and its coverage, so both answer one state of the store and
+    /// the index.
     pub fn count(
         &self,
         query: &PimdirQuery,
@@ -1102,7 +1132,38 @@ impl PimdirIndex {
     ) -> Result<PimdirSearchCountOutput, PimdirError> {
         let now = clock.now();
         let zone = clock.time_zone()?;
-        let mut compiled = self.compile(query, now, &zone)?;
+        let read = match self.conn.is_autocommit() {
+            true => Some(self.conn.unchecked_transaction()?),
+            false => None,
+        };
+        let count = self.counted(query, now, &zone)?;
+        let coverage = self.coverage(query, now, clock, &zone)?;
+        if let Some(read) = read {
+            read.commit()?;
+        }
+
+        Ok(PimdirSearchCountOutput { count, coverage })
+    }
+
+    /// How many hits a query has: text terms alone over every collection,
+    /// on an index holding the store as it stands, counted off their
+    /// matches; another query by its smallest set read and every other
+    /// term probed per hit, or every live item of its scope when no
+    /// positive term has a set, each read once and marked per account
+    /// when every term is one the scope implies.
+    fn counted(&self, query: &PimdirQuery, now: i64, zone: &TimeZone) -> Result<u64, PimdirError> {
+        let mut compiled = self.compile(query, now, zone)?;
+        let current = self
+            .conn
+            .query_row_cached(search::INDEX_CURRENT, [], |row| row.get::<_, bool>(0))?;
+        if current
+            && self.force.get().is_none()
+            && compiled.bitwise()
+            && self.items_held()? <= BITMAP_SEQ_MAX
+        {
+            return self.count_bitwise(&compiled);
+        }
+
         let bounds = self.estimate(&compiled)?;
         let choice = compiled
             .plan
@@ -1110,30 +1171,30 @@ impl PimdirIndex {
         compiled.access = choice.access;
         self.read_terms(&compiled, false)?;
         let count = match &choice.driver {
-            PimdirPlanDriver::Set(set) => {
-                self.run(&compiled.count_set(set), &compiled.values, &[], |row| {
-                    row.get::<_, i64>(0)
-                })?
-            }
+            PimdirPlanDriver::Set(set) => self.run(
+                &compiled.count_set(set, current),
+                &compiled.values,
+                &[],
+                |row| row.get::<_, i64>(0),
+            )?,
             _ if compiled.plan.is_scoped()
                 && !compiled.plan.scope.is_one_collection()
-                && self
-                    .conn
-                    .query_row_cached(search::ITEMS_HELD, [], |row| row.get::<_, i64>(0))?
-                    <= BITMAP_SEQ_MAX =>
+                && self.items_held()? <= BITMAP_SEQ_MAX =>
             {
-                vec![self.count_placed(&compiled)? as i64]
+                return self.count_placed(&compiled);
             }
             _ => self.run(&compiled.count_scope(), &compiled.values, &[], |row| {
                 row.get::<_, i64>(0)
             })?,
         };
-        let coverage = self.coverage(query, now, clock, &zone)?;
+        Ok(count.first().copied().unwrap_or(0).max(0) as u64)
+    }
 
-        Ok(PimdirSearchCountOutput {
-            count: count.first().copied().unwrap_or(0).max(0) as u64,
-            coverage,
-        })
+    /// The store's highest public id ([`ITEMS_HELD`](search::ITEMS_HELD)).
+    fn items_held(&self) -> Result<i64, PimdirError> {
+        Ok(self
+            .conn
+            .query_row_cached(search::ITEMS_HELD, [], |row| row.get::<_, i64>(0))?)
     }
 
     /// One item by the address a hit carries, read as the index reads it:
@@ -1228,10 +1289,7 @@ impl PimdirIndex {
                     .copied()
                     .unwrap_or(0)
                     .max(0) as u64,
-                items: self
-                    .conn
-                    .query_row_cached(search::ITEMS_HELD, [], |row| row.get::<_, i64>(0))?
-                    .max(0) as u64,
+                items: self.items_held()?.max(0) as u64,
             },
             false => PimdirPlanExtent::default(),
         };
@@ -1576,6 +1634,126 @@ impl PimdirIndex {
             Ok(())
         })?;
         Ok(count)
+    }
+
+    /// How many hits a query of text terms alone has over every
+    /// collection, on an index holding the store as it stands, whose
+    /// placements are then the store's live ones: each term's placements
+    /// read once off the full-text index into a bitmap of public ids per
+    /// account, the bitmaps combined as the query combines its terms, with
+    /// no seek into the store and no table of matches.
+    fn count_bitwise(&self, compiled: &Compiled) -> Result<u64, PimdirError> {
+        let counted: i64 = self
+            .conn
+            .query_row_cached(search::COUNT_ACCOUNTS, [], |row| row.get(0))?;
+        let mut accounts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut held: HashMap<String, usize> = HashMap::new();
+        if counted > 1 {
+            for (id, account) in self.run(search::COLLECTION_ACCOUNTS, &[], &[], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let next = accounts.len();
+                held.insert(id, *accounts.entry(account).or_insert(next));
+            }
+        }
+        let held = Held {
+            collections: held,
+            accounts: counted.max(0) as usize,
+        };
+        let marked = self.marked(compiled, &compiled.plan.root, &held)?;
+        Ok(marked
+            .iter()
+            .flatten()
+            .map(|word| u64::from(word.count_ones()))
+            .sum())
+    }
+
+    /// The hits of `node` as bitmaps of public ids per account, under the
+    /// shapes [`bitwise`](Compiled::bitwise) admits: an `and` holding a
+    /// positive operand, its negated ones taken away; an `or` of positive
+    /// operands; a text term, its placements' hits.
+    fn marked(
+        &self,
+        compiled: &Compiled,
+        node: &PimdirPlanNode,
+        held: &Held,
+    ) -> Result<Vec<Vec<u64>>, PimdirError> {
+        match node {
+            PimdirPlanNode::Leaf(at) => {
+                let mut marked = vec![Vec::new(); held.accounts];
+                for sql in compiled.placements(*at) {
+                    self.run(sql, &compiled.values, &[], |row| {
+                        let Some(account) = held.account(row)? else {
+                            return Ok(());
+                        };
+                        let seq = row.get::<_, i64>(1)?.max(0) as usize;
+                        let bits = &mut marked[account];
+                        let word = seq / 64;
+                        if bits.len() <= word {
+                            bits.resize(word + 1, 0);
+                        }
+                        bits[word] |= 1u64 << (seq % 64);
+                        Ok(())
+                    })?;
+                }
+                Ok(marked)
+            }
+            PimdirPlanNode::Or(operands) => {
+                let mut marked = vec![Vec::new(); held.accounts];
+                for operand in operands {
+                    for (bits, other) in
+                        marked.iter_mut().zip(self.marked(compiled, operand, held)?)
+                    {
+                        if bits.len() < other.len() {
+                            bits.resize(other.len(), 0);
+                        }
+                        for (word, other) in bits.iter_mut().zip(other) {
+                            *word |= other;
+                        }
+                    }
+                }
+                Ok(marked)
+            }
+            PimdirPlanNode::And(operands) => {
+                let mut marked: Option<Vec<Vec<u64>>> = None;
+                for operand in operands {
+                    if matches!(operand, PimdirPlanNode::Not(_)) {
+                        continue;
+                    }
+                    let other = self.marked(compiled, operand, held)?;
+                    marked = Some(match marked {
+                        None => other,
+                        Some(mut marked) => {
+                            for (bits, other) in marked.iter_mut().zip(other) {
+                                bits.truncate(other.len());
+                                for (word, other) in bits.iter_mut().zip(other) {
+                                    *word &= other;
+                                }
+                            }
+                            marked
+                        }
+                    });
+                }
+                let mut marked = marked.unwrap_or_else(|| vec![Vec::new(); held.accounts]);
+                for operand in operands {
+                    let PimdirPlanNode::Not(negated) = operand else {
+                        continue;
+                    };
+                    if marked.iter().flatten().all(|word| *word == 0) {
+                        break;
+                    }
+                    for (bits, other) in
+                        marked.iter_mut().zip(self.marked(compiled, negated, held)?)
+                    {
+                        for (word, other) in bits.iter_mut().zip(other) {
+                            *word &= !other;
+                        }
+                    }
+                }
+                Ok(marked)
+            }
+            PimdirPlanNode::Not(_) => Ok(vec![Vec::new(); held.accounts]),
+        }
     }
 
     /// Reads what each text term needs under the plan's access: its

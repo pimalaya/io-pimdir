@@ -117,6 +117,9 @@ struct Leaf {
     estimate: Option<String>,
     /// The statements reading its matches into `temp.term_match`.
     matches: Vec<String>,
+    /// The statements reading the placements of those matches, `SELECT
+    /// collection, seq`, unranked.
+    placements: Vec<String>,
     /// A text term's condition reading the bodies and summaries it matches
     /// from `temp.term_source`, per live placement of the hit.
     source: Option<String>,
@@ -216,14 +219,18 @@ impl Compiled {
 
     /// How many hits the union of the sets of `set` holds that have a
     /// live placement in the scope and meet the query. A set of system
-    /// flags reads live placements off the store as it stands, so over an
-    /// unbounded scope each of its hits has one and none is sought.
-    pub(crate) fn count_set(&self, set: &[usize]) -> String {
+    /// flags reads live placements off the store as it stands, and a text
+    /// set those of the index, which are the store's live ones when the
+    /// index is `current` ([`INDEX_CURRENT`](search::INDEX_CURRENT)), so
+    /// over an unbounded scope each of their hits has one and none is
+    /// sought.
+    pub(crate) fn count_set(&self, set: &[usize], current: bool) -> String {
         let live = set.iter().all(|at| {
+            let leaf = &self.plan.leaves[*at];
             matches!(
-                self.plan.leaves[*at].estimate,
+                leaf.estimate,
                 PimdirPlanEstimate::Marked | PimdirPlanEstimate::Unread
-            )
+            ) || (current && leaf.is_text())
         });
         let placed = match live && self.plan.scope == PimdirPlanScope::default() {
             true => String::from("1"),
@@ -234,6 +241,45 @@ impl Compiled {
             self.driven(set),
             self.condition("h.akey", "h.seq", &self.skip(set)),
         )
+    }
+
+    /// Whether the query is text terms alone over every collection,
+    /// combined so their hits combine as bitmaps: an `and` holding a
+    /// positive operand, its negated ones taken away, and an `or` of
+    /// positive operands, at any depth. Its hits are then those of the
+    /// terms' placements once the index holds the store as it stands.
+    pub(crate) fn bitwise(&self) -> bool {
+        fn combines(node: &PimdirPlanNode) -> bool {
+            match node {
+                PimdirPlanNode::Leaf(_) => true,
+                PimdirPlanNode::Not(_) => false,
+                PimdirPlanNode::Or(operands) => operands.iter().all(combines),
+                PimdirPlanNode::And(operands) => {
+                    operands
+                        .iter()
+                        .any(|operand| !matches!(operand, PimdirPlanNode::Not(_)))
+                        && operands.iter().all(|operand| match operand {
+                            PimdirPlanNode::Not(negated) => combines(negated),
+                            operand => combines(operand),
+                        })
+                }
+            }
+        }
+        self.plan.scope == PimdirPlanScope::default()
+            && !self.plan.leaves.is_empty()
+            && self
+                .plan
+                .leaves
+                .iter()
+                .zip(&self.leaves)
+                .all(|(leaf, rendered)| leaf.is_text() && !rendered.placements.is_empty())
+            && combines(&self.plan.root)
+    }
+
+    /// The statements reading the placements text term `at` matches,
+    /// `SELECT collection, seq`.
+    pub(crate) fn placements(&self, at: usize) -> &[String] {
+        &self.leaves[at].placements
     }
 
     /// How many hits the scope's live placements hold that meet the
@@ -622,6 +668,7 @@ impl Compiled {
             set: None,
             estimate: None,
             matches: Vec::new(),
+            placements: Vec::new(),
             source: None,
             sources: Vec::new(),
         };
@@ -1159,6 +1206,16 @@ impl Compiled {
             Some(kind) => format!(" WHERE c.kind = '{kind}'"),
             None => String::new(),
         };
+        let unranked = matched
+            .replace("bm25(object_text)", "NULL")
+            .replace("bm25(summary_text)", "NULL");
+        leaf.placements.push(match kind.is_empty() {
+            true => format!("SELECT m.collection, m.seq FROM ({unranked}) m"),
+            false => format!(
+                "SELECT m.collection, m.seq FROM ({unranked}) m \
+                 JOIN store.collections c ON c.id = m.collection{kind}"
+            ),
+        });
         leaf.matches.push(format!(
             "INSERT INTO temp.term_match(term, collection, akey, seq, src, rank) \
              SELECT {at}, m.collection, ifnull(c.account, ''), m.seq, '{src}', m.rank \
