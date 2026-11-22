@@ -471,3 +471,26 @@ fn the_hit_columns_answer_as_the_index_alone() {
     }
     assert!(plain.iter().any(|(_, count, ..)| *count > 0));
 }
+
+/// A rebuilt index.db takes the hit columns with it: the filesystem may
+/// give the new file the old one's inode, and a rebuild from an unchanged
+/// store reaches the same change, purge and id counts the cache's stamp
+/// names, so a cache left behind would read as the new index's.
+#[test]
+fn a_rebuild_drops_the_hit_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    PimdirIndex::open(dir.path())
+        .unwrap()
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let hits = dir.path().join("index.hits");
+    assert!(hits.exists());
+
+    rusqlite::Connection::open(dir.path().join("index.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE pimdir_from;")
+        .unwrap();
+    drop(PimdirIndex::open(dir.path()).unwrap());
+    assert!(!hits.exists());
+}

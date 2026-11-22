@@ -3196,7 +3196,7 @@ fn draft(version: &str) -> Option<u32> {
 #[cfg(feature = "indexer")]
 fn build(dir: &Path) -> Result<Connection, PimdirError> {
     debug!("building search index at {}", dir.display());
-    for name in ["index.db", "index.db-wal", "index.db-shm"] {
+    for name in ["index.db", "index.db-wal", "index.db-shm", hits::FILE] {
         match fs::remove_file(dir.join(name)) {
             Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
             _ => (),

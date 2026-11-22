@@ -106,18 +106,26 @@ impl Stamp {
     }
 }
 
-/// The inode of the file at `path`, 0 where none is told.
+/// The inode of the file at `path` and its birth time, 0 for what is not
+/// told: a filesystem may hand a removed file's inode to the next one
+/// created, a rebuilt index.db among them, but not its birth time.
 fn inode(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    let born = metadata
+        .created()
+        .ok()
+        .and_then(|born| born.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |born| born.as_nanos() as u64);
     #[cfg(unix)]
-    {
+    let ino = {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path).map_or(0, |metadata| metadata.ino())
-    }
+        metadata.ino()
+    };
     #[cfg(not(unix))]
-    {
-        let _ = path;
-        0
-    }
+    let ino = 0;
+    ino.rotate_left(32) ^ born
 }
 
 /// The words of a cache, mapped or read.
