@@ -76,6 +76,13 @@ fn paragraphs(bytes: &[u8]) -> Vec<Range<usize>> {
     let mut scan = 0;
 
     while scan < bytes.len() {
+        match bytes[scan..]
+            .iter()
+            .position(|b| matches!(b, b'\n' | b'\r'))
+        {
+            Some(skip) => scan += skip,
+            None => break,
+        }
         match blank_run(bytes, scan) {
             Some(end) => {
                 if scan > at {

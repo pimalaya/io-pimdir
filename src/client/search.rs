@@ -329,10 +329,6 @@ pub struct PimdirIndex {
     /// only, never refreshed.
     #[cfg(feature = "indexer")]
     query_only: bool,
-    /// Whether the index stands under this build's extraction (SEARCH §2,
-    /// §6), so the chunk offsets it stores index the text this build
-    /// extracts; a query client re-chunks its own text otherwise.
-    own_extraction: bool,
     /// Whether index.db holds the `from` posting list of this crate's own
     /// (`sql::search::FROM_POSTING`), which a `from:` word reads in place
     /// of `object_text`'s column.
@@ -786,7 +782,6 @@ impl PimdirIndex {
             dir: dir.to_path_buf(),
             #[cfg(feature = "indexer")]
             query_only: false,
-            own_extraction: true,
             from_posting: true,
             coverages: RefCell::default(),
             force: Cell::new(None),
@@ -852,10 +847,6 @@ impl PimdirIndex {
             dir: dir.to_path_buf(),
             #[cfg(feature = "indexer")]
             query_only: true,
-            own_extraction: matches!(
-                held,
-                PimdirIndexHeld::Current | PimdirIndexHeld::Unposted { extracted: false }
-            ),
             from_posting: matches!(held, PimdirIndexHeld::Current | PimdirIndexHeld::Extracted),
             coverages: RefCell::default(),
             force: Cell::new(None),
@@ -2699,6 +2690,11 @@ impl PimdirIndex {
     /// `words`, else the first chunk, trimmed to about [`SNIPPET_LEN`]
     /// characters around the word. A blob that cannot be read cuts none,
     /// so one hit never fails the page.
+    ///
+    /// The chunks are cut from this build's own extraction of the body
+    /// (SEARCH §6): under the index's extraction they are the offsets
+    /// `chunks_of` answers, under another the stored ones index another
+    /// text, so no statement is run a hit either way.
     fn snippet(
         &self,
         kind: &str,
@@ -2711,21 +2707,6 @@ impl PimdirIndex {
         else {
             return Ok(None);
         };
-        let chunks = rows(
-            &self.conn,
-            search::CHUNKS_OF,
-            named_params! { ":hash": hash.0 },
-            |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? as usize,
-                    row.get::<_, i64>(3)? as usize,
-                ))
-            },
-        )?;
-        if chunks.is_empty() && self.own_extraction {
-            return Ok(None);
-        }
         let blob = match self.reader.blobs().get(hash) {
             Ok(Some(blob)) => blob,
             Ok(None) => return Ok(None),
@@ -2742,20 +2723,11 @@ impl PimdirIndex {
         let Some(extract) = PimdirExtract::text(media_type, &blob) else {
             return Ok(None);
         };
-        // NOTE: the stored offsets index the text of the indexer's own
-        // extraction (SEARCH §6): under another, this one's is cut again.
-        let chunks = match self.own_extraction {
-            true => chunks,
-            false => extract
-                .chunks()
-                .into_iter()
-                .map(|chunk| (chunk.field.into(), chunk.range.start, chunk.range.end))
-                .collect(),
-        };
         let words: Vec<String> = words.iter().map(|word| fold::text(word)).collect();
-        let texts: Vec<&str> = chunks
+        let texts: Vec<&str> = extract
+            .chunks()
             .iter()
-            .filter_map(|(field, start, end)| extract.field(field)?.get(*start..*end))
+            .filter_map(|chunk| extract.field(chunk.field)?.get(chunk.range.clone()))
             .collect();
 
         for text in &texts {

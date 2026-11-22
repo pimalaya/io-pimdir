@@ -163,11 +163,16 @@ impl PimdirBlobs {
     /// producer finding one moves nothing; the owner's reads move it into
     /// quarantine/.
     pub fn get(&self, hash: &PimdirHash) -> io::Result<Option<Vec<u8>>> {
-        let PimdirBlobOpen::Body(mut file) = self.open_body(hash)? else {
+        let PimdirBlobOpen::Body(mut file, len) = self.open_body(hash)? else {
             return Ok(None);
         };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0).saturating_add(1));
+        (&mut file)
+            .take(len.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > len {
+            file.read_to_end(&mut bytes)?;
+        }
 
         Ok((self.hash(&bytes) == *hash).then_some(bytes))
     }
@@ -179,7 +184,7 @@ impl PimdirBlobs {
     /// the check covers every read through this file while it stays open,
     /// and nothing is recorded, so the next open checks again.
     pub fn verified(&self, hash: &PimdirHash) -> io::Result<Option<fs::File>> {
-        let PimdirBlobOpen::Body(mut file) = self.open_body(hash)? else {
+        let PimdirBlobOpen::Body(mut file, _) = self.open_body(hash)? else {
             return Ok(None);
         };
         if hash_file(&mut file)? != *hash {
@@ -197,7 +202,7 @@ impl PimdirBlobs {
     /// [`ErrorKind::InvalidData`], so a consumer streaming the body (an
     /// upload, an export) fails before it commits anything built from it.
     pub fn reader(&self, hash: &PimdirHash) -> io::Result<Option<PimdirBlobReader>> {
-        let PimdirBlobOpen::Body(file) = self.open_body(hash)? else {
+        let PimdirBlobOpen::Body(file, _) = self.open_body(hash)? else {
             return Ok(None);
         };
 
@@ -264,7 +269,7 @@ impl PimdirBlobs {
     /// descriptor, never held whole (§7).
     pub(crate) fn check(&self, hash: &PimdirHash) -> io::Result<PimdirBlobCheck> {
         Ok(match self.open_body(hash)? {
-            PimdirBlobOpen::Body(mut file) => match hash_file(&mut file)? == *hash {
+            PimdirBlobOpen::Body(mut file, _) => match hash_file(&mut file)? == *hash {
                 true => PimdirBlobCheck::Sound,
                 false => PimdirBlobCheck::Failing,
             },
@@ -285,7 +290,7 @@ impl PimdirBlobs {
     /// serialised against its own writers, as the collector is (§8).
     pub(crate) fn quarantine(&self, hash: &PimdirHash) -> io::Result<Option<PathBuf>> {
         let failing = match self.open_body(hash)? {
-            PimdirBlobOpen::Body(mut file) => {
+            PimdirBlobOpen::Body(mut file, _) => {
                 if hash_file(&mut file)? == *hash {
                     return Ok(None);
                 }
@@ -611,8 +616,10 @@ impl PimdirBlobs {
         let path = shard.join(name);
 
         match open_unfollowed(&shard, name) {
-            Ok(file) if file.metadata()?.is_file() => Ok(PimdirBlobOpen::Body(file)),
-            Ok(_) => Ok(PimdirBlobOpen::Stray(path)),
+            Ok(file) => match file.metadata()? {
+                meta if meta.is_file() => Ok(PimdirBlobOpen::Body(file, meta.len())),
+                _ => Ok(PimdirBlobOpen::Stray(path)),
+            },
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(PimdirBlobOpen::Missing),
             Err(err) => {
                 // NOTE: a link refused by the open, or a file where the
@@ -1065,8 +1072,8 @@ pub(crate) mod probe {
 
 /// What sits where a body belongs, opened without following a link.
 enum PimdirBlobOpen {
-    /// A regular file, open.
-    Body(fs::File),
+    /// A regular file, open, with the length it stated when opened.
+    Body(fs::File, u64),
     /// Nothing.
     Missing,
     /// A link, or anything else that is no regular file, at the body's
