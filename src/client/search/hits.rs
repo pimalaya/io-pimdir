@@ -931,17 +931,20 @@ impl super::PimdirIndex {
         })?))
     }
 
-    /// The members of `thread` in `account` among `hits`, in `sort`
-    /// order, as [`members`](super::PimdirIndex::members) reads them.
+    /// The members of `thread` among `hits` in the account of `hit`, the
+    /// hit that met it, in `sort` order, as
+    /// [`members`](super::PimdirIndex::members) reads them: `hit` itself
+    /// when it is the only one, no statement run for it.
     pub(super) fn columnar_members(
         &self,
         compiled: &super::Compiled,
         hits: &super::Hits,
         names: &[String],
         thread: &str,
-        account: Option<&str>,
+        hit: &super::Found,
         sort: super::PimdirSearchSort,
     ) -> Result<Vec<super::Found>, PimdirError> {
+        let account = hit.account.as_deref();
         let name = account.unwrap_or_default();
         let Some(number) = names.iter().position(|known| known == name) else {
             return Ok(Vec::new());
@@ -963,6 +966,9 @@ impl super::PimdirIndex {
         .collect();
         if seqs.is_empty() {
             return Ok(Vec::new());
+        }
+        if seqs.len() == 1 && seqs.contains(&hit.seq) {
+            return Ok(vec![hit.clone()]);
         }
         let mut extra = vec![(
             String::from(":akey"),

@@ -1181,14 +1181,9 @@ impl PimdirIndex {
                 }
                 let members = match &quick {
                     #[cfg(feature = "indexer")]
-                    Some((hits, names)) => self.columnar_members(
-                        &compiled,
-                        hits,
-                        names,
-                        &thread,
-                        hit.account.as_deref(),
-                        sort,
-                    )?,
+                    Some((hits, names)) => {
+                        self.columnar_members(&compiled, hits, names, &thread, &hit, sort)?
+                    }
                     _ => self.members(&compiled, &thread, hit.account.as_deref(), sort)?,
                 };
                 let earlier = options.after.as_ref().is_some_and(|after| {
