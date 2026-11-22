@@ -326,7 +326,7 @@ fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> 
 fn every_refresh_vector_answers() {
     let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/refresh.json"));
-    assert_eq!(vectors["v"], 5, "refresh.json at another version");
+    assert_eq!(vectors["v"], 6, "refresh.json at another version");
     let now = unix(
         json(&spec.join("vectors/search/queries.json"))["now"]
             .as_str()
@@ -391,29 +391,30 @@ fn every_refresh_vector_answers() {
                     .unwrap();
                 let mut fresh = PimdirIndex::open(rebuilt.path()).unwrap();
                 fresh.refresh(&refreshed).unwrap();
-                if let Some(objects) = step["objects"].as_i64() {
-                    let held = |dir: &Path| -> i64 {
-                        rusqlite::Connection::open(dir.join("index.db"))
-                            .unwrap()
-                            .query_row("SELECT count(*) FROM object", [], |r| r.get(0))
-                            .unwrap()
-                    };
-                    assert_eq!(held(dir.path()), objects, "object rows: refreshed");
-                    assert_eq!(held(rebuilt.path()), objects, "object rows: rebuilt");
-                }
-                if let Some(split) = step["split"].as_array() {
-                    let want: Vec<i64> = split.iter().map(|seq| seq.as_i64().unwrap()).collect();
-                    let held = |dir: &Path| -> Vec<i64> {
-                        let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
-                        let mut seqs = conn.prepare("SELECT seq FROM split ORDER BY seq").unwrap();
-                        seqs.query_map([], |r| r.get(0))
-                            .unwrap()
-                            .map(Result::unwrap)
-                            .collect()
-                    };
-                    assert_eq!(held(dir.path()), want, "split rows: refreshed");
-                    assert_eq!(held(rebuilt.path()), want, "split rows: rebuilt");
-                }
+                let objects = |dir: &Path| -> i64 {
+                    rusqlite::Connection::open(dir.join("index.db"))
+                        .unwrap()
+                        .query_row("SELECT count(*) FROM object", [], |r| r.get(0))
+                        .unwrap()
+                };
+                assert_eq!(
+                    objects(dir.path()),
+                    objects(rebuilt.path()),
+                    "object rows: refreshed against rebuilt"
+                );
+                let split = |dir: &Path| -> Vec<i64> {
+                    let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+                    let mut seqs = conn.prepare("SELECT seq FROM split ORDER BY seq").unwrap();
+                    seqs.query_map([], |r| r.get(0))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect()
+                };
+                assert_eq!(
+                    split(dir.path()),
+                    split(rebuilt.path()),
+                    "split rows: refreshed against rebuilt"
+                );
                 for query in step["queries"].as_array().unwrap() {
                     let text = query["query"].as_str().unwrap();
                     if let Some(threads) = query.get("threads") {

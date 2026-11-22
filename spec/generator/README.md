@@ -1,6 +1,6 @@
 # pimdir-generator
 
-Status: tooling of this repository, no part of the standard
+Status: io-pimdir's own test tooling (moved from the pimdir specification on 2026-11-23, cairn/changes/a-smaller-pimdir there), no part of the standard
 
 A deterministic generator of pimdir histories, the stores they leave and what every conforming implementation answers over them. It is the generator of cairn/changes/the-freeze-plan (section 2, and the oracle of section 5b), into which cairn/changes/pim-corpus folds. This file is its design note: what it models, what it writes and through what, what its oracle states, how a failure shrinks into a vector, and how io-pimdir takes it as a dev-dependency. scenarios.md beside it is the catalogue of what the consumers do with a store, read once from their sources, from which the profiles draw their events.
 
@@ -105,7 +105,7 @@ Three things a writer cannot choose: the store id and the instants SQLite stamps
 
 A state the model reaches and no canonical statement writes is a finding (the store's statements cannot build what its rules lead to), reported with the event that reached it. The writer records which statements a profile ran: a statement no profile runs is an input to checks/waivers.txt's review, never a reason to add SQL of the generator's own.
 
-**Where it reads the statements.** The crate finds migrations/, queries/ and vectors/ in the directory above its own manifest (`env!("CARGO_MANIFEST_DIR")/..`), which is this repository's root here and io-pimdir's spec/ once vendored there (below), or in a directory the caller names, `PIMDIR_GENERATOR_TREE` naming one for the crate's own tests (a snapshot of the tree while another change is half written). It refuses a tree whose statements disagree with queries/signatures.json.
+**Where it reads the statements.** The crate finds migrations/, queries/ and vectors/ in the directory above its own manifest (`env!("CARGO_MANIFEST_DIR")/..`), which is io-pimdir's spec/, or in a directory the caller names, `PIMDIR_GENERATOR_TREE` naming one for the crate's own tests (a snapshot of the tree while another change is half written). It refuses a tree whose statements disagree with queries/signatures.json.
 
 ## The scripted remote
 

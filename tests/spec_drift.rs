@@ -1,21 +1,21 @@
 //! The crate's vendored copy against the canonical pimdir specification.
 //!
-//! spec/ is a byte-for-byte copy of the specification's migrations/,
-//! queries/, vectors/, payloads/ and generator/ at the revision
-//! spec/REVISION names. `sql` is generated from its storage statements
-//! and, read by the `search` feature, its search statements, so a
-//! consumer holding its own SQLite binding runs the format's own
-//! statements by name; the suites read the vectors from it. The copy is only worth something if it is checked:
-//! the crate and the spec live in separate repositories, so nothing else
-//! notices when one moves and the other does not.
+//! spec/ holds two things. The specification's migrations/storage/,
+//! vectors/ and payloads/, a byte-for-byte copy at the revision
+//! spec/REVISION names. And this crate's own statements (queries/), index
+//! schema (migrations/search/) and generator (generator/), which the
+//! specification no longer binds. `sql` is generated from the statements,
+//! so a consumer holding its own SQLite binding runs them by name; the
+//! suites read the vectors from spec/. The copy is only worth something if
+//! it is checked: the crate and the spec live in separate repositories, so
+//! nothing else notices when one moves and the other does not.
 //!
 //! Four things are checked. The vendored files must be the spec's at the
 //! pinned revision, byte for byte, both ways, which is what makes the
 //! generated schema the canonical one. vectors/ and payloads/ must be what
 //! vectors/manifest.json lists, file by file and case by case. Every
-//! canonical statement must be reachable by name. Every statement,
-//! canonical or this crate's own, must prepare against the schema, this
-//! being the only place the spec's own SQL is ever loaded.
+//! statement must be reachable by name. Every statement must prepare
+//! against the schema.
 //!
 //! The first check reads the pinned revision from the git history of a
 //! pimdir checkout beside this one, whatever its working tree holds, and
@@ -39,7 +39,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// The directories of spec/ copied whole from the specification.
-const VENDORED: [&str; 5] = ["migrations", "queries", "vectors", "payloads", "generator"];
+const VENDORED: [&str; 3] = ["migrations/storage", "vectors", "payloads"];
 
 /// The files of vectors/ and payloads/ the manifest does not list: itself
 /// and the README.
@@ -312,7 +312,7 @@ fn the_vendored_vectors_are_the_manifests() {
     );
 }
 
-/// spec/ holds the specification's migrations/, queries/, vectors/ and
+/// spec/ holds the specification's migrations/storage/, vectors/ and
 /// payloads/ at the revision spec/REVISION names, file by file and both
 /// ways.
 #[test]

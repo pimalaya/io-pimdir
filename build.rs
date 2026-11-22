@@ -2,16 +2,15 @@
 //! specification vendored under spec/, and bakes the CLI's build
 //! metadata.
 //!
-//! spec/ is a byte-for-byte copy of the pimdir repository's migrations/
-//! and queries/ (with vectors/ and payloads/, which the suites read, and
-//! generator/, the specification's own test tooling); one file per
-//! statement under queries/storage/<profile>/ and queries/search/, named
-//! after it. queries/signatures.json, the specification's own listing of
-//! every statement's parameters and columns, sits beside those
+//! spec/migrations/storage/, spec/vectors/ and spec/payloads/ are a
+//! byte-for-byte copy of the pimdir specification's; tests/spec_drift.rs
+//! proves the copy against a sibling checkout. spec/queries/,
+//! spec/migrations/search/ and spec/generator/ are this crate's own: one
+//! file per statement under queries/storage/<profile>/ and
+//! queries/search/, named after it. queries/signatures.json, the listing
+//! of every statement's parameters and columns, sits beside those
 //! directories and is no statement: only the profile directories are
-//! read. Re-vendor by copying the five directories over, generator/
-//! without its target/, and tests/spec_drift.rs proves the copy against
-//! a sibling checkout.
+//! read.
 
 extern crate alloc;
 
