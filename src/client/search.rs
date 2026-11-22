@@ -1007,7 +1007,7 @@ impl PimdirIndex {
     /// Runs the index's part of an erase (STORAGE §11.5, SEARCH §4), after
     /// `PimdirStore::erase` purged the item: a refresh folding the whole
     /// feed in the zone the index records, which deletes the item's
-    /// placement, its bodies and the thread rows it gave, then
+    /// placement, its bodies and the message rows it gave, then
     /// `optimize_text` under index.lock, merging every full-text segment
     /// so no deleted token stays in one, then a `TRUNCATE` checkpoint of
     /// index.db until every frame is checkpointed.
@@ -2700,9 +2700,7 @@ impl PimdirIndex {
     /// so one hit never fails the page.
     ///
     /// The chunks are cut from this build's own extraction of the body
-    /// (SEARCH §6): under the index's extraction they are the offsets
-    /// `chunks_of` answers, under another the stored ones index another
-    /// text, so no statement is run a hit either way.
+    /// (SEARCH §6), the index storing none, so no statement is run a hit.
     fn snippet(
         &self,
         kind: &str,

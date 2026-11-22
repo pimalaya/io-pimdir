@@ -29,8 +29,8 @@ fn opened(dir: &Path) -> PimdirSourceStore {
 }
 
 /// The cascade used to drop a queued action with no receipt and no report
-/// (STORAGE §14, `collections_keep_queued`): the delete is refused, typed,
-/// and the row stays until the operator cancels it.
+/// (STORAGE §14, the queue's `ON DELETE RESTRICT`): the delete is refused,
+/// typed, and the row stays until the operator cancels it.
 #[test]
 fn a_collection_holding_a_queued_action_is_not_deleted() {
     let dir = tempfile::tempdir().unwrap();
@@ -74,6 +74,17 @@ fn a_collection_holding_a_queued_action_is_not_deleted() {
         store.delete_collection("INBOX"),
         Err(PimdirError::Queued { .. })
     ));
+
+    let raw = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    raw.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    let bypass = raw.execute("DELETE FROM collections WHERE id = 'INBOX'", []);
+    assert!(
+        matches!(&bypass, Err(rusqlite::Error::SqliteFailure(err, Some(message)))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+                && message == "FOREIGN KEY constraint failed"),
+        "{bypass:?}"
+    );
+    drop(raw);
 
     assert!(store.drop_action(id).unwrap());
     assert!(store.delete_collection("INBOX").unwrap());

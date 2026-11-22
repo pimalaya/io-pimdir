@@ -1768,14 +1768,15 @@ fn threads(index: &mut PimdirIndex) -> BTreeSet<(String, u64, BTreeSet<String>)>
         .collect()
 }
 
-/// The `thread` and `message` rows index.db holds.
+/// The threads the `message` rows of index.db name, and those rows.
 fn thread_rows(dir: &Path) -> (i64, i64) {
     let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
-    let count = |table: &str| {
-        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap()
-    };
-    (count("thread"), count("message"))
+    conn.query_row(
+        "SELECT count(DISTINCT thread), count(*) FROM message",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
 }
 
 fn thread(id: &str, count: u64, hits: &[&str]) -> (String, u64, BTreeSet<String>) {
@@ -2384,12 +2385,12 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
     for (altered, version, shape) in [
         (
             "UPDATE index_meta SET shape = 'fts4'",
-            Some("search-draft-16"),
+            Some("search-draft-17"),
             Some("fts4"),
         ),
         (
-            "UPDATE index_meta SET format_version = 'search-draft-17'",
-            Some("search-draft-17"),
+            "UPDATE index_meta SET format_version = 'search-draft-18'",
+            Some("search-draft-18"),
             Some("canonical"),
         ),
         (
@@ -2445,6 +2446,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         "UPDATE index_meta SET format_version = 'search-draft-13'",
         "UPDATE index_meta SET format_version = 'search-draft-14'",
         "UPDATE index_meta SET format_version = 'search-draft-15'",
+        "UPDATE index_meta SET format_version = 'search-draft-16'",
         "ALTER TABLE index_meta DROP COLUMN format_version",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -2461,7 +2463,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         drop(index);
         assert_eq!(
             index_meta(dir.path(), "format_version"),
-            rusqlite::types::Value::Text("search-draft-16".into()),
+            rusqlite::types::Value::Text("search-draft-17".into()),
             "{altered}"
         );
     }
@@ -3185,11 +3187,12 @@ fn a_body_that_could_not_be_read_is_folded_again() {
     assert_eq!(answer.hits[0].matched, Some(PimdirSearchMatched::Body));
 }
 
-/// The `message` rows, then the `thread` rows, of an index, as text.
+/// The `message` rows, then the threads they name, of an index, as text.
 type ThreadRows = (Vec<Vec<String>>, Vec<Vec<String>>);
 
-/// The `message` and `thread` rows index.db holds, then those an index
-/// rebuilt from the store as it stands holds, the rebuild left in place.
+/// The `message` rows index.db holds and the threads they name, then
+/// those of an index rebuilt from the store as it stands, the rebuild
+/// left in place.
 fn thread_rows_and_rebuilt(dir: &Path) -> [ThreadRows; 2] {
     let read = |dir: &Path| {
         let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
@@ -3213,7 +3216,7 @@ fn thread_rows_and_rebuilt(dir: &Path) -> [ThreadRows; 2] {
         };
         (
             rows("SELECT link_id, thread, parent FROM message ORDER BY link_id"),
-            rows("SELECT id, first, last, count FROM thread ORDER BY id"),
+            rows("SELECT DISTINCT thread FROM message ORDER BY thread"),
         )
     };
 
@@ -4187,29 +4190,6 @@ mod memory {
             .collect();
         assert_eq!(categories, held, "card categories");
 
-        let chunks: BTreeSet<(String, i64, String, i64, i64)> = rows(
-            "SELECT o.hash, c.ord, c.field, c.start, c.end FROM chunk c JOIN object o ON o.id = c.object",
-        )
-        .iter()
-        .map(|r| (text(&r[0]), int(&r[1]), text(&r[2]), int(&r[3]), int(&r[4])))
-        .collect();
-        let held: BTreeSet<(String, i64, String, i64, i64)> = memory
-            .objects
-            .iter()
-            .flat_map(|(hash, o)| {
-                o.chunks.iter().enumerate().map(|(ord, chunk)| {
-                    (
-                        hash.clone(),
-                        ord as i64,
-                        chunk.field.to_string(),
-                        chunk.range.start as i64,
-                        chunk.range.end as i64,
-                    )
-                })
-            })
-            .collect();
-        assert_eq!(chunks, held, "chunks");
-
         let texts: BTreeSet<String> =
             rows("SELECT o.hash FROM object_text t JOIN object o ON o.id = t.rowid")
                 .iter()
@@ -4269,12 +4249,12 @@ mod memory {
                 .map(|r| (text(&r[0]), (text(&r[1]), maybe(&r[2]))))
                 .collect();
         assert_eq!(messages, memory.messages, "messages");
-        let threads: BTreeMap<String, (String, String, i64)> =
-            rows("SELECT id, first, last, count FROM thread")
-                .iter()
-                .map(|r| (text(&r[0]), (text(&r[1]), text(&r[2]), int(&r[3]))))
-                .collect();
-        assert_eq!(threads, memory.threads, "threads");
+        let threads: BTreeSet<String> = rows("SELECT DISTINCT thread FROM message")
+            .iter()
+            .map(|r| text(&r[0]))
+            .collect();
+        let held: BTreeSet<String> = memory.threads.keys().cloned().collect();
+        assert_eq!(threads, held, "the threads the message rows name");
 
         let meta = &rows(
             "SELECT store_change, store_purges, horizon_start, horizon_end, \

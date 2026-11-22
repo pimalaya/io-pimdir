@@ -472,25 +472,7 @@ impl Statements<'_> {
                 let pruned: Vec<String> = rows(tx, search::PRUNE_MESSAGES, key, |r| r.get(0))?;
                 trace!("pruned {} message row(s) of thread {thread}", pruned.len());
             }
-            PimdirIndexOp::PutThread {
-                id,
-                first,
-                last,
-                count,
-            } => {
-                tx.execute_cached(
-                    search::UPSERT_THREAD,
-                    named_params! {
-                        ":id": id,
-                        ":first": first,
-                        ":last": last,
-                        ":count": count as i64,
-                    },
-                )?;
-            }
-            PimdirIndexOp::DropThread(id) => {
-                tx.execute_cached(search::DELETE_THREAD, named_params! { ":id": id })?;
-            }
+            PimdirIndexOp::PutThread { .. } | PimdirIndexOp::DropThread(_) => (),
             PimdirIndexOp::SetCursor {
                 store_change,
                 store_purges,
@@ -528,9 +510,9 @@ impl Statements<'_> {
         Ok(())
     }
 
-    /// Writes a body indexed for the first time: its `object` row, its
-    /// categories and its chunks, its text keyed on the row's id held back
-    /// in `texts`.
+    /// Writes a body indexed for the first time: its `object` row and its
+    /// categories, its text keyed on the row's id held back in `texts`.
+    /// Its chunks are no row: a snippet cuts them from the body again.
     fn put_object(
         &self,
         object: PimdirIndexObject,
@@ -554,18 +536,6 @@ impl Statements<'_> {
             tx.execute_cached(
                 search::INSERT_OBJECT_CATEGORY,
                 named_params! { ":object": id, ":value": value },
-            )?;
-        }
-        for (ord, chunk) in object.chunks.iter().enumerate() {
-            tx.execute_cached(
-                search::INSERT_CHUNK,
-                named_params! {
-                    ":object": id,
-                    ":ord": ord as i64,
-                    ":field": chunk.field,
-                    ":start": chunk.range.start as i64,
-                    ":end": chunk.range.end as i64,
-                },
             )?;
         }
         texts.push(TextWrite::PutObject(id, object.text));

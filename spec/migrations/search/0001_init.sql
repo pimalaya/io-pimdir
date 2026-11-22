@@ -106,19 +106,6 @@ CREATE VIRTUAL TABLE object_text USING fts5(
     tokenize = 'unicode61 remove_diacritics 0', prefix = '2 3'
 );
 
--- The chunk boundaries of a body's long fields (§6), so a snippet is cut from
--- them and an embedding index embeds the same chunks without extracting again.
--- Only `body` and `note` are chunked. Offsets are UTF-8 bytes into the field's
--- extracted text, which stays in the blob; the rows go with the object.
-CREATE TABLE chunk (
-    object INTEGER NOT NULL REFERENCES object(id) ON DELETE CASCADE,
-    ord    INTEGER NOT NULL,           -- 0-based, in text order across fields
-    field  TEXT    NOT NULL,           -- 'body' | 'note'
-    start  INTEGER NOT NULL,           -- UTF-8 byte offset into the text
-    end    INTEGER NOT NULL,           -- exclusive
-    PRIMARY KEY (object, ord)
-) STRICT;
-
 -- The placements the index knows, so a purge or a rename is reconciled by key
 -- (§4) and a mutable item's new body is found (§6). `id` is the stable rowid
 -- summary_text joins on, for the reason object.id gives.
@@ -218,17 +205,12 @@ CREATE INDEX occurrence_by_item ON occurrence(collection, seq);
 -- one node. A message row exists for every id a held message bears or names,
 -- and for no other, so two replies to a parent the store never held still
 -- join and a purged message leaves nothing it named; thread_members reaches
--- the present ones through placement.
-CREATE TABLE thread (
-    id    TEXT    PRIMARY KEY,
-    first TEXT    NOT NULL,                  -- earliest sort key in the thread
-    last  TEXT    NOT NULL,                  -- latest
-    count INTEGER NOT NULL                   -- present members
-) STRICT;
-
+-- the present ones through placement. A thread is named by the id of its
+-- present member with the lowest sort key, and is no row of its own: its
+-- span is read from the store's items through its members.
 CREATE TABLE message (
     link_id TEXT PRIMARY KEY,
-    thread  TEXT NOT NULL REFERENCES thread(id) ON DELETE CASCADE,
+    thread  TEXT NOT NULL,                   -- the thread's id, a message id
     parent  TEXT                             -- the message id replied to, or NULL
 ) STRICT;
 

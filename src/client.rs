@@ -886,25 +886,23 @@ impl PimdirStore {
     /// settled by a recompute in the same transaction, skipped when the
     /// collection held none (`collection_holds_objects`); the bodies fall
     /// to the collector. A collection holding a pending or parked queue
-    /// row is refused as [`PimdirError::Queued`], the cascade dropping the
-    /// action with no receipt (`collections_keep_queued`).
+    /// row is refused as [`PimdirError::Queued`], a cascade dropping the
+    /// action with no receipt (`collection_holds_actions`, the queue's
+    /// `ON DELETE RESTRICT`).
     pub fn delete_collection(&mut self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
         let collection = collection.as_ref();
         let tx = begin(&mut self.reader.conn, &self.lock)?;
         let key = named_params! { ":collection": collection };
+        let queued: bool =
+            tx.query_row_cached(sql::COLLECTION_HOLDS_ACTIONS, key, |row| row.get(0))?;
+        if queued {
+            return Err(PimdirError::Queued {
+                collection: String::from(collection),
+            });
+        }
         let pins: bool =
             tx.query_row_cached(sql::COLLECTION_HOLDS_OBJECTS, key, |row| row.get(0))?;
-        let deleted = match tx.execute_cached(sql::DELETE_COLLECTION, key) {
-            Err(rusqlite::Error::SqliteFailure(err, Some(message)))
-                if err.code == ErrorCode::ConstraintViolation
-                    && message == "collection holds queued actions" =>
-            {
-                return Err(PimdirError::Queued {
-                    collection: String::from(collection),
-                });
-            }
-            deleted => deleted?,
-        };
+        let deleted = tx.execute_cached(sql::DELETE_COLLECTION, key)?;
         if pins {
             tx.execute_cached(sql::RECOMPUTE_REFCOUNTS, [])?;
         }
@@ -2093,7 +2091,7 @@ pub enum PimdirError {
         collection: String,
     },
     /// A collection holding a pending or parked queue row was deleted
-    /// (§14, `collections_keep_queued`): cancel the rows first.
+    /// (§14, `collection_holds_actions`): cancel the rows first.
     Queued {
         /// The collection the delete was for.
         collection: String,

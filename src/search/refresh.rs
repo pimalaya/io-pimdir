@@ -972,11 +972,12 @@ pub struct PimdirIndexRefreshOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirIndexOp {
     /// Puts a body indexed for the first time: its `object` row, its card
-    /// categories, its text and its chunks (`insert_object`,
-    /// `insert_object_category`, `insert_object_text`, `insert_chunk`).
+    /// categories and its text (`insert_object`, `insert_object_category`,
+    /// `insert_object_text`), and its chunks for a shape storing them,
+    /// which this crate's does not.
     PutObject(PimdirIndexObject),
-    /// Drops a body the store no longer holds, its text, chunks and
-    /// categories with it (`delete_object`, `delete_object_row`).
+    /// Drops a body the store no longer holds, its text and categories
+    /// with it (`delete_object`, `delete_object_row`).
     DropObject(PimdirHash),
     /// Drops a body once no placement names it, as [`DropObject`] drops
     /// one (`object_placed`, SEARCH §4): a placement left it or moved off it.
@@ -1046,8 +1047,8 @@ pub enum PimdirIndexOp {
     /// calendar item recorded, or that holds none (`delete_missing`), if
     /// recorded.
     DropMissing(PimdirIndexKey),
-    /// Puts a message row (`upsert_message`), its thread row written
-    /// before it.
+    /// Puts a message row (`upsert_message`), after its thread's
+    /// [`PutThread`](PimdirIndexOp::PutThread).
     PutMessage {
         /// The message id.
         link_id: String,
@@ -1060,7 +1061,8 @@ pub enum PimdirIndexOp {
     /// placement holds name no parent (`unparent_messages`), then those no
     /// row names go (`prune_messages`).
     PruneThread(String),
-    /// Puts a thread row (`upsert_thread`).
+    /// Puts a thread's span, for a shape keeping a row per thread: this
+    /// crate's keeps none, reading the span from the store (SEARCH §9).
     PutThread {
         /// The link id of its present member with the lowest
         /// `(sort_key, link_id)`.
@@ -1073,8 +1075,10 @@ pub enum PimdirIndexOp {
         /// Its present members.
         count: u64,
     },
-    /// Drops a thread row when no message row points to it any more,
-    /// keeping it otherwise (`delete_thread`).
+    /// Drops a thread's row once no message row points to it any more,
+    /// for a shape keeping one, as [`PutThread`] puts it.
+    ///
+    /// [`PutThread`]: PimdirIndexOp::PutThread
     DropThread(String),
     /// Records the store's cursor folded in (`set_index_cursor`).
     SetCursor {
@@ -1264,7 +1268,7 @@ pub struct PimdirIndexObject {
     /// A card's `CATEGORIES` values, folded as STORAGE Annex A.2 folds
     /// `fn`, each once (`object_category`).
     pub categories: Vec<String>,
-    /// The chunks, numbered in order from 0 (`chunk`).
+    /// The chunks, numbered in order from 0, for a shape storing them.
     pub chunks: Vec<PimdirChunk>,
 }
 

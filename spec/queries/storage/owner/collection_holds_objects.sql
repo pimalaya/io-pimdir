@@ -1,10 +1,10 @@
 -- Whether a collection's rows point at an object (§14): an item's body or
--- conflict, a binding's base, conflict or shared body, a queued body. A
--- delete_collection of one that holds none drops no pointer, and
--- recompute_refcounts may be skipped.
+-- conflict, a binding's base, conflict or shared body. A delete_collection of
+-- one that holds none drops no pointer, and recompute_refcounts may be
+-- skipped. A queued body needs no clause: a collection a queue row names is
+-- not deleted (collection_holds_actions).
 SELECT EXISTS (SELECT 1 FROM items WHERE collection = :collection
                  AND (object IS NOT NULL OR conflict_object IS NOT NULL))
     OR EXISTS (SELECT 1 FROM bindings WHERE collection = :collection
                  AND (base_object IS NOT NULL OR conflict_object IS NOT NULL
-                      OR shared_object IS NOT NULL))
-    OR EXISTS (SELECT 1 FROM queue WHERE collection = :collection AND object IS NOT NULL) AS holds;
+                      OR shared_object IS NOT NULL)) AS holds;

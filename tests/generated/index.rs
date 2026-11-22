@@ -301,7 +301,7 @@ pub fn dump(root: &Path) -> Dump {
     )
     .unwrap();
 
-    let tables: [(&str, &str); 13] = [
+    let tables: [(&str, &str); 11] = [
         (
             "unplaced",
             "SELECT hash, status FROM object WHERE id NOT IN (SELECT id FROM temp.placed) \
@@ -323,11 +323,6 @@ pub fn dump(root: &Path) -> Dump {
              ORDER BY 1, 2",
         ),
         (
-            "chunk",
-            "SELECT o.hash, c.ord, c.field, c.start, c.\"end\" FROM chunk c \
-             JOIN temp.placed o ON o.id = c.object ORDER BY 1, 2",
-        ),
-        (
             "placement",
             "SELECT p.collection, p.seq, p.link_id, \
              coalesce(o.hash, CASE WHEN p.object IS NOT NULL THEN 'gone' END), p.cut \
@@ -344,10 +339,6 @@ pub fn dump(root: &Path) -> Dump {
         (
             "occurrence",
             "SELECT collection, seq, start, \"end\" FROM occurrence ORDER BY 1, 2, 3, 4",
-        ),
-        (
-            "thread",
-            "SELECT id, first, last, count FROM thread ORDER BY id",
         ),
         (
             "message",
