@@ -50,7 +50,6 @@ use alloc::{
 use std::{
     collections::HashMap,
     path::Path,
-    sync::LazyLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(feature = "indexer")]
@@ -115,6 +114,11 @@ const BITMAP_SEQ_MAX: i64 = 1 << 26;
 /// The most hits a page of text terms alone reads from its bitmaps, a
 /// seek each for its sort key, rather than walking the store's order.
 const PAGE_HITS_MAX: u64 = 40_000;
+
+/// The most bodies or summaries a page off the hit columns reads a plain
+/// term's matches into bitmaps for, rather than probing each hit: past
+/// it the read costs more than the page's probes.
+const PROBE_SET_MAX: usize = 1024;
 
 /// The values a dated page's statement binds beyond the query's: `:limit`
 /// the `need` rows it reads, and the cursor `after` names.
@@ -307,11 +311,6 @@ impl Held {
         self.collections.get(collection).copied()
     }
 }
-
-/// The tables, indexes and triggers the index schema declares, by name,
-/// as [`shape`] reads them from an index.db (SEARCH §2).
-static SHAPE_DECLARED: LazyLock<BTreeMap<String, String>> =
-    LazyLock::new(|| schema::declared(search::MIGRATIONS));
 
 /// The SQLite version the index requires, for `contentless_delete`
 /// (SEARCH §2), as `sqlite3_libversion_number` spells it.
@@ -2984,7 +2983,9 @@ const WAL_AUTOCHECKPOINT: i64 = 16384;
 /// indexer sets the journal mode once it found the index its own or built
 /// it ([`held`]), so an index it refuses stays as it is. The indexer
 /// creates an absent index.db `0600` first, its `-wal` and `-shm` taking
-/// that mode (STORAGE §18).
+/// that mode (STORAGE §18). The store is attached in SQLite's shared cache,
+/// as the reader opens it, so its schema is parsed once per process rather
+/// than once per connection.
 fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     let access = match query_only {
         true => OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -3004,7 +3005,7 @@ fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     let store = dir.join("pimdir.db").canonicalize()?;
     conn.execute_cached(
         "ATTACH DATABASE ?1 AS store",
-        [format!("file:{}?mode=ro", uri_path(&store))],
+        [format!("file:{}?mode=ro&cache=shared", uri_path(&store))],
     )?;
     Ok(conn)
 }
@@ -3115,9 +3116,11 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     // NOTE: before `load_index_meta`, which names columns an index of an
     // earlier schema text may lack.
     let declared: BTreeMap<String, String> = shape(conn, "main")?.into_iter().collect();
-    let same = SHAPE_DECLARED
-        .iter()
-        .all(|(name, sql)| declared.get(name).is_some_and(|held| held == sql));
+    let same = search::DECLARED.iter().all(|(name, sql)| {
+        declared
+            .get(*name)
+            .is_some_and(|held| schema::same(held, sql))
+    });
     if !same {
         return Ok(PimdirIndexHeld::Stale);
     }
@@ -3184,7 +3187,7 @@ fn build(dir: &Path) -> Result<Connection, PimdirError> {
 }
 
 /// The tables, indexes and triggers database `schema` declares, by name,
-/// with their text as SEARCH §2 compares it; the shadow tables of each
+/// with the text SQLite records for each; the shadow tables of each
 /// virtual table, and the automatic indexes, left out.
 fn shape(conn: &Connection, schema: &str) -> Result<Vec<(String, String)>, PimdirError> {
     let declared = rows(
@@ -3209,7 +3212,6 @@ fn shape(conn: &Connection, schema: &str) -> Result<Vec<(String, String)>, Pimdi
     Ok(declared
         .into_iter()
         .filter(|(name, _)| !virtuals.iter().any(|prefix| name.starts_with(prefix)))
-        .map(|(name, sql)| (name, schema::normalised(&sql)))
         .collect())
 }
 
@@ -3308,9 +3310,17 @@ fn extract(
 /// byte of the fold came from, so a word found in the fold is placed in
 /// the text. A mark the fold drops maps to nothing.
 fn fold_chars(text: &str) -> (String, Vec<usize>) {
+    if text.is_ascii() {
+        return (text.to_ascii_lowercase(), (0..text.len()).collect());
+    }
     let mut folded = String::with_capacity(text.len());
     let mut origin = Vec::with_capacity(text.len());
     for (at, c) in text.chars().enumerate() {
+        if c.is_ascii() {
+            folded.push(c.to_ascii_lowercase());
+            origin.push(at);
+            continue;
+        }
         let mut buf = [0; 4];
         let one = fold::text(c.encode_utf8(&mut buf));
         origin.extend(core::iter::repeat_n(at, one.len()));

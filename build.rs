@@ -13,6 +13,11 @@
 //! without its target/, and tests/spec_drift.rs proves the copy against
 //! a sibling checkout.
 
+extern crate alloc;
+
+#[path = "src/client/schema/declared.rs"]
+mod declared;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -22,6 +27,7 @@ fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let spec = root.join("spec");
     println!("cargo:rerun-if-changed=spec");
+    println!("cargo:rerun-if-changed=src/client/schema/declared.rs");
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     fs::write(out.join("canonical.rs"), canonical(&spec)).unwrap();
@@ -55,6 +61,8 @@ fn canonical(spec: &Path) -> String {
         out += &format!("    MIGRATION_{:04},\n", index + 1);
     }
     out += "];\n\n";
+
+    declared_objects(&mut out, &migrations);
 
     let mut names = Vec::new();
     for profile in ["read", "queue", "owner"] {
@@ -99,6 +107,8 @@ fn search(spec: &Path) -> String {
     }
     out += "];\n\n";
 
+    declared_objects(&mut out, &migrations);
+
     let mut names = Vec::new();
     for path in files(&spec.join("queries/search")) {
         names.push(statement(&mut out, &path, "SEARCH §2"));
@@ -112,6 +122,24 @@ fn search(spec: &Path) -> String {
     out += "];\n";
 
     out
+}
+
+/// Appends `DECLARED`: every table, index and trigger `migrations`
+/// declare, in name order, with its text as a schema check compares it.
+fn declared_objects(out: &mut String, migrations: &[PathBuf]) {
+    let texts: Vec<String> = migrations
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+    *out += "/// Every table, index and trigger the migrations declare, in name\n";
+    *out += "/// order, its text as the schema check compares it: every `--`\n";
+    *out += "/// comment dropped and whitespace collapsed to single spaces.\n";
+    *out += "pub const DECLARED: &[(&str, &str)] = &[\n";
+    for (name, text) in declared::declared(&texts) {
+        *out += &format!("    ({name:?}, {text:?}),\n");
+    }
+    *out += "];\n\n";
 }
 
 /// Appends one statement's constant, its leading comment as its

@@ -509,6 +509,8 @@ impl PimdirReader {
     /// profile does, one no owner has created ([`PimdirError::Uncreated`]),
     /// one of another draft ([`PimdirError::Version`]) and every other
     /// store the owner's open refuses (STORAGE §6, §18). Takes no lock.
+    /// The database is read through SQLite's shared cache, which a search
+    /// index attaching the store joins, its schema parsed once.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         if !dir.join("pimdir.db").is_file() {
@@ -517,7 +519,8 @@ impl PimdirReader {
         modes::check(dir)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_SHARED_CACHE;
         let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
         prepare_connection(&conn)?;
         schema::check(&conn, PimdirProfile::Reader)?;

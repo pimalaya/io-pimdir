@@ -424,6 +424,12 @@ fn the_hit_columns_answer_as_the_index_alone() {
         "from:user1 kiwi",
         "rep* not is:read",
         "kiwi season",
+        "from:user1@example.org",
+        "from:User2@Example.org kiwi",
+        "with:user3@example.org not is:flagged",
+        "to:user1@example.org",
+        "account:work from:user4@example.org",
+        "from:user1@example.org or from:user2@example.org",
     ];
     let answers = |index: &PimdirIndex| {
         let clock = PimdirSearchClock::default();

@@ -31,7 +31,7 @@ use crate::{
 pub(crate) const FILE: &str = "index.hits";
 
 /// The cache's first word, its version and byte order.
-const MAGIC: u64 = u64::from_ne_bytes(*b"PIMHITS2");
+const MAGIC: u64 = u64::from_ne_bytes(*b"PIMHITS3");
 
 /// How many words the header holds.
 const HEADER: usize = 16;
@@ -202,6 +202,9 @@ pub(crate) struct PimdirHitColumns {
     records: (usize, usize),
     objects: (usize, usize),
     multi: (usize, usize),
+    /// Where the index placement of each store item id starts, two to a
+    /// word, and how many item ids it spans.
+    items: (usize, usize),
     keys: usize,
     /// Where each hit's held word starts: the union of its placements'
     /// marks in its low byte, the date of its dated mail placements above.
@@ -306,6 +309,7 @@ impl PimdirHitColumns {
         let (records, objects, multi, seq_max) =
             (w[5] as usize, w[6] as usize, w[7] as usize, w[8] as usize);
         let (accounts, kinds, flags) = (w[9] as usize, w[10] as usize, w[11]);
+        let items = w[13] as usize;
         let mut at = HEADER;
         let account_names = names(w, &mut at, accounts)?;
         let kind_names = names(w, &mut at, kinds)?;
@@ -315,6 +319,8 @@ impl PimdirHitColumns {
         at += objects.1.div_ceil(2);
         let multi = (at, multi);
         at += multi.1;
+        let items = (at, items);
+        at += items.1.div_ceil(2);
         let keys = at;
         at += accounts * (seq_max + 1);
         let held = at;
@@ -334,6 +340,7 @@ impl PimdirHitColumns {
             records,
             objects,
             multi,
+            items,
             keys,
         })
     }
@@ -405,6 +412,23 @@ impl PimdirHitColumns {
         }
     }
 
+    /// The record of the placement of store item `item`, `None` for no
+    /// live placement.
+    pub(crate) fn of_item(&self, item: i64) -> Option<Record> {
+        let item = usize::try_from(item)
+            .ok()
+            .filter(|item| *item < self.items.1)?;
+        let word = self.words.get()[self.items.0 + item / 2];
+        let placement = match item % 2 {
+            0 => word & 0xffff_ffff,
+            _ => word >> 32,
+        };
+        match placement {
+            0 => None,
+            placement => self.record(placement as i64),
+        }
+    }
+
     /// The sort key of hit `(account, seq)`: the greatest of its
     /// placements' dates, [`UNDATED`] when one is of an undated kind,
     /// [`NO_HIT`] for none.
@@ -465,7 +489,12 @@ pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), P
     let seq_max: i64 = conn.query_row("SELECT ifnull(max(seq), 0) FROM placement", [], |row| {
         row.get(0)
     })?;
+    let item_max: i64 =
+        conn.query_row("SELECT ifnull(max(id), 0) FROM store.items", [], |row| {
+            row.get(0)
+        })?;
     if stamp.placement_max >= 0xffff_ffff
+        || !(0..0xffff_ffff).contains(&item_max)
         || stamp.object_max >= 0xffff_ffff
         || !(0..0xffff_ffff).contains(&seq_max)
     {
@@ -517,6 +546,8 @@ pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), P
     let mut records = vec![0u64; records_len * 2];
     let mut objects = vec![0u32; objects_len];
     let mut multi: Vec<u64> = Vec::new();
+    let items_len = item_max as usize + 1;
+    let mut items = vec![0u32; items_len];
     let mut keys = vec![NO_HIT; keys_len as usize];
     let mut held = vec![0u64; keys_len as usize];
     let mut uniform = true;
@@ -526,7 +557,7 @@ pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), P
     let mut exact = true;
     {
         let mut statement = conn.prepare(
-            "SELECT p.id, p.object, p.collection, p.seq, i.sort_key, i.marks \
+            "SELECT p.id, p.object, p.collection, p.seq, i.sort_key, i.marks, i.id \
              FROM placement p JOIN store.items i \
              ON i.collection = p.collection AND i.seq = p.seq AND i.deleted = 0",
         )?;
@@ -538,12 +569,17 @@ pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), P
             let seq: i64 = row.get(3)?;
             let key = row.get_ref(4)?.as_str().map_err(rusqlite::Error::from)?;
             let marks: i64 = row.get(5)?;
+            let item: i64 = row.get(6)?;
             let Some(&(account, kind)) = collections.get(collection) else {
                 continue;
             };
-            if !(0..records_len as i64).contains(&id) || !(0..=seq_max).contains(&seq) {
+            if !(1..records_len as i64).contains(&id)
+                || !(0..=seq_max).contains(&seq)
+                || !(0..items_len as i64).contains(&item)
+            {
                 return gone(&path);
             }
+            items[item as usize] = id as u32;
             let date = date_of(key).unwrap_or_else(|| {
                 exact = false;
                 0
@@ -591,6 +627,7 @@ pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), P
     out[0] = MAGIC;
     out[1..5].copy_from_slice(&stamp.words());
     out[12] = stamp.file;
+    out[13] = items_len as u64;
     out[5] = records_len as u64;
     out[6] = objects_len as u64;
     out[7] = multi.len() as u64;
@@ -607,6 +644,11 @@ pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), P
             .map(|pair| u64::from(pair[0]) | u64::from(*pair.get(1).unwrap_or(&0)) << 32),
     );
     out.extend_from_slice(&multi);
+    out.extend(
+        items
+            .chunks(2)
+            .map(|pair| u64::from(pair[0]) | u64::from(*pair.get(1).unwrap_or(&0)) << 32),
+    );
     out.extend(keys.iter().map(|key| *key as u64));
     out.extend_from_slice(&held);
 
@@ -633,6 +675,9 @@ enum Column<'a> {
     Text(&'a str, bool),
     /// A date term: `[since, until)` as [`date_of`] reads a key.
     Date(i64, i64),
+    /// An address term: the address lowercased, and its role, `None` for
+    /// any.
+    Address(String, Option<&'static str>),
 }
 
 impl super::PimdirIndex {
@@ -690,6 +735,13 @@ impl super::PimdirIndex {
                         (Some(since), Some(until)) => Column::Date(since, until),
                         _ => return Ok(None),
                     }
+                }
+                P::Address { role, text } if text.text.contains('@') => {
+                    if text.text.starts_with('@') {
+                        return Ok(None);
+                    }
+                    let role = role.map(|role| role.as_str());
+                    Column::Address(text.text.to_lowercase(), role)
                 }
                 _ if leaf.is_text() => match compiled.text_of(at) {
                     Some((expression, summary)) => Column::Text(expression, summary),
@@ -1045,6 +1097,25 @@ impl Run<'_> {
         Ok(hits)
     }
 
+    /// The hits of the store items `address` stands in, in `role` or in
+    /// any.
+    fn address(&self, address: &str, role: Option<&str>) -> Result<super::Hits, PimdirError> {
+        let mut hits = self.empty();
+        let mut statement = self.index.conn.prepare_cached(
+            "SELECT item FROM store.item_address \
+             WHERE address = ?1 AND (?2 IS NULL OR role = ?2)",
+        )?;
+        let mut rows = statement.query(rusqlite::params![address, role])?;
+        while let Some(row) = rows.next()? {
+            if let Some(record) = self.columns.of_item(row.get(0)?)
+                && self.in_scope(&record)
+            {
+                hits[record.account][record.seq / 64] |= 1 << (record.seq % 64);
+            }
+        }
+        Ok(hits)
+    }
+
     fn leaf(&mut self, at: usize) -> Result<super::Hits, PimdirError> {
         match &self.read[at] {
             Column::Every => Ok(self.every()),
@@ -1056,6 +1127,7 @@ impl Run<'_> {
                 let summary = summary.then_some(*expression);
                 self.text(Some(expression), summary)
             }
+            Column::Address(address, role) => self.address(address, *role),
         }
     }
 
@@ -1203,18 +1275,24 @@ impl Run<'_> {
 }
 
 impl super::PimdirIndex {
-    /// Reads each probed prefix term of a page answered off the hit
-    /// columns into bitmaps of the bodies and summaries it matches, one
-    /// scan of the full-text index each, where a probe per hit would
-    /// expand the prefix again.
+    /// Reads each probed term of a page answered off the hit columns into
+    /// bitmaps of the bodies and summaries it matches, one scan of the
+    /// full-text index each, where a probe per hit would expand a prefix
+    /// again or seek the term's matches once more: every prefix term, and
+    /// a plain one matching at most
+    /// [`PROBE_SET_MAX`](super::PROBE_SET_MAX) of each.
     pub(super) fn probe_sets(
         &self,
         probes: &mut [(&super::Probe, super::Sourced)],
     ) -> Result<(), PimdirError> {
         for (probe, sourced) in probes.iter_mut() {
-            if !matches!(sourced, super::Sourced::Probed) || !probe.expression.contains('*') {
+            if !matches!(sourced, super::Sourced::Probed) {
                 continue;
             }
+            let limit = match probe.expression.contains('*') {
+                true => -1,
+                false => super::PROBE_SET_MAX as i64 + 1,
+            };
             let mut bodies = Vec::new();
             let mut summaries = Vec::new();
             let set = |bits: &mut Vec<u64>, id: i64| {
@@ -1226,21 +1304,26 @@ impl super::PimdirIndex {
                 }
                 bits[id / 64] |= 1 << (id % 64);
             };
-            let mut statement = self
-                .conn
-                .prepare_cached("SELECT rowid FROM object_text WHERE object_text MATCH ?1")?;
-            let mut rows = statement.query([&probe.expression])?;
-            while let Some(row) = rows.next()? {
-                set(&mut bodies, row.get(0)?);
-            }
-            if probe.summary {
-                let mut statement = self
-                    .conn
-                    .prepare_cached("SELECT rowid FROM summary_text WHERE summary_text MATCH ?1")?;
-                let mut rows = statement.query([&probe.expression])?;
+            let read = |sql: &str, bits: &mut Vec<u64>| -> Result<bool, PimdirError> {
+                let mut statement = self.conn.prepare_cached(sql)?;
+                let mut rows = statement.query(rusqlite::params![&probe.expression, limit])?;
+                let mut count = 0i64;
                 while let Some(row) = rows.next()? {
-                    set(&mut summaries, row.get(0)?);
+                    count += 1;
+                    if count == limit {
+                        return Ok(false);
+                    }
+                    set(bits, row.get(0)?);
                 }
+                Ok(true)
+            };
+            let body = "SELECT rowid FROM object_text WHERE object_text MATCH ?1 LIMIT ?2";
+            if !read(body, &mut bodies)? {
+                continue;
+            }
+            let summary = "SELECT rowid FROM summary_text WHERE summary_text MATCH ?1 LIMIT ?2";
+            if probe.summary && !read(summary, &mut summaries)? {
+                continue;
             }
             *sourced = super::Sourced::Sets { bodies, summaries };
         }
