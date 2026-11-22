@@ -98,3 +98,11 @@ Head to head after (new14, ms, notmuch vs pimdir):
 | folder | 2.3 vs 2.5 | 3.3 vs 3.6 | 4 vs 4.8 |
 
 Ahead on all three for 12 of 17, and unread word ties its count. Trailing: rare word and folder by 0.1 to 0.8 ms (the floor and a page's presentation), subject word count by 0.6 (the `title` column filter, as `from` was), combined by 1.2 to 2.2 (the joint `AND` decodes `dasovich`'s positions in every body to filter its column).
+
+## Titles in the posting lists (d4a0cf8)
+
+`pimdir_from` became `pimdir_fields(title, "from")`, `detail = column`; a posted word reads its bodies whole into a page's probe sets (past `PROBE_SET_MAX`, the per-hit probe gone). `meeting`: 115,416 bodies anywhere, 32,562 in a title. Rebuild 8 min 51 s, 155 s user; index.db 3,801 MB (3,758 with no list, 3,776 with `from` alone). Every count, page and threads page of the 17 queries equals new9's on x2c (51 md5).
+
+subject word went 5.8 / 9.2 / 10.3 to 4.0 / 7.3 / 9.0 (notmuch 5.5 / 14.7 / 16.3): ahead on all three, 13 of 17.
+
+Tried and dropped again for combined: the joint `AND` holding the bare word (`"dasovich"`, no column) and its bodies intersected with the posting's `{from}` set: count 8.0 to 9.3 in one run. The unfiltered `AND` still walks both doclists; the column filter is not where combined's time goes.

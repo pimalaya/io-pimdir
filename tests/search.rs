@@ -4487,6 +4487,8 @@ fn a_from_word_reads_the_posting_list_and_falls_back_without_it() {
         "from:alice not body:roadmap",
         "subject:sync",
         "subject:syn*",
+        "from:alice sync",
+        "subject:sync from:ali* not body:roadmap",
     ];
     let held: Vec<u64> = queries.iter().map(|query| count(query)).collect();
     assert!(held.iter().all(|count| *count > 0), "{held:?}");
