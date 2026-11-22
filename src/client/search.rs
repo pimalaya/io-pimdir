@@ -3135,12 +3135,7 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
 
     // NOTE: before `load_index_meta`, which names columns an index of an
     // earlier schema text may lack.
-    let declared: BTreeMap<String, String> = shape(conn, "main")?.into_iter().collect();
-    let same = search::DECLARED.iter().all(|(name, sql)| {
-        declared
-            .get(*name)
-            .is_some_and(|held| schema::same(held, sql))
-    });
+    let (same, posted) = declared(conn)?;
     if !same {
         return Ok(PimdirIndexHeld::Stale);
     }
@@ -3174,7 +3169,7 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     if extracted {
         debug!("search index stands under extraction {extraction} by {extractor:?}");
     }
-    if !declared.contains_key(search::FROM_POSTING_TABLE) {
+    if !posted {
         debug!("search index holds no from posting list");
         return Ok(PimdirIndexHeld::Unposted { extracted });
     }
@@ -3213,33 +3208,37 @@ fn build(dir: &Path) -> Result<Connection, PimdirError> {
     Ok(conn)
 }
 
-/// The tables, indexes and triggers database `schema` declares, by name,
-/// with the text SQLite records for each; the shadow tables of each
-/// virtual table, and the automatic indexes, left out.
-fn shape(conn: &Connection, schema: &str) -> Result<Vec<(String, String)>, PimdirError> {
-    let declared = rows(
-        conn,
-        &format!(
-            "SELECT name, sql FROM {schema}.sqlite_schema \
-             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
-        ),
-        [],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+/// Whether index.db holds every table, index and trigger the canonical
+/// schema declares, each with its text, and whether it holds the `from`
+/// posting list of this crate's own: `sqlite_schema` read in name order
+/// beside [`search::DECLARED`], each text borrowed, any other object (the
+/// shadow tables of a virtual table among them) passed over (SEARCH §2).
+fn declared(conn: &Connection) -> Result<(bool, bool), PimdirError> {
+    let mut statement = conn.prepare_cached(
+        "SELECT name, sql FROM main.sqlite_schema \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
-    let virtuals: Vec<String> = declared
-        .iter()
-        .filter(|(_, sql)| {
-            sql.trim_start()
-                .to_ascii_uppercase()
-                .starts_with("CREATE VIRTUAL TABLE")
-        })
-        .map(|(name, _)| format!("{name}_"))
-        .collect();
-
-    Ok(declared
-        .into_iter()
-        .filter(|(name, _)| !virtuals.iter().any(|prefix| name.starts_with(prefix)))
-        .collect())
+    let mut rows = statement.query([])?;
+    let mut declared = search::DECLARED.iter().peekable();
+    let mut posted = false;
+    while let Some(row) = rows.next()? {
+        let name = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+        posted |= name == search::FROM_POSTING_TABLE;
+        let Some((known, normalised)) = declared.peek() else {
+            continue;
+        };
+        if *known < name {
+            return Ok((false, posted));
+        }
+        if *known == name {
+            let text = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+            if !schema::same(text, normalised) {
+                return Ok((false, posted));
+            }
+            declared.next();
+        }
+    }
+    Ok((declared.peek().is_none(), posted))
 }
 
 /// Applies the index schema to an empty index.db, refusing a SQLite that
