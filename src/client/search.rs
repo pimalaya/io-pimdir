@@ -333,6 +333,10 @@ pub struct PimdirIndex {
     /// §6), so the chunk offsets it stores index the text this build
     /// extracts; a query client re-chunks its own text otherwise.
     own_extraction: bool,
+    /// Whether index.db holds the `from` posting list of this crate's own
+    /// (`sql::search::FROM_POSTING`), which a `from:` word reads in place
+    /// of `object_text`'s column.
+    from_posting: bool,
     /// The coverages answered since index.db and the store last moved.
     coverages: RefCell<PimdirCoverageCache>,
     /// The driver every answer takes in place of the plan's, set by
@@ -783,6 +787,7 @@ impl PimdirIndex {
             #[cfg(feature = "indexer")]
             query_only: false,
             own_extraction: true,
+            from_posting: true,
             coverages: RefCell::default(),
             force: Cell::new(None),
             #[cfg(feature = "indexer")]
@@ -826,7 +831,9 @@ impl PimdirIndex {
         let conn = connect(dir, true)?;
         let held = held(&conn, dir)?;
         match held {
-            PimdirIndexHeld::Current | PimdirIndexHeld::Extracted => (),
+            PimdirIndexHeld::Current
+            | PimdirIndexHeld::Extracted
+            | PimdirIndexHeld::Unposted { .. } => (),
             PimdirIndexHeld::Empty => return Err(PimdirError::IndexMissing(path)),
             PimdirIndexHeld::Earlier { version, shape } => {
                 return Err(PimdirError::IndexVersion {
@@ -845,7 +852,11 @@ impl PimdirIndex {
             dir: dir.to_path_buf(),
             #[cfg(feature = "indexer")]
             query_only: true,
-            own_extraction: held == PimdirIndexHeld::Current,
+            own_extraction: matches!(
+                held,
+                PimdirIndexHeld::Current | PimdirIndexHeld::Unposted { extracted: false }
+            ),
+            from_posting: matches!(held, PimdirIndexHeld::Current | PimdirIndexHeld::Extracted),
             coverages: RefCell::default(),
             force: Cell::new(None),
             #[cfg(feature = "indexer")]
@@ -1020,6 +1031,7 @@ impl PimdirIndex {
         debug!("optimize the full-text tables");
         self.conn
             .execute_batch(search::OPTIMIZE_TEXT)
+            .and_then(|()| self.conn.execute_batch(search::OPTIMIZE_FROM_POSTING))
             .map_err(busy_or_sql)?;
         checkpoint(&self.conn)?;
 
@@ -3035,6 +3047,14 @@ enum PimdirIndexHeld {
     /// which extracts every body and expands every calendar item again; a
     /// query client answers from it.
     Extracted,
+    /// What this crate builds, from this store, lacking the `from`
+    /// posting list of its own (`sql::search::FROM_POSTING`), under its
+    /// extraction or, `extracted`, another: the indexer rebuilds it, a
+    /// query client answers from it, its `from:` words read `object_text`.
+    Unposted {
+        /// Whether it stands under another extraction too.
+        extracted: bool,
+    },
     /// What this crate builds, from this store.
     Current,
 }
@@ -3150,8 +3170,15 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
         debug!("search index was built from another store or copy of it");
         return Ok(PimdirIndexHeld::Stale);
     }
-    if extraction != extract::EXTRACTION || extractor != extract::EXTRACTOR {
+    let extracted = extraction != extract::EXTRACTION || extractor != extract::EXTRACTOR;
+    if extracted {
         debug!("search index stands under extraction {extraction} by {extractor:?}");
+    }
+    if !declared.contains_key(search::FROM_POSTING_TABLE) {
+        debug!("search index holds no from posting list");
+        return Ok(PimdirIndexHeld::Unposted { extracted });
+    }
+    if extracted {
         return Ok(PimdirIndexHeld::Extracted);
     }
 
@@ -3230,6 +3257,7 @@ fn init(conn: &mut Connection) -> Result<(), PimdirError> {
             return Err(err.into());
         }
     }
+    tx.execute_batch(search::FROM_POSTING)?;
     tx.pragma_update(Some("main"), "user_version", search::VERSION)?;
     tx.execute_cached(
         search::INIT_INDEX_META,

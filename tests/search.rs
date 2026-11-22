@@ -4462,3 +4462,63 @@ fn a_page_resumes_after_the_last_hit_it_answered() {
     assert_eq!(PimdirSearchCursor::from_token(&token.token()), Some(token));
     assert_eq!(PimdirSearchCursor::from_token("2"), None);
 }
+
+/// A `from:` word off the hit columns reads the `from` posting list, so a
+/// row taken out of it is a hit fewer; an index lacking the list answers a
+/// query client the same as one holding it, off `object_text`, and the
+/// indexer rebuilds it with the list.
+#[test]
+fn a_from_word_reads_the_posting_list_and_falls_back_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    build(&spec_dir(), dir.path());
+    PimdirIndex::open(dir.path())
+        .unwrap()
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let clock = PimdirSearchClock::default();
+    let count = |query: &str| {
+        let index = PimdirIndex::open_query(dir.path()).unwrap();
+        let parsed = PimdirQuery::parse(query).unwrap();
+        index.count(&parsed, &clock).unwrap().count
+    };
+    let queries = ["from:alice", "from:ali*", "from:alice not body:roadmap"];
+    let held: Vec<u64> = queries.iter().map(|query| count(query)).collect();
+    assert!(held.iter().all(|count| *count > 0), "{held:?}");
+
+    let index = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    let posted = |index: &rusqlite::Connection| {
+        index
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'pimdir_from'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(posted(&index), 1);
+    let first: i64 = index
+        .query_row(
+            "SELECT min(rowid) FROM pimdir_from WHERE pimdir_from MATCH 'alice'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    index
+        .execute("DELETE FROM pimdir_from WHERE rowid = ?1", [first])
+        .unwrap();
+    assert_eq!(count("from:alice"), held[0] - 1);
+
+    index.execute_batch("DROP TABLE pimdir_from;").unwrap();
+    let fallen: Vec<u64> = queries.iter().map(|query| count(query)).collect();
+    assert_eq!(fallen, held);
+
+    drop(index);
+    PimdirIndex::open(dir.path())
+        .unwrap()
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let index = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    assert_eq!(posted(&index), 1);
+    let rebuilt: Vec<u64> = queries.iter().map(|query| count(query)).collect();
+    assert_eq!(rebuilt, held);
+}

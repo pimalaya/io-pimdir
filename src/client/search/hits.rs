@@ -25,6 +25,7 @@ use rusqlite::Connection;
 use crate::{
     client::{PimdirError, PreparedCached},
     search::plan::PimdirPlanNode,
+    sql::search,
 };
 
 /// The cache's name in the store's directory.
@@ -1067,11 +1068,15 @@ impl Run<'_> {
         let mut hits = self.empty();
         let columns = self.columns;
         if let Some(expression) = body {
-            let mut statement = self
-                .index
-                .conn
-                .prepare_cached("SELECT rowid FROM object_text WHERE object_text MATCH ?1")?;
-            let mut rows = statement.query([expression])?;
+            let (sql, expression) = match self.index.posted_word(expression) {
+                Some(word) => (search::MATCH_FROM_POSTING, word),
+                None => (
+                    "SELECT rowid FROM object_text WHERE object_text MATCH ?1 LIMIT ?2",
+                    expression,
+                ),
+            };
+            let mut statement = self.index.conn.prepare_cached(sql)?;
+            let mut rows = statement.query(rusqlite::params![expression, -1])?;
             while let Some(row) = rows.next()? {
                 columns.of_object(row.get(0)?, |record| {
                     if self.in_scope(&record) {
@@ -1275,6 +1280,26 @@ impl Run<'_> {
 }
 
 impl super::PimdirIndex {
+    /// The expression of the `from` posting list answering `expression`,
+    /// a `from:` term of one word or prefix as the compiler renders it
+    /// (`{from} : "word"`, then ` *` for a prefix), when index.db holds
+    /// the list: the same word under the same tokenizer over the same
+    /// text, so the bodies it matches are the column filter's. `None` for
+    /// any other expression, a phrase or a word the tokenizer could split
+    /// among them, which `object_text` answers.
+    fn posted_word<'e>(&self, expression: &'e str) -> Option<&'e str> {
+        if !self.from_posting {
+            return None;
+        }
+        let word = expression.strip_prefix("{from} : ")?;
+        let quoted = word.strip_suffix(" *").unwrap_or(word);
+        let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+        match !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            true => Some(word),
+            false => None,
+        }
+    }
+
     /// Reads each probed term of a page answered off the hit columns into
     /// bitmaps of the bodies and summaries it matches, one scan of the
     /// full-text index each, where a probe per hit would expand a prefix
@@ -1304,25 +1329,32 @@ impl super::PimdirIndex {
                 }
                 bits[id / 64] |= 1 << (id % 64);
             };
-            let read = |sql: &str, bits: &mut Vec<u64>| -> Result<bool, PimdirError> {
-                let mut statement = self.conn.prepare_cached(sql)?;
-                let mut rows = statement.query(rusqlite::params![&probe.expression, limit])?;
-                let mut count = 0i64;
-                while let Some(row) = rows.next()? {
-                    count += 1;
-                    if count == limit {
-                        return Ok(false);
+            let read =
+                |sql: &str, expression: &str, bits: &mut Vec<u64>| -> Result<bool, PimdirError> {
+                    let mut statement = self.conn.prepare_cached(sql)?;
+                    let mut rows = statement.query(rusqlite::params![expression, limit])?;
+                    let mut count = 0i64;
+                    while let Some(row) = rows.next()? {
+                        count += 1;
+                        if count == limit {
+                            return Ok(false);
+                        }
+                        set(bits, row.get(0)?);
                     }
-                    set(bits, row.get(0)?);
-                }
-                Ok(true)
+                    Ok(true)
+                };
+            let (body, expression) = match self.posted_word(&probe.expression) {
+                Some(word) => (search::MATCH_FROM_POSTING, word),
+                None => (
+                    "SELECT rowid FROM object_text WHERE object_text MATCH ?1 LIMIT ?2",
+                    probe.expression.as_str(),
+                ),
             };
-            let body = "SELECT rowid FROM object_text WHERE object_text MATCH ?1 LIMIT ?2";
-            if !read(body, &mut bodies)? {
+            if !read(body, expression, &mut bodies)? {
                 continue;
             }
             let summary = "SELECT rowid FROM summary_text WHERE summary_text MATCH ?1 LIMIT ?2";
-            if probe.summary && !read(summary, &mut summaries)? {
+            if probe.summary && !read(summary, &probe.expression, &mut summaries)? {
                 continue;
             }
             *sourced = super::Sourced::Sets { bodies, summaries };

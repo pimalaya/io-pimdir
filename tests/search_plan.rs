@@ -422,6 +422,8 @@ fn the_hit_columns_answer_as_the_index_alone() {
         "account:home is:flagged",
         "account:work kiwi",
         "from:user1 kiwi",
+        "from:user1",
+        "from:use*",
         "rep* not is:read",
         "kiwi season",
         "from:user1@example.org",
