@@ -970,23 +970,19 @@ impl super::PimdirIndex {
         if seqs.len() == 1 && seqs.contains(&hit.seq) {
             return Ok(vec![hit.clone()]);
         }
-        let mut extra = vec![(
-            String::from(":akey"),
-            rusqlite::types::Value::from(String::from(name)),
-        )];
-        let mut listed = Vec::new();
-        for (at, seq) in seqs.into_iter().enumerate() {
-            listed.push(alloc::format!("(:m{at})"));
-            extra.push((
-                alloc::format!(":m{at}"),
-                rusqlite::types::Value::Integer(seq),
-            ));
-        }
-        let members = alloc::format!(
-            "SELECT :akey AS akey, column1 AS seq FROM (VALUES {})",
-            listed.join(", ")
-        );
-        let sql = compiled.met_rows(&members, sort, None);
+        let listed: Vec<String> = seqs.iter().map(|seq| alloc::format!("{seq}")).collect();
+        let extra = vec![
+            (
+                String::from(":akey"),
+                rusqlite::types::Value::from(String::from(name)),
+            ),
+            (
+                String::from(":members"),
+                rusqlite::types::Value::from(alloc::format!("[{}]", listed.join(","))),
+            ),
+        ];
+        let members = "SELECT :akey AS akey, value AS seq FROM json_each(:members)";
+        let sql = compiled.met_rows(members, sort, None);
         let mut found = self.run(&sql, &compiled.values, &extra, |row| {
             super::found(row, sort)
         })?;
