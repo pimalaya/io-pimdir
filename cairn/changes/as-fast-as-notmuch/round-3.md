@@ -75,3 +75,33 @@ Head-to-head after the first step (pimdir-new8, ms, notmuch vs pimdir), count | 
 | folder | 2.3 vs 2.7 | 2.9 vs 4.2 | 4 vs 5.5 |
 
 The `from` column holds the names the body's From header parses to (src/search/extract/mail.rs), not the store's `item_address` rows, so a `from:` name term cannot be answered off the store exactly; FTS5's column filter over `dasovich`'s 63,150 bodies costs 2.8 ms of the from name count (notmuch reads a 22k posting list of its own `from` prefix).
+
+Head-to-head after the second step (pimdir 04d3211, ms, notmuch vs pimdir), count | page | threads:
+
+| query | count | page | threads |
+| --- | --- | --- | --- |
+| all mail | 54.5 vs 5.9 | 263.9 vs 12.7 | 280 vs 14 |
+| unread | 21.6 vs 7.9 | 80.2 vs 11 | 86.3 vs 13.1 |
+| flagged | 6.4 vs 6 | 16.4 vs 8 | 18.9 vs 10.1 |
+| from address | 13.1 vs 6.5 | 17 vs 7.5 | 19.6 vs 9.2 |
+| from name | 4.1 vs 6 | 7.9 vs 8.5 | 10 vs 10.1 |
+| subject word | 5.3 vs 6.4 | 15.1 vs 10.1 | 17.1 vs 11.8 |
+| common word | 89.2 vs 52.7 | 288.4 vs 60.1 | 304.2 vs 63.4 |
+| mid word | 8.8 vs 7 | 27.9 vs 11.1 | 29.6 vs 12.4 |
+| rare word | 2.8 vs 3.5 | 4.2 vs 5.4 | 6 vs 7.3 |
+| phrase | 16.5 vs 10.5 | 28.6 vs 14.3 | 29.5 vs 15.6 |
+| two words | 7.7 vs 7.3 | 17.3 vs 11.6 | 19 vs 12.8 |
+| negation | 9.3 vs 8.2 | 23.4 vs 11.4 | 25.2 vs 13 |
+| prefix | 5.3 vs 5.2 | 12.7 vs 9.7 | 14.1 vs 10.9 |
+| date month | 24.4 vs 7.7 | 40 vs 10.2 | 42.5 vs 12.1 |
+| combined | 4.7 vs 6.6 | 6.4 vs 9.5 | 7.7 vs 10.7 |
+| unread word | 7.2 vs 7.8 | 14.9 vs 12 | 16.8 vs 13.8 |
+| folder | 2.3 vs 2.7 | 3.4 vs 4.1 | 4.1 vs 5.2 |
+
+Ahead on all three for 11 of 17 (subject word and unread word on page and threads). Behind: from name (FTS5 column filter, above), combined (the same from: term), rare word and folder (the process floor: SQLite parsing pimdir.db's schema ~0.95 ms and index.db's ~0.3, coverage's sources scan ~0.57 ms for an unscoped query; a page's per-hit presentation, placements ~9 µs and snippet ~20 µs a hit), subject and unread word counts by 0.6 to 1.1 ms.
+
+## Left, each needing the owner
+
+- A covering index on `sources(covered_at, covered_since, covered_until)` in the canonical store schema (pimdir STORAGE): an unscoped coverage reads ~40 index pages instead of 121 table pages (~0.4 ms off every unscoped count and page).
+- A posting list of the `from` column's tokens: the index keeps no copy of the text (contentless FTS5), so index.hits cannot derive it at its rebuild; it needs the refresh to keep it incrementally (an io-pimdir-owned table beside the canonical schema, or a canonical one). Would take from name and combined to about the floor.
+- The page measure is not like for like: notmuch `--output=messages` prints ids alone, pimdir each hit's title, placements, flags and snippet. A presentation without snippets (an option, or a JSON field set) would put rare word and folder pages under notmuch's, but changes the CLI contract.
