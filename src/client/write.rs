@@ -1810,6 +1810,7 @@ fn keep_overruled(
         key = key.minted(&lost.handle);
     }
 
+    let keywords = keywords(&lost.flags)?;
     let seq: i64 = conn.query_row_cached(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?;
     conn.execute_cached(
         sql::INSERT_ITEM,
@@ -1819,6 +1820,7 @@ fn keep_overruled(
             ":seq": seq,
             ":flags_known": lost.flags.known().is_some(),
             ":marks": codec::marks_to_int(&lost.flags),
+            ":keywords": keywords,
             ":object_hash": lost.object.0,
             ":sort_key": lost.sort_key.0.as_str(),
             ":level": codec::level_to_int(PimdirLevel::Full),
@@ -1827,7 +1829,6 @@ fn keep_overruled(
             ":conflict_object": None::<&str>,
         },
     )?;
-    write_flags(conn, collection, &key.0, None, &lost.flags)?;
     write_summary(conn, collection, &key, None, lost.summary.as_ref())?;
     conn.execute_cached(
         sql::RETAIN_ITEM,
@@ -1941,6 +1942,7 @@ fn insert_item(
             )
             .optional()?,
     };
+    let keywords = keywords(&item.flags)?;
     let seq = match existing {
         Some(seq) => seq,
         None => conn.query_row_cached(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
@@ -1953,6 +1955,7 @@ fn insert_item(
             ":seq": seq,
             ":flags_known": item.flags.known().is_some(),
             ":marks": codec::marks_to_int(&item.flags),
+            ":keywords": keywords,
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
@@ -1961,7 +1964,6 @@ fn insert_item(
             ":conflict_object": item.conflict_object.as_ref().map(|o| o.0.as_str()),
         },
     )?;
-    write_flags(conn, collection, &link.0, None, &item.flags)?;
     for (source, binding) in &item.sources {
         insert_binding(conn, collection, link, source, binding)?;
     }
@@ -2054,14 +2056,15 @@ fn revive_item(
     Ok(true)
 }
 
-/// Updates an item's row, then its flag set ([`write_flags`]): the
-/// triggers stamp it only when a column or a flag moved (§4.5).
+/// Updates an item's row, its flag set among its columns ([`keywords`]):
+/// the triggers stamp it only when a column moved (§4.5).
 fn update_item(
     conn: &Connection,
     collection: &str,
     link: &PimdirLinkId,
     item: &PimdirHubItem,
 ) -> Result<(), PimdirError> {
+    let keywords = keywords(&item.flags)?;
     conn.execute_cached(
         sql::UPDATE_ITEM,
         named_params! {
@@ -2069,6 +2072,7 @@ fn update_item(
             ":link_id": link.0,
             ":flags_known": item.flags.known().is_some(),
             ":marks": codec::marks_to_int(&item.flags),
+            ":keywords": keywords,
             ":object_hash": item.object.as_ref().map(|o| o.0.as_str()),
             ":sort_key": item.sort_key.0.as_str(),
             ":level": codec::level_to_int(item.level),
@@ -2077,50 +2081,20 @@ fn update_item(
             ":conflict_object": item.conflict_object.as_ref().map(|o| o.0.as_str()),
         },
     )?;
-    write_flags(conn, collection, &link.0, None, &item.flags)
+    Ok(())
 }
 
-/// Writes a flag set's rows after the row it belongs to (§13, §14): a
-/// placement's with no `source`, else that source's base. The row write
-/// carried its system flags as bits ([`codec::marks_to_int`]); its other
-/// flags fill the `flags` slot, empty for an unknown set, then
-/// `retain_flags` and `add_flags`, or their base twins, run; a set written
-/// as it was moves no row and draws no stamp. A flag the store cannot hold
-/// is [`PimdirError::Flag`], refused before any is written, never trimmed.
-pub(crate) fn write_flags(
-    conn: &Connection,
-    collection: &str,
-    link_id: &str,
-    source: Option<&str>,
-    flags: &PimdirFlags,
-) -> Result<(), PimdirError> {
+/// A flag set's other flags as the row holds them (§13, §14): the system
+/// flags go to `marks` ([`codec::marks_to_int`]), the rest to `keywords` or
+/// `base_keywords` ([`codec::keywords_to_text`]), so a set written as it
+/// was moves no column and draws no stamp. A flag the store cannot hold is
+/// [`PimdirError::Flag`], refused before the row is written, never
+/// trimmed.
+pub(crate) fn keywords(flags: &PimdirFlags) -> Result<String, PimdirError> {
     if let Some(flag) = flags.invalid() {
         return Err(PimdirError::Flag(flag.into()));
     }
-    let others = flags.known().into_iter().flatten();
-    bind_list(
-        conn,
-        "flags",
-        others.filter(|flag| codec::mark_of(flag).is_none()),
-    )?;
-
-    match source {
-        None => {
-            let key = named_params! { ":collection": collection, ":link_id": link_id };
-            conn.execute_cached(sql::RETAIN_FLAGS, key)?;
-            conn.execute_cached(sql::ADD_FLAGS, key)?;
-        }
-        Some(source) => {
-            let key = named_params! {
-                ":collection": collection,
-                ":link_id": link_id,
-                ":source": source,
-            };
-            conn.execute_cached(sql::RETAIN_BASE_FLAGS, key)?;
-            conn.execute_cached(sql::ADD_BASE_FLAGS, key)?;
-        }
-    }
-    Ok(())
+    Ok(codec::keywords_to_text(flags))
 }
 
 /// Records the automatic references a written summary reads (§14.2):
@@ -2447,6 +2421,7 @@ fn insert_binding(
     source: &PimdirSourceId,
     binding: &PimdirBinding,
 ) -> Result<(), PimdirError> {
+    let base_keywords = keywords(base_flags(binding))?;
     conn.execute_cached(
         sql::INSERT_BINDING,
         named_params! {
@@ -2456,6 +2431,7 @@ fn insert_binding(
             ":handle": binding.handle.0,
             ":base_flags_known": base_flags(binding).known().is_some(),
             ":base_marks": codec::marks_to_int(base_flags(binding)),
+            ":base_keywords": base_keywords,
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
             ":base_present": binding.base.is_some() as i64,
@@ -2466,13 +2442,7 @@ fn insert_binding(
             ":server_object_id": binding.server_object_id.as_deref(),
         },
     )?;
-    write_flags(
-        conn,
-        collection,
-        &link.0,
-        Some(&source.0),
-        base_flags(binding),
-    )
+    Ok(())
 }
 
 fn update_binding(
@@ -2482,6 +2452,7 @@ fn update_binding(
     source: &PimdirSourceId,
     binding: &PimdirBinding,
 ) -> Result<(), PimdirError> {
+    let base_keywords = keywords(base_flags(binding))?;
     conn.execute_cached(
         sql::UPDATE_BINDING,
         named_params! {
@@ -2490,6 +2461,7 @@ fn update_binding(
             ":source": source.0,
             ":base_flags_known": base_flags(binding).known().is_some(),
             ":base_marks": codec::marks_to_int(base_flags(binding)),
+            ":base_keywords": base_keywords,
             ":base_object": binding.base.as_ref().and_then(|b| b.object.as_ref()).map(|o| o.0.as_str()),
             ":base_revision": binding.base.as_ref().and_then(|b| b.revision.as_deref()),
             ":base_present": binding.base.is_some() as i64,
@@ -2500,13 +2472,7 @@ fn update_binding(
             ":server_object_id": binding.server_object_id.as_deref(),
         },
     )?;
-    write_flags(
-        conn,
-        collection,
-        &link.0,
-        Some(&source.0),
-        base_flags(binding),
-    )
+    Ok(())
 }
 
 /// A size a summary states as its column holds it (§13): one no `INTEGER`
@@ -2515,7 +2481,7 @@ pub(crate) fn stated_size(size: u64) -> Option<i64> {
     i64::try_from(size).ok()
 }
 
-/// A binding's base flag set as its rows hold it (§13): no base holds an
+/// A binding's base flag set as its columns hold it (§13): no base holds an
 /// unknown one.
 fn base_flags(binding: &PimdirBinding) -> &PimdirFlags {
     const UNKNOWN: &PimdirFlags = &PimdirFlags::Unknown;

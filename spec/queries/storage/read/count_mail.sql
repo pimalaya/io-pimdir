@@ -4,7 +4,7 @@
 -- included, is unread; an attachment mark never examined (NULL) matches
 -- neither filter. :since is a floor on the sort key, the `Date` (Annex A.1): a
 -- row below it is left out, an undated one ('') below any; NULL is no floor.
--- The seen test is a seek on placement_flag's key and the summary is read
+-- The seen test reads the marks bit and the summary is read
 -- only for the attachment filter, so with both NULL a count reads
 -- items_by_sort alone.
 SELECT count(*) AS count

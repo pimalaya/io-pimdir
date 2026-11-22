@@ -12,7 +12,7 @@ SELECT i.collection, i.link_id,
                    || CASE WHEN i.marks & 4 THEN '\Flagged ' ELSE '' END
                    || CASE WHEN i.marks & 8 THEN '\Draft ' ELSE '' END
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
-                   || coalesce((SELECT group_concat(g.flag, ' ') FROM store.placement_flag g WHERE g.item = i.id), '')) END AS flags,
+                   || i.keywords) END AS flags,
        (SELECT o.hash FROM store.objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level, c.kind,
        CASE c.kind
          WHEN 'message/rfc822' THEN 'mail'

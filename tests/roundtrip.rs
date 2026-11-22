@@ -1023,18 +1023,18 @@ fn an_unknown_flag_set_stores_no_row_and_loads_back_unknown() {
         .unwrap();
 
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    let stored: Vec<(i64, i64)> = conn
-        .prepare(
-            "SELECT flags_known, (SELECT count(*) FROM placement_flag f \
-             WHERE f.item = i.id) \
-             FROM items i ORDER BY link_id",
-        )
+    let stored: Vec<(i64, String)> = conn
+        .prepare("SELECT flags_known, keywords FROM items i ORDER BY link_id")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(stored, vec![(0, 0), (1, 0)], "unknown, then known-empty");
+    assert_eq!(
+        stored,
+        vec![(0, String::new()), (1, String::new())],
+        "unknown, then known-empty"
+    );
     drop(conn);
 
     let loaded = store.load(&inbox(), &PimdirLoadSelection::All).unwrap();

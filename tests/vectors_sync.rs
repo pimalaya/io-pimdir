@@ -109,8 +109,6 @@ fn flags_json(flags: &Option<String>) -> Value {
     }
 }
 
-/// Writes a case's flag array to the rows of `retain` and `add` (STORAGE
-/// §13), after the row they belong to: the set in the `flags` slot.
 /// A case's flag set's system flags as the row's bits (STORAGE §13), `0`
 /// for an unknown set.
 fn marks(value: &Value) -> i64 {
@@ -120,32 +118,23 @@ fn marks(value: &Value) -> i64 {
         .sum()
 }
 
-fn seed_flags(
-    conn: &Connection,
-    value: &Value,
-    retain: &str,
-    add: &str,
-    key: &[(&str, &dyn rusqlite::ToSql)],
-) {
-    conn.execute(sql::CLEAR_PARAM, []).unwrap();
-    let others = value
+/// A case's flag set's other flags as the row's text (STORAGE §13): sorted
+/// bytewise, each once, joined by single spaces, `''` for none and for an
+/// unknown set.
+fn keywords(value: &Value) -> String {
+    let others: std::collections::BTreeSet<&[u8]> = value
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|flag| codec::mark_of(flag.as_str().unwrap()).is_none());
-    for (position, flag) in others.enumerate() {
-        conn.execute(
-            sql::BIND_PARAM,
-            named_params! {
-                ":slot": "flags",
-                ":position": position as i64,
-                ":value": flag.as_str().unwrap(),
-            },
-        )
-        .unwrap();
-    }
-    conn.execute(retain, key).unwrap();
-    conn.execute(add, key).unwrap();
+        .map(|flag| flag.as_str().unwrap())
+        .filter(|flag| codec::mark_of(flag).is_none())
+        .map(str::as_bytes)
+        .collect();
+    let others: Vec<&str> = others
+        .into_iter()
+        .map(|flag| std::str::from_utf8(flag).unwrap())
+        .collect();
+    others.join(" ")
 }
 
 /// Seeds a store from a case's `store` object.
@@ -224,6 +213,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":seq": seq,
                 ":flags_known": item.get("flags").is_some_and(|f| !f.is_null()),
                 ":marks": marks(&item["flags"]),
+                ":keywords": keywords(&item["flags"]),
                 ":object_hash": bodies.hash(&item["object"]),
                 ":sort_key": item["sort_key"].as_str().unwrap_or(""),
                 ":level": item["level"].as_i64().unwrap_or(0),
@@ -233,18 +223,6 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             },
         )
         .unwrap();
-        if let Some(flags) = item.get("flags").filter(|f| !f.is_null()) {
-            seed_flags(
-                &conn,
-                flags,
-                sql::RETAIN_FLAGS,
-                sql::ADD_FLAGS,
-                named_params! {
-                    ":collection": item["collection"].as_str().unwrap(),
-                    ":link_id": item["link_id"].as_str().unwrap(),
-                },
-            );
-        }
         if item["retained"].as_bool() == Some(true) {
             conn.execute(
                 sql::RETAIN_ITEM,
@@ -284,6 +262,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 ":handle": binding["handle"].as_str().unwrap(),
                 ":base_flags_known": binding.get("base_flags").is_some_and(|f| !f.is_null()),
                 ":base_marks": marks(&binding["base_flags"]),
+                ":base_keywords": keywords(&binding["base_flags"]),
                 ":base_object": bodies.hash(&binding["base_object"]),
                 ":base_revision": binding["base_revision"].as_str(),
                 ":base_present": binding["base_present"].as_i64().unwrap_or(0),
@@ -295,19 +274,6 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             },
         )
         .unwrap();
-        if let Some(flags) = binding.get("base_flags").filter(|f| !f.is_null()) {
-            seed_flags(
-                &conn,
-                flags,
-                sql::RETAIN_BASE_FLAGS,
-                sql::ADD_BASE_FLAGS,
-                named_params! {
-                    ":collection": binding["collection"].as_str().unwrap(),
-                    ":link_id": binding["link_id"].as_str().unwrap(),
-                    ":source": binding["source"].as_str().unwrap(),
-                },
-            );
-        }
         // NOTE: a refusal standing on the binding (SYNC §5), its instant
         // stamped by the statement.
         if let Some(reason) = binding["refusal"].as_str() {
@@ -1104,10 +1070,10 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
 
     let query = match table {
         "items" => {
-            "SELECT i.collection, i.link_id, i.seq, CASE WHEN i.flags_known = 1 THEN trim(CASE WHEN i.marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN i.marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN i.marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN i.marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN i.marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(f.flag, ' ') FROM placement_flag f WHERE f.item = i.id), '')) END, (SELECT o.hash FROM objects o WHERE o.id = i.object), i.level, i.deleted, i.retained_at, i.retained_by, i.sort_key, i.conflicted, (SELECT o.hash FROM objects o WHERE o.id = i.conflict_object) FROM items i ORDER BY i.collection, i.link_id"
+            "SELECT i.collection, i.link_id, i.seq, CASE WHEN i.flags_known = 1 THEN trim(CASE WHEN i.marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN i.marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN i.marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN i.marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN i.marks & 16 THEN '\\Deleted ' ELSE '' END || i.keywords) END, (SELECT o.hash FROM objects o WHERE o.id = i.object), i.level, i.deleted, i.retained_at, i.retained_by, i.sort_key, i.conflicted, (SELECT o.hash FROM objects o WHERE o.id = i.conflict_object) FROM items i ORDER BY i.collection, i.link_id"
         }
         "bindings" => {
-            "SELECT b.collection, i.link_id, b.source, b.handle, CASE WHEN b.base_flags_known = 1 THEN trim(CASE WHEN b.base_marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN b.base_marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN b.base_marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN b.base_marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN b.base_marks & 16 THEN '\\Deleted ' ELSE '' END || coalesce((SELECT group_concat(g.flag, ' ') FROM binding_base_flag g WHERE g.item = b.item AND g.source = b.source), '')) END, (SELECT o.hash FROM objects o WHERE o.id = b.base_object), b.base_revision, b.base_present, b.conflicted, b.conflict_revision, (SELECT o.hash FROM objects o WHERE o.id = b.conflict_object), (SELECT o.hash FROM objects o WHERE o.id = b.shared_object), b.round, b.refusal, b.refused_key, b.server_object_id FROM bindings b JOIN items i ON i.id = b.item ORDER BY b.collection, i.link_id, b.source"
+            "SELECT b.collection, i.link_id, b.source, b.handle, CASE WHEN b.base_flags_known = 1 THEN trim(CASE WHEN b.base_marks & 1 THEN '\\Seen ' ELSE '' END || CASE WHEN b.base_marks & 2 THEN '\\Answered ' ELSE '' END || CASE WHEN b.base_marks & 4 THEN '\\Flagged ' ELSE '' END || CASE WHEN b.base_marks & 8 THEN '\\Draft ' ELSE '' END || CASE WHEN b.base_marks & 16 THEN '\\Deleted ' ELSE '' END || b.base_keywords) END, (SELECT o.hash FROM objects o WHERE o.id = b.base_object), b.base_revision, b.base_present, b.conflicted, b.conflict_revision, (SELECT o.hash FROM objects o WHERE o.id = b.conflict_object), (SELECT o.hash FROM objects o WHERE o.id = b.shared_object), b.round, b.refusal, b.refused_key, b.server_object_id FROM bindings b JOIN items i ON i.id = b.item ORDER BY b.collection, i.link_id, b.source"
         }
         "sources" => {
             "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until, round_band FROM sources ORDER BY collection, source"

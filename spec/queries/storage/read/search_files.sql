@@ -7,7 +7,7 @@ SELECT i.collection, i.seq, i.link_id,
                    || CASE WHEN i.marks & 4 THEN '\Flagged ' ELSE '' END
                    || CASE WHEN i.marks & 8 THEN '\Draft ' ELSE '' END
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
-                   || coalesce((SELECT group_concat(f.flag, ' ') FROM placement_flag f WHERE f.item = i.id), '')) END AS flags,
+                   || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
        s.name, s.media_type, s.size, s.part
 FROM (SELECT DISTINCT value AS id FROM temp.param WHERE slot = 'collections') p

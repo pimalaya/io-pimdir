@@ -8,7 +8,7 @@ SELECT i.collection, i.link_id, i.seq, (SELECT o.hash FROM store.objects o WHERE
                    || CASE WHEN i.marks & 4 THEN '\Flagged ' ELSE '' END
                    || CASE WHEN i.marks & 8 THEN '\Draft ' ELSE '' END
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
-                   || coalesce((SELECT group_concat(f.flag, ' ') FROM store.placement_flag f WHERE f.item = i.id), '')) END AS flags,
+                   || i.keywords) END AS flags,
        i.deleted, i.retained_at, c.kind, c.account, i.changed
 FROM store.items i JOIN store.collections c ON c.id = i.collection
 WHERE i.changed > :since ORDER BY i.changed LIMIT :limit;

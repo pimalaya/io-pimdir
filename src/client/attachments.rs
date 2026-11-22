@@ -467,6 +467,7 @@ pub(crate) fn insert_file(
             ":seq": seq,
             ":flags_known": 1,
             ":marks": 0,
+            ":keywords": "",
             ":object_hash": None::<String>,
             ":sort_key": summary.sort_key().0,
             ":level": 1,

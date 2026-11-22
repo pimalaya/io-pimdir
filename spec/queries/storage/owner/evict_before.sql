@@ -8,9 +8,9 @@
 -- from a binding's base flags, both known (an unpushed flag change), or a
 -- person's reference names it, or its seq holds a property (§4.3), neither
 -- of which a relisting restores; such an item stays. The two sets differ by
--- a system flag's bit or by a row either holds and the other lacks, each
--- direction an anti-join on the other's key, so no set is gathered to be
--- compared. An unknown `date` is never older. No tombstone and no push: the
+-- a system flag's bit or by their other flags' texts, which their writers
+-- sort, so no set is gathered to be compared. An unknown `date` is never
+-- older. No tombstone and no push: the
 -- remote keeps every member, and a widening relists them. Retained rows are
 -- the purge's, not this. The cascade drops pins no statement returns, so
 -- recompute_refcounts follows in the same transaction; the delete trigger
@@ -28,18 +28,7 @@ WHERE collection = :collection AND deleted = 0 AND conflicted = 0
                          OR substr(b.handle, 1, 1) = char(1)
                          OR (items.flags_known = 1 AND b.base_flags_known = 1
                              AND (items.marks != b.base_marks
-                                  OR EXISTS (SELECT 1 FROM placement_flag f
-                                             WHERE f.item = items.id
-                                               AND NOT EXISTS (SELECT 1 FROM binding_base_flag g
-                                                               WHERE g.item = b.item
-                                                                 AND g.source = b.source
-                                                                 AND g.flag = f.flag))
-                                  OR EXISTS (SELECT 1 FROM binding_base_flag g
-                                             WHERE g.item = b.item
-                                               AND g.source = b.source
-                                               AND NOT EXISTS (SELECT 1 FROM placement_flag f
-                                                               WHERE f.item = items.id
-                                                                 AND f.flag = g.flag))))))
+                                  OR items.keywords != b.base_keywords))))
   AND NOT EXISTS (SELECT 1 FROM item_reference r
                   WHERE r.origin = 'user'
                     AND ((r.from_link_id = items.link_id AND r.from_kind = 'message/rfc822')

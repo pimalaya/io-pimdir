@@ -260,7 +260,7 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
         });
     }
 
-    let (flags_known, marks, others) = flag_columns(item.flags.as_ref());
+    let (flags_known, marks, keywords) = flag_columns(item.flags.as_ref());
     let object = name(&item.object);
     run(
         store,
@@ -271,6 +271,7 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
             ("seq", &Value::Integer(seq)),
             ("flags_known", &flags_known),
             ("marks", &marks),
+            ("keywords", &keywords),
             ("object_hash", &object),
             ("sort_key", &Value::Text(item.sort_key.clone())),
             ("level", &Value::Integer(item.level)),
@@ -282,21 +283,13 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
             ("conflict_object", &name(&item.conflict_object)),
         ],
     )?;
-    if !others.is_empty() {
-        store.bind_slot("flags", &others)?;
-        let key = [
-            ("collection", &collection as &dyn ToSql),
-            ("link_id", &link_id),
-        ];
-        store.run("storage/owner/retain_flags", &key)?;
-        store.run("storage/owner/add_flags", &key)?;
-    }
 
     write_summary(store, item, &collection, &link_id)?;
 
     for binding in &item.bindings {
         let source = Value::Text(binding.source.clone());
-        let (base_flags_known, base_marks, base_others) = flag_columns(binding.base_flags.as_ref());
+        let (base_flags_known, base_marks, base_keywords) =
+            flag_columns(binding.base_flags.as_ref());
         run(
             store,
             "storage/owner/insert_binding",
@@ -307,6 +300,7 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
                 ("handle", &Value::Text(binding.handle.clone())),
                 ("base_flags_known", &base_flags_known),
                 ("base_marks", &base_marks),
+                ("base_keywords", &base_keywords),
                 ("base_object", &name(&binding.base_object)),
                 ("base_revision", &text(binding.base_revision.as_deref())),
                 (
@@ -323,16 +317,6 @@ fn write_item(store: &Store, item: &Item) -> Result<()> {
                 ("server_object_id", &Value::Null),
             ],
         )?;
-        if !base_others.is_empty() {
-            store.bind_slot("flags", &base_others)?;
-            let key = [
-                ("collection", &collection as &dyn ToSql),
-                ("link_id", &link_id),
-                ("source", &source),
-            ];
-            store.run("storage/owner/retain_base_flags", &key)?;
-            store.run("storage/owner/add_base_flags", &key)?;
-        }
         if let Some(refusal) = &binding.refusal {
             run(
                 store,
@@ -641,15 +625,23 @@ fn write_summary(store: &Store, item: &Item, collection: &Value, link_id: &Value
     Ok(())
 }
 
-fn flag_columns(flags: Option<&BTreeSet<String>>) -> (Value, Value, Vec<Value>) {
+/// A flag set as its three columns hold it (STORAGE §13): whether it is
+/// known, the system flags' bits and the other flags, sorted bytewise and
+/// joined by single spaces.
+fn flag_columns(flags: Option<&BTreeSet<String>>) -> (Value, Value, Value) {
     match flags {
-        None => (Value::Integer(0), Value::Integer(0), Vec::new()),
+        None => (
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Text(String::new()),
+        ),
         Some(flags) => {
-            let (marks, others) = split_flags(flags);
+            let (marks, mut others) = split_flags(flags);
+            others.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             (
                 Value::Integer(1),
                 Value::Integer(marks),
-                others.into_iter().map(Value::Text).collect(),
+                Value::Text(others.join(" ")),
             )
         }
     }

@@ -1,4 +1,4 @@
-//! Flags as rows (STORAGE §4.3, §13): a set reads back whole in no order,
+//! Flags as columns (STORAGE §4.3, §13): a set reads back whole,
 //! a set written again as it was stamps nothing, and a flag the store
 //! cannot hold, empty or holding a space, a control or a non-ASCII
 //! character, is refused as `flag-invalid` wherever it would enter: a
@@ -11,9 +11,12 @@ use std::path::Path;
 
 use io_pimdir::{
     change::PimdirWriteOp,
-    client::{PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer},
+    client::{
+        PimdirError, PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
+    },
     codec::PimdirAction,
     collection::PimdirCollectionId,
+    hub::PimdirSourceId,
     load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
     placement::{
@@ -98,6 +101,59 @@ fn a_set_reads_back_whole_and_a_restatement_stamps_nothing() {
 
     write(&mut store, PimdirFlags::from_iter(["\\Seen"])).unwrap();
     assert!(stamp(dir.path()) > before, "a flag removed stamps the item");
+}
+
+/// A keyword set written in any order is held sorted bytewise beside the
+/// system flags' bits, reads back equal through the reader, the base's as
+/// the item's, and written again in another order stamps nothing (§4.5,
+/// §13).
+#[test]
+fn a_keyword_set_reads_back_sorted_and_a_reordered_restatement_stamps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seeded(dir.path());
+    let written = [
+        "~last",
+        "Zeta",
+        "\\Flagged",
+        "$junk",
+        "alpha",
+        "\\seen",
+        "$Junk",
+    ];
+    write(&mut store, PimdirFlags::from_iter(written)).unwrap();
+
+    let keywords = |column: &str| -> String {
+        rusqlite::Connection::open(dir.path().join("pimdir.db"))
+            .unwrap()
+            .query_row(
+                &format!("SELECT {column} FROM items i JOIN bindings b ON b.item = i.id"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let sorted = "$Junk $junk Zeta \\seen alpha ~last";
+    assert_eq!(keywords("i.keywords"), sorted);
+    assert_eq!(keywords("b.base_keywords"), sorted);
+
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let seq = store.list_items("INBOX", None, 1).unwrap()[0].seq;
+    let item = reader.get_item("INBOX", seq).unwrap().unwrap();
+    assert_eq!(item.flags, PimdirFlags::from_iter(written));
+    let bindings = reader.item_bindings("INBOX", "a@example.org").unwrap();
+    let base = bindings[&PimdirSourceId("imap".into())].base.as_ref();
+    assert_eq!(base.unwrap().flags, item.flags);
+    drop(reader);
+
+    let before = stamp(dir.path());
+    for turn in 1..written.len() {
+        let mut reordered = written;
+        reordered.rotate_left(turn);
+        reordered.reverse();
+        write(&mut store, PimdirFlags::from_iter(reordered)).unwrap();
+        assert_eq!(stamp(dir.path()), before, "turn {turn} moved no column");
+    }
+    assert_eq!(keywords("i.keywords"), sorted);
 }
 
 #[test]

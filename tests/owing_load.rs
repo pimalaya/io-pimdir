@@ -90,15 +90,11 @@ fn a_system_flag_is_a_bit_and_its_lowercase_a_row() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    let rows: Vec<String> = conn
-        .prepare("SELECT flag FROM placement_flag ORDER BY flag")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let keywords: String = conn
+        .query_row("SELECT keywords FROM items", [], |r| r.get(0))
+        .unwrap();
     assert_eq!((marks, base_marks), (5, 1), "\\Seen 1 and \\Flagged 4");
-    assert_eq!(rows, ["$label", "\\seen"], "every other flag a row");
+    assert_eq!(keywords, "$label \\seen", "every other flag a keyword");
 
     let loaded = store.load(&inbox(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(loaded.placements[0].flags, PimdirFlags::from_iter(flags));

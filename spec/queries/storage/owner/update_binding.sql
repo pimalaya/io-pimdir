@@ -3,8 +3,8 @@
 -- resolves this binding to another handle is refused instead (§10), the second
 -- copy having a key and an item of its own (§9); a legitimate rebind goes
 -- through the handle-space rebuild. Each body by its hash, written as
--- insert_item writes it (§4.4).
-UPDATE bindings SET base_flags_known = :base_flags_known, base_marks = :base_marks,
+-- insert_item writes it (§4.4), and :base_keywords as insert_binding does.
+UPDATE bindings SET base_flags_known = :base_flags_known, base_marks = :base_marks, base_keywords = :base_keywords,
        base_object = CASE WHEN :base_object IS NULL THEN NULL ELSE coalesce((SELECT id FROM objects WHERE hash = :base_object), 0) END,
        base_revision = :base_revision, base_present = :base_present,
        conflicted = :conflicted, conflict_revision = :conflict_revision,

@@ -48,11 +48,11 @@ pub fn flags_from_column(joined: Option<&str>) -> PimdirFlags {
 /// The system flags a row holds as bits (STORAGE §13), each by its exact
 /// bytes, in the order of their bits: `\Seen` 1, `\Answered` 2, `\Flagged`
 /// 4, `\Draft` 8, `\Deleted` 16. Every other flag, `\seen` included, is a
-/// row.
+/// keyword.
 pub const MARKS: [&str; 5] = ["\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"];
 
 /// A flag's bit in `marks` or `base_marks` (STORAGE §13), `None` for a
-/// flag held as a row.
+/// flag held as a keyword.
 pub fn mark_of(flag: &str) -> Option<i64> {
     MARKS
         .iter()
@@ -69,6 +69,20 @@ pub fn marks_to_int(flags: &PimdirFlags) -> i64 {
         .flatten()
         .filter_map(|flag| mark_of(flag))
         .sum()
+}
+
+/// A set's other flags as the `keywords` or `base_keywords` column holds
+/// them (STORAGE §13): every flag but the system ones, sorted bytewise and
+/// joined by single spaces, `''` for none and for an unknown set.
+pub fn keywords_to_text(flags: &PimdirFlags) -> String {
+    let others: Vec<&str> = flags
+        .known()
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|flag| mark_of(flag).is_none())
+        .collect();
+    others.join(" ")
 }
 
 /// Whether the store holds `flag` (STORAGE §13): non-empty and printable
