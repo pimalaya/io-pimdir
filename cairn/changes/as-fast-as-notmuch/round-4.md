@@ -20,3 +20,11 @@ new9 (x2c) vs new10 (x2d), ms, count / page / threads:
 | folder | 2.7 vs 2.7 | 4.3 vs 4.3 | 5.3 vs 5.2 |
 
 Every other unscoped query moved by 0.3 to 0.5 ms likewise; folder is scoped and reads its own sources row.
+
+## The from posting list (f38858c)
+
+`pimdir_from`: a contentless FTS5 table of `object_text`'s `from` column alone, `detail = none`, same tokenizer, same rowid, written and dropped with the body's `object_text` row, created by the build, optimized by `erase`, left out by the shape check like any other table. Off the hit columns (count bitmaps, page probe sets), `{from} : "w"` and `{from} : "w" *` with `w` ASCII alphanumeric read it; a phrase errs under `detail = none` (checked in SQLite's shell), so phrases, other words, summaries and ranked reads stay on `object_text`. A missing-rowid delete on a contentless_delete table is harmless (shell). An index without the list is `PimdirIndexHeld::Unposted`: the indexer rebuilds, a query client answers off `object_text`.
+
+## Tried and dropped
+
+- blake3 `std` (runtime detection): the crate's build already detects without it; 1 KB 1.10 µs, 3 KB 2.18, 32 KB 6.27 per hash with and without.
