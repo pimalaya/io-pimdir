@@ -146,13 +146,6 @@ pub const ROLL_COVERAGE: &str = r#"SELECT max(covered_since) FILTER (WHERE cover
 FROM store.sources
 WHERE collection IN (SELECT value FROM temp.param WHERE slot = 'collections');"#;
 
-/// [`ROLL_COVERAGE`] over every collection of the store, what a query no
-/// conjunct narrows reads: no slot bound, the sources read once.
-pub const ROLL_COVERAGE_ALL: &str = r#"SELECT max(covered_since) FILTER (WHERE covered_at IS NOT NULL),
-       min(covered_until) FILTER (WHERE covered_at IS NOT NULL),
-       count(*) - count(covered_at)
-FROM store.sources;"#;
-
 /// Every collection's id, account and kind: what a query's conjuncts
 /// narrow its coverage's collections by (SEARCH §8.2).
 pub const SCOPE_COLLECTIONS: &str = r#"SELECT id, account, kind FROM store.collections;"#;

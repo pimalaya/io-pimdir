@@ -358,7 +358,7 @@ The store schema is version 1 (`user_version` 1), migrations/storage/0001_init.s
 `PRAGMA journal_mode = WAL` is set after the creation commits, by the owner alone ("The journal mode is chosen when the store is created").
 
 #### Scenario: A fresh store
-- tests/store_version.rs `a_fresh_store_names_this_draft_and_an_identity`: `storage-draft-15`, the three versions at 1, a 32-digit id, incarnation 1, `blake3`, derivation 3, no sync version, `auto_vacuum` INCREMENTAL (0 under an immediate transaction, before the change)
+- tests/store_version.rs `a_fresh_store_names_this_draft_and_an_identity`: `storage-draft-16`, the three versions at 1, a 32-digit id, incarnation 1, `blake3`, derivation 3, no sync version, `auto_vacuum` INCREMENTAL (0 under an immediate transaction, before the change)
 
 ### Requirement: A store of another draft is refused
 Every profile (the owner's `open` and `open_current`, the reader, the producer, and the index, which opens the store through a reader first) SHALL run STORAGE §6's open contract (`schema::check`) before it reads or writes anything, refusing, writing nothing, in this order: a database declaring tables at `user_version` 0, or whose `store_meta` names another `format` or holds no row (`PimdirError::Foreign`, `store-foreign`); one holding no schema (`Uncreated`, or `NotCurrent(Version { found: 0 })` from `open_current`); a store whose `store_meta.format_version` is not `sql::FORMAT_VERSION`, `storage-draft-08`, or which lacks the column, as every draft before 08 wrote (`PimdirError::Version { found }`, `store-version`, naming both versions, `found` `None` for the missing column); disagreeing stamps (`VersionMismatch`, `store-corrupt`); a `hash_algo` other than `blake3` (`HashAlgo`, `store-hash-algo`); then a schema whose text is not the canonical one ("The schema check covers the triggers"). Nothing is reconciled, migrated nor rebuilt, whatever the profile: a store of another draft is set aside and a new one synced, which the CHANGELOG says first (STORAGE §4.2).
@@ -1405,7 +1405,7 @@ No message SHALL advise deleting the store: a resync restores neither the queue,
 #### Scenario: A later store
 - GIVEN a store marked `storage-v2` at version 2
 - WHEN an owner, a producer or a reader opens it
-- THEN the error's code is `store-version` and its message names `storage-draft-15` (tests/queue.rs `a_store_of_a_later_version_is_refused`); a damaged store is `store-corrupt` (tests/stale_store.rs)
+- THEN the error's code is `store-version` and its message names `storage-draft-16` (tests/queue.rs `a_store_of_a_later_version_is_refused`); a damaged store is `store-corrupt` (tests/stale_store.rs)
 
 ### Requirement: The public API names no foreign error type
 `PimdirError::Sql`, `Unanswerable` and `Json` SHALL wrap the opaque `PimdirSqlError` and `PimdirJsonError`, which display the cause and give it through `Error::source` without naming rusqlite or serde_json types, so a major of either is not one of this crate. The `From` conversions the crate's own `?` relies on are hidden from the documentation and are no contract.

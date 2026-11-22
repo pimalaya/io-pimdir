@@ -2823,9 +2823,9 @@ impl PimdirIndex {
     ///
     /// A scope holding every collection, no conjunct narrowing it or none
     /// ruling one out, has its sources and bodies out of sight rolled up
-    /// over the whole store (`ROLL_COVERAGE_ALL`, the canonical `coverage_all`), no
-    /// collection bound, so the cost is the rows counted, not the
-    /// collections. Another reads its collections, one alone for a
+    /// over the whole store (the canonical `covered_all` and
+    /// `coverage_all`), no collection bound, so the cost is the rows
+    /// counted, not the collections. Another reads its collections, one alone for a
     /// `collection:` conjunct, binds their ids once, every statement
     /// reading the slot, the canonical ones run as their text stands, and
     /// rolls the sources up in one statement (`ROLL_COVERAGE`). The
@@ -2905,7 +2905,7 @@ impl PimdirIndex {
         let since = scope.since.as_deref();
         let until = scope.until.as_deref();
         let (roll, covered) = match all {
-            true => (search::ROLL_COVERAGE_ALL, search::COVERAGE_ALL),
+            true => (search::COVERED_ALL, search::COVERAGE_ALL),
             false => {
                 bind()?;
                 (search::ROLL_COVERAGE, search::COVERAGE)

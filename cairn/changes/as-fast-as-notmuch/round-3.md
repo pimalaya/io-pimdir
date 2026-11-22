@@ -105,3 +105,9 @@ Ahead on all three for 11 of 17 (subject word and unread word on page and thread
 - A covering index on `sources(covered_at, covered_since, covered_until)` in the canonical store schema (pimdir STORAGE): an unscoped coverage reads ~40 index pages instead of 121 table pages (~0.4 ms off every unscoped count and page).
 - A posting list of the `from` column's tokens: the index keeps no copy of the text (contentless FTS5), so index.hits cannot derive it at its rebuild; it needs the refresh to keep it incrementally (an io-pimdir-owned table beside the canonical schema, or a canonical one). Would take from name and combined to about the floor.
 - The page measure is not like for like: notmuch `--output=messages` prints ids alone, pimdir each hit's title, placements, flags and snippet. A presentation without snippets (an option, or a JSON field set) would put rare word and folder pages under notmuch's, but changes the CLI contract.
+
+## Owner decisions (2026-11-22, round 4 start)
+
+- Covering index on `sources(covered_at, covered_since, covered_until)`: yes, in the canonical store schema.
+- `from` token posting list kept by the refresh: yes, io-pimdir-owned (beside the canonical index schema, not in pimdir's spec).
+- Snippet-less presentation: no, the CLI contract stays; only the per-hit cost gets cheaper.
