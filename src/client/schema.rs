@@ -153,6 +153,9 @@ pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), Pim
 /// declares; `None` when the schema is the canonical one. The objects are
 /// read in name order beside [`sql::DECLARED`], their text borrowed.
 fn differs(conn: &Connection) -> Result<Option<String>, PimdirError> {
+    if canonical(conn)? {
+        return Ok(None);
+    }
     let mut statement = conn.prepare_cached(
         "SELECT name, sql FROM sqlite_schema \
          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -186,10 +189,80 @@ fn differs(conn: &Connection) -> Result<Option<String>, PimdirError> {
         .or(extra))
 }
 
+/// Whether the schema is the canonical one, read in `sqlite_schema`'s own
+/// order with each name sought in [`sql::DECLARED`], no row sorted: every
+/// object declared and with its text, none other. What [`differs`] asks
+/// first, walking the names in order only to name a damaged object.
+fn canonical(conn: &Connection) -> Result<bool, PimdirError> {
+    let mut statement = conn.prepare_cached(
+        "SELECT name, sql FROM sqlite_schema \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut held = 0;
+    while let Some(row) = rows.next()? {
+        let name = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+        let Ok(at) = sql::DECLARED.binary_search_by(|(known, _)| (*known).cmp(name)) else {
+            return Ok(false);
+        };
+        let text = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+        if !same(text, sql::DECLARED[at].1) {
+            return Ok(false);
+        }
+        held += 1;
+    }
+    Ok(held == sql::DECLARED.len())
+}
+
 /// Whether the text SQLite records for a statement, every `--` comment
 /// dropped and whitespace collapsed to single spaces, is `normalised`:
-/// compared word by word, nothing allocated.
+/// compared byte by byte in one pass, nothing allocated.
+///
+/// Whitespace is ASCII's (a Unicode space is a byte like any other, so a
+/// text holding one where the migrations hold none is not the canonical
+/// one), a comment runs from `--` to the end of its line, and a line
+/// break separates as whitespace does.
 pub(crate) fn same(sql: &str, normalised: &str) -> bool {
+    let want = normalised.as_bytes();
+    let bytes = sql.as_bytes();
+    let (mut at, mut i) = (0, 0);
+    let mut space = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' | b' ' | b'\t' | b'\r' | 0x0B | 0x0C => {
+                space = at > 0;
+                i += 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                space = at > 0;
+                i = bytes[i..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(bytes.len(), |end| i + end);
+            }
+            byte => {
+                if space {
+                    if want.get(at) != Some(&b' ') {
+                        return false;
+                    }
+                    at += 1;
+                    space = false;
+                }
+                if want.get(at) != Some(&byte) {
+                    return false;
+                }
+                at += 1;
+                i += 1;
+            }
+        }
+    }
+    at == want.len()
+}
+
+/// [`same`] as it read before, word by word, which the byte comparison
+/// is held to.
+#[cfg(test)]
+fn same_by_words(sql: &str, normalised: &str) -> bool {
     let mut words = normalised.split(' ').filter(|word| !word.is_empty());
     sql.lines()
         .flat_map(|line| {
@@ -199,6 +272,42 @@ pub(crate) fn same(sql: &str, normalised: &str) -> bool {
         })
         .all(|word| words.next() == Some(word))
         && words.next().is_none()
+}
+
+#[cfg(test)]
+mod same_tests {
+    use alloc::format;
+
+    use crate::client::schema::{same, same_by_words};
+
+    /// The byte comparison answers the word comparison over every object
+    /// the migrations declare, as recorded and perturbed.
+    #[test]
+    fn the_byte_comparison_answers_the_word_comparison() {
+        let texts = crate::client::schema::declared::declared(&[crate::sql::MIGRATION_0001]);
+        assert!(!texts.is_empty());
+        for normalised in texts.values() {
+            let spaced = normalised.replace(' ', " \n\t ");
+            let commented = normalised.replacen(' ', " -- a note\n ", 1);
+            let other = normalised.replacen(' ', "  x ", 1);
+            let short = &normalised[..normalised.len() - 1];
+            let long = format!("{normalised} x");
+            let crlf = normalised.replace(' ', "\r\n");
+            let lead = format!("\n  {normalised}\n");
+            let candidates: [&str; 8] = [
+                normalised, &spaced, &commented, &other, short, &long, &crlf, &lead,
+            ];
+            for text in candidates {
+                assert_eq!(
+                    same(text, normalised),
+                    same_by_words(text, normalised),
+                    "{text:?}"
+                );
+            }
+            assert!(same(&spaced, normalised));
+            assert!(!same(&other, normalised));
+        }
+    }
 }
 
 /// Records this crate's Annex A revision in the caller's transaction, the

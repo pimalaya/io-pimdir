@@ -3182,35 +3182,30 @@ fn build(dir: &Path) -> Result<Connection, PimdirError> {
 
 /// Whether index.db holds every table, index and trigger the canonical
 /// schema declares, each with its text, and whether it holds the `from`
-/// posting list of this crate's own: `sqlite_schema` read in name order
-/// beside [`search::DECLARED`], each text borrowed, any other object (the
-/// shadow tables of a virtual table among them) passed over (SEARCH §2).
+/// posting list of this crate's own: `sqlite_schema` read in its own
+/// order, each name sought in [`search::DECLARED`] and each text
+/// borrowed, any other object (the shadow tables of a virtual table among
+/// them) passed over (SEARCH §2).
 fn declared(conn: &Connection) -> Result<(bool, bool), PimdirError> {
     let mut statement = conn.prepare_cached(
         "SELECT name, sql FROM main.sqlite_schema \
-         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name",
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
     )?;
     let mut rows = statement.query([])?;
-    let mut declared = search::DECLARED.iter().peekable();
-    let mut posted = false;
+    let (mut held, mut posted) = (0, false);
     while let Some(row) = rows.next()? {
         let name = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
         posted |= name == search::FROM_POSTING_TABLE;
-        let Some((known, normalised)) = declared.peek() else {
+        let Ok(at) = search::DECLARED.binary_search_by(|(known, _)| (*known).cmp(name)) else {
             continue;
         };
-        if *known < name {
+        let text = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+        if !schema::same(text, search::DECLARED[at].1) {
             return Ok((false, posted));
         }
-        if *known == name {
-            let text = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
-            if !schema::same(text, normalised) {
-                return Ok((false, posted));
-            }
-            declared.next();
-        }
+        held += 1;
     }
-    Ok((declared.peek().is_none(), posted))
+    Ok((held == search::DECLARED.len(), posted))
 }
 
 /// Applies the index schema to an empty index.db, refusing a SQLite that
