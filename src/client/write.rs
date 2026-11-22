@@ -1061,7 +1061,6 @@ pub(crate) fn read_hub(
     }
 
     let kind = kind_of(conn, collection)?;
-    let tables = tables_of(&kind);
     hub.immutable = collection::media_type(&kind) == "message/rfc822";
     // NOTE: one fill of the `links` slot serves every read below, none of
     // which binds another slot.
@@ -1069,16 +1068,18 @@ pub(crate) fn read_hub(
         bind_list(conn, "links", links)?;
     }
     let by_link = links.is_some();
-    let (items_sql, bindings_sql, addresses_sql) = match by_link {
+    let (items_sql, bindings_sql, summaries_sql, values_sql) = match by_link {
         true => (
             sql::LOAD_ITEMS_BY_LINK,
             sql::LOAD_BINDINGS_BY_LINK,
-            sql::LOAD_ADDRESSES_BY_LINK,
+            sql::LOAD_SUMMARIES_BY_LINK,
+            sql::LOAD_VALUES_BY_LINK,
         ),
         false => (
             sql::LOAD_ITEMS,
             sql::LOAD_BINDINGS,
-            sql::LOAD_ADDRESSES_BY_COLLECTION,
+            sql::LOAD_SUMMARIES,
+            sql::LOAD_VALUES_BY_COLLECTION,
         ),
     };
     let key = named_params! { ":collection": collection };
@@ -1092,32 +1093,18 @@ pub(crate) fn read_hub(
         }
     }
 
-    for table in &tables {
-        let statement = table.load_sql(by_link);
-        for (link, summary) in load_summaries(conn, statement, *table, collection)? {
-            if let Some(item) = hub.items.get_mut(&link) {
-                item.summary = Some(summary);
-            }
+    for (link, summary) in load_summaries(conn, summaries_sql, collection)? {
+        if let Some(item) = hub.items.get_mut(&link) {
+            item.summary = Some(summary);
         }
     }
-    for (link, role, address) in load_addresses(conn, addresses_sql, collection)? {
+    for (link, value) in load_values(conn, values_sql, collection)? {
         if let Some(summary) = hub
             .items
             .get_mut(&link)
             .and_then(|item| item.summary.as_mut())
         {
-            attach_address(summary, role, address);
-        }
-    }
-    for statement in list_sql(&tables, by_link) {
-        for (link, value) in load_list(conn, statement, collection)? {
-            if let Some(summary) = hub
-                .items
-                .get_mut(&link)
-                .and_then(|item| item.summary.as_mut())
-            {
-                attach_list_value(summary, value);
-            }
+            attach_value(summary, value);
         }
     }
 
@@ -1185,7 +1172,7 @@ pub(crate) enum PimdirSummaryTable {
 
 impl PimdirSummaryTable {
     /// The table a summary variant is written to.
-    fn of(summary: &PimdirSummary) -> Self {
+    pub(crate) fn of(summary: &PimdirSummary) -> Self {
         match summary {
             PimdirSummary::Mail(_) => Self::Mail,
             PimdirSummary::Contact(_) => Self::Contact,
@@ -1196,24 +1183,28 @@ impl PimdirSummaryTable {
         }
     }
 
-    /// The load of this table's rows over a whole collection
-    /// (`load_mail_summaries` and its siblings), or with `by_link` over the
-    /// link ids of the `links` slot, a seek per id (their `_by_link`
-    /// twins, §4.4).
-    pub(crate) fn load_sql(self, by_link: bool) -> &'static str {
-        match (self, by_link) {
-            (Self::Mail, false) => sql::LOAD_MAIL_SUMMARIES,
-            (Self::Contact, false) => sql::LOAD_CONTACT_SUMMARIES,
-            (Self::Event, false) => sql::LOAD_EVENT_SUMMARIES,
-            (Self::Task, false) => sql::LOAD_TASK_SUMMARIES,
-            (Self::Journal, false) => sql::LOAD_JOURNAL_SUMMARIES,
-            (Self::File, false) => sql::LOAD_FILE_SUMMARIES,
-            (Self::Mail, true) => sql::LOAD_MAIL_SUMMARIES_BY_LINK,
-            (Self::Contact, true) => sql::LOAD_CONTACT_SUMMARIES_BY_LINK,
-            (Self::Event, true) => sql::LOAD_EVENT_SUMMARIES_BY_LINK,
-            (Self::Task, true) => sql::LOAD_TASK_SUMMARIES_BY_LINK,
-            (Self::Journal, true) => sql::LOAD_JOURNAL_SUMMARIES_BY_LINK,
-            (Self::File, true) => sql::LOAD_FILE_SUMMARIES_BY_LINK,
+    /// The table a `component` value of the summary row names.
+    fn parse(component: &str) -> Option<Self> {
+        match component {
+            "mail" => Some(Self::Mail),
+            "contact" => Some(Self::Contact),
+            "event" => Some(Self::Event),
+            "task" => Some(Self::Task),
+            "journal" => Some(Self::Journal),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+
+    /// The `component` value of the summary row.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mail => "mail",
+            Self::Contact => "contact",
+            Self::Event => "event",
+            Self::Task => "task",
+            Self::Journal => "journal",
+            Self::File => "file",
         }
     }
 
@@ -1230,15 +1221,11 @@ impl PimdirSummaryTable {
         }
     }
 
-    /// The delete a component rewritten as another runs; a mail, contact
-    /// or file row never leaves its item, the collection's kind being fixed.
-    fn delete_sql(self) -> Option<&'static str> {
-        match self {
-            Self::Mail | Self::Contact | Self::File => None,
-            Self::Event => Some(sql::DELETE_EVENT_SUMMARY),
-            Self::Task => Some(sql::DELETE_TASK_SUMMARY),
-            Self::Journal => Some(sql::DELETE_JOURNAL_SUMMARY),
-        }
+    /// Whether a row of this component leaves its item once the body
+    /// derives no summary (`delete_summary`); a mail, contact or file row
+    /// never does, the collection's kind being fixed.
+    fn leaves(self) -> bool {
+        matches!(self, Self::Event | Self::Task | Self::Journal)
     }
 
     /// Maps a row whose summary columns start at `at`, its addresses and
@@ -1366,20 +1353,19 @@ impl PimdirSummaryTable {
     }
 }
 
-/// The summaries a table holds for a collection through `statement`, one
-/// of its [`load_sql`](PimdirSummaryTable::load_sql), a `_by_link` one
-/// reading the `links` slot the caller filled (§4.4).
+/// The summaries of a collection through `statement`, `load_summaries`, or
+/// `load_summaries_by_link` reading the `links` slot the caller filled
+/// (§4.4), whatever their component.
 pub(crate) fn load_summaries(
     conn: &Connection,
     statement: &str,
-    table: PimdirSummaryTable,
     collection: &str,
 ) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirSummary)>> {
     let loaded = rows(
         conn,
         statement,
         named_params! { ":collection": collection },
-        |row| Ok((PimdirLinkId(row.get(0)?), table.read_row(row, 1)?)),
+        |row| Ok((PimdirLinkId(row.get(0)?), read_summary(row, 1)?)),
     )?;
 
     Ok(loaded
@@ -1388,14 +1374,136 @@ pub(crate) fn load_summaries(
         .collect())
 }
 
-/// The addresses of a collection's items in document order, through
-/// `statement`: `load_addresses_by_collection`, or `load_addresses_by_link`
-/// over the `links` slot the caller filled.
-pub(crate) fn load_addresses(
+/// Maps a `summary` row whose columns start at `at` in the order
+/// `load_summaries` answers them, from `component` to `part`, its lists
+/// empty; `None` for a component this crate does not know.
+fn read_summary(row: &Row, at: usize) -> rusqlite::Result<Option<PimdirSummary>> {
+    let text = |offset: usize| row.get::<_, Option<String>>(at + offset);
+    let int = |offset: usize| row.get::<_, Option<i64>>(at + offset);
+    let flag = |offset: usize| Ok::<_, rusqlite::Error>(int(offset)?.map(|v| v != 0));
+    let size = |offset: usize| Ok::<_, rusqlite::Error>(int(offset)?.map(|v| v.max(0) as u64));
+    let time = |value: usize| {
+        Ok::<_, rusqlite::Error>(text(value)?.map(|time| PimdirTime {
+            value: time,
+            tzid: text(value + 1).ok().flatten(),
+            date: text(value + 2).ok().flatten().as_deref() == Some("date"),
+        }))
+    };
+
+    let component = row.get::<_, String>(at)?;
+    let Some(table) = PimdirSummaryTable::parse(&component) else {
+        return Ok(None);
+    };
+    let uid = text(1)?;
+    let title = row.get::<_, String>(at + 2)?;
+
+    let summary = match table {
+        PimdirSummaryTable::Mail => PimdirSummary::Mail(PimdirMailSummary {
+            message_id: uid,
+            subject: title,
+            sender: text(3)?,
+            sender_name: text(4)?,
+            date: text(5)?,
+            size: size(6)?,
+            attachment: flag(7)?,
+            invitation: text(8)?,
+            ..Default::default()
+        }),
+        PimdirSummaryTable::Contact => PimdirSummary::Contact(PimdirContactSummary {
+            uid,
+            full_name: title,
+            kind: text(9)?,
+            org: text(10)?,
+            emails: Vec::new(),
+        }),
+        PimdirSummaryTable::Event => PimdirSummary::Event(PimdirEventSummary {
+            uid,
+            summary: title,
+            location: text(11)?,
+            dtstart: time(12)?,
+            dtend: text(15)?,
+            recurring: flag(16)?,
+            until: text(17)?,
+            organizer: None,
+            attendees: Vec::new(),
+        }),
+        PimdirSummaryTable::Task => PimdirSummary::Task(PimdirTaskSummary {
+            uid,
+            summary: title,
+            dtstart: time(12)?,
+            due: time(18)?,
+            status: text(21)?,
+            completed: text(22)?,
+            percent: int(23)?,
+            recurring: flag(16)?,
+            until: text(17)?,
+            priority: int(24)?,
+            categories: Vec::new(),
+            parent: text(25)?,
+            mid: text(26)?,
+            created: text(27)?,
+            organizer: None,
+            attendees: Vec::new(),
+            contacts: Vec::new(),
+        }),
+        PimdirSummaryTable::Journal => PimdirSummary::Journal(PimdirJournalSummary {
+            uid,
+            summary: title,
+            dtstart: time(12)?,
+            organizer: None,
+            attendees: Vec::new(),
+        }),
+        PimdirSummaryTable::File => PimdirSummary::File(PimdirFileSummary {
+            name: title,
+            media_type: text(28)?,
+            size: size(6)?,
+            part: text(29)?,
+        }),
+    };
+
+    Ok(Some(summary))
+}
+
+/// One value of a summary's lists (§4.4): an address under its role, an
+/// `In-Reply-To` id, or a category.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PimdirSummaryValue {
+    Address(PimdirAddressRole, PimdirAddress),
+    InReplyTo(String),
+    Category(String),
+}
+
+impl PimdirSummaryValue {
+    /// The role of a message's `In-Reply-To` ids.
+    const IN_REPLY_TO: &'static str = "in-reply-to";
+    /// The role of a task's categories.
+    const CATEGORY: &'static str = "category";
+
+    /// The value a `summary_value` row of `role` holds; `None` for a role
+    /// this crate does not know.
+    pub(crate) fn of(role: &str, value: String, name: Option<String>) -> Option<Self> {
+        match role {
+            Self::IN_REPLY_TO => Some(Self::InReplyTo(value)),
+            Self::CATEGORY => Some(Self::Category(value)),
+            role => Some(Self::Address(
+                PimdirAddressRole::parse(role)?,
+                PimdirAddress {
+                    address: value,
+                    name,
+                },
+            )),
+        }
+    }
+}
+
+/// The lists of a collection's items, by item and role in document order,
+/// through `statement`: `load_values_by_collection`, or
+/// `load_values_by_link` over the `links` slot the caller filled.
+pub(crate) fn load_values(
     conn: &Connection,
     statement: &str,
     collection: &str,
-) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirAddressRole, PimdirAddress)>> {
+) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirSummaryValue)>> {
     let loaded = rows(
         conn,
         statement,
@@ -1404,61 +1512,32 @@ pub(crate) fn load_addresses(
             Ok((
                 PimdirLinkId(row.get(0)?),
                 row.get::<_, String>(1)?,
-                PimdirAddress {
-                    address: row.get(3)?,
-                    name: row.get(4)?,
-                },
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         },
     )?;
 
     Ok(loaded
         .into_iter()
-        .filter_map(|(link, role, address)| Some((link, PimdirAddressRole::parse(&role)?, address)))
+        .filter_map(|(link, role, value, name)| {
+            Some((link, PimdirSummaryValue::of(&role, value, name)?))
+        })
         .collect())
 }
 
-/// The list statements the summaries of `tables` read beside their rows
-/// (§4.4): `load_in_reply_to` for mail, `load_categories` for tasks, or
-/// with `by_link` their `_by_link` twins over the `links` slot.
-pub(crate) fn list_sql(tables: &[PimdirSummaryTable], by_link: bool) -> Vec<&'static str> {
-    let mut statements = Vec::new();
-    if tables.contains(&PimdirSummaryTable::Mail) {
-        statements.push(match by_link {
-            true => sql::LOAD_IN_REPLY_TO_BY_LINK,
-            false => sql::LOAD_IN_REPLY_TO,
-        });
-    }
-    if tables.contains(&PimdirSummaryTable::Task) {
-        statements.push(match by_link {
-            true => sql::LOAD_CATEGORIES_BY_LINK,
-            false => sql::LOAD_CATEGORIES,
-        });
-    }
-    statements
-}
-
-/// The values of a list Annex A derives (§4.4) through `statement`, one
-/// of [`list_sql`]: each by its item, in document order.
-pub(crate) fn load_list(
-    conn: &Connection,
-    statement: &str,
-    collection: &str,
-) -> rusqlite::Result<Vec<(PimdirLinkId, String)>> {
-    rows(
-        conn,
-        statement,
-        named_params! { ":collection": collection },
-        |row| Ok((PimdirLinkId(row.get(0)?), row.get(2)?)),
-    )
-}
-
-/// Files a list value under the field its summary keeps it in: an
-/// `In-Reply-To` id on a message, a category on a task.
-pub(crate) fn attach_list_value(summary: &mut PimdirSummary, value: String) {
-    match summary {
-        PimdirSummary::Mail(mail) => mail.in_reply_to.push(value),
-        PimdirSummary::Task(task) => task.categories.push(value),
+/// Files a list value under the field its summary keeps it in: an address
+/// under the field its role names, an `In-Reply-To` id on a message, a
+/// category on a task.
+pub(crate) fn attach_value(summary: &mut PimdirSummary, value: PimdirSummaryValue) {
+    match (summary, value) {
+        (summary, PimdirSummaryValue::Address(role, address)) => {
+            attach_address(summary, role, address)
+        }
+        (PimdirSummary::Mail(mail), PimdirSummaryValue::InReplyTo(id)) => mail.in_reply_to.push(id),
+        (PimdirSummary::Task(task), PimdirSummaryValue::Category(value)) => {
+            task.categories.push(value)
+        }
         _ => {}
     }
 }
@@ -1758,25 +1837,14 @@ fn held_summary(
     collection: &str,
     link: &PimdirLinkId,
 ) -> Result<Option<PimdirSummary>, PimdirError> {
-    let tables = tables_of(&kind_of(conn, collection)?);
     bind_list(conn, "links", [link.0.as_str()])?;
 
-    let mut held = None;
-    for table in &tables {
-        for (_, summary) in load_summaries(conn, table.load_sql(true), *table, collection)? {
-            held = Some(summary);
-        }
-    }
-    let Some(mut summary) = held else {
+    let held = load_summaries(conn, sql::LOAD_SUMMARIES_BY_LINK, collection)?;
+    let Some((_, mut summary)) = held.into_iter().next() else {
         return Ok(None);
     };
-    for (_, role, address) in load_addresses(conn, sql::LOAD_ADDRESSES_BY_LINK, collection)? {
-        attach_address(&mut summary, role, address);
-    }
-    for statement in list_sql(&tables, true) {
-        for (_, value) in load_list(conn, statement, collection)? {
-            attach_list_value(&mut summary, value);
-        }
+    for (_, value) in load_values(conn, sql::LOAD_VALUES_BY_LINK, collection)? {
+        attach_value(&mut summary, value);
     }
 
     Ok(Some(summary))
@@ -2178,10 +2246,10 @@ pub(crate) fn rederive_item(
     Ok(summary_moved || key_moved)
 }
 
-/// Writes the summary, address and list rows when they moved, reporting
-/// whether they did: the row of the old variant goes when the variant
-/// changed, its lists with it by cascade, the addresses and the lists are
-/// replaced as sets (Annex A.1, A.4, A.6).
+/// Writes the summary and list rows when they moved, reporting whether
+/// they did: one upsert whatever the component, the row going when a
+/// calendar resource derives none, the lists replaced as sets (Annex A.1,
+/// A.4, A.6).
 fn write_summary(
     conn: &Connection,
     collection: &str,
@@ -2195,160 +2263,201 @@ fn write_summary(
 
     schema::record_derivation(conn)?;
     let key = named_params! { ":collection": collection, ":link_id": link.0 };
-    if let Some(old) = old
-        && new.is_none_or(|new| PimdirSummaryTable::of(new) != PimdirSummaryTable::of(old))
-        && let Some(delete) = PimdirSummaryTable::of(old).delete_sql()
-    {
-        conn.execute_cached(delete, key)?;
+    let leaves = new.is_none() && old.is_some_and(|old| PimdirSummaryTable::of(old).leaves());
+    if leaves {
+        conn.execute_cached(sql::DELETE_SUMMARY, key)?;
     }
-    conn.execute_cached(sql::REPLACE_ADDRESSES, key)?;
+    conn.execute_cached(
+        sql::REPLACE_VALUES,
+        named_params! {
+            ":collection": collection,
+            ":link_id": link.0,
+            ":lists": i64::from(new.is_some() || leaves),
+        },
+    )?;
 
     let Some(new) = new else {
         return Ok(true);
     };
 
-    match new {
-        PimdirSummary::Mail(mail) => conn.execute_cached(
-            sql::UPSERT_MAIL_SUMMARY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link.0,
-                ":message_id": mail.message_id,
-                ":subject": mail.subject,
-                ":sender": mail.sender,
-                ":sender_name": mail.sender_name,
-                ":date": mail.date,
-                ":size": mail.size.and_then(stated_size),
-                ":attachment": mail.attachment.map(i64::from),
-                ":invitation": mail.invitation,
-            },
-        )?,
-        PimdirSummary::Contact(contact) => conn.execute_cached(
-            sql::UPSERT_CONTACT_SUMMARY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link.0,
-                ":uid": contact.uid,
-                ":fn": contact.full_name,
-                ":kind": contact.kind,
-                ":org": contact.org,
-            },
-        )?,
-        PimdirSummary::Event(event) => conn.execute_cached(
-            sql::UPSERT_EVENT_SUMMARY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link.0,
-                ":uid": event.uid,
-                ":summary": event.summary,
-                ":location": event.location,
-                ":dtstart": event.dtstart.as_ref().map(|t| t.value.as_str()),
-                ":dtstart_tzid": event.dtstart.as_ref().and_then(|t| t.tzid.as_deref()),
-                ":dtstart_value": event.dtstart.as_ref().map(PimdirTime::value_kind),
-                ":dtend": event.dtend,
-                ":recurring": event.recurring.map(i64::from),
-                ":until": event.until,
-            },
-        )?,
-        PimdirSummary::Task(task) => conn.execute_cached(
-            sql::UPSERT_TASK_SUMMARY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link.0,
-                ":uid": task.uid,
-                ":summary": task.summary,
-                ":dtstart": task.dtstart.as_ref().map(|t| t.value.as_str()),
-                ":dtstart_tzid": task.dtstart.as_ref().and_then(|t| t.tzid.as_deref()),
-                ":dtstart_value": task.dtstart.as_ref().map(PimdirTime::value_kind),
-                ":due": task.due.as_ref().map(|t| t.value.as_str()),
-                ":due_tzid": task.due.as_ref().and_then(|t| t.tzid.as_deref()),
-                ":due_value": task.due.as_ref().map(PimdirTime::value_kind),
-                ":status": task.status,
-                ":completed": task.completed,
-                ":percent": task.percent,
-                ":recurring": task.recurring.map(i64::from),
-                ":until": task.until,
-                ":priority": task.priority,
-                ":parent": task.parent,
-                ":mid": task.mid,
-                ":created": task.created,
-            },
-        )?,
-        PimdirSummary::Journal(journal) => conn.execute_cached(
-            sql::UPSERT_JOURNAL_SUMMARY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link.0,
-                ":uid": journal.uid,
-                ":summary": journal.summary,
-                ":dtstart": journal.dtstart.as_ref().map(|t| t.value.as_str()),
-                ":dtstart_tzid": journal.dtstart.as_ref().and_then(|t| t.tzid.as_deref()),
-                ":dtstart_value": journal.dtstart.as_ref().map(PimdirTime::value_kind),
-            },
-        )?,
-        PimdirSummary::File(file) => conn.execute_cached(
-            sql::UPSERT_FILE_SUMMARY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link.0,
-                ":name": file.name,
-                ":media_type": file.media_type,
-                ":size": file.size.and_then(stated_size),
-                ":part": file.part,
-            },
-        )?,
-    };
+    upsert_summary(conn, collection, link, new)?;
 
+    let mut values: Vec<(&str, i64, &str, Option<&str>)> = Vec::new();
     match new {
         PimdirSummary::Mail(mail) => {
-            conn.execute_cached(sql::REPLACE_IN_REPLY_TO, key)?;
             for (position, id) in mail.in_reply_to.iter().enumerate() {
-                conn.execute_cached(
-                    sql::INSERT_IN_REPLY_TO,
-                    named_params! {
-                        ":collection": collection,
-                        ":link_id": link.0,
-                        ":position": position as i64,
-                        ":message_id": id,
-                    },
-                )?;
+                values.push((PimdirSummaryValue::IN_REPLY_TO, position as i64, id, None));
             }
         }
         PimdirSummary::Task(task) => {
-            conn.execute_cached(sql::REPLACE_CATEGORIES, key)?;
             for (position, value) in task.categories.iter().enumerate() {
-                conn.execute_cached(
-                    sql::INSERT_CATEGORY,
-                    named_params! {
-                        ":collection": collection,
-                        ":link_id": link.0,
-                        ":position": position as i64,
-                        ":value": value,
-                    },
-                )?;
+                values.push((PimdirSummaryValue::CATEGORY, position as i64, value, None));
             }
         }
         _ => {}
     }
-
     let mut position: HashMap<PimdirAddressRole, i64> = HashMap::new();
     for (role, address) in new.addresses() {
         let at = position.entry(role).or_insert(0);
+        values.push((
+            role.as_str(),
+            *at,
+            &address.address,
+            address.name.as_deref(),
+        ));
+        *at += 1;
+    }
+    for (role, position, value, name) in values {
         conn.execute_cached(
-            sql::INSERT_ADDRESS,
+            sql::INSERT_VALUE,
             named_params! {
                 ":collection": collection,
                 ":link_id": link.0,
-                ":role": role.as_str(),
-                ":position": *at,
-                ":address": address.address,
-                ":name": address.name,
+                ":role": role,
+                ":position": position,
+                ":value": value,
+                ":name": name,
             },
         )?;
-        *at += 1;
     }
 
     Ok(true)
+}
+
+/// Writes an item's summary row (`upsert_summary`): the columns its
+/// component owns, every other one NULL.
+pub(crate) fn upsert_summary(
+    conn: &Connection,
+    collection: &str,
+    link: &PimdirLinkId,
+    summary: &PimdirSummary,
+) -> rusqlite::Result<usize> {
+    let mut row = PimdirSummaryRow {
+        component: PimdirSummaryTable::of(summary).as_str(),
+        ..Default::default()
+    };
+    match summary {
+        PimdirSummary::Mail(mail) => {
+            row.uid = mail.message_id.as_deref();
+            row.title = &mail.subject;
+            row.sender = mail.sender.as_deref();
+            row.sender_name = mail.sender_name.as_deref();
+            row.date = mail.date.as_deref();
+            row.size = mail.size.and_then(stated_size);
+            row.attachment = mail.attachment.map(i64::from);
+            row.invitation = mail.invitation.as_deref();
+        }
+        PimdirSummary::Contact(contact) => {
+            row.uid = contact.uid.as_deref();
+            row.title = &contact.full_name;
+            row.card_kind = contact.kind.as_deref();
+            row.org = contact.org.as_deref();
+        }
+        PimdirSummary::Event(event) => {
+            row.uid = event.uid.as_deref();
+            row.title = &event.summary;
+            row.location = event.location.as_deref();
+            row.dtstart = event.dtstart.as_ref();
+            row.dtend = event.dtend.as_deref();
+            row.recurring = event.recurring.map(i64::from);
+            row.until = event.until.as_deref();
+        }
+        PimdirSummary::Task(task) => {
+            row.uid = task.uid.as_deref();
+            row.title = &task.summary;
+            row.dtstart = task.dtstart.as_ref();
+            row.due = task.due.as_ref();
+            row.status = task.status.as_deref();
+            row.completed = task.completed.as_deref();
+            row.percent = task.percent;
+            row.recurring = task.recurring.map(i64::from);
+            row.until = task.until.as_deref();
+            row.priority = task.priority;
+            row.parent = task.parent.as_deref();
+            row.mid = task.mid.as_deref();
+            row.created = task.created.as_deref();
+        }
+        PimdirSummary::Journal(journal) => {
+            row.uid = journal.uid.as_deref();
+            row.title = &journal.summary;
+            row.dtstart = journal.dtstart.as_ref();
+        }
+        PimdirSummary::File(file) => {
+            row.title = &file.name;
+            row.size = file.size.and_then(stated_size);
+            row.media_type = file.media_type.as_deref();
+            row.part = file.part.as_deref();
+        }
+    }
+
+    conn.execute_cached(
+        sql::UPSERT_SUMMARY,
+        named_params! {
+            ":collection": collection,
+            ":link_id": link.0,
+            ":component": row.component,
+            ":uid": row.uid,
+            ":title": row.title,
+            ":sender": row.sender,
+            ":sender_name": row.sender_name,
+            ":date": row.date,
+            ":size": row.size,
+            ":attachment": row.attachment,
+            ":invitation": row.invitation,
+            ":card_kind": row.card_kind,
+            ":org": row.org,
+            ":location": row.location,
+            ":dtstart": row.dtstart.map(|t| t.value.as_str()),
+            ":dtstart_tzid": row.dtstart.and_then(|t| t.tzid.as_deref()),
+            ":dtstart_value": row.dtstart.map(PimdirTime::value_kind),
+            ":dtend": row.dtend,
+            ":recurring": row.recurring,
+            ":until": row.until,
+            ":due": row.due.map(|t| t.value.as_str()),
+            ":due_tzid": row.due.and_then(|t| t.tzid.as_deref()),
+            ":due_value": row.due.map(PimdirTime::value_kind),
+            ":status": row.status,
+            ":completed": row.completed,
+            ":percent": row.percent,
+            ":priority": row.priority,
+            ":parent": row.parent,
+            ":mid": row.mid,
+            ":created": row.created,
+            ":media_type": row.media_type,
+            ":part": row.part,
+        },
+    )
+}
+
+/// The columns of one `summary` row as `upsert_summary` binds them.
+#[derive(Default)]
+struct PimdirSummaryRow<'a> {
+    component: &'static str,
+    uid: Option<&'a str>,
+    title: &'a str,
+    sender: Option<&'a str>,
+    sender_name: Option<&'a str>,
+    date: Option<&'a str>,
+    size: Option<i64>,
+    attachment: Option<i64>,
+    invitation: Option<&'a str>,
+    card_kind: Option<&'a str>,
+    org: Option<&'a str>,
+    location: Option<&'a str>,
+    dtstart: Option<&'a PimdirTime>,
+    dtend: Option<&'a str>,
+    recurring: Option<i64>,
+    until: Option<&'a str>,
+    due: Option<&'a PimdirTime>,
+    status: Option<&'a str>,
+    completed: Option<&'a str>,
+    percent: Option<i64>,
+    priority: Option<i64>,
+    parent: Option<&'a str>,
+    mid: Option<&'a str>,
+    created: Option<&'a str>,
+    media_type: Option<&'a str>,
+    part: Option<&'a str>,
 }
 
 /// Deletes the bindings one item's diff releases: a source that no

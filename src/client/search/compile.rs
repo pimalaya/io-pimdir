@@ -71,14 +71,12 @@ pub(crate) type Labels = Vec<(String, Vec<String>)>;
 /// The media types of the undated kinds, as SQL.
 const UNDATED: &str = "('text/vcard', 'application/octet-stream')";
 
+/// The roles of `summary_value` that hold no address, as SQL.
+const LISTS: &str = "('in-reply-to', 'category')";
+
 /// The titles a hit's placements carry, joined for the `name` order.
 const TITLES: &str = "FROM store.items i JOIN store.collections c ON c.id = i.collection
-   LEFT JOIN store.mail_summary ms ON ms.item = i.id
-   LEFT JOIN store.contact_summary cs ON cs.item = i.id
-   LEFT JOIN store.event_summary es ON es.item = i.id
-   LEFT JOIN store.task_summary ts ON ts.item = i.id
-   LEFT JOIN store.journal_summary js ON js.item = i.id
-   LEFT JOIN store.file_summary fs ON fs.item = i.id";
+   LEFT JOIN store.summary ts ON ts.item = i.id";
 
 /// A compiled query: its plan, the fragments each of its terms renders
 /// to, the values they bind, and what an answer reports beside its hits.
@@ -439,14 +437,14 @@ impl Compiled {
         };
         let title = match sort {
             PimdirSearchSort::Title => format!(
-                "(SELECT coalesce(ms.subject, cs.fn, es.summary, ts.summary, js.summary, fs.name, '') \
+                "(SELECT coalesce(ts.title, '') \
                  {TITLES} WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0 \
                  ORDER BY i.collection LIMIT 1)"
             ),
             PimdirSearchSort::Sender => String::from(
                 "(SELECT coalesce(ms.sender, '') FROM store.items i \
                  JOIN store.collections c ON c.id = i.collection \
-                 LEFT JOIN store.mail_summary ms ON ms.item = i.id \
+                 LEFT JOIN store.summary ms ON ms.item = i.id \
                  WHERE i.seq = h.seq AND ifnull(c.account, '') = h.akey AND i.deleted = 0 \
                  ORDER BY i.collection LIMIT 1)",
             ),
@@ -764,7 +762,7 @@ impl Compiled {
     /// by theirs (SEARCH §6). `priority:` reads a column a store whose
     /// owner predates it holds `NULL` (STORAGE §6), every task then of no
     /// priority. `category:` folds both sides as STORAGE Annex A.2 folds
-    /// `fn`, in Rust: a task by the `task_category` values the caller found
+    /// `fn`, in Rust: a task by the `category` values the caller found
     /// folding to the term's, compared as stated, a card by the folded
     /// values its extraction recorded. A date term's open side is the
     /// earliest or the latest instant an RFC 3339 string spells, and it
@@ -816,14 +814,14 @@ impl Compiled {
                 let role = role.map(|role| self.bind(role.as_str().to_string()));
                 let roled = |alias: &str| match &role {
                     Some(role) => format!(" AND {alias}.role = {role}"),
-                    None => String::new(),
+                    None => format!(" AND {alias}.role NOT IN {LISTS}"),
                 };
                 match address.strip_prefix('@') {
                     Some(domain) => {
                         let domain = self.bind(domain.to_string());
                         format!(
-                            "EXISTS (SELECT 1 FROM store.item_address a{at} \
-                             WHERE a{at}.item = {j}.id AND lower(substr(a{at}.address, \
+                            "EXISTS (SELECT 1 FROM store.summary_value a{at} \
+                             WHERE a{at}.item = {j}.id AND lower(substr(a{at}.value, \
                              -length({domain}) - 1)) = '@' || lower({domain}){})",
                             roled(&format!("a{at}"))
                         )
@@ -832,20 +830,20 @@ impl Compiled {
                         let address = self.bind(address);
                         leaf.set = Some(format!(
                             "SELECT ifnull(c.account, '') AS akey, i.seq AS seq \
-                             FROM store.item_address a \
+                             FROM store.summary_value a \
                              JOIN store.items i ON i.id = a.item AND i.deleted = 0 \
                              JOIN store.collections c ON c.id = i.collection \
-                             WHERE a.address = {address}{}",
+                             WHERE a.value = {address}{}",
                             roled("a")
                         ));
                         leaf.estimate = Some(format!(
-                            "SELECT count(*) FROM (SELECT 1 FROM store.item_address a \
-                             WHERE a.address = {address}{} LIMIT {CAP})",
+                            "SELECT count(*) FROM (SELECT 1 FROM store.summary_value a \
+                             WHERE a.value = {address}{} LIMIT {CAP})",
                             roled("a")
                         ));
                         format!(
-                            "EXISTS (SELECT 1 FROM store.item_address a{at} \
-                             WHERE a{at}.item = {j}.id AND a{at}.address = {address}{})",
+                            "EXISTS (SELECT 1 FROM store.summary_value a{at} \
+                             WHERE a{at}.item = {j}.id AND a{at}.value = {address}{})",
                             roled(&format!("a{at}"))
                         )
                     }
@@ -872,8 +870,9 @@ impl Compiled {
                     );
                 }
                 let named = format!(
-                    "EXISTS (SELECT 1 FROM store.item_address a{at} WHERE a{at}.item = {j}.id \
-                     AND a{at}.address IN (SELECT e.address FROM store.item_address e \
+                    "EXISTS (SELECT 1 FROM store.summary_value a{at} WHERE a{at}.item = {j}.id \
+                     AND a{at}.role NOT IN {LISTS} \
+                     AND a{at}.value IN (SELECT e.value FROM store.summary_value e \
                      JOIN store.items ei ON ei.id = e.item WHERE e.role = 'email' \
                      AND (ei.collection, ei.seq) IN (SELECT t.collection, t.seq \
                      FROM temp.term_match t WHERE t.term = {at})))"
@@ -951,7 +950,7 @@ impl Compiled {
             }
             PimdirQueryPredicate::HasBody => format!("{j}.object IS NOT NULL"),
             PimdirQueryPredicate::HasAttachment => format!(
-                "(EXISTS (SELECT 1 FROM store.mail_summary m{at} WHERE m{at}.item = {j}.id \
+                "(EXISTS (SELECT 1 FROM store.summary m{at} WHERE m{at}.item = {j}.id \
                  AND m{at}.attachment = 1) OR ({c}.kind = 'text/calendar' AND {}))",
                 object(at, &j, &format!("o{at}.attachment = 1"))
             ),
@@ -966,27 +965,30 @@ impl Compiled {
             }
             PimdirQueryPredicate::Kind(kind) => match kind {
                 PimdirQueryKind::Event | PimdirQueryKind::Task | PimdirQueryKind::Journal => {
-                    let table = match kind {
-                        PimdirQueryKind::Event => "event_summary",
-                        PimdirQueryKind::Task => "task_summary",
-                        _ => "journal_summary",
+                    let component = match kind {
+                        PimdirQueryKind::Event => "event",
+                        PimdirQueryKind::Task => "task",
+                        _ => "journal",
                     };
-                    format!("EXISTS (SELECT 1 FROM store.{table} s{at} WHERE s{at}.item = {j}.id)")
+                    format!(
+                        "EXISTS (SELECT 1 FROM store.summary s{at} WHERE s{at}.item = {j}.id \
+                         AND s{at}.component = '{component}')"
+                    )
                 }
                 kind => format!("{c}.kind = '{}'", plan::media_type(*kind)),
             },
             PimdirQueryPredicate::Status(status) => {
                 let status = self.bind(status.clone());
                 format!(
-                    "EXISTS (SELECT 1 FROM store.task_summary s{at} WHERE s{at}.item = {j}.id \
+                    "EXISTS (SELECT 1 FROM store.summary s{at} WHERE s{at}.item = {j}.id \
                      AND s{at}.status = {status})"
                 )
             }
             PimdirQueryPredicate::Mid(id) => {
                 let id = self.bind(id.clone());
                 format!(
-                    "EXISTS (SELECT 1 FROM store.mail_summary s{at} WHERE s{at}.item = {j}.id \
-                     AND s{at}.message_id = {id})"
+                    "EXISTS (SELECT 1 FROM store.summary s{at} WHERE s{at}.item = {j}.id \
+                     AND s{at}.component = 'mail' AND s{at}.uid = {id})"
                 )
             }
             PimdirQueryPredicate::Priority(priority) => {
@@ -997,8 +999,8 @@ impl Compiled {
                     PimdirQueryPriority::None => format!("ifnull(s{at}.priority, 0) = 0"),
                 };
                 format!(
-                    "EXISTS (SELECT 1 FROM store.task_summary s{at} WHERE s{at}.item = {j}.id \
-                     AND {band})"
+                    "EXISTS (SELECT 1 FROM store.summary s{at} WHERE s{at}.item = {j}.id \
+                     AND s{at}.component = 'task' AND {band})"
                 )
             }
             PimdirQueryPredicate::Category(category) => {
@@ -1018,8 +1020,8 @@ impl Compiled {
                     }
                 };
                 format!(
-                    "(EXISTS (SELECT 1 FROM store.task_category s{at} WHERE s{at}.item = {j}.id \
-                     AND {stated}) OR EXISTS (SELECT 1 FROM placement p{at} \
+                    "(EXISTS (SELECT 1 FROM store.summary_value s{at} WHERE s{at}.item = {j}.id \
+                     AND s{at}.role = 'category' AND {stated}) OR EXISTS (SELECT 1 FROM placement p{at} \
                      JOIN object_category k{at} ON k{at}.object = p{at}.object \
                      WHERE p{at}.collection = {j}.collection AND p{at}.seq = {j}.seq \
                      AND k{at}.value = {folded}))"

@@ -379,7 +379,7 @@ pub enum PimdirPlanEstimate {
     /// The full-text matches of its expression, over bodies and
     /// summaries.
     Text,
-    /// The `item_address` rows of one address.
+    /// The `summary_value` rows of one address.
     Address,
     /// The index's `flag` rows of one keyword (`flagged`).
     Flag,

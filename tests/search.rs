@@ -3671,9 +3671,10 @@ mod memory {
             let mut stmt = self
                 .store
                 .prepare(
-                    "SELECT a.role, a.address, a.name FROM store.item_address a \
+                    "SELECT a.role, a.value, a.name FROM store.summary_value a \
                      JOIN store.items i ON i.id = a.item \
-                     WHERE i.collection = ?1 AND i.link_id = ?2 ORDER BY a.role, a.position",
+                     WHERE i.collection = ?1 AND i.link_id = ?2 \
+                     AND a.role NOT IN ('in-reply-to', 'category') ORDER BY a.role, a.position",
                 )
                 .unwrap();
             let addresses = stmt
@@ -3722,9 +3723,10 @@ mod memory {
                 .find_map(|((collection, _), _)| {
                     self.store
                         .query_row(
-                            "SELECT r.message_id FROM store.mail_in_reply_to r \
+                            "SELECT r.value FROM store.summary_value r \
                              JOIN store.items i ON i.id = r.item \
-                             WHERE i.collection = ?1 AND i.link_id = ?2 ORDER BY r.position LIMIT 1",
+                             WHERE i.collection = ?1 AND i.link_id = ?2 \
+                             AND r.role = 'in-reply-to' ORDER BY r.position LIMIT 1",
                             params![collection, link_id],
                             |r| r.get(0),
                         )
@@ -3785,12 +3787,10 @@ mod memory {
                         .store
                         .prepare(
                             "SELECT i.collection, i.seq, i.sort_key, \
-                                    coalesce(e.recurring, t.recurring), coalesce(e.until, t.until) \
+                                    s.recurring, s.until \
                              FROM store.items i JOIN store.collections c ON c.id = i.collection \
-                             LEFT JOIN store.event_summary e \
-                               ON e.item = i.id \
-                             LEFT JOIN store.task_summary t \
-                               ON t.item = i.id \
+                             LEFT JOIN store.summary s \
+                               ON s.item = i.id \
                              WHERE c.kind = 'text/calendar' AND i.deleted = 0",
                         )
                         .unwrap();

@@ -68,7 +68,7 @@ What the generator files for each case pim-corpus enumerates, and for the store'
 | reserved prefixes in a hint | `esc:` keys (card-reserved-uid.vcf and twins) |
 | a card or an event with no usable `UID` | a `hash:` key, two byte-identical ones in one collection |
 | attachments, invitations, encrypted mail | stand-ins and references, `invitation` and its reference, a body the search part counts `encrypted` |
-| tasks with a parent, a mail they came from, categories | `parent`, `mid`, `task_category`, the references the owner records |
+| tasks with a parent, a mail they came from, categories | `parent`, `mid`, `category` values, the references the owner records |
 | recurring, all-day, floating and zoned events, overrides | the fixtures of A.3, generated series with `RRULE`, `RDATE`, `EXDATE` and `RECURRENCE-ID` |
 
 ## Events and histories

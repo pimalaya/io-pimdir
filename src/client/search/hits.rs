@@ -1108,8 +1108,9 @@ impl Run<'_> {
     fn address(&self, address: &str, role: Option<&str>) -> Result<super::Hits, PimdirError> {
         let mut hits = self.empty();
         let mut statement = self.index.conn.prepare_cached(
-            "SELECT item FROM store.item_address \
-             WHERE address = ?1 AND (?2 IS NULL OR role = ?2)",
+            "SELECT item FROM store.summary_value \
+             WHERE value = ?1 AND (?2 IS NULL OR role = ?2) \
+             AND role NOT IN ('in-reply-to', 'category')",
         )?;
         let mut rows = statement.query(rusqlite::params![address, role])?;
         while let Some(row) = rows.next()? {

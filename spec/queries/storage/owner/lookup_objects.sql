@@ -18,10 +18,10 @@
 -- none: a body is never adopted from a row stating another id than the
 -- member's (SYNC.md §6), ids being comparable within one source alone. One
 -- row per holder, so the caller picks one that agrees.
-SELECT i.link_id, o.hash AS object_hash, o.size, m.subject, m.date, m.sender, b.server_object_id FROM items i
+SELECT i.link_id, o.hash AS object_hash, o.size, m.title AS subject, m.date, m.sender, b.server_object_id FROM items i
 JOIN collections c ON c.id = i.collection
 JOIN objects o ON o.id = i.object
-LEFT JOIN mail_summary m ON m.item = i.id
+LEFT JOIN summary m ON m.item = i.id AND m.component = 'mail'
 LEFT JOIN bindings b ON b.item = i.id AND b.source = :source
 WHERE i.object IS NOT NULL
   AND i.link_id IN (SELECT value FROM temp.param WHERE slot = 'links')

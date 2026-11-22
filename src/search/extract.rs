@@ -219,7 +219,7 @@ impl PimdirExtract {
                 PimdirAddressRole::Attendee => &mut extract.attendee,
                 // NOTE: the index keeps no contact field and SEARCH §6 reads
                 // a task's people from ORGANIZER and ATTENDEE alone, so a
-                // waited-on person is the store's to seek (item_address).
+                // waited-on person is the store's to seek (summary_value).
                 PimdirAddressRole::Contact => continue,
             };
             push(field, &text);

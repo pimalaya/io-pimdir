@@ -1373,7 +1373,7 @@ pub struct PimdirIndexMessage {
     /// A body the index holds for it, of its mail placement with the
     /// lowest `(collection, seq)` holding one.
     pub hash: Option<PimdirHash>,
-    /// The first `In-Reply-To` id of its summary (`mail_in_reply_to`), of
+    /// The first `In-Reply-To` id of its summary (`in-reply-to` values), of
     /// its placement with the lowest `(collection, seq)` naming one.
     pub in_reply_to: Option<String>,
 }

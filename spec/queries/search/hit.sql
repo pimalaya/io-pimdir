@@ -19,19 +19,12 @@ SELECT i.collection, i.link_id,
          WHEN 'text/vcard' THEN 'contact'
          WHEN 'application/octet-stream' THEN 'file'
          WHEN 'text/calendar' THEN CASE
-           WHEN e.item IS NOT NULL THEN 'event'
-           WHEN t.item IS NOT NULL THEN 'task'
-           WHEN j.item IS NOT NULL THEN 'journal'
+           WHEN s.component IN ('event', 'task', 'journal') THEN s.component
          END
        END AS kind_value,
-       coalesce(m.subject, k.fn, e.summary, t.summary, j.summary, f.name, '') AS title
+       coalesce(s.title, '') AS title
 FROM store.items i
 JOIN store.collections c ON c.id = i.collection
-LEFT JOIN store.mail_summary m ON m.item = i.id
-LEFT JOIN store.contact_summary k ON k.item = i.id
-LEFT JOIN store.event_summary e ON e.item = i.id
-LEFT JOIN store.task_summary t ON t.item = i.id
-LEFT JOIN store.journal_summary j ON j.item = i.id
-LEFT JOIN store.file_summary f ON f.item = i.id
+LEFT JOIN store.summary s ON s.item = i.id
 WHERE i.seq = :seq AND c.account IS :account AND i.deleted = 0 AND i.retained_at IS NULL
 ORDER BY i.collection;

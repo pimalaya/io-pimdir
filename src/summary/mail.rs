@@ -52,7 +52,7 @@ const ENTITY_FIELDS: [&str; 4] = [
     "content-id",
 ];
 
-/// The `mail_summary` row of a message with the people it names.
+/// The `summary` row of a message with the people it names.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirMailSummary {
     /// The bare `Message-ID`, angle brackets stripped.

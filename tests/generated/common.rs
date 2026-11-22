@@ -135,7 +135,7 @@ pub const ITEM: [&str; 6] = [
     "level",
 ];
 
-/// The columns of `mail_summary` a read joins.
+/// The columns a mail's read answers from its `summary` row.
 pub const MAIL: [&str; 7] = [
     "message_id",
     "subject",
@@ -146,10 +146,10 @@ pub const MAIL: [&str; 7] = [
     "attachment",
 ];
 
-/// The columns of `contact_summary` a read joins.
+/// The columns a contact's read answers from its `summary` row.
 pub const CONTACT: [&str; 4] = ["uid", "fn", "kind", "org"];
 
-/// The columns of `event_summary` a read joins.
+/// The columns an event's read answers from its `summary` row.
 pub const EVENT: [&str; 9] = [
     "uid",
     "summary",
@@ -162,7 +162,7 @@ pub const EVENT: [&str; 9] = [
     "until",
 ];
 
-/// The columns of `task_summary` a read joins.
+/// The columns a task's read answers from its `summary` row.
 pub const TASK: [&str; 17] = [
     "uid",
     "summary",
@@ -183,10 +183,10 @@ pub const TASK: [&str; 17] = [
     "created",
 ];
 
-/// The columns of `journal_summary` a read joins.
+/// The columns a journal's read answers from its `summary` row.
 pub const JOURNAL: [&str; 5] = ["uid", "summary", "dtstart", "dtstart_tzid", "dtstart_value"];
 
-/// The columns of `file_summary` a read joins.
+/// The columns a file's read answers from its `summary` row.
 pub const FILE: [&str; 4] = ["name", "media_type", "size", "part"];
 
 /// The six columns every item read leads with.

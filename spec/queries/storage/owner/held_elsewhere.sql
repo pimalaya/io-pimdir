@@ -18,10 +18,10 @@ WHERE held.link_id = :link_id AND held.collection != :collection
         WHEN here.kind != 'message/rfc822' THEN 1
         ELSE EXISTS (
           SELECT 1 FROM items AS mine
-          JOIN mail_summary AS own ON own.item = mine.id
-          JOIN mail_summary AS theirs ON theirs.item = held.id
+          JOIN summary AS own ON own.item = mine.id AND own.component = 'mail'
+          JOIN summary AS theirs ON theirs.item = held.id AND theirs.component = 'mail'
           WHERE mine.collection = :collection AND mine.link_id = :link_id
-            AND theirs.subject IS own.subject AND theirs.date IS own.date
+            AND theirs.title IS own.title AND theirs.date IS own.date
             AND theirs.sender IS own.sender)
       END
 LIMIT 1;

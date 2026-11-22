@@ -9,7 +9,7 @@ SELECT i.collection, i.seq, i.link_id,
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
                    || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
-       s.name, s.media_type, s.size, s.part
+       s.title AS name, s.media_type, s.size, s.part
 FROM (SELECT DISTINCT value AS id FROM temp.param WHERE slot = 'collections') p
 JOIN items i ON i.rowid IN (
   SELECT x.rowid FROM items x
@@ -17,9 +17,9 @@ JOIN items i ON i.rowid IN (
     AND (x.sort_key, x.seq) >= (coalesce(:after_key, ''), coalesce(:after_seq, 0))
     AND (x.sort_key, x.seq, x.collection)
         > (coalesce(:after_key, ''), coalesce(:after_seq, 0), coalesce(:after_collection, ''))
-    AND EXISTS (SELECT 1 FROM file_summary n
-                WHERE n.item = x.id
-                  AND n.name LIKE :pattern ESCAPE '\')
+    AND EXISTS (SELECT 1 FROM summary n
+                WHERE n.item = x.id AND n.component = 'file'
+                  AND n.title LIKE :pattern ESCAPE '\')
   ORDER BY x.sort_key, x.seq LIMIT :limit)
-JOIN file_summary s ON s.item = i.id
+JOIN summary s ON s.item = i.id AND s.component = 'file'
 ORDER BY i.sort_key, i.seq, i.collection LIMIT :limit;

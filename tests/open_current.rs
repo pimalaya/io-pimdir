@@ -129,7 +129,7 @@ fn a_cancel_leaves_a_store_of_another_draft_as_it_was() {
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch(
         "UPDATE store_meta SET format_version = 'storage-draft-18';
-         ALTER TABLE task_summary ADD COLUMN newer TEXT;",
+         ALTER TABLE summary ADD COLUMN newer TEXT;",
     )
     .unwrap();
     drop(conn);

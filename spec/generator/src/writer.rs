@@ -544,85 +544,92 @@ fn draw_seq(store: &Store, item: &Item) -> Result<i64> {
 
 fn write_summary(store: &Store, item: &Item, collection: &Value, link_id: &Value) -> Result<()> {
     let summary = &item.summary;
-    let name = format!("storage/owner/upsert_{}_summary", summary.table.stem());
-    let statement = store.spec().statement(&name)?;
+    let name = "storage/owner/upsert_summary";
+    let statement = store.spec().statement(name)?;
 
+    let mut unbound: BTreeSet<&str> = summary.columns.keys().map(String::as_str).collect();
     let mut values = Vec::new();
     for parameter in &statement.parameters {
         let value = match parameter.as_str() {
             "collection" => collection.clone(),
             "link_id" => link_id.clone(),
-            column => match summary.columns.get(column) {
-                Some(value) => value.clone(),
-                None => {
-                    return Err(Error::Parameters {
-                        statement: name,
-                        detail: format!("the model states no column {column}"),
-                    });
-                }
-            },
+            "component" => Value::Text(String::from(summary.table.stem())),
+            parameter => {
+                let column = summary_column(summary.table, parameter);
+                unbound.remove(column);
+                summary.get(column)
+            }
         };
         values.push((parameter.as_str(), value));
+    }
+    if let Some(column) = unbound.first() {
+        return Err(Error::Parameters {
+            statement: String::from(name),
+            detail: format!("no parameter takes the model's column {column}"),
+        });
     }
     let bound: Vec<(&str, &dyn ToSql)> = values
         .iter()
         .map(|(name, value)| (*name, value as &dyn ToSql))
         .collect();
-    store.run(&name, &bound)?;
+    store.run(name, &bound)?;
 
     let key = [
         ("collection", collection as &dyn ToSql),
         ("link_id", link_id),
+        ("lists", &1_i64),
     ];
-    store.run("storage/owner/replace_addresses", &key)?;
-    for address in &item.addresses {
+    store.run("storage/owner/replace_values", &key)?;
+
+    let addresses = item.addresses.iter().map(|address| {
+        (
+            address.role.as_str(),
+            address.position,
+            address.address.as_str(),
+            address.name.as_deref(),
+        )
+    });
+    let in_reply_to = summary
+        .in_reply_to
+        .iter()
+        .enumerate()
+        .map(|(position, id)| ("in-reply-to", position as i64, id.as_str(), None));
+    let categories = summary
+        .categories
+        .iter()
+        .enumerate()
+        .map(|(position, value)| ("category", position as i64, value.as_str(), None));
+    for (role, position, value, name) in addresses.chain(in_reply_to).chain(categories) {
         run(
             store,
-            "storage/owner/insert_address",
+            "storage/owner/insert_value",
             &[
                 ("collection", collection),
                 ("link_id", link_id),
-                ("role", &Value::Text(address.role.clone())),
-                ("position", &Value::Integer(address.position)),
-                ("address", &Value::Text(address.address.clone())),
-                ("name", &text(address.name.as_deref())),
+                ("role", &Value::Text(String::from(role))),
+                ("position", &Value::Integer(position)),
+                ("value", &Value::Text(String::from(value))),
+                ("name", &text(name)),
             ],
         )?;
     }
 
-    if summary.table == Table::Mail {
-        store.run("storage/owner/replace_in_reply_to", &key)?;
-        for (position, id) in summary.in_reply_to.iter().enumerate() {
-            run(
-                store,
-                "storage/owner/insert_in_reply_to",
-                &[
-                    ("collection", collection),
-                    ("link_id", link_id),
-                    ("position", &Value::Integer(position as i64)),
-                    ("message_id", &Value::Text(id.clone())),
-                ],
-            )?;
-        }
-    }
-
-    if summary.table == Table::Task {
-        store.run("storage/owner/replace_categories", &key)?;
-        for (position, value) in summary.categories.iter().enumerate() {
-            run(
-                store,
-                "storage/owner/insert_category",
-                &[
-                    ("collection", collection),
-                    ("link_id", link_id),
-                    ("position", &Value::Integer(position as i64)),
-                    ("value", &Value::Text(value.clone())),
-                ],
-            )?;
-        }
-    }
-
     Ok(())
+}
+
+/// The model's column of a `table` row that the `upsert_summary`
+/// parameter `parameter` takes: the model keeps each kind's own names
+/// for the unified `uid`, `title` and `card_kind`.
+fn summary_column(table: Table, parameter: &str) -> &str {
+    match (table, parameter) {
+        (Table::Mail, "uid") => "message_id",
+        (Table::Mail, "title") => "subject",
+        (Table::Contact, "title") => "fn",
+        (Table::Contact, "card_kind") => "kind",
+        (Table::File, "title") => "name",
+        (_, "title") => "summary",
+        (_, parameter) => parameter,
+    }
 }
 
 /// A flag set as its three columns hold it (STORAGE §13): whether it is

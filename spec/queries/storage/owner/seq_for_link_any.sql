@@ -12,9 +12,9 @@
 SELECT held.seq FROM items AS held
 JOIN collections AS there ON there.id = held.collection
 JOIN collections AS here ON here.id = :collection
-LEFT JOIN mail_summary AS m ON m.item = held.id
+LEFT JOIN summary AS m ON m.item = held.id AND m.component = 'mail'
 WHERE held.link_id = :link_id AND there.kind = here.kind
   AND (here.kind != 'message/rfc822'
-       OR (m.item IS NOT NULL AND m.subject IS :subject AND m.date IS :date AND m.sender IS :sender))
+       OR (m.item IS NOT NULL AND m.title IS :subject AND m.date IS :date AND m.sender IS :sender))
 ORDER BY held.seq
 LIMIT 1;

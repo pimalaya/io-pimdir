@@ -17,7 +17,7 @@ SELECT i.collection, i.seq, i.link_id,
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
                    || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
-       s.message_id, s.subject, s.sender, s.sender_name, s.date, s.size, s.attachment
+       s.uid AS message_id, s.title AS subject, s.sender, s.sender_name, s.date, s.size, s.attachment
 FROM (SELECT DISTINCT value AS id FROM temp.param WHERE slot = 'collections') p
 JOIN items i ON i.rowid IN (
   SELECT x.rowid FROM items x
@@ -29,8 +29,8 @@ JOIN items i ON i.rowid IN (
     AND (:seen IS NULL
          OR :seen = (x.marks & 1))
     AND (:attachment IS NULL
-         OR EXISTS (SELECT 1 FROM mail_summary a
+         OR EXISTS (SELECT 1 FROM summary a
                     WHERE a.item = x.id AND a.attachment = :attachment))
   ORDER BY x.sort_key DESC, x.seq DESC LIMIT :limit)
-LEFT JOIN mail_summary s ON s.item = i.id
+LEFT JOIN summary s ON s.item = i.id AND s.component = 'mail'
 ORDER BY i.sort_key DESC, i.seq DESC, i.collection DESC LIMIT :limit;

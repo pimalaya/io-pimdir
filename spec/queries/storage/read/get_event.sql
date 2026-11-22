@@ -8,7 +8,7 @@ SELECT i.seq, i.link_id,
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
                    || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
-       s.uid, s.summary, s.location, s.dtstart, s.dtstart_tzid, s.dtstart_value,
+       s.uid, s.title AS summary, s.location, s.dtstart, s.dtstart_tzid, s.dtstart_value,
        s.dtend, s.recurring, s.until
-FROM items i LEFT JOIN event_summary s ON s.item = i.id
+FROM items i LEFT JOIN summary s ON s.item = i.id AND s.component = 'event'
 WHERE i.collection = :collection AND i.seq = :seq AND i.deleted = 0;

@@ -19,7 +19,7 @@ use crate::{
 /// The kind of every file collection (STORAGE §14.3).
 pub const KIND: &str = "application/octet-stream";
 
-/// The `file_summary` row of one placement of a file.
+/// The `summary` row of one placement of a file.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirFileSummary {
     /// The file's name in this collection; empty when none.

@@ -42,18 +42,14 @@ fn refused_by_every_profile(dir: &std::path::Path, object: &str) {
 
 #[test]
 fn a_store_missing_a_canonical_table_is_refused_by_every_profile() {
-    let dir = damaged("DROP TABLE item_address");
-    refused_by_every_profile(dir.path(), "item_address");
+    let dir = damaged("DROP TABLE summary_value");
+    refused_by_every_profile(dir.path(), "summary_value");
 }
 
 #[test]
 fn a_column_dropped_is_a_damage_too() {
-    let dir = damaged(
-        "DROP INDEX task_summary_by_parent;
-         DROP INDEX task_summary_by_mid;
-         ALTER TABLE task_summary DROP COLUMN mid;",
-    );
-    refused_by_every_profile(dir.path(), "task_summary");
+    let dir = damaged("ALTER TABLE summary DROP COLUMN title;");
+    refused_by_every_profile(dir.path(), "summary");
 }
 
 #[test]

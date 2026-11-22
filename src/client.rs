@@ -2903,15 +2903,13 @@ mod tests {
         for collection in ["a", "b", "c"] {
             rows(
                 &conn,
-                sql::LOAD_MAIL_SUMMARIES_BY_LINK,
+                sql::LOAD_SUMMARIES_BY_LINK,
                 named_params! { ":collection": collection },
                 |_| Ok(()),
             )
             .unwrap();
         }
-        let statement = conn
-            .prepare_cached(sql::LOAD_MAIL_SUMMARIES_BY_LINK)
-            .unwrap();
+        let statement = conn.prepare_cached(sql::LOAD_SUMMARIES_BY_LINK).unwrap();
         assert_eq!(statement.get_status(StatementStatus::RePrepare), 0);
     }
 }

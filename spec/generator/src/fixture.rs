@@ -4,7 +4,8 @@
 //! vectors/summaries.json pins for each: the structure cases of Annex A
 //! (encoded words, folding, broken dates, raw octets, charsets, time
 //! zones, overrides, the walk's bounds), derived twice already, which the
-//! generator files as they stand rather than render.
+//! generator files as they stand rather than render. A case's `table` is
+//! the vectors' logical name for its component, `mail_summary` for `mail`.
 
 use std::{collections::BTreeSet, fs};
 

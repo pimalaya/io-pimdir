@@ -7,7 +7,10 @@ use alloc::{string::String, vec::Vec};
 use rusqlite::{Connection, OptionalExtension, named_params};
 
 use crate::{
-    client::{PimdirError, bind_list, rows, write::tables_of},
+    client::{
+        PimdirError, rows,
+        write::{PimdirSummaryValue, attach_value, tables_of},
+    },
     sql,
     summary::{PimdirAddress, PimdirAddressRole, PimdirSummary},
 };
@@ -47,34 +50,21 @@ pub(crate) fn summary(
     };
 
     let item = named_params! { ":collection": collection, ":link_id": link_id };
-    let collection = named_params! { ":collection": collection };
-    match &mut found {
-        Some(PimdirSummary::Mail(mail)) => {
-            bind_list(conn, "links", [&link_id])?;
-            mail.in_reply_to = rows(conn, sql::LOAD_IN_REPLY_TO_BY_LINK, collection, |r| {
-                r.get(2)
-            })?;
-        }
-        Some(PimdirSummary::Task(task)) => {
-            bind_list(conn, "links", [&link_id])?;
-            task.categories = rows(conn, sql::LOAD_CATEGORIES_BY_LINK, collection, |r| r.get(2))?;
-        }
-        _ => (),
-    }
-
-    let mut addresses = Vec::new();
-    let read = rows(conn, sql::LOAD_ADDRESSES, item, |r| {
+    let read = rows(conn, sql::LOAD_VALUES, item, |r| {
         Ok((
             r.get::<_, String>(0)?,
-            PimdirAddress {
-                address: r.get(2)?,
-                name: r.get(3)?,
-            },
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
-    for (role, address) in read {
-        if let Some(role) = PimdirAddressRole::parse(&role) {
-            addresses.push((role, address));
+    let mut addresses = Vec::new();
+    for (role, value, name) in read {
+        match (PimdirSummaryValue::of(&role, value, name), &mut found) {
+            (Some(PimdirSummaryValue::Address(role, address)), _) => {
+                addresses.push((role, address));
+            }
+            (Some(value), Some(summary)) => attach_value(summary, value),
+            _ => {}
         }
     }
 

@@ -578,7 +578,7 @@ fn a_copy_of_a_body_held_with_no_mark_takes_the_columns_a_walk_gives() {
     // the body and recorded no stand-in.
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
     conn.execute_batch(
-        "UPDATE mail_summary SET attachment = NULL, invitation = NULL;
+        "UPDATE summary SET attachment = NULL, invitation = NULL WHERE component = 'mail';
          DELETE FROM item_reference WHERE role = 'attachment';",
     )
     .unwrap();

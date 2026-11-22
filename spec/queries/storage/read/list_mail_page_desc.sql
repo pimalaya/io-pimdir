@@ -11,8 +11,8 @@ SELECT i.seq, i.link_id,
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
                    || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
-       s.message_id, s.subject, s.sender, s.sender_name, s.date, s.size, s.attachment
-FROM items i LEFT JOIN mail_summary s ON s.item = i.id
+       s.uid AS message_id, s.title AS subject, s.sender, s.sender_name, s.date, s.size, s.attachment
+FROM items i LEFT JOIN summary s ON s.item = i.id AND s.component = 'mail'
 WHERE i.collection = :collection AND i.deleted = 0
   AND (i.sort_key, i.seq) < (coalesce(:after_key, x''), coalesce(:after_seq, 0))
 ORDER BY i.sort_key DESC, i.seq DESC LIMIT :limit;

@@ -8,8 +8,8 @@ SELECT DISTINCT 'message/rfc822', mi.link_id, 'text/vcard', ci.link_id, 'sender'
        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 FROM items ci
 JOIN collections cc ON cc.id = ci.collection AND cc.kind = 'text/vcard'
-JOIN item_address c ON c.item = ci.id AND c.role = 'email'
-JOIN item_address m ON m.address = c.address AND m.role = 'from'
+JOIN summary_value c ON c.item = ci.id AND c.role = 'email'
+JOIN summary_value m ON m.value = c.value AND m.role = 'from'
 JOIN items mi ON mi.id = m.item AND mi.deleted = 0
 JOIN collections mc ON mc.id = mi.collection AND mc.kind = 'message/rfc822'
 WHERE ci.link_id BETWEEN coalesce(:link_id, '') AND coalesce(:link_id, x'') AND ci.deleted = 0

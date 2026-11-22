@@ -189,7 +189,8 @@ WHERE collection = :collection AND seq = :seq;"#;
 /// Every category a task states, each once: what `category:` folds in
 /// Rust and compares with its folded value (SEARCH §8), so no SQL function
 /// folds the stored side.
-pub const TASK_CATEGORY_VALUES: &str = r#"SELECT DISTINCT value FROM store.task_category;"#;
+pub const TASK_CATEGORY_VALUES: &str =
+    r#"SELECT DISTINCT value FROM store.summary_value WHERE role = 'category';"#;
 
 /// The mail placements the index holds for one message id, `count` zero
 /// for a message no placement holds: how many, the lowest sort key, the
@@ -210,9 +211,9 @@ ORDER BY p.collection, p.seq LIMIT 1;"#;
 
 /// The first `In-Reply-To` id of a message id's summary (STORAGE Annex
 /// A.1), the parent of a message the index holds no body of (SEARCH §9).
-pub const MESSAGE_IN_REPLY_TO: &str = r#"SELECT r.message_id FROM placement p
+pub const MESSAGE_IN_REPLY_TO: &str = r#"SELECT r.value FROM placement p
 JOIN store.items i ON i.collection = p.collection AND i.link_id = p.link_id
-JOIN store.mail_in_reply_to r ON r.item = i.id
+JOIN store.summary_value r ON r.item = i.id AND r.role = 'in-reply-to'
 WHERE p.link_id = :link_id
 ORDER BY p.collection, p.seq, r.position LIMIT 1;"#;
 

@@ -201,20 +201,21 @@ pub fn synced_by<S: AsRef<str>>(sources: &[S]) -> BTreeMap<String, SourceState> 
         .collect()
 }
 
-/// The table a summary row lives in (STORAGE §4.3).
+/// The component of a `summary` row (STORAGE §4.3), which names the
+/// columns it owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Table {
-    /// `mail_summary`.
+    /// `mail`.
     Mail,
-    /// `contact_summary`.
+    /// `contact`.
     Contact,
-    /// `event_summary`.
+    /// `event`.
     Event,
-    /// `task_summary`.
+    /// `task`.
     Task,
-    /// `journal_summary`.
+    /// `journal`.
     Journal,
-    /// `file_summary`.
+    /// `file`.
     File,
 }
 
@@ -229,8 +230,8 @@ impl Table {
         }
     }
 
-    /// The suffix of its statements' names, `mail` for
-    /// `upsert_mail_summary`.
+    /// Its `component` value, also the suffix of its reads' names, `mail`
+    /// for `get_mail`.
     pub fn stem(&self) -> &'static str {
         match self {
             Self::Mail => "mail",
@@ -247,13 +248,17 @@ impl Table {
 /// derives.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
-    /// Its table.
+    /// Its component.
     pub table: Table,
-    /// Its columns but `item`, by name.
+    /// Its columns but `item` and `component`, by name, under the kind's
+    /// own names: `message_id` or `uid` for `uid`, `subject`, `fn`,
+    /// `summary` or `name` for `title`, a card's `kind` for `card_kind`.
     pub columns: BTreeMap<String, Value>,
-    /// A message's `In-Reply-To` ids, in document order.
+    /// A message's `In-Reply-To` ids, in document order, its
+    /// `summary_value` rows under `in-reply-to`.
     pub in_reply_to: Vec<String>,
-    /// A task's categories, in document order.
+    /// A task's categories, in document order, its `summary_value` rows
+    /// under `category`.
     pub categories: Vec<String>,
 }
 
@@ -279,7 +284,8 @@ impl Summary {
     }
 }
 
-/// One row of `item_address` (STORAGE Annex A.6).
+/// One `summary_value` row naming a person (STORAGE Annex A.6), its
+/// `value` the address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Address {
     /// Its role.

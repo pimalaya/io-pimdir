@@ -440,47 +440,27 @@ fn answer(reader: &PimdirReader, expectation: &Expectation) -> Result<Option<Ans
             columns.extend(["retained_at", "retained_by", "size"]);
             Answer { columns, rows }
         }
-        "load_in_reply_to"
-        | "load_in_reply_to_by_link"
-        | "load_categories"
-        | "load_categories_by_link" => {
+        "load_values_by_collection" | "load_values_by_link" => {
             let held = held(reader, &at.string("collection"))?;
             let rows = held
                 .iter()
                 .flat_map(|(link, summary)| {
-                    let values = match (name.starts_with("load_in_reply_to"), summary) {
-                        (true, Some(PimdirSummary::Mail(mail))) => mail.in_reply_to.clone(),
-                        (false, Some(PimdirSummary::Task(task))) => task.categories.clone(),
-                        _ => Vec::new(),
-                    };
-                    values
-                        .into_iter()
-                        .enumerate()
-                        .map(move |(position, value)| {
-                            vec![
-                                Value::Text(link.clone()),
-                                Value::Integer(position as i64),
-                                Value::Text(value),
-                            ]
-                        })
+                    values(summary.as_ref()).into_iter().map(move |row| {
+                        let mut cells = vec![Value::Text(link.clone())];
+                        cells.extend(row);
+                        cells
+                    })
                 })
                 .collect();
-            match name.starts_with("load_in_reply_to") {
-                true => Answer::new(&["link_id", "position", "message_id"], rows),
-                false => Answer::new(&["link_id", "position", "value"], rows),
-            }
+            Answer::new(&["link_id", "role", "position", "value", "name"], rows)
         }
-        "load_addresses" => {
+        "load_values" => {
             let held = held(reader, &at.string("collection"))?;
             let summary = held.get(&at.string("link_id")).cloned().flatten();
-            let mut rows = addresses(summary.as_ref());
-            rows.sort_by(|a, b| match (&a[0], &a[1], &b[0], &b[1]) {
-                (Value::Text(ra), Value::Integer(pa), Value::Text(rb), Value::Integer(pb)) => {
-                    (ra, pa).cmp(&(rb, pb))
-                }
-                _ => Ordering::Equal,
-            });
-            Answer::new(&["role", "position", "address", "name"], rows)
+            Answer::new(
+                &["role", "position", "value", "name"],
+                values(summary.as_ref()),
+            )
         }
         "get_item" => Answer::new(
             &ITEM,
@@ -1365,7 +1345,36 @@ fn held(
     Ok(held)
 }
 
-/// The `item_address` rows a summary's people stand for (Annex A.6).
+/// The `summary_value` rows a summary's people, `In-Reply-To` ids and
+/// categories stand for (Annex A.1, A.4, A.6), by role bytewise, then
+/// position.
+fn values(summary: Option<&PimdirSummary>) -> Vec<Vec<Value>> {
+    let lists = match summary {
+        Some(PimdirSummary::Mail(mail)) => vec![("in-reply-to", &mail.in_reply_to)],
+        Some(PimdirSummary::Task(task)) => vec![("category", &task.categories)],
+        _ => Vec::new(),
+    };
+    let mut rows = addresses(summary);
+    for (role, values) in lists {
+        for (position, value) in values.iter().enumerate() {
+            rows.push(vec![
+                Value::Text(String::from(role)),
+                Value::Integer(position as i64),
+                Value::Text(value.clone()),
+                Value::Null,
+            ]);
+        }
+    }
+    rows.sort_by(|a, b| match (&a[0], &a[1], &b[0], &b[1]) {
+        (Value::Text(ra), Value::Integer(pa), Value::Text(rb), Value::Integer(pb)) => {
+            (ra, pa).cmp(&(rb, pb))
+        }
+        _ => Ordering::Equal,
+    });
+    rows
+}
+
+/// The `summary_value` rows a summary's people stand for (Annex A.6).
 fn addresses(summary: Option<&PimdirSummary>) -> Vec<Vec<Value>> {
     let mut roles: Vec<(&str, Vec<&PimdirAddress>)> = Vec::new();
     match summary {

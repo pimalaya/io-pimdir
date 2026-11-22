@@ -12,7 +12,7 @@ SELECT count(*) AS messages, coalesce(sum(size), 0) AS bytes, count(*) - count(s
 FROM (
   SELECT i.seq, max(s.size) AS size
   FROM items i
-  LEFT JOIN mail_summary s ON s.item = i.id
+  LEFT JOIN summary s ON s.item = i.id AND s.component = 'mail'
   WHERE i.collection IN (SELECT value FROM temp.param WHERE slot = 'collections') AND i.deleted = 0
     AND (:seen IS NULL
          OR :seen = (i.marks & 1))

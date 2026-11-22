@@ -513,40 +513,8 @@ impl Oracle<'_> {
 
         let mut lists: Vec<&Item> = rows.clone();
         lists.sort_by(|a, b| a.link_id.cmp(&b.link_id));
-        let in_reply_to = lists
-            .iter()
-            .flat_map(|item| {
-                item.summary
-                    .in_reply_to
-                    .iter()
-                    .enumerate()
-                    .map(|(position, id)| {
-                        vec![
-                            Value::Text(item.link_id.clone()),
-                            Value::Integer(position as i64),
-                            Value::Text(id.clone()),
-                        ]
-                    })
-            })
-            .collect();
-        self.expect("load_in_reply_to", &key, in_reply_to);
-        let categories = lists
-            .iter()
-            .flat_map(|item| {
-                item.summary
-                    .categories
-                    .iter()
-                    .enumerate()
-                    .map(|(position, value)| {
-                        vec![
-                            Value::Text(item.link_id.clone()),
-                            Value::Integer(position as i64),
-                            Value::Text(value.clone()),
-                        ]
-                    })
-            })
-            .collect();
-        self.expect("load_categories", &key, categories);
+        let values = lists.iter().flat_map(|item| linked_values(item)).collect();
+        self.expect("storage/owner/load_values_by_collection", &key, values);
 
         Ok(())
     }
@@ -581,20 +549,7 @@ impl Oracle<'_> {
             vec![vec![Value::Integer(item.seq)]],
         );
 
-        let mut addresses = item.addresses.clone();
-        addresses.sort_by(|a, b| (a.role.as_str(), a.position).cmp(&(b.role.as_str(), b.position)));
-        let rows = addresses
-            .into_iter()
-            .map(|address| {
-                vec![
-                    Value::Text(address.role),
-                    Value::Integer(address.position),
-                    Value::Text(address.address),
-                    text(address.name.as_deref()),
-                ]
-            })
-            .collect();
-        self.expect("load_addresses", &by_link, rows);
+        self.expect("load_values", &by_link, values(item));
 
         let bindings = item
             .bindings
@@ -1381,6 +1336,57 @@ fn as_text(value: &Value) -> &str {
         Value::Text(text) => text,
         _ => "",
     }
+}
+
+/// An item's `summary_value` rows as `load_values` answers them: role,
+/// position, value and name, by role bytewise, then position.
+pub(crate) fn values(item: &Item) -> Vec<Vec<Value>> {
+    let addresses = item.addresses.iter().map(|address| {
+        (
+            address.role.as_str(),
+            address.position,
+            address.address.as_str(),
+            address.name.as_deref(),
+        )
+    });
+    let in_reply_to = item
+        .summary
+        .in_reply_to
+        .iter()
+        .enumerate()
+        .map(|(position, id)| ("in-reply-to", position as i64, id.as_str(), None));
+    let categories = item
+        .summary
+        .categories
+        .iter()
+        .enumerate()
+        .map(|(position, value)| ("category", position as i64, value.as_str(), None));
+    let mut values: Vec<_> = addresses.chain(in_reply_to).chain(categories).collect();
+    values.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    values
+        .into_iter()
+        .map(|(role, position, value, name)| {
+            vec![
+                Value::Text(String::from(role)),
+                Value::Integer(position),
+                Value::Text(String::from(value)),
+                text(name),
+            ]
+        })
+        .collect()
+}
+
+/// An item's `summary_value` rows as the `load_values_by_` statements
+/// answer them, its link id first.
+pub(crate) fn linked_values(item: &Item) -> Vec<Vec<Value>> {
+    values(item)
+        .into_iter()
+        .map(|row| {
+            let mut cells = vec![Value::Text(item.link_id.clone())];
+            cells.extend(row);
+            cells
+        })
+        .collect()
 }
 
 fn hash(name: &Option<ObjectName>) -> Value {

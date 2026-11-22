@@ -18,7 +18,7 @@
 -- the seqs evicted.
 DELETE FROM items
 WHERE collection = :collection AND deleted = 0 AND conflicted = 0
-  AND id IN (SELECT item FROM mail_summary WHERE date < :before)
+  AND id IN (SELECT item FROM summary WHERE date < :before)
   AND EXISTS (SELECT 1 FROM bindings b
               WHERE b.item = items.id)
   AND NOT EXISTS (SELECT 1 FROM bindings b

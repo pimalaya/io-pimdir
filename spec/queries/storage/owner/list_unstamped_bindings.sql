@@ -16,7 +16,7 @@ SELECT b.handle, i.link_id
 FROM bindings b
 JOIN items i ON i.id = b.item
 JOIN sources r ON r.collection = b.collection AND r.source = b.source
-LEFT JOIN mail_summary s ON s.item = b.item
+LEFT JOIN summary s ON s.item = b.item
 WHERE b.collection = :collection AND b.source = :source
   AND r.round_started_at IS NOT NULL
   AND b.round IS NOT r.round

@@ -9,7 +9,7 @@
 -- another account under the same key never does (§9.2).
 SELECT link_id, collection, seq, name, media_type, size, part, object_hash
 FROM (
-  SELECT r.to_link_id AS link_id, i.collection, i.seq, s.name, s.media_type, s.size, s.part,
+  SELECT r.to_link_id AS link_id, i.collection, i.seq, s.title AS name, s.media_type, s.size, s.part,
          (SELECT o.hash FROM items h JOIN collections hc ON hc.id = h.collection JOIN objects o ON o.id = h.object
           WHERE h.link_id = r.to_link_id AND h.deleted = 0 AND h.object IS NOT NULL
             AND hc.kind = 'application/octet-stream' AND hc.account IS :account
@@ -18,7 +18,7 @@ FROM (
   FROM item_reference r
   JOIN items i ON i.link_id = r.to_link_id AND i.deleted = 0
   JOIN collections c ON c.id = i.collection AND c.kind = r.to_kind AND c.account IS :account
-  LEFT JOIN file_summary s ON s.item = i.id
+  LEFT JOIN summary s ON s.item = i.id AND s.component = 'file'
   WHERE r.from_kind = 'message/rfc822' AND r.from_link_id = :link_id
     AND r.role = 'attachment' AND r.to_kind = 'application/octet-stream'
   GROUP BY r.to_link_id

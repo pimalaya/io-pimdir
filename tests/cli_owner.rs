@@ -35,7 +35,7 @@ fn columns(dir: &Path, table: &str) -> Vec<String> {
 }
 
 /// A store holding one queued row, marked as a later draft's, whose
-/// `task_summary` carries a column that draft added; answers the row's id.
+/// `summary` carries a column that draft added; answers the row's id.
 fn newer_store(dir: &Path) -> i64 {
     let store = PimdirStore::open(dir).unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
@@ -57,7 +57,7 @@ fn newer_store(dir: &Path) -> i64 {
     let conn = rusqlite::Connection::open(dir.join("pimdir.db")).unwrap();
     conn.execute_batch(
         "UPDATE store_meta SET format_version = 'storage-draft-18';
-         ALTER TABLE task_summary ADD COLUMN newer TEXT;",
+         ALTER TABLE summary ADD COLUMN newer TEXT;",
     )
     .unwrap();
     id
@@ -81,16 +81,16 @@ fn pimdir(dir: &Path, args: &[&str]) -> (i32, Value) {
 fn an_owner_verb_leaves_a_store_of_another_revision_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let id = newer_store(dir.path());
-    let before = columns(dir.path(), "task_summary");
+    let before = columns(dir.path(), "summary");
     assert!(before.iter().any(|column| column == "newer"));
 
     let (cancel, _) = pimdir(dir.path(), &["queue", "cancel", &id.to_string(), "--yes"]);
     assert_ne!(cancel, 0, "queue cancel refused");
-    assert_eq!(columns(dir.path(), "task_summary"), before, "not rebuilt");
+    assert_eq!(columns(dir.path(), "summary"), before, "not rebuilt");
 
     let (gc, _) = pimdir(dir.path(), &["gc"]);
     assert_ne!(gc, 0, "gc refused");
-    assert_eq!(columns(dir.path(), "task_summary"), before, "not rebuilt");
+    assert_eq!(columns(dir.path(), "summary"), before, "not rebuilt");
 }
 
 /// A verb that enqueues then drains refuses a store of another draft at the

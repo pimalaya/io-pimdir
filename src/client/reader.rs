@@ -36,8 +36,8 @@ use crate::{
         },
         rows, schema,
         write::{
-            PimdirSummaryTable, attach_address, attach_list_value, binding_from_row, list_sql,
-            load_addresses, load_list, load_summaries, read_hub, tables_of,
+            PimdirSummaryTable, attach_value, binding_from_row, load_summaries, load_values,
+            read_hub, tables_of,
         },
     },
     codec::{self, PimdirAction, PimdirActionHandle},
@@ -1100,7 +1100,7 @@ impl PimdirReader {
     /// source mail (its `mid`) was answered. Mail under the `sent` or
     /// `drafts` role is the person's own and answers nothing.
     ///
-    /// Ids compare bare and exactly, as Annex A.1 stores `mail_in_reply_to`
+    /// Ids compare bare and exactly, as Annex A.1 stores In-Reply-To ids
     /// and A.4 a task's `mid`: each one given is trimmed and stripped of one
     /// pair of enclosing angle brackets, an empty one dropped. The answer
     /// holds each id answered once, bare, in code point order. A seek per id.
@@ -2175,19 +2175,20 @@ impl PimdirReader {
             "links",
             items.iter().map(|item| item.link_id.0.as_str()),
         )?;
-        for table in &tables {
-            let statement = table.load_sql(true);
-            for (link, summary) in load_summaries(&self.conn, statement, *table, collection)? {
-                if let Some(item) = items.iter_mut().find(|item| item.link_id == link) {
-                    item.summary = Some(summary);
-                }
+        for (link, summary) in load_summaries(&self.conn, sql::LOAD_SUMMARIES_BY_LINK, collection)?
+        {
+            if !tables.contains(&PimdirSummaryTable::of(&summary)) {
+                continue;
+            }
+            if let Some(item) = items.iter_mut().find(|item| item.link_id == link) {
+                item.summary = Some(summary);
             }
         }
         self.attach_addresses(collection, &tables, items)
     }
 
     /// Joins the address rows and the lists (§4.4) onto a page's
-    /// summaries, one query each per page.
+    /// summaries, one query per page.
     fn attach_addresses(
         &self,
         collection: &str,
@@ -2202,26 +2203,13 @@ impl PimdirReader {
             "links",
             items.iter().map(|item| item.link_id.0.as_str()),
         )?;
-        for (link, role, address) in
-            load_addresses(&self.conn, sql::LOAD_ADDRESSES_BY_LINK, collection)?
-        {
+        for (link, value) in load_values(&self.conn, sql::LOAD_VALUES_BY_LINK, collection)? {
             if let Some(summary) = items
                 .iter_mut()
                 .find(|item| item.link_id == link)
                 .and_then(|item| item.summary.as_mut())
             {
-                attach_address(summary, role, address);
-            }
-        }
-        for statement in list_sql(tables, true) {
-            for (link, value) in load_list(&self.conn, statement, collection)? {
-                if let Some(summary) = items
-                    .iter_mut()
-                    .find(|item| item.link_id == link)
-                    .and_then(|item| item.summary.as_mut())
-                {
-                    attach_list_value(summary, value);
-                }
+                attach_value(summary, value);
             }
         }
         Ok(())

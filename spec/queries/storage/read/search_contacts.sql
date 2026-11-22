@@ -14,7 +14,7 @@ SELECT i.collection, i.seq, i.link_id,
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
                    || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
-       s.uid, s.fn, s.kind, s.org
+       s.uid, s.title AS fn, s.card_kind AS kind, s.org
 FROM (SELECT DISTINCT value AS id FROM temp.param WHERE slot = 'collections') p
 JOIN items i ON i.rowid IN (
   SELECT x.rowid FROM items x
@@ -22,12 +22,12 @@ JOIN items i ON i.rowid IN (
     AND (x.sort_key, x.seq) >= (coalesce(:after_key, ''), coalesce(:after_seq, 0))
     AND (x.sort_key, x.seq, x.collection)
         > (coalesce(:after_key, ''), coalesce(:after_seq, 0), coalesce(:after_collection, ''))
-    AND EXISTS (SELECT 1 FROM contact_summary c
-                WHERE c.item = x.id
-                  AND (c.fn LIKE :pattern ESCAPE '\'
-                       OR EXISTS (SELECT 1 FROM item_address a
+    AND EXISTS (SELECT 1 FROM summary c
+                WHERE c.item = x.id AND c.component = 'contact'
+                  AND (c.title LIKE :pattern ESCAPE '\'
+                       OR EXISTS (SELECT 1 FROM summary_value a
                                   WHERE a.item = x.id
-                                    AND a.role = 'email' AND a.address LIKE :pattern ESCAPE '\')))
+                                    AND a.role = 'email' AND a.value LIKE :pattern ESCAPE '\')))
   ORDER BY x.sort_key, x.seq LIMIT :limit)
-JOIN contact_summary s ON s.item = i.id
+JOIN summary s ON s.item = i.id AND s.component = 'contact'
 ORDER BY i.sort_key, i.seq, i.collection LIMIT :limit;

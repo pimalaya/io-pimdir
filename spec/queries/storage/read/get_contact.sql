@@ -8,6 +8,6 @@ SELECT i.seq, i.link_id,
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
                    || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
-       s.uid, s.fn, s.kind, s.org
-FROM items i LEFT JOIN contact_summary s ON s.item = i.id
+       s.uid, s.title AS fn, s.card_kind AS kind, s.org
+FROM items i LEFT JOIN summary s ON s.item = i.id AND s.component = 'contact'
 WHERE i.collection = :collection AND i.seq = :seq AND i.deleted = 0;

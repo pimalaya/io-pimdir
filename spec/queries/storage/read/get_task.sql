@@ -8,8 +8,8 @@ SELECT i.seq, i.link_id,
                    || CASE WHEN i.marks & 16 THEN '\Deleted ' ELSE '' END
                    || i.keywords) END AS flags,
        (SELECT o.hash FROM objects o WHERE o.id = i.object) AS object_hash, i.sort_key, i.level,
-       s.uid, s.summary, s.dtstart, s.dtstart_tzid, s.dtstart_value,
+       s.uid, s.title AS summary, s.dtstart, s.dtstart_tzid, s.dtstart_value,
        s.due, s.due_tzid, s.due_value, s.status, s.completed, s.percent, s.recurring, s.until,
        s.priority, s.parent, s.mid, s.created
-FROM items i LEFT JOIN task_summary s ON s.item = i.id
+FROM items i LEFT JOIN summary s ON s.item = i.id AND s.component = 'task'
 WHERE i.collection = :collection AND i.seq = :seq AND i.deleted = 0;

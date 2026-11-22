@@ -13,6 +13,6 @@ WHERE i.collection IN (SELECT value FROM temp.param WHERE slot = 'collections') 
   AND (:seen IS NULL
        OR :seen = (i.marks & 1))
   AND (:attachment IS NULL
-       OR EXISTS (SELECT 1 FROM mail_summary s
+       OR EXISTS (SELECT 1 FROM summary s
                   WHERE s.item = i.id AND s.attachment = :attachment))
   AND i.sort_key >= coalesce(:since, '');

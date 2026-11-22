@@ -102,10 +102,12 @@ fn db(dir: &Path) -> Connection {
 fn as_written_under(dir: &Path, revision: i64) {
     db(dir)
         .execute_batch(&format!(
-            "UPDATE mail_summary SET subject = 'stale', date = NULL, sender_name = 'stale'
-             WHERE item IN (SELECT id FROM items WHERE link_id <> 'm299@example.org');
-             UPDATE item_address SET name = 'stale'
-             WHERE item IN (SELECT id FROM items WHERE link_id <> 'm299@example.org');
+            "UPDATE summary SET title = 'stale', date = NULL, sender_name = 'stale'
+             WHERE item IN (SELECT id FROM items WHERE link_id <> 'm299@example.org')
+               AND component = 'mail';
+             UPDATE summary_value SET name = 'stale'
+             WHERE item IN (SELECT id FROM items WHERE link_id <> 'm299@example.org')
+               AND role NOT IN ('in-reply-to', 'category');
              UPDATE items SET sort_key = '' WHERE link_id <> 'm299@example.org';
              UPDATE store_meta SET derivation = {revision};"
         ))
@@ -116,10 +118,10 @@ fn as_written_under(dir: &Path, revision: i64) {
 fn mail_row(dir: &Path, link: &str) -> (String, Option<String>, Option<String>, String, String) {
     db(dir)
         .query_row(
-            "SELECT m.subject, m.date, m.sender_name, a.name, i.sort_key
-             FROM mail_summary m
+            "SELECT m.title, m.date, m.sender_name, a.name, i.sort_key
+             FROM summary m
              JOIN items i ON i.id = m.item
-             JOIN item_address a ON a.item = m.item
+             JOIN summary_value a ON a.item = m.item
              WHERE i.link_id = ?1 AND a.role = 'from'",
             [link],
             |row| {
@@ -167,7 +169,7 @@ fn an_owner_re_derives_a_store_an_earlier_revision_wrote() {
         assert_eq!(mail_row(dir.path(), "m5@example.org"), fresh);
         let stale: i64 = db(dir.path())
             .query_row(
-                "SELECT count(*) FROM mail_summary WHERE subject = 'stale'",
+                "SELECT count(*) FROM summary WHERE title = 'stale'",
                 [],
                 |row| row.get(0),
             )
@@ -182,8 +184,8 @@ fn an_owner_re_derives_a_store_an_earlier_revision_wrote() {
 
         let (key, id): (String, String) = db(dir.path())
             .query_row(
-                "SELECT i.link_id, m.message_id FROM mail_summary m JOIN items i ON i.id = m.item \
-                 WHERE m.subject = '\u{20ac} 0'",
+                "SELECT i.link_id, m.uid FROM summary m JOIN items i ON i.id = m.item \
+                 WHERE m.title = '\u{20ac} 0'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

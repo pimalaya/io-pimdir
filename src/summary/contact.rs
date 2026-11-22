@@ -14,7 +14,7 @@ use crate::{
     summary::{PimdirAddress, PimdirDerivation, PimdirSummary, uid_key, unfold},
 };
 
-/// The `contact_summary` row of a card with the emails it carries.
+/// The `summary` row of a card with the emails it carries.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirContactSummary {
     /// The `UID` verbatim.

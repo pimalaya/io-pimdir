@@ -1,7 +1,7 @@
 //! # The store's own searches and sums
 //!
 //! What `count_mail_by_day`, `sum_mail`, the four `search_` statements and
-//! the `_by_link` list loads answer (STORAGE §14.1): a `LIKE` pattern
+//! `load_values_by_link` answer (STORAGE §14.1): a `LIKE` pattern
 //! matched as SQLite matches one, ASCII letters folded and `\` escaping,
 //! over each kind's collections merged in their order.
 
@@ -15,7 +15,7 @@ use rusqlite::types::Value;
 use crate::{
     error::Result,
     model::{Item, Kind, State, Table},
-    oracle::{Oracle, pages, row, seen_bit, text},
+    oracle::{Oracle, linked_values, pages, row, seen_bit, text},
     time::Instant,
 };
 
@@ -207,49 +207,13 @@ impl Oracle<'_> {
             links.push(Value::Text(String::from("absent@pimdir.invalid")));
             let mut sorted = rows.clone();
             sorted.sort_by(|a, b| a.link_id.cmp(&b.link_id));
-            let lists =
-                [
-                    (
-                        "load_in_reply_to_by_link",
-                        sorted
-                            .iter()
-                            .flat_map(|item| {
-                                item.summary
-                                    .in_reply_to
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(position, id)| {
-                                        vec![
-                                            Value::Text(item.link_id.clone()),
-                                            Value::Integer(position as i64),
-                                            Value::Text(id.clone()),
-                                        ]
-                                    })
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                    (
-                        "load_categories_by_link",
-                        sorted
-                            .iter()
-                            .flat_map(|item| {
-                                item.summary.categories.iter().enumerate().map(
-                                    |(position, value)| {
-                                        vec![
-                                            Value::Text(item.link_id.clone()),
-                                            Value::Integer(position as i64),
-                                            Value::Text(value.clone()),
-                                        ]
-                                    },
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                ];
-            for (name, rows) in lists {
-                self.expect(name, &[("collection", Value::Text(id.clone()))], rows);
-                self.last().slot = Some((String::from("links"), links.clone()));
-            }
+            let values = sorted.iter().flat_map(|item| linked_values(item)).collect();
+            self.expect(
+                "storage/owner/load_values_by_link",
+                &[("collection", Value::Text(id.clone()))],
+                values,
+            );
+            self.last().slot = Some((String::from("links"), links));
         }
 
         Ok(())

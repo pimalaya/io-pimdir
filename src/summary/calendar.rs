@@ -45,7 +45,7 @@ impl PimdirTime {
     }
 }
 
-/// The `event_summary` row of a `VEVENT` resource with its people.
+/// The `summary` row of a `VEVENT` resource with its people.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirEventSummary {
     /// The `UID` verbatim.
@@ -68,7 +68,7 @@ pub struct PimdirEventSummary {
     pub attendees: Vec<PimdirAddress>,
 }
 
-/// The `task_summary` row of a `VTODO` resource with its people.
+/// The `summary` row of a `VTODO` resource with its people.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirTaskSummary {
     /// The `UID` verbatim.
@@ -109,7 +109,7 @@ pub struct PimdirTaskSummary {
     pub contacts: Vec<PimdirAddress>,
 }
 
-/// The `journal_summary` row of a `VJOURNAL` resource with its people.
+/// The `summary` row of a `VJOURNAL` resource with its people.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirJournalSummary {
     /// The `UID` verbatim.

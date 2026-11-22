@@ -39,7 +39,7 @@ use crate::{
         PimdirError, PreparedCached, bind_list,
         blobs::PimdirBlobs,
         schema,
-        write::{kind_of, stated_size},
+        write::{kind_of, upsert_summary},
     },
     hub::{PimdirHub, PimdirHubItem},
     object::{PimdirHash, PimdirHeldObject, PimdirObject},
@@ -480,7 +480,7 @@ pub(crate) fn insert_file(
     Ok(seq)
 }
 
-/// Writes one placement's `file_summary` row.
+/// Writes one placement's summary row, a file's.
 pub(crate) fn upsert_file_summary(
     conn: &Connection,
     collection: &str,
@@ -488,16 +488,11 @@ pub(crate) fn upsert_file_summary(
     summary: &PimdirFileSummary,
 ) -> rusqlite::Result<()> {
     schema::record_derivation(conn)?;
-    conn.execute_cached(
-        sql::UPSERT_FILE_SUMMARY,
-        named_params! {
-            ":collection": collection,
-            ":link_id": link.as_str(),
-            ":name": summary.name,
-            ":media_type": summary.media_type,
-            ":size": summary.size.and_then(stated_size),
-            ":part": summary.part,
-        },
+    upsert_summary(
+        conn,
+        collection,
+        link,
+        &PimdirSummary::File(summary.clone()),
     )?;
     Ok(())
 }

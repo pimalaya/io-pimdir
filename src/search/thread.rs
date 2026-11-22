@@ -4,7 +4,7 @@
 //! message id a held message bears or names as its parent, present in the
 //! store or not, its `parent` the first `In-Reply-To` id, else the last
 //! `References` id, read from the body the index holds, else from the
-//! summary's `mail_in_reply_to`. A thread is a connected set over those
+//! summary's `in-reply-to` values. A thread is a connected set over those
 //! rows, named after its present member with the lowest
 //! `(sort_key, link_id)`.
 //!
@@ -214,7 +214,7 @@ impl<'a> Graph<'a> {
 
     /// The parent of a held message (SEARCH §9): from a body the index
     /// holds, what its headers name; from its summary's
-    /// `mail_in_reply_to` when it holds none, or none it can read. `None`
+    /// `in-reply-to` values when it holds none, or none it can read. `None`
     /// when the body is not read yet.
     fn parent(&mut self, node: &PimdirIndexMessage) -> Option<Option<String>> {
         if let Some(hash) = &node.hash {

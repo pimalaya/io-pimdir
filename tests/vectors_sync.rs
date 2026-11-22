@@ -323,8 +323,11 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             .as_object()
             .unwrap()
             .iter()
-            .partition(|(column, _)| list_table(table, column).is_none());
-        let columns: Vec<&String> = row.iter().map(|(column, _)| *column).collect();
+            .partition(|(column, _)| list_role(table, column).is_none());
+        let columns: Vec<&str> = row
+            .iter()
+            .map(|(column, _)| summary_column(table, column))
+            .collect();
         let values: Vec<rusqlite::types::Value> = row
             .iter()
             .map(|(_, value)| match value {
@@ -336,13 +339,9 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
             })
             .collect();
         let query = format!(
-            "INSERT INTO {table} (item, {}) VALUES ((SELECT id FROM items WHERE collection = ?1 AND link_id = ?2), {})",
-            columns
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            (3..columns.len() + 3)
+            "INSERT INTO summary (item, component, {}) VALUES ((SELECT id FROM items WHERE collection = ?1 AND link_id = ?2), ?3, {})",
+            columns.join(", "),
+            (4..columns.len() + 4)
                 .map(|at| format!("?{at}"))
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -350,6 +349,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
         let mut bound: Vec<rusqlite::types::Value> = vec![
             rusqlite::types::Value::Text(entry["collection"].as_str().unwrap().into()),
             rusqlite::types::Value::Text(entry["link_id"].as_str().unwrap().into()),
+            rusqlite::types::Value::Text(component(table).into()),
         ];
         bound.extend(values);
         conn.execute(&query, rusqlite::params_from_iter(bound))
@@ -357,16 +357,15 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
         // NOTE: a case states a summary's lists as arrays, whichever table
         // a shape keeps them in (STORAGE §16).
         for (column, values) in lists {
-            let (list, value_column) = list_table(table, column).unwrap();
+            let role = list_role(table, column).unwrap();
             for (position, value) in values.as_array().into_iter().flatten().enumerate() {
                 conn.execute(
-                    &format!(
-                        "INSERT INTO {list} (item, position, {value_column}) \
-                         VALUES ((SELECT id FROM items WHERE collection = ?1 AND link_id = ?2), ?3, ?4)"
-                    ),
+                    "INSERT INTO summary_value (item, role, position, value) \
+                     VALUES ((SELECT id FROM items WHERE collection = ?1 AND link_id = ?2), ?3, ?4, ?5)",
                     params![
                         entry["collection"].as_str().unwrap(),
                         entry["link_id"].as_str().unwrap(),
+                        role,
                         position as i64,
                         value.as_str().unwrap(),
                     ],
@@ -1082,7 +1081,7 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
             "SELECT id, account, kind, conflict, generation, name, role FROM collections ORDER BY id"
         }
         "addresses" => {
-            "SELECT i.collection, i.link_id, a.role, a.position, a.address, a.name FROM item_address a JOIN items i ON i.id = a.item ORDER BY i.collection, i.link_id, a.role, a.position"
+            "SELECT i.collection, i.link_id, a.role, a.position, a.value, a.name FROM summary_value a JOIN items i ON i.id = a.item WHERE a.role NOT IN ('in-reply-to', 'category') ORDER BY i.collection, i.link_id, a.role, a.position"
         }
         "references" => {
             "SELECT from_kind, from_link_id, to_kind, to_link_id, role, origin FROM item_reference ORDER BY from_kind, from_link_id, to_kind, to_link_id, role"
@@ -1203,7 +1202,8 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
     rows.map(Result::unwrap).collect()
 }
 
-/// The summary rows the case expects, read from their tables.
+/// The summary rows the case expects, read from the summary of the
+/// component each names and its lists.
 fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
     expected
         .iter()
@@ -1214,21 +1214,26 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
                 .unwrap()
                 .keys()
                 .cloned()
-                .partition(|column| list_table(table, column).is_none());
+                .partition(|column| list_role(table, column).is_none());
             let key = params![
                 entry["collection"].as_str().unwrap(),
                 entry["link_id"].as_str().unwrap()
             ];
             let query = format!(
-                "SELECT {} FROM {table} WHERE item = (SELECT id FROM items WHERE collection = ?1 AND link_id = ?2)",
-                columns.join(", ")
+                "SELECT {} FROM summary WHERE item = (SELECT id FROM items WHERE collection = ?1 AND link_id = ?2) AND component = ?3",
+                columns
+                    .iter()
+                    .map(|column| summary_column(table, column))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             let row = conn
                 .query_row(
                     &query,
                     params![
                         entry["collection"].as_str().unwrap(),
-                        entry["link_id"].as_str().unwrap()
+                        entry["link_id"].as_str().unwrap(),
+                        component(table),
                     ],
                     |row| {
                         let mut object = Map::new();
@@ -1250,14 +1255,15 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
             let mut row = row;
             if let Value::Object(object) = &mut row {
                 for column in lists {
-                    let (list, value_column) = list_table(table, &column).unwrap();
+                    let role = list_role(table, &column).unwrap();
                     let values: Vec<String> = conn
-                        .prepare(&format!(
-                            "SELECT {value_column} FROM {list} \
-                             WHERE item = (SELECT id FROM items WHERE collection = ?1 AND link_id = ?2) ORDER BY position"
-                        ))
+                        .prepare(
+                            "SELECT value FROM summary_value \
+                             WHERE item = (SELECT id FROM items WHERE collection = ?1 AND link_id = ?2) \
+                             AND role = ?3 ORDER BY position",
+                        )
                         .unwrap()
-                        .query_map(key, |r| r.get(0))
+                        .query_map(params![key[0], key[1], role], |r| r.get(0))
                         .unwrap()
                         .map(Result::unwrap)
                         .collect();
@@ -1277,12 +1283,38 @@ fn actual_summaries(conn: &Connection, expected: &[Value]) -> Vec<Value> {
 /// One column of a case's summary row and its value.
 type Column<'a> = (&'a String, &'a Value);
 
-/// The table and value column a summary list a case states as an array
-/// is kept in (STORAGE §4.3), `None` for a column of the summary's own.
-fn list_table(table: &str, column: &str) -> Option<(&'static str, &'static str)> {
+/// The component of the summary a case's table names (STORAGE §4.4).
+fn component(table: &str) -> &'static str {
+    match table {
+        "mail_summary" => "mail",
+        "contact_summary" => "contact",
+        "event_summary" => "event",
+        "task_summary" => "task",
+        "journal_summary" => "journal",
+        "file_summary" => "file",
+        other => panic!("no summary table {other}"),
+    }
+}
+
+/// The column of `summary` a case's summary column is kept in.
+fn summary_column<'a>(table: &str, column: &'a str) -> &'a str {
     match (table, column) {
-        ("mail_summary", "in_reply_to") => Some(("mail_in_reply_to", "message_id")),
-        ("task_summary", "categories") => Some(("task_category", "value")),
+        ("mail_summary", "message_id") => "uid",
+        ("mail_summary", "subject") | ("contact_summary", "fn") | ("file_summary", "name") => {
+            "title"
+        }
+        ("event_summary" | "task_summary" | "journal_summary", "summary") => "title",
+        ("contact_summary", "kind") => "card_kind",
+        (_, column) => column,
+    }
+}
+
+/// The role of `summary_value` a summary list a case states as an array
+/// is kept under (STORAGE §4.4), `None` for a column of the summary's own.
+fn list_role(table: &str, column: &str) -> Option<&'static str> {
+    match (table, column) {
+        ("mail_summary", "in_reply_to") => Some("in-reply-to"),
+        ("task_summary", "categories") => Some("category"),
         _ => None,
     }
 }
