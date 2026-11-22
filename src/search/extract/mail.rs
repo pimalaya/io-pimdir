@@ -24,9 +24,19 @@ impl PimdirExtract {
     /// [`Unparseable`](PimdirExtractStatus::Unparseable) with every field
     /// empty, which the caller fills from the summary.
     pub fn mail(body: &[u8]) -> Self {
+        Self::mail_with(body, true)
+    }
+
+    /// The extraction of a `message/rfc822` body as [`mail`](Self::mail)
+    /// reads it, but for its address fields and attachments, left empty.
+    pub fn mail_text(body: &[u8]) -> Self {
+        Self::mail_with(body, false)
+    }
+
+    fn mail_with(body: &[u8], whole: bool) -> Self {
         let cst = parse(body);
         if !restates(&cst.root) {
-            return Self::parsed(body, &cst.root);
+            return Self::parsed(body, &cst.root, whole);
         }
 
         // NOTE: mime-rs reads the fields an entity is split and decoded by
@@ -34,11 +44,12 @@ impl PimdirExtract {
         // message stating one twice is parsed again with the later ones
         // cut out: the same parts, read as the summary reads them.
         let once = mail::first_occurrences(body);
-        Self::parsed(body, &parse(&once).root)
+        Self::parsed(body, &parse(&once).root, whole)
     }
 
-    /// The extraction of the message `body` parsed to `root`.
-    fn parsed(body: &[u8], root: &MimeEntity) -> Self {
+    /// The extraction of the message `body` parsed to `root`, its address
+    /// fields and attachments only when `whole`.
+    fn parsed(body: &[u8], root: &MimeEntity, whole: bool) -> Self {
         let mut extract = if root.header.fields().next().is_none() {
             let Some(text) = headless(body) else {
                 return Self {
@@ -58,10 +69,16 @@ impl PimdirExtract {
             };
 
             let roles = [
-                (first::<FROM>(root), &mut extract.from),
-                (first::<TO>(root), &mut extract.to),
-                (first::<CC>(root), &mut extract.cc),
-                (first::<BCC>(root), &mut extract.bcc),
+                (
+                    whole.then(|| first::<FROM>(root)).flatten(),
+                    &mut extract.from,
+                ),
+                (whole.then(|| first::<TO>(root)).flatten(), &mut extract.to),
+                (whole.then(|| first::<CC>(root)).flatten(), &mut extract.cc),
+                (
+                    whole.then(|| first::<BCC>(root)).flatten(),
+                    &mut extract.bcc,
+                ),
             ];
             for (addresses, field) in roles {
                 if let Some(addresses) = addresses {
@@ -86,6 +103,9 @@ impl PimdirExtract {
 
         // NOTE: the attachments are the stand-ins' (STORAGE §14.3), so an
         // inline part, an invitation's calendar among them, is none.
+        if !whole {
+            return extract;
+        }
         for file in attachments::attachments(body) {
             push(&mut extract.attachment, &file.name);
             push(

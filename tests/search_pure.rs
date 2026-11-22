@@ -309,3 +309,26 @@ filed\r\n\
 --b--\r\n";
     assert_eq!(PimdirExtract::mail(body).body.trim(), "shown");
 }
+
+/// What a snippet cuts is the body the index's extraction reads: the
+/// body and note of every mail fixture, the restated ones included, read
+/// alike with and without the address fields and attachments.
+#[test]
+fn a_snippet_reads_the_body_the_index_reads() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/vectors/fixtures");
+    let mut read = 0;
+    for entry in std::fs::read_dir(fixtures).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|extension| extension != "eml") {
+            continue;
+        }
+        let body = std::fs::read(&path).unwrap();
+        let whole = PimdirExtract::mail(&body);
+        let text = PimdirExtract::text("message/rfc822", &body).unwrap();
+        assert_eq!(whole.body, text.body, "{}", path.display());
+        assert_eq!(whole.note, text.note, "{}", path.display());
+        assert_eq!(whole.status, text.status, "{}", path.display());
+        read += 1;
+    }
+    assert!(read > 5);
+}

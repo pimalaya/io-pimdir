@@ -2727,7 +2727,7 @@ impl PimdirIndex {
             Some(kind) => compile::media_type(kind),
             None => kind,
         };
-        let Some(extract) = PimdirExtract::body(media_type, &blob) else {
+        let Some(extract) = PimdirExtract::text(media_type, &blob) else {
             return Ok(None);
         };
         // NOTE: the stored offsets index the text of the indexer's own

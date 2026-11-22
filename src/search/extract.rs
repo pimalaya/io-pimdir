@@ -166,6 +166,22 @@ impl PimdirExtract {
         }
     }
 
+    /// The `body` and `note` fields of a body's extraction by kind, as
+    /// [`body`](Self::body) extracts them, the others left empty where
+    /// reading them costs a pass of their own (a message's addresses and
+    /// attachments): what a snippet cuts.
+    #[cfg_attr(
+        not(any(feature = "mail", feature = "contact", feature = "calendar")),
+        allow(unused_variables)
+    )]
+    pub fn text(kind: &str, body: &[u8]) -> Option<Self> {
+        match collection::media_type(kind) {
+            #[cfg(feature = "mail")]
+            "message/rfc822" => Some(Self::mail_text(body)),
+            _ => Self::body(kind, body),
+        }
+    }
+
     /// Extracts an item from its summary and address rows: a placement
     /// holding no body (SEARCH §6), a file whatever it holds, and a
     /// contact or a calendar item no parser accepts.

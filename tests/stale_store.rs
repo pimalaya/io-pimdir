@@ -62,6 +62,17 @@ fn an_extra_index_is_a_damage_too() {
     refused_by_every_profile(dir.path(), "zz_extra");
 }
 
+/// A canonical object missing is named before an extra one, wherever the
+/// extra one sorts.
+#[test]
+fn a_missing_object_is_named_before_an_extra_one() {
+    let dir = damaged(
+        "CREATE INDEX aa_extra ON items(sort_key);
+         DROP INDEX items_by_changed;",
+    );
+    refused_by_every_profile(dir.path(), "items_by_changed");
+}
+
 /// A draft's store holds version 1 alone (STORAGE §4.2): one whose two
 /// stamps agree on another is damaged, not a later store.
 #[test]

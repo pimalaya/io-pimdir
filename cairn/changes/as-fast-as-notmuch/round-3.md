@@ -45,3 +45,33 @@ A page adds per hit: placements ~10, `matched` ~25 (an FTS5 probe per hit), snip
 | folder | 2.3 / 3.4 / 4.1 | 3.5 / 5.9 / 6.8 | 2.9 / 4.2 / 5.6 |
 
 Still behind: from name, rare word, combined and folder on all three; subject word, prefix and unread word counts by under 1 ms. The page measure is not like for like: notmuch prints message ids alone (`--output=messages`), pimdir each hit's title, placements and a snippet cut from its body.
+
+## Second step
+
+- The store schema check walks `sqlite_schema` in name order beside `sql::DECLARED`, borrowing each text, no map built (folder count ~0.1 ms). tests/stale_store.rs `a_missing_object_is_named_before_an_extra_one` keeps the error naming order.
+- Snippets read `PimdirExtract::text`: a message's body and note without its address fields and attachments (the attachments walk parsed the message a second time). tests/search_pure.rs `a_snippet_reads_the_body_the_index_reads` compares the two over every mail fixture. Per hit of a folder page, snippet 28 µs (blob 6.7, extraction 11.5, chunks and fold ~10) and placements 9 before.
+- Bench note: the machine drifts (powersave governor): notmuch's folder count read 2.3 then 3.9 ms an hour apart. Head-to-head numbers now come from one hyperfine run holding both commands per measure (vs.sh in the session scratchpad: notmuch then pimdir, medians of 10).
+
+Head-to-head after the first step (pimdir-new8, ms, notmuch vs pimdir), count | page | threads:
+
+| query | count | page | threads |
+| --- | --- | --- | --- |
+| all mail | 54.3 vs 5.7 | 263 vs 12.3 | 279.6 vs 13.9 |
+| unread | 21.4 vs 7.6 | 79.9 vs 10.8 | 86.8 vs 12.9 |
+| flagged | 5.7 vs 5.4 | 16.9 vs 8.7 | 18.3 vs 10 |
+| from address | 12.6 vs 5.8 | 17.8 vs 8 | 19.1 vs 8.9 |
+| from name | 4.1 vs 5.9 | 7.9 vs 8.6 | 9.9 vs 10.4 |
+| subject word | 5.4 vs 6.3 | 15 vs 10.3 | 16.5 vs 12 |
+| common word | 88 vs 51.4 | 287.2 vs 60.8 | 302.7 vs 62.2 |
+| mid word | 9.1 vs 6.8 | 27.6 vs 11.3 | 29.4 vs 12.6 |
+| rare word | 2.4 vs 3.1 | 4.2 vs 5.6 | 6.1 vs 7.5 |
+| phrase | 16.9 vs 9.5 | 27.8 vs 13.8 | 29.9 vs 16.2 |
+| two words | 8.1 vs 7.6 | 17.3 vs 11.6 | 18.6 vs 12.6 |
+| negation | 9.3 vs 8 | 23.5 vs 12.1 | 25.8 vs 13.8 |
+| prefix | 5.8 vs 5.5 | 12.2 vs 9.3 | 14.4 vs 11.5 |
+| date month | 23.9 vs 7 | 39.6 vs 10 | 42.3 vs 12 |
+| combined | 5.1 vs 6.8 | 6.4 vs 9.5 | 8.3 vs 11.5 |
+| unread word | 6.7 vs 7.2 | 14.8 vs 12 | 16.6 vs 13.8 |
+| folder | 2.3 vs 2.7 | 2.9 vs 4.2 | 4 vs 5.5 |
+
+The `from` column holds the names the body's From header parses to (src/search/extract/mail.rs), not the store's `item_address` rows, so a `from:` name term cannot be answered off the store exactly; FTS5's column filter over `dasovich`'s 63,150 bodies costs 2.8 ms of the from name count (notmuch reads a 22k posting list of its own `from` prefix).

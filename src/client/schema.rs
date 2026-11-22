@@ -9,14 +9,12 @@
 #[cfg(test)]
 pub(crate) mod declared;
 
-use alloc::{string::String, vec::Vec};
-
-use std::collections::BTreeMap;
+use alloc::string::String;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params};
 
 use crate::{
-    client::{PimdirError, PreparedCached, busy_or_sql, rows},
+    client::{PimdirError, PreparedCached, busy_or_sql},
     hash::HASH_ALGO,
     sql,
     sync::SYNC_VERSION,
@@ -144,24 +142,48 @@ pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), Pim
             object: String::from("user_version"),
         });
     }
-    let held = objects(conn)?;
-    let differs = sql::DECLARED
-        .iter()
-        .find(|(name, text)| !held.get(*name).is_some_and(|sql| same(sql, text)))
-        .map(|(name, _)| String::from(*name))
-        .or_else(|| {
-            held.keys()
-                .find(|name| {
-                    sql::DECLARED
-                        .binary_search_by(|(known, _)| (*known).cmp(name.as_str()))
-                        .is_err()
-                })
-                .cloned()
-        });
-    match differs {
+    match differs(conn)? {
         Some(object) => Err(PimdirError::Damaged { object }),
         None => Ok(()),
     }
+}
+
+/// The first object, by name, whose text is not the canonical one: a
+/// canonical one missing or recorded otherwise, else one no migration
+/// declares; `None` when the schema is the canonical one. The objects are
+/// read in name order beside [`sql::DECLARED`], their text borrowed.
+fn differs(conn: &Connection) -> Result<Option<String>, PimdirError> {
+    let mut statement = conn.prepare_cached(
+        "SELECT name, sql FROM sqlite_schema \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut declared = sql::DECLARED.iter().peekable();
+    let mut extra: Option<String> = None;
+    while let Some(row) = rows.next()? {
+        let name = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+        let text = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+        if let Some((known, _)) = declared.peek()
+            && *known < name
+        {
+            return Ok(Some(String::from(*known)));
+        }
+        match declared.peek() {
+            Some((known, normalised)) if *known == name => {
+                if !same(text, normalised) {
+                    return Ok(Some(String::from(name)));
+                }
+                declared.next();
+            }
+            _ => {
+                extra.get_or_insert_with(|| String::from(name));
+            }
+        }
+    }
+    Ok(declared
+        .next()
+        .map(|(known, _)| String::from(*known))
+        .or(extra))
 }
 
 /// Whether the text SQLite records for a statement, every `--` comment
@@ -208,20 +230,6 @@ pub(crate) fn sync_version(conn: &Connection) -> Result<Option<String>, PimdirEr
     }
 }
 
-/// Every table, index and trigger a database declares, by name, the text
-/// SQLite records for it; the automatic indexes, which declare no
-/// statement, and SQLite's own tables left out.
-fn objects(conn: &Connection) -> Result<BTreeMap<String, String>, PimdirError> {
-    let declared: Vec<(String, String)> = rows(
-        conn,
-        "SELECT name, sql FROM sqlite_schema \
-         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    Ok(declared.into_iter().collect())
-}
-
 /// The store's `PRAGMA user_version`, `0` for a fresh database.
 fn user_version(conn: &Connection) -> Result<i64, PimdirError> {
     Ok(conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
@@ -256,9 +264,16 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, Pimd
 
 #[cfg(test)]
 mod tests {
-    use alloc::string::String;
+    use alloc::{string::String, vec::Vec};
 
-    use crate::sql;
+    use std::collections::BTreeMap;
+
+    use rusqlite::Connection;
+
+    use crate::{
+        client::{PimdirError, rows},
+        sql,
+    };
 
     /// The marker the refusal compares is the one `init_store_meta`
     /// writes, so a re-vendored draft moves both or fails here.
@@ -271,17 +286,17 @@ mod tests {
             for migration in migrations {
                 conn.execute_batch(migration).unwrap();
             }
-            let recorded: super::BTreeMap<_, _> = super::objects(&conn)
+            let recorded: BTreeMap<_, _> = objects(&conn)
                 .unwrap()
                 .into_iter()
                 .map(|(name, sql)| (name, super::declared::normalised(&sql)))
                 .collect();
-            let virtuals: alloc::vec::Vec<alloc::string::String> = recorded
+            let virtuals: Vec<String> = recorded
                 .iter()
                 .filter(|(_, sql)| sql.starts_with("CREATE VIRTUAL TABLE"))
                 .map(|(name, _)| alloc::format!("{name}_"))
                 .collect();
-            let recorded: super::BTreeMap<_, _> = recorded
+            let recorded: BTreeMap<_, _> = recorded
                 .into_iter()
                 .filter(|(name, _)| !virtuals.iter().any(|prefix| name.starts_with(prefix)))
                 .collect();
@@ -293,7 +308,7 @@ mod tests {
     /// declare, and each one's recorded text compares equal to it.
     #[test]
     fn the_built_schema_is_the_declared_one() {
-        let built = |declared: &[(&str, &str)]| -> super::BTreeMap<_, _> {
+        let built = |declared: &[(&str, &str)]| -> BTreeMap<_, _> {
             declared
                 .iter()
                 .map(|(name, text)| (String::from(*name), String::from(*text)))
@@ -305,7 +320,7 @@ mod tests {
         assert_eq!(super::declared::declared(sql::MIGRATIONS), built);
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(sql::MIGRATION_0001).unwrap();
-        for (name, raw) in super::objects(&conn).unwrap() {
+        for (name, raw) in objects(&conn).unwrap() {
             if let Some(text) = built.get(&name) {
                 assert!(super::same(&raw, text), "{name}");
                 assert!(!super::same(&raw, &alloc::format!("{text} x")), "{name}");
@@ -317,5 +332,19 @@ mod tests {
     fn the_marker_is_the_one_init_store_meta_writes() {
         let marker = alloc::format!("'{}'", sql::FORMAT_VERSION);
         assert!(sql::INIT_STORE_META.contains(&marker));
+    }
+
+    /// Every table, index and trigger a database declares, by name, the text
+    /// SQLite records for it; the automatic indexes, which declare no
+    /// statement, and SQLite's own tables left out.
+    fn objects(conn: &Connection) -> Result<BTreeMap<String, String>, PimdirError> {
+        let declared: Vec<(String, String)> = rows(
+            conn,
+            "SELECT name, sql FROM sqlite_schema \
+             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(declared.into_iter().collect())
     }
 }
