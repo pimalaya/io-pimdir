@@ -58,3 +58,11 @@ Rebuilding x2d for the posting list left index.hits at its old mtime: the new in
 From name leads on all three now (12 of 17). Trailing: combined, rare word, folder on all three; subject word and unread word counts.
 
 Tried and dropped: taking a posted `from:` word out of the joint FTS5 `AND` (combined: count 8.1 to 10.6 in one run): alone, `california` is decoded whole, where the joint `AND` seeks through its doclist.
+
+## The per-hit page cost (563478d)
+
+Instrumented (eprintln timings, the file restored after), 50-hit pages on x2d: kiwi select 0.87 ms, probe sets 0.1, hits 2.4 (placements 0.56, matched 0.18, snippet 1.67), coverage 0.17; folder select 0.32, hits 1.3 (placements 0.44, snippet 0.86), coverage 0.29; subject:meeting select 6.5, matched 1.5 (its 30 µs probe a hit: the term matches more than PROBE_SET_MAX). Snippet per hit, kiwi (15.6 KB bodies on average) / folder (2.4 KB): chunks_of 8 / 5 µs, blob 10 / 6.5, extraction 7.5 / 2.7, cut 5.5 / 3.
+
+Landed: the chunks from this build's own extraction (no `chunks_of` a hit), the paragraph scan skipping to the next CR or LF, a blob read to its stated length plus one byte (no second fstat and lseek). Folder snippets 0.9 to 0.64 ms; kiwi's unmoved (computing every chunk of a large body costs what the statement did, extraction and the read dominate).
+
+Bench trap: the hits stamp changed with 85503f4 (birth time mixed in), so a build before it and one after cannot share index.hits; A/B against pimdir-new12b (85503f4 built from a git archive) after rewriting the cache with the newer build.
