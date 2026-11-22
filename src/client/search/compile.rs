@@ -305,7 +305,7 @@ impl Compiled {
     }
 
     /// [`joint`](Self::joint) of one node.
-    fn jointly(&self, node: &PimdirPlanNode, summary: bool) -> Option<String> {
+    pub(crate) fn jointly(&self, node: &PimdirPlanNode, summary: bool) -> Option<String> {
         match node {
             PimdirPlanNode::Leaf(at) => {
                 let (expression, held) = self.text_of(*at)?;

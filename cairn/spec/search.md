@@ -401,3 +401,10 @@ Under the `mail` feature, without `client`, `PimdirQuery::match_mails(&[PimdirMa
 #### Scenario: Each order
 - tests/search.rs `every_search_vector_answers`: the cases stating `oldest-first`, `title`, `sender` and `relevance`
 - src/client/search.rs `a_page_is_the_slice_of_the_sorted_answer_after_its_cursor`, over `PimdirSearchSort::ALL`
+
+### Requirement: Counts and dated pages read the hit columns when they hold the index's state
+A refresh leaving the index holding the store as it stands writes index.hits beside index.db (src/client/search/hits.rs) whenever its stamp differs: the store change and purges the index folded, its highest placement and object ids, and index.db's inode. It holds per index placement id its date (`YYYY-MM-DDTHH:MM:SSZ` read as `YYYYMMDDHHMMSS`), seq, account, marks and kind; per object id its placements; per hit its greatest date (the dated orders' key), the union of its placements' marks and its mail date. It is written beside and renamed over, never truncated in place, and mapped read-only. A count, a dated page from its start or after a dated cursor, and threads read it first when the query is system flags, text terms and date terms (over a store of no calendar and no undated kind in the date's scope) under a scope of kinds and accounts; any other query, a stamp differing, or a forced driver reads index.db as before. Text terms read FTS5 rowids alone; an `and` of text terms matches as one expression while `split` is empty; flag and date terms scan the records once, or test each hit's held word when an `and` leaves few hits and every hit's dated mail placements share one date. A page writes its candidates (the hits whose key reaches the `need`-th) to `temp.hit_page` for `met_rows` to sort and cut exactly.
+
+#### Scenario: The same answers with and without the columns
+- **WHEN** tests/search_plan.rs asks counts, pages walked to their end in both dated orders and first pages of threads over hits of two placements and two accounts, with and without index.hits
+- **THEN** every answer is the same, and the query vectors pass through the columns (104 cases)

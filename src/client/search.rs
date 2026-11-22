@@ -26,6 +26,8 @@
 
 mod compile;
 #[cfg(feature = "indexer")]
+mod hits;
+#[cfg(feature = "indexer")]
 mod refresh;
 mod summary;
 mod tag;
@@ -139,6 +141,30 @@ fn page_params(after: Option<&PimdirSearchCursor>, need: usize) -> Vec<(String, 
         ]);
     }
     extra
+}
+
+/// How a page hit's match of a positive text term is told
+/// ([`matched`](PimdirIndex::matched)).
+enum Sourced {
+    /// Probed per body and summary against the full-text index.
+    Probed,
+    /// Read from the term's sources in `temp.term_source`.
+    Read,
+    /// Read from bitmaps of the object ids and the placement ids whose
+    /// body and summary the term matches.
+    #[cfg_attr(not(feature = "indexer"), allow(dead_code))]
+    Sets {
+        bodies: Vec<u64>,
+        summaries: Vec<u64>,
+    },
+}
+
+/// Whether bitmap `bits` holds `id`.
+fn bit_of(bits: &[u64], id: i64) -> bool {
+    usize::try_from(id).is_ok_and(|id| {
+        bits.get(id / 64)
+            .is_some_and(|word| word >> (id % 64) & 1 == 1)
+    })
 }
 
 /// Hits as bitmaps of public ids, one per account by its number.
@@ -313,6 +339,10 @@ pub struct PimdirIndex {
     /// The driver every answer takes in place of the plan's, set by
     /// [`force_driver`](PimdirIndex::force_driver).
     force: Cell<Option<PimdirPlanForce>>,
+    /// The hit columns last mapped (hits.rs), kept while their stamp is
+    /// the index's.
+    #[cfg(feature = "indexer")]
+    columns: RefCell<Option<hits::PimdirHitColumns>>,
 }
 
 /// The most coverages a handle keeps between two moves of index.db or the
@@ -756,6 +786,8 @@ impl PimdirIndex {
             own_extraction: true,
             coverages: RefCell::default(),
             force: Cell::new(None),
+            #[cfg(feature = "indexer")]
+            columns: RefCell::new(None),
         })
     }
 
@@ -817,6 +849,8 @@ impl PimdirIndex {
             own_extraction: held == PimdirIndexHeld::Current,
             coverages: RefCell::default(),
             force: Cell::new(None),
+            #[cfg(feature = "indexer")]
+            columns: RefCell::new(None),
         })
     }
 
@@ -945,6 +979,16 @@ impl PimdirIndex {
             }
         }
 
+        let current = self
+            .conn
+            .query_row_cached(search::INDEX_CURRENT, [], |row| row.get::<_, bool>(0))?;
+        if current {
+            let stamp = hits::Stamp::of(&self.conn, &self.dir)?;
+            let read = self.conn.unchecked_transaction()?;
+            hits::write(&self.conn, &self.dir, stamp)?;
+            read.commit()?;
+        }
+
         debug!(
             "refreshed search index: {} rows folded, {} bodies indexed, cursor {}",
             report.folded, report.indexed, report.cursor
@@ -997,14 +1041,25 @@ impl PimdirIndex {
     ) -> Result<PimdirSearchOutput, PimdirError> {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
-        let (mut compiled, driver) = self.planned(query, now, &zone, options)?;
-        let (page, more) = self.ordered(
-            &mut compiled,
-            &driver,
-            options.after.as_ref(),
-            options.sort,
-            options.limit,
-        )?;
+        #[cfg_attr(not(feature = "indexer"), allow(unused_variables))]
+        let (compiled, page, more, quick) = match self.quick_page(query, now, &zone, options)? {
+            Some((compiled, mut page)) => {
+                let more = page.len() > options.limit;
+                page.truncate(options.limit);
+                (compiled, page, more, true)
+            }
+            None => {
+                let (mut compiled, driver) = self.planned(query, now, &zone, options)?;
+                let (page, more) = self.ordered(
+                    &mut compiled,
+                    &driver,
+                    options.after.as_ref(),
+                    options.sort,
+                    options.limit,
+                )?;
+                (compiled, page, more, false)
+            }
+        };
         let next = match more {
             true => page
                 .last()
@@ -1013,7 +1068,12 @@ impl PimdirIndex {
             false => None,
         };
 
-        let probes = self.presented(&compiled, page.len())?;
+        #[cfg_attr(not(feature = "indexer"), allow(unused_mut))]
+        let mut probes = self.presented(&compiled, page.len())?;
+        #[cfg(feature = "indexer")]
+        if quick {
+            self.probe_sets(&mut probes)?;
+        }
         let mut hits = Vec::new();
         for hit in page {
             hits.push(self.hit(hit, &probes, &compiled.words)?);
@@ -1046,7 +1106,14 @@ impl PimdirIndex {
     ) -> Result<PimdirSearchThreadsOutput, PimdirError> {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
-        let (mut compiled, driver) = self.planned(query, now, &zone, options)?;
+        let (mut quick, mut compiled, mut driver) =
+            match self.quick_hits(query, now, &zone, options)? {
+                Some((compiled, hits)) => (Some(hits), compiled, PimdirPlanDriver::Scope),
+                None => {
+                    let (compiled, driver) = self.planned(query, now, &zone, options)?;
+                    (None, compiled, driver)
+                }
+            };
         let sort = options.sort;
         let batch = match sort.is_dated() {
             true => options.limit.saturating_mul(2).max(1),
@@ -1058,8 +1125,31 @@ impl PimdirIndex {
         let mut met: BTreeSet<(Option<String>, String)> = BTreeSet::new();
         let mut cursor = options.after.clone();
         'batches: loop {
-            let (found, more) =
-                self.ordered(&mut compiled, &driver, cursor.as_ref(), sort, batch)?;
+            let quickly: Option<Vec<Found>> = match &quick {
+                #[cfg(feature = "indexer")]
+                Some((hits, names)) => self.columnar_batch(
+                    &compiled,
+                    hits,
+                    names,
+                    cursor.as_ref(),
+                    sort,
+                    batch.saturating_add(1),
+                )?,
+                _ => None,
+            };
+            let (found, more) = match quickly {
+                Some(mut found) => {
+                    let more = found.len() > batch;
+                    found.truncate(batch);
+                    (found, more)
+                }
+                None => {
+                    if quick.take().is_some() {
+                        (compiled, driver) = self.planned(query, now, &zone, options)?;
+                    }
+                    self.ordered(&mut compiled, &driver, cursor.as_ref(), sort, batch)?
+                }
+            };
             for hit in found {
                 cursor = Some(hit.place.clone());
                 let thread: Option<String> = self
@@ -1080,7 +1170,18 @@ impl PimdirIndex {
                 if !met.insert((hit.account.clone(), thread.clone())) {
                     continue;
                 }
-                let members = self.members(&compiled, &thread, hit.account.as_deref(), sort)?;
+                let members = match &quick {
+                    #[cfg(feature = "indexer")]
+                    Some((hits, names)) => self.columnar_members(
+                        &compiled,
+                        hits,
+                        names,
+                        &thread,
+                        hit.account.as_deref(),
+                        sort,
+                    )?,
+                    _ => self.members(&compiled, &thread, hit.account.as_deref(), sort)?,
+                };
                 let earlier = options.after.as_ref().is_some_and(|after| {
                     members
                         .first()
@@ -1109,7 +1210,12 @@ impl PimdirIndex {
         };
 
         let shown = groups.iter().map(|(_, found)| found.len()).sum();
-        let probes = self.presented(&compiled, shown)?;
+        #[cfg_attr(not(feature = "indexer"), allow(unused_mut))]
+        let mut probes = self.presented(&compiled, shown)?;
+        #[cfg(feature = "indexer")]
+        if quick.is_some() {
+            self.probe_sets(&mut probes)?;
+        }
         let mut threads = Vec::new();
         for (thread, found) in groups {
             let account = found[0].account.clone();
@@ -1298,6 +1404,10 @@ impl PimdirIndex {
     /// when every term is one the scope implies.
     fn counted(&self, query: &PimdirQuery, now: i64, zone: &TimeZone) -> Result<u64, PimdirError> {
         let mut compiled = self.compile(query, now, zone)?;
+        #[cfg(feature = "indexer")]
+        if let Some((hits, _)) = self.columnar(&compiled)? {
+            return Ok(hits_counted(&hits));
+        }
         let current = self
             .conn
             .query_row_cached(search::INDEX_CURRENT, [], |row| row.get::<_, bool>(0))?;
@@ -1425,6 +1535,51 @@ impl PimdirIndex {
         self.whole(&compiled, &choice.driver, sort)
     }
 
+    /// A first dated page read off the hit columns before any plan is
+    /// drawn ([`columnar_page`](Self::columnar_page)), its terms then
+    /// never read into the temporary tables; `None` where the columns
+    /// cannot answer.
+    fn quick_page(
+        &self,
+        query: &PimdirQuery,
+        now: i64,
+        zone: &TimeZone,
+        options: &PimdirSearchOptions,
+    ) -> Result<Option<(Compiled, Vec<Found>)>, PimdirError> {
+        #[cfg(feature = "indexer")]
+        if options.after.is_none() && options.sort.is_dated() && self.force.get().is_none() {
+            let compiled = self.compile(query, now, zone)?;
+            let need = options.limit.saturating_add(1);
+            if let Some(found) = self.columnar_page(&compiled, None, options.sort, need)? {
+                return Ok(Some((compiled, found)));
+            }
+        }
+        let _ = (query, now, zone, options);
+        Ok(None)
+    }
+
+    /// A query compiled with its hits read off the hit columns
+    /// ([`columnar`](Self::columnar)) for a dated order from its start, no
+    /// plan drawn; `None` where the columns cannot answer.
+    #[allow(clippy::type_complexity)]
+    fn quick_hits(
+        &self,
+        query: &PimdirQuery,
+        now: i64,
+        zone: &TimeZone,
+        options: &PimdirSearchOptions,
+    ) -> Result<Option<(Compiled, (Hits, Vec<String>))>, PimdirError> {
+        #[cfg(feature = "indexer")]
+        if options.after.is_none() && options.sort.is_dated() && self.force.get().is_none() {
+            let compiled = self.compile(query, now, zone)?;
+            if let Some(hits) = self.columnar(&compiled)? {
+                return Ok(Some((compiled, hits)));
+            }
+        }
+        let _ = (query, now, zone, options);
+        Ok(None)
+    }
+
     /// A query compiled and planned for a page of `options`, its text
     /// terms read into `temp.term_match` as the plan chose, with the
     /// driver it takes.
@@ -1476,7 +1631,7 @@ impl PimdirIndex {
         &self,
         compiled: &'a Compiled,
         hits: usize,
-    ) -> Result<Vec<(&'a Probe, bool)>, PimdirError> {
+    ) -> Result<Vec<(&'a Probe, Sourced)>, PimdirError> {
         let costs = PimdirPlanCosts::default();
         let mut presented = Vec::new();
         for probe in &compiled.probes {
@@ -1496,7 +1651,13 @@ impl PimdirIndex {
                     self.run(sql, &compiled.values, &[], |_| Ok(()))?;
                 }
             }
-            presented.push((probe, read || cheap));
+            presented.push((
+                probe,
+                match read || cheap {
+                    true => Sourced::Read,
+                    false => Sourced::Probed,
+                },
+            ));
         }
         Ok(presented)
     }
@@ -1518,6 +1679,12 @@ impl PimdirIndex {
         }
 
         let need = limit.saturating_add(1);
+        #[cfg(feature = "indexer")]
+        if let Some(mut found) = self.columnar_page(compiled, after, sort, need)? {
+            let more = found.len() > limit;
+            found.truncate(limit);
+            return Ok((found, more));
+        }
         if let Some(mut found) = self.bitmap_page(compiled, after, sort, need)? {
             let more = found.len() > limit;
             found.truncate(limit);
@@ -2246,7 +2413,7 @@ impl PimdirIndex {
     fn hit(
         &self,
         found: Found,
-        probes: &[(&Probe, bool)],
+        probes: &[(&Probe, Sourced)],
         words: &[String],
     ) -> Result<PimdirSearchHit, PimdirError> {
         let Found { account, seq, .. } = found;
@@ -2280,19 +2447,30 @@ impl PimdirIndex {
         &self,
         seq: i64,
         placements: &[PimdirSearchPlacement],
-        probes: &[(&Probe, bool)],
+        probes: &[(&Probe, Sourced)],
     ) -> Result<Option<PimdirSearchMatched>, PimdirError> {
         let mut matched = None;
         for (probe, sourced) in probes {
             for placement in placements {
                 if let Some(hash) = &placement.object {
                     let body = match sourced {
-                        true => self.conn.query_row_cached(
+                        Sourced::Sets { bodies, .. } => self
+                            .conn
+                            .query_row_cached(
+                                "SELECT id FROM object WHERE hash = :hash",
+                                named_params! { ":hash": hash.0 },
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .and_then(|id| match bit_of(bodies, id) {
+                                true => Ok(()),
+                                false => Err(rusqlite::Error::QueryReturnedNoRows),
+                            }),
+                        Sourced::Read => self.conn.query_row_cached(
                             search::SOURCE_OBJECT,
                             named_params! { ":term": probe.term as i64, ":hash": hash.0 },
                             |_| Ok(()),
                         ),
-                        false => self.conn.query_row_cached(
+                        Sourced::Probed => self.conn.query_row_cached(
                             search::MATCH_OBJECT,
                             named_params! { ":match": probe.expression, ":hash": hash.0 },
                             |_| Ok(()),
@@ -2306,7 +2484,21 @@ impl PimdirIndex {
                 }
                 if probe.summary && matched.is_none() {
                     let summary = match sourced {
-                        true => self.conn.query_row_cached(
+                        Sourced::Sets { summaries, .. } => self
+                            .conn
+                            .query_row_cached(
+                                "SELECT id FROM placement WHERE collection = :collection AND seq = :seq",
+                                named_params! {
+                                    ":collection": placement.collection,
+                                    ":seq": seq,
+                                },
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .and_then(|id| match bit_of(summaries, id) {
+                                true => Ok(()),
+                                false => Err(rusqlite::Error::QueryReturnedNoRows),
+                            }),
+                        Sourced::Read => self.conn.query_row_cached(
                             search::SOURCE_SUMMARY,
                             named_params! {
                                 ":term": probe.term as i64,
@@ -2315,7 +2507,7 @@ impl PimdirIndex {
                             },
                             |_| Ok(()),
                         ),
-                        false => self.conn.query_row_cached(
+                        Sourced::Probed => self.conn.query_row_cached(
                             search::MATCH_SUMMARY,
                             named_params! {
                                 ":match": probe.expression,

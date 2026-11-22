@@ -31,6 +31,10 @@ use log::{LevelFilter, Log, Metadata, Record};
 /// The statements the search runs, as its trace log prints them.
 static STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// Held by each test of this binary: the log is the process's, so one
+/// test's statements must not land among another's.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 struct Statements;
 
 impl Log for Statements {
@@ -240,6 +244,9 @@ fn walked(
 
 #[test]
 fn every_driver_answers_alike_and_seeks() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     static LOGGER: Statements = Statements;
     log::set_logger(&LOGGER).unwrap();
     log::set_max_level(LevelFilter::Trace);
@@ -250,6 +257,7 @@ fn every_driver_answers_alike_and_seeks() {
     index
         .refresh(&PimdirIndexRefreshOptions::default())
         .unwrap();
+    std::fs::remove_file(dir.path().join("index.hits")).unwrap();
 
     let queries = [
         "kind:mail",
@@ -377,4 +385,81 @@ fn every_driver_answers_alike_and_seeks() {
             }
         }
     }
+}
+
+/// The hit columns (index.hits) answer every count, every page walked to
+/// its end in both dated orders and every first page of threads as
+/// index.db alone does, over hits of two placements, two accounts, flags
+/// and dates, and their terms read off each hit where few remain.
+#[test]
+fn the_hit_columns_answer_as_the_index_alone() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert!(dir.path().join("index.hits").exists());
+
+    let queries = [
+        "kiwi",
+        "report",
+        "report not kiwi",
+        "is:flagged",
+        "is:unread",
+        "is:unread report",
+        "is:flagged kiwi",
+        "kiwi not is:read",
+        "kiwi or is:flagged",
+        "date:2026-02-01..2026-02-28",
+        "date:2026-02-01..2026-02-28 report",
+        "kiwi date:2026-01-01..2026-01-31",
+        "kiwi date:2026-02-01..2026-05-31 is:flagged",
+        "kind:mail is:flagged",
+        "account:home is:flagged",
+        "account:work kiwi",
+        "from:user1 kiwi",
+        "rep* not is:read",
+        "kiwi season",
+    ];
+    let answers = |index: &PimdirIndex| {
+        let clock = PimdirSearchClock::default();
+        queries
+            .iter()
+            .map(|query| {
+                let parsed = PimdirQuery::parse(query).unwrap();
+                let count = index.count(&parsed, &clock).unwrap().count;
+                let newest = walked(index, &parsed, PimdirSearchSort::NewestFirst, 7);
+                let oldest = walked(index, &parsed, PimdirSearchSort::OldestFirst, 7);
+                let options = PimdirSearchOptions {
+                    limit: 5,
+                    ..Default::default()
+                };
+                let threads: Vec<Vec<(String, i64)>> = index
+                    .threads(&parsed, &options)
+                    .unwrap()
+                    .threads
+                    .iter()
+                    .map(|thread| {
+                        thread
+                            .hits
+                            .iter()
+                            .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+                            .collect()
+                    })
+                    .collect();
+                (query, count, newest, oldest, threads)
+            })
+            .collect::<Vec<_>>()
+    };
+    let columned = answers(&index);
+    std::fs::remove_file(dir.path().join("index.hits")).unwrap();
+    let plain = answers(&PimdirIndex::open(dir.path()).unwrap());
+    for (columned, plain) in columned.iter().zip(&plain) {
+        assert_eq!(columned, plain);
+    }
+    assert!(plain.iter().any(|(_, count, ..)| *count > 0));
 }
