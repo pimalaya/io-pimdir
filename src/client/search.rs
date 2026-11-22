@@ -333,6 +333,10 @@ pub struct PimdirIndex {
     /// (`sql::search::FROM_POSTING`), which a `from:` word reads in place
     /// of `object_text`'s column.
     from_posting: bool,
+    /// Whether this connection declared `temp.term_match` and
+    /// `temp.term_source`, which the first compiled statement naming one
+    /// declares: a query answered off the hit columns reads neither.
+    terms: Cell<bool>,
     /// The coverages answered since index.db and the store last moved.
     coverages: RefCell<PimdirCoverageCache>,
     /// The driver every answer takes in place of the plan's, set by
@@ -783,6 +787,7 @@ impl PimdirIndex {
             #[cfg(feature = "indexer")]
             query_only: false,
             from_posting: true,
+            terms: Cell::new(false),
             coverages: RefCell::default(),
             force: Cell::new(None),
             #[cfg(feature = "indexer")]
@@ -848,6 +853,7 @@ impl PimdirIndex {
             #[cfg(feature = "indexer")]
             query_only: true,
             from_posting: matches!(held, PimdirIndexHeld::Current | PimdirIndexHeld::Extracted),
+            terms: Cell::new(false),
             coverages: RefCell::default(),
             force: Cell::new(None),
             #[cfg(feature = "indexer")]
@@ -926,6 +932,7 @@ impl PimdirIndex {
             let held = mem::replace(&mut self.conn, Connection::open_in_memory()?);
             drop(held);
             self.conn = build(&self.dir)?;
+            self.terms.set(false);
             report.cursor = 0;
         }
         debug!(
@@ -2357,6 +2364,10 @@ impl PimdirIndex {
         mut map: impl FnMut(&Row) -> rusqlite::Result<T>,
     ) -> Result<Vec<T>, PimdirError> {
         trace!("search statement: {sql}");
+        if !self.terms.get() && sql.contains("term_") {
+            self.conn.execute_batch(search::CREATE_TERM_MATCH)?;
+            self.terms.set(true);
+        }
         let mut statement = self.conn.prepare_cached(sql).map_err(unanswerable)?;
         let names: Vec<(usize, String)> = (1..=statement.parameter_count())
             .filter_map(|at| Some((at, statement.parameter_name(at)?.to_string())))
@@ -2544,8 +2555,10 @@ impl PimdirIndex {
         let categories = self.categories(query)?;
         let labels = self.labels(query)?;
         let plan = PimdirPlan::new(query, now, zone);
-        self.conn.execute_cached(search::CLEAR_TERM_MATCH, [])?;
-        self.conn.execute_cached(search::CLEAR_TERM_SOURCE, [])?;
+        if self.terms.get() {
+            self.conn.execute_cached(search::CLEAR_TERM_MATCH, [])?;
+            self.conn.execute_cached(search::CLEAR_TERM_SOURCE, [])?;
+        }
         Ok(Compiled::new(plan, &ends, &categories, &labels))
     }
 
@@ -2984,7 +2997,6 @@ fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     if !query_only {
         conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT)?;
     }
-    conn.execute_batch(search::CREATE_TERM_MATCH)?;
 
     let store = dir.join("pimdir.db").canonicalize()?;
     conn.execute_cached(
