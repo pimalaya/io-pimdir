@@ -889,14 +889,7 @@ impl super::PimdirIndex {
             return Ok(None);
         }
 
-        self.conn
-            .execute_batch(crate::sql::search::CREATE_HIT_PAGE)?;
-        self.conn
-            .execute_cached(crate::sql::search::CLEAR_HIT_PAGE, [])?;
-        let mut insert = self
-            .conn
-            .prepare_cached(crate::sql::search::INSERT_HIT_PAGE)?;
-        let mut failed = None;
+        let mut page = String::from("[");
         each(&mut |account, seq, key| {
             let wanted = match (key, threshold) {
                 (UNDATED, _) => with_undated,
@@ -905,27 +898,25 @@ impl super::PimdirIndex {
                 (key, Some(threshold)) if newest => key >= threshold,
                 (key, Some(threshold)) => key <= threshold,
             };
-            if wanted && failed.is_none() {
+            if wanted {
                 let name = names.get(account).map(String::as_str).unwrap_or("");
-                if let Err(err) = insert.execute(rusqlite::named_params! {
-                    ":akey": name,
-                    ":seq": seq as i64,
-                }) {
-                    failed = Some(err);
+                if page.len() > 1 {
+                    page.push(',');
                 }
+                page.push('[');
+                json_string(&mut page, name);
+                page.push_str(&alloc::format!(",{seq}]"));
             }
         });
-        drop(insert);
-        if let Some(err) = failed {
-            return Err(err.into());
-        }
+        page.push(']');
 
         let sql = compiled.met_rows(
-            "SELECT akey, seq FROM temp.hit_page",
+            "SELECT p.value ->> 0 AS akey, p.value ->> 1 AS seq FROM json_each(:page) p",
             sort,
             Some(after.is_some()),
         );
-        let extra = super::page_params(after, need);
+        let mut extra = super::page_params(after, need);
+        extra.push((String::from(":page"), rusqlite::types::Value::from(page)));
         Ok(Some(self.run(&sql, &compiled.values, &extra, |row| {
             super::found(row, sort)
         })?))
@@ -1376,4 +1367,18 @@ impl super::PimdirIndex {
         }
         Ok(())
     }
+}
+
+/// Appends `text` to `out` as a JSON string, quoted and escaped.
+fn json_string(out: &mut String, text: &str) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&alloc::format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
