@@ -66,3 +66,35 @@ Instrumented (eprintln timings, the file restored after), 50-hit pages on x2d: k
 Landed: the chunks from this build's own extraction (no `chunks_of` a hit), the paragraph scan skipping to the next CR or LF, a blob read to its stated length plus one byte (no second fstat and lseek). Folder snippets 0.9 to 0.64 ms; kiwi's unmoved (computing every chunk of a large body costs what the statement did, extraction and the read dominate).
 
 Bench trap: the hits stamp changed with 85503f4 (birth time mixed in), so a build before it and one after cannot share index.hits; A/B against pimdir-new12b (85503f4 built from a git archive) after rewriting the cache with the newer build.
+
+## The process floor (408c186 and the next commit)
+
+A fresh count of kiwi, ticks between stages (µs, mean of 15): store `prepare_connection` 962 (SQLite loading pimdir.db's 50 KB of schema text: tables 32 KB, triggers 13 KB, intrinsic), store schema check 387, index `prepare_connection` 269, `CREATE TEMP TABLE term_match` 68, `held` 143, `INDEX_CURRENT` 46, hits stamp 31, column eval 258 (the FTS5 read), coverage 156. `pimdir --version` alone 0.94 ms, `notmuch --version` 2.7 ms the same hour.
+
+Landed: `schema::same` compares bytes in one pass (held to the word version over every declared object and perturbations of it, src/client/schema.rs `same_tests`); both checks read `sqlite_schema` unsorted and seek each name in `DECLARED`, the store's sorted walk kept to name a damaged object: store check 387 to 205, `held` 143 to 119. The term tables are declared by the first compiled statement naming them (the column paths read neither).
+
+Tried and dropped: `PRAGMA temp_store = MEMORY` on the read-only connections (the temp tables cost the same). Left: `temp.param` on every connection (~40 µs each, 28 call sites read it, some maybe unbound).
+
+Head to head after (new14, ms, notmuch vs pimdir):
+
+| query | count | page | threads |
+| --- | --- | --- | --- |
+| all mail | 53.8 vs 5 | 264.2 vs 11.8 | 280.1 vs 12.9 |
+| unread | 20.6 vs 6.7 | 80.8 vs 10.2 | 85.8 vs 11.6 |
+| flagged | 6.2 vs 5.1 | 16.8 vs 7 | 18.8 vs 8.9 |
+| from address | 12.8 vs 5.3 | 17.5 vs 6.8 | 19.1 vs 7.8 |
+| from name | 3.7 vs 3.4 | 7.9 vs 6.1 | 9.9 vs 7.7 |
+| subject word | 5.2 vs 5.8 | 15 vs 9.2 | 16.3 vs 10.3 |
+| common word | 88.1 vs 51.5 | 287.9 vs 60.1 | 304.1 vs 62.3 |
+| mid word | 8.8 vs 6.2 | 27.3 vs 10.1 | 29.2 vs 11.4 |
+| rare word | 2.4 vs 2.5 | 4.7 vs 5.1 | 6.1 vs 6.7 |
+| phrase | 16.5 vs 8.5 | 27.9 vs 13.2 | 29.9 vs 14.9 |
+| two words | 7.6 vs 6.5 | 16.6 vs 9.9 | 18.8 vs 11.4 |
+| negation | 9.8 vs 8 | 22.9 vs 10.5 | 25.8 vs 12.6 |
+| prefix | 5.4 vs 4.6 | 12.9 vs 9.1 | 13.9 vs 10 |
+| date month | 24.5 vs 6.7 | 39.4 vs 9 | 41.9 vs 10.6 |
+| combined | 4.6 vs 5.8 | 6.4 vs 8.6 | 7.7 vs 9.9 |
+| unread word | 7.1 vs 7.1 | 14.2 vs 10.2 | 16.4 vs 12.7 |
+| folder | 2.3 vs 2.5 | 3.3 vs 3.6 | 4 vs 4.8 |
+
+Ahead on all three for 12 of 17, and unread word ties its count. Trailing: rare word and folder by 0.1 to 0.8 ms (the floor and a page's presentation), subject word count by 0.6 (the `title` column filter, as `from` was), combined by 1.2 to 2.2 (the joint `AND` decodes `dasovich`'s positions in every body to filter its column).
