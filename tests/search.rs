@@ -4463,10 +4463,10 @@ fn a_page_resumes_after_the_last_hit_it_answered() {
     assert_eq!(PimdirSearchCursor::from_token("2"), None);
 }
 
-/// A `from:` word off the hit columns reads the `from` posting list, so a
-/// row taken out of it is a hit fewer; an index lacking the list answers a
-/// query client the same as one holding it, off `object_text`, and the
-/// indexer rebuilds it with the list.
+/// A `from:` or `subject:` word off the hit columns reads the posting
+/// lists, so a row taken out of them is a hit fewer; an index lacking the
+/// lists answers a query client the same as one holding them, off
+/// `object_text`, and the indexer rebuilds it with the lists.
 #[test]
 fn a_from_word_reads_the_posting_list_and_falls_back_without_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -4481,7 +4481,13 @@ fn a_from_word_reads_the_posting_list_and_falls_back_without_it() {
         let parsed = PimdirQuery::parse(query).unwrap();
         index.count(&parsed, &clock).unwrap().count
     };
-    let queries = ["from:alice", "from:ali*", "from:alice not body:roadmap"];
+    let queries = [
+        "from:alice",
+        "from:ali*",
+        "from:alice not body:roadmap",
+        "subject:sync",
+        "subject:syn*",
+    ];
     let held: Vec<u64> = queries.iter().map(|query| count(query)).collect();
     assert!(held.iter().all(|count| *count > 0), "{held:?}");
 
@@ -4489,7 +4495,7 @@ fn a_from_word_reads_the_posting_list_and_falls_back_without_it() {
     let posted = |index: &rusqlite::Connection| {
         index
             .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name = 'pimdir_from'",
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'pimdir_fields'",
                 [],
                 |r| r.get::<_, i64>(0),
             )
@@ -4498,17 +4504,17 @@ fn a_from_word_reads_the_posting_list_and_falls_back_without_it() {
     assert_eq!(posted(&index), 1);
     let first: i64 = index
         .query_row(
-            "SELECT min(rowid) FROM pimdir_from WHERE pimdir_from MATCH 'alice'",
+            "SELECT min(rowid) FROM pimdir_fields WHERE pimdir_fields MATCH '{from} : alice'",
             [],
             |r| r.get(0),
         )
         .unwrap();
     index
-        .execute("DELETE FROM pimdir_from WHERE rowid = ?1", [first])
+        .execute("DELETE FROM pimdir_fields WHERE rowid = ?1", [first])
         .unwrap();
     assert_eq!(count("from:alice"), held[0] - 1);
 
-    index.execute_batch("DROP TABLE pimdir_from;").unwrap();
+    index.execute_batch("DROP TABLE pimdir_fields;").unwrap();
     let fallen: Vec<u64> = queries.iter().map(|query| count(query)).collect();
     assert_eq!(fallen, held);
 

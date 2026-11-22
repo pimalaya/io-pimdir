@@ -242,45 +242,46 @@ JOIN store.items i ON i.collection = p.collection AND i.seq = p.seq
 WHERE m.thread = :thread AND c.account IS :account AND c.kind = 'message/rfc822'
   AND i.deleted = 0 AND i.retained_at IS NULL;"#;
 
-/// The name of [`FROM_POSTING`]'s table.
-pub const FROM_POSTING_TABLE: &str = "pimdir_from";
+/// The name of [`POSTING`]'s table.
+pub const POSTING_TABLE: &str = "pimdir_fields";
 
-/// The `from` posting list, this crate's own table beside the canonical
-/// schema, which the shape check leaves out as it does any other table
-/// (SEARCH §2): `object_text`'s `from` column alone, under its tokenizer
-/// and keyed on its rowid, so a `from:` word reads the bodies stating it
-/// in their From header without decoding the doclist of every body
-/// holding it anywhere. It keeps no positions (`detail = none`), so it
-/// answers a word or a prefix alone, a phrase reading `object_text`.
-pub const FROM_POSTING: &str = r#"CREATE VIRTUAL TABLE IF NOT EXISTS pimdir_from USING fts5(
-    "from",
-    content = '', contentless_delete = 1, detail = none,
+/// The posting lists of the short fields, this crate's own table beside
+/// the canonical schema, which the shape check leaves out as it does any
+/// other table (SEARCH §2): `object_text`'s `title` and `from` columns
+/// alone, under its tokenizer and keyed on its rowid, so a `subject:` or
+/// `from:` word reads the bodies stating it there without decoding the
+/// doclist of every body holding it anywhere. It keeps each match's
+/// columns and no positions (`detail = column`), so it answers a word or
+/// a prefix in one column alone, a phrase reading `object_text`.
+pub const POSTING: &str = r#"CREATE VIRTUAL TABLE IF NOT EXISTS pimdir_fields USING fts5(
+    title, "from",
+    content = '', contentless_delete = 1, detail = column,
     tokenize = 'unicode61 remove_diacritics 0'
 );"#;
 
-/// A body's `from` text into [`FROM_POSTING`], beside its `object_text`
-/// row.
-pub const INSERT_FROM_POSTING: &str =
-    r#"INSERT INTO pimdir_from(rowid, "from") VALUES (:rowid, :from);"#;
+/// A body's `title` and `from` text into [`POSTING`], beside its
+/// `object_text` row.
+pub const INSERT_POSTING: &str =
+    r#"INSERT INTO pimdir_fields(rowid, title, "from") VALUES (:rowid, :title, :from);"#;
 
-/// A body's row of [`FROM_POSTING`] dropped with its `object_text` row.
-pub const DELETE_FROM_POSTING: &str = r#"DELETE FROM pimdir_from WHERE rowid = :rowid;"#;
+/// A body's row of [`POSTING`] dropped with its `object_text` row.
+pub const DELETE_POSTING: &str = r#"DELETE FROM pimdir_fields WHERE rowid = :rowid;"#;
 
-/// [`FROM_POSTING`] merged into one segment, beside `optimize_text`.
-pub const OPTIMIZE_FROM_POSTING: &str =
-    r#"INSERT INTO pimdir_from(pimdir_from) VALUES ('optimize');"#;
+/// [`POSTING`] merged into one segment, beside `optimize_text`.
+pub const OPTIMIZE_POSTING: &str =
+    r#"INSERT INTO pimdir_fields(pimdir_fields) VALUES ('optimize');"#;
 
-/// The bodies whose From header states the word or prefix `?1` (an
-/// expression of [`FROM_POSTING`]), at most `?2`.
-pub const MATCH_FROM_POSTING: &str =
-    r#"SELECT rowid FROM pimdir_from WHERE pimdir_from MATCH ?1 LIMIT ?2;"#;
+/// The bodies an expression of [`POSTING`] matches (`?1`, one column's
+/// word or prefix), at most `?2`.
+pub const MATCH_POSTING: &str =
+    r#"SELECT rowid FROM pimdir_fields WHERE pimdir_fields MATCH ?1 LIMIT ?2;"#;
 
 /// Every statement of this crate's own, paired with its constant name.
 pub const OWN: &[(&str, &str)] = &[
-    ("INSERT_FROM_POSTING", INSERT_FROM_POSTING),
-    ("DELETE_FROM_POSTING", DELETE_FROM_POSTING),
-    ("OPTIMIZE_FROM_POSTING", OPTIMIZE_FROM_POSTING),
-    ("MATCH_FROM_POSTING", MATCH_FROM_POSTING),
+    ("INSERT_POSTING", INSERT_POSTING),
+    ("DELETE_POSTING", DELETE_POSTING),
+    ("OPTIMIZE_POSTING", OPTIMIZE_POSTING),
+    ("MATCH_POSTING", MATCH_POSTING),
     ("COUNT_UNINDEXED", COUNT_UNINDEXED),
     ("ROLL_COVERAGE", ROLL_COVERAGE),
     ("SCOPE_COLLECTIONS", SCOPE_COLLECTIONS),
@@ -324,7 +325,7 @@ mod tests {
             .unwrap();
         let conn = Connection::open(dir.path().join("index.db")).unwrap();
         conn.execute_batch(MIGRATION_0001).unwrap();
-        conn.execute_batch(FROM_POSTING).unwrap();
+        conn.execute_batch(POSTING).unwrap();
         conn.execute("ATTACH DATABASE ?1 AS store", [store.to_str().unwrap()])
             .unwrap();
         conn.execute_batch(sql::CREATE_PARAM).unwrap();

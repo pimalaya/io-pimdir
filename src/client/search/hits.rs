@@ -1077,7 +1077,7 @@ impl Run<'_> {
         let columns = self.columns;
         if let Some(expression) = body {
             let (sql, expression) = match self.index.posted_word(expression) {
-                Some(word) => (search::MATCH_FROM_POSTING, word),
+                Some(word) => (search::MATCH_POSTING, word),
                 None => (
                     "SELECT rowid FROM object_text WHERE object_text MATCH ?1 LIMIT ?2",
                     expression,
@@ -1288,22 +1288,25 @@ impl Run<'_> {
 }
 
 impl super::PimdirIndex {
-    /// The expression of the `from` posting list answering `expression`,
-    /// a `from:` term of one word or prefix as the compiler renders it
-    /// (`{from} : "word"`, then ` *` for a prefix), when index.db holds
-    /// the list: the same word under the same tokenizer over the same
-    /// text, so the bodies it matches are the column filter's. `None` for
-    /// any other expression, a phrase or a word the tokenizer could split
-    /// among them, which `object_text` answers.
+    /// The expression of the posting lists answering `expression`, a
+    /// `subject:` or `from:` term of one word or prefix as the compiler
+    /// renders it (`{title} : "word"` or `{from} : "word"`, then ` *` for
+    /// a prefix), when index.db holds the lists: the same word under the
+    /// same tokenizer over the same text in the same column, so the bodies
+    /// it matches are the column filter's. `None` for any other
+    /// expression, a phrase or a word the tokenizer could split among
+    /// them, which `object_text` answers.
     fn posted_word<'e>(&self, expression: &'e str) -> Option<&'e str> {
-        if !self.from_posting {
+        if !self.posting {
             return None;
         }
-        let word = expression.strip_prefix("{from} : ")?;
+        let word = expression
+            .strip_prefix("{title} : ")
+            .or_else(|| expression.strip_prefix("{from} : "))?;
         let quoted = word.strip_suffix(" *").unwrap_or(word);
         let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
         match !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            true => Some(word),
+            true => Some(expression),
             false => None,
         }
     }
@@ -1322,7 +1325,9 @@ impl super::PimdirIndex {
             if !matches!(sourced, super::Sourced::Probed) {
                 continue;
             }
-            let limit = match probe.expression.contains('*') {
+            let limit = match probe.expression.contains('*')
+                || self.posted_word(&probe.expression).is_some()
+            {
                 true => -1,
                 false => super::PROBE_SET_MAX as i64 + 1,
             };
@@ -1352,7 +1357,7 @@ impl super::PimdirIndex {
                     Ok(true)
                 };
             let (body, expression) = match self.posted_word(&probe.expression) {
-                Some(word) => (search::MATCH_FROM_POSTING, word),
+                Some(word) => (search::MATCH_POSTING, word),
                 None => (
                     "SELECT rowid FROM object_text WHERE object_text MATCH ?1 LIMIT ?2",
                     probe.expression.as_str(),

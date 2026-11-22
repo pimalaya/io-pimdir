@@ -489,7 +489,7 @@ fn a_rebuild_drops_the_hit_columns() {
 
     rusqlite::Connection::open(dir.path().join("index.db"))
         .unwrap()
-        .execute_batch("DROP TABLE pimdir_from;")
+        .execute_batch("DROP TABLE pimdir_fields;")
         .unwrap();
     drop(PimdirIndex::open(dir.path()).unwrap());
     assert!(!hits.exists());

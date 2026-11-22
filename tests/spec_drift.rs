@@ -414,7 +414,7 @@ fn every_canonical_search_statement_is_inlined_and_prepares() {
 #[test]
 fn every_inlined_search_statement_prepares() {
     let (_dir, conn) = index(sql::MIGRATION_0001, sql::search::MIGRATION_0001);
-    conn.execute_batch(sql::search::FROM_POSTING).unwrap();
+    conn.execute_batch(sql::search::POSTING).unwrap();
 
     for (name, text) in sql::search::all() {
         assert!(

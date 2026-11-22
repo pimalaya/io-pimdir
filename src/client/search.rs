@@ -329,10 +329,10 @@ pub struct PimdirIndex {
     /// only, never refreshed.
     #[cfg(feature = "indexer")]
     query_only: bool,
-    /// Whether index.db holds the `from` posting list of this crate's own
-    /// (`sql::search::FROM_POSTING`), which a `from:` word reads in place
-    /// of `object_text`'s column.
-    from_posting: bool,
+    /// Whether index.db holds the posting lists of this crate's own
+    /// (`sql::search::POSTING`), which a `subject:` or `from:` word reads
+    /// in place of `object_text`'s column.
+    posting: bool,
     /// Whether this connection declared `temp.term_match` and
     /// `temp.term_source`, which the first compiled statement naming one
     /// declares: a query answered off the hit columns reads neither.
@@ -786,7 +786,7 @@ impl PimdirIndex {
             dir: dir.to_path_buf(),
             #[cfg(feature = "indexer")]
             query_only: false,
-            from_posting: true,
+            posting: true,
             terms: Cell::new(false),
             coverages: RefCell::default(),
             force: Cell::new(None),
@@ -852,7 +852,7 @@ impl PimdirIndex {
             dir: dir.to_path_buf(),
             #[cfg(feature = "indexer")]
             query_only: true,
-            from_posting: matches!(held, PimdirIndexHeld::Current | PimdirIndexHeld::Extracted),
+            posting: matches!(held, PimdirIndexHeld::Current | PimdirIndexHeld::Extracted),
             terms: Cell::new(false),
             coverages: RefCell::default(),
             force: Cell::new(None),
@@ -1029,7 +1029,7 @@ impl PimdirIndex {
         debug!("optimize the full-text tables");
         self.conn
             .execute_batch(search::OPTIMIZE_TEXT)
-            .and_then(|()| self.conn.execute_batch(search::OPTIMIZE_FROM_POSTING))
+            .and_then(|()| self.conn.execute_batch(search::OPTIMIZE_POSTING))
             .map_err(busy_or_sql)?;
         checkpoint(&self.conn)?;
 
@@ -3032,7 +3032,7 @@ enum PimdirIndexHeld {
     /// query client answers from it.
     Extracted,
     /// What this crate builds, from this store, lacking the `from`
-    /// posting list of its own (`sql::search::FROM_POSTING`), under its
+    /// posting list of its own (`sql::search::POSTING`), under its
     /// extraction or, `extracted`, another: the indexer rebuilds it, a
     /// query client answers from it, its `from:` words read `object_text`.
     Unposted {
@@ -3207,7 +3207,7 @@ fn declared(conn: &Connection) -> Result<(bool, bool), PimdirError> {
     let (mut held, mut posted) = (0, false);
     while let Some(row) = rows.next()? {
         let name = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
-        posted |= name == search::FROM_POSTING_TABLE;
+        posted |= name == search::POSTING_TABLE;
         let Ok(at) = search::DECLARED.binary_search_by(|(known, _)| (*known).cmp(name)) else {
             continue;
         };
@@ -3235,7 +3235,7 @@ fn init(conn: &mut Connection) -> Result<(), PimdirError> {
             return Err(err.into());
         }
     }
-    tx.execute_batch(search::FROM_POSTING)?;
+    tx.execute_batch(search::POSTING)?;
     tx.pragma_update(Some("main"), "user_version", search::VERSION)?;
     tx.execute_cached(
         search::INIT_INDEX_META,

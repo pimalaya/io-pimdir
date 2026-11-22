@@ -579,8 +579,8 @@ impl Statements<'_> {
             match write {
                 TextWrite::PutObject(id, text) => {
                     tx.execute_cached(
-                        search::INSERT_FROM_POSTING,
-                        named_params! { ":rowid": id, ":from": &text.from },
+                        search::INSERT_POSTING,
+                        named_params! { ":rowid": id, ":title": &text.title, ":from": &text.from },
                     )?;
                     tx.execute_cached(
                         search::INSERT_OBJECT_TEXT,
@@ -605,7 +605,7 @@ impl Statements<'_> {
                 }
                 TextWrite::DropObject(id) => {
                     tx.execute_cached(search::DELETE_OBJECT, named_params! { ":rowid": id })?;
-                    tx.execute_cached(search::DELETE_FROM_POSTING, named_params! { ":rowid": id })?;
+                    tx.execute_cached(search::DELETE_POSTING, named_params! { ":rowid": id })?;
                 }
                 TextWrite::PutSummary(id, text) => {
                     tx.execute_cached(
