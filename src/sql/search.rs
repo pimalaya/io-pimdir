@@ -1,9 +1,9 @@
 //! # Search SQL
 //!
-//! The index schema and statements of SEARCH.md, generated at build time
-//! from the specification vendored under spec/ (migrations/search/ and
-//! queries/search/), each prepared on index.db with the store attached
-//! read-only as `store` (SEARCH §2).
+//! This crate's index schema and statements (spec/migrations/search/ and
+//! spec/queries/search/, the index being the implementation's own under
+//! SEARCH.md), generated at build time, each prepared on index.db with the
+//! store attached read-only as `store`.
 //!
 //! The statements of this crate's own follow: the indexer's bookkeeping
 //! around the canonical ones, none of which another implementation needs

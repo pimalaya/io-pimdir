@@ -1,6 +1,6 @@
 # pimdir-generator
 
-Status: io-pimdir's own test tooling (moved from the pimdir specification on 2026-11-23, cairn/changes/a-smaller-pimdir there), no part of the standard
+Status: io-pimdir's own test tooling (moved from the pimdir specification on 2026-11-22, cairn/changes/a-smaller-pimdir there), no part of the standard
 
 A deterministic generator of pimdir histories, the stores they leave and what every conforming implementation answers over them. It is the generator of cairn/changes/the-freeze-plan (section 2, and the oracle of section 5b), into which cairn/changes/pim-corpus folds. This file is its design note: what it models, what it writes and through what, what its oracle states, how a failure shrinks into a vector, and how io-pimdir takes it as a dev-dependency. scenarios.md beside it is the catalogue of what the consumers do with a store, read once from their sources, from which the profiles draw their events.
 

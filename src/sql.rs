@@ -1,11 +1,11 @@
 //! # Canonical SQL
 //!
-//! The pimdir schema and statements, generated at build time from the
-//! specification vendored under spec/ (migrations/storage/ and
-//! queries/storage/, one file per statement under read/, queue/ and
-//! owner/), so the crate is self-contained and every canonical statement
-//! is reachable by name for an implementation holding its own SQLite
-//! binding.
+//! The pimdir schema, vendored from the specification under
+//! spec/migrations/storage/, and this crate's statements, one file per
+//! statement under spec/queries/storage/ (read/, queue/, owner/), both
+//! generated at build time, so the crate is self-contained and every
+//! statement is reachable by name for an implementation holding its own
+//! SQLite binding.
 //!
 //! The statements of this crate's own are the operator tool's, behind
 //! `pimdir check` and `store info`, and the narrowed coverage count the
