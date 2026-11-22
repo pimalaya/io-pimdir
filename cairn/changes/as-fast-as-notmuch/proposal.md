@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: as-fast-as-notmuch
-status: draft
+status: landed
 created: 2026-11-21
 ---
 
