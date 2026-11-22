@@ -136,3 +136,9 @@ Head to head (new18):
 | folder | 2.3 vs 2.5 | 3.3 vs 3.6 | 4.1 vs 4.8 |
 
 Ahead on all three for 14 of 17. Trailing: rare word and folder (0.1 to 0.7 ms), combined (1.2 to 2.1).
+
+## Page candidates as JSON (9a97d23); the kind index dropped
+
+A page off the columns binds its candidates as one JSON array read through `json_each` (no `temp.hit_page` to declare and fill a row at a time): pages 0.1 to 0.2 ms in one A/B run, answers equal.
+
+Tried and dropped: `collections_by_kind ON collections(kind, id)` in the canonical store schema, for `HOLDS_CALENDARS` and `items_to_reexpand`. With no statistics SQLite's planner then drives seven other canonical statements from it (`seq_for_link_any`, the `link_*_of` family, `list_held_mail`, `coverage_all`), breaking their plan checks in checks/invariants.sh: reverted before any commit.
