@@ -106,3 +106,33 @@ Ahead on all three for 12 of 17, and unread word ties its count. Trailing: rare 
 subject word went 5.8 / 9.2 / 10.3 to 4.0 / 7.3 / 9.0 (notmuch 5.5 / 14.7 / 16.3): ahead on all three, 13 of 17.
 
 Tried and dropped again for combined: the joint `AND` holding the bare word (`"dasovich"`, no column) and its bodies intersected with the posting's `{from}` set: count 8.0 to 9.3 in one run. The unfiltered `AND` still walks both doclists; the column filter is not where combined's time goes.
+
+## Threads (bb7373f, be17c07)
+
+A threaded page off the columns ran per thread `THREAD_MEMBERS`, a members statement whose `VALUES` list held one row per member (a new text, so a prepare, per member count) and `THREAD_SPAN`. A thread whose only member among the hits is the hit that met it now answers that hit, no members statement; the others list their seqs through `json_each(:members)`, one text. Folder threads 6.1 to 4.7 ms (one A/B run); every threads page of the 17 queries equals new9's.
+
+Combined's count (ticks): the joint FTS5 `AND` 4.4 ms (`from` posting alone 1.6, `california` alone 5.6) and its coverage 508 µs against 150 for an undated query: `HOLDS_CALENDARS` scans every collection (6,622) for `kind`, which no index holds. A `collections(kind)` index would take ~0.35 ms off every dated query on a store of many collections (canonical schema, storage-draft-16 is untagged); not built yet.
+
+Head to head (new18):
+
+| query | count | page | threads |
+| --- | --- | --- | --- |
+| all mail | 52.7 vs 5.1 | 264.3 vs 11.4 | 281.1 vs 13 |
+| unread | 21 vs 6.5 | 80.4 vs 9.9 | 85.5 vs 11.2 |
+| flagged | 6.2 vs 4.9 | 17.2 vs 7.2 | 18.7 vs 8.5 |
+| from address | 12.3 vs 5.3 | 17.6 vs 7 | 18.7 vs 7.6 |
+| from name | 3.9 vs 3.6 | 7.9 vs 6 | 9.9 vs 7.4 |
+| subject word | 5.3 vs 4 | 15.1 vs 7.9 | 16.7 vs 9 |
+| common word | 88.1 vs 52.2 | 288.6 vs 59.9 | 304 vs 62.4 |
+| mid word | 9.3 vs 6.5 | 27 vs 10.2 | 30.2 vs 11.7 |
+| rare word | 2.4 vs 2.5 | 4.6 vs 5.2 | 6.1 vs 6.5 |
+| phrase | 16.9 vs 8.6 | 27.3 vs 13.1 | 30.1 vs 14.3 |
+| two words | 7.6 vs 6.7 | 17.3 vs 10.5 | 18.8 vs 11.3 |
+| negation | 9.7 vs 7.9 | 23.1 vs 10.8 | 25.7 vs 12.2 |
+| prefix | 5.7 vs 4.9 | 12.3 vs 8.5 | 14.1 vs 9.9 |
+| date month | 24.1 vs 6.9 | 38.9 vs 8.5 | 42 vs 10.6 |
+| combined | 4.6 vs 5.8 | 6.8 vs 8.5 | 7.7 vs 9.8 |
+| unread word | 7 vs 6.9 | 14.3 vs 10.2 | 16.5 vs 12.1 |
+| folder | 2.3 vs 2.5 | 3.3 vs 3.6 | 4.1 vs 4.8 |
+
+Ahead on all three for 14 of 17. Trailing: rare word and folder (0.1 to 0.7 ms), combined (1.2 to 2.1).
