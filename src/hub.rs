@@ -455,6 +455,76 @@ impl PimdirHub {
         out
     }
 
+    /// [`project_with`](Self::project_with) moving out of the hub what the
+    /// placements hold and what [`conflicted`](Self::conflicted),
+    /// [`offered`](Self::offered) and [`folded`](Self::folded) never read,
+    /// instead of copying it: the item's summary, sort key and flags, the
+    /// binding's handle, conflict, server object id and its base's flags
+    /// and revision. The projection is the same; the hub keeps the rest,
+    /// for a caller reading only those three afterwards.
+    pub(crate) fn project_moving(
+        &mut self,
+        collection: &PimdirCollectionId,
+        source: &PimdirSourceId,
+        mut origin: impl FnMut(&PimdirPlacement) -> Option<PimdirOrigin>,
+    ) -> Vec<PimdirPlacement> {
+        let mut out = Vec::with_capacity(self.items.len());
+
+        for (link, item) in &mut self.items {
+            if item.sources.is_empty() {
+                continue;
+            }
+            let status = match (item.deleted, item.sources.get(source)) {
+                (true, Some(_)) => PimdirStatus::Tombstone,
+                (true, None) => continue,
+                (false, Some(binding)) => Self::bound_status(self.immutable, item, binding),
+                (false, None) if Self::creatable(link, item) => PimdirStatus::Created,
+                (false, None) => continue,
+            };
+            let stored = item.stored_level();
+            let mut placement = PimdirPlacement {
+                collection: collection.clone(),
+                handle: PimdirHandle(String::new()),
+                link_id: Some(link.clone()),
+                object: item.object.clone(),
+                level: PimdirLevel::Full,
+                summary: item.summary.take(),
+                sort_key: core::mem::take(&mut item.sort_key),
+                flags: core::mem::replace(&mut item.flags, PimdirFlags::Unknown),
+                status,
+                conflict_revision: None,
+                conflict_object: None,
+                base: None,
+                origin: None,
+                server_object_id: None,
+            };
+            if let Some(binding) = item.sources.get_mut(source) {
+                placement.handle =
+                    core::mem::replace(&mut binding.handle, PimdirHandle(String::new()));
+                placement.level = stored;
+                placement.conflict_revision = binding.conflict_revision.take();
+                placement.conflict_object = binding.conflict_object.take();
+                placement.base = binding.base.as_mut().map(|base| PimdirBase {
+                    flags: core::mem::replace(&mut base.flags, PimdirFlags::Unknown),
+                    revision: base.revision.take(),
+                    object: base.object.clone(),
+                });
+                placement.server_object_id = binding.server_object_id.take();
+            } else {
+                placement.handle = link.provisional();
+            }
+            if matches!(
+                placement.status,
+                PimdirStatus::Created | PimdirStatus::Tombstone
+            ) {
+                placement.origin = origin(&placement);
+            }
+            out.push(placement);
+        }
+
+        out
+    }
+
     /// The item conflicts of `placements`, a projection of this hub, for
     /// [`PimdirLoaded::conflicted`](crate::load::PimdirLoaded::conflicted):
     /// each placement whose item is conflicted, with the item's diverging
@@ -463,10 +533,9 @@ impl PimdirHub {
         &self,
         placements: &[PimdirPlacement],
     ) -> Vec<(PimdirHandle, Option<PimdirHash>)> {
-        placements
-            .iter()
-            .filter_map(|placement| {
-                let item = self.items.get(placement.link_id.as_ref()?)?;
+        self.items_of(placements)
+            .filter_map(|(placement, item)| {
+                let item = item?;
                 item.conflicted
                     .then(|| (placement.handle.clone(), item.conflict_object.clone()))
             })
@@ -509,10 +578,9 @@ impl PimdirHub {
         source: &PimdirSourceId,
         placements: &[PimdirPlacement],
     ) -> Vec<PimdirHandle> {
-        placements
-            .iter()
-            .filter(|placement| {
-                let Some(item) = placement.link_id.as_ref().and_then(|l| self.items.get(l)) else {
+        self.items_of(placements)
+            .filter(|(_, item)| {
+                let Some(item) = item else {
                     return false;
                 };
                 let Some(binding) = item.sources.get(source) else {
@@ -522,8 +590,34 @@ impl PimdirHub {
                 let agreed = binding.shared_object.as_ref().or(base);
                 binding.base.is_some() && item.object.is_some() && item.object.as_ref() != agreed
             })
-            .map(|placement| placement.handle.clone())
+            .map(|(placement, _)| placement.handle.clone())
             .collect()
+    }
+
+    /// Each placement with its item, `self.items.get` of its link id,
+    /// found by walking the items alongside the placements in the order a
+    /// projection answers them: a placement out of that order is looked
+    /// up, so the pairs are the same whatever the order.
+    fn items_of<'a>(
+        &'a self,
+        placements: &'a [PimdirPlacement],
+    ) -> impl Iterator<Item = (&'a PimdirPlacement, Option<&'a PimdirHubItem>)> + 'a {
+        let mut walk = self.items.iter().peekable();
+        placements.iter().map(move |placement| {
+            let Some(link) = placement.link_id.as_ref() else {
+                return (placement, None);
+            };
+            while let Some((key, item)) = walk.peek() {
+                match (*key).cmp(link) {
+                    core::cmp::Ordering::Less => {
+                        walk.next();
+                    }
+                    core::cmp::Ordering::Equal => return (placement, Some(*item)),
+                    core::cmp::Ordering::Greater => break,
+                }
+            }
+            (placement, self.items.get(link))
+        })
     }
 
     /// The placement for an item this source already holds.
@@ -545,26 +639,7 @@ impl PimdirHub {
         item: &PimdirHubItem,
         binding: &PimdirBinding,
     ) -> PimdirPlacement {
-        let mutable = !self.immutable;
-        // NOTE: the flag sets differ only when both are known (SYNC §3
-        // rule 4): an unknown one holds no opinion.
-        let in_sync = binding.base.as_ref().is_some_and(|b| {
-            let flags = match (b.flags.known(), item.flags.known()) {
-                (Some(base), Some(held)) => base == held,
-                _ => true,
-            };
-            flags && (!mutable || item.object.is_none() || b.object == item.object)
-        });
-        let status = if binding.conflicted || item.conflicted {
-            PimdirStatus::Conflict
-        } else if binding.base.is_none() {
-            PimdirStatus::Created
-        } else if in_sync {
-            PimdirStatus::Clean
-        } else {
-            PimdirStatus::Dirty
-        };
-
+        let status = Self::bound_status(self.immutable, item, binding);
         let mut placement = item.project(collection, link, binding.handle.clone());
         placement.status = status;
         placement.conflict_revision = binding.conflict_revision.clone();
@@ -572,6 +647,33 @@ impl PimdirHub {
         placement.base = binding.base.clone();
         placement.server_object_id = binding.server_object_id.clone();
         placement
+    }
+
+    /// The status of [`bound_placement`](Self::bound_placement), of a hub
+    /// holding an immutable kind or not. The flag sets differ only when
+    /// both are known (SYNC §3 rule 4): an unknown one holds no opinion.
+    fn bound_status(
+        immutable: bool,
+        item: &PimdirHubItem,
+        binding: &PimdirBinding,
+    ) -> PimdirStatus {
+        let mutable = !immutable;
+        let in_sync = binding.base.as_ref().is_some_and(|b| {
+            let flags = match (b.flags.known(), item.flags.known()) {
+                (Some(base), Some(held)) => base == held,
+                _ => true,
+            };
+            flags && (!mutable || item.object.is_none() || b.object == item.object)
+        });
+        if binding.conflicted || item.conflicted {
+            PimdirStatus::Conflict
+        } else if binding.base.is_none() {
+            PimdirStatus::Created
+        } else if in_sync {
+            PimdirStatus::Clean
+        } else {
+            PimdirStatus::Dirty
+        }
     }
 
     /// A `Tombstone` for an item deleted elsewhere but still held here.
@@ -606,8 +708,7 @@ impl PimdirHub {
         link: &PimdirLinkId,
         item: &PimdirHubItem,
     ) -> Option<PimdirPlacement> {
-        item.object.as_ref()?;
-        if link.as_str().starts_with("hash:") {
+        if !Self::creatable(link, item) {
             return None;
         }
 
@@ -615,6 +716,11 @@ impl PimdirHub {
         placement.status = PimdirStatus::Created;
         placement.level = PimdirLevel::Full;
         Some(placement)
+    }
+
+    /// Whether [`created_placement`](Self::created_placement) stages one.
+    fn creatable(link: &PimdirLinkId, item: &PimdirHubItem) -> bool {
+        item.object.is_some() && !link.as_str().starts_with("hash:")
     }
 
     /// Folds a source's sync writes back into the hub.
@@ -1141,7 +1247,21 @@ mod tests {
     }
 
     fn placements(hub: &PimdirHub, source: &str) -> Vec<PimdirPlacement> {
-        hub.project(&"inbox".into(), &PimdirSourceId::from(source))
+        let source = PimdirSourceId::from(source);
+        let projected = hub.project(&"inbox".into(), &source);
+        let mut moved = hub.clone();
+        let moving = moved.project_moving(&"inbox".into(), &source, |_| None);
+        assert_eq!(moving, projected, "the moving projection is the same");
+        assert_eq!(moved.conflicted(&moving), hub.conflicted(&projected));
+        assert_eq!(
+            moved.offered(&source, &moving),
+            hub.offered(&source, &projected)
+        );
+        assert_eq!(
+            moved.folded(&source, &moving),
+            hub.folded(&source, &projected)
+        );
+        projected
     }
 
     /// Binds `right` to the single item at the given base flags.

@@ -139,7 +139,7 @@ impl PimdirSourceStore {
                 ..Default::default()
             });
         }
-        let hub = match selection {
+        let mut hub = match selection {
             PimdirLoadSelection::All | PimdirLoadSelection::LastPage { .. } => {
                 read_hub(conn, &collection.0, None)?
             }
@@ -179,7 +179,7 @@ impl PimdirSourceStore {
         };
 
         let mut failed = None;
-        let mut placements = hub.project_with(collection, &self.source, |placement| {
+        let mut placements = hub.project_moving(collection, &self.source, |placement| {
             origin_for(conn, &self.source, placement).unwrap_or_else(|err| {
                 failed = Some(err);
                 None
@@ -1122,31 +1122,155 @@ pub(crate) fn read_hub(
     };
     let key = named_params! { ":collection": collection };
 
-    for (link, item) in rows(conn, items_sql, key, item_from_row)? {
+    let mut statement = conn.prepare_cached(items_sql)?;
+    let mut found = statement.query(key)?;
+    while let Some(row) = found.next()? {
+        let (link, item) = item_from_row(row)?;
         hub.items.insert(link, item);
     }
-    for (link, source, binding) in rows(conn, bindings_sql, key, binding_from_row)? {
-        if let Some(item) = hub.items.get_mut(&link) {
+    drop(found);
+    drop(statement);
+    attach_bindings(conn, bindings_sql, key, &mut hub.items)?;
+
+    attach_summaries(conn, summaries_sql, key, &mut hub.items)?;
+    attach_values(conn, values_sql, key, &mut hub.items)?;
+
+    Ok(hub)
+}
+
+/// Files the bindings `statement` answers (`load_bindings` or
+/// `load_bindings_by_link`) on `items`, as [`binding_from_row`] then one
+/// lookup per binding would, streamed, the link id read into one buffer.
+fn attach_bindings(
+    conn: &Connection,
+    statement: &str,
+    params: &[(&str, &dyn rusqlite::ToSql)],
+    items: &mut BTreeMap<PimdirLinkId, PimdirHubItem>,
+) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare_cached(statement)?;
+    let mut found = statement.query(params)?;
+    let mut link = PimdirLinkId(String::new());
+    while let Some(row) = found.next()? {
+        let at = text_ref(row, 0)?;
+        link.0.clear();
+        link.0.push_str(at);
+        let (source, binding) = binding_fields_from_row(row)?;
+        if let Some(item) = items.get_mut(&link) {
             item.sources.insert(source, binding);
         }
     }
+    Ok(())
+}
 
-    for (link, summary) in load_summaries(conn, summaries_sql, collection)? {
-        if let Some(item) = hub.items.get_mut(&link) {
+/// Files the summaries `statement` answers (`load_summaries` or
+/// `load_summaries_by_link`) on `items`, as [`load_summaries`] then one
+/// lookup per summary would, streamed, the link id read into one buffer.
+fn attach_summaries(
+    conn: &Connection,
+    statement: &str,
+    params: &[(&str, &dyn rusqlite::ToSql)],
+    items: &mut BTreeMap<PimdirLinkId, PimdirHubItem>,
+) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare_cached(statement)?;
+    let mut found = statement.query(params)?;
+    let mut link = PimdirLinkId(String::new());
+    while let Some(row) = found.next()? {
+        let at = text_ref(row, 0)?;
+        let Some(summary) = read_summary(row, 1)? else {
+            continue;
+        };
+        link.0.clear();
+        link.0.push_str(at);
+        if let Some(item) = items.get_mut(&link) {
             item.summary = Some(summary);
         }
     }
-    for (link, value) in load_values(conn, values_sql, collection)? {
-        if let Some(summary) = hub
-            .items
-            .get_mut(&link)
-            .and_then(|item| item.summary.as_mut())
-        {
-            attach_value(summary, value);
+    Ok(())
+}
+
+/// Files the lists `statement` answers (`load_values_by_collection` or
+/// `load_values_by_link`) on the summaries of `items`, as [`load_values`]
+/// then [`attach_value`] row by row would, streamed: the item is looked
+/// up once per run of rows of one link id, the order keeping each link's
+/// rows together, and only a value filed is copied out of its row.
+fn attach_values(
+    conn: &Connection,
+    statement: &str,
+    params: &[(&str, &dyn rusqlite::ToSql)],
+    items: &mut BTreeMap<PimdirLinkId, PimdirHubItem>,
+) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare_cached(statement)?;
+    let mut found = statement.query(params)?;
+    let mut link = PimdirLinkId(String::new());
+    let mut started = false;
+    let mut summary: Option<&mut PimdirSummary> = None;
+    while let Some(row) = found.next()? {
+        let at = text_ref(row, 0)?;
+        if !started || at != link.0 {
+            started = true;
+            link.0.clear();
+            link.0.push_str(at);
+            summary = items.get_mut(&link).and_then(|item| item.summary.as_mut());
+        }
+        let role = text_ref(row, 1)?;
+        match summary.as_deref_mut() {
+            Some(summary) => {
+                let value = row.get::<_, String>(3)?;
+                let name = row.get::<_, Option<String>>(4)?;
+                if let Some(value) = PimdirSummaryValue::of(role, value, name) {
+                    attach_value(summary, value);
+                }
+            }
+            None => {
+                text_ref(row, 3)?;
+                text_or_null_ref(row, 4)?;
+            }
         }
     }
+    Ok(())
+}
 
-    Ok(hub)
+/// A text column borrowed from its row, failing as [`Row::get`] of a
+/// `String` fails.
+fn text_ref<'row>(row: &'row Row, at: usize) -> rusqlite::Result<&'row str> {
+    let value = row.get_ref(at)?;
+    value
+        .as_str()
+        .map_err(|err| column_error(row, at, value, err))
+}
+
+/// A nullable text column borrowed from its row, failing as [`Row::get`]
+/// of an `Option<String>` fails.
+fn text_or_null_ref<'row>(row: &'row Row, at: usize) -> rusqlite::Result<Option<&'row str>> {
+    let value = row.get_ref(at)?;
+    value
+        .as_str_or_null()
+        .map_err(|err| column_error(row, at, value, err))
+}
+
+/// The error [`Row::get`] maps a failed text conversion to.
+fn column_error(
+    row: &Row,
+    at: usize,
+    value: rusqlite::types::ValueRef,
+    err: rusqlite::types::FromSqlError,
+) -> rusqlite::Error {
+    match err {
+        rusqlite::types::FromSqlError::Utf8Error(err) => rusqlite::Error::Utf8Error(at, err),
+        rusqlite::types::FromSqlError::InvalidType => rusqlite::Error::InvalidColumnType(
+            at,
+            row.as_ref()
+                .column_name(at)
+                .map(String::from)
+                .unwrap_or_default(),
+            value.data_type(),
+        ),
+        err => rusqlite::Error::FromSqlConversionFailure(
+            at,
+            value.data_type(),
+            alloc::boxed::Box::new(err),
+        ),
+    }
 }
 
 /// [`read_hub`] of the named link ids, for a load: naming none projects
@@ -2746,6 +2870,12 @@ pub(crate) fn binding_from_row(
     row: &Row,
 ) -> rusqlite::Result<(PimdirLinkId, PimdirSourceId, PimdirBinding)> {
     let link: String = row.get(0)?;
+    let (source, binding) = binding_fields_from_row(row)?;
+    Ok((PimdirLinkId(link), source, binding))
+}
+
+/// [`binding_from_row`] past the link id, its first column.
+fn binding_fields_from_row(row: &Row) -> rusqlite::Result<(PimdirSourceId, PimdirBinding)> {
     let source: String = row.get(1)?;
     let handle: String = row.get(2)?;
     let base_flags: Option<String> = row.get(3)?;
@@ -2775,7 +2905,6 @@ pub(crate) fn binding_from_row(
 
     let conflicted = conflicted != 0;
     Ok((
-        PimdirLinkId(link),
         PimdirSourceId(source),
         PimdirBinding {
             handle: PimdirHandle(handle),
