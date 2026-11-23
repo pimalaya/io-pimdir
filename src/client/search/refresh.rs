@@ -7,6 +7,8 @@
 //!
 //! [`PimdirIndexRefresh`]: crate::search::refresh::PimdirIndexRefresh
 
+use core::cell::RefCell;
+
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     string::String,
@@ -17,7 +19,12 @@ use log::{debug, trace};
 use rusqlite::{OptionalExtension, Transaction, named_params};
 
 use crate::{
-    client::{PimdirError, PreparedCached, blobs::PimdirBlobs, rows, search::summary},
+    client::{
+        PimdirError, PreparedCached,
+        blobs::PimdirBlobs,
+        rows,
+        search::{hits::Touched, summary},
+    },
     codec,
     object::PimdirHash,
     placement::PimdirLinkId,
@@ -35,6 +42,9 @@ use crate::{
 pub(crate) struct Statements<'a> {
     pub(crate) tx: &'a Transaction<'a>,
     pub(crate) blobs: &'a PimdirBlobs,
+    /// Where the placements fed and written are told, while the hit
+    /// columns are patched rather than read whole.
+    pub(crate) touched: Option<&'a RefCell<Touched>>,
 }
 
 impl Statements<'_> {
@@ -252,6 +262,12 @@ impl Statements<'_> {
                 summary: None,
             })
         })?;
+        if let Some(touched) = self.touched {
+            let mut touched = touched.borrow_mut();
+            for row in &feed {
+                touched.key(&row.collection, row.seq);
+            }
+        }
         for row in &mut feed {
             if row.needs_summary() {
                 let (summary, addresses) =
@@ -283,6 +299,28 @@ impl Statements<'_> {
                 },
             )
             .optional()?)
+    }
+
+    /// Tells the placement `(collection, seq)` about to be written, with
+    /// the body it names, to [`touched`](Self::touched) when one listens.
+    fn touch(&self, collection: &str, seq: i64) -> Result<(), PimdirError> {
+        let Some(touched) = self.touched else {
+            return Ok(());
+        };
+        let held: Option<(i64, Option<i64>)> = self
+            .tx
+            .query_row_cached(
+                search::LOAD_PLACEMENT_OBJECT,
+                named_params! { ":collection": collection, ":seq": seq },
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let mut touched = touched.borrow_mut();
+        touched.key(collection, seq);
+        if let Some((id, object)) = held {
+            touched.before(id, object);
+        }
+        Ok(())
     }
 
     /// The rowid of a placement's row, which its summary text is keyed on.
@@ -370,7 +408,8 @@ impl Statements<'_> {
                 }
             }
             PimdirIndexOp::PutPlacement(placement) => {
-                tx.query_row_cached(
+                self.touch(&placement.collection, placement.seq)?;
+                let id = tx.query_row_cached(
                     search::UPSERT_PLACEMENT,
                     named_params! {
                         ":collection": placement.collection,
@@ -380,8 +419,12 @@ impl Statements<'_> {
                     },
                     |r| r.get::<_, i64>(0),
                 )?;
+                if let Some(touched) = self.touched {
+                    touched.borrow_mut().before(id, None);
+                }
             }
             PimdirIndexOp::DropPlacement { collection, seq } => {
+                self.touch(&collection, seq)?;
                 let id: Option<i64> = tx
                     .query_row_cached(
                         search::DELETE_PLACEMENT,

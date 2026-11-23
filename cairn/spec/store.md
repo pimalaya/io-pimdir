@@ -152,7 +152,8 @@ projects each side.
 
 ### Requirement: Collections declare a media type
 A collection SHALL carry a `kind` (an IANA media type). `ensure_collection` sets
-it; the lazy collection creation inside `write` uses `ON CONFLICT DO NOTHING` and
+it, reading the row first and writing nothing when it already holds that
+kind (`load_kind`), so the no-op sync of every folder begins no write; the lazy collection creation inside `write` uses `ON CONFLICT DO NOTHING` and
 never clobbers a declared kind. This makes the store self-describing and lets one
 store hold several item kinds.
 

@@ -952,6 +952,8 @@ impl PimdirIndex {
         let blobs = self.reader.blobs();
         let now = options.now.unwrap_or_else(unix_now);
         let mut first = true;
+        let start = hits::Stamp::of(&self.conn, &self.dir)?;
+        let touched = hits::holds(&self.dir, start).then(|| RefCell::new(hits::Touched::default()));
         loop {
             if options
                 .deadline
@@ -968,6 +970,7 @@ impl PimdirIndex {
             let statements = Statements {
                 tx: &tx,
                 blobs: &blobs,
+                touched: touched.as_ref(),
             };
             let mut run = PimdirIndexRefresh::new(now, batch);
             run.floating_zone.clone_from(&options.floating_zone);
@@ -1001,7 +1004,9 @@ impl PimdirIndex {
         if current {
             let stamp = hits::Stamp::of(&self.conn, &self.dir)?;
             let read = self.conn.unchecked_transaction()?;
-            hits::write(&self.conn, &self.dir, stamp)?;
+            let touched = touched.as_ref().map(RefCell::borrow);
+            let since = touched.as_deref().map(|touched| (start, touched));
+            hits::write(&self.conn, &self.dir, stamp, since)?;
             read.commit()?;
         }
 

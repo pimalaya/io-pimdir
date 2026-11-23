@@ -439,13 +439,26 @@ impl PimdirStore {
     }
 
     /// Declares a collection's media type, creating the row if absent
-    /// (§14). The lazy creation inside a write never overwrites it.
+    /// (§14). The lazy creation inside a write never overwrites it. A row
+    /// already of `kind` is read and left as it is, no write begun.
     pub fn ensure_collection(
         &self,
         collection: impl AsRef<str>,
         kind: &str,
     ) -> Result<(), PimdirError> {
         self.lock.verify()?;
+        let held: Option<String> = self
+            .conn
+            .query_row_cached(
+                sql::LOAD_KIND,
+                named_params! { ":collection": collection.as_ref() },
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(busy_or_sql)?;
+        if held.as_deref() == Some(kind) {
+            return Ok(());
+        }
         self.conn
             .execute_cached(
                 sql::SET_COLLECTION_KIND,

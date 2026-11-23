@@ -186,6 +186,11 @@ WHERE (i.seq = :seq OR i.link_id = :link_id)
 pub const LOAD_PLACEMENT: &str = r#"SELECT id, link_id, (SELECT o.hash FROM object o WHERE o.id = placement.object) FROM placement
 WHERE collection = :collection AND seq = :seq;"#;
 
+/// One placement row's id and the `object` row it names, `NULL` while
+/// bodiless: what a refresh tells the hit columns before writing it.
+pub const LOAD_PLACEMENT_OBJECT: &str =
+    r#"SELECT id, object FROM placement WHERE collection = :collection AND seq = :seq;"#;
+
 /// Every category a task states, each once: what `category:` folds in
 /// Rust and compares with its folded value (SEARCH §8), so no SQL function
 /// folds the stored side.
@@ -305,6 +310,7 @@ pub const OWN: &[(&str, &str)] = &[
     ("STORE_DATA_VERSION", STORE_DATA_VERSION),
     ("LOAD_ENDS", LOAD_ENDS),
     ("LOAD_PLACEMENT", LOAD_PLACEMENT),
+    ("LOAD_PLACEMENT_OBJECT", LOAD_PLACEMENT_OBJECT),
     ("TASK_CATEGORY_VALUES", TASK_CATEGORY_VALUES),
     ("MESSAGE_PRESENCE", MESSAGE_PRESENCE),
     ("MESSAGE_HASH", MESSAGE_HASH),

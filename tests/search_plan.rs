@@ -11,7 +11,7 @@
 use std::{collections::BTreeSet, path::Path, sync::Mutex};
 
 use io_pimdir::{
-    change::PimdirWriteOp,
+    change::{PimdirDropReason, PimdirWriteOp},
     client::{
         PimdirStore,
         search::{
@@ -35,6 +35,9 @@ static STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// test's statements must not land among another's.
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// How many refreshes patched the hit columns, as the log tells.
+static PATCHED: Mutex<usize> = Mutex::new(0);
+
 struct Statements;
 
 impl Log for Statements {
@@ -44,6 +47,9 @@ impl Log for Statements {
 
     fn log(&self, record: &Record) {
         let message = record.args().to_string();
+        if message.starts_with("hit columns patched") {
+            *PATCHED.lock().unwrap() += 1;
+        }
         if let Some(sql) = message.strip_prefix("search statement: ") {
             STATEMENTS.lock().unwrap().push(sql.to_string());
         }
@@ -248,7 +254,7 @@ fn every_driver_answers_alike_and_seeks() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     static LOGGER: Statements = Statements;
-    log::set_logger(&LOGGER).unwrap();
+    let _ = log::set_logger(&LOGGER);
     log::set_max_level(LevelFilter::Trace);
 
     let dir = tempfile::tempdir().unwrap();
@@ -493,4 +499,127 @@ fn a_rebuild_drops_the_hit_columns() {
         .unwrap();
     drop(PimdirIndex::open(dir.path()).unwrap());
     assert!(!hits.exists());
+}
+
+/// A refresh finding the hit columns stamped as the index stood patches
+/// them where its placements moved, to the very bytes a cache read from
+/// the index whole holds: flags changed, placements dropped (some of a
+/// body filed twice), a body filed again elsewhere, and a new collection
+/// of a new account, its messages new hits and new public ids; then the
+/// newest placements dropped, their ids past the highest left.
+#[test]
+fn a_patched_cache_is_the_one_read_whole() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    static LOGGER: Statements = Statements;
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(LevelFilter::Trace);
+
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let hits = dir.path().join("index.hits");
+    assert!(hits.exists());
+
+    let placement = |collection: &str, handle: String, summary: PimdirMailSummary, flags| {
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            collection: PimdirCollectionId(collection.into()),
+            handle: PimdirHandle(handle),
+            link_id: Some(summary.link_id()),
+            object: None,
+            level: PimdirLevel::Meta,
+            sort_key: summary.sort_key(),
+            summary: Some(PimdirSummary::Mail(summary)),
+            flags: PimdirFlags::Known(flags),
+            status: PimdirStatus::Clean,
+            conflict_revision: None,
+            conflict_object: None,
+            base: None,
+            origin: None,
+            server_object_id: None,
+        })
+    };
+    let owner = PimdirStore::open(dir.path()).unwrap().for_account("play");
+    owner
+        .ensure_collection("play/INBOX", "message/rfc822")
+        .unwrap();
+    drop(owner);
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut ops = Vec::new();
+    for i in 0..20 {
+        let (handle, _, summary) = mail("work/INBOX", i);
+        let flags = BTreeSet::from([String::from("\\Flagged"), String::from("\\Seen")]);
+        ops.push(placement("work/INBOX", handle, summary, flags));
+    }
+    for i in (0..100).step_by(5) {
+        let (handle, ..) = mail("home/Archive", i);
+        ops.push(PimdirWriteOp::DropPlacement {
+            collection: PimdirCollectionId("home/Archive".into()),
+            handle: PimdirHandle(handle),
+            reason: PimdirDropReason::Deleted,
+        });
+    }
+    store.write(ops).unwrap();
+    let mut ops = Vec::new();
+    for i in 0..40 {
+        let (handle, _, summary) = match i {
+            0..10 => mail("home/INBOX", 1_000 + i),
+            _ => mail("play/INBOX", 2_000 + i),
+        };
+        ops.push(placement("play/INBOX", handle, summary, BTreeSet::new()));
+    }
+    store.write(ops).unwrap();
+    drop(store);
+
+    let patched = *PATCHED.lock().unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(
+        *PATCHED.lock().unwrap(),
+        patched + 1,
+        "the cache was patched"
+    );
+    let read = std::fs::read(&hits).unwrap();
+    std::fs::remove_file(&hits).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(*PATCHED.lock().unwrap(), patched + 1, "read whole");
+    assert!(
+        read == std::fs::read(&hits).unwrap(),
+        "patched as read whole"
+    );
+
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let ops = (30..40)
+        .map(|i| PimdirWriteOp::DropPlacement {
+            collection: PimdirCollectionId("play/INBOX".into()),
+            handle: PimdirHandle(mail("play/INBOX", 2_000 + i).0),
+            reason: PimdirDropReason::Deleted,
+        })
+        .collect();
+    store.write(ops).unwrap();
+    drop(store);
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert_eq!(
+        *PATCHED.lock().unwrap(),
+        patched + 2,
+        "the newest placements dropped, the cache was patched"
+    );
+    let read = std::fs::read(&hits).unwrap();
+    std::fs::remove_file(&hits).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    assert!(
+        read == std::fs::read(&hits).unwrap(),
+        "patched as read whole"
+    );
 }

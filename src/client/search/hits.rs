@@ -12,7 +12,12 @@
 //! then renamed over it, so a reader maps one whole file or none. The
 //! file is never truncated in place, so a map stays that of its file.
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec,
+    vec::Vec,
+};
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -20,7 +25,8 @@ use std::{
     path::Path,
 };
 
-use rusqlite::Connection;
+use log::debug;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::{
     client::{PimdirError, PreparedCached},
@@ -469,26 +475,109 @@ impl PimdirHitColumns {
     }
 }
 
-/// Writes the cache of `dir` stamped `stamp`, unless it already is, from
-/// the index `conn` holds with the store attached, beside it then renamed
-/// in; removes it when the store is past what a cache holds.
-pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), PimdirError> {
-    let path = dir.join(FILE);
-    if let Ok(mut file) = File::open(&path) {
-        let mut head = [0u8; 104];
-        if file.read_exact(&mut head).is_ok() {
-            let word = |at: usize| {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&head[at * 8..at * 8 + 8]);
-                u64::from_ne_bytes(bytes)
-            };
-            if word(0) == MAGIC
-                && [word(1), word(2), word(3), word(4)] == stamp.words()
-                && word(12) == stamp.file
-            {
-                return Ok(());
-            }
+/// Whether the cache of `dir` is stamped `stamp`, read from its header.
+pub(crate) fn holds(dir: &Path, stamp: Stamp) -> bool {
+    let Ok(mut file) = File::open(dir.join(FILE)) else {
+        return false;
+    };
+    let mut head = [0u8; 104];
+    if file.read_exact(&mut head).is_err() {
+        return false;
+    }
+    let word = |at: usize| {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&head[at * 8..at * 8 + 8]);
+        u64::from_ne_bytes(bytes)
+    };
+    word(0) == MAGIC
+        && [word(1), word(2), word(3), word(4)] == stamp.words()
+        && word(12) == stamp.file
+}
+
+/// The most placement keys a refresh follows for [`write`] to patch the
+/// cache it found rather than read the index whole.
+const TOUCHED_MAX: usize = 1 << 15;
+
+/// What a refresh fed and wrote of the placements, so the cache it found
+/// stamped as the index stood before it is patched where they changed.
+#[derive(Default)]
+pub(crate) struct Touched {
+    /// The key of every placement fed or written.
+    keys: BTreeSet<(String, i64)>,
+    /// Every placement id put or dropped, with the body it named before
+    /// the refresh, `None` for none or no placement.
+    ids: BTreeMap<i64, Option<i64>>,
+    /// Whether more than [`TOUCHED_MAX`] keys moved, the rest untold.
+    over: bool,
+}
+
+impl Touched {
+    /// Notes the placement `(collection, seq)` fed or written.
+    pub(crate) fn key(&mut self, collection: &str, seq: i64) {
+        if self.over {
+            return;
         }
+        if self.keys.len() >= TOUCHED_MAX {
+            self.over = true;
+            self.keys = BTreeSet::new();
+            self.ids = BTreeMap::new();
+            return;
+        }
+        self.keys.insert((collection.into(), seq));
+    }
+
+    /// Notes placement `id` naming body `object` before it is written,
+    /// unless an earlier write of the refresh already told it.
+    pub(crate) fn before(&mut self, id: i64, object: Option<i64>) {
+        if !self.over {
+            self.ids.entry(id).or_insert(object);
+        }
+    }
+}
+
+/// A cache's contents, before they are written.
+struct Built {
+    accounts: Vec<String>,
+    kinds: Vec<String>,
+    seq_max: usize,
+    exact: bool,
+    uniform: bool,
+    records: Vec<u64>,
+    objects: Vec<u32>,
+    multi: Vec<u64>,
+    items: Vec<u32>,
+    keys: Vec<i64>,
+    held: Vec<u64>,
+}
+
+/// Writes the cache of `dir` stamped `stamp`, unless it already is, beside
+/// it then renamed in; removes it when the store is past what a cache
+/// holds. With `since`, the stamp of the cache a refresh found and what it
+/// fed and wrote since, the cache found is patched where they moved;
+/// otherwise, or when the patch cannot tell, it is read from the index
+/// `conn` holds with the store attached, whole.
+pub(crate) fn write(
+    conn: &Connection,
+    dir: &Path,
+    stamp: Stamp,
+    since: Option<(Stamp, &Touched)>,
+) -> Result<(), PimdirError> {
+    if holds(dir, stamp) {
+        return Ok(());
+    }
+    let path = dir.join(FILE);
+    if let Some((old, touched)) = since
+        && !touched.over
+        && old.file == stamp.file
+        && let Some(columns) = PimdirHitColumns::open(dir, old)
+        && let Some(built) = patch(conn, &columns, stamp, touched)?
+    {
+        drop(columns);
+        debug!(
+            "hit columns patched where {} placement keys moved",
+            touched.keys.len()
+        );
+        return emit(&path, stamp, &built);
     }
 
     let gone = |path: &Path| {
@@ -632,45 +721,444 @@ pub(crate) fn write(conn: &Connection, dir: &Path, stamp: Stamp) -> Result<(), P
     }
     multi.sort_unstable();
 
-    let mut out: Vec<u64> = vec![0; HEADER];
-    out[0] = MAGIC;
-    out[1..5].copy_from_slice(&stamp.words());
-    out[12] = stamp.file;
-    out[13] = items_len as u64;
-    out[5] = records_len as u64;
-    out[6] = objects_len as u64;
-    out[7] = multi.len() as u64;
-    out[8] = seq_max as u64;
-    out[9] = accounts.len() as u64;
-    out[10] = kinds.len() as u64;
-    out[11] = if exact { EXACT_DATES } else { 0 } | if uniform { UNIFORM_DATES } else { 0 };
-    put_names(&mut out, &accounts);
-    put_names(&mut out, &kinds);
-    out.extend_from_slice(&records);
-    out.extend(
-        objects
-            .chunks(2)
-            .map(|pair| u64::from(pair[0]) | u64::from(*pair.get(1).unwrap_or(&0)) << 32),
-    );
-    out.extend_from_slice(&multi);
-    out.extend(
-        items
-            .chunks(2)
-            .map(|pair| u64::from(pair[0]) | u64::from(*pair.get(1).unwrap_or(&0)) << 32),
-    );
-    out.extend(keys.iter().map(|key| *key as u64));
-    out.extend_from_slice(&held);
+    let built = Built {
+        accounts,
+        kinds,
+        seq_max: seq_max as usize,
+        exact,
+        uniform,
+        records,
+        objects,
+        multi,
+        items,
+        keys,
+        held,
+    };
+    emit(&path, stamp, &built)
+}
 
-    let new = dir.join(".index.hits.new");
-    {
-        let mut file = File::create(&new)?;
+/// Writes `built` stamped `stamp` beside `path`, then renames it over.
+fn emit(path: &Path, stamp: Stamp, built: &Built) -> Result<(), PimdirError> {
+    let mut head: Vec<u64> = vec![0; HEADER];
+    head[0] = MAGIC;
+    head[1..5].copy_from_slice(&stamp.words());
+    head[12] = stamp.file;
+    head[13] = built.items.len() as u64;
+    head[5] = (built.records.len() / 2) as u64;
+    head[6] = built.objects.len() as u64;
+    head[7] = built.multi.len() as u64;
+    head[8] = built.seq_max as u64;
+    head[9] = built.accounts.len() as u64;
+    head[10] = built.kinds.len() as u64;
+    head[11] =
+        if built.exact { EXACT_DATES } else { 0 } | if built.uniform { UNIFORM_DATES } else { 0 };
+    put_names(&mut head, &built.accounts);
+    put_names(&mut head, &built.kinds);
+
+    /// Writes words as their bytes.
+    fn words(file: &mut File, words: &[u64]) -> std::io::Result<()> {
         // SAFETY: the words are plain integers viewed as their bytes.
         let bytes =
-            unsafe { core::slice::from_raw_parts(out.as_ptr().cast::<u8>(), out.len() * 8) };
-        file.write_all(bytes)?;
+            unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8) };
+        file.write_all(bytes)
     }
-    fs::rename(&new, &path)?;
+    /// Writes ids two to a word, the first in the low half.
+    fn halves(file: &mut File, ids: &[u32]) -> std::io::Result<()> {
+        let mut buffer = Vec::with_capacity(ids.len().div_ceil(2).min(1 << 16));
+        for chunk in ids.chunks(1 << 17) {
+            buffer.clear();
+            buffer.extend(
+                chunk
+                    .chunks(2)
+                    .map(|pair| u64::from(pair[0]) | u64::from(*pair.get(1).unwrap_or(&0)) << 32),
+            );
+            words(file, &buffer)?;
+        }
+        Ok(())
+    }
+
+    let new = path.with_file_name(".index.hits.new");
+    {
+        let mut file = File::create(&new)?;
+        words(&mut file, &head)?;
+        words(&mut file, &built.records)?;
+        halves(&mut file, &built.objects)?;
+        words(&mut file, &built.multi)?;
+        halves(&mut file, &built.items)?;
+        // SAFETY: an i64 has the size and alignment of a u64, any bits valid.
+        let keys = unsafe {
+            core::slice::from_raw_parts(built.keys.as_ptr().cast::<u64>(), built.keys.len())
+        };
+        words(&mut file, keys)?;
+        words(&mut file, &built.held)?;
+    }
+    fs::rename(&new, path)?;
     Ok(())
+}
+
+/// The cache `old` patched to the index `conn` holds as stamped `stamp`,
+/// where `touched` tells what moved since: each placement fed or written
+/// read again, with the bodies and hits it named before and names now;
+/// `None` when the patch cannot tell (a collection's account or kind
+/// moved, an id range shrank past a live entry, a bound a cache holds
+/// passed), for the whole index to be read.
+fn patch(
+    conn: &Connection,
+    old: &PimdirHitColumns,
+    stamp: Stamp,
+    touched: &Touched,
+) -> Result<Option<Built>, PimdirError> {
+    let w = old.words.get();
+    let seq_now: i64 =
+        conn.query_row_cached("SELECT ifnull(max(seq), 0) FROM placement", [], |row| {
+            row.get(0)
+        })?;
+    let item_max: i64 =
+        conn.query_row_cached("SELECT ifnull(max(id), 0) FROM store.items", [], |row| {
+            row.get(0)
+        })?;
+    if stamp.placement_max >= 0xffff_ffff
+        || !(0..0xffff_ffff).contains(&item_max)
+        || stamp.object_max >= 0xffff_ffff
+        || !(0..0xffff_ffff).contains(&seq_now)
+    {
+        return Ok(None);
+    }
+    let records_len = stamp.placement_max as usize + 1;
+    let objects_len = stamp.object_max as usize + 1;
+    let items_len = item_max as usize + 1;
+    let records_cap = records_len.max(old.records.1);
+    let objects_cap = objects_len.max(old.objects.1);
+    let items_cap = items_len.max(old.items.1);
+    let seq_max = old.seq_max.max(seq_now as usize);
+    let mut accounts = old.accounts.clone();
+    let mut kinds = old.kinds.clone();
+
+    let mut ids: BTreeSet<i64> = touched.ids.keys().copied().collect();
+    for (collection, seq) in &touched.keys {
+        let id: Option<i64> = conn
+            .query_row_cached(
+                "SELECT id FROM placement WHERE collection = ?1 AND seq = ?2",
+                rusqlite::params![collection, seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ids.extend(id);
+    }
+
+    {
+        let mut changed = conn.prepare_cached(
+            "SELECT id, ifnull(account, ''), kind FROM store.collections WHERE changed > ?1",
+        )?;
+        let mut rows = changed.query([old.stamp.store_change])?;
+        while let Some(row) = rows.next()? {
+            let collection = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+            let account = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+            let kind = row.get_ref(2)?.as_str().map_err(rusqlite::Error::from)?;
+            let mut placements =
+                conn.prepare_cached("SELECT id FROM placement WHERE collection = ?1")?;
+            let mut placed = placements.query([collection])?;
+            while let Some(placement) = placed.next()? {
+                let id: i64 = placement.get(0)?;
+                if touched.ids.contains_key(&id) {
+                    continue;
+                }
+                if let Some(record) = old.record(id) {
+                    if accounts[record.account] != account || kinds[record.kind - 1] != kind {
+                        return Ok(None);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut records = vec![0u64; records_cap * 2];
+    records[..old.records.1 * 2]
+        .copy_from_slice(&w[old.records.0..old.records.0 + old.records.1 * 2]);
+    let unhalve = |(at, len): (usize, usize), to: usize| {
+        let mut ids = vec![0u32; to];
+        for (pair, word) in ids[..len].chunks_mut(2).zip(&w[at..at + len.div_ceil(2)]) {
+            pair[0] = *word as u32;
+            if let Some(second) = pair.get_mut(1) {
+                *second = (*word >> 32) as u32;
+            }
+        }
+        ids
+    };
+    let mut objects = unhalve(old.objects, objects_cap);
+    let mut items = unhalve(old.items, items_cap);
+    let old_multi = &w[old.multi.0..old.multi.0 + old.multi.1];
+
+    let mut collections: HashMap<String, Option<(usize, usize)>> = HashMap::new();
+    let mut attrs = |collection: &str| -> Result<Option<(usize, usize)>, PimdirError> {
+        if let Some(known) = collections.get(collection) {
+            return Ok(*known);
+        }
+        let row: Option<(String, String)> = conn
+            .query_row_cached(
+                "SELECT ifnull(account, ''), kind FROM store.collections WHERE id = ?1",
+                [collection],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let known = row.map(|(account, kind)| {
+            let account = match accounts.iter().position(|known| *known == account) {
+                Some(at) => at,
+                None => {
+                    accounts.push(account);
+                    accounts.len() - 1
+                }
+            };
+            let kind = match kinds.iter().position(|known| *known == kind) {
+                Some(at) => at + 1,
+                None => {
+                    kinds.push(kind);
+                    kinds.len()
+                }
+            };
+            (account, kind)
+        });
+        collections.insert(collection.into(), known);
+        Ok(known)
+    };
+
+    if ids.iter().any(|id| !(1..records_cap as i64).contains(id)) {
+        return Ok(None);
+    }
+    let mut read_again = vec![0u64; records_cap.div_ceil(64)];
+    for &id in &ids {
+        read_again[id as usize / 64] |= 1 << (id % 64);
+    }
+    for slot in &mut items {
+        let at = *slot as usize;
+        if read_again[at / 64] & 1 << (at % 64) != 0 {
+            *slot = 0;
+        }
+    }
+
+    let mut exact = old.exact_dates;
+    let mut hits: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut dropped: Vec<(u64, u32)> = Vec::new();
+    let mut added: Vec<(u64, u32)> = Vec::new();
+    for &id in &ids {
+        let current: Option<Option<i64>> = conn
+            .query_row_cached("SELECT object FROM placement WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(record) = old.record(id) {
+            hits.insert((record.account, record.seq));
+            let object = match touched.ids.get(&id) {
+                Some(object) => *object,
+                None => current.flatten(),
+            };
+            if let Some(object) = object.and_then(|object| u64::try_from(object).ok()) {
+                dropped.push((object, id as u32));
+            }
+        }
+        let at = id as usize * 2;
+        records[at] = 0;
+        records[at + 1] = 0;
+
+        let mut statement = conn.prepare_cached(
+            "SELECT p.object, p.collection, p.seq, i.sort_key, i.marks, i.id \
+             FROM placement p JOIN store.items i \
+             ON i.collection = p.collection AND i.seq = p.seq AND i.deleted = 0 \
+             WHERE p.id = ?1",
+        )?;
+        let mut rows = statement.query([id])?;
+        while let Some(row) = rows.next()? {
+            let object: Option<i64> = row.get(0)?;
+            let collection = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+            let seq: i64 = row.get(2)?;
+            let key = row.get_ref(3)?.as_str().map_err(rusqlite::Error::from)?;
+            let marks: i64 = row.get(4)?;
+            let item: i64 = row.get(5)?;
+            let Some((account, kind)) = attrs(collection)? else {
+                continue;
+            };
+            if !(0..=seq_now).contains(&seq) || !(0..items_len as i64).contains(&item) {
+                return Ok(None);
+            }
+            items[item as usize] = id as u32;
+            let date = date_of(key).unwrap_or_else(|| {
+                exact = false;
+                0
+            });
+            records[at] = date as u64;
+            records[at + 1] = pack(seq as u64, account as u64, marks as u64, kind as u64);
+            hits.insert((account, seq as usize));
+            if let Some(object) = object.and_then(|object| u64::try_from(object).ok()) {
+                if object as usize >= objects_len {
+                    return Ok(None);
+                }
+                added.push((object, id as u32));
+            }
+        }
+    }
+    let keys_len = accounts.len() as u64 * (seq_max as u64 + 1);
+    if accounts.len() > NAMES_MAX || kinds.len() >= NAMES_MAX || keys_len > HIT_KEYS_MAX {
+        return Ok(None);
+    }
+
+    let mut moved: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    for &(object, _) in dropped.iter().chain(&added) {
+        moved.entry(object).or_insert_with(|| {
+            let object_at = object as usize;
+            match objects.get(object_at).copied().unwrap_or(0) {
+                0 => Vec::new(),
+                u32::MAX => {
+                    let first = old_multi.partition_point(|pair| (pair >> 32) < object);
+                    old_multi[first..]
+                        .iter()
+                        .take_while(|pair| (*pair >> 32) == object)
+                        .map(|pair| *pair as u32)
+                        .collect()
+                }
+                placement => vec![placement],
+            }
+        });
+    }
+    for (object, id) in dropped {
+        if let Some(placements) = moved.get_mut(&object) {
+            placements.retain(|placement| *placement != id);
+        }
+    }
+    for (object, id) in added {
+        if let Some(placements) = moved.get_mut(&object)
+            && !placements.contains(&id)
+        {
+            placements.push(id);
+        }
+    }
+    let mut multi: Vec<u64> = old_multi
+        .iter()
+        .copied()
+        .filter(|pair| !moved.contains_key(&(pair >> 32)))
+        .collect();
+    for (object, placements) in &moved {
+        let slot = &mut objects[*object as usize];
+        *slot = match placements.as_slice() {
+            [] => 0,
+            [single] => *single,
+            _ => {
+                multi.extend(placements.iter().map(|id| object << 32 | u64::from(*id)));
+                u32::MAX
+            }
+        };
+    }
+    multi.sort_unstable();
+    if records[records_len * 2..].iter().any(|word| *word != 0)
+        || objects[objects_len..].iter().any(|id| *id != 0)
+        || items[items_len..].iter().any(|id| *id != 0)
+    {
+        return Ok(None);
+    }
+    records.truncate(records_len * 2);
+    objects.truncate(objects_len);
+    items.truncate(items_len);
+
+    let row_len = seq_max + 1;
+    let old_row = old.seq_max + 1;
+    let mut keys = vec![NO_HIT; keys_len as usize];
+    let mut held = vec![0u64; keys_len as usize];
+    for account in 0..old.accounts.len() {
+        let from = account * old_row;
+        let to = account * row_len;
+        for (slot, word) in keys[to..to + old_row]
+            .iter_mut()
+            .zip(&w[old.keys + from..old.keys + from + old_row])
+        {
+            *slot = *word as i64;
+        }
+        held[to..to + old_row].copy_from_slice(&w[old.held + from..old.held + from + old_row]);
+    }
+    let undated: Vec<bool> = core::iter::once(false)
+        .chain(
+            kinds
+                .iter()
+                .map(|kind| UNDATED_KINDS.contains(&kind.as_str())),
+        )
+        .collect();
+    let mail: Vec<bool> = core::iter::once(false)
+        .chain(kinds.iter().map(|kind| kind == "message/rfc822"))
+        .collect();
+    let mut uniform = old.uniform_dates;
+    let mut by_seq = conn.prepare_cached("SELECT id FROM placement WHERE seq = ?1")?;
+    for (account, seq) in hits {
+        let mut key = NO_HIT;
+        let mut word = 0u64;
+        let mut rows = by_seq.query([seq as i64])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let Some(at) = usize::try_from(id).ok().filter(|at| *at < records_len) else {
+                continue;
+            };
+            let Some(record) = unpack(records[at * 2], records[at * 2 + 1]) else {
+                continue;
+            };
+            if record.account != account || record.seq != seq {
+                continue;
+            }
+            let date = record.date;
+            word |= record.marks as u64 & 0xff;
+            if mail[record.kind] && date > 0 {
+                let was = (word >> 8) as i64;
+                if was == 0 || date < was {
+                    uniform &= was == 0;
+                    word = (word & 0xff) | (date as u64) << 8;
+                } else if date != was {
+                    uniform = false;
+                }
+            }
+            key = match (undated[record.kind], key) {
+                (true, _) | (_, UNDATED) => UNDATED,
+                (false, NO_HIT) => date,
+                (false, held) => held.max(date),
+            };
+        }
+        keys[account * row_len + seq] = key;
+        held[account * row_len + seq] = word;
+    }
+
+    let seq_now = seq_now as usize;
+    if seq_now < seq_max {
+        let clean = keys
+            .chunks(row_len)
+            .all(|row| row[seq_now + 1..].iter().all(|key| *key == NO_HIT))
+            && held
+                .chunks(row_len)
+                .all(|row| row[seq_now + 1..].iter().all(|word| *word == 0));
+        if !clean {
+            return Ok(None);
+        }
+        keys = keys
+            .chunks(row_len)
+            .flat_map(|row| &row[..=seq_now])
+            .copied()
+            .collect();
+        held = held
+            .chunks(row_len)
+            .flat_map(|row| &row[..=seq_now])
+            .copied()
+            .collect();
+    }
+    let seq_max = seq_max.min(seq_now);
+
+    Ok(Some(Built {
+        accounts,
+        kinds,
+        seq_max,
+        exact,
+        uniform,
+        records,
+        objects,
+        multi,
+        items,
+        keys,
+        held,
+    }))
 }
 
 /// How a leaf reads off the columns.
