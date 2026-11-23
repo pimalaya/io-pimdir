@@ -32,11 +32,11 @@ use crate::{
     collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoadSelection,
-    object::{PimdirHash, PimdirHeldObject, PimdirObject},
+    object::{PimdirHash, PimdirHeldObject},
     placement::{
         PimdirBase, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirStatus,
     },
-    remote::{PimdirFetchedBody, PimdirFetchedItem, PimdirTier},
+    remote::{PimdirFetchedItem, PimdirTier},
     summary::{self, PimdirSummary},
     sync::{PimdirConflictPolicy, PimdirSyncEvent, PimdirSyncOptions},
 };
@@ -216,7 +216,7 @@ impl PimdirUpgrade {
                 let Some(body) = item.body else {
                     continue;
                 };
-                let (object, bytes) = stored_body(body);
+                let (object, bytes) = body.stored();
                 let hash = object.hash.clone();
                 self.ops.push(PimdirWriteOp::StoreObject {
                     object,
@@ -248,7 +248,7 @@ impl PimdirUpgrade {
                 let Some(body) = item.body else {
                     continue;
                 };
-                let (object, bytes) = stored_body(body);
+                let (object, bytes) = body.stored();
                 let hash = object.hash.clone();
 
                 self.ops.push(PimdirWriteOp::StoreObject {
@@ -285,7 +285,7 @@ impl PimdirUpgrade {
             // is a new identity there (SYNC §6): keyed afresh, the storage
             // retiring the old binding as a changed hash: key is. A minted
             // key never equals its hint and stays.
-            let mutable = item.revision.is_some() || is_mutable(&patched);
+            let mutable = item.revision.is_some() || patched.is_mutable();
             let restated = patched
                 .link_id
                 .as_ref()
@@ -341,7 +341,7 @@ impl PimdirUpgrade {
 
             match (self.tier, item.body) {
                 (PimdirTier::Full, Some(body)) => {
-                    let (object, bytes) = stored_body(body);
+                    let (object, bytes) = body.stored();
                     let hash = object.hash.clone();
                     self.ops.push(PimdirWriteOp::StoreObject {
                         object,
@@ -423,7 +423,7 @@ impl PimdirUpgrade {
                 let links: Vec<_> = pending
                     .iter()
                     .filter_map(|h| self.placements.get(h))
-                    .filter(|p| !is_mutable(p) && !is_conflicted(p))
+                    .filter(|p| !p.is_mutable() && !is_conflicted(p))
                     .filter_map(|p| p.link_id.clone())
                     .collect();
 
@@ -598,7 +598,7 @@ impl PimdirUpgrade {
         let mut fetched = None;
 
         if let (PimdirTier::Full, Some(body)) = (self.tier, item.body) {
-            let (object, bytes) = stored_body(body);
+            let (object, bytes) = body.stored();
             let hash = object.hash.clone();
             self.ops.push(PimdirWriteOp::StoreObject {
                 object,
@@ -722,7 +722,7 @@ impl PimdirCoroutine for PimdirUpgrade {
                     let hit = placement
                         .link_id
                         .as_ref()
-                        .filter(|_| !is_mutable(placement) && !is_conflicted(placement))
+                        .filter(|_| !placement.is_mutable() && !is_conflicted(placement))
                         .and_then(|link| known.get(link))
                         .into_iter()
                         .flatten()
@@ -834,23 +834,6 @@ impl PimdirCoroutine for PimdirUpgrade {
     }
 }
 
-/// Splits a fetched body into the object to record and the bytes to store.
-///
-/// A body the consumer already streamed into its blob store has no bytes.
-fn stored_body(body: PimdirFetchedBody) -> (PimdirObject, Option<Vec<u8>>) {
-    match body {
-        PimdirFetchedBody::Inline { hash, bytes } => {
-            let object = PimdirObject {
-                hash,
-                size: bytes.len(),
-            };
-
-            (object, Some(bytes))
-        }
-        PimdirFetchedBody::Persisted { hash, size } => (PimdirObject { hash, size }, None),
-    }
-}
-
 /// Whether the placement holds the local side of a divergence.
 ///
 /// A fetch of it answers what the remote holds instead, so it is fetched
@@ -864,18 +847,6 @@ fn is_conflicted(placement: &PimdirPlacement) -> bool {
 /// on the body, which records no revision on the binding.
 fn is_item_conflict(placement: &PimdirPlacement) -> bool {
     is_conflicted(placement) && placement.conflict_revision.is_none()
-}
-
-/// Whether the content is mutable, which a last-synced revision marks.
-///
-/// Such a placement is fetched rather than linked from the store: a link
-/// id says two copies are the same item, not that they hold the same
-/// bytes.
-fn is_mutable(placement: &PimdirPlacement) -> bool {
-    placement
-        .base
-        .as_ref()
-        .is_some_and(|base| base.revision.is_some())
 }
 
 /// Whether a body may be linked from the row `held` (SYNC §6, STORAGE
@@ -918,7 +889,7 @@ mod tests {
 
     use crate::{
         load::PimdirLoaded,
-        object::PimdirHash,
+        object::{PimdirHash, PimdirObject},
         placement::{PimdirBase, PimdirFlags, PimdirLinkId, PimdirOrigin, PimdirStatus},
         remote::{PimdirFetchedBody, PimdirFetchedItem},
         upgrade::*,

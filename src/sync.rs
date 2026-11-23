@@ -50,7 +50,7 @@ use crate::{
     },
     coroutine::*,
     load::{PimdirLoadSelection, PimdirLoaded, PimdirRefusal},
-    object::{PimdirHash, PimdirObject},
+    object::PimdirHash,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
         PimdirPlacement, PimdirStatus, PimdirSuperseded,
@@ -1164,7 +1164,7 @@ impl PimdirSync {
             // NOTE: never re-identifies a linked item of an immutable kind;
             // a mutable resource stating another hint under its handle is a
             // new identity there, the storage retiring the old binding.
-            let mutable = item.revision.is_some() || is_mutable(placement);
+            let mutable = item.revision.is_some() || placement.is_mutable();
             let restated = placement
                 .link_id
                 .as_ref()
@@ -1461,16 +1461,7 @@ impl PimdirSync {
 
     /// Records a body a listing carried, answering the hash it is stored by.
     fn store_body(&mut self, body: PimdirFetchedBody) -> crate::object::PimdirHash {
-        let (object, bytes) = match body {
-            PimdirFetchedBody::Inline { hash, bytes } => (
-                PimdirObject {
-                    hash,
-                    size: bytes.len(),
-                },
-                Some(bytes),
-            ),
-            PimdirFetchedBody::Persisted { hash, size } => (PimdirObject { hash, size }, None),
-        };
+        let (object, bytes) = body.stored();
         let hash = object.hash.clone();
         self.writes.push(PimdirWriteOp::StoreObject {
             object,
@@ -2006,12 +1997,7 @@ impl PimdirSync {
             self.drop(&resurrected.handle, PimdirDropReason::Superseded);
             resurrected.handle = provisional;
         }
-        resurrected.status = PimdirStatus::Created;
-        resurrected.conflict_revision = None;
-        resurrected.conflict_object = None;
-        resurrected.base = None;
-        resurrected.origin = None;
-        self.upsert(resurrected);
+        self.upsert(resurrected.restaged());
     }
 
     /// Reconciles the content of a placement present on both sides.
@@ -2882,14 +2868,6 @@ fn flag_delta(
         true => None,
         false => Some((add, remove)),
     }
-}
-
-/// Whether the content is mutable, which a last-synced revision marks.
-fn is_mutable(placement: &PimdirPlacement) -> bool {
-    placement
-        .base
-        .as_ref()
-        .is_some_and(|base| base.revision.is_some())
 }
 
 /// Whether the content axis still owes a push for this placement.

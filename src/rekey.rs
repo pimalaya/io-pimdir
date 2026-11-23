@@ -246,11 +246,7 @@ impl PimdirRekey {
             let edited = matches!(
                 placement.status,
                 PimdirStatus::Dirty | PimdirStatus::Conflict
-            ) && placement.object.is_some()
-                && placement
-                    .base
-                    .as_ref()
-                    .is_none_or(|b| b.object != placement.object);
+            ) && placement.staged_edit().is_some();
             if edited {
                 // NOTE: re-staged under the provisional handle its key
                 // derives, as a sync re-stages one (SYNC §5): its old
@@ -261,12 +257,7 @@ impl PimdirRekey {
                     resurrected.handle = link.provisional();
                     restaged.insert(placement.handle.clone());
                 }
-                resurrected.status = PimdirStatus::Created;
-                resurrected.conflict_revision = None;
-                resurrected.conflict_object = None;
-                resurrected.base = None;
-                resurrected.origin = None;
-                writes.push(PimdirWriteOp::UpsertPlacement(resurrected));
+                writes.push(PimdirWriteOp::UpsertPlacement(resurrected.restaged()));
                 carried_over.insert(placement.handle.clone());
                 self.report.rekeyed += 1;
             }
@@ -442,7 +433,7 @@ impl PimdirRekey {
             .or_else(|| resolved.and_then(|r| r.revision.clone()));
         let base_revision = old_base.and_then(|b| b.revision.clone());
         let remote_edited = observed.is_some() && observed != base_revision;
-        let local_edit = old.object.is_some() && old_base.is_none_or(|b| b.object != old.object);
+        let local_edit = old.staged_edit().is_some();
 
         let mutable = observed.is_some() || base_revision.is_some();
         let revived = remote_edited && old.status == PimdirStatus::Tombstone;

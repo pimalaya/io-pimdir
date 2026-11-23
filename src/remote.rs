@@ -36,7 +36,7 @@ use alloc::{string::String, vec::Vec};
 use crate::{
     change::PimdirChange,
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
-    object::PimdirHash,
+    object::{PimdirHash, PimdirObject},
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId, PimdirSortKey},
     summary::{PimdirDerivation, PimdirSummary},
 };
@@ -470,6 +470,23 @@ impl PimdirFetchedBody {
     pub fn hash(&self) -> &PimdirHash {
         match self {
             Self::Inline { hash, .. } | Self::Persisted { hash, .. } => hash,
+        }
+    }
+
+    /// Splits the body into the object to record and the bytes to store.
+    ///
+    /// A body the consumer already streamed into its blob store has no bytes.
+    pub(crate) fn stored(self) -> (PimdirObject, Option<Vec<u8>>) {
+        match self {
+            Self::Inline { hash, bytes } => {
+                let object = PimdirObject {
+                    hash,
+                    size: bytes.len(),
+                };
+
+                (object, Some(bytes))
+            }
+            Self::Persisted { hash, size } => (PimdirObject { hash, size }, None),
         }
     }
 }

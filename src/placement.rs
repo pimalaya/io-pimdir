@@ -454,6 +454,29 @@ impl PimdirPlacement {
                 .as_ref()
                 .is_some_and(|base| base.revision.is_some() && base.object.is_none())
     }
+
+    /// Whether the content is mutable, which a last-synced revision marks.
+    ///
+    /// Such a placement is fetched rather than linked from the store: a
+    /// link id says two copies are the same item, not that they hold the
+    /// same bytes.
+    pub(crate) fn is_mutable(&self) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|base| base.revision.is_some())
+    }
+
+    /// The placement re-staged as a pending create (SYNC §5): `Created`,
+    /// with no base, no origin and no divergence. The handle is the
+    /// caller's to choose.
+    pub(crate) fn restaged(mut self) -> Self {
+        self.status = PimdirStatus::Created;
+        self.conflict_revision = None;
+        self.conflict_object = None;
+        self.base = None;
+        self.origin = None;
+        self
+    }
 }
 
 #[cfg(test)]
