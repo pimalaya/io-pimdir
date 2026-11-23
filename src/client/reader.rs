@@ -28,7 +28,7 @@ use crate::{
     client::{
         PimdirError, PreparedCached, bind_list,
         blobs::PimdirBlobs,
-        capability, modes, prepare_connection,
+        capability, modes, prepare_read_connection,
         producer::{
             self, PimdirActionStatus, PimdirParkedAction, PimdirPendingAction,
             PimdirReceiptRefusal, PimdirRefusalRow, action_status, overlaid_actions,
@@ -522,7 +522,7 @@ impl PimdirReader {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_SHARED_CACHE;
         let conn = Connection::open_with_flags(dir.join("pimdir.db"), flags)?;
-        prepare_connection(&conn)?;
+        prepare_read_connection(&conn)?;
         schema::check(&conn, PimdirProfile::Reader)?;
 
         Self::over(conn, dir.to_path_buf())

@@ -70,8 +70,24 @@ pub(crate) fn init(conn: &mut Connection) -> Result<(), PimdirError> {
 /// ([`PimdirError::VersionMismatch`]), an algorithm other than BLAKE3
 /// ([`PimdirError::HashAlgo`]), then a schema whose text is not the
 /// canonical one ([`PimdirError::Damaged`]).
+///
+/// A store at this version holding the canonical schema, every store this
+/// crate opens, is judged by its `store_meta` row alone, read once: its
+/// columns are then the canonical ones, so the steps asking whether they
+/// exist answer yes, and the schema is not the damage, whatever else is.
 pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), PimdirError> {
     let user_version = user_version(conn)?;
+    if user_version == sql::VERSION && canonical(conn)? {
+        let row = conn
+            .query_row_cached(sql::LOAD_STORE_META, [], |r| {
+                Ok((r.get::<_, String>(0)?, meta(r)?))
+            })
+            .optional()?;
+        return match row {
+            Some((format, meta)) if format == "pimdir" => judge(profile, user_version, meta),
+            _ => Err(PimdirError::Foreign),
+        };
+    }
     if user_version == 0 {
         return match holds_schema(conn)? {
             true => Err(PimdirError::Foreign),
@@ -97,11 +113,40 @@ pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), Pim
     if !has_column(conn, "store_meta", "format_version")? {
         return Err(PimdirError::Version { found: None });
     }
-    type Meta = (i64, String, String, i64, i64);
-    let (version, hash_algo, format_version, read_version, produce_version): Meta = conn
-        .query_row_cached(sql::LOAD_STORE_META, [], |r| {
-            Ok((r.get(1)?, r.get(2)?, r.get(8)?, r.get(9)?, r.get(10)?))
-        })?;
+    let meta = conn.query_row_cached(sql::LOAD_STORE_META, [], meta)?;
+    judge(profile, user_version, meta)?;
+
+    // NOTE: a draft's store holds version 1 alone (§4.2), and its schema
+    // is 0001_init.sql's to the word: anything else is damage.
+    if user_version != sql::VERSION {
+        return Err(PimdirError::Damaged {
+            object: String::from("user_version"),
+        });
+    }
+    match differs(conn)? {
+        Some(object) => Err(PimdirError::Damaged { object }),
+        None => Ok(()),
+    }
+}
+
+/// The columns of `load_store_meta` a `pimdir` store is judged by: its
+/// `version`, `hash_algo`, `format_version`, `read_version` and
+/// `produce_version`.
+type Meta = (i64, String, String, i64, i64);
+
+/// Reads [`Meta`] off a `load_store_meta` row.
+fn meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<Meta> {
+    Ok((r.get(1)?, r.get(2)?, r.get(8)?, r.get(9)?, r.get(10)?))
+}
+
+/// Refuses a `pimdir` store by its `store_meta` row (STORAGE §6 step 2),
+/// in order: a `format_version` this crate's draft does not open,
+/// disagreeing schema stamps, another algorithm. A draft is refused for
+/// its marker alone (§4.2): the six columns a release judges by have no
+/// error of their own until one is built, and the checks after the first
+/// are a draft opener's own.
+fn judge(profile: PimdirProfile, user_version: i64, meta: Meta) -> Result<(), PimdirError> {
+    let (version, hash_algo, format_version, read_version, produce_version) = meta;
     let program = PimdirProgram {
         profile,
         version: sql::VERSION,
@@ -109,7 +154,7 @@ pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), Pim
         hash_algos: &[HASH_ALGO],
     };
     let store = PimdirStoreVersion {
-        format: format.as_deref(),
+        format: Some("pimdir"),
         format_version: Some(&format_version),
         version,
         user_version,
@@ -117,9 +162,6 @@ pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), Pim
         produce_version,
         hash_algo: &hash_algo,
     };
-    // NOTE: a draft is refused for its marker alone (§4.2): the six
-    // columns a release judges by have no error of their own until one is
-    // built, and the checks below are a draft opener's own.
     if store.opens(&program).is_err() {
         return Err(PimdirError::Version {
             found: Some(format_version),
@@ -134,18 +176,7 @@ pub(crate) fn check(conn: &Connection, profile: PimdirProfile) -> Result<(), Pim
     if hash_algo != HASH_ALGO {
         return Err(PimdirError::HashAlgo { found: hash_algo });
     }
-
-    // NOTE: a draft's store holds version 1 alone (§4.2), and its schema
-    // is 0001_init.sql's to the word: anything else is damage.
-    if user_version != sql::VERSION {
-        return Err(PimdirError::Damaged {
-            object: String::from("user_version"),
-        });
-    }
-    match differs(conn)? {
-        Some(object) => Err(PimdirError::Damaged { object }),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 /// The first object, by name, whose text is not the canonical one: a

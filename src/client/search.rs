@@ -75,6 +75,7 @@ pub use crate::search::plan::{PimdirSearchCursor, PimdirSearchSort};
 use crate::{
     client::{
         PimdirError, PreparedCached, bind_list, busy_or_sql, modes, prepare_connection,
+        prepare_read_connection,
         reader::{PimdirReader, rolled_temporal},
         rows, schema,
         search::compile::{Categories, Compiled, Ends, Labels, Probe},
@@ -2976,7 +2977,8 @@ impl PimdirIndex {
     /// reading the slot, the canonical ones run as their text stands, and
     /// rolls the sources up in one statement (`ROLL_COVERAGE`). The
     /// unindexed items are counted only while the index is behind, none
-    /// being stamped above its cursor otherwise.
+    /// being stamped above its cursor otherwise, and the unread ones only
+    /// when [`COVERAGE_HELD`](search::COVERAGE_HELD) finds one store-wide.
     ///
     /// A range leaves the horizon when it starts before it or ends after
     /// it, an open side always (SEARCH §8.1), a date term under `or` or
@@ -3063,18 +3065,24 @@ impl PimdirIndex {
             ..Default::default()
         };
 
-        let kinds = rows(&self.conn, covered, [], |r| {
-            let count = |column| r.get::<_, i64>(column).map(|count| count.max(0) as u64);
-            Ok((
-                r.get::<_, String>(0)?,
-                PimdirSearchUnread {
-                    bodiless: count(1)?,
-                    missing: count(2)?,
-                    unparseable: count(3)?,
-                    encrypted: count(4)?,
-                },
-            ))
-        })?;
+        let unread = self
+            .conn
+            .query_row_cached(search::COVERAGE_HELD, [], |r| r.get::<_, bool>(0))?;
+        let kinds = match unread {
+            false => Vec::new(),
+            true => rows(&self.conn, covered, [], |r| {
+                let count = |column| r.get::<_, i64>(column).map(|count| count.max(0) as u64);
+                Ok((
+                    r.get::<_, String>(0)?,
+                    PimdirSearchUnread {
+                        bodiless: count(1)?,
+                        missing: count(2)?,
+                        unparseable: count(3)?,
+                        encrypted: count(4)?,
+                    },
+                ))
+            })?,
+        };
         coverage.local.kinds = kinds.into_iter().collect();
         let behind: i64 = self
             .conn
@@ -3143,9 +3151,12 @@ fn connect(dir: &Path, query_only: bool) -> Result<Connection, PimdirError> {
     };
     let flags = access | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(dir.join("index.db"), flags)?;
-    prepare_connection(&conn)?;
-    if !query_only {
-        conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT)?;
+    match query_only {
+        true => prepare_read_connection(&conn)?,
+        false => {
+            prepare_connection(&conn)?;
+            conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT)?;
+        }
     }
 
     let store = dir.join("pimdir.db").canonicalize()?;
@@ -3203,7 +3214,27 @@ enum PimdirIndexHeld {
 /// store it was built from and the cursor it folded, against the store's
 /// own (STORAGE §4.5), then the revisions of its extraction against this
 /// build's.
+///
+/// An index at this schema version holding the canonical schema, every
+/// index a query reads, has its version and shape read with the rest of
+/// `index_meta`, in one statement: its columns are then the canonical
+/// ones, so the steps asking whether they exist answer yes, and its text
+/// is not what makes it stale, whatever else does.
 fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
+    let user_version: i64 = conn.pragma_query_value(Some("main"), "user_version", |r| r.get(0))?;
+    if user_version == search::VERSION {
+        let (same, posted) = declared(conn)?;
+        if same {
+            let named = conn
+                .query_row_cached(search::LOAD_INDEX_META, [], |r| Ok((r.get(9)?, r.get(10)?)))
+                .optional()?;
+            return match named_held(dir, named)? {
+                Some(held) => Ok(held),
+                None => meta_held(conn, posted),
+            };
+        }
+    }
+
     let objects: i64 =
         conn.query_row_cached("SELECT count(*) FROM main.sqlite_schema", [], |r| r.get(0))?;
     if objects == 0 {
@@ -3234,36 +3265,11 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
             )
             .optional()?,
     };
-    let refused = |version: Option<String>, shape: Option<String>| PimdirError::IndexVersion {
-        path: dir.join("index.db"),
-        version,
-        shape,
-    };
-    let Some((version, named)) = named else {
-        return Err(refused(None, None));
-    };
-    let Some(found) = version.clone() else {
-        return Ok(PimdirIndexHeld::Earlier {
-            version,
-            shape: named,
-        });
-    };
-    if named.as_deref() != Some(search::SHAPE) {
-        return Err(refused(version, named));
-    }
-    match draft(&found) {
-        Some(number) if number < search::FORMAT_DRAFT => {
-            return Ok(PimdirIndexHeld::Earlier {
-                version,
-                shape: named,
-            });
-        }
-        Some(number) if number == search::FORMAT_DRAFT => (),
-        _ => return Err(refused(version, named)),
+    if let Some(held) = named_held(dir, named)? {
+        return Ok(held);
     }
 
-    let version: i64 = conn.pragma_query_value(Some("main"), "user_version", |r| r.get(0))?;
-    if version != search::VERSION {
+    if user_version != search::VERSION {
         return Ok(PimdirIndexHeld::Stale);
     }
 
@@ -3273,7 +3279,50 @@ fn held(conn: &Connection, dir: &Path) -> Result<PimdirIndexHeld, PimdirError> {
     if !same {
         return Ok(PimdirIndexHeld::Stale);
     }
+    meta_held(conn, posted)
+}
 
+/// What [`held`] answers from `index_meta`'s version and shape, `named`
+/// (`None` for no row): refused for none, another shape, or a later or
+/// unknown version; [`PimdirIndexHeld::Earlier`] for no version or an
+/// earlier one; `None`, read further, for this crate's.
+fn named_held(
+    dir: &Path,
+    named: Option<(Option<String>, Option<String>)>,
+) -> Result<Option<PimdirIndexHeld>, PimdirError> {
+    let refused = |version: Option<String>, shape: Option<String>| PimdirError::IndexVersion {
+        path: dir.join("index.db"),
+        version,
+        shape,
+    };
+    let Some((version, named)) = named else {
+        return Err(refused(None, None));
+    };
+    let Some(found) = version.clone() else {
+        return Ok(Some(PimdirIndexHeld::Earlier {
+            version,
+            shape: named,
+        }));
+    };
+    if named.as_deref() != Some(search::SHAPE) {
+        return Err(refused(version, named));
+    }
+    match draft(&found) {
+        Some(number) if number < search::FORMAT_DRAFT => Ok(Some(PimdirIndexHeld::Earlier {
+            version,
+            shape: named,
+        })),
+        Some(number) if number == search::FORMAT_DRAFT => Ok(None),
+        _ => Err(refused(version, named)),
+    }
+}
+
+/// What [`held`] answers of an index of this crate's version and shape at
+/// this schema version holding the canonical schema, the `from` posting
+/// list or not (`posted`): stale under another tokenizer, from another
+/// store or copy of it, or past the store's last stamp; else by its
+/// extraction and its posting list.
+fn meta_held(conn: &Connection, posted: bool) -> Result<PimdirIndexHeld, PimdirError> {
     type Meta = (i64, String, i64, String, i64, i64, String);
     let (version, tokenizer, change, id, incarnation, extraction, extractor): Meta = conn
         .query_row_cached(search::LOAD_INDEX_META, [], |r| {

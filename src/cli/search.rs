@@ -12,7 +12,7 @@
 
 use std::{
     collections::BTreeMap,
-    fmt,
+    fmt, mem,
     time::{Duration, Instant},
 };
 
@@ -168,22 +168,26 @@ impl SearchCommand {
         if self.threads {
             let answer = index.threads(&query, &options).map_err(report)?;
 
-            return printer.out(Whole(SearchThreadsOutput {
+            let printed = printer.out(Whole(SearchThreadsOutput {
                 query: self.query,
                 next_page: answer.next.as_ref().map(PimdirSearchCursor::token),
                 threads: answer.threads.iter().map(ThreadRow::from).collect(),
                 coverage: CoverageRow::from(&answer.coverage),
             }));
+            self.refresh.finish(index);
+            return printed;
         }
 
         let answer = index.search(&query, &options).map_err(report)?;
 
-        printer.out(Whole(SearchOutput {
+        let printed = printer.out(Whole(SearchOutput {
             query: self.query,
             next_page: answer.next.as_ref().map(PimdirSearchCursor::token),
             hits: answer.hits.iter().map(HitRow::from).collect(),
             coverage: CoverageRow::from(&answer.coverage),
-        }))
+        }));
+        self.refresh.finish(index);
+        printed
     }
 }
 
@@ -232,11 +236,13 @@ impl CountCommand {
             .count(&query, &clock(&index, self.zone)?)
             .map_err(report)?;
 
-        printer.out(CountOutput {
+        let printed = printer.out(CountOutput {
             query: self.query,
             count: answer.count,
             coverage: CoverageRow::from(&answer.coverage),
-        })
+        });
+        self.refresh.finish(index);
+        printed
     }
 }
 
@@ -596,6 +602,17 @@ impl RefreshFlags {
             })
             .map_err(report)?;
         Ok(index)
+    }
+
+    /// Ends the answer read from `index`: one opened for queries alone is
+    /// left for the process exit to release, its read-only connections
+    /// holding no write to checkpoint, where closing them frees both
+    /// parsed schemas object by object (a twelfth of a short query).
+    fn finish(&self, index: PimdirIndex) {
+        match self.refresh_timeout.is_zero() {
+            true => mem::forget(index),
+            false => drop(index),
+        }
     }
 }
 

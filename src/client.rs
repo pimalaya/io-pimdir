@@ -1705,13 +1705,18 @@ impl PreparedCached for Connection {
 /// Fills the list parameter `slot` of the canonical statements with
 /// `values` in order (STORAGE §4.4), every slot cleared first: what a
 /// statement reading `temp.param` binds before it runs, in its
-/// transaction. The connection created the table when it opened.
+/// transaction. A connection [`prepare_read_connection`] opened creates
+/// the table at its first bind: clearing fails without it, and again once
+/// created only for another cause.
 pub(crate) fn bind_list<V: ToSql>(
     conn: &Connection,
     slot: &str,
     values: impl IntoIterator<Item = V>,
 ) -> rusqlite::Result<()> {
-    conn.execute_cached(sql::CLEAR_PARAM, [])?;
+    if conn.execute_cached(sql::CLEAR_PARAM, []).is_err() {
+        conn.execute_batch(sql::CREATE_PARAM)?;
+        conn.execute_cached(sql::CLEAR_PARAM, [])?;
+    }
     let mut bind = conn.prepare_cached(sql::BIND_PARAM)?;
     for (position, value) in values.into_iter().enumerate() {
         bind.execute(named_params! {
@@ -1814,7 +1819,8 @@ const QPSG_MIN: i32 = 3_020_000;
 /// Sets up a connection to a store or an index as every role does
 /// (STORAGE §4.1, §4.4): foreign keys on, the durability pragmas, the
 /// size a checkpointed WAL keeps, a busy timeout, and the list
-/// parameters' temporary table, which a read-only connection creates too.
+/// parameters' temporary table, which a read-only connection creates too
+/// ([`prepare_read_connection`] leaves it to the first bind).
 ///
 /// Every store is opened as one from elsewhere (§18), whoever created it:
 /// `trusted_schema` off and the defensive flag on, under which the
@@ -1830,6 +1836,17 @@ const QPSG_MIN: i32 = 3_020_000;
 /// bound value might change: once per collection a sync loads, three
 /// quarters of a sync's CPU when nothing moved.
 pub(crate) fn prepare_connection(conn: &Connection) -> rusqlite::Result<()> {
+    prepare_read_connection(conn)?;
+    conn.execute_batch(sql::CREATE_PARAM)
+}
+
+/// [`prepare_connection`] without the list parameters' table, which
+/// [`bind_list`] creates at the first bind: a read-only connection
+/// answering a query that binds no list (a reader's, a query client's
+/// index) declares no temporary table, ~40 µs each. Creating it later
+/// expires the connection's prepared statements once, as any change to
+/// the temporary schema does.
+pub(crate) fn prepare_read_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON;")?;
     if rusqlite::version_number() >= DEFENSIVE_MIN {
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
@@ -1841,7 +1858,7 @@ pub(crate) fn prepare_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
-    conn.execute_batch(sql::CREATE_PARAM)
+    Ok(())
 }
 
 /// How many `TRUNCATE` checkpoints an erase tries, each waiting out the

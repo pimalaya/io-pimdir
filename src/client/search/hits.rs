@@ -80,19 +80,14 @@ pub(crate) struct Stamp {
 impl Stamp {
     /// The stamp of the index `conn` holds as it stands in `dir`.
     pub(crate) fn of(conn: &Connection, dir: &Path) -> Result<Self, PimdirError> {
-        let (store_change, store_purges) = conn.query_row_cached(
-            "SELECT store_change, store_purges FROM index_meta WHERE id = 1",
+        let (store_change, store_purges, placement_max, object_max) = conn.query_row_cached(
+            "SELECT store_change, store_purges, \
+             (SELECT ifnull(max(id), 0) FROM placement), \
+             (SELECT ifnull(max(id), 0) FROM object) \
+             FROM index_meta WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        let placement_max =
-            conn.query_row_cached("SELECT ifnull(max(id), 0) FROM placement", [], |row| {
-                row.get(0)
-            })?;
-        let object_max =
-            conn.query_row_cached("SELECT ifnull(max(id), 0) FROM object", [], |row| {
-                row.get(0)
-            })?;
         Ok(Self {
             store_change,
             store_purges,

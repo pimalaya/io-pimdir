@@ -160,6 +160,17 @@ pub const SCOPE_COLLECTION: &str =
 pub const HOLDS_CALENDARS: &str =
     r#"SELECT EXISTS (SELECT 1 FROM store.collections WHERE kind = 'text/calendar');"#;
 
+/// Whether a row any of `coverage` and `coverage_all`'s counts reads
+/// exists (SEARCH §8.2), store-wide: a live item holding no body, a body
+/// missing, one not read whole. Three seeks, each on an index holding
+/// those rows alone; when none holds one, both answer no row whatever the
+/// collections, and a client runs neither, each costing a query more to
+/// prepare than this does.
+pub const COVERAGE_HELD: &str = r#"SELECT EXISTS (SELECT 1 FROM store.items INDEXED BY items_bodiless
+               WHERE object IS NULL AND deleted = 0)
+    OR EXISTS (SELECT 1 FROM missing)
+    OR EXISTS (SELECT 1 FROM object INDEXED BY object_not_ok WHERE status <> 'ok');"#;
+
 /// How many collections the store holds.
 pub const COUNT_COLLECTIONS: &str = r#"SELECT count(*) FROM store.collections;"#;
 
@@ -306,6 +317,7 @@ pub const OWN: &[(&str, &str)] = &[
     ("COUNT_UNINDEXED", COUNT_UNINDEXED),
     ("ROLL_COVERAGE", ROLL_COVERAGE),
     ("SCOPE_COLLECTIONS", SCOPE_COLLECTIONS),
+    ("COVERAGE_HELD", COVERAGE_HELD),
     ("INDEX_DATA_VERSION", INDEX_DATA_VERSION),
     ("STORE_DATA_VERSION", STORE_DATA_VERSION),
     ("LOAD_ENDS", LOAD_ENDS),

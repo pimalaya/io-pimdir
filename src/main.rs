@@ -33,8 +33,10 @@
 
 mod cli;
 
+use std::{env, ffi::OsString};
+
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use pimalaya_cli::{
     clap::{
         args::{JsonFlag, LogFlags},
@@ -68,17 +70,33 @@ use crate::cli::{
 };
 
 fn main() {
+    untrack_sqlite_memory();
     // NOTE: the base64 and quoted-printable codecs below read the
     // installed CPU token, the portable baseline until one is installed.
     let _ = SimdCpu::install_detected();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_query(env::args_os()).unwrap_or_else(Cli::parse);
 
     let mut printer = StdoutPrinter::new(&cli.json);
 
     let result =
         Logger::try_init(&cli.log).and_then(|()| cli.command.execute(&mut printer, &cli.store));
     ErrorReport::<ErrorCode>::eval_coded(&mut printer, result)
+}
+
+/// Turns SQLite's memory statistics off before any connection opens: no
+/// global mutex nor counter per allocation, and every open parses the
+/// store's schema in thousands of them (a twelfth of a query's time). This
+/// process reads no statistic nor sets a heap limit. `sqlite3_config` must
+/// run before SQLite initializes, so first in `main`.
+fn untrack_sqlite_memory() {
+    // SAFETY: no thread nor connection exists yet; the option takes an int.
+    unsafe {
+        rusqlite::ffi::sqlite3_config(
+            rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS,
+            0 as core::ffi::c_int,
+        );
+    }
 }
 
 /// Top-level command-line interface parser.
@@ -111,6 +129,24 @@ struct Cli {
     /// Whether the output is rendered as JSON.
     #[command(flatten)]
     pub json: JsonFlag,
+}
+
+impl Cli {
+    /// The arguments of a `count` or a `search` read by a root holding
+    /// those two subcommands and the global flags alone, `None` for any
+    /// other or any error, help and version included, which the whole tree
+    /// reads then and reports: building every verb with every argument
+    /// and its help costs a short query a thirtieth of its time. The verbs
+    /// are matched by their full names, never inferred, so a line this
+    /// root reads is one the whole tree reads alike.
+    fn parse_query(args: impl IntoIterator<Item = OsString>) -> Option<Self> {
+        let root = clap::Command::new(env!("CARGO_BIN_NAME"))
+            .subcommand(CountCommand::augment_args(clap::Command::new("count")))
+            .subcommand(SearchCommand::augment_args(clap::Command::new("search")));
+        let root = JsonFlag::augment_args(LogFlags::augment_args(StoreFlags::augment_args(root)));
+        let mut matches = root.try_get_matches_from(args).ok()?;
+        Self::from_arg_matches_mut(&mut matches).ok()
+    }
 }
 
 /// Top-level subcommands.
@@ -184,6 +220,94 @@ impl Command {
             Self::Completion(cmd) => cmd.execute(printer, Cli::command()),
             Self::Manual(cmd) => cmd.execute(printer, Cli::command()),
             Self::JsonSchema(cmd) => cmd.execute(printer, json_schema::registry()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use crate::Cli;
+
+    /// Every line the query root reads, the whole tree reads alike, and a
+    /// line it leaves (another verb, an inferred one, help, version, an
+    /// error) is the whole tree's to read.
+    #[test]
+    fn the_query_root_reads_as_the_whole_tree() {
+        let read: &[&[&str]] = &[
+            &["-s", "/tmp", "count", "--refresh-timeout", "0s", "kiwi"],
+            &[
+                "--json",
+                "-s",
+                "/tmp",
+                "search",
+                "--refresh-timeout",
+                "0s",
+                "-n",
+                "50",
+                "a b",
+            ],
+            &[
+                "search",
+                "--threads",
+                "-n",
+                "5",
+                "--sort",
+                "oldest-first",
+                "q",
+                "--json",
+            ],
+            &[
+                "count",
+                "--zone",
+                "UTC",
+                "--log-level",
+                "debug",
+                "--source",
+                "phone",
+                "x",
+            ],
+            &[
+                "search",
+                "--page-token",
+                "t",
+                "--floating-zone",
+                "Europe/Paris",
+                "x",
+            ],
+            &["--store", "count", "count", "count"],
+            &["count", "--", "-x"],
+            &["search", "--offset", "t", "--log-file", "/tmp/log", "x"],
+        ];
+        for args in read {
+            let line = || core::iter::once("pimdir").chain(args.iter().copied());
+            let quick = Cli::parse_query(line().map(Into::into));
+            let whole = Cli::try_parse_from(line());
+            assert!(quick.is_some(), "{args:?}");
+            assert_eq!(
+                format!("{quick:?}"),
+                format!("{:?}", whole.ok()),
+                "{args:?}"
+            );
+        }
+
+        let left: &[&[&str]] = &[
+            &[],
+            &["co", "x"],
+            &["sea", "x"],
+            &["count"],
+            &["count", "--help"],
+            &["search", "-V"],
+            &["--version"],
+            &["help", "count"],
+            &["show", "1"],
+            &["count", "--limit", "5", "x"],
+            &["search", "--sort", "nope", "x"],
+        ];
+        for args in left {
+            let line = core::iter::once("pimdir").chain(args.iter().copied());
+            assert!(Cli::parse_query(line.map(Into::into)).is_none(), "{args:?}");
         }
     }
 }
