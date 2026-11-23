@@ -30,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added `pimdir version`, the one probe of the JSON contract: `formatVersion`, io-pimdir's major version (`0` below 1.0), beside the crate's version and the STORAGE, SEARCH and SYNC drafts the build implements (`pimdir-version`). No other payload carries the contract's version.
 - Added `codec::keywords_to_text`, a flag set's other flags as `items.keywords` and `bindings.base_keywords` hold them (pimdir STORAGE §13, storage-draft-17): every flag but the five system flags, sorted bytewise and joined by one space, `''` for none and for an unknown set.
 - Added the statements `sql::UPSERT_SUMMARY`, `DELETE_SUMMARY`, `LOAD_SUMMARIES`, `LOAD_SUMMARIES_BY_LINK`, `REPLACE_VALUES`, `INSERT_VALUE`, `LOAD_VALUES`, `LOAD_VALUES_BY_LINK` and `LOAD_VALUES_BY_COLLECTION`, which write and read the one `summary` table and the one `summary_value` table whatever the kind, and `sql::COLLECTION_HOLDS_ACTIONS`, which `delete_collection` asks before it deletes.
+- Added `sql::search` under `indexer` without `client`: the index's migrations, statements, `FORMAT_VERSION` and `all()`, text and constants alone, for an indexer binding its own SQLite with no rusqlite in its build.
 
 ### Changed
 
@@ -87,6 +88,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **BREAKING**: Removed the per-kind summary and list statements, merged into the statements Added names: `sql::UPSERT_MAIL_SUMMARY`, `UPSERT_CONTACT_SUMMARY`, `UPSERT_EVENT_SUMMARY`, `UPSERT_TASK_SUMMARY`, `UPSERT_JOURNAL_SUMMARY`, `UPSERT_FILE_SUMMARY` (to `UPSERT_SUMMARY`); `DELETE_EVENT_SUMMARY`, `DELETE_TASK_SUMMARY`, `DELETE_JOURNAL_SUMMARY` (to `DELETE_SUMMARY`); `LOAD_MAIL_SUMMARIES`, `LOAD_CONTACT_SUMMARIES`, `LOAD_EVENT_SUMMARIES`, `LOAD_TASK_SUMMARIES`, `LOAD_JOURNAL_SUMMARIES`, `LOAD_FILE_SUMMARIES` (to `LOAD_SUMMARIES`) and their six `_BY_LINK` twins (to `LOAD_SUMMARIES_BY_LINK`); `REPLACE_ADDRESSES`, `REPLACE_IN_REPLY_TO`, `REPLACE_CATEGORIES` (to `REPLACE_VALUES`); `INSERT_ADDRESS`, `INSERT_IN_REPLY_TO`, `INSERT_CATEGORY` (to `INSERT_VALUE`); `LOAD_ADDRESSES_BY_COLLECTION` (to `LOAD_VALUES_BY_COLLECTION`); `LOAD_ADDRESSES_BY_LINK`, `LOAD_IN_REPLY_TO_BY_LINK`, `LOAD_CATEGORIES_BY_LINK` (to `LOAD_VALUES_BY_LINK`); `LOAD_ADDRESSES`, `LOAD_IN_REPLY_TO`, `LOAD_CATEGORIES` (to `LOAD_VALUES`).
 - **BREAKING**: Removed `sql::DELIVER_BINDING`, `LINK_SENDERS_OF_BY_LINK`, `LIST_GARBAGE_OBJECTS` and `SET_STORE_VERSION`, which nothing ran.
 - **BREAKING**: Removed `sql::search::CHUNKS_OF`, `INSERT_CHUNK`, `UPSERT_THREAD`, `DELETE_THREAD` and `SET_EXTRACTION`, with the index's `chunk` and `thread` tables; an index whose extraction revisions differ is rebuilt, never restated in place.
+
+### Fixed
+
+- Fixed the Windows build, which failed on an untyped inode in the search cache's identity (src/client/search/hits.rs).
+- Fixed the builds of `mail`, `contact`, `calendar` and `indexer` without `client`, which warned of a hub projection only the client uses.
 
 ## [0.19.1] - 2026-11-21
 

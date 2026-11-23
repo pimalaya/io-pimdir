@@ -341,7 +341,7 @@ pub fn all() -> impl Iterator<Item = (&'static str, &'static str)> {
     CANONICAL.iter().chain(OWN).copied()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "search"))]
 mod tests {
     use alloc::{format, string::String, vec, vec::Vec};
 

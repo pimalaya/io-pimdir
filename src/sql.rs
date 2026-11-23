@@ -12,10 +12,12 @@
 //! search coverage reads: nothing on a profile's path, so an
 //! implementation of the standard needs none of them.
 //!
-//! `search` (feature `search`) holds the index's, from
-//! migrations/search/ and queries/search/, on the same terms.
+//! `search` (feature `search` or `indexer`) holds the index's, from
+//! migrations/search/ and queries/search/, on the same terms: text and
+//! constants alone, so an indexer binding its own SQLite reads them
+//! without `client`.
 
-#[cfg(feature = "search")]
+#[cfg(any(feature = "search", feature = "indexer"))]
 pub mod search;
 
 include!(concat!(env!("OUT_DIR"), "/canonical.rs"));

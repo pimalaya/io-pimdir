@@ -125,7 +125,7 @@ fn inode(path: &Path) -> u64 {
         metadata.ino()
     };
     #[cfg(not(unix))]
-    let ino = 0;
+    let ino: u64 = 0;
     ino.rotate_left(32) ^ born
 }
 

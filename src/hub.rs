@@ -462,6 +462,7 @@ impl PimdirHub {
     /// binding's handle, conflict, server object id and its base's flags
     /// and revision. The projection is the same; the hub keeps the rest,
     /// for a caller reading only those three afterwards.
+    #[cfg(any(feature = "client", test))]
     pub(crate) fn project_moving(
         &mut self,
         collection: &PimdirCollectionId,
