@@ -168,22 +168,38 @@ impl SearchCommand {
         if self.threads {
             let answer = index.threads(&query, &options).map_err(report)?;
 
-            return printer.out(SearchThreadsOutput {
+            return printer.out(Whole(SearchThreadsOutput {
                 query: self.query,
                 next_page: answer.next.as_ref().map(PimdirSearchCursor::token),
                 threads: answer.threads.iter().map(ThreadRow::from).collect(),
                 coverage: CoverageRow::from(&answer.coverage),
-            });
+            }));
         }
 
         let answer = index.search(&query, &options).map_err(report)?;
 
-        printer.out(SearchOutput {
+        printer.out(Whole(SearchOutput {
             query: self.query,
             next_page: answer.next.as_ref().map(PimdirSearchCursor::token),
             hits: answer.hits.iter().map(HitRow::from).collect(),
             coverage: CoverageRow::from(&answer.coverage),
-        })
+        }))
+    }
+}
+
+/// An output rendered whole before it is printed, so a page costs stdout
+/// one write where each of its lines took one; its JSON is the output's.
+struct Whole<T>(T);
+
+impl<T: fmt::Display> fmt::Display for Whole<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.to_string())
+    }
+}
+
+impl<T: Serialize> Serialize for Whole<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
     }
 }
 

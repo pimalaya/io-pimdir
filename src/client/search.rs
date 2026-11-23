@@ -85,6 +85,7 @@ use crate::{
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
     property,
     search::{
+        chunk,
         coverage::{self, PimdirSearchCoverage, PimdirSearchUnread},
         extract::{self, PimdirChunk, PimdirExtract, PimdirExtractStatus},
         fold,
@@ -732,6 +733,10 @@ pub struct PimdirSearchItem {
     pub chunks: Vec<PimdirChunk>,
 }
 
+/// A thread's span as `THREAD_SPAN` reads it: its live members' count,
+/// their earliest and latest sort key naming a date.
+type Span = (u64, Option<String>, Option<String>);
+
 /// A hit as a compiled query answers it, before it is described.
 #[derive(Clone)]
 struct Found {
@@ -1043,7 +1048,34 @@ impl PimdirIndex {
     /// less than a walk, else walks the scope's collections in the
     /// store's order until the page is full ([`PimdirWalk`]); the
     /// `title`, `sender` and `relevance` orders read every hit.
+    ///
+    /// One read transaction holds the page, its presentation and its
+    /// coverage, so they answer one state of the store and the index and
+    /// no statement takes and drops the read locks of its own.
     pub fn search(
+        &self,
+        query: &PimdirQuery,
+        options: &PimdirSearchOptions,
+    ) -> Result<PimdirSearchOutput, PimdirError> {
+        self.read(|| self.searched(query, options))
+    }
+
+    /// Runs `answer` in one read transaction, or in the transaction the
+    /// connection already stands in.
+    fn read<T>(&self, answer: impl FnOnce() -> Result<T, PimdirError>) -> Result<T, PimdirError> {
+        let read = match self.conn.is_autocommit() {
+            true => Some(self.conn.unchecked_transaction()?),
+            false => None,
+        };
+        let answer = answer()?;
+        if let Some(read) = read {
+            read.commit()?;
+        }
+        Ok(answer)
+    }
+
+    /// See [`search`](Self::search).
+    fn searched(
         &self,
         query: &PimdirQuery,
         options: &PimdirSearchOptions,
@@ -1107,8 +1139,18 @@ impl PimdirIndex {
     /// The hits are read in order a batch at a time, as a page is, until
     /// the page holds its threads and one more: each thread met is read
     /// whole, its hits among its members, and one whose first hit stands
-    /// at or before the cursor is an earlier page's.
+    /// at or before the cursor is an earlier page's. One read transaction
+    /// holds the page, as [`search`](Self::search)'s does.
     pub fn threads(
+        &self,
+        query: &PimdirQuery,
+        options: &PimdirSearchOptions,
+    ) -> Result<PimdirSearchThreadsOutput, PimdirError> {
+        self.read(|| self.threaded(query, options))
+    }
+
+    /// See [`threads`](Self::threads).
+    fn threaded(
         &self,
         query: &PimdirQuery,
         options: &PimdirSearchOptions,
@@ -1130,7 +1172,7 @@ impl PimdirIndex {
         };
         let wanted = options.limit.saturating_add(1);
 
-        let mut groups: Vec<(Option<String>, Vec<Found>)> = Vec::new();
+        let mut groups: Vec<(Option<String>, Vec<Found>, Span)> = Vec::new();
         let mut met: BTreeSet<(Option<String>, String)> = BTreeSet::new();
         let mut cursor = options.after.clone();
         'batches: loop {
@@ -1159,44 +1201,64 @@ impl PimdirIndex {
                     self.ordered(&mut compiled, &driver, cursor.as_ref(), sort, batch)?
                 }
             };
-            for hit in found {
-                cursor = Some(hit.place.clone());
-                let thread: Option<String> = self
-                    .conn
-                    .query_row_cached(
-                        search::HIT_THREAD,
-                        named_params! { ":seq": hit.seq, ":account": hit.account },
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let Some(thread) = thread else {
-                    groups.push((None, vec![hit]));
+            let mut found = found.into_iter();
+            loop {
+                let part: Vec<Found> = found
+                    .by_ref()
+                    .take(wanted.saturating_sub(groups.len()).max(1))
+                    .collect();
+                if part.is_empty() {
+                    break;
+                }
+                let threads = self.hit_threads(&part)?;
+                let mut fresh: Vec<(Option<String>, String)> = Vec::new();
+                for (hit, thread) in part.iter().zip(&threads) {
+                    if let Some(thread) = thread {
+                        let key = (hit.account.clone(), thread.clone());
+                        if !met.contains(&key) && !fresh.contains(&key) {
+                            fresh.push(key);
+                        }
+                    }
+                }
+                let mut held = self.threads_held(&fresh)?;
+
+                for (hit, thread) in part.into_iter().zip(threads) {
+                    cursor = Some(hit.place.clone());
+                    let Some(thread) = thread else {
+                        groups.push((None, vec![hit], (1, None, None)));
+                        if groups.len() >= wanted {
+                            break 'batches;
+                        }
+                        continue;
+                    };
+                    let key = (hit.account.clone(), thread);
+                    if !met.insert(key.clone()) {
+                        continue;
+                    }
+                    let Some(at) = fresh.iter().position(|fresh| *fresh == key) else {
+                        continue;
+                    };
+                    let (seqs, span) = mem::take(&mut held[at]);
+                    let thread = key.1;
+                    let members = match &quick {
+                        #[cfg(feature = "indexer")]
+                        Some((hits, names)) => {
+                            self.columnar_members(&compiled, hits, names, &seqs, &hit, sort)?
+                        }
+                        _ => self.members(&compiled, &seqs, hit.account.as_deref(), sort)?,
+                    };
+                    let earlier = options.after.as_ref().is_some_and(|after| {
+                        members.first().is_some_and(|first| {
+                            first.place.compare(after, sort) != Ordering::Greater
+                        })
+                    });
+                    if earlier || members.is_empty() {
+                        continue;
+                    }
+                    groups.push((Some(thread), members, span));
                     if groups.len() >= wanted {
                         break 'batches;
                     }
-                    continue;
-                };
-                if !met.insert((hit.account.clone(), thread.clone())) {
-                    continue;
-                }
-                let members = match &quick {
-                    #[cfg(feature = "indexer")]
-                    Some((hits, names)) => {
-                        self.columnar_members(&compiled, hits, names, &thread, &hit, sort)?
-                    }
-                    _ => self.members(&compiled, &thread, hit.account.as_deref(), sort)?,
-                };
-                let earlier = options.after.as_ref().is_some_and(|after| {
-                    members
-                        .first()
-                        .is_some_and(|first| first.place.compare(after, sort) != Ordering::Greater)
-                });
-                if earlier || members.is_empty() {
-                    continue;
-                }
-                groups.push((Some(thread), members));
-                if groups.len() >= wanted {
-                    break 'batches;
                 }
             }
             if !more {
@@ -1208,12 +1270,12 @@ impl PimdirIndex {
         let next = match more {
             true => groups
                 .last()
-                .map(|(_, hits)| hits[0].place.clone())
+                .map(|(_, hits, _)| hits[0].place.clone())
                 .or(options.after.clone()),
             false => None,
         };
 
-        let shown = groups.iter().map(|(_, found)| found.len()).sum();
+        let shown = groups.iter().map(|(_, found, _)| found.len()).sum();
         #[cfg_attr(not(feature = "indexer"), allow(unused_mut))]
         let mut probes = self.presented(&compiled, shown)?;
         #[cfg(feature = "indexer")]
@@ -1221,16 +1283,8 @@ impl PimdirIndex {
             self.probe_sets(&mut probes)?;
         }
         let mut threads = Vec::new();
-        for (thread, found) in groups {
+        for (thread, found, (count, first, last)) in groups {
             let account = found[0].account.clone();
-            let (count, first, last) = match &thread {
-                Some(thread) => self.conn.query_row_cached(
-                    search::THREAD_SPAN,
-                    named_params! { ":thread": thread, ":account": account },
-                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
-                )?,
-                None => (1, None, None),
-            };
             let mut hits = Vec::new();
             for hit in found {
                 hits.push(self.hit(hit, &probes, &compiled.words)?);
@@ -1846,24 +1900,89 @@ impl PimdirIndex {
         }
     }
 
+    /// The thread of each of `hits` in its account (`HIT_THREADS`), `None`
+    /// for one no thread holds, in one statement.
+    fn hit_threads(&self, hits: &[Found]) -> Result<Vec<Option<String>>, PimdirError> {
+        let listed: Vec<(Option<&str>, i64)> = hits
+            .iter()
+            .map(|hit| (hit.account.as_deref(), hit.seq))
+            .collect();
+        let mut threads = vec![None; hits.len()];
+        let held = rows(
+            &self.conn,
+            search::HIT_THREADS,
+            named_params! { ":hits": serde_json::to_string(&listed).unwrap_or_default() },
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        for (at, thread) in held {
+            if let Some(slot) = usize::try_from(at).ok().and_then(|at| threads.get_mut(at)) {
+                *slot = thread;
+            }
+        }
+        Ok(threads)
+    }
+
+    /// The members of each of `threads`, `(account, thread)`, in one
+    /// statement (`THREADS_HELD`): the seqs `thread_members` names, with
+    /// the span `THREAD_SPAN` reads off the live mail among them.
+    fn threads_held(
+        &self,
+        threads: &[(Option<String>, String)],
+    ) -> Result<Vec<(BTreeSet<i64>, Span)>, PimdirError> {
+        let mut held: Vec<(BTreeSet<i64>, BTreeSet<i64>, Span)> =
+            vec![Default::default(); threads.len()];
+        if threads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placed = rows(
+            &self.conn,
+            search::THREADS_HELD,
+            named_params! { ":threads": serde_json::to_string(threads).unwrap_or_default() },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<bool>>(3)?.unwrap_or_default(),
+                ))
+            },
+        )?;
+        for (at, seq, sort_key, live) in placed {
+            let Some((seqs, lives, span)) =
+                usize::try_from(at).ok().and_then(|at| held.get_mut(at))
+            else {
+                continue;
+            };
+            seqs.insert(seq);
+            if !live {
+                continue;
+            }
+            lives.insert(seq);
+            if let Some(key) = sort_key.filter(|key| !key.is_empty()) {
+                if span.1.as_ref().is_none_or(|first| key < *first) {
+                    span.1 = Some(key.clone());
+                }
+                if span.2.as_ref().is_none_or(|last| key > *last) {
+                    span.2 = Some(key);
+                }
+            }
+        }
+        Ok(held
+            .into_iter()
+            .map(|(seqs, lives, (_, first, last))| (seqs, (lives.len() as u64, first, last)))
+            .collect())
+    }
+
     /// The hits of one thread in an account (SEARCH §9), in `sort` order:
-    /// its live members there (`thread_members`) meeting the query, each
-    /// with its place.
+    /// its live members there (`thread_members`, their `seqs`) meeting the
+    /// query, each with its place.
     fn members(
         &self,
         compiled: &Compiled,
-        thread: &str,
+        seqs: &BTreeSet<i64>,
         account: Option<&str>,
         sort: PimdirSearchSort,
     ) -> Result<Vec<Found>, PimdirError> {
-        let seqs: BTreeSet<i64> = rows(
-            &self.conn,
-            search::THREAD_MEMBERS,
-            named_params! { ":thread": thread, ":account": account },
-            |row| row.get::<_, i64>(1),
-        )?
-        .into_iter()
-        .collect();
         if seqs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1872,7 +1991,7 @@ impl PimdirIndex {
             Value::from(account.unwrap_or_default().to_string()),
         )];
         let mut listed = Vec::new();
-        for (at, seq) in seqs.into_iter().enumerate() {
+        for (at, seq) in seqs.iter().copied().enumerate() {
             listed.push(format!("(:m{at})"));
             extra.push((format!(":m{at}"), Value::Integer(seq)));
         }
@@ -2700,7 +2819,8 @@ impl PimdirIndex {
     /// so one hit never fails the page.
     ///
     /// The chunks are cut from this build's own extraction of the body
-    /// (SEARCH §6), the index storing none, so no statement is run a hit.
+    /// (SEARCH §6), the index storing none, so no statement is run a hit,
+    /// and only until the one naming a word: none past it is cut.
     fn snippet(
         &self,
         kind: &str,
@@ -2729,25 +2849,34 @@ impl PimdirIndex {
         let Some(extract) = PimdirExtract::text(media_type, &blob) else {
             return Ok(None);
         };
-        let words: Vec<String> = words.iter().map(|word| fold::text(word)).collect();
-        let texts: Vec<&str> = extract
-            .chunks()
+        let words: Vec<String> = words
             .iter()
-            .filter_map(|chunk| extract.field(chunk.field)?.get(chunk.range.clone()))
+            .map(|word| fold::text(word))
+            .filter(|word| !word.is_empty())
             .collect();
+        let mut texts = [&extract.body, &extract.note]
+            .into_iter()
+            .flat_map(|field| chunk::Chunks::new(field).filter_map(|range| field.get(range)));
+        let Some(first) = texts.next() else {
+            return Ok(None);
+        };
+        if words.is_empty() {
+            return Ok(Some(trim(first, 0)));
+        }
 
-        for text in &texts {
-            let (folded, origin) = fold_chars(text);
-            if let Some(at) = words
-                .iter()
-                .filter(|word| !word.is_empty())
-                .filter_map(|word| folded.find(word.as_str()))
-                .min()
-            {
-                return Ok(Some(trim(text, origin[at])));
+        for text in core::iter::once(first).chain(texts) {
+            let at = match text.is_ascii() {
+                true => first_word(&text.to_ascii_lowercase(), &words),
+                false => {
+                    let (folded, origin) = fold_chars(text);
+                    first_word(&folded, &words).map(|at| origin[at])
+                }
+            };
+            if let Some(at) = at {
+                return Ok(Some(trim(text, at)));
             }
         }
-        Ok(texts.first().map(|text| trim(text, 0)))
+        Ok(Some(trim(first, 0)))
     }
 
     /// What an answer to a query could not see (SEARCH §8.2), over the
@@ -3304,14 +3433,20 @@ fn extract(
     Ok(extract)
 }
 
+/// Where the first of `words` found in `folded` starts, the least byte
+/// offset any of them is found at.
+fn first_word(folded: &str, words: &[String]) -> Option<usize> {
+    words
+        .iter()
+        .filter_map(|word| folded.find(word.as_str()))
+        .min()
+}
+
 /// A text folded for a snippet's word search as the index folds it
 /// (SEARCH §5), each character alone, with the character of `text` each
 /// byte of the fold came from, so a word found in the fold is placed in
 /// the text. A mark the fold drops maps to nothing.
 fn fold_chars(text: &str) -> (String, Vec<usize>) {
-    if text.is_ascii() {
-        return (text.to_ascii_lowercase(), (0..text.len()).collect());
-    }
     let mut folded = String::with_capacity(text.len());
     let mut origin = Vec::with_capacity(text.len());
     for (at, c) in text.chars().enumerate() {

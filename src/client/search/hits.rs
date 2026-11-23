@@ -922,8 +922,8 @@ impl super::PimdirIndex {
         })?))
     }
 
-    /// The members of `thread` among `hits` in the account of `hit`, the
-    /// hit that met it, in `sort` order, as
+    /// The members of a thread, its `seqs`, among `hits` in the account of
+    /// `hit`, the hit that met it, in `sort` order, as
     /// [`members`](super::PimdirIndex::members) reads them: `hit` itself
     /// when it is the only one, no statement run for it.
     pub(super) fn columnar_members(
@@ -931,7 +931,7 @@ impl super::PimdirIndex {
         compiled: &super::Compiled,
         hits: &super::Hits,
         names: &[String],
-        thread: &str,
+        seqs: &alloc::collections::BTreeSet<i64>,
         hit: &super::Found,
         sort: super::PimdirSearchSort,
     ) -> Result<Vec<super::Found>, PimdirError> {
@@ -941,20 +941,16 @@ impl super::PimdirIndex {
             return Ok(Vec::new());
         };
         let bits = &hits[number];
-        let seqs: alloc::collections::BTreeSet<i64> = crate::client::rows(
-            &self.conn,
-            crate::sql::search::THREAD_MEMBERS,
-            rusqlite::named_params! { ":thread": thread, ":account": account },
-            |row| row.get::<_, i64>(1),
-        )?
-        .into_iter()
-        .filter(|seq| {
-            usize::try_from(*seq).is_ok_and(|seq| {
-                bits.get(seq / 64)
-                    .is_some_and(|word| word >> (seq % 64) & 1 == 1)
+        let seqs: alloc::collections::BTreeSet<i64> = seqs
+            .iter()
+            .copied()
+            .filter(|seq| {
+                usize::try_from(*seq).is_ok_and(|seq| {
+                    bits.get(seq / 64)
+                        .is_some_and(|word| word >> (seq % 64) & 1 == 1)
+                })
             })
-        })
-        .collect();
+            .collect();
         if seqs.is_empty() {
             return Ok(Vec::new());
         }

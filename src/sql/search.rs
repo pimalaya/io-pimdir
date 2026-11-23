@@ -223,14 +223,16 @@ pub const LOAD_MESSAGE: &str = r#"SELECT thread, parent FROM message WHERE link_
 /// The messages naming one as their parent.
 pub const MESSAGE_CHILDREN: &str = r#"SELECT link_id FROM message WHERE parent = :link_id;"#;
 
-/// The thread of one hit, `(account, seq)`, through any of its live mail
-/// placements (SEARCH §9).
-pub const HIT_THREAD: &str = r#"SELECT m.thread FROM store.items i
-JOIN store.collections c ON c.id = i.collection
-JOIN message m ON m.link_id = i.link_id
-WHERE i.seq = :seq AND c.account IS :account AND c.kind = 'message/rfc822'
-  AND i.deleted = 0 AND i.retained_at IS NULL
-ORDER BY i.collection LIMIT 1;"#;
+/// The thread of each hit `:hits` lists, a JSON array of `[account, seq]`
+/// pairs, through any of its live mail placements (SEARCH §9), by its
+/// position in the list; NULL for one no thread holds.
+pub const HIT_THREADS: &str = r#"SELECT h.key, (SELECT m.thread FROM store.items i
+  JOIN store.collections c ON c.id = i.collection
+  JOIN message m ON m.link_id = i.link_id
+  WHERE i.seq = h.value ->> 1 AND c.account IS h.value ->> 0
+    AND c.kind = 'message/rfc822' AND i.deleted = 0 AND i.retained_at IS NULL
+  ORDER BY i.collection LIMIT 1)
+FROM json_each(:hits) h;"#;
 
 /// A thread as one account holds it (SEARCH §9): its live members there,
 /// as `thread_members` names them, counted by `seq`, with their lowest and
@@ -242,6 +244,19 @@ JOIN store.collections c ON c.id = p.collection
 JOIN store.items i ON i.collection = p.collection AND i.seq = p.seq
 WHERE m.thread = :thread AND c.account IS :account AND c.kind = 'message/rfc822'
   AND i.deleted = 0 AND i.retained_at IS NULL;"#;
+
+/// The members of each thread `:threads` lists, a JSON array of
+/// `[account, thread]` pairs, by its position in the list: every
+/// placement `thread_members` names, with its sort key and whether it is
+/// a live mail placement, what [`THREAD_SPAN`] counts and bounds.
+pub const THREADS_HELD: &str = r#"SELECT t.key, p.seq, i.sort_key,
+       i.deleted = 0 AND i.retained_at IS NULL AND c.kind = 'message/rfc822'
+FROM json_each(:threads) t
+JOIN message m ON m.thread = t.value ->> 1
+JOIN placement p ON p.link_id = m.link_id
+JOIN store.collections c ON c.id = p.collection
+LEFT JOIN store.items i ON i.collection = p.collection AND i.seq = p.seq
+WHERE c.account IS t.value ->> 0;"#;
 
 /// The name of [`POSTING`]'s table.
 pub const POSTING_TABLE: &str = "pimdir_fields";
@@ -296,7 +311,8 @@ pub const OWN: &[(&str, &str)] = &[
     ("MESSAGE_IN_REPLY_TO", MESSAGE_IN_REPLY_TO),
     ("LOAD_MESSAGE", LOAD_MESSAGE),
     ("MESSAGE_CHILDREN", MESSAGE_CHILDREN),
-    ("HIT_THREAD", HIT_THREAD),
+    ("HIT_THREADS", HIT_THREADS),
+    ("THREADS_HELD", THREADS_HELD),
     ("THREAD_SPAN", THREAD_SPAN),
     ("SPLIT_HELD", SPLIT_HELD),
 ];
