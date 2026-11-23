@@ -1274,7 +1274,7 @@ impl PimdirSync {
                 create.flags =
                     PimdirFlags::merge(&PimdirFlags::Unknown, &create.flags, &item.flags);
             }
-            let mut landed = self.land(create, item, offered);
+            let mut landed = Self::land(create, item, offered, &mut |body| self.store_body(body));
             landed.server_object_id = meta.server_object_id.clone();
             let conflicted = landed.status == PimdirStatus::Conflict;
             self.local.insert(item.handle.clone(), landed);
@@ -1406,11 +1406,14 @@ impl PimdirSync {
     /// folds it into the item by the collection's policy (SYNC §9). A
     /// mutable member carrying none holds no body: the write records the
     /// item's conflict until the upgrade reads it.
-    fn land(
-        &mut self,
+    ///
+    /// `store` records a body the listing carried and answers its hash: a
+    /// rekey lands a create as a page does (SYNC §8).
+    pub(crate) fn land(
         create: PimdirPlacement,
         item: &PimdirRemoteItem,
         offered: bool,
+        store: &mut dyn FnMut(PimdirFetchedBody) -> crate::object::PimdirHash,
     ) -> PimdirPlacement {
         debug!(
             "land the pending create {} under {}",
@@ -1441,7 +1444,7 @@ impl PimdirSync {
         // staged body as an edit and push it over the arrival.
         let mut base_object = landed.object.clone();
         if !diverged && let Some(body) = item.meta.body.clone() {
-            let hash = self.store_body(body);
+            let hash = store(body);
             base_object = Some(hash.clone());
             landed.object.get_or_insert(hash);
         }

@@ -299,7 +299,7 @@ impl PimdirStore {
     }
 
     /// Re-derives the held mail and tasks of a store whose rows stand under
-    /// an earlier Annex A revision than [`schema::DERIVATION`] (STORAGE §6):
+    /// an earlier Annex A revision than [`summary::DERIVATION`] (STORAGE §6):
     /// every message and task holding a body, a keyset page of
     /// `list_held_mail`, then of `list_held_tasks`, at a time, each page
     /// written in its own transaction and the revision recorded with
@@ -312,7 +312,7 @@ impl PimdirStore {
         const PAGE: i64 = 256;
 
         let stored = self.store_meta()?.derivation;
-        if stored >= schema::DERIVATION {
+        if stored >= summary::DERIVATION {
             return Ok(());
         }
         debug!("re-derive the store from revision {stored}");
@@ -365,7 +365,7 @@ impl PimdirStore {
                 if last && at + 1 == lists.len() {
                     tx.execute_cached(
                         sql::SET_DERIVATION,
-                        named_params! { ":derivation": schema::DERIVATION },
+                        named_params! { ":derivation": summary::DERIVATION },
                     )?;
                 }
                 tx.commit().map_err(busy_or_sql)?;
@@ -381,7 +381,7 @@ impl PimdirStore {
 
         debug!(
             "re-derived {moved} items to revision {}",
-            schema::DERIVATION
+            summary::DERIVATION
         );
         Ok(())
     }

@@ -56,7 +56,11 @@
 //! coverage of an answer, with no feature. `mail`, `contact` and
 //! `calendar` add each domain's extraction (and `contact` the card
 //! matcher); `search` reads the index, `client::search`; `indexer` builds
-//! and refreshes it, over every domain.
+//! and refreshes it, over every domain. A reader built without a domain's
+//! feature still finds that domain's hits, but cuts them no snippet and
+//! reads them, in `PimdirIndex::item`, from their summary as a bodiless
+//! item reads: no error says so, so a reader showing a kind takes its
+//! domain's feature.
 //!
 //! ## Conventions
 //!

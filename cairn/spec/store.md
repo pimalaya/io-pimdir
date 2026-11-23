@@ -574,6 +574,14 @@ append order, so a frontend can overlay them on its item projection for
 read-your-writes, and the store's as a whole (`list_pending_actions`), each
 naming its collection.
 
+A pending row whose payload does not decode SHALL be listed beside the rows that decode, never fail the listing (STORAGE §15.4; finding G1, cardamum CD1, himalaya HM2, calendula CL1): as `PimdirAction::Unknown` with its kind and payload verbatim, the signature of `pending_actions` kept, until the drain parks it. `codec::payload_outcome` tells it malformed and `codec::action_from_payload` names its error; `pimdir queue list` prints that error on the row (tests/generated/reader.rs, its known-included twin failing before and run since).
+
+### Requirement: The drain reads a target as a load of its links answers it
+A drained `copy` or `move` SHALL read its target through the projection a `Links` load answers (`write::retain_links`, shared by the load and the drain): a create the store offers this source for an item it lacks is no live placement there, so the create joins that item as `store.mutate` does (pimdir SYNC §7, §10; STORAGE §14), where the drain minted a second item under a `dup:` key (K4; tests/drain_copy.rs, failing before). For an action whose item one source binds, the drain SHALL leave the rows `store.mutate` leaves for the mutation it maps to (tests/vectors_sync.rs `every_expressible_mutate_vector_drains_to_its_rows`, 17 mutate vectors, none disagreeing).
+
+### Requirement: The Annex A revision is public
+The revision summaries are derived under (`store_meta.derivation`, STORAGE §6) SHALL be the public constant `summary::DERIVATION`, outside `client`, the one the store stamps (android AN3, pimdir audit-2026-11-12 A5).
+
 ### Requirement: A reader may overlay a collection's pending actions
 A reader built with `with_pending` SHALL project a collection's pending actions
 over its committed items, in row `id` order, so a consumer sees its own staged
@@ -593,7 +601,7 @@ An `update` stating `if_match` SHALL fold only when it names the body the item h
 A parked row SHALL NOT overlay, its error asserting that it will not be applied
 without an operator. A pending row whose payload the reader cannot decode
 SHALL be skipped by the overlay, never fail the read: the drain is what parks
-it, and the strict `pending_actions` read still reports it as an error. A row
+it, and `pending_actions` lists it opaque, as above. A row
 whose action, or whose payload version, the reader does not know SHALL be
 listed by every pending read, the strict one included, as `PimdirAction::Unknown`
 with its action and its payload verbatim, and folded into nothing (STORAGE

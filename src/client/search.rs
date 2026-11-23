@@ -1611,8 +1611,10 @@ impl PimdirIndex {
     }
 
     /// One item by the address a hit carries, read as the index reads it:
-    /// its body extracted afresh, or its summary when it holds none.
-    /// `None` when no live placement of it is in the account.
+    /// its body extracted afresh, or its summary when it holds none or
+    /// when this build leaves its domain's feature (`mail`, `contact`,
+    /// `calendar`) out, which no error reports. `None` when no live
+    /// placement of it is in the account.
     pub fn item(
         &self,
         account: Option<&str>,

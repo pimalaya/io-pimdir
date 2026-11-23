@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
 };
 
+use log::debug;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params};
 
 use crate::{
@@ -1173,18 +1174,39 @@ pub struct PimdirDrainOverruled {
 }
 
 /// Reads pending rows, a collection's or every collection's, decoding
-/// each payload strictly: a malformed one is the read's error, until the
-/// drain parks it. A row whose action, or whose payload version, this
-/// crate does not know is listed as [`PimdirAction::Unknown`], its
+/// each payload strictly. A row whose action, or whose payload version,
+/// this crate does not know is listed as [`PimdirAction::Unknown`], its
 /// payload verbatim (§15.4): somebody's write a reader cannot show, never
-/// one it may hide, which the drain leaves pending for a later owner.
+/// one it may hide, which the drain leaves pending for a later owner. A
+/// malformed one, which the drain parks, is listed the same way until it
+/// does, its kind and payload verbatim beside the rows that decode: a
+/// reader tells it apart by [`codec::payload_outcome`] and names its error
+/// by [`codec::action_from_payload`].
 pub(crate) fn pending_actions(
     conn: &Connection,
     collection: Option<&str>,
 ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
     let mut actions = Vec::new();
     for row in pending_rows(conn, collection)? {
-        actions.push(row.decode()?);
+        let action = match row.decode() {
+            Ok(action) => action,
+            Err(err) => {
+                debug!("pending row {} lists opaque: {err}", row.id);
+                PimdirPendingAction {
+                    id: row.id,
+                    created_at: row.created_at,
+                    producer: row.producer,
+                    collection: row.collection,
+                    action: PimdirAction::Unknown {
+                        kind: row.action,
+                        payload: row.payload,
+                        object_hash: row.object_hash.map(PimdirHash),
+                    },
+                    attempts: row.attempts,
+                }
+            }
+        };
+        actions.push(action);
     }
     Ok(actions)
 }
@@ -2206,8 +2228,11 @@ fn stage_action(
             }
             _ => Vec::new(),
         };
-        let placements =
-            write::read_hub(tx, &collection.0, Some(&links))?.project(&collection, source);
+        let hub = write::read_hub(tx, &collection.0, Some(&links))?;
+        let mut placements = hub.project(&collection, source);
+        if matches!(selection, PimdirLoadSelection::Links(_)) {
+            write::retain_links(&hub, source, &mut placements);
+        }
         state = mutate.resume(Some(PimdirArg::Load(PimdirLoaded {
             placements,
             ..Default::default()

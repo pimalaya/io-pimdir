@@ -24,6 +24,7 @@ mod membership;
 mod policy_property;
 mod property;
 mod quarantine;
+mod rekey_cases;
 mod rekey_copies;
 mod rekey_scale;
 mod soft_delete;

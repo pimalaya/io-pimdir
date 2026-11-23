@@ -31,6 +31,13 @@ use crate::{
     },
 };
 
+/// The Annex A revision this crate derives summaries, addresses and sort
+/// keys under (STORAGE §6), which an owner records in
+/// `store_meta.derivation`: a store holding rows of an earlier revision is
+/// re-derived. Public for an owner holding its own SQLite, which stamps
+/// the same value.
+pub const DERIVATION: i64 = 3;
+
 /// One kind's summary row with the addresses it names (Annex A).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PimdirSummary {

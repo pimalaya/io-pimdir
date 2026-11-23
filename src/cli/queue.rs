@@ -12,7 +12,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use io_pimdir::{
     client::producer::PimdirActionStatus,
-    codec::{PimdirAction, PimdirActionHandle, action_to_payload},
+    codec::{PimdirAction, PimdirActionHandle, action_from_payload, action_to_payload},
 };
 use log::warn;
 use pimalaya_cli::{
@@ -98,6 +98,14 @@ impl QueueListCommand {
                 match store.pending_actions(&collection) {
                     Ok(actions) => {
                         for action in actions {
+                            let error = match &action.action {
+                                PimdirAction::Unknown { kind, payload, .. } => {
+                                    action_from_payload(kind, payload)
+                                        .err()
+                                        .map(|err| err.to_string())
+                                }
+                                _ => None,
+                            };
                             rows.push(QueueRow {
                                 row: action.id,
                                 created_at: action.created_at,
@@ -108,7 +116,7 @@ impl QueueListCommand {
                                 payload: action_to_payload(&action.action),
                                 attempts: action.attempts,
                                 unconfirmed: false,
-                                error: None,
+                                error,
                             });
                         }
                     }

@@ -417,3 +417,9 @@ index.db SHALL hold, beside the canonical schema, the crate's own `pimdir_fields
 #### Scenario: The list answers, its absence falls back
 - **WHEN** tests/search.rs `a_from_word_reads_the_posting_list_and_falls_back_without_it` counts `from:alice`, `from:ali*`, `from:alice not body:roadmap`, `subject:sync` and `subject:syn*` over the vector store, takes one row out of the list, then drops it, then lets the indexer rebuild
 - **THEN** a row taken out is a hit fewer, the dropped list answers the counts first held, and the rebuilt index holds the list and answers them again; tests/search_plan.rs `the_hit_columns_answer_as_the_index_alone` compares `from:user1` and `from:use*` off the columns with the compiled answer
+
+### Requirement: The index statements build without client
+`sql::search` (the statement texts, `FORMAT_VERSION`, `MIGRATIONS`, `all()`) SHALL compile under `indexer` alone, so a consumer running the refresh over its own SQLite links no rusqlite (android AN1; tests/indexer_alone.rs, and `cargo tree --no-default-features --features indexer -e normal` naming no rusqlite).
+
+### Requirement: A domain left out reads as a bodiless item
+A reader built without a domain's feature (`mail`, `contact`, `calendar`) SHALL still find that domain's hits, cutting them no snippet and reading them in `PimdirIndex::item` from their summary, as a bodiless item reads; no error says so, which the crate documentation and `PimdirIndex::item` state (calendula CL3).

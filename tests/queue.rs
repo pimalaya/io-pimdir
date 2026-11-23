@@ -1344,11 +1344,14 @@ fn a_malformed_pending_row_is_skipped_by_the_overlay_and_parked_by_the_drain() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].flags, PimdirFlags::from_iter(["\\Flagged"]));
     assert_eq!(reader.count_items("INBOX").unwrap(), 1);
-    // the strict read still says the row is there and unreadable
-    assert!(matches!(
-        reader.pending_actions("INBOX"),
-        Err(PimdirError::Action(_))
-    ));
+    let pending = reader.pending_actions("INBOX").unwrap();
+    assert_eq!(pending.len(), 2, "the listing names the row, opaque");
+    let PimdirAction::Unknown { kind, payload, .. } = &pending[0].action else {
+        panic!("the malformed row lists opaque: {:?}", pending[0].action);
+    };
+    assert_eq!((kind.as_str(), payload.as_str()), ("set-flags", "not json"));
+    assert!(io_pimdir::codec::action_from_payload(kind, payload).is_err());
+    assert!(matches!(pending[1].action, PimdirAction::SetFlags { .. }));
 
     let report = store.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 1, 0));

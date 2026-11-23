@@ -511,6 +511,10 @@ impl PimdirReader {
     /// store the owner's open refuses (STORAGE §6, §18). Takes no lock.
     /// The database is read through SQLite's shared cache, which a search
     /// index attaching the store joins, its schema parsed once.
+    ///
+    /// A reader keeps the database file it opened: a store moved aside
+    /// and synced anew under the same directory is another file, which a
+    /// long-lived reader sees only once it opens the directory again.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         let dir = dir.as_ref();
         if !dir.join("pimdir.db").is_file() {

@@ -17,13 +17,10 @@ use crate::{
     client::{PimdirError, PreparedCached, busy_or_sql},
     hash::HASH_ALGO,
     sql,
+    summary::DERIVATION,
     sync::SYNC_VERSION,
     version::{PimdirFormat, PimdirProfile, PimdirProgram, PimdirStoreVersion},
 };
-
-/// The Annex A revision this crate derives summaries, addresses and sort
-/// keys under (STORAGE §6), recorded in `store_meta.derivation`.
-pub(crate) const DERIVATION: i64 = 3;
 
 /// Opens a store as its owner: a fresh database is created, an existing
 /// one goes through [`check`], so a store this crate does not open is

@@ -46,9 +46,11 @@ use crate::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
         PimdirSortKey, PimdirStatus,
     },
-    remote::{PimdirEnumerate, PimdirEnumerated, PimdirListing, PimdirRemoteItem},
+    remote::{
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirListing, PimdirRemoteItem,
+    },
     summary::{self, PimdirSummary},
-    sync::{PimdirParked, PimdirSyncEvent},
+    sync::{PimdirParked, PimdirSync, PimdirSyncEvent},
 };
 
 /// What a rekey did.
@@ -82,6 +84,9 @@ pub struct PimdirRekey {
     checkpoint: Option<PimdirCheckpoint>,
     /// What each member's meta resolved, by new handle.
     resolved: BTreeMap<PimdirHandle, Resolved>,
+    /// The creates the store offers this source, items it does not bind
+    /// yet, which a member stating their key joins (SYNC §6, §8).
+    offered: BTreeSet<PimdirHandle>,
     /// Whether a page of the listing said the source caps it (SYNC §4).
     capped: bool,
     /// Whether the caller confirmed the absences the listing leaves, so
@@ -103,6 +108,7 @@ impl PimdirRekey {
             items: Vec::new(),
             checkpoint: None,
             resolved: BTreeMap::new(),
+            offered: BTreeSet::new(),
             capped: false,
             accept_absences: false,
             report: PimdirRekeyReport::default(),
@@ -174,11 +180,14 @@ impl PimdirRekey {
         let mut carried_over = BTreeSet::new();
         let mut restaged = BTreeSet::new();
         let mut in_place = BTreeSet::new();
+        let mut superseded = BTreeSet::new();
+        let mut landed_drops = Vec::new();
+        let mut staged = staged;
         // NOTE: seeded with the pending creates' keys, which stay taken
         // since the rebuild leaves those rows where they are.
         let mut claimed: BTreeSet<PimdirLinkId> = staged
-            .into_iter()
-            .filter_map(|placement| placement.link_id)
+            .iter()
+            .filter_map(|placement| placement.link_id.clone())
             .collect();
         for item in items {
             let resolved = links.get(&item.handle);
@@ -199,25 +208,96 @@ impl PimdirRekey {
                 claimed.insert(key);
             }
 
+            let hint = resolved.map(|resolved| resolved.link_id.as_str());
+            let pending = match (&carried, hint) {
+                (None, Some(hint)) => staged.iter().position(|create| {
+                    create.handle != item.handle
+                        && create.link_id.as_ref().and_then(PimdirLinkId::landed_hint) == Some(hint)
+                        && summary::same_message(
+                            create.summary.as_ref(),
+                            item.meta.summary.as_ref(),
+                        )
+                }),
+                _ => None,
+            };
+
             match carried {
+                Some(old) if old.delivered() => {
+                    trace!("a delivered create lands on its member");
+                    carried_over.insert(old.handle.clone());
+                    superseded.insert(old.handle.clone());
+                    let landed = Self::land(old, &item, false, &mut writes);
+                    writes.push(PimdirWriteOp::UpsertPlacement(landed));
+                    self.report.rekeyed += 1;
+                    self.report
+                        .events
+                        .push(PimdirSyncEvent::Created(item.handle.clone()));
+                }
+                None if let Some(at) = pending => {
+                    let create = staged.remove(at);
+                    if let Some(key) = &key {
+                        claimed.remove(key);
+                    }
+                    let offered = self.offered.contains(&create.handle);
+                    landed_drops.push(PimdirWriteOp::DropPlacement {
+                        collection: self.collection.clone(),
+                        handle: create.handle.clone(),
+                        reason: PimdirDropReason::Superseded,
+                    });
+                    let landed = Self::land(create, &item, offered, &mut writes);
+                    let conflicted = landed.status == PimdirStatus::Conflict;
+                    writes.push(PimdirWriteOp::UpsertPlacement(landed));
+                    let event = match offered {
+                        true => {
+                            trace!("an offered copy joins its member");
+                            self.report.pulled += 1;
+                            PimdirSyncEvent::Added(item.handle.clone())
+                        }
+                        false => {
+                            trace!("a pending create lands on its member");
+                            self.report.rekeyed += 1;
+                            PimdirSyncEvent::Created(item.handle.clone())
+                        }
+                    };
+                    self.report.events.push(event);
+                    if conflicted {
+                        self.report
+                            .events
+                            .push(PimdirSyncEvent::Conflicted(item.handle.clone()));
+                    }
+                }
                 Some(old) => {
                     if old.handle == item.handle {
                         in_place.insert(old.handle.clone());
                     }
                     carried_over.insert(old.handle.clone());
-                    writes.push(PimdirWriteOp::UpsertPlacement(
-                        self.carry(old, &item, resolved),
-                    ));
+                    let carried = self.carry(old, &item, resolved, &mut writes);
+                    writes.push(PimdirWriteOp::UpsertPlacement(carried));
                     self.report.rekeyed += 1;
                 }
                 None => {
-                    writes.push(PimdirWriteOp::UpsertPlacement(
-                        self.fresh(&item, resolved, key),
-                    ));
+                    let apart = hint.and_then(|hint| {
+                        staged.iter().find(|create| {
+                            create.handle != item.handle
+                                && !self.offered.contains(&create.handle)
+                                && create.link_id.as_ref().and_then(PimdirLinkId::landed_hint)
+                                    == Some(hint)
+                        })
+                    });
+                    let apart = apart.and_then(|create| create.link_id.clone());
+                    let fresh = self.fresh(&item, resolved, key, &mut writes);
+                    writes.push(PimdirWriteOp::UpsertPlacement(fresh));
                     self.report.pulled += 1;
                     self.report
                         .events
                         .push(PimdirSyncEvent::Added(item.handle.clone()));
+                    if let Some(link_id) = apart {
+                        trace!("a member disagrees with the pending create, minted apart");
+                        self.report.events.push(PimdirSyncEvent::Disagreed {
+                            handle: item.handle.clone(),
+                            link_id,
+                        });
+                    }
                 }
             }
         }
@@ -290,6 +370,7 @@ impl PimdirRekey {
             // NOTE: a re-staged edit's binding moves to its provisional
             // handle, licensed by a `Superseded` drop of the void one, which
             // goes before any upsert reusing it (SYNC §10).
+            let moved = moved || superseded.contains(&placement.handle);
             let reason = match (moved, carried_over.contains(&placement.handle)) {
                 (true, _) => PimdirDropReason::Superseded,
                 (false, true) => PimdirDropReason::Rekeyed,
@@ -302,6 +383,7 @@ impl PimdirRekey {
             });
         }
 
+        drops.append(&mut landed_drops);
         drops.append(&mut writes);
         // NOTE: the rekey's checkpoint lands with it, the coverage left as
         // it was (SYNC §8); a listing handing none keeps the old one.
@@ -406,6 +488,24 @@ impl PimdirRekey {
         })
     }
 
+    /// Lands a create on the member stating its key, as a page lands it
+    /// (SYNC §6, §8): a delivered create, a pending one or one the store
+    /// offers this source. A body the listing carries is stored first.
+    fn land(
+        create: PimdirPlacement,
+        item: &PimdirRemoteItem,
+        offered: bool,
+        writes: &mut Vec<PimdirWriteOp>,
+    ) -> PimdirPlacement {
+        let mut create = create;
+        if offered {
+            create.flags = PimdirFlags::merge(&PimdirFlags::Unknown, &create.flags, &item.flags);
+        }
+        let mut landed = PimdirSync::land(create, item, offered, &mut |body| store(writes, body));
+        landed.server_object_id = item.meta.server_object_id.clone();
+        landed
+    }
+
     /// Carries an old placement onto the new handle.
     ///
     /// The cache survives and the flag delta re-derives against the new
@@ -422,10 +522,18 @@ impl PimdirRekey {
         old: PimdirPlacement,
         item: &PimdirRemoteItem,
         resolved: Option<&Resolved>,
+        writes: &mut Vec<PimdirWriteOp>,
     ) -> PimdirPlacement {
         let old_base = old.base.as_ref();
         let old_base_flags = old_base.map(|b| b.flags.clone()).unwrap_or_default();
         let flags = PimdirFlags::merge(&old_base_flags, &old.flags, &item.flags);
+        let base_flags = match item.flags.is_unknown() && old_base.is_some() {
+            true => {
+                trace!("the listing states no flags: the base keeps its own");
+                old_base_flags.clone()
+            }
+            false => item.flags.clone(),
+        };
 
         let observed = item
             .revision
@@ -436,7 +544,10 @@ impl PimdirRekey {
         let local_edit = old.staged_edit().is_some();
 
         let mutable = observed.is_some() || base_revision.is_some();
-        let revived = remote_edited && old.status == PimdirStatus::Tombstone;
+        let revived = remote_edited
+            && old.status == PimdirStatus::Tombstone
+            && old.conflict_revision.is_none()
+            && !local_edit;
         let kept_edit = local_edit && mutable && !revived;
         let summary = match kept_edit {
             true => old.summary.clone(),
@@ -464,7 +575,7 @@ impl PimdirRekey {
             conflict_revision: None,
             conflict_object: None,
             base: Some(PimdirBase {
-                flags: item.flags.clone(),
+                flags: base_flags,
                 revision: base_revision,
                 object: old_base.and_then(|b| b.object.clone()),
             }),
@@ -472,25 +583,21 @@ impl PimdirRekey {
             server_object_id: item.meta.server_object_id.clone(),
         };
 
-        // NOTE: a delivered create carried onto its member is landed there,
-        // so an immutable one's base takes the staged body, one identity
-        // being one message (SYNC §6, §8).
-        if old.delivered()
-            && observed.is_none()
-            && let Some(base) = &mut carried.base
-        {
-            base.object = old.object.clone();
-        }
-
         let flags_pending = carried.flags != item.flags;
         match old.status {
             // NOTE: an item-level conflict tracks no revision and stays so
             // unless the remote moved under the rebuild too (SYNC §3).
             PimdirStatus::Conflict => {
                 carried.status = PimdirStatus::Conflict;
-                if old.conflict_revision.is_some() || remote_edited {
-                    carried.conflict_revision = observed;
-                }
+                carried.conflict_revision = match (&old.conflict_revision, &observed) {
+                    (Some(recorded), None) => {
+                        trace!("the listing states no revision: the conflict is carried");
+                        Some(recorded.clone())
+                    }
+                    (Some(_), Some(_)) => observed,
+                    (None, _) if remote_edited => observed,
+                    (None, _) => None,
+                };
                 // NOTE: the diverging body describes the revision recorded
                 // beside it, so a newer one drops it and the upgrade pass
                 // asks anew.
@@ -500,6 +607,24 @@ impl PimdirRekey {
             }
             // NOTE: a delta never relists the member, so the revive a sync
             // would make on the next listing is made here (SYNC §5).
+            PimdirStatus::Tombstone if old.conflict_revision.is_some() => {
+                trace!("a conflicted tombstone is carried with its conflict");
+                carried.status = PimdirStatus::Tombstone;
+                let recorded = old.conflict_revision.clone();
+                carried.conflict_revision = match (&observed, remote_edited) {
+                    (Some(observed), true) => Some(observed.clone()),
+                    _ => recorded.clone(),
+                };
+                if carried.conflict_revision == recorded {
+                    carried.conflict_object = old.conflict_object.clone();
+                }
+            }
+            PimdirStatus::Tombstone if remote_edited && local_edit => {
+                trace!("a tombstone holding an edit meets a remote edit: a conflict");
+                carried.status = PimdirStatus::Conflict;
+                carried.conflict_revision = observed;
+                carried.conflict_object = item.meta.body.clone().map(|body| store(writes, body));
+            }
             PimdirStatus::Tombstone if remote_edited => {
                 carried.object = None;
                 carried.level = PimdirLevel::Meta;
@@ -516,17 +641,28 @@ impl PimdirRekey {
             _ if remote_edited && local_edit => {
                 carried.status = PimdirStatus::Conflict;
                 carried.conflict_revision = observed;
+                carried.conflict_object = item.meta.body.clone().map(|body| {
+                    trace!("a conflict stores the body its listing carries");
+                    store(writes, body)
+                });
             }
             _ if remote_edited => {
-                carried.object = None;
-                carried.level = PimdirLevel::Meta;
+                let listed = item.meta.body.clone().map(|body| {
+                    trace!("a pull stores the body its listing carries");
+                    store(writes, body)
+                });
+                carried.level = match listed {
+                    Some(_) => PimdirLevel::Full,
+                    None => PimdirLevel::Meta,
+                };
+                carried.object = listed.clone();
                 carried.status = match flags_pending {
                     true => PimdirStatus::Dirty,
                     false => PimdirStatus::Clean,
                 };
                 if let Some(base) = &mut carried.base {
                     base.revision = observed;
-                    base.object = None;
+                    base.object = listed;
                 }
             }
             _ if local_edit && old.status == PimdirStatus::Dirty => {
@@ -552,13 +688,21 @@ impl PimdirRekey {
         item: &PimdirRemoteItem,
         resolved: Option<&Resolved>,
         key: Option<PimdirLinkId>,
+        writes: &mut Vec<PimdirWriteOp>,
     ) -> PimdirPlacement {
+        let listed = item.meta.body.clone().map(|body| {
+            trace!("an arrival stores the body its listing carries");
+            store(writes, body)
+        });
         PimdirPlacement {
             collection: self.collection.clone(),
             handle: item.handle.clone(),
             link_id: key,
-            object: None,
-            level: PimdirLevel::Meta,
+            object: listed.clone(),
+            level: match listed {
+                Some(_) => PimdirLevel::Full,
+                None => PimdirLevel::Meta,
+            },
             summary: resolved.and_then(|r| r.summary.clone()),
             sort_key: resolved.map(|r| r.sort_key.clone()).unwrap_or_default(),
             flags: item.flags.clone(),
@@ -568,12 +712,24 @@ impl PimdirRekey {
             base: Some(PimdirBase {
                 flags: item.flags.clone(),
                 revision: item.revision.clone(),
-                object: None,
+                object: listed,
             }),
             origin: None,
             server_object_id: item.meta.server_object_id.clone(),
         }
     }
+}
+
+/// Records a body a listing carried in the batch, answering the hash it is
+/// stored by: a rekey stores what a page would (SYNC §5, §8).
+fn store(writes: &mut Vec<PimdirWriteOp>, body: PimdirFetchedBody) -> PimdirHash {
+    let (object, bytes) = body.stored();
+    let hash = object.hash.clone();
+    writes.push(PimdirWriteOp::StoreObject {
+        object,
+        body: bytes,
+    });
+    hash
 }
 
 impl PimdirCoroutine for PimdirRekey {
@@ -596,6 +752,7 @@ impl PimdirCoroutine for PimdirRekey {
 
             (State::Loading, Some(PimdirArg::Load(loaded))) => {
                 self.old = loaded.placements;
+                self.offered = loaded.offered.into_iter().collect();
 
                 debug!("enumerate the new handle space in full");
                 trace!("loaded {} old placements", self.old.len());
@@ -637,6 +794,10 @@ impl PimdirCoroutine for PimdirRekey {
                 // its rounds (SYNC §4): one page stating it is enough.
                 self.capped |= page.capped;
                 for item in page.items {
+                    if self.resolved.contains_key(&item.handle) {
+                        trace!("a repeated handle keeps its first entry");
+                        continue;
+                    }
                     self.resolved.insert(
                         item.handle.clone(),
                         Resolved {
@@ -710,7 +871,14 @@ impl PimdirCoroutine for PimdirRekey {
                 }
             }
 
-            (State::Writing, Some(PimdirArg::Write | PimdirArg::Written(_))) => {
+            (State::Writing, Some(arg @ (PimdirArg::Write | PimdirArg::Written(_)))) => {
+                if let PimdirArg::Written(written) = arg {
+                    for (handle, link_id) in written.overruled {
+                        self.report
+                            .events
+                            .push(PimdirSyncEvent::Overruled { handle, link_id });
+                    }
+                }
                 debug!(
                     "rekey done: {} carried, {} pulled, {} pending dropped",
                     self.report.rekeyed, self.report.pulled, self.report.dropped,

@@ -17,7 +17,7 @@ use std::{
 
 use io_pimdir::{
     change::{PimdirChange, PimdirChangeKind},
-    client::{PimdirSourceStore, PimdirStore, blobs::PimdirBlobs},
+    client::{PimdirSourceStore, PimdirStore, blobs::PimdirBlobs, producer::PimdirProducer},
     codec,
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     coroutine::{PimdirArg, PimdirCoroutine, PimdirCoroutineState, PimdirYield},
@@ -1574,4 +1574,160 @@ fn reproduce(spec: &Path, path: &Path) {
             assert_same_set(&label, table, expected, actual);
         }
     }
+}
+
+/// The mutate cases the queue's drain disagrees with, each with its reason
+/// (cairn/changes/what-the-consumers-need report.md): none known.
+const DRAIN_KNOWN: &[(&str, &str)] = &[];
+
+/// Every mutate case a queue action expresses, its item bound by one
+/// source, drained from the queue to the rows `store.mutate` leaves (SYNC
+/// §7, STORAGE §14, §15): a `SetFlags`, a `Remove`, a `Move`, a `Copy` and
+/// an `Edit` overruling nothing. The vectors have no drain verb, so the
+/// drain is held to the mutate case's rows, its events and pushes being the
+/// mutation's own.
+#[test]
+fn every_expressible_mutate_vector_drains_to_its_rows() {
+    let spec = spec_dir();
+    let mut paths: Vec<PathBuf> = fs::read_dir(spec.join("vectors/sync"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+
+    let mut drained = 0;
+    let mut disagreeing = Vec::new();
+    for path in &paths {
+        let case: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let Some(rows) = drain_case(&spec, &case) else {
+            continue;
+        };
+        drained += 1;
+        let known = DRAIN_KNOWN.iter().any(|(case, _)| *case == stem);
+        match (rows, known) {
+            (Ok(()), true) => disagreeing.push(format!("{stem}: listed known, agrees")),
+            (Err(err), false) => disagreeing.push(format!("{stem}: {err}")),
+            _ => {}
+        }
+    }
+    assert!(
+        drained > 0,
+        "no mutate case is expressible as a queue action"
+    );
+    assert!(disagreeing.is_empty(), "{disagreeing:#?}");
+}
+
+/// One mutate case enqueued and drained: `None` when no queue action
+/// expresses it, else whether the rows agree with the case's.
+fn drain_case(spec: &Path, case: &Value) -> Option<Result<(), String>> {
+    let run = &case["run"];
+    if run["verb"].as_str() != Some("mutate") {
+        return None;
+    }
+    let sources: BTreeSet<&str> = case["store"]["bindings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|binding| binding["source"].as_str())
+        .collect();
+    if sources.len() != 1 {
+        return None;
+    }
+    let mutation = &run["mutation"];
+    let collection = run["collection"].as_str().unwrap();
+    let seq = || mutation["seq"].as_i64().expect("the item's seq");
+    let to = || PimdirCollectionId::from(mutation["to"].as_str().unwrap());
+
+    let dir = tempfile::tempdir().unwrap();
+    let bodies = seed(dir.path(), spec, &case["store"]);
+    let resolves = |value: &Value| {
+        value.as_array().map(|labels| {
+            labels
+                .iter()
+                .map(|label| PimdirHash::from(bodies.hash(label).expect("a body label")))
+                .collect::<Vec<_>>()
+        })
+    };
+    let (action, object) = match mutation["kind"].as_str().unwrap() {
+        "SetFlags" => (
+            codec::PimdirAction::SetFlags {
+                seq: seq(),
+                flags: flags(&mutation["flags"]),
+                base: mutation.get("base").map(flags),
+            },
+            None,
+        ),
+        "Remove" => (
+            codec::PimdirAction::Remove {
+                seq: seq(),
+                if_match: bodies.hash(&mutation["if_match"]).map(PimdirHash::from),
+                resolves: resolves(&mutation["resolves"]),
+            },
+            None,
+        ),
+        "Move" => (
+            codec::PimdirAction::Move {
+                seq: seq(),
+                to: to(),
+            },
+            None,
+        ),
+        "Copy" => (
+            codec::PimdirAction::Copy {
+                seq: seq(),
+                to: to(),
+            },
+            None,
+        ),
+        "Edit" if !mutation["overrule"].as_bool().unwrap_or(false) => {
+            let (object, _) = bodies.object(&mutation["object"]);
+            (
+                codec::PimdirAction::Update {
+                    seq: seq(),
+                    object: object.hash.clone(),
+                    if_match: bodies.hash(&mutation["if_match"]).map(PimdirHash::from),
+                    resolves: resolves(&mutation["resolves"]),
+                },
+                Some(object),
+            )
+        }
+        _ => return None,
+    };
+
+    let mut producer = PimdirProducer::open(dir.path(), "vectors").unwrap();
+    if producer
+        .enqueue(collection, &action, object.as_ref())
+        .is_err()
+    {
+        return None;
+    }
+    drop(producer);
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source(run["source"].as_str().unwrap());
+    store.drain().unwrap();
+    drop(store);
+
+    let conn = Connection::open(dir.path().join("pimdir.db")).unwrap();
+    let expect = case["expect"]["store"].as_object().unwrap();
+    for (table, rows) in expect {
+        if table == "objects" {
+            continue;
+        }
+        let mut expected = rows.as_array().cloned().unwrap_or_default();
+        let mut actual = match table.as_str() {
+            "summaries" => actual_summaries(&conn, &expected),
+            table => actual_rows(&conn, &bodies, table, &expected),
+        };
+        expected.sort_by_key(|row| row.to_string());
+        actual.sort_by_key(|row| row.to_string());
+        if expected != actual {
+            return Some(Err(format!(
+                "{table} rows differ:\n  expected {expected:?}\n  drained {actual:?}"
+            )));
+        }
+    }
+    Some(Ok(()))
 }

@@ -8,16 +8,17 @@ Written at planning (2026-11-23, about 15:50) from the four files that existed t
 
 - HM1 Whether a writer folds a system flag's case into `items.marks`: deferred. It is a STORAGE §13 ruling for the owner (D13), not made mid-migration; sources send `\Seen` and nothing is lost.
 - HM2 `pending_actions` lists a row it cannot decode: accepted, as CD1 (task 2.11, D12).
-- HM3 R4, R1 and K4 fixed: accepted, drop 2 (tasks 2.1, 2.2, 2.10). R4 and R1 each get a pimdir vector. K4's check is an io-pimdir test (tests/drain_copy.rs, tests/drain_agrees.rs), because the vectors have no drain verb.
+- HM3 R4, R1 and K4 fixed: accepted, drop 2 (tasks 2.1, 2.2, 2.10). R4 and R1 are pimdir vectors 201 and 202. K4's check is an io-pimdir test (tests/drain_copy.rs, tests/drain_agrees.rs), because the vectors have no drain verb.
 - HM4 The release with `client`, `search`, `mail`, `indexer` and `vendored` as at 7f16b27: accepted (tasks §5, §6). No feature changes; AN1 only adds `sql::search` under `indexer`.
 - HM5 A `mid:` term driven by `summary.uid` rather than a scan: deferred to a 0.20.x. It is a query-path speed-up with a workaround (`envelope search mid:`), and no 0.20.0 fix touches the query path (D7).
 
 ## neverest
 
-- NV1 R5, R6, R6b and K4 fixed: accepted, drop 2 (tasks 2.7 to 2.10). R6 (R6a) is a rule change, D10, whose default is to land the pending create as a page does, so the "no second APPEND" test can hold.
+- NV1 R5, R6, R6b and K4 fixed: accepted, drop 2 (tasks 2.7 to 2.10; pimdir vectors 203 to 206, the "no second APPEND" case being 205). R6 (R6a) is a rule change, D10, whose default is to land the pending create as a page does, so the "no second APPEND" test can hold.
 - NV2 An owner write registering a source: deferred. It is additive and the code passes at 7f16b27; it can land in a 0.20.x.
 - NV3 The bound-placements and owed-body reads: deferred, as performance with a workaround.
 - NV4 The release: accepted (tasks §5, §6).
+- NV5 (from the io-pimdir lane, not neverest's file) Drop 2's CD1 changes neverest's tests/queue.rs `a_malformed_row_fails_the_drain_coded`: a malformed row no longer fails the strict pre-drain listing (src/sync/driver/queue.rs:29), so the drain runs and parks it, exit 3 with the row's error, where every drain failed with exit 4 and the queue stayed stuck. The test wants the parked row; nothing else in neverest's suite moves (734 of 735 pass on drop 2).
 
 ## cardamum
 
@@ -35,8 +36,9 @@ Written at planning (2026-11-23, about 15:50) from the four files that existed t
 ## carillon
 
 - CR1 A change feed scoped to one collection: deferred. An index on `items(collection, changed)` is a storage schema change, and storage-draft-17 does not move in this migration.
-- CR2 A reader holds a store moved aside: noted, no code. A rustdoc sentence on `PimdirReader` says a long-lived reader opens the store again to see one synced anew (drop 2, with task 2.12); STORAGE §8 wording is pimdir's, left to the owner.
+- CR2 A reader holds a store moved aside: noted, no code. A rustdoc sentence on `PimdirReader::open` (drop 2) says a long-lived reader opens the store again to see one synced anew (drop 2, with task 2.12); STORAGE §8 wording is pimdir's, left to the owner.
 - CR3 Generator events with a `VALARM`: deferred, as CL2.
+- CR4 A keyset page of `(seq, object)` for one collection: deferred to a 0.20.x, additive (a new reader statement), the full `list_items` workaround standing; added at C2 (17:36).
 
 ## android
 

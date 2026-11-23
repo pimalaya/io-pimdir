@@ -194,13 +194,7 @@ impl PimdirSourceStore {
             }
         }
         if matches!(selection, PimdirLoadSelection::Links(_)) {
-            placements.retain(|placement| {
-                placement.link_id.as_ref().is_some_and(|link| {
-                    hub.items
-                        .get(link)
-                        .is_some_and(|item| item.sources.contains_key(&self.source))
-                })
-            });
+            retain_links(&hub, &self.source, &mut placements);
         }
 
         let state = sync_state(conn, &collection.0, &self.source)?;
@@ -1076,6 +1070,23 @@ fn batch_links(
     }
 
     Ok(links.into_iter().collect())
+}
+
+/// Keeps the placements a `Links` selection answers: those of an item the
+/// source binds, never a create offered for an item it lacks (STORAGE
+/// §14), so a load and the queue's drain read one target alike.
+pub(crate) fn retain_links(
+    hub: &PimdirHub,
+    source: &PimdirSourceId,
+    placements: &mut Vec<PimdirPlacement>,
+) {
+    placements.retain(|placement| {
+        placement.link_id.as_ref().is_some_and(|link| {
+            hub.items
+                .get(link)
+                .is_some_and(|item| item.sources.contains_key(source))
+        })
+    });
 }
 
 /// Reads a collection's hub: its policy, items, bindings, summaries and

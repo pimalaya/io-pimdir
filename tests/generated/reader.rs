@@ -30,7 +30,6 @@ use io_pimdir::{
 use pimdir_generator::{
     model::Model,
     oracle::{self, Expectation},
-    queue::{Action, RowState},
     spec::Spec,
 };
 use rusqlite::types::Value;
@@ -46,12 +45,6 @@ const UNWRAPPED: [&str; 3] = [
     "storage/owner/load_conflict",
     "storage/owner/load_round",
 ];
-
-/// Finding G1 (implementation, public API): a collection's pending listing
-/// fails whole on one row whose payload does not decode, where STORAGE
-/// §15.4 lists a row a reader cannot show rather than hide it, and
-/// `PimdirPendingAction` has no shape for it.
-const G1: &str = "G1: a malformed pending row fails the collection's pending listing";
 
 #[test]
 fn every_read_of_a_generated_store_answers_what_the_oracle_states() {
@@ -70,8 +63,10 @@ fn every_read_of_a_generated_store_answers_what_the_oracle_states() {
     }
 }
 
+/// The same, every known finding included: G1 (a malformed pending row
+/// failing its collection's pending listing, where STORAGE §15.4 lists a
+/// row a reader cannot show) failed it until the row was listed opaque.
 #[test]
-#[ignore = "G1: a malformed pending row fails the collection's pending listing"]
 fn every_read_of_a_generated_store_answers_what_the_oracle_states_known_included() {
     let disagreements: Vec<(u64, Option<&str>, String)> = SEEDS
         .into_iter()
@@ -181,25 +176,10 @@ pub fn compare(
     (expectations.len(), disagreements)
 }
 
-/// The known finding a point stands under, if any.
-fn known(model: &Model, expectation: &Expectation) -> Option<&'static str> {
-    let collection = expectation
-        .params
-        .iter()
-        .find(|(name, _)| name == "collection")
-        .map(|(_, value)| value);
-    let malformed = model.queue.iter().any(|row| {
-        row.state == RowState::Pending
-            && matches!(
-                row.action,
-                Action::Raw {
-                    malformed: true,
-                    ..
-                }
-            )
-            && collection == Some(&Value::Text(row.collection.clone()))
-    });
-    (expectation.statement == "storage/read/load_pending_actions" && malformed).then_some(G1)
+/// The known finding a point stands under, if any: none since G1 (a
+/// malformed pending row failing its collection's listing) was fixed.
+fn known(_: &Model, _: &Expectation) -> Option<&'static str> {
+    None
 }
 
 /// What a reader call answers at an expectation's point, projected onto

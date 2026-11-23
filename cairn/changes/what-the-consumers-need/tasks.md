@@ -9,17 +9,17 @@ Conventions: `I` = /home/soywod/code/pimalaya/io-pimdir, `P` = /home/soywod/code
 
 ## 0. Start
 
-- [ ] 0.1 Create journal.md and drops.md here. Gate: they exist.
-- [ ] 0.2 C0: read the six <app>/cairn/changes/follows-storage-draft-17/needs-io-pimdir.md, confirm answers.md's lines and add the new ones. Gate: every request has a line.
-- [ ] 0.3 Baseline: run the suite on a `git archive HEAD` snapshot at $L/src, with P/cairn/changes/a-smaller-sync/candidates/k3_rekey.rs and k4_drain.rs in tests/ and $L/pimdir a symlink to P. Gate: 1,203 passed, 0 failed, 8 ignored (inventory §1).
-- [ ] 0.4 Oracle copy: `cp -a` .pimdir-night/sync-diff, without target/, to $L/sync-diff. Set D, `-j 4`, `--threads 4` and taskset in gate.sh and switch.sh. Add rebase.sh `<commit>` (git archive into old/, `name = "io-pimdir-old"`). Add a logger recording `trace!` lines per thread and `--expect <cases>`, which accepts a first difference only in a run where a listed case's line fired and reports the differing, expected, unexpected and fired counts. Gate: 131f9bf against the tree, 200 vectors and 100,000 scenarios, 0 differences.
+- [x] 0.1 Create journal.md and drops.md here. Gate: they exist.
+- [x] 0.2 C0: read the six <app>/cairn/changes/follows-storage-draft-17/needs-io-pimdir.md, confirm answers.md's lines and add the new ones. Gate: every request has a line.
+- [x] 0.3 Baseline: run the suite on a `git archive HEAD` snapshot at $L/src, with P/cairn/changes/a-smaller-sync/candidates/k3_rekey.rs and k4_drain.rs in tests/ and $L/pimdir a symlink to P. Gate: 1,203 passed, 0 failed, 8 ignored (inventory §1).
+- [x] 0.4 Oracle copy: `cp -a` .pimdir-night/sync-diff, without target/, to $L/sync-diff. Set D, `-j 4`, `--threads 4` and taskset in gate.sh and switch.sh. Add rebase.sh `<commit>` (git archive into old/, `name = "io-pimdir-old"`). Add a logger recording `trace!` lines per thread and `--expect <cases>`, which accepts a first difference only in a run where a listed case's line fired and reports the differing, expected, unexpected and fired counts. Gate: 131f9bf against the tree, 200 vectors and 100,000 scenarios, 0 differences.
 
 ## 1. Drop 1: CI green and Android's build
 
-- [ ] 1.1 I/src/client/search/hits.rs:128 becomes `let ino: u64 = 0;`. Then `nix build .#cross-x86_64-windows --no-write-lock-file --max-jobs 1 --cores 4`. Gate: result/bin/pimdir.exe. If no cross toolchain is reachable, journal it and let the Releases run decide.
-- [ ] 1.2 I/src/hub.rs:465 `project_moving` under `#[cfg(any(feature = "client", test))]`; its callers are src/client/write.rs:182 and the hub test at :1253. Gate: the CI matrix, all 7 feature sets.
-- [ ] 1.3 AN1: I/src/sql.rs:18 `#[cfg(any(feature = "search", feature = "indexer"))]`, with build.rs baking the index statements for `indexer` too. Add tests/indexer_alone.rs, `#![cfg(all(feature = "indexer", not(feature = "client")))]`, naming `sql::search::FORMAT_VERSION` and `all()`. Gate: `cargo test --no-default-features --features indexer --test indexer_alone` passes, and `cargo tree --no-default-features --features indexer -e normal` names no rusqlite.
-- [ ] 1.4 CHANGELOG Unreleased, Fixed and Added, then commit. Drop 1 goes in drops.md, with `git archive` to $L/drops/1. Then C1 (as 0.2).
+- [x] 1.1 I/src/client/search/hits.rs:128 becomes `let ino: u64 = 0;`. Then `nix build .#cross-x86_64-windows --no-write-lock-file --max-jobs 1 --cores 4`. Gate: result/bin/pimdir.exe. If no cross toolchain is reachable, journal it and let the Releases run decide.
+- [x] 1.2 I/src/hub.rs:465 `project_moving` under `#[cfg(any(feature = "client", test))]`; its callers are src/client/write.rs:182 and the hub test at :1253. Gate: the CI matrix, all 7 feature sets.
+- [x] 1.3 AN1: I/src/sql.rs:18 `#[cfg(any(feature = "search", feature = "indexer"))]`, with build.rs baking the index statements for `indexer` too. Add tests/indexer_alone.rs, `#![cfg(all(feature = "indexer", not(feature = "client")))]`, naming `sql::search::FORMAT_VERSION` and `all()`. Gate: `cargo test --no-default-features --features indexer --test indexer_alone` passes, and `cargo tree --no-default-features --features indexer -e normal` names no rusqlite.
+- [x] 1.4 CHANGELOG Unreleased, Fixed and Added, then commit. Drop 1 goes in drops.md, with `git archive` to $L/drops/1. Then C1 (as 0.2).
 
 ## 2. Drop 2: the engine follows SYNC, and the accepted requests
 
@@ -31,19 +31,19 @@ The case loop, for 2.1 to 2.9:
 5. `./rebase.sh <commit before>`, then `./gate.sh <case> 20000 --weights rekey --expect <case>`. Gate: 0 unexpected, counts journalled.
 6. Commit I. Set P/checks/io-pimdir.rev to it and commit P.
 
-- [ ] 2.1 R4 (201): a binding owes `\Flagged`; the listing's flags are null. Expect the base `\Seen` kept and no push. src/rekey.rs:466-467. SYNC §8 gains "an unknown listed set leaves the base's".
-- [ ] 2.2 R1 (202): a conflict at "1" with its body, listed with no revision. Expect both kept. :489-500.
-- [ ] 2.3 R2b (203), R2c (204): a conflicted tombstone listed at its base revision, then at the conflict's. Expect the conflict carried, no `Remove`, no revive. :503-515.
-- [ ] 2.4 R8 (206 arrival, 207 pull): listed bodies, inline and persisted. Expect `StoreObject`, level 2, the pull's base body. :454-575.
-- [ ] 2.5 R3 (205): a tombstone holding an edit, remote edited. Expect a conflict at "1" with the listed body, the edit kept, nothing retained. :503 before :516. The report carries `Overruled` for `PimdirWritten::overruled`, and SYNC §5 lists it for a rekey.
-- [ ] 2.6 R0 (208): a repeated handle. Expect the first entry whole and no `Deleted`. :639-649.
-- [ ] 2.7 R5 (209): a delivered create matched. Expect a `Superseded` drop, staged flags, the listed base with the staged body, `Created`. :202-211, :293-295, :475-483. SYNC §5 lists `Created` for a rekey.
-- [ ] 2.8 R6b (210): an offered copy's hint stated by a member. Expect a join, one item. :158-182, and keep `loaded.offered` (:598).
-- [ ] 2.9 R6a (212, D10): a pending create's hint stated by a member. Expect it landed as §6 lands it, or minted apart and `Disagreed` when the summaries disagree. SYNC §8:546 is edited. This is what neverest's NV1 asks.
-- [ ] 2.10 K4: tests/drain_copy.rs from candidates/k4_drain.rs, asserting that the drained Copy and Move leave `store.mutate`'s rows (fails before). One `pub(crate)` `Links` projection (src/client/write.rs:196-204) serves src/client/producer.rs:2209-2210. Then tests/drain_agrees.rs: each `mutate` vector a queue action expresses, its item bound by one source, drained to the vector's rows. A further disagreement goes in report.md (a loss first) and is listed as known in the test with its reason. Gate: suite, and 0 oracle differences.
-- [ ] 2.11 CD1 (D12): the ignored G1 twin in tests/generated/reader.rs is the check (fails before). `pending_actions` (src/client/producer.rs:717, reader.rs:1237) lists an undecodable row as an opaque action naming its error, with the signature kept. Gate: G1 leaves the known list. If the signature must break, defer CD1 and say so in answers.md.
-- [ ] 2.12 AN3: `pub const DERIVATION` outside `client`, which src/client/schema.rs:26 re-uses. CHANGELOG Added.
-- [ ] 2.13 Pins passing before and after: R2a (211), R7 matched (213) and unmatched (214). SYNC §8 states D1.
+- [x] 2.1 R4 (201): a binding owes `\Flagged`; the listing's flags are null. Expect the base `\Seen` kept and no push. src/rekey.rs:466-467. SYNC §8 gains "an unknown listed set leaves the base's".
+- [x] 2.2 R1 (202): a conflict at "1" with its body, listed with no revision. Expect both kept. :489-500.
+- [x] 2.3 R2b (203), R2c (204): a conflicted tombstone listed at its base revision, then at the conflict's. Expect the conflict carried, no `Remove`, no revive. :503-515.
+- [x] 2.4 R8 (206 arrival, 207 pull): listed bodies, inline and persisted. Expect `StoreObject`, level 2, the pull's base body. :454-575.
+- [x] 2.5 R3 (205): a tombstone holding an edit, remote edited. Expect a conflict at "1" with the listed body, the edit kept, nothing retained. :503 before :516. The report carries `Overruled` for `PimdirWritten::overruled`, and SYNC §5 lists it for a rekey.
+- [x] 2.6 R0 (208): a repeated handle. Expect the first entry whole and no `Deleted`. :639-649.
+- [x] 2.7 R5 (209): a delivered create matched. Expect a `Superseded` drop, staged flags, the listed base with the staged body, `Created`. :202-211, :293-295, :475-483. SYNC §5 lists `Created` for a rekey.
+- [x] 2.8 R6b (210): an offered copy's hint stated by a member. Expect a join, one item. :158-182, and keep `loaded.offered` (:598).
+- [x] 2.9 R6a (212, D10): a pending create's hint stated by a member. Expect it landed as §6 lands it, or minted apart and `Disagreed` when the summaries disagree. SYNC §8:546 is edited. This is what neverest's NV1 asks.
+- [x] 2.10 K4: tests/drain_copy.rs from candidates/k4_drain.rs, asserting that the drained Copy and Move leave `store.mutate`'s rows (fails before). One `pub(crate)` `Links` projection (src/client/write.rs:196-204) serves src/client/producer.rs:2209-2210. Then tests/drain_agrees.rs: each `mutate` vector a queue action expresses, its item bound by one source, drained to the vector's rows. A further disagreement goes in report.md (a loss first) and is listed as known in the test with its reason. Gate: suite, and 0 oracle differences.
+- [x] 2.11 CD1 (D12): the ignored G1 twin in tests/generated/reader.rs is the check (fails before). `pending_actions` (src/client/producer.rs:717, reader.rs:1237) lists an undecodable row as an opaque action naming its error, with the signature kept. Gate: G1 leaves the known list. If the signature must break, defer CD1 and say so in answers.md.
+- [x] 2.12 AN3: `pub const DERIVATION` outside `client`, which src/client/schema.rs:26 re-uses. CHANGELOG Added.
+- [x] 2.13 Pins passing before and after: R2a (211), R7 matched (213) and unmatched (214). SYNC §8 states D1.
 - [ ] 2.14 Close the drop:
   - final oracle, 131f9bf against the tree, 100,000 scenarios, `--expect` every case: 0 unexpected;
   - neverest's lane head (or .pimdir-night/neverest if it does not build) as a git archive, path-patched to I, suite at drop 1 then at the tree, no servers and no live: no new failure;

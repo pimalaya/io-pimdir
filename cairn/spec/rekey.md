@@ -17,10 +17,12 @@ Identity is the only thing a handle-space change leaves intact, so it is the onl
 
 The batch SHALL list every `Rekeyed` drop before every upsert (pimdir SYNC §8, §10): a new handle may be an old one another member held, and the drop is what licenses the store to move the binding. The hub keeps the dropped binding's base aside for the upsert that rebinds the source ([hub](hub.md)).
 
+A listed flag set that is unknown SHALL leave the base's flags as they are, holding no opinion (pimdir SYNC §3, §8): a flag change still owed stays owed, and the next sync pushes it. Taking the unknown set as the base read the owed change as agreed and never pushed it (vectors/sync/201, R4 of pimdir cairn/changes/a-smaller-sync, a silent loss).
+
 A pending create staged from this collection into another carries an origin naming a handle the rebuild voided. The store derives the origin anew on every load from the bindings by link id (SYNC §3), so such a create copies from the carried handle; a consumer keeping the staged origin sees it fall back to an upload when the store holds the body, and rejected until restaged otherwise.
 
 ### Requirement: A rekey never writes a base it never reconciled
-A mutable member whose listed revision differs from the one its old base held changed on the remote while the handles did (pimdir SYNC §8). The rekey SHALL carry it as the pull a sync would make, body dropped, level `Meta`, base object `None` at the fetched revision, or as a `Conflict` at the fetched revision with the base untouched and no `conflict_object` when the placement also holds a local edit, a body its base does not. A tombstone meeting one is carried as it is, base included, for the next sync to revive it on the ordinary edit-beats-delete path. A `Conflict` the old handle held is carried as it is, revision and diverging body kept while the fetched revision is the one recorded; an item-level conflict ([hub](hub.md)), which records no revision, SHALL gain none unless the remote moved, since a binding conflict pinned at a revision the server never left holds that source's pushes for ever while the other sources settle the item. A base claiming the fetched revision while holding the old body is the one thing the rekey MUST NOT write: the next sync would read the stale body as current, or push the local edit last-writer-wins. A local edit carried in conflict keeps the summary and sort key it states, the fetch's describing the server's body nobody adopted (pimdir SYNC §8, STORAGE §9.3; tests/engine/summary_kept.rs, failing before it).
+A mutable member whose listed revision differs from the one its old base held changed on the remote while the handles did (pimdir SYNC §8). The rekey SHALL carry it as the pull a sync would make, at the fetched revision, the body the listing carries stored as the placement's and the base's at `Full`, or, carrying none, the body dropped, level `Meta`, base object `None` (vectors/sync/212); or as a `Conflict` at the fetched revision with the base untouched when the placement also holds a local edit, a body its base does not, the listed body its `conflict_object` when the listing carries one. A tombstone holding a local edit is that case too: carried as a `Conflict` at the fetched revision, never revived as a pull keeping the edit only in an item retained apart (vectors/sync/209, R3); a tombstone holding none is revived as the pull SYNC §5 makes. A tombstone whose binding is conflicted SHALL keep its conflict, a delete settling none (SYNC §3), listed at its base revision or at its conflict's, and derives no `Remove` (vectors/sync/207, 208; R2b, R2c). A `Conflict` the old handle held is carried as it is, revision and diverging body kept while the fetched revision is the one recorded or the listing states none, a listing stating no revision stating no move (vectors/sync/202; R1, a silent loss: the conflict was cleared and its body made collectable); an item-level conflict ([hub](hub.md)), which records no revision, SHALL gain none unless the remote moved, since a binding conflict pinned at a revision the server never left holds that source's pushes for ever while the other sources settle the item. A base claiming the fetched revision while holding the old body is the one thing the rekey MUST NOT write: the next sync would read the stale body as current, or push the local edit last-writer-wins. A local edit carried in conflict keeps the summary and sort key it states, the fetch's describing the server's body nobody adopted (pimdir SYNC §8, STORAGE §9.3; tests/engine/summary_kept.rs, failing before it).
 
 #### Scenario: A remote edit over a clean placement
 - GIVEN a placement clean at `r1` whose new handle the listing reports at `r2`
@@ -73,7 +75,7 @@ Carrying the old minted key is what the mint's own determinism rests on. The key
 
 Merging the two instead keeps one body, one summary and one set of pending edits for two resources the source holds, and loses the other at the write that noticed the problem.
 
-The keys of the pending creates a rebuild leaves untouched SHALL count as taken, those rows staying in the collection while the rebuild runs.
+A member resolving to no old binding SHALL be named as a page names one (pimdir SYNC §6, §8): it lands this source's pending create whose key it states and whose summary it agrees with, the provisional handle dropped `Superseded` and `Created` reported (vectors/sync/205), joins a create the store offers this source (`PimdirLoaded::offered`), an item it does not bind yet, reported `Added` (vectors/sync/204), and is minted apart and reported `Disagreed` when its summary disagrees with the pending create's (vectors/sync/206). A pending create's key counts as taken only while no member lands it: counting it taken whatever the member minted the arrival apart and pushed the add again, a second message on the server (rule D10 of cairn/changes/what-the-consumers-need, neverest NV1).
 
 Where one hint had several old copies, a member SHALL be matched first to the old copy whose base names its fetched revision, then to the one holding its body when the fetch carried one, and in handle order only among what neither tells apart (pimdir SYNC §8), so a renumbering that swapped two resources under one `UID` carries each one's flags and pending edit onto itself.
 
@@ -87,10 +89,10 @@ Where one hint had several old copies, a member SHALL be matched first to the ol
 - WHEN the spine is rebuilt
 - THEN the second member takes a key minted from its own handle
 
-#### Scenario: A pending create keeps its key
+#### Scenario: A pending create lands on its member
 - GIVEN a collection holding a pending create under an identity
-- WHEN a rebuilt member resolves to that identity
-- THEN the member takes a minted key, the create keeping the one a push is about to land
+- WHEN a rebuilt member states that identity and agrees with the create's summary
+- THEN the create lands on the member, one item, reported `Created`, and no second add is pushed (vectors/sync/205)
 
 #### Scenario: Two copies at one revision
 - tests/engine/sync_audit.rs `a_rekey_matches_copies_of_one_hint_by_their_body` (failed before the change, which matched no body: the rebuild carried one copy onto the other's handle and the store refused it)
@@ -155,7 +157,19 @@ A rebuild SHALL index the old copies by identity once (`PimdirRekey::copies`) ra
 - THEN the coroutine's and the write's times grow about as the collection does (tests/engine/rekey_scale.rs, ignored, run with `--release --ignored`)
 
 ### Requirement: A rekey reports the members it names
-A member no old placement resolves to by link id SHALL be named in the rekey's batch as a page names one and reported `PimdirSyncEvent::Added` on `PimdirRekeyReport::events` once the batch committed (pimdir SYNC §5, §8); a parked rekey reports none.
+A member no old placement resolves to by link id SHALL be named in the rekey's batch as a page names one and reported `PimdirSyncEvent::Added` on `PimdirRekeyReport::events` once the batch committed (pimdir SYNC §5, §8); a parked rekey reports none. A create the rekey lands is reported `Created`, a member minted apart from a pending create `Disagreed`, and each body its write kept apart (`PimdirWritten::overruled`) `Overruled`, as a sync reports them (vectors/sync/203, 205, 206).
+
+### Requirement: A repeated handle keeps its first entry
+A rekey listing a handle twice SHALL read only its first entry, its flags, link id, summary, sort key and revision alike, as a page does (pimdir SYNC §4). Mixing the two carried the first entry's flags under the last's identity and dropped the carried item `Deleted` (vectors/sync/210, R0).
+
+### Requirement: A delivered create is landed as a page lands it
+A delivered create a member resolves to SHALL be landed as a page lands it (pimdir SYNC §6, §8), through the one landing a sync uses (`PimdirSync::land`): a `Superseded` drop of its provisional handle, its staged flags kept, its base the listed flags with the staged body, and `Created` reported (vectors/sync/203, R5).
+
+### Requirement: A listed body is stored as a page stores it
+A body the listing carries, inline or persisted, SHALL be stored (`StoreObject`) in the rekey's batch: an arrival's becomes its body and its base's at `Full` (vectors/sync/211), a pull's as above (212), a conflict's as its diverging body (209), a landed create's as a page lands it (R8).
+
+### Requirement: A base-less binding is carried as it is
+A conflicted binding with no base under a handle the renumbering voids SHALL be carried onto the member resolving to it with its conflict and a base of the listed flags naming no revision and no body, which claims nothing reconciled; when no member resolves to it, it SHALL be re-staged as a pending create under its provisional handle, as a sync re-stages an edit whose member went (pimdir SYNC §5, §8; rule D1). No vector states that starting state (a binding has a base unless provisional): tests/engine/rekey_cases.rs pins both.
 
 #### Scenario: A message arriving during a renumbering
 - **GIVEN** a source renumbering `10` into `20` while a new message arrives as `21`

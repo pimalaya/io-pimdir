@@ -665,7 +665,8 @@ impl Model {
     /// revision first, then the one whose base holds the carried body, then
     /// in old handle order), its flags merged with the listed ones over the
     /// old base, the listed ones the base, a member of a mutable kind listed
-    /// at another revision pulled to `Meta` with its summary and sort key, or
+    /// at another revision pulled with its summary and sort key, the body the
+    /// page carries stored at `Full` (else `Meta`), or
     /// recorded in conflict over a local edit, and every binding no member
     /// resolves to dropped `Deleted`, the collection's generation bumped. A
     /// rekey missing more than half of at least 20, naming no member while
@@ -766,14 +767,23 @@ impl Model {
                     continue;
                 };
                 let filed = &remote.members[&member.handle].filed;
+                let moved = mutable
+                    && member.revision
+                        != self.items[*index]
+                            .bound(&source)
+                            .expect("a bound item")
+                            .base_revision;
+                let listed = (moved && member.carries).then(|| {
+                    let name = ObjectName::of(&member.meta);
+                    self.objects.insert(name.clone(), member.meta.clone());
+                    name
+                });
                 let item = &mut self.items[*index];
                 let edited = item.object.is_some()
                     && item.object != item.bound(&source).expect("a bound item").base_object;
-                let moved = mutable
-                    && member.revision != item.bound(&source).expect("a bound item").base_revision;
                 if moved && !edited {
-                    item.object = None;
-                    item.level = 1;
+                    item.object = listed.clone();
+                    item.level = if listed.is_some() { 2 } else { 1 };
                     item.summary = filed.summary.clone();
                     item.addresses = filed.addresses.clone();
                     item.sort_key = filed.sort_key.clone();
@@ -787,10 +797,13 @@ impl Model {
                     (true, true) => {
                         binding.conflicted = true;
                         binding.conflict_revision = member.revision.clone();
-                        binding.conflict_object = None;
+                        binding.conflict_object = listed;
                     }
                     (true, false) => {
-                        binding.base_object = None;
+                        if listed.is_some() {
+                            binding.shared_object = listed.clone();
+                        }
+                        binding.base_object = listed;
                         binding.base_revision = member.revision.clone();
                     }
                     _ => {}
