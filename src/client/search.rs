@@ -120,6 +120,7 @@ const PAGE_HITS_MAX: u64 = 40_000;
 /// The most bodies or summaries a page off the hit columns reads a plain
 /// term's matches into bitmaps for, rather than probing each hit: past
 /// it the read costs more than the page's probes.
+#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 const PROBE_SET_MAX: usize = 1024;
 
 /// The values a dated page's statement binds beyond the query's: `:limit`
@@ -334,6 +335,7 @@ pub struct PimdirIndex {
     /// Whether index.db holds the posting lists of this crate's own
     /// (`sql::search::POSTING`), which a `subject:` or `from:` word reads
     /// in place of `object_text`'s column.
+    #[cfg_attr(not(feature = "indexer"), allow(dead_code))]
     posting: bool,
     /// Whether this connection declared `temp.term_match` and
     /// `temp.term_source`, which the first compiled statement naming one
@@ -1317,7 +1319,7 @@ impl PimdirIndex {
                     let Some(at) = fresh.iter().position(|fresh| *fresh == key) else {
                         continue;
                     };
-                    let (seqs, span) = mem::take(&mut held[at]);
+                    let (seqs, span) = core::mem::take(&mut held[at]);
                     let thread = key.1;
                     let members = match &quick {
                         #[cfg(feature = "indexer")]
