@@ -15,4 +15,4 @@ Each drop: the io-pimdir commit, what consumers feel, the archive under ~/code/p
 ## Drop 3, the release candidate
 
 - Consumers feel: version 0.20.0 (untagged, unpublished: the owner's tag publishes it), so the patch requirement can read `version = "0.20.0"` once released; rust-version 1.89 builds again (drop 2 needed a later compiler); a `search` build without `indexer` reads the hit columns (himalaya N6) and its `PimdirIndex` is no longer `Send`, as with `indexer`; `accounts_of` skips the coverage join (himalaya N7). No store, index or sync rule moves.
-- Commit: pending the lead. Archive: $L/drops/3 once committed. Pushed hash: pending.
+- Commit and pushed hash (signed): 17d4ea8008996bc94d014c1ff925a5e609b89722, version 0.20.0 untagged, with pimdir 087410f pinning it. Archive: $L/drops/3.
