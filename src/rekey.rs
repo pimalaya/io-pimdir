@@ -221,8 +221,8 @@ impl PimdirRekey {
                 _ => None,
             };
 
-            match carried {
-                Some(old) if old.delivered() => {
+            match (carried, pending) {
+                (Some(old), _) if old.delivered() => {
                     trace!("a delivered create lands on its member");
                     carried_over.insert(old.handle.clone());
                     superseded.insert(old.handle.clone());
@@ -233,7 +233,7 @@ impl PimdirRekey {
                         .events
                         .push(PimdirSyncEvent::Created(item.handle.clone()));
                 }
-                None if let Some(at) = pending => {
+                (None, Some(at)) => {
                     let create = staged.remove(at);
                     if let Some(key) = &key {
                         claimed.remove(key);
@@ -266,7 +266,7 @@ impl PimdirRekey {
                             .push(PimdirSyncEvent::Conflicted(item.handle.clone()));
                     }
                 }
-                Some(old) => {
+                (Some(old), _) => {
                     if old.handle == item.handle {
                         in_place.insert(old.handle.clone());
                     }
@@ -275,7 +275,7 @@ impl PimdirRekey {
                     writes.push(PimdirWriteOp::UpsertPlacement(carried));
                     self.report.rekeyed += 1;
                 }
-                None => {
+                (None, None) => {
                     let apart = hint.and_then(|hint| {
                         staged.iter().find(|create| {
                             create.handle != item.handle

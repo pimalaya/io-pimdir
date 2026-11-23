@@ -12,21 +12,24 @@
 //! then renamed over it, so a reader maps one whole file or none. The
 //! file is never truncated in place, so a map stays that of its file.
 
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    string::String,
-    vec,
-    vec::Vec,
-};
+#[cfg(feature = "indexer")]
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::{string::String, vec, vec::Vec};
+#[cfg(feature = "indexer")]
 use std::{
     collections::HashMap,
-    fs::{self, File},
     io::{Read, Write},
+};
+use std::{
+    fs::{self, File},
     path::Path,
 };
 
+#[cfg(feature = "indexer")]
 use log::debug;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
+#[cfg(feature = "indexer")]
+use rusqlite::OptionalExtension;
 
 use crate::{
     client::{PimdirError, PreparedCached},
@@ -51,9 +54,11 @@ const EXACT_DATES: u64 = 1;
 const UNIFORM_DATES: u64 = 2;
 
 /// The most account and kind names a cache holds, each a bit of a mask.
+#[cfg(feature = "indexer")]
 pub(crate) const NAMES_MAX: usize = 64;
 
 /// The most words the per-hit sort keys may take.
+#[cfg(feature = "indexer")]
 const HIT_KEYS_MAX: u64 = 1 << 28;
 
 /// A hit's sort key when one of its placements is of an undated kind.
@@ -63,6 +68,7 @@ pub(crate) const UNDATED: i64 = -1;
 pub(crate) const NO_HIT: i64 = i64::MIN;
 
 /// The media types holding no date (SEARCH §8.2).
+#[cfg(feature = "indexer")]
 const UNDATED_KINDS: [&str; 2] = ["text/vcard", "application/octet-stream"];
 
 /// What identifies the index state a cache was derived from.
@@ -235,6 +241,7 @@ pub(crate) struct Record {
     pub(crate) kind: usize,
 }
 
+#[cfg(feature = "indexer")]
 fn pack(seq: u64, account: u64, marks: u64, kind: u64) -> u64 {
     (seq & 0xffff_ffff) | (account & 0xffff) << 32 | (marks & 0xff) << 48 | (kind & 0xff) << 56
 }
@@ -268,6 +275,7 @@ fn names(words: &[u64], at: &mut usize, count: usize) -> Option<Vec<String>> {
     Some(names)
 }
 
+#[cfg(feature = "indexer")]
 fn put_names(out: &mut Vec<u64>, names: &[String]) {
     for name in names {
         out.push(name.len() as u64);
@@ -471,6 +479,7 @@ impl PimdirHitColumns {
 }
 
 /// Whether the cache of `dir` is stamped `stamp`, read from its header.
+#[cfg(feature = "indexer")]
 pub(crate) fn holds(dir: &Path, stamp: Stamp) -> bool {
     let Ok(mut file) = File::open(dir.join(FILE)) else {
         return false;
@@ -491,11 +500,13 @@ pub(crate) fn holds(dir: &Path, stamp: Stamp) -> bool {
 
 /// The most placement keys a refresh follows for [`write`] to patch the
 /// cache it found rather than read the index whole.
+#[cfg(feature = "indexer")]
 const TOUCHED_MAX: usize = 1 << 15;
 
 /// What a refresh fed and wrote of the placements, so the cache it found
 /// stamped as the index stood before it is patched where they changed.
 #[derive(Default)]
+#[cfg(feature = "indexer")]
 pub(crate) struct Touched {
     /// The key of every placement fed or written.
     keys: BTreeSet<(String, i64)>,
@@ -506,6 +517,7 @@ pub(crate) struct Touched {
     over: bool,
 }
 
+#[cfg(feature = "indexer")]
 impl Touched {
     /// Notes the placement `(collection, seq)` fed or written.
     pub(crate) fn key(&mut self, collection: &str, seq: i64) {
@@ -531,6 +543,7 @@ impl Touched {
 }
 
 /// A cache's contents, before they are written.
+#[cfg(feature = "indexer")]
 struct Built {
     accounts: Vec<String>,
     kinds: Vec<String>,
@@ -551,6 +564,7 @@ struct Built {
 /// fed and wrote since, the cache found is patched where they moved;
 /// otherwise, or when the patch cannot tell, it is read from the index
 /// `conn` holds with the store attached, whole.
+#[cfg(feature = "indexer")]
 pub(crate) fn write(
     conn: &Connection,
     dir: &Path,
@@ -733,6 +747,7 @@ pub(crate) fn write(
 }
 
 /// Writes `built` stamped `stamp` beside `path`, then renames it over.
+#[cfg(feature = "indexer")]
 fn emit(path: &Path, stamp: Stamp, built: &Built) -> Result<(), PimdirError> {
     let mut head: Vec<u64> = vec![0; HEADER];
     head[0] = MAGIC;
@@ -797,6 +812,7 @@ fn emit(path: &Path, stamp: Stamp, built: &Built) -> Result<(), PimdirError> {
 /// `None` when the patch cannot tell (a collection's account or kind
 /// moved, an id range shrank past a live entry, a bound a cache holds
 /// passed), for the whole index to be read.
+#[cfg(feature = "indexer")]
 fn patch(
     conn: &Connection,
     old: &PimdirHitColumns,

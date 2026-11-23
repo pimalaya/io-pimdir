@@ -25,7 +25,6 @@
 //! [`refresh`](PimdirIndex::refresh) whenever the store moves.
 
 mod compile;
-#[cfg(feature = "indexer")]
 mod hits;
 #[cfg(feature = "indexer")]
 mod refresh;
@@ -49,14 +48,13 @@ use alloc::{
 
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(feature = "indexer")]
 use std::{
     fs::{self, File},
     io,
-    path::PathBuf,
     time::Instant,
 };
 
@@ -120,7 +118,6 @@ const PAGE_HITS_MAX: u64 = 40_000;
 /// The most bodies or summaries a page off the hit columns reads a plain
 /// term's matches into bitmaps for, rather than probing each hit: past
 /// it the read costs more than the page's probes.
-#[cfg_attr(not(feature = "indexer"), allow(dead_code))]
 const PROBE_SET_MAX: usize = 1024;
 
 /// The values a dated page's statement binds beyond the query's: `:limit`
@@ -159,7 +156,6 @@ enum Sourced {
     Read,
     /// Read from bitmaps of the object ids and the placement ids whose
     /// body and summary the term matches.
-    #[cfg_attr(not(feature = "indexer"), allow(dead_code))]
     Sets {
         bodies: Vec<u64>,
         summaries: Vec<u64>,
@@ -326,7 +322,6 @@ const SNIPPET_LEN: usize = 200;
 pub struct PimdirIndex {
     conn: Connection,
     reader: PimdirReader,
-    #[cfg(feature = "indexer")]
     dir: PathBuf,
     /// Opened by [`open_query`](PimdirIndex::open_query): index.db read
     /// only, never refreshed.
@@ -335,7 +330,6 @@ pub struct PimdirIndex {
     /// Whether index.db holds the posting lists of this crate's own
     /// (`sql::search::POSTING`), which a `subject:` or `from:` word reads
     /// in place of `object_text`'s column.
-    #[cfg_attr(not(feature = "indexer"), allow(dead_code))]
     posting: bool,
     /// Whether this connection declared `temp.term_match` and
     /// `temp.term_source`, which the first compiled statement naming one
@@ -348,7 +342,6 @@ pub struct PimdirIndex {
     force: Cell<Option<PimdirPlanForce>>,
     /// The hit columns last mapped (hits.rs), kept while their stamp is
     /// the index's.
-    #[cfg(feature = "indexer")]
     columns: RefCell<Option<hits::PimdirHitColumns>>,
 }
 
@@ -793,7 +786,6 @@ impl PimdirIndex {
         Ok(Self {
             conn,
             reader,
-            #[cfg(feature = "indexer")]
             dir: dir.to_path_buf(),
             #[cfg(feature = "indexer")]
             query_only: false,
@@ -801,7 +793,6 @@ impl PimdirIndex {
             terms: Cell::new(false),
             coverages: RefCell::default(),
             force: Cell::new(None),
-            #[cfg(feature = "indexer")]
             columns: RefCell::new(None),
         })
     }
@@ -859,7 +850,6 @@ impl PimdirIndex {
         Ok(Self {
             conn,
             reader,
-            #[cfg(feature = "indexer")]
             dir: dir.to_path_buf(),
             #[cfg(feature = "indexer")]
             query_only: true,
@@ -867,7 +857,6 @@ impl PimdirIndex {
             terms: Cell::new(false),
             coverages: RefCell::default(),
             force: Cell::new(None),
-            #[cfg(feature = "indexer")]
             columns: RefCell::new(None),
         })
     }
@@ -1162,7 +1151,6 @@ impl PimdirIndex {
     ) -> Result<PimdirSearchOutput, PimdirError> {
         let now = options.clock.now();
         let zone = options.clock.time_zone()?;
-        #[cfg_attr(not(feature = "indexer"), allow(unused_variables))]
         let (compiled, page, more, quick) = match self.quick_page(query, now, &zone, options)? {
             Some((compiled, mut page)) => {
                 let more = page.len() > options.limit;
@@ -1189,9 +1177,7 @@ impl PimdirIndex {
             false => None,
         };
 
-        #[cfg_attr(not(feature = "indexer"), allow(unused_mut))]
         let mut probes = self.presented(&compiled, page.len())?;
-        #[cfg(feature = "indexer")]
         if quick && !page.iter().all(|hit| hit.body) {
             self.probe_sets(&mut probes)?;
         }
@@ -1257,7 +1243,6 @@ impl PimdirIndex {
         let mut cursor = options.after.clone();
         'batches: loop {
             let quickly: Option<Vec<Found>> = match &quick {
-                #[cfg(feature = "indexer")]
                 Some((hits, names, proven)) => self.columnar_batch(
                     &compiled,
                     hits,
@@ -1322,7 +1307,6 @@ impl PimdirIndex {
                     let (seqs, span) = core::mem::take(&mut held[at]);
                     let thread = key.1;
                     let members = match &quick {
-                        #[cfg(feature = "indexer")]
                         Some((hits, names, proven)) => self
                             .columnar_members(&compiled, hits, names, proven, &seqs, &hit, sort)?,
                         _ => self.members(&compiled, &seqs, hit.account.as_deref(), sort)?,
@@ -1356,9 +1340,7 @@ impl PimdirIndex {
         };
 
         let shown = groups.iter().map(|(_, found, _)| found.len()).sum();
-        #[cfg_attr(not(feature = "indexer"), allow(unused_mut))]
         let mut probes = self.presented(&compiled, shown)?;
-        #[cfg(feature = "indexer")]
         if quick.is_some()
             && !groups
                 .iter()
@@ -1548,7 +1530,6 @@ impl PimdirIndex {
     /// when every term is one the scope implies.
     fn counted(&self, query: &PimdirQuery, now: i64, zone: &TimeZone) -> Result<u64, PimdirError> {
         let mut compiled = self.compile(query, now, zone)?;
-        #[cfg(feature = "indexer")]
         if let Some((hits, _, _)) = self.columnar(&compiled)? {
             return Ok(hits_counted(&hits));
         }
@@ -1692,7 +1673,6 @@ impl PimdirIndex {
         zone: &TimeZone,
         options: &PimdirSearchOptions,
     ) -> Result<Option<(Compiled, Vec<Found>)>, PimdirError> {
-        #[cfg(feature = "indexer")]
         if options.after.is_none() && options.sort.is_dated() && self.force.get().is_none() {
             let compiled = self.compile(query, now, zone)?;
             let need = options.limit.saturating_add(1);
@@ -1715,7 +1695,6 @@ impl PimdirIndex {
         zone: &TimeZone,
         options: &PimdirSearchOptions,
     ) -> Result<Option<(Compiled, (Hits, Vec<String>, Hits))>, PimdirError> {
-        #[cfg(feature = "indexer")]
         if options.after.is_none() && options.sort.is_dated() && self.force.get().is_none() {
             let compiled = self.compile(query, now, zone)?;
             if let Some(hits) = self.columnar(&compiled)? {
@@ -1825,7 +1804,6 @@ impl PimdirIndex {
         }
 
         let need = limit.saturating_add(1);
-        #[cfg(feature = "indexer")]
         if let Some(mut found) = self.columnar_page(compiled, after, sort, need)? {
             let more = found.len() > limit;
             found.truncate(limit);
@@ -2971,13 +2949,6 @@ impl PimdirIndex {
             }
         }
         Ok(Some(trim(first, 0)))
-    }
-
-    /// No hit columns answer whether the store holds a calendar without
-    /// the indexer.
-    #[cfg(not(feature = "indexer"))]
-    fn columnar_calendars(&self) -> Result<Option<bool>, PimdirError> {
-        Ok(None)
     }
 
     /// What an answer to a query could not see (SEARCH §8.2), over the

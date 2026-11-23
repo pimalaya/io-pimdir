@@ -24,4 +24,4 @@ change: the-query-split-by-domain
 
 ## Release
 
-- [ ] CHANGELOG, 0.20.0, consumers' feature lines listed for Cardamum, Calendula, Himalaya and the Android app.
+- [x] CHANGELOG, 0.20.0, consumers' feature lines listed for Cardamum, Calendula, Himalaya and the Android app (2026-11-23, by cairn/changes/what-the-consumers-need task 5.2).

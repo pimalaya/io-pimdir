@@ -76,6 +76,10 @@ SELECT o.hash, o.refcount, coalesce(c.n, 0) FROM objects o
 LEFT JOIN counted c ON c.id = o.id
 WHERE o.refcount != coalesce(c.n, 0) ORDER BY o.hash;"#;
 
+/// Every account and kind collections are held under, once each, for a
+/// reader resolving accounts with no coverage to read (§9.2).
+ACCOUNTS_AND_KINDS = r#"SELECT DISTINCT account, kind FROM collections;"#;
+
 /// How many minted keys (§9) each collection holds; `GLOB` since `LIKE`
 /// is case-insensitive over ASCII.
 MINTED_KEYS = r#"SELECT collection, count(*) FROM items

@@ -1,6 +1,6 @@
 # io-pimdir against notmuch
 
-The standing bench of cairn/changes/as-fast-as-notmuch: io-pimdir imports, indexes and queries the Enron corpus beside notmuch, on the same Maildirs, on one core. It started as pimdir's cairn/changes/compared-with-notmuch/bench, whose proposal.md (Part 2) holds the first numbers and the reasoning behind this protocol.
+The standing bench of cairn/changes/archive/as-fast-as-notmuch: io-pimdir imports, indexes and queries the Enron corpus beside notmuch, on the same Maildirs, on one core. It started as pimdir's cairn/changes/compared-with-notmuch/bench, whose proposal.md (Part 2) holds the first numbers and the reasoning behind this protocol.
 
 This directory is a crate of its own (an empty `[workspace]`, `publish = false`), built apart from io-pimdir and never packaged with it. The corpus is never vendored: scripts/fetch.sh downloads it.
 
@@ -126,7 +126,7 @@ The archive is the CMU release of 2015-05-07, https://www.cs.cmu.edu/~enron/enro
 
 ## The gates
 
-From cairn/changes/as-fast-as-notmuch/proposal.md, on the 517k and 1M tiers, warm cache, one core:
+From cairn/changes/archive/as-fast-as-notmuch/proposal.md, on the 517k and 1M tiers, warm cache, one core:
 
 - every query of the table (count, page of 50, threaded page of 50) no slower than notmuch's: the `worst pd / nm` column of summary.sh at or below 1.0;
 - no query whose cost grows with the store while its answer does not (a rare word, a one-collection scope, an address): compare `kiwi`, `folder:dasovich-j/inbox` and the address between x1 and x2;

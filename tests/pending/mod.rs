@@ -1,6 +1,7 @@
 //! The vector cases expected to fail until a later phase of
-//! cairn/changes/the-crate-follows-storage-draft-08 lands (its decision 3):
-//! tests/pending_vectors.txt names each, with the phase fixing it.
+//! cairn/changes/archive/the-crate-follows-storage-draft-08 lands (its
+//! decision 3): tests/pending_vectors.txt names each, with the phase fixing
+//! it.
 //!
 //! A runner checks every case of its suite, a failure staying the case's
 //! own, then settles the outcomes against the list: a listed case failing

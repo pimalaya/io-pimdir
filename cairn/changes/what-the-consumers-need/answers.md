@@ -10,6 +10,9 @@ Written at planning (2026-11-23, about 15:50) from the four files that existed t
 - HM2 `pending_actions` lists a row it cannot decode: accepted, as CD1 (task 2.11, D12).
 - HM3 R4, R1 and K4 fixed: accepted, drop 2 (tasks 2.1, 2.2, 2.10). R4 and R1 are pimdir vectors 201 and 202. K4's check is an io-pimdir test (tests/drain_copy.rs, tests/drain_agrees.rs), because the vectors have no drain verb.
 - HM4 The release with `client`, `search`, `mail`, `indexer` and `vendored` as at 7f16b27: accepted (tasks §5, §6). No feature changes; AN1 only adds `sql::search` under `indexer`.
+- HM6 (N6) The hit columns read under `search` without `indexer`: accepted, drop 3. A search-only build's `PimdirIndex` holds the mapped columns too, so it is no longer `Send`, as builds with `indexer` already were (CHANGELOG BREAKING).
+- HM7 (N7) `accounts_of` without the coverage join: accepted, drop 3 (`sql::ACCOUNTS_AND_KINDS`).
+- HM8 (N8) A text term tokenized without allocating: deferred to a 0.20.x, optional, no gate (himalaya D2).
 - HM5 A `mid:` term driven by `summary.uid` rather than a scan: deferred to a 0.20.x. It is a query-path speed-up with a workaround (`envelope search mid:`), and no 0.20.0 fix touches the query path (D7).
 
 ## neverest

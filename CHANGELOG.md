@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-23
+
+The store follows pimdir's storage-draft-17, the index search-draft-17 and the sync sync-draft-15. Drafts are exact: a store an earlier draft wrote is refused, never migrated, so a user starts over, moving the store directory aside and syncing anew (`neverest` re-creates it); an index of an earlier draft is rebuilt by the indexer. Every CLI sharing a store moves to this release together.
+
+The features split by domain (cairn/changes/archive/the-query-split-by-domain): `client` the store, `search` the index's read side over it, `mail`, `contact` and `calendar` each domain's extraction, `indexer` the refresh over the three without `client`, `vendored` SQLite bundled. As the consumers take them: neverest `search` and `indexer`, the one CLI building and refreshing the index; himalaya `mail`, with `client` and `search` for its pimdir backend; cardamum `contact`, with `client`, `search` and `contact` for its pimdir backend; calendula `client`, `search` and `calendar`; the `pimdir` binary (`cli`) `search` and `indexer`; the Android app `indexer` alone. A client refreshing an index in its tests only takes `indexer` as a dev-dependency.
+
 ### Added
 
 - Added `PimdirSourceStore::settled_collections`: the collections where a run of the source that lists nothing new derives nothing, with the coverage each checkpoint serves, so a caller whose source states no change may leave them unsynced (`pimbench sync` does under `PIMBENCH_SKIP=1`: the 517k no-op from 75 to 21.5 ms).
@@ -35,6 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Changed a query client built with `search` and no `indexer` to read the hit columns (index.hits) the indexer writes, as one built with both does: counts, dated pages and threads skip the index.db path the cache exists to spare (himalaya N6: `pimdir count california` at 517k from 80 to 14 ms in its own build, measured by its lane). Writing the cache stays under `indexer`.
+- Changed `PimdirReader::accounts_of` to read the accounts and kinds alone (`sql::ACCOUNTS_AND_KINDS`, added), no coverage join: the answer is unchanged, about 4 ms less at 3,313 collections on every command resolving an account (himalaya N7).
 - Changed a load naming no link to read no hub: a sync of a collection owing nothing runs seven statements fewer (the 517k no-op from 95 to 75 ms with every folder synced). The answer of every load is unchanged.
 - **BREAKING**: Changed the store schema to pimdir's storage-draft-17 (pimdir f295ed7) and the index to search-draft-17 (`sql::FORMAT_VERSION`, `sql::search::FORMAT_VERSION`): a store of storage-draft-16 or earlier is refused as an earlier engine's, moved aside and synced anew; an index of search-draft-16 or earlier is rebuilt by the indexer and refused by a query client until then. In the store, the flags but the five system flags are the columns `items.keywords` and `bindings.base_keywords` in place of the tables `placement_flag` and `binding_base_flag`; `mail_summary`, `contact_summary`, `event_summary`, `task_summary`, `journal_summary` and `file_summary` are one `summary` table keyed by `items.id`, its `component` naming the kind; `item_address`, `mail_in_reply_to` and `task_category` are one `summary_value(item, role, position, value, name)` table; `queue.collection` is `ON DELETE RESTRICT` in place of the `collections_keep_queued` trigger. In the index, the `chunk` and `thread` tables are gone: a snippet cuts its chunks from the body, and `message.thread` names a thread whose span is read from the store. A consumer reading these tables in its own SQL follows them; the public types and the reader statements' names and answered columns do not move (the readers alias `title AS subject`, `uid AS message_id`, `card_kind AS kind`).
 - **BREAKING**: Changed the statements, the index schema and the test generator to be this crate's own: pimdir binds none of them since pimdir 692af79. They stay under spec/queries/, spec/migrations/search/ and spec/generator/, edited here, and `io_pimdir::sql` keeps exposing every statement by name; only spec/migrations/storage/, spec/vectors/ and spec/payloads/ are pimdir's, byte for byte at spec/REVISION.
@@ -89,6 +97,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **BREAKING**: Removed the per-kind summary and list statements, merged into the statements Added names: `sql::UPSERT_MAIL_SUMMARY`, `UPSERT_CONTACT_SUMMARY`, `UPSERT_EVENT_SUMMARY`, `UPSERT_TASK_SUMMARY`, `UPSERT_JOURNAL_SUMMARY`, `UPSERT_FILE_SUMMARY` (to `UPSERT_SUMMARY`); `DELETE_EVENT_SUMMARY`, `DELETE_TASK_SUMMARY`, `DELETE_JOURNAL_SUMMARY` (to `DELETE_SUMMARY`); `LOAD_MAIL_SUMMARIES`, `LOAD_CONTACT_SUMMARIES`, `LOAD_EVENT_SUMMARIES`, `LOAD_TASK_SUMMARIES`, `LOAD_JOURNAL_SUMMARIES`, `LOAD_FILE_SUMMARIES` (to `LOAD_SUMMARIES`) and their six `_BY_LINK` twins (to `LOAD_SUMMARIES_BY_LINK`); `REPLACE_ADDRESSES`, `REPLACE_IN_REPLY_TO`, `REPLACE_CATEGORIES` (to `REPLACE_VALUES`); `INSERT_ADDRESS`, `INSERT_IN_REPLY_TO`, `INSERT_CATEGORY` (to `INSERT_VALUE`); `LOAD_ADDRESSES_BY_COLLECTION` (to `LOAD_VALUES_BY_COLLECTION`); `LOAD_ADDRESSES_BY_LINK`, `LOAD_IN_REPLY_TO_BY_LINK`, `LOAD_CATEGORIES_BY_LINK` (to `LOAD_VALUES_BY_LINK`); `LOAD_ADDRESSES`, `LOAD_IN_REPLY_TO`, `LOAD_CATEGORIES` (to `LOAD_VALUES`).
 - **BREAKING**: Removed `sql::DELIVER_BINDING`, `LINK_SENDERS_OF_BY_LINK`, `LIST_GARBAGE_OBJECTS` and `SET_STORE_VERSION`, which nothing ran.
 - **BREAKING**: Removed `sql::search::CHUNKS_OF`, `INSERT_CHUNK`, `UPSERT_THREAD`, `DELETE_THREAD` and `SET_EXTRACTION`, with the index's `chunk` and `thread` tables; an index whose extraction revisions differ is rebuilt, never restated in place.
+- **BREAKING**: Removed `sql::search::HIT_THREAD`, a page's threads read by `HIT_THREADS` and `THREADS_HELD`.
+- **BREAKING**: Removed the `Send` implementation of `PimdirIndex`, which holds the hit columns it maps (index.hits): an index is used on the thread that opened it. A build with `search` and no `indexer` maps them since this release (himalaya N6), so it loses `Send` too.
 
 ### Fixed
 
@@ -1431,6 +1441,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
 [unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..HEAD
+[0.20.0]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..v0.20.0
 [0.19.1]: https://github.com/pimalaya/io-pimdir/compare/v0.19.0..v0.19.1
 [0.19.0]: https://github.com/pimalaya/io-pimdir/compare/v0.18.1..v0.19.0
 [0.18.1]: https://github.com/pimalaya/io-pimdir/compare/v0.18.0..v0.18.1

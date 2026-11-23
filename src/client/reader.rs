@@ -647,13 +647,17 @@ impl PimdirReader {
     /// The accounts holding collections of the media type `kind`, or of
     /// any kind for `None`, sorted and deduplicated, `None` within for the
     /// ungrouped (§9.2). An undeclared collection, of the empty kind,
-    /// belongs to no media type.
+    /// belongs to no media type. Reads the accounts and kinds alone
+    /// ([`ACCOUNTS_AND_KINDS`](sql::ACCOUNTS_AND_KINDS)), no coverage.
     pub fn accounts_of(&self, kind: Option<&str>) -> Result<Vec<Option<String>>, PimdirError> {
-        let mut accounts: Vec<Option<String>> = self
-            .list_collections()?
+        let held: Vec<(Option<String>, String)> =
+            rows(&self.conn, sql::ACCOUNTS_AND_KINDS, [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        let mut accounts: Vec<Option<String>> = held
             .into_iter()
-            .filter(|held| kind.is_none_or(|kind| collection::media_type(&held.kind) == kind))
-            .map(|held| held.account)
+            .filter(|(_, held)| kind.is_none_or(|kind| collection::media_type(held) == kind))
+            .map(|(account, _)| account)
             .collect();
 
         accounts.sort();

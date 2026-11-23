@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: the-query-split-by-domain
-status: draft
+status: landed
 created: 2026-11-21
 ---
 

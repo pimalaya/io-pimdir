@@ -44,7 +44,7 @@ The case loop, for 2.1 to 2.9:
 - [x] 2.11 CD1 (D12): the ignored G1 twin in tests/generated/reader.rs is the check (fails before). `pending_actions` (src/client/producer.rs:717, reader.rs:1237) lists an undecodable row as an opaque action naming its error, with the signature kept. Gate: G1 leaves the known list. If the signature must break, defer CD1 and say so in answers.md.
 - [x] 2.12 AN3: `pub const DERIVATION` outside `client`, which src/client/schema.rs:26 re-uses. CHANGELOG Added.
 - [x] 2.13 Pins passing before and after: R2a (211), R7 matched (213) and unmatched (214). SYNC §8 states D1.
-- [ ] 2.14 Close the drop:
+- [x] 2.14 Close the drop:
   - final oracle, 131f9bf against the tree, 100,000 scenarios, `--expect` every case: 0 unexpected;
   - neverest's lane head (or .pimdir-night/neverest if it does not build) as a git archive, path-patched to I, suite at drop 1 then at the tree, no servers and no live: no new failure;
   - delta.md folded into cairn/spec; CHANGELOG Fixed, BREAKING where rekey outcomes move;
@@ -54,23 +54,23 @@ The case loop, for 2.1 to 2.9:
 
 ## 3. Housekeeping
 
-- [ ] 3.1 Move the 71 folders of inventory §4 to cairn/changes/archive/, setting the-crate-follows-draft-15 `landed`, and re-point references outside cairn/log. Gate: no `cairn/changes/<id>` left outside cairn/log and archive/.
+- [x] 3.1 Move the 71 folders of inventory §4 to cairn/changes/archive/, setting the-crate-follows-draft-15 `landed`, and re-point references outside cairn/log. Gate: no `cairn/changes/<id>` left outside cairn/log and archive/.
 
 ## 4. Performance
 
-- [ ] 4.1 Under `flock -s ~/code/pimalaya/.lanes/locks/store-517k`, copy .pimdir-night/sync-perf store/ and state/ to $L/perf (`cp -a`) and corpus/ (`cp -al`). Point prep-incr.sh at it.
-- [ ] 4.2 Build pimbench (I/bench) and the CLI at 7f16b27 twice (for the A/A) and at the RC, three copies each on ext4.
-- [ ] 4.3 Under `flock ~/code/pimalaya/.lanes/locks/measure`, `taskset -c 15`, hyperfine interleaved, after an A/A within 1%: the no-op sync (every folder, then `PIMBENCH_SKIP=1`), 300 new (prep-incr.sh), scripts/queries.sh at 517k, and `cargo test --release --test engine rekey_scale -- --ignored --nocapture`. Gate: no median more than 3% slower after one re-run. The table goes in report.md.
+- [x] 4.1 Under `flock -s ~/code/pimalaya/.lanes/locks/store-517k`, copy .pimdir-night/sync-perf store/ and state/ to $L/perf (`cp -a`) and corpus/ (`cp -al`). Point prep-incr.sh at it.
+- [x] 4.2 Build pimbench (I/bench) and the CLI at 7f16b27 twice (for the A/A) and at the RC, three copies each on ext4.
+- [x] 4.3 Under `flock ~/code/pimalaya/.lanes/locks/measure`, `taskset -c 15`, hyperfine interleaved, after an A/A within 1%: the no-op sync (every folder, then `PIMBENCH_SKIP=1`), 300 new (prep-incr.sh), scripts/queries.sh at 517k, and `cargo test --release --test engine rekey_scale -- --ignored --nocapture`. Gate: no median more than 3% slower after one re-run. The table goes in report.md.
 
 ## 5. Drop 3: the release candidate
 
-- [ ] 5.1 C3. Gate: answers.md complete.
-- [ ] 5.2 CHANGELOG: Unreleased becomes `## [0.20.0] - <date>`, with an empty Unreleased above. Add the consumers' feature lines (the-query-split-by-domain proposal.md:34-39) and the start-over note (frame §2). Set that change landed and archived.
-- [ ] 5.3 Only with the owner's yes to 0.20.0, asked when the lane is launched (never bump a version unasked): Cargo.toml `version = "0.20.0"`, Cargo.lock updated. Gate: `cargo metadata` reads 0.20.0. Without the yes, drop 3 keeps 0.19.1 and journal.md says so.
-- [ ] 5.4 MSRV: `cargo check --all-features --all-targets` with fenix 1.89 (a scratch shell.nix). Gate: builds; if not, the first version that builds goes to the owner.
-- [ ] 5.5 `cargo deny check`, `cargo package` (verify), and `cargo package --list` against inventory §5. Gate: both pass.
-- [ ] 5.6 `nix-shell -p cargo-semver-checks --run 'cargo semver-checks --baseline-version 0.19.1 --all-features'`. Gate: every break has its BREAKING line.
-- [ ] 5.7 The CI matrix, then drop 3 as 1.4, then report.md (frame §8 L).
+- [x] 5.1 C3. Gate: answers.md complete.
+- [x] 5.2 CHANGELOG: Unreleased becomes `## [0.20.0] - <date>`, with an empty Unreleased above. Add the consumers' feature lines (the-query-split-by-domain proposal.md:34-39) and the start-over note (frame §2). Set that change landed and archived.
+- [x] 5.3 Only with the owner's yes to 0.20.0, asked when the lane is launched (never bump a version unasked): Cargo.toml `version = "0.20.0"`, Cargo.lock updated. Gate: `cargo metadata` reads 0.20.0. Without the yes, drop 3 keeps 0.19.1 and journal.md says so.
+- [x] 5.4 MSRV: `cargo check --all-features --all-targets` with fenix 1.89 (a scratch shell.nix). Gate: builds; if not, the first version that builds goes to the owner.
+- [x] 5.5 `cargo deny check`, `cargo package` (verify), and `cargo package --list` against inventory §5. Gate: both pass.
+- [x] 5.6 `nix-shell -p cargo-semver-checks --run 'cargo semver-checks --baseline-version 0.19.1 --all-features'`. Gate: every break has its BREAKING line.
+- [x] 5.7 The CI matrix, then drop 3 as 1.4, then report.md (frame §8 L).
 
 ## 6. The owner's, listed
 
