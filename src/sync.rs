@@ -135,6 +135,38 @@ pub enum PimdirConflictPolicy {
     KeepLocal,
 }
 
+impl PimdirConflictPolicy {
+    /// What the policy makes of a content divergence (SYNC §5), whether
+    /// the run may push content and whether the member's body was read.
+    ///
+    /// No policy pushes over a body nobody has read: `PreferLocal` and
+    /// `KeepLocal` record the divergence as `Manual` does when the body
+    /// is unread or content pushes are forbidden.
+    pub(crate) fn verdict(self, pushes_content: bool, body_read: bool) -> PimdirVerdict {
+        match self {
+            Self::Manual => PimdirVerdict::Record,
+            Self::PreferRemote => PimdirVerdict::Adopt,
+            Self::PreferLocal | Self::KeepLocal if pushes_content && body_read => {
+                PimdirVerdict::Keep
+            }
+            Self::PreferLocal | Self::KeepLocal => PimdirVerdict::Record,
+        }
+    }
+}
+
+/// What a source's policy makes of a content divergence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PimdirVerdict {
+    /// The divergence is recorded on the binding, for a person or an
+    /// upgrade to settle.
+    Record,
+    /// The member's body is kept as a retained item and the local body
+    /// pushed over it.
+    Keep,
+    /// The member's body is adopted as the body and the base.
+    Adopt,
+}
+
 /// Tuning for one sync run: the push direction, the listing and its scope.
 ///
 /// A local delete the source's rights forbid follows no option (SYNC §5):
@@ -2120,20 +2152,17 @@ impl PimdirSync {
     /// as `Manual` records it, for the upgrade to fetch and settle.
     fn resolve_conflict(&mut self, local: &PimdirPlacement, item: &Remote) -> ContentOutcome {
         let pushes = self.opts.push && self.opts.rights.content;
-        match self.opts.conflict {
-            PimdirConflictPolicy::Manual => self.mark_conflict(local, item),
-            PimdirConflictPolicy::PreferRemote => {
-                ContentOutcome::Rewritten(self.pull_content(local, item))
-            }
-            PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal if !pushes => {
-                self.mark_conflict(local, item)
-            }
-            PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal => {
-                match self.carried_body(&item.handle) {
-                    Some(observed) => self.keep_observed(local, item, observed),
-                    None => self.mark_conflict(local, item),
-                }
-            }
+        let read = self
+            .metas
+            .get(&item.handle)
+            .is_some_and(|meta| meta.body.is_some());
+        match self.opts.conflict.verdict(pushes, read) {
+            PimdirVerdict::Record => self.mark_conflict(local, item),
+            PimdirVerdict::Adopt => ContentOutcome::Rewritten(self.pull_content(local, item)),
+            PimdirVerdict::Keep => match self.carried_body(&item.handle) {
+                Some(observed) => self.keep_observed(local, item, observed),
+                None => self.mark_conflict(local, item),
+            },
         }
     }
 
@@ -2155,11 +2184,7 @@ impl PimdirSync {
             item.revision,
         );
 
-        let mut diverged = local.clone();
-        diverged.status = PimdirStatus::Conflict;
-        diverged.conflict_revision = item.revision.clone();
-        diverged.conflict_object = Some(observed.clone());
-        self.upsert(diverged);
+        self.upsert(local.diverged(item.revision.clone(), Some(observed.clone())));
         self.writes.push(PimdirWriteOp::Overrule {
             collection: self.collection.clone(),
             handle: local.handle.clone(),
@@ -2190,10 +2215,8 @@ impl PimdirSync {
     /// fetching nothing itself: a conflict holding no conflict object is
     /// the request, and the upgrade pass is what answers it.
     fn mark_conflict(&mut self, local: &PimdirPlacement, item: &Remote) -> ContentOutcome {
-        let mut conflicted = local.clone();
-        conflicted.status = PimdirStatus::Conflict;
-        conflicted.conflict_revision = item.revision.clone();
-        conflicted.conflict_object = self.carried_body(&item.handle);
+        let body = self.carried_body(&item.handle);
+        let conflicted = local.diverged(item.revision.clone(), body);
         self.upsert(conflicted.clone());
         self.report.conflicts += 1;
         self.emit(PimdirSyncEvent::Conflicted(local.handle.clone()));

@@ -38,7 +38,7 @@ use crate::{
     },
     remote::{PimdirFetchedItem, PimdirTier},
     summary::{self, PimdirSummary},
-    sync::{PimdirConflictPolicy, PimdirSyncEvent, PimdirSyncOptions},
+    sync::{PimdirConflictPolicy, PimdirSyncEvent, PimdirSyncOptions, PimdirVerdict},
 };
 
 /// What an upgrade did.
@@ -484,23 +484,14 @@ impl PimdirUpgrade {
             .as_ref()
             .map(|base| base.flags.clone())
             .unwrap_or_else(|| patched.flags.clone());
-        let mut diverged = patched.clone();
-        diverged.status = PimdirStatus::Conflict;
-        diverged.conflict_revision = revision.clone();
-        diverged.conflict_object = Some(fetched.clone());
+        let diverged = patched.diverged(revision.clone(), Some(fetched.clone()));
 
-        let policy = match (self.opts.conflict, self.opts.push_content) {
-            (PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal, false) => {
-                PimdirConflictPolicy::Manual
-            }
-            (policy, _) => policy,
-        };
-        match policy {
-            PimdirConflictPolicy::Manual => {
+        match self.opts.conflict.verdict(self.opts.push_content, true) {
+            PimdirVerdict::Record => {
                 self.ops.push(PimdirWriteOp::UpsertPlacement(diverged));
                 return;
             }
-            PimdirConflictPolicy::PreferLocal | PimdirConflictPolicy::KeepLocal => {
+            PimdirVerdict::Keep => {
                 debug!("keep the body {} pushes over", patched.handle.as_str());
                 self.ops.push(PimdirWriteOp::UpsertPlacement(diverged));
                 self.ops.push(PimdirWriteOp::Overrule {
@@ -508,7 +499,7 @@ impl PimdirUpgrade {
                     handle: patched.handle.clone(),
                 });
             }
-            PimdirConflictPolicy::PreferRemote => {
+            PimdirVerdict::Adopt => {
                 debug!("adopt the body {} fetched", patched.handle.as_str());
                 // NOTE: the binding's conflict clears first, so the write
                 // reads the pull as one dropping a local edit, which it

@@ -466,6 +466,17 @@ impl PimdirPlacement {
             .is_some_and(|base| base.revision.is_some())
     }
 
+    /// The placement holding the local side of a divergence (SYNC §5): a
+    /// `Conflict` at the remote's `revision`, its diverging `body` the one
+    /// read, if any.
+    pub(crate) fn diverged(&self, revision: Option<String>, body: Option<PimdirHash>) -> Self {
+        let mut diverged = self.clone();
+        diverged.status = PimdirStatus::Conflict;
+        diverged.conflict_revision = revision;
+        diverged.conflict_object = body;
+        diverged
+    }
+
     /// The placement re-staged as a pending create (SYNC §5): `Created`,
     /// with no base, no origin and no divergence. The handle is the
     /// caller's to choose.
