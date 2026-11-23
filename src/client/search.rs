@@ -64,12 +64,12 @@ use std::{
 use fs4::FileExt;
 use jiff::tz::TimeZone;
 use log::{debug, trace};
-#[cfg(feature = "indexer")]
-use rusqlite::TransactionBehavior;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, named_params,
     types::{Value, ValueRef},
 };
+#[cfg(feature = "indexer")]
+use rusqlite::{Transaction, TransactionBehavior};
 
 pub use crate::search::plan::{PimdirSearchCursor, PimdirSearchSort};
 use crate::{
@@ -463,10 +463,10 @@ struct PimdirCoverageCache {
 #[cfg(feature = "indexer")]
 #[derive(Clone, Debug)]
 pub struct PimdirIndexRefreshOptions {
-    /// The most feed rows one transaction folds, so the store's WAL still
-    /// checkpoints between them (SEARCH §4). 4,096 by default: each commit
-    /// rewrites a page of every random-key index per row it touched, so a
-    /// first build at 256 wrote 3.7 times the bytes, at 28 MB more memory.
+    /// The most feed rows one run folds, the memory of the run, runs
+    /// sharing a transaction up to 16,384 rows so the store's WAL still
+    /// checkpoints between them (SEARCH §4). 4,096 by default: a first
+    /// build at 256 wrote 3.7 times the bytes, at 28 MB more memory.
     pub batch: usize,
     /// When to stop: checked between batches, so the pass ends at the
     /// first batch boundary past it with the cursor at that boundary.
@@ -891,14 +891,17 @@ impl PimdirIndex {
         Ok(zone.unwrap_or_else(|| coverage::FLOATING_ZONE.into()))
     }
 
-    /// Folds the store's change feed into the index (SEARCH §4), in
-    /// transactions of at most `options.batch` rows, until the feed is
-    /// exhausted or the deadline passes.
+    /// Folds the store's change feed into the index (SEARCH §4), in runs
+    /// of at most `options.batch` rows, until the feed is exhausted or the
+    /// deadline passes, the runs sharing a transaction until it folded
+    /// 16,384 rows. A build, a pass over a whole feed from an empty index,
+    /// holds its full-text merges back and merges once at its end, each
+    /// table into one segment.
     ///
-    /// Each transaction is one run of [`PimdirIndexRefresh`], its yields
-    /// answered and its ops written through the canonical statements, so
-    /// this index and one an owner keeps on its own SQLite fold alike. Each
-    /// writes the cursor it reached, so a pass cut short resumes there; the
+    /// Each run is one [`PimdirIndexRefresh`], its yields answered and its
+    /// ops written through the canonical statements, so this index and one
+    /// an owner keeps on its own SQLite fold alike. Each run writes the
+    /// cursor it reached, so a pass cut short resumes there; the
     /// one exhausting the feed also reconciles keys when the store's purge
     /// count moved, a rename counting there, meets again the bodies an earlier
     /// pass could not read, and writes the cursor read before it, so a
@@ -952,18 +955,17 @@ impl PimdirIndex {
         let batch = options.batch.max(1);
         let blobs = self.reader.blobs();
         let now = options.now.unwrap_or_else(unix_now);
-        let mut first = true;
         let start = hits::Stamp::of(&self.conn, &self.dir)?;
         let touched = hits::holds(&self.dir, start).then(|| RefCell::new(hits::Touched::default()));
-        loop {
-            if options
+        let building = self.building(report.cursor, report.head, batch)?;
+        let past = || {
+            options
                 .deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                debug!("refresh deadline passed at stamp {}", report.cursor);
-                break;
-            }
-
+        };
+        let mut first = true;
+        let mut exhausted = false;
+        while !exhausted && !past() {
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -973,30 +975,43 @@ impl PimdirIndex {
                 blobs: &blobs,
                 touched: touched.as_ref(),
             };
-            let mut run = PimdirIndexRefresh::new(now, batch);
-            run.floating_zone.clone_from(&options.floating_zone);
-            run.missing = mem::take(&mut first);
-            let mut arg = None;
-            let output = loop {
-                match run.resume(arg.take()) {
-                    PimdirCoroutineState::Yielded(want) => arg = Some(statements.answer(want)?),
-                    PimdirCoroutineState::Complete(output) => {
-                        break output.map_err(PimdirError::Refresh)?;
+            let mut held = 0;
+            loop {
+                let mut run = PimdirIndexRefresh::new(now, batch);
+                run.floating_zone.clone_from(&options.floating_zone);
+                run.missing = mem::take(&mut first);
+                let mut arg = None;
+                let output = loop {
+                    match run.resume(arg.take()) {
+                        PimdirCoroutineState::Yielded(want) => {
+                            arg = Some(statements.answer(want)?);
+                        }
+                        PimdirCoroutineState::Complete(output) => {
+                            break output.map_err(PimdirError::Refresh)?;
+                        }
                     }
-                }
-            };
-            tx.commit().map_err(busy_or_sql)?;
+                };
 
-            report.folded += output.folded;
-            report.indexed += output.indexed;
-            report.expanded += output.expanded;
-            report.bounded += output.bounded;
-            report.removed += output.removed;
-            report.reconciled |= output.reconciled;
-            report.cursor = output.cursor;
-            if output.exhausted {
-                break;
+                report.folded += output.folded;
+                report.indexed += output.indexed;
+                report.expanded += output.expanded;
+                report.bounded += output.bounded;
+                report.removed += output.removed;
+                report.reconciled |= output.reconciled;
+                report.cursor = output.cursor;
+                exhausted = output.exhausted;
+                held += output.folded;
+                if exhausted || held >= TRANSACTION_ROWS || past() {
+                    break;
+                }
             }
+            tx.commit().map_err(busy_or_sql)?;
+        }
+        if exhausted && building {
+            exhausted = self.merge_built(past)?;
+        }
+        if !exhausted {
+            debug!("refresh deadline passed at stamp {}", report.cursor);
         }
 
         let current = self
@@ -1016,6 +1031,60 @@ impl PimdirIndex {
             report.folded, report.indexed, report.cursor
         );
         Ok(report)
+    }
+
+    /// Whether this pass builds the index: one starting from an empty
+    /// index over a feed longer than a batch, its full-text merges then
+    /// held back ([`MERGES_HELD`]), or one going on with a build a
+    /// deadline or a failure cut, its merges held still. The pass
+    /// exhausting the feed merges every full-text table into one segment
+    /// and settles the merges ([`MERGES_SETTLED`]).
+    #[cfg(feature = "indexer")]
+    fn building(&self, cursor: i64, head: i64, batch: usize) -> Result<bool, PimdirError> {
+        let automerge: Option<i64> = self
+            .conn
+            .query_row_cached(AUTOMERGE, [], |row| row.get(0))
+            .optional()?;
+        if automerge == Some(BUILD_AUTOMERGE) {
+            return Ok(true);
+        }
+        if cursor != 0 || head <= batch as i64 {
+            return Ok(false);
+        }
+
+        debug!("building the search index, its full-text merges held back");
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        tx.execute_batch(MERGES_HELD).map_err(busy_or_sql)?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(true)
+    }
+
+    /// Merges the full-text tables of an index whose build folded the
+    /// whole feed into one segment each, [`MERGE_STEP`] by [`MERGE_STEP`]
+    /// in transactions of their own so the WAL stays bounded, then settles
+    /// the merges. Answers false when the deadline cut it, the merges
+    /// still held for the next pass to go on.
+    #[cfg(feature = "indexer")]
+    fn merge_built(&self, past: impl Fn() -> bool) -> Result<bool, PimdirError> {
+        debug!("built the search index, merging its full-text segments");
+        loop {
+            if past() {
+                return Ok(false);
+            }
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+                .map_err(busy_or_sql)?;
+            let before = tx.total_changes();
+            tx.execute_batch(MERGE_STEP).map_err(busy_or_sql)?;
+            let merged = tx.total_changes() - before > MERGE_TABLES;
+            if !merged {
+                tx.execute_batch(MERGES_SETTLED).map_err(busy_or_sql)?;
+            }
+            tx.commit().map_err(busy_or_sql)?;
+            if !merged {
+                return Ok(true);
+            }
+        }
     }
 
     /// Runs the index's part of an erase (STORAGE §11.5, SEARCH §4), after
@@ -3131,6 +3200,63 @@ impl PimdirIndex {
 /// once per checkpoint, so fewer checkpoints write it fewer times (15% fewer
 /// bytes on a first build at the default batch, a WAL of up to 64 MB).
 const WAL_AUTOCHECKPOINT: i64 = 16384;
+
+/// The feed rows a refresh transaction folds before it commits, its runs
+/// of [`PimdirIndexRefreshOptions::batch`] rows sharing it until then: a
+/// commit writes a page of every random-key index per row it touched, so
+/// four runs of 4,096 a commit write fewer bytes on a first build, the
+/// memory still that of one run. Sixteen wrote a quarter less again, for
+/// a WAL twice as large (1.2 GB on a first build of 1M messages).
+#[cfg(feature = "indexer")]
+const TRANSACTION_ROWS: u64 = 16_384;
+
+/// `automerge` of `object_text`, `None` when never set:
+/// [`BUILD_AUTOMERGE`] while a build holds its merges back
+/// ([`PimdirIndex::building`]).
+#[cfg(feature = "indexer")]
+const AUTOMERGE: &str = "SELECT v FROM object_text_config WHERE k = 'automerge'";
+
+/// The `automerge` a build runs at ([`MERGES_HELD`]).
+#[cfg(feature = "indexer")]
+const BUILD_AUTOMERGE: i64 = 16;
+
+/// The full-text tables' merges held back while a build runs: incremental
+/// merges of 16 segments of a level rather than 4, so each body's terms
+/// are rewritten at half as many levels, the build merging everything
+/// once at its end; FTS5's crisis merge, which merges a whole level in
+/// one transaction, only past 64. Merges at 4 took a quarter of the CPU.
+#[cfg(feature = "indexer")]
+const MERGES_HELD: &str = "\
+    INSERT INTO object_text(object_text, rank) VALUES ('automerge', 16);
+    INSERT INTO object_text(object_text, rank) VALUES ('crisismerge', 64);
+    INSERT INTO summary_text(summary_text, rank) VALUES ('automerge', 16);
+    INSERT INTO summary_text(summary_text, rank) VALUES ('crisismerge', 64);
+    INSERT INTO pimdir_fields(pimdir_fields, rank) VALUES ('automerge', 16);
+    INSERT INTO pimdir_fields(pimdir_fields, rank) VALUES ('crisismerge', 64);";
+
+/// One step of the merge ending a build: up to 16,384 pages of each
+/// full-text table merged, every segment of the table taken as one level
+/// (a negative `merge`), so the steps end in one segment a table. A step
+/// with nothing left to merge changes one row a table, its command's.
+#[cfg(feature = "indexer")]
+const MERGE_STEP: &str = "\
+    INSERT INTO object_text(object_text, rank) VALUES ('merge', -16384);
+    INSERT INTO summary_text(summary_text, rank) VALUES ('merge', -16384);
+    INSERT INTO pimdir_fields(pimdir_fields, rank) VALUES ('merge', -16384);";
+
+/// The tables [`MERGE_STEP`] merges.
+#[cfg(feature = "indexer")]
+const MERGE_TABLES: u64 = 3;
+
+/// The full-text tables' merges once a build ends: FTS5's defaults.
+#[cfg(feature = "indexer")]
+const MERGES_SETTLED: &str = "\
+    INSERT INTO object_text(object_text, rank) VALUES ('automerge', 4);
+    INSERT INTO object_text(object_text, rank) VALUES ('crisismerge', 16);
+    INSERT INTO summary_text(summary_text, rank) VALUES ('automerge', 4);
+    INSERT INTO summary_text(summary_text, rank) VALUES ('crisismerge', 16);
+    INSERT INTO pimdir_fields(pimdir_fields, rank) VALUES ('automerge', 4);
+    INSERT INTO pimdir_fields(pimdir_fields, rank) VALUES ('crisismerge', 16);";
 
 /// Opens index.db as the main database, the store attached read-only as
 /// `store` through a URI (SEARCH §3): read-write and created when absent

@@ -1492,6 +1492,59 @@ fn a_batch_writes_its_text_as_one_segment() {
     assert_eq!(segments, 1);
 }
 
+/// A build holds its full-text merges back, through a pass its deadline
+/// cut, and merges each table into one segment once the feed is folded,
+/// the merges then settled to FTS5's defaults.
+#[test]
+fn a_build_merges_its_text_once_at_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..40 {
+        let body = message(&format!("{n}@x"), "Alpha", &format!("body {n}"));
+        file_message(dir.path(), "INBOX", body, &["\\Seen"]);
+    }
+    let config = |table: &str| -> Option<i64> {
+        let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+        conn.query_row(
+            &format!("SELECT v FROM {table}_config WHERE k = 'automerge'"),
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    let segments = |table: &str| -> i64 {
+        let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+        conn.query_row(
+            &format!("SELECT count(DISTINCT segid) FROM {table}_idx"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    let cut = PimdirIndexRefreshOptions {
+        batch: 4,
+        deadline: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    assert_eq!(index.refresh(&cut).unwrap().folded, 0);
+    assert_eq!(config("object_text"), Some(16), "merges held");
+
+    let report = index
+        .refresh(&PimdirIndexRefreshOptions {
+            batch: 4,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(report.is_current());
+    assert_eq!(report.indexed, 40);
+    assert_eq!(hits(&index, "body").len(), 40);
+    for table in ["object_text", "pimdir_fields"] {
+        assert_eq!(segments(table), 1, "{table}");
+        assert_eq!(config(table), Some(4), "{table}");
+    }
+}
+
 #[test]
 fn a_hit_whose_body_cannot_be_read_lists_without_a_snippet() {
     use std::os::unix::fs::PermissionsExt;
