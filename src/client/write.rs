@@ -107,7 +107,7 @@ impl PimdirSourceStore {
             }
             PimdirLoadSelection::Links(links) => {
                 let links: Vec<String> = links.iter().map(|l| l.0.clone()).collect();
-                read_hub(conn, &collection.0, Some(&links))?
+                read_linked_hub(conn, &collection.0, &links)?
             }
             PimdirLoadSelection::Handles(handles) => {
                 let mut links = Vec::new();
@@ -118,7 +118,7 @@ impl PimdirSourceStore {
                     let offered = || handle.as_str().strip_prefix('\u{1}').map(String::from);
                     links.extend(bound.or_else(offered));
                 }
-                read_hub(conn, &collection.0, Some(&links))?
+                read_linked_hub(conn, &collection.0, &links)?
             }
             PimdirLoadSelection::Owing(handles) => {
                 let key = named_params! { ":collection": collection.0, ":source": self.source.0 };
@@ -136,7 +136,7 @@ impl PimdirSourceStore {
                 }
                 links.sort();
                 links.dedup();
-                read_hub(conn, &collection.0, Some(&links))?
+                read_linked_hub(conn, &collection.0, &links)?
             }
         };
 
@@ -1109,6 +1109,19 @@ pub(crate) fn read_hub(
     }
 
     Ok(hub)
+}
+
+/// [`read_hub`] of the named link ids, for a load: naming none projects
+/// nothing, so nothing is read.
+fn read_linked_hub(
+    conn: &Connection,
+    collection: &str,
+    links: &[String],
+) -> Result<PimdirHub, PimdirError> {
+    match links.is_empty() {
+        true => Ok(PimdirHub::default()),
+        false => read_hub(conn, collection, Some(links)),
+    }
 }
 
 /// The declared kind of a collection, empty when undeclared (`load_kind`):
