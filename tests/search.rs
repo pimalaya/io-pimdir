@@ -1125,6 +1125,66 @@ fn a_hit_says_what_it_matched_and_carries_a_snippet() {
     );
 }
 
+/// What each hit matched is the same off the hit columns, where a hit a
+/// positive term matched a body of is `body` with no probe, as when every
+/// term is probed per hit, on a page and in threads, for hits matched in
+/// a body, in a summary, under a negation and by no text term.
+#[test]
+fn a_hit_matches_alike_off_the_hit_columns() {
+    let spec = spec_dir();
+    let dir = tempfile::tempdir().unwrap();
+    build(&spec, dir.path());
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+
+    type Matched = Vec<(Option<String>, i64, Option<PimdirSearchMatched>)>;
+    let answer = |query: &str| -> (Matched, Matched) {
+        let parsed = PimdirQuery::parse(query).unwrap();
+        let options = PimdirSearchOptions::default();
+        let mut paged: Matched = index
+            .search(&parsed, &options)
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|hit| (hit.account, hit.seq, hit.matched))
+            .collect();
+        let mut threaded: Matched = index
+            .threads(&parsed, &options)
+            .unwrap()
+            .threads
+            .into_iter()
+            .flat_map(|thread| thread.hits)
+            .map(|hit| (hit.account, hit.seq, hit.matched))
+            .collect();
+        paged.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        threaded.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        (paged, threaded)
+    };
+
+    let queries = [
+        "budget",
+        "final",
+        "budget or final",
+        "final not budget",
+        "not final",
+        "not not final",
+        "roadmap final",
+        "is:flagged",
+        "is:flagged or final",
+    ];
+    for query in queries {
+        let quick = answer(query);
+        let _unforced = Unforced(&index);
+        index.force_driver(Some(PimdirPlanForce::Walk));
+        let probed = answer(query);
+        index.force_driver(None);
+        assert_eq!(quick.0, probed.0, "{query:?}: a page's matched");
+        assert_eq!(quick.1, probed.1, "{query:?}: threads' matched");
+    }
+}
+
 #[test]
 fn every_chunk_vector_derives() {
     let spec = spec_dir();

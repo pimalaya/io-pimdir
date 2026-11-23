@@ -744,6 +744,9 @@ struct Found {
     seq: i64,
     /// Its place in the order asked.
     place: PimdirSearchCursor,
+    /// Whether a body of its matched a positive text term as the hit
+    /// columns read it, so its `matched` is `body` with no probe.
+    body: bool,
 }
 
 impl PimdirIndex {
@@ -1112,7 +1115,7 @@ impl PimdirIndex {
         #[cfg_attr(not(feature = "indexer"), allow(unused_mut))]
         let mut probes = self.presented(&compiled, page.len())?;
         #[cfg(feature = "indexer")]
-        if quick {
+        if quick && !page.iter().all(|hit| hit.body) {
             self.probe_sets(&mut probes)?;
         }
         let mut hits = Vec::new();
@@ -1178,10 +1181,11 @@ impl PimdirIndex {
         'batches: loop {
             let quickly: Option<Vec<Found>> = match &quick {
                 #[cfg(feature = "indexer")]
-                Some((hits, names)) => self.columnar_batch(
+                Some((hits, names, proven)) => self.columnar_batch(
                     &compiled,
                     hits,
                     names,
+                    proven,
                     cursor.as_ref(),
                     sort,
                     batch.saturating_add(1),
@@ -1242,9 +1246,8 @@ impl PimdirIndex {
                     let thread = key.1;
                     let members = match &quick {
                         #[cfg(feature = "indexer")]
-                        Some((hits, names)) => {
-                            self.columnar_members(&compiled, hits, names, &seqs, &hit, sort)?
-                        }
+                        Some((hits, names, proven)) => self
+                            .columnar_members(&compiled, hits, names, proven, &seqs, &hit, sort)?,
                         _ => self.members(&compiled, &seqs, hit.account.as_deref(), sort)?,
                     };
                     let earlier = options.after.as_ref().is_some_and(|after| {
@@ -1279,7 +1282,11 @@ impl PimdirIndex {
         #[cfg_attr(not(feature = "indexer"), allow(unused_mut))]
         let mut probes = self.presented(&compiled, shown)?;
         #[cfg(feature = "indexer")]
-        if quick.is_some() {
+        if quick.is_some()
+            && !groups
+                .iter()
+                .all(|(_, found, _)| found.iter().all(|hit| hit.body))
+        {
             self.probe_sets(&mut probes)?;
         }
         let mut threads = Vec::new();
@@ -1353,6 +1360,7 @@ impl PimdirIndex {
                 account: account.clone(),
                 seq,
                 place: PimdirSearchCursor::default(),
+                body: false,
             };
             return Ok(Some(PimdirSearchThread {
                 account,
@@ -1378,6 +1386,7 @@ impl PimdirIndex {
                 account: account.clone(),
                 seq,
                 place: PimdirSearchCursor::default(),
+                body: false,
             };
             let hit = self.hit(found, &[], &[])?;
             // NOTE: a member whose placements went since the last refresh
@@ -1463,7 +1472,7 @@ impl PimdirIndex {
     fn counted(&self, query: &PimdirQuery, now: i64, zone: &TimeZone) -> Result<u64, PimdirError> {
         let mut compiled = self.compile(query, now, zone)?;
         #[cfg(feature = "indexer")]
-        if let Some((hits, _)) = self.columnar(&compiled)? {
+        if let Some((hits, _, _)) = self.columnar(&compiled)? {
             return Ok(hits_counted(&hits));
         }
         let current = self
@@ -1626,7 +1635,7 @@ impl PimdirIndex {
         now: i64,
         zone: &TimeZone,
         options: &PimdirSearchOptions,
-    ) -> Result<Option<(Compiled, (Hits, Vec<String>))>, PimdirError> {
+    ) -> Result<Option<(Compiled, (Hits, Vec<String>, Hits))>, PimdirError> {
         #[cfg(feature = "indexer")]
         if options.after.is_none() && options.sort.is_dated() && self.force.get().is_none() {
             let compiled = self.compile(query, now, zone)?;
@@ -1891,6 +1900,7 @@ impl PimdirIndex {
                             account: (!place.account.is_empty()).then(|| place.account.clone()),
                             seq: place.seq,
                             place,
+                            body: false,
                         })
                         .collect();
                     return Ok(Some(found));
@@ -2543,9 +2553,14 @@ impl PimdirIndex {
         probes: &[(&Probe, Sourced)],
         words: &[String],
     ) -> Result<PimdirSearchHit, PimdirError> {
-        let Found { account, seq, .. } = found;
+        let Found {
+            account, seq, body, ..
+        } = found;
         let (kind, title, placements) = self.placements(account.as_deref(), seq)?;
-        let matched = self.matched(seq, &placements, probes)?;
+        let matched = match body {
+            true => Some(PimdirSearchMatched::Body),
+            false => self.matched(seq, &placements, probes)?,
+        };
         let snippet = self.snippet(&kind, &placements, words)?;
 
         Ok(PimdirSearchHit {
@@ -2879,6 +2894,13 @@ impl PimdirIndex {
         Ok(Some(trim(first, 0)))
     }
 
+    /// No hit columns answer whether the store holds a calendar without
+    /// the indexer.
+    #[cfg(not(feature = "indexer"))]
+    fn columnar_calendars(&self) -> Result<Option<bool>, PimdirError> {
+        Ok(None)
+    }
+
     /// What an answer to a query could not see (SEARCH §8.2), over the
     /// query's collections, those its conjuncts leave
     /// ([`PimdirQuery::conjuncts`]), and the date range they narrow to:
@@ -3013,12 +3035,13 @@ impl PimdirIndex {
         };
         let calendar = match &held {
             Some(held) => held.iter().any(|(_, _, kind)| kind == "text/calendar"),
-            None => {
-                scope.dated
-                    && self
-                        .conn
-                        .query_row_cached(search::HOLDS_CALENDARS, [], |r| r.get::<_, bool>(0))?
-            }
+            None if !scope.dated => false,
+            None => match self.columnar_calendars()? {
+                Some(held) => held,
+                None => self
+                    .conn
+                    .query_row_cached(search::HOLDS_CALENDARS, [], |r| r.get::<_, bool>(0))?,
+            },
         };
 
         let since = scope.since.as_deref();
@@ -3518,6 +3541,7 @@ fn found(row: &Row, sort: PimdirSearchSort) -> rusqlite::Result<Found> {
         account: (!akey.is_empty()).then_some(akey),
         seq: place.seq,
         place,
+        body: false,
     })
 }
 
@@ -3605,6 +3629,7 @@ mod tests {
                         seq,
                         account: String::new(),
                     },
+                    body: false,
                 }
             })
             .collect();

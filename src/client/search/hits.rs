@@ -691,14 +691,17 @@ enum Column<'a> {
 
 impl super::PimdirIndex {
     /// The hits of `compiled` read off the hit columns, with each
-    /// account's name by its number: `None` when the index does not hold
-    /// the store as it stands, no cache holds its state, or a term or the
-    /// scope is one the columns cannot answer (a collection scope, a term
-    /// other than system flags, text and dates over mail alone).
+    /// account's name by its number and the hits a positive text term
+    /// was read off one of their bodies for ([`Run::proven`]): `None` when
+    /// the index does not hold the store as it stands, no cache holds its
+    /// state, or a term or the scope is one the columns cannot answer (a
+    /// collection scope, a term other than system flags, text and dates
+    /// over mail alone).
+    #[allow(clippy::type_complexity)]
     pub(super) fn columnar(
         &self,
         compiled: &super::Compiled,
-    ) -> Result<Option<(super::Hits, Vec<String>)>, PimdirError> {
+    ) -> Result<Option<(super::Hits, Vec<String>, super::Hits)>, PimdirError> {
         let plan = &compiled.plan;
         if self.force.get().is_some() || plan.scope.collections.is_some() {
             return Ok(None);
@@ -794,9 +797,50 @@ impl super::PimdirIndex {
             every: None,
             scanned: vec![None; read.len()],
             joint: split == 0,
+            negations: 0,
+            proven: Vec::new(),
         };
         let hits = run.eval(&plan.root)?;
-        Ok(Some((hits, columns.accounts.clone())))
+        Ok(Some((hits, columns.accounts.clone(), run.proven)))
+    }
+
+    /// Marks each of `found` whose hit `proven` holds as matched in a
+    /// body ([`Found::body`](super::Found)), `names` numbering the
+    /// accounts as the columns do.
+    fn prove(&self, found: &mut [super::Found], names: &[String], proven: &super::Hits) {
+        for hit in found {
+            let name = hit.account.as_deref().unwrap_or("");
+            hit.body = names
+                .iter()
+                .position(|known| known == name)
+                .zip(usize::try_from(hit.seq).ok())
+                .and_then(|(account, seq)| proven.get(account)?.get(seq / 64))
+                .is_some_and(|word| word >> (hit.seq % 64) & 1 == 1);
+        }
+    }
+
+    /// Whether the store holds a calendar collection, read off the hit
+    /// columns last mapped: their kinds are every collection's, read
+    /// after the index folded the store change their stamp holds, so while
+    /// the index holds the store as it stands and that stamp is the
+    /// index's, no collection was made, retyped or removed since. `None`
+    /// when no columns are mapped or they no longer answer.
+    pub(super) fn columnar_calendars(&self) -> Result<Option<bool>, PimdirError> {
+        let held = self.columns.borrow();
+        let Some(columns) = held.as_ref() else {
+            return Ok(None);
+        };
+        let current = self
+            .conn
+            .query_row_cached(crate::sql::search::INDEX_CURRENT, [], |row| {
+                row.get::<_, bool>(0)
+            })?;
+        if !current || !columns.is(Stamp::of(&self.conn, &self.dir)?) {
+            return Ok(None);
+        }
+        Ok(Some(
+            columns.kinds.iter().any(|kind| kind == "text/calendar"),
+        ))
     }
 
     /// The first `need` hits after `after` of a dated `sort` read off the
@@ -811,10 +855,10 @@ impl super::PimdirIndex {
         if !sort.is_dated() || need == 0 {
             return Ok(None);
         }
-        let Some((hits, names)) = self.columnar(compiled)? else {
+        let Some((hits, names, proven)) = self.columnar(compiled)? else {
             return Ok(None);
         };
-        self.columnar_batch(compiled, &hits, &names, after, sort, need)
+        self.columnar_batch(compiled, &hits, &names, &proven, after, sort, need)
     }
 
     /// The first `need` of `hits` after `after` in a dated `sort`: the
@@ -823,11 +867,14 @@ impl super::PimdirIndex {
     /// joined to the store, sorted and cut by one statement; the undated
     /// join them when fewer dated hits remain. `None` after an undated
     /// cursor, or past [`PAGE_HITS_MAX`](super::PAGE_HITS_MAX) of them.
+    /// Each is marked matched in a body when `proven` holds it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn columnar_batch(
         &self,
         compiled: &super::Compiled,
         hits: &super::Hits,
         names: &[String],
+        proven: &super::Hits,
         after: Option<&super::PimdirSearchCursor>,
         sort: super::PimdirSearchSort,
         need: usize,
@@ -917,20 +964,25 @@ impl super::PimdirIndex {
         );
         let mut extra = super::page_params(after, need);
         extra.push((String::from(":page"), rusqlite::types::Value::from(page)));
-        Ok(Some(self.run(&sql, &compiled.values, &extra, |row| {
+        let mut found = self.run(&sql, &compiled.values, &extra, |row| {
             super::found(row, sort)
-        })?))
+        })?;
+        self.prove(&mut found, names, proven);
+        Ok(Some(found))
     }
 
     /// The members of a thread, its `seqs`, among `hits` in the account of
     /// `hit`, the hit that met it, in `sort` order, as
     /// [`members`](super::PimdirIndex::members) reads them: `hit` itself
-    /// when it is the only one, no statement run for it.
+    /// when it is the only one, no statement run for it. Each is marked
+    /// matched in a body when `proven` holds it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn columnar_members(
         &self,
         compiled: &super::Compiled,
         hits: &super::Hits,
         names: &[String],
+        proven: &super::Hits,
         seqs: &alloc::collections::BTreeSet<i64>,
         hit: &super::Found,
         sort: super::PimdirSearchSort,
@@ -973,6 +1025,7 @@ impl super::PimdirIndex {
         let mut found = self.run(&sql, &compiled.values, &extra, |row| {
             super::found(row, sort)
         })?;
+        self.prove(&mut found, names, proven);
         found.sort_by(|left, right| left.place.compare(&right.place, sort));
         Ok(found)
     }
@@ -998,6 +1051,12 @@ struct Run<'a> {
     /// Whether no hit holds several documents (`split` empty), so an `and`
     /// of text terms matches as one FTS5 expression.
     joint: bool,
+    /// How many negations the node evaluated stands under.
+    negations: usize,
+    /// The hits a body of theirs matched a text term standing under no
+    /// negation for, a positive term the page probes, so their `matched`
+    /// is `body` with no probe; empty until one is read.
+    proven: super::Hits,
 }
 
 impl Run<'_> {
@@ -1060,8 +1119,13 @@ impl Run<'_> {
     }
 
     /// The hits of the bodies and summaries FTS5 expressions match, the
-    /// summaries' only when `summary` is.
-    fn text(&self, body: Option<&str>, summary: Option<&str>) -> Result<super::Hits, PimdirError> {
+    /// summaries' only when `summary` is; those of the bodies
+    /// [`proven`](Self::proven) under no negation.
+    fn text(
+        &mut self,
+        body: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<super::Hits, PimdirError> {
         let mut hits = self.empty();
         let columns = self.columns;
         if let Some(expression) = body {
@@ -1080,6 +1144,12 @@ impl Run<'_> {
                         hits[record.account][record.seq / 64] |= 1 << (record.seq % 64);
                     }
                 });
+            }
+            if self.negations == 0 {
+                match self.proven.is_empty() {
+                    true => self.proven = hits.clone(),
+                    false => super::unite(&mut self.proven, &hits),
+                }
             }
         }
         if let Some(expression) = summary {
@@ -1120,7 +1190,8 @@ impl Run<'_> {
     }
 
     fn leaf(&mut self, at: usize) -> Result<super::Hits, PimdirError> {
-        match &self.read[at] {
+        let read = self.read;
+        match &read[at] {
             Column::Every => Ok(self.every()),
             Column::Mark(_) | Column::Date(..) => {
                 self.scan();
@@ -1191,6 +1262,15 @@ impl Run<'_> {
         true
     }
 
+    /// Whether `node` is a text term filtered to one column (`{from} :`),
+    /// which a joint `AND` steps through more slowly than a bare word,
+    /// decoding each body's positions to find the column: FTS5 steps its
+    /// first operand and seeks the others, so such a term goes last.
+    fn column_filtered(&self, node: &PimdirPlanNode) -> bool {
+        matches!(node, PimdirPlanNode::Leaf(at)
+            if matches!(self.read[*at], Column::Text(expression, _) if expression.starts_with('{')))
+    }
+
     fn is_text(&self, node: &PimdirPlanNode) -> bool {
         match node {
             PimdirPlanNode::Leaf(at) => matches!(self.read[*at], Column::Text(..)),
@@ -1199,6 +1279,14 @@ impl Run<'_> {
             }
             _ => false,
         }
+    }
+
+    /// The hits of `node`, standing under one more negation.
+    fn negated(&mut self, node: &PimdirPlanNode) -> Result<super::Hits, PimdirError> {
+        self.negations += 1;
+        let hits = self.eval(node);
+        self.negations -= 1;
+        hits
     }
 
     /// The hits of `node`, as [`flagged`](super::flagged) combines them:
@@ -1210,7 +1298,7 @@ impl Run<'_> {
             PimdirPlanNode::Leaf(at) => self.leaf(*at),
             PimdirPlanNode::Not(operand) => {
                 let mut hits = self.every();
-                super::subtract(&mut hits, &self.eval(operand)?);
+                super::subtract(&mut hits, &self.negated(operand)?);
                 Ok(hits)
             }
             PimdirPlanNode::Or(operands) => {
@@ -1232,6 +1320,8 @@ impl Run<'_> {
                     .iter()
                     .any(|operand| matches!(operand, PimdirPlanNode::Leaf(_)));
                 if self.joint && text.len() >= 2 && positive {
+                    let mut text = text;
+                    text.sort_by_key(|operand| self.column_filtered(operand));
                     let node = PimdirPlanNode::And(text);
                     let body = self.compiled.jointly(&node, false);
                     let summary = self.compiled.jointly(&node, true);
@@ -1269,7 +1359,7 @@ impl Run<'_> {
                     if self.scans(operand) && self.filters(&mut hits, operand) {
                         continue;
                     }
-                    super::subtract(&mut hits, &self.eval(negated)?);
+                    super::subtract(&mut hits, &self.negated(negated)?);
                 }
                 Ok(hits)
             }
