@@ -23,11 +23,11 @@ use std::{
 use io_pimdir::{
     change::PimdirChange,
     client::{
-        PimdirStore,
+        PimdirSourceStore, PimdirStore,
         blobs::PimdirBodyFlush,
         search::{PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchOptions},
     },
-    collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor},
+    collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     hash,
     placement::{PimdirFlags, PimdirHandle},
     remote::{
@@ -420,6 +420,22 @@ fn writeback(file: &fs::File) {
     }
 }
 
+/// The folders `PIMBENCH_SKIP=1` leaves unsynced when their times did not
+/// move since their last sync: those the store calls settled under the
+/// unbounded scope `sync` asks. None without it.
+fn settled_folders(store: &PimdirSourceStore) -> BTreeSet<String> {
+    if env::var("PIMBENCH_SKIP").as_deref() != Ok("1") {
+        return BTreeSet::new();
+    }
+    store
+        .settled_collections()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, coverage)| coverage.scope == PimdirScope::default())
+        .map(|(collection, _)| collection.0)
+        .collect()
+}
+
 fn cmd_sync(args: &[String]) {
     let store_dir = PathBuf::from(&args[0]);
     let root = PathBuf::from(&args[1]);
@@ -440,8 +456,13 @@ fn cmd_sync(args: &[String]) {
         seen: BTreeMap::new(),
     };
     let phase = Phase::start();
-    let (mut pulled, mut unreadable) = (0, 0);
+    let (mut pulled, mut unreadable, mut skipped) = (0, 0, 0);
+    let settled = settled_folders(&store);
     for folder in &folders {
+        if settled.contains(folder) && remote.mtimes.get(folder) == Some(&remote.stat(folder).0) {
+            skipped += 1;
+            continue;
+        }
         store.ensure_collection(folder, "message/rfc822").unwrap();
         let report = store
             .sync(
@@ -457,7 +478,7 @@ fn cmd_sync(args: &[String]) {
     }
     remote.save_mtimes().unwrap();
     println!(
-        "sync folders={} pulled={pulled} unreadable={unreadable} read_mib={:.1} secs={:.2} peak_rss_mib={:.0}",
+        "sync folders={} skipped={skipped} pulled={pulled} unreadable={unreadable} read_mib={:.1} secs={:.2} peak_rss_mib={:.0}",
         folders.len(),
         remote.read_bytes as f64 / 1048576.0,
         phase.wall_secs(),

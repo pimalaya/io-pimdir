@@ -225,6 +225,25 @@ A connector whose source's state did not move hands back the checkpoint it was g
 - GIVEN the same source and a delta answering a flag change and `c0`
 - THEN the write upserts the placement and carries no `SetCheckpoint` (src/sync.rs `a_delta_pulling_under_the_same_checkpoint_writes_the_pull_alone`)
 
+### Requirement: A settled collection may be left unsynced
+`PimdirSourceStore::settled_collections` SHALL answer, for its source, the collections where a run that lists nothing new derives nothing, each with the coverage its checkpoint serves: the source holds a checkpoint and a coverage there and no round is open, no binding of it owes a push or holds a refusal, no live item lacks it, and no supersession names an item there (spec/queries/storage/owner/settled_collections.sql). It SHALL refuse a store another engine version wrote, as a load does. Such a run pushes nothing, writes nothing and reports nothing when its caller also knows three things: its source states no change since that checkpoint, it asks the coverage's scope, and it asks no full listing. A caller holding all three MAY leave the collection unsynced; one missing any syncs it as before. A load naming no link reads no hub, so a run that does sync a settled collection costs two read transactions and no write.
+
+On the 517k Enron bench (3,313 Maildir folders), the no-op sync went from 95 ms to 75 ms with every folder synced, and to 21.5 ms with the settled ones skipped (`PIMBENCH_SKIP=1`), against `notmuch new`'s 50 ms on the same store and core. The read takes 2 ms on the 1M store (6,622 collections).
+
+#### Scenario: A clean collection is settled
+- GIVEN a source that synced two collections fully
+- WHEN the read runs, then each is synced against an empty delta under its checkpoint and coverage
+- THEN both are listed with their coverage, and each run yields one enumerate, no write, no fetch, no push and a default report (tests/settled_collections.rs `a_settled_collection_derives_nothing_from_an_empty_delta`)
+
+#### Scenario: Anything owed leaves a collection out
+- GIVEN the same, then one of: a flag edit or an add staged, a push refused, a second source's item this source lacks, a round left open, a round closing with no checkpoint, a supersession naming an item there
+- THEN that collection is not listed and the other still is (tests/settled_collections.rs)
+
+#### Scenario: The differential oracle
+- GIVEN every end state of 20,000 generated multi-source scenarios
+- WHEN each collection the read lists is synced against an empty delta
+- THEN none yields a push, a write or an event (.pimdir-night/sync-diff `--features settled`, the night of 2026-11-23)
+
 ### Requirement: Every change carries an idempotency key
 A `PimdirChange` SHALL be a `PimdirChangeKind` (what the remote is asked to do, the four verbs that were the change itself) plus the `PimdirChangeKey` naming it. The key SHALL be derived as pimdir SYNC §4 fixes it, so two engines over one store key one change alike and every vector's key reproduces: FNV-1a 64 bits over fields each followed by one `0x00` byte, rendered as sixteen lowercase hexadecimal digits; the fields being the collection id, the handle, the kind as `add`, `remove`, `set-flags` or `update`, then the kind's own, an optional value as the field `1` followed by the value or the field `0` alone, and a flag set as the field `unknown` or the field `known`, the count in decimal ASCII, then each flag in code point order. `add` folds the link id, the flags, the origin as `1`, its collection and its handle or `0` alone, then the object hash; `remove` the destination; `set-flags` its `add` set then its `remove` set, each a known flag set; `update` the object hash. The same derived change SHALL key the same on every run, and changes differing in any of those SHALL key differently.
 

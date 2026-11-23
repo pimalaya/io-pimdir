@@ -141,6 +141,7 @@
 {"name": "storage/owner/retry_action", "parameters": ["id"], "slots": [], "columns": ["id"]},
 {"name": "storage/owner/revive_item", "parameters": ["collection", "link_id"], "slots": [], "columns": []},
 {"name": "storage/owner/seq_for_link_any", "parameters": ["collection", "link_id", "subject", "date", "sender"], "slots": [], "columns": ["seq"]},
+{"name": "storage/owner/settled_collections", "parameters": ["source"], "slots": [], "columns": ["collection", "covered_since", "covered_until", "covered_at"]},
 {"name": "storage/owner/set_capability", "parameters": ["account", "source", "collection", "capability", "support", "detail"], "slots": [], "columns": []},
 {"name": "storage/owner/set_collection_account", "parameters": ["account", "collection"], "slots": [], "columns": []},
 {"name": "storage/owner/set_collection_kind", "parameters": ["collection", "account", "kind"], "slots": [], "columns": []},

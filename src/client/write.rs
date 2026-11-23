@@ -81,6 +81,44 @@ impl PimdirSourceStore {
         Ok(loaded)
     }
 
+    /// The collections where a run of this source that lists nothing new
+    /// derives nothing, each with the coverage its checkpoint serves
+    /// (`settled_collections`), in collection order.
+    ///
+    /// Such a run pushes nothing, writes nothing and reports nothing when
+    /// three things hold besides, which are the caller's to know: its
+    /// source states no change since the checkpoint the store holds, it
+    /// asks the coverage's scope (a narrower one writes the coverage, a
+    /// wider one lists a round), and it asks no full listing. A caller
+    /// holding all three may leave the collection unsynced; anything else
+    /// is synced as before. A store another engine version wrote is
+    /// refused as [`PimdirError::SyncVersion`], as a load is.
+    pub fn settled_collections(
+        &self,
+    ) -> Result<Vec<(PimdirCollectionId, PimdirCoverage)>, PimdirError> {
+        let tx = self.store.reader.conn.unchecked_transaction()?;
+        schema::sync_version(&tx)?;
+        let settled = rows(
+            &tx,
+            sql::SETTLED_COLLECTIONS,
+            named_params! { ":source": self.source.0 },
+            |r| {
+                Ok((
+                    PimdirCollectionId(r.get(0)?),
+                    PimdirCoverage {
+                        scope: PimdirScope {
+                            since: r.get(1)?,
+                            until: r.get(2)?,
+                        },
+                        at: r.get(3)?,
+                    },
+                ))
+            },
+        )?;
+        tx.commit()?;
+        Ok(settled)
+    }
+
     /// [`load`](Self::load) inside the caller's read transaction.
     fn load_in(
         &self,
