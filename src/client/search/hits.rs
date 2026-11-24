@@ -15,11 +15,10 @@
 #[cfg(feature = "indexer")]
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::{string::String, vec, vec::Vec};
+#[cfg(any(feature = "indexer", not(unix)))]
+use std::io::Read;
 #[cfg(feature = "indexer")]
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
-};
+use std::{collections::HashMap, io::Write};
 use std::{
     fs::{self, File},
     path::Path,

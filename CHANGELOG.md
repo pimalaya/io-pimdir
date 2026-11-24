@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `search` failing to compile for a non-Unix target without `indexer` (Windows releases of himalaya, cardamum and calendula): the hit columns read their file with `Read`, imported only under `indexer`.
+
 ## [0.20.0] - 2026-11-24
 
 The store follows pimdir's storage-draft-17, the index search-draft-17 and the sync sync-draft-15. Drafts are exact: a store an earlier draft wrote is refused, never migrated, so a user starts over, moving the store directory aside and syncing anew (`neverest` re-creates it); an index of an earlier draft is rebuilt by the indexer. Every CLI sharing a store moves to this release together.
