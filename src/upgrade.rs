@@ -533,6 +533,25 @@ impl PimdirUpgrade {
         self.ops.push(PimdirWriteOp::UpsertPlacement(patched));
     }
 
+    /// Whether the collection holds another member stating the hint the
+    /// placement is keyed under, a key minted from it (SYNC §6, STORAGE
+    /// §9): two members of one collection stating one `Message-ID` share
+    /// no body by agreement, the store's `Handles` load reading each such
+    /// member beside the one it names.
+    fn crowded(&self, placement: &PimdirPlacement) -> bool {
+        let Some(hint) = placement.link_id.as_ref().filter(|key| !key.is_derived()) else {
+            return false;
+        };
+
+        self.placements.values().any(|other| {
+            other.handle != placement.handle
+                && other
+                    .link_id
+                    .as_ref()
+                    .is_some_and(|key| key.minted_from().contains(&hint.as_str()))
+        })
+    }
+
     /// Takes the pending create of this source holding `hint`, if any.
     ///
     /// A `Created` placement with no base under a provisional handle is
@@ -710,6 +729,7 @@ impl PimdirCoroutine for PimdirUpgrade {
                     // another body, whatever its size, a size being a
                     // witness and no identity. A body found missing is no
                     // body to link.
+                    let crowded = self.crowded(placement);
                     let hit = placement
                         .link_id
                         .as_ref()
@@ -718,6 +738,7 @@ impl PimdirCoroutine for PimdirUpgrade {
                         .into_iter()
                         .flatten()
                         .filter(|held| agrees(placement, held))
+                        .filter(|held| !crowded || same_content(placement, held))
                         .find(|held| !self.missing.contains(&held.object.hash))
                         .map(|held| held.object.hash.clone());
 
@@ -860,6 +881,17 @@ fn agrees(placement: &PimdirPlacement, held: &PimdirHeldObject) -> bool {
     };
 
     held.agrees(placement.summary.as_ref()) && sized && same_content
+}
+
+/// Whether the source states one server object id for the placement and
+/// the row `held` (SYNC §6): the server's word that the two are one
+/// content, the only one linking a body into a collection holding another
+/// member stating the placement's hint.
+fn same_content(placement: &PimdirPlacement, held: &PimdirHeldObject) -> bool {
+    placement
+        .server_object_id
+        .as_ref()
+        .is_some_and(|stated| held.server_object_id.as_ref() == Some(stated))
 }
 
 /// What the coroutine is doing while it waits for the caller.

@@ -98,6 +98,7 @@
 {"name": "storage/owner/list_held_mail", "parameters": ["after_collection", "after_link_id", "limit"], "slots": [], "columns": ["collection", "link_id", "seq", "object_hash"]},
 {"name": "storage/owner/list_held_tasks", "parameters": ["after_collection", "after_link_id", "limit"], "slots": [], "columns": ["collection", "link_id", "seq", "object_hash"]},
 {"name": "storage/owner/list_lacking_items", "parameters": ["collection", "source"], "slots": [], "columns": ["link_id"]},
+{"name": "storage/owner/list_minted_links", "parameters": ["collection"], "slots": ["links"], "columns": ["link_id"]},
 {"name": "storage/owner/list_owing_bindings", "parameters": ["collection", "source"], "slots": [], "columns": ["handle"]},
 {"name": "storage/owner/list_pending_actions", "parameters": [], "slots": [], "columns": ["id", "created_at", "producer", "collection", "action", "payload", "target_collection", "object_hash", "attempts"]},
 {"name": "storage/owner/list_queued_submits", "parameters": [], "slots": [], "columns": ["id", "payload"]},

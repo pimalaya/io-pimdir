@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `PimdirHub::release_shared`: the body a member under a bare `Message-ID` shares with a member minted from it that took it in the batch absorbed, released from the bare one as a release does, for the next upgrade to fetch (pimdir SYNC §6, STORAGE §14).
+- Added `sql::LIST_MINTED_LINKS`, the keys a collection holds minted from the link ids of the `links` slot.
+
+### Fixed
+
+- Fixed two messages stating one `Message-ID` in one mail collection holding one body (neverest's live test on Stalwart, a move into a mailbox holding another message stating the moved one's `Message-ID`, of one size): the target's own member had linked the moved message's body by agreement on subject, date, sender and size when it was listed, and kept it once the move landed, the moved body shown and acted on as the other message's. A `Full` upgrade now links no body by agreement into a collection holding another member stating the placement's hint, only under an equal server object id, the `Handles` load reading each such member beside the one named; and the write giving a member under a minted key the body the bare one holds releases it from the bare one, which the next upgrade fetches: one download per such member, on every server (pimdir sync-draft-15 and storage-draft-17 edited in place).
+
 ## [0.20.2] - 2026-11-24
 
 ### Fixed

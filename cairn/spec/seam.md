@@ -80,6 +80,8 @@ A load names the collection it reads, which is the coroutine's own except where 
 
 The selection is a floor, not a ceiling: a storage SHALL return at least the placements it names and MAY return more, so a storage that ignores it stays correct, just as expensive as before. Under-delivering is not correct: a mutation that cannot see a colliding link id creates a duplicate. A `Handles` selection naming a provisional handle no binding of the source holds names the copy the hub offers under it, so a mutation can withdraw it.
 
+A `Handles` selection over a mail collection SHALL also return every member, a retained one aside, under a key minted from a key it reads that a writer does not derive (`list_minted_links`, one range seek per key on the `(collection, link_id)` index): the other members stating that hint, which an upgrade naming the bare one alone needs to see so it links no body by agreement (upgrade.md, pimdir STORAGE §14).
+
 #### Scenario: A one-row edit reads one row
 - GIVEN a storage that honours the scope exactly
 - WHEN any mutation other than `Add` runs
@@ -100,6 +102,12 @@ A rebuild relies on it outright: every `Rekeyed` drop precedes every upsert ([re
 - GIVEN a placement the old handle space held under a handle the new one reuses
 - WHEN the collection is rebuilt
 - THEN the batch drops that handle `Rekeyed` first and writes it once after, the store bumping the generation
+
+### Requirement: A write releases a body two members stating one hint would share
+In a mail collection, a batch giving a member under a key minted from a hint a body it did not hold, the one the live member under the bare hint holds, SHALL release that body from the bare one in its transaction as `release_before` does (pimdir STORAGE §11.4, §14): `object` cleared and `level` 1, summary, flags, bindings and `seq` kept, each binding's `base_object` and `shared_object` naming it cleared, the binding staying based. It SHALL NOT when the batch upserts the bare one, the bare one needs its body (conflicted, a binding unbased, conflicted or based on another body, or a source of the collection binding it not), a source states one `server_object_id` on its bindings of both, or another live member minted from the hint held that body before the batch, a sharing a fetch confirmed (vectors/sync/215 stays as it was). The write reads the bare hint and every key minted from it beside the batch's links (`minted_hints`, `list_minted_links`) and applies `PimdirHub::release_shared` after the absorb.
+
+#### Scenario: A copy beside a member that linked its body
+- vectors/sync/223; tests/engine/membership.rs `a_copy_beside_a_message_of_its_id_linked_before_keeps_both_bodies`.
 
 ### Requirement: A listed member carries its meta
 `PimdirRemoteItem` SHALL carry a `PimdirRemoteMeta`: the identity hint (never a minted key), the summary and addresses Annex A derives, the sort key, the body when the listing read it, and the server object id its source gives the content where it states one (`server_object_id`, RFC 8474 `EMAILID`, Gmail's `X-GM-MSGID`, JMAP's `Email/id`, never one the connector derives; `PimdirRemoteMeta::with_server_object_id`) (pimdir SYNC §4). The engine records it on the member's binding (`PimdirPlacement::server_object_id`, `PimdirBinding::server_object_id`, `bindings.server_object_id`) when it names or relists the member, a listing stating none clearing it (vectors/sync/200). A connector reads it in the listing itself: an IMAP `ENVELOPE` with the header fields Annex A needs, `Content-Type` among them, or `summary::mail::derive_meta` over the header block; a Graph `$select` or a JMAP `Email/get` building `PimdirMailSummary` with the source's own attachment flag; a DAV `multiget` carrying the body. A page is a `PimdirRemoteSnapshot` (`complete`, `last`, `cursor`, an optional `checkpoint`, `narrowed` and, on a narrowed round's last page, `enumerated`), answered as `PimdirEnumerated::Page`, or `CursorRejected` when the source refuses a resumed round's cursor. A head (`PimdirListing::Head`) is answered as a page, `PimdirRemoteSnapshot::delta` for a delta head and `band_head` for a band head, or as `HeadRejected` or `NoHead`.

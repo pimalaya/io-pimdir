@@ -127,6 +127,40 @@ impl PimdirHubItem {
         }
     }
 
+    /// Whether the item holds `object` live and may let it go as a
+    /// release does (STORAGE §11.4): not conflicted, bound, every binding
+    /// based, unconflicted and based on that body or none, and bound by
+    /// each of `sources`, so no push nor propagation waits for the body.
+    fn releases(&self, object: &PimdirHash, sources: &BTreeSet<PimdirSourceId>) -> bool {
+        self.object.as_ref() == Some(object)
+            && !self.deleted
+            && !self.conflicted
+            && !self.sources.is_empty()
+            && sources
+                .iter()
+                .all(|source| self.sources.contains_key(source))
+            && self.sources.values().all(|binding| {
+                !binding.conflicted
+                    && binding
+                        .base
+                        .as_ref()
+                        .is_some_and(|base| base.object.as_ref().is_none_or(|b| b == object))
+            })
+    }
+
+    /// Whether a source states one server object id for both items, its
+    /// word that they are one content (SYNC §4, §6).
+    fn same_content(&self, other: &PimdirHubItem) -> bool {
+        self.sources.iter().any(|(source, binding)| {
+            binding.server_object_id.as_ref().is_some_and(|stated| {
+                other
+                    .sources
+                    .get(source)
+                    .is_some_and(|theirs| theirs.server_object_id.as_ref() == Some(stated))
+            })
+        })
+    }
+
     /// Reconciles the shared body against an incoming upsert by policy,
     /// the cross-source merge of SYNC §9, I/O-free: the item takes the
     /// body and conflict it settles on, the verdict says what it lost.
@@ -722,6 +756,96 @@ impl PimdirHub {
     /// Whether [`created_placement`](Self::created_placement) stages one.
     fn creatable(link: &PimdirLinkId, item: &PimdirHubItem) -> bool {
         item.object.is_some() && !link.as_str().starts_with("hash:")
+    }
+
+    /// Releases the body a member under a bare hint shares with a member
+    /// minted from that hint which took it in the batch absorbed since
+    /// `old` (SYNC §6, STORAGE §9, §11.4), answering the keys released.
+    ///
+    /// Two members of one mail collection stating one `Message-ID` share
+    /// no body unless their server says they are one content: the bare
+    /// one may have taken it by agreement before the other arrived, the
+    /// minted one never does, so the bare one goes back to `Meta` for the
+    /// next upgrade to fetch, as a release leaves it (summary, flags and
+    /// bindings kept, each base and shared body naming it let go). A
+    /// member `written` in the batch, one needing its body as a release
+    /// keeps it (conflicted, a binding unbased, conflicted or based on
+    /// another body, or a source of `sources` binding it not), one a
+    /// source states the same server object id for, and one another
+    /// member minted from its hint shared the body with before the batch
+    /// (a sharing a fetch confirmed) stay. `old` holds every live member
+    /// minted from the hint.
+    pub fn release_shared(
+        &mut self,
+        old: &PimdirHub,
+        written: &BTreeSet<PimdirLinkId>,
+        sources: &BTreeSet<PimdirSourceId>,
+    ) -> Vec<PimdirLinkId> {
+        if !self.immutable {
+            return Vec::new();
+        }
+
+        let taken: Vec<(PimdirLinkId, PimdirHash)> = self
+            .items
+            .iter()
+            .filter(|(key, item)| key.is_minted() && !item.deleted)
+            .filter_map(|(key, item)| {
+                let object = item.object.clone()?;
+                let before = old.items.get(key).and_then(|held| held.object.as_ref());
+                (before != Some(&object)).then(|| (key.clone(), object))
+            })
+            .collect();
+
+        let mut released = Vec::new();
+        for (key, object) in taken {
+            for hint in key.minted_from() {
+                let hint = PimdirLinkId::from(hint);
+                if hint.is_derived() || written.contains(&hint) || released.contains(&hint) {
+                    continue;
+                }
+                let Some(minted) = self.items.get(&key) else {
+                    continue;
+                };
+                let Some(held) = self.items.get(&hint) else {
+                    continue;
+                };
+                if !held.releases(&object, sources)
+                    || held.same_content(minted)
+                    || old.shared_before(&hint, &object)
+                {
+                    continue;
+                }
+
+                let held = self.items.get_mut(&hint).expect("the held item");
+                held.object = None;
+                held.level = PimdirLevel::Meta;
+                for binding in held.sources.values_mut() {
+                    if let Some(base) = &mut binding.base
+                        && base.object.as_ref() == Some(&object)
+                    {
+                        base.object = None;
+                    }
+                    if binding.shared_object.as_ref() == Some(&object) {
+                        binding.shared_object = None;
+                    }
+                }
+                released.push(hint);
+            }
+        }
+
+        released
+    }
+
+    /// Whether a live member minted from `hint` held `object` already: the
+    /// bare one shared it before, a sharing an earlier fetch confirmed or
+    /// the server stated, which a further copy of the body leaves alone.
+    fn shared_before(&self, hint: &PimdirLinkId, object: &PimdirHash) -> bool {
+        self.items.iter().any(|(key, item)| {
+            key.is_minted()
+                && key.minted_from().contains(&hint.as_str())
+                && !item.deleted
+                && item.object.as_ref() == Some(object)
+        })
     }
 
     /// Folds a source's sync writes back into the hub.

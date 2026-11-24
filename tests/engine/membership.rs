@@ -17,7 +17,7 @@ use io_pimdir::{
     sync::PimdirSyncOptions,
 };
 
-use crate::common::{Client, MemRemote};
+use crate::common::{Client, MemRemote, hash};
 
 /// One hydrated inbox member.
 fn seeded_client() -> Client {
@@ -408,4 +408,154 @@ fn a_copy_over_a_member_moved_out_unpushed_revives_it() {
         assert_eq!(rows.len(), 1, "{collection}: {rows:?}");
         assert_eq!(rows[0].status, PimdirStatus::Clean, "{collection}");
     }
+}
+
+/// A client over `remote` whose inbox and archive are declared mail
+/// collections, as an owner declares a mailbox before its first sync.
+fn mail_client(remote: MemRemote) -> Client {
+    let client = Client::new(remote);
+    for collection in ["inbox", "archive"] {
+        client
+            .store
+            .ensure_collection(collection, "message/rfc822")
+            .unwrap();
+    }
+    client
+}
+
+/// Raises every bodiless member of `collection` to `Full`, as an owner
+/// hydrating a collection does after a sync.
+fn hydrate(client: &mut Client, collection: &str) {
+    let handles: Vec<PimdirHandle> = client
+        .storage()
+        .rows(collection)
+        .into_iter()
+        .filter(|p| p.object.is_none() && !p.handle.is_provisional())
+        .map(|p| p.handle)
+        .collect();
+    if !handles.is_empty() {
+        client
+            .upgrade(collection, handles, PimdirTier::Full)
+            .unwrap();
+    }
+}
+
+/// Every member of `collection` holding a body holds the one its server
+/// holds under its handle, never another message's stating its
+/// `Message-ID` (SYNC §6).
+fn assert_own_bodies(client: &Client, collection: &str) {
+    let rows = client.storage().rows(collection);
+    let served = client.remote().items.get(&collection.into()).unwrap();
+    for row in &rows {
+        let server = served
+            .get(&row.handle)
+            .unwrap_or_else(|| panic!("{} on the server", row.handle.as_str()));
+        assert_eq!(
+            row.object,
+            Some(hash(&server.body)),
+            "{collection}/{} holds the body of the member it is bound to: {rows:?}",
+            row.handle.as_str(),
+        );
+    }
+}
+
+/// A move into a collection holding another message stating its
+/// `Message-ID`, listed and linked by agreement before the move, leaves
+/// each member holding its own body: the move's create taking the body
+/// the other one linked releases it from the other one, whose next
+/// upgrade fetches it rather than linking it again (SYNC §6).
+#[test]
+fn a_move_beside_a_message_of_its_id_linked_before_keeps_both_bodies() {
+    let moved = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nMOVED\r\n";
+    let other = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nOTHER\r\n";
+    let mut remote = MemRemote::default();
+    remote.states_moved = true;
+    remote.seed("inbox", "i1", "msg-a", &[], moved);
+    let mut client = mail_client(remote);
+    let opts = PimdirSyncOptions::default();
+    client.sync("inbox", opts.clone()).unwrap();
+    hydrate(&mut client, "inbox");
+    client
+        .remote_mut()
+        .seed("archive", "a1", "msg-a", &[], other);
+    client.sync("archive", opts.clone()).unwrap();
+    hydrate(&mut client, "archive");
+
+    stage_move(&mut client);
+    client.sync("inbox", opts.clone()).unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    client.sync("archive", opts).unwrap();
+    hydrate(&mut client, "archive");
+
+    assert_eq!(remote_members(&client, "archive"), ["a1", "i1-moved"]);
+    assert_eq!(client.storage().rows("archive").len(), 2);
+    assert_own_bodies(&client, "archive");
+}
+
+/// A copy beside such a message keeps both bodies too, though the copied
+/// message stays where it was, agreeing with the other one: the other
+/// one, released, is fetched, never linked from it again (SYNC §6).
+#[test]
+fn a_copy_beside_a_message_of_its_id_linked_before_keeps_both_bodies() {
+    let copied = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nCOPIED\r\n";
+    let other = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nOTHER\r\n";
+    let mut remote = MemRemote::default();
+    remote.seed("inbox", "i1", "msg-a", &[], copied);
+    let mut client = mail_client(remote);
+    let opts = PimdirSyncOptions::default();
+    client.sync("inbox", opts.clone()).unwrap();
+    hydrate(&mut client, "inbox");
+    client
+        .remote_mut()
+        .seed("archive", "a1", "msg-a", &[], other);
+    client.sync("archive", opts.clone()).unwrap();
+    hydrate(&mut client, "archive");
+
+    client
+        .mutate(
+            "inbox",
+            PimdirMutation::Copy {
+                handle: PimdirHandle::from("i1"),
+                target: "archive".into(),
+            },
+        )
+        .unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    client.sync("archive", opts).unwrap();
+    hydrate(&mut client, "archive");
+
+    assert_eq!(remote_members(&client, "archive").len(), 2);
+    assert_eq!(client.storage().rows("archive").len(), 2);
+    assert_own_bodies(&client, "archive");
+    assert_own_bodies(&client, "inbox");
+}
+
+/// A listing bringing two messages stating one `Message-ID` links neither
+/// body by agreement from a third another collection holds, even when the
+/// member under the bare hint is upgraded alone: the store's load reads
+/// the other one beside it (SYNC §6, STORAGE §14).
+#[test]
+fn a_listing_bringing_two_messages_of_one_id_links_neither() {
+    let held = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nHELD\r\n";
+    let other = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nOTHER\r\n";
+    let mut remote = MemRemote::default();
+    remote.seed("inbox", "i1", "msg-a", &[], held);
+    let mut client = mail_client(remote);
+    let opts = PimdirSyncOptions::default();
+    client.sync("inbox", opts.clone()).unwrap();
+    hydrate(&mut client, "inbox");
+    client
+        .remote_mut()
+        .seed("archive", "a1", "msg-a", &[], other);
+    client
+        .remote_mut()
+        .seed("archive", "a2", "msg-a", &[], held);
+    client.sync("archive", opts).unwrap();
+
+    client
+        .upgrade("archive", vec![PimdirHandle::from("a1")], PimdirTier::Full)
+        .unwrap();
+    hydrate(&mut client, "archive");
+
+    assert_own_bodies(&client, "archive");
 }

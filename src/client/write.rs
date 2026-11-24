@@ -156,6 +156,8 @@ impl PimdirSourceStore {
                     let offered = || handle.as_str().strip_prefix('\u{1}').map(String::from);
                     links.extend(bound.or_else(offered));
                 }
+                let minted = minted_siblings(conn, &collection.0, &links)?;
+                links.extend(minted);
                 read_linked_hub(conn, &collection.0, &links)?
             }
             PimdirLoadSelection::Owing(handles) => {
@@ -664,12 +666,20 @@ pub(crate) fn apply(
 
     for (collection, mut ops) in hub_ops {
         refuse_colliding_upserts(&collection, source, &ops)?;
-        let links = batch_links(tx, &collection, source, &ops, &bound_links)?;
+        let mut links = batch_links(tx, &collection, source, &ops, &bound_links)?;
+        let hints = minted_hints(&ops);
+        if !hints.is_empty() {
+            links.extend(minted_siblings(tx, &collection, &hints)?);
+            links.extend(hints);
+        }
+        links.sort();
+        links.dedup();
         let old = read_hub(tx, &collection, Some(&links))?;
         mint_other_messages(tx, &collection, source, &old, &mut ops)?;
         refuse_unread_overrule(&collection, source, &old, &ops)?;
         let mut new = old.clone();
         new.absorb(source, &ops);
+        release_shared(tx, &collection, &ops, &old, &mut new)?;
         // NOTE: a settle adopting a diverging body nobody summarized
         // derives its summary from the body, as Annex A does for a fetch.
         for link in core::mem::take(&mut new.unsummarized) {
@@ -1074,6 +1084,68 @@ fn batch_links(
     Ok(links.into_iter().collect())
 }
 
+/// The bare hints the minted keys a batch upserts were minted from: what
+/// the write reads beside them, with every key minted from each, so a
+/// body two members stating one hint would come to share is released
+/// from the bare one (SYNC §6, STORAGE §9).
+fn minted_hints(ops: &[PimdirWriteOp]) -> Vec<String> {
+    ops.iter()
+        .filter_map(|op| match op {
+            PimdirWriteOp::UpsertPlacement(placement) => placement.link_id.as_ref(),
+            _ => None,
+        })
+        .flat_map(PimdirLinkId::minted_from)
+        .filter(|hint| !PimdirLinkId::from(*hint).is_derived())
+        .map(String::from)
+        .collect()
+}
+
+/// Releases the body a member under a bare hint shares with a member
+/// minted from it that took the body in this batch
+/// ([`PimdirHub::release_shared`]), the next upgrade fetching it rather
+/// than linking it: two members of one collection stating one
+/// `Message-ID` never share a body unless the server says they are one
+/// content (SYNC §6, STORAGE §9, §11.4). Read against the collection's
+/// sources (`collection_sources`), a member one of them binds not keeping
+/// its body as a release does.
+fn release_shared(
+    conn: &Connection,
+    collection: &str,
+    ops: &[PimdirWriteOp],
+    old: &PimdirHub,
+    new: &mut PimdirHub,
+) -> Result<(), PimdirError> {
+    if !new.immutable || !new.items.keys().any(PimdirLinkId::is_minted) {
+        return Ok(());
+    }
+
+    let written: BTreeSet<PimdirLinkId> = ops
+        .iter()
+        .filter_map(|op| match op {
+            PimdirWriteOp::UpsertPlacement(placement) => placement.link_id.clone(),
+            _ => None,
+        })
+        .collect();
+    let sources: BTreeSet<PimdirSourceId> = rows(
+        conn,
+        sql::COLLECTION_SOURCES,
+        named_params! { ":collection": collection },
+        |r| r.get::<_, String>(0),
+    )?
+    .into_iter()
+    .map(PimdirSourceId)
+    .collect();
+
+    for released in new.release_shared(old, &written, &sources) {
+        log::debug!(
+            "{} shares its body with a member minted from it, released for a fetch",
+            released.as_str(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Keeps the placements a `Links` selection answers: those of an item the
 /// source binds, never a create offered for an item it lacks (STORAGE
 /// §14), so a load and the queue's drain read one target alike.
@@ -1297,6 +1369,40 @@ fn read_linked_hub(
         true => Ok(PimdirHub::default()),
         false => read_hub(conn, collection, Some(links)),
     }
+}
+
+/// The keys a mail collection holds minted from the bare hints among
+/// `links` (`list_minted_links`): the other members stating each hint,
+/// which a `Handles` load reads beside the member, so an upgrade knows
+/// the collection holds two of it and links no body into either by
+/// agreement (STORAGE §14, SYNC §6). None for another kind.
+fn minted_siblings(
+    conn: &Connection,
+    collection: &str,
+    links: &[String],
+) -> Result<Vec<String>, PimdirError> {
+    let kind = kind_of(conn, collection)?;
+    if collection::media_type(&kind) != "message/rfc822" {
+        return Ok(Vec::new());
+    }
+    let hints: Vec<&str> = links
+        .iter()
+        .map(String::as_str)
+        .filter(|link| !PimdirLinkId::from(*link).is_derived())
+        .collect();
+    if hints.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    bind_list(conn, "links", hints)?;
+    let minted = rows(
+        conn,
+        sql::LIST_MINTED_LINKS,
+        named_params! { ":collection": collection },
+        |r| r.get(0),
+    )?;
+
+    Ok(minted)
 }
 
 /// The declared kind of a collection, empty when undeclared (`load_kind`):
