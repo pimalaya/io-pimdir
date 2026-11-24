@@ -45,7 +45,10 @@ A store SHALL have at most one owner process at a time, and every owning handle
 SHALL take an exclusive advisory lock on the store directory (STORAGE §8) for its
 lifetime. The lock lives on the open file description, so the kernel releases it
 when the process dies: a crashed owner leaves a lock file that locks nothing, and
-no stale-lock recovery is needed or offered.
+no stale-lock recovery is needed or offered. A release SHALL unlock the
+description before closing it: a child forked by another thread holds a copy of
+it until its `exec`, and a close alone would leave the store locked that while,
+a reopen in the same process reporting it `Owned`.
 
 An owner that cannot take the lock SHALL fail immediately with
 `PimdirError::Owned`, naming the store. A lock that fails for any other reason

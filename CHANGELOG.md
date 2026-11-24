@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a store closed and opened again in one process reported owned by another process (`PimdirError::Owned`) when another thread was spawning a child: the child holds a copy of the locked description until its `exec`, and the release only closed this process's descriptor. A release now unlocks the description before closing it, the owner lock and the staging lock alike (seen as himalaya's `pimdir_queue` test failing in CI, 5 of 80 parallel runs).
+
 ## [0.20.3] - 2026-11-24
 
 ### Added

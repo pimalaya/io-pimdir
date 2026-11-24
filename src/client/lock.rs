@@ -350,6 +350,9 @@ impl PimdirLock {
 impl Drop for PimdirLock {
     fn drop(&mut self) {
         let Some(key) = &self.registered else {
+            if let Some(file) = &self.file {
+                release(file);
+            }
             return;
         };
 
@@ -363,9 +366,21 @@ impl Drop for PimdirLock {
         };
 
         entry.handles -= 1;
-        if entry.handles == 0 {
-            owned.remove(key);
+        if entry.handles == 0
+            && let Some(entry) = owned.remove(key)
+        {
+            release(&entry.file);
         }
+    }
+}
+
+/// Unlocks a held description before it closes: a child forked by another
+/// thread holds a copy of it until its `exec`, and closing ours alone would
+/// leave the store locked for that while, a reopen reading it as another
+/// holder. Unlocking releases the description whatever copies exist.
+fn release(file: &File) {
+    if let Err(err) = FileExt::unlock(file) {
+        log::debug!("cannot unlock a store lock before closing it: {err}");
     }
 }
 
@@ -495,5 +510,29 @@ mod tests {
         for thread in threads {
             thread.join().unwrap().expect("a handover was refused");
         }
+    }
+
+    /// A store closed while a copy of its locked description lives on, as
+    /// one a child forked by another thread holds until its `exec`, opens
+    /// again in this process: the release unlocks the description rather
+    /// than only closing this process's descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_of_the_lock_a_forked_child_holds_does_not_keep_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = PimdirLock::own(dir.path()).unwrap();
+        let key = dir.path().canonicalize().unwrap();
+        let copy = super::OWNED
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|owned| owned.file.try_clone().unwrap())
+            .unwrap();
+
+        drop(lock);
+        let reopened = PimdirLock::own(dir.path()).map_err(|err| format!("{err}"));
+        drop(copy);
+
+        reopened.expect("the store stayed locked by a copy of its description");
     }
 }
