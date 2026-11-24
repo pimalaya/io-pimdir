@@ -6,20 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
-### Added
-
-- Added `PimdirSubmit::to_payload`, the `v: 1` payload `to_action` wraps, which a rename writes back with its `copy` renamed.
-
-### Fixed
-
-- A flag change staged before a move is no longer undone when the relocation states its member's handle (an IMAP `UID MOVE` answering `COPYUID`): the landed create takes as its base the flags the member carries, the removed member's base, rather than the staged ones, so the staged set is pushed instead of pulled back over (pimdir sync-draft-15, vector 214). `PimdirWriteOp::LandPlacement` gains `flags`.
-- A fourth copy of one message into a collection is no longer refused and parked: a `Copy` or a `Move` read the target for the bare key and its first minted key only, so a target holding three copies gave the fourth the third's key, which the write refused (a binding pins one handle). `PimdirMutate` now reads the target again for each key minted over a held one until a free one, and the drain services every read (pimdir sync-draft-15, vector 215).
-- A copy, a move or an add into a collection where the same source holds the message as a tombstone, its delete not pushed yet (a move out staged since the last sync), is no longer refused and parked for good ("a binding pins one handle"): the tombstone is revived under the handle it is bound to, its base kept and its delete withdrawn, and no create is staged; a move doing so leaves its own tombstone a plain delete. A tombstone holding another message under the same `Message-ID` has the copy or the add minted beside it (pimdir sync-draft-15, vectors 216 to 219). A queued `add` drained from the queue does the same.
-- A send queued with a copy to file, across a rename of that collection an earlier run made, no longer fails "FOREIGN KEY constraint failed" once sent: `PimdirStore::rename_collection` rewrites the `copy` of every queued `submit` naming the old id, pending or parked, in the same transaction (pimdir storage-draft-17, STORAGE §14).
-- A parked move, copy or superseding add retried after a rename of the collection it targets no longer parks again on the old id: `PimdirStore::rename_collection` follows `queue.target_collection` on parked rows too, as on pending ones (pimdir STORAGE §14).
-- A flag change staged on a delivered create, or a copy reviving a tombstoned one, no longer gives its base the item's body: the base keeps naming nothing, so the create stays delivered and a relocation stating its member's handle still lands it, where it was left on its provisional handle (pimdir sync-draft-15, vectors 220 and 221).
-
-## [0.20.0] - 2026-11-23
+## [0.20.0] - 2026-11-24
 
 The store follows pimdir's storage-draft-17, the index search-draft-17 and the sync sync-draft-15. Drafts are exact: a store an earlier draft wrote is refused, never migrated, so a user starts over, moving the store directory aside and syncing anew (`neverest` re-creates it); an index of an earlier draft is rebuilt by the indexer. Every CLI sharing a store moves to this release together.
 
@@ -51,6 +38,7 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 - Added the statements `sql::UPSERT_SUMMARY`, `DELETE_SUMMARY`, `LOAD_SUMMARIES`, `LOAD_SUMMARIES_BY_LINK`, `REPLACE_VALUES`, `INSERT_VALUE`, `LOAD_VALUES`, `LOAD_VALUES_BY_LINK` and `LOAD_VALUES_BY_COLLECTION`, which write and read the one `summary` table and the one `summary_value` table whatever the kind, and `sql::COLLECTION_HOLDS_ACTIONS`, which `delete_collection` asks before it deletes.
 - Added `sql::search` under `indexer` without `client`: the index's migrations, statements, `FORMAT_VERSION` and `all()`, text and constants alone, for an indexer binding its own SQLite with no rusqlite in its build.
 - Added `summary::DERIVATION`, the Annex A revision recorded in `store_meta.derivation`, public without `client` for an owner holding its own SQLite (pimdir audit-2026-11-12 A5).
+- Added `PimdirSubmit::to_payload`, the `v: 1` payload `to_action` wraps, which a rename writes back with its `copy` renamed.
 
 ### Changed
 
@@ -124,6 +112,12 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 - **BREAKING**: Fixed a rekey whose listing repeats a handle mixing its entries, the first's flags under the last's identity, summary and sort key, the old item dropped `Deleted`: the first entry is kept whole, as a page keeps it (pimdir SYNC §4, §8, vector 210). A rekey now stores a body its listing carries, inline or persisted, as a page does: an arrival's and a pull's become the item's body and the base's at `Full`, where they were dropped and the member left at `Meta` (vectors 211, 212).
 - Fixed the queue's drain of a `copy` or a `move` into a collection where another source binds the identity minting a second item under a `dup:` key, where `store.mutate` joins that source's item: the drain reads its target as a `Links` load does (pimdir SYNC §7, STORAGE §14).
 - Fixed `PimdirReader::pending_actions`, `list_pending_actions` and `PimdirProducer::pending_actions` failing a whole listing on one row whose payload does not decode: the row is listed as `PimdirAction::Unknown`, its kind and payload verbatim, beside the rows that decode, until the drain parks it (STORAGE §15.4); `codec::payload_outcome` tells it malformed and `codec::action_from_payload` names its error. `pimdir queue list` prints that error on the row, and no longer reports its collection in `undecodable`.
+- Fixed a flag change staged before a move being undone when the relocation states its member's handle (an IMAP `UID MOVE` answering `COPYUID`): the landed create takes as its base the flags the member carries, so the staged set is pushed instead of pulled back over (pimdir sync-draft-15, vector 214). `PimdirWriteOp::LandPlacement` gains `flags`.
+- Fixed a fourth copy of one message into a collection being refused and parked, given the third copy's key: `PimdirMutate` reads the target again for each key minted over a held one until a free one (pimdir sync-draft-15, vector 215).
+- Fixed a copy, a move or an add into a collection where the same source holds the message as a tombstone not pushed yet being parked for good ("a binding pins one handle"): the tombstone is revived under the handle it is bound to and its delete withdrawn; one holding another message has the copy or the add minted beside it (pimdir sync-draft-15, vectors 216 to 219).
+- Fixed a send queued with a copy to file failing "FOREIGN KEY constraint failed" across a rename of that collection an earlier run made: `PimdirStore::rename_collection` rewrites the `copy` of every queued `submit`, pending or parked (pimdir STORAGE §14).
+- Fixed a parked move, copy or superseding add retried after a rename of its target parking again on the old id: `PimdirStore::rename_collection` follows `queue.target_collection` on parked rows too (pimdir STORAGE §14).
+- Fixed a flag change staged on a delivered create, or a copy reviving a tombstoned one, giving its base the item's body, which left the create on its provisional handle when a relocation stated its member's handle (pimdir sync-draft-15, vectors 220 and 221).
 
 ## [0.19.1] - 2026-11-21
 
@@ -1453,7 +1447,7 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.0..HEAD
 [0.20.0]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..v0.20.0
 [0.19.1]: https://github.com/pimalaya/io-pimdir/compare/v0.19.0..v0.19.1
 [0.19.0]: https://github.com/pimalaya/io-pimdir/compare/v0.18.1..v0.19.0
