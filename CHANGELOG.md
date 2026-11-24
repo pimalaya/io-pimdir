@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-11-24
+
 ### Added
 
 - Added `PimdirHub::release_shared`: the body a member under a bare `Message-ID` shares with a member minted from it that took it in the batch absorbed, released from the bare one as a release does, for the next upgrade to fetch (pimdir SYNC §6, STORAGE §14).
@@ -1468,7 +1470,8 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.2..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.3..HEAD
+[0.20.3]: https://github.com/pimalaya/io-pimdir/compare/v0.20.2..v0.20.3
 [0.20.2]: https://github.com/pimalaya/io-pimdir/compare/v0.20.1..v0.20.2
 [0.20.1]: https://github.com/pimalaya/io-pimdir/compare/v0.20.0..v0.20.1
 [0.20.0]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..v0.20.0
