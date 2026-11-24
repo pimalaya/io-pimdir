@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-11-24
+
 ### Fixed
 
 - Fixed a lock that fails for another reason than another holder being reported as one: the owner, staging and probe locks answered `Owned`, `Staging` or `Busy` on any `flock` error, telling the user another process holds the store; such an error is now `PimdirError::Io` with its cause.
@@ -1457,7 +1459,8 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.1..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.2..HEAD
+[0.20.2]: https://github.com/pimalaya/io-pimdir/compare/v0.20.1..v0.20.2
 [0.20.1]: https://github.com/pimalaya/io-pimdir/compare/v0.20.0..v0.20.1
 [0.20.0]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..v0.20.0
 [0.19.1]: https://github.com/pimalaya/io-pimdir/compare/v0.19.0..v0.19.1
