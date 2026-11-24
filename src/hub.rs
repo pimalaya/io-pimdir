@@ -803,7 +803,8 @@ impl PimdirHub {
     /// it, joins its flags to the held ones as a union (SYNC §5), whichever
     /// page of a round named it. An immutable kind never owes a body, so
     /// its binding's base adopts the shared one, a base naming none in an
-    /// immutable collection included (SYNC §3, §9).
+    /// immutable collection included (SYNC §3, §9), but a delivered
+    /// create's, whose base names nothing until its member lands (SYNC §2).
     fn absorb_upsert(&mut self, source: &PimdirSourceId, placement: &PimdirPlacement) {
         let Some(link) = placement.link_id.clone() else {
             return;
@@ -976,6 +977,7 @@ impl PimdirHub {
             && base.revision.is_none()
             && (base.object.is_some() || immutable)
             && item.object.is_some()
+            && !placement.delivered()
         {
             base.object = item.object.clone();
         }

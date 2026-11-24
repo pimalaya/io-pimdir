@@ -122,6 +122,41 @@ fn a_relocation_stating_its_handle_lands_a_delivered_create() {
     assert!(landed.base.as_ref().is_some_and(|b| b.object.is_some()));
 }
 
+/// A flag change staged on a delivered create leaves its base naming
+/// nothing (SYNC §2), so a relocation stating its handle still lands it
+/// (pimdir vector 221). Given the item's body as its base, the create was
+/// no delivered one any more and the landing passed it by.
+#[test]
+fn a_delivered_create_flagged_since_lands_all_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = populated(dir.path(), &["a@x"]);
+    store
+        .write(vec![PimdirWriteOp::DeliverPlacement {
+            collection: inbox(),
+            handle: provisional("a@x"),
+        }])
+        .unwrap();
+    let seq = store.seq_for_link("INBOX", "a@x").unwrap().unwrap();
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let flagged = PimdirAction::SetFlags {
+        seq,
+        flags: PimdirFlags::from_iter(["\\Flagged", "\\Seen"]),
+        base: None,
+    };
+    producer.enqueue("INBOX", &flagged, None).unwrap();
+    drop(producer);
+    assert_eq!(store.drain().unwrap().applied, 1);
+    let flagged = loaded(&mut store);
+    let delivered = placement(&flagged, "a@x");
+    assert!(delivered.delivered());
+    assert_eq!(delivered.base.as_ref().unwrap().object, None);
+
+    store.write(vec![land("a@x", "7")]).unwrap();
+
+    let loaded = loaded(&mut store);
+    assert_eq!(placement(&loaded, "a@x").handle.as_str(), "7");
+}
+
 /// A stated handle the source already binds in the collection is no
 /// member to move the create to: the create is recorded delivered, for a
 /// listing to land, and the binding holding the handle is left as it is.

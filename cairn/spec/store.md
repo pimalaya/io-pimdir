@@ -285,8 +285,8 @@ carry its items, bindings, sources, queue rows and child collections with it, by
 way of `ON UPDATE CASCADE` on every foreign key onto `collections(id)` **and** on
 `bindings(collection, link_id)`, which is a parent one level down and refuses the
 cascade without it. The rename SHALL also retarget the queued `move` and
-`copy` rows naming the old id (`RENAME_QUEUE_TARGETS`, STORAGE §15), in the same
-transaction, and the canonical trigger restamps the collection's items for the
+`copy` rows naming the old id, pending or parked (`RENAME_QUEUE_TARGETS`,
+STORAGE §15), in the same transaction, and the canonical trigger restamps the collection's items for the
 change feed.
 
 This SHALL be the only id change offered. Deleting a collection and recreating it
@@ -1533,7 +1533,10 @@ A summary's lists SHALL be rows of `summary_value(item, role, position, value, n
 Every statement taking a list SHALL read it from `temp.param(slot, position, value)` (STORAGE §4.4), which `create_param` makes on every connection the crate opens and `clear_param` and `bind_param` fill inside the statement's transaction. A read over a whole collection and the same read over the link ids of the `links` slot are two statements, the second named `_by_link` (`load_summaries_by_link`, `load_values_by_link`), `:scoped` being gone. The statements call no JSON function.
 
 ### Requirement: A queued action's target is a column a rename follows
-`queue.target_collection` SHALL hold the target a move, a copy or a superseding add names (STORAGE §4.3, §15.3), written by `enqueue_action` from `PimdirAction::target_collection`, read by the queue loads in place of the payload's, which keeps the id it was enqueued with, and followed by `rename_queue_targets`.
+`queue.target_collection` SHALL hold the target a move, a copy or a superseding add names (STORAGE §4.3, §15.3), written by `enqueue_action` from `PimdirAction::target_collection`, read by the queue loads in place of the payload's, which keeps the id it was enqueued with, and followed by `rename_queue_targets` on every queued row, pending or parked: a parked row retried after the rename lands where it was meant to, where one left on the old id parked again on a target with no declared kind.
+
+#### Scenario: A parked move retried after a rename
+- tests/invariants_queue.rs `a_parked_move_retried_after_a_rename_lands_in_the_renamed_target`: a move into Archive parked, Archive renamed, the row retried and drained: applied into the renamed collection. Failed before, the drain parking it again (applied 0, parked 1)
 
 A `submit`'s `copy` is the one collection a payload names that no column holds, and its performer files the copy where the payload says once the message is sent (STORAGE §14, §15.5). `rename_collection` SHALL rewrite it in the same transaction on every queued `submit` naming the old id, pending or parked: `list_queued_submits` reads them, `PimdirSubmit::from_payload` decodes each, no statement calling a JSON function, and `set_queued_payload` writes `PimdirSubmit::to_payload` back. A payload that does not decode is left for its performer to park.
 

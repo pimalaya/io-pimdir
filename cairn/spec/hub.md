@@ -256,6 +256,11 @@ It follows that mirroring is a sync **plus** an upgrade. The hub offers a member
 ### Requirement: An immutable binding owes no body
 `PimdirHub::immutable`, set by the store's `read_hub` for a `message/rfc822` collection, SHALL make the projection compare no body against a binding's base (SYNC §3 rule 4: the body axis is a mutable kind's), and the absorb SHALL let a binding of such a collection adopt the shared body as its base whatever its own base named, a listing carrying none included (SYNC §3, §9). A message another source holds, joined by a member a page before the last names, or listed by both sources before either hydrated it, so projects `Clean` and derives no `Update`, which an IMAP connector rejects every run while no flag change for the message ever pushes; a binding a store already wrote with a body-less base is read so without a rebuild.
 
+A delivered create's base (`PimdirPlacement::delivered`: its provisional handle and a base) SHALL adopt nothing: it names no flag set, revision nor body until its member lands (SYNC §2), and a relocation stating its member's handle lands only a create whose base names nothing (`absorb_landing`, SYNC §4). A flag change staged on it, or a copy reviving it tombstoned, so leaves it delivered.
+
+#### Scenario: A delivered create flagged, then landed
+- tests/relocation_landing.rs `a_delivered_create_flagged_since_lands_all_the_same`, and pimdir vectors 220 and 221, by the engine and by the drain. Without the guard the base took the item's body and the relocation left the create on its provisional handle
+
 #### Scenario: A message another source holds
 - GIVEN a mail collection one source holds a message in, hydrated, and a second source listing its own copy on the first page of a round of two, or both sources listing it at `Meta` before each hydrates
 - WHEN the second source syncs several times, then the first's server gains a flag

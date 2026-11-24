@@ -113,6 +113,48 @@ fn l558_l1722_a_rename_follows_into_pending_targets() {
     );
 }
 
+/// A parked move follows a rename of its target as a pending one does
+/// (STORAGE §14), so retried after it, it lands in the renamed collection
+/// rather than parking again on an id gone.
+#[test]
+fn a_parked_move_retried_after_a_rename_lands_in_the_renamed_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = mail_store(dir.path(), "imap");
+    let a = message("a@x", "A", AUG, Some("alice@x"));
+    store
+        .write(vec![
+            body(&store, &a),
+            PimdirWriteOp::UpsertPlacement(held(&store, "INBOX", "1", &a)),
+        ])
+        .unwrap();
+    let seq = store.seq_for_link("INBOX", "a@x").unwrap().unwrap();
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let id = producer
+        .enqueue(
+            "INBOX",
+            &PimdirAction::Move {
+                seq,
+                to: PimdirCollectionId("Archive".into()),
+            },
+            None,
+        )
+        .unwrap()
+        .handle
+        .id;
+    drop(producer);
+
+    let mut owner = io_pimdir::client::PimdirStore::open(dir.path()).unwrap();
+    owner.fail_action(id, Some("server unreachable")).unwrap();
+    owner.rename_collection("Archive", "Archive-2026").unwrap();
+    assert!(owner.retry_action(id).unwrap());
+    drop(owner);
+
+    let report = store.drain().unwrap();
+    assert_eq!((report.applied, report.parked), (1, 0), "{report:?}");
+    assert!(store.seq_for_link("Archive-2026", "a@x").unwrap().is_some());
+}
+
 fn created(collection: &str, handle: &str, link: &str) -> PimdirWriteOp {
     let mut placement = bare(collection, handle, link);
     placement.status = PimdirStatus::Created;

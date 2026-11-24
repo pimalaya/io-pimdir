@@ -875,11 +875,11 @@ impl PimdirStore {
 
     /// Gives a collection a new id, its contents following through the
     /// cascades and its items restamped (§14): the only safe way to change
-    /// one. A pending move, copy or superseding add naming it as a target
-    /// follows too, its `target_collection` being what no cascade reaches,
-    /// and so does a queued `submit` filing its copy there, pending or
-    /// parked, its payload's `copy` rewritten: the performer files the
-    /// copy where the payload says once the message is sent.
+    /// one. A queued move, copy or superseding add naming it as a target
+    /// follows too, pending or parked, its `target_collection` being what
+    /// no cascade reaches, and so does a queued `submit` filing its copy
+    /// there, its payload's `copy` rewritten: the performer files the copy
+    /// where the payload says once the message is sent.
     pub fn rename_collection(
         &mut self,
         collection: impl AsRef<str>,
