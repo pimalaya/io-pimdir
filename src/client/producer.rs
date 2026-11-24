@@ -2217,7 +2217,7 @@ fn stage_action(
     })));
 
     // NOTE: a copy or a move reads its target for the identity it carries.
-    if let PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
+    while let PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
         collection,
         selection,
     }) = state

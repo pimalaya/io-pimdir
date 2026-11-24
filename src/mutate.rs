@@ -11,6 +11,8 @@
 //! A copy or a move carries an identity into another collection and reads
 //! that collection first: a collection holds one key once, so a target
 //! already holding the identity gives the create a minted key instead.
+//! Each key minted again over a held one is read in turn, so the create
+//! takes the first free key however many copies the target holds.
 
 use core::{error, fmt};
 
@@ -506,6 +508,10 @@ pub struct PimdirMutate {
     mutation: PimdirMutation,
     /// The source of a staged create, held while the target's keys are read.
     source: Option<PimdirPlacement>,
+    /// The keys whose holders in the target were read.
+    asked: BTreeSet<PimdirLinkId>,
+    /// The keys a live placement of the target holds, of those read.
+    held: BTreeSet<PimdirLinkId>,
     /// Whether the run's source syncs the target (SYNC §7).
     syncs_target: bool,
     /// Whether the edited placement's item is conflicted, which a
@@ -524,6 +530,8 @@ impl PimdirMutate {
             collection,
             mutation,
             source: None,
+            asked: BTreeSet::new(),
+            held: BTreeSet::new(),
             syncs_target: false,
             item_conflicted: false,
             state: State::Start,
@@ -924,10 +932,9 @@ impl PimdirCoroutine for PimdirMutate {
                         // NOTE: a second copy in the target mints over the
                         // provisional handle the bare key would take, so
                         // that key is read too (STORAGE §9).
-                        let selection = PimdirLoadSelection::Links(vec![
-                            hint.clone(),
-                            hint.minted(&hint.provisional()),
-                        ]);
+                        let links = vec![hint.clone(), hint.minted(&hint.provisional())];
+                        self.asked.extend(links.iter().cloned());
+                        let selection = PimdirLoadSelection::Links(links);
 
                         debug!("read what {} holds of that identity", collection.as_str());
                         self.source = Some(placement);
@@ -950,14 +957,32 @@ impl PimdirCoroutine for PimdirMutate {
             (State::LoadingTarget, Some(PimdirArg::Load(loaded))) => {
                 let source = self.source.take().expect("the source of a staged create");
                 let hint = source.link_id.clone().expect("a linked source");
-                let held: BTreeSet<PimdirLinkId> = loaded
-                    .placements
-                    .into_iter()
-                    .filter(|p| p.status != PimdirStatus::Tombstone)
-                    .filter_map(|p| p.link_id)
-                    .collect();
+                self.held.extend(
+                    loaded
+                        .placements
+                        .into_iter()
+                        .filter(|p| p.status != PimdirStatus::Tombstone)
+                        .filter_map(|p| p.link_id),
+                );
 
-                let key = hint.claim(&hint.provisional(), |key| held.contains(key));
+                let key = hint.claim(&hint.provisional(), |key| self.held.contains(key));
+                if self.asked.insert(key.clone()) {
+                    let collection = self
+                        .mutation
+                        .create_target()
+                        .expect("the target of a staged create")
+                        .clone();
+                    debug!(
+                        "read what {} holds of {}",
+                        collection.as_str(),
+                        key.as_str()
+                    );
+                    self.source = Some(source);
+                    return PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
+                        collection,
+                        selection: PimdirLoadSelection::Links(vec![key]),
+                    });
+                }
                 let ops = self.writes(source, Some(key));
 
                 debug!("stage local change, {} write(s)", ops.len());

@@ -41,7 +41,7 @@ Every create the engine stages, an `Add`, a `Copy`, a `Move`, a vanished edit re
 ### Requirement: A staged create never takes a key its target holds
 A `Copy` or a `Move` SHALL read the target collection for the identity it is carrying into it, and SHALL key the staged create under a minted key (upgrade.md) when a live placement the run's source binds there already holds that identity: a create the store offers the source for another source's item holds no key, and the staged create joins that item (K4; tests/drain_copy.rs). The key is the identity minted over the provisional handle it derives, minted again while held, and the store pairs it with the identity for the create's origin and the tombstone's destination (pimdir SYNC §3). Refusing is not the answer, the way it is for an `Add`: the caller is asking for the copy, and a target holding the identity already is a target holding two resources once the create lands.
 
-The read SHALL ask for the key a second copy would take beside the identity itself, and SHALL be made against the target rather than the collection the mutation reads, which cannot answer it. A source placement holding no identity yet stages its create without the read, having no key to collide with.
+The read SHALL ask for the key a second copy would take beside the identity itself, and SHALL be made against the target rather than the collection the mutation reads, which cannot answer it. While the key minted again over the held ones is one the read did not ask for, the coroutine SHALL read the target again for that key alone (`PimdirYield::WantsLoad` with `PimdirLoadSelection::Links`) and claim anew, so the create takes the first key no live row of the target holds however many copies it holds; a key claimed unread would be the one a previous copy took, which the write refuses (a binding pins one handle) and a queued `copy` or `move` parks on for good. The drain services every such read. A source placement holding no identity yet stages its create without the read, having no key to collide with.
 
 A `Copy` or a `Move` of a placement holding no body SHALL fail with `PimdirMutateError::Undeliverable` unless its binding is based and the run's source syncs the target (`PimdirMutate::syncs_target`, which `PimdirSourceStore::mutate` and the drain of a queued `move` or `copy` read from `collection_sources`, `false` by default): only that source holds the origin a bodiless create is copied from, and another source is offered the create once the body is held (pimdir SYNC §7; vectors/sync/135).
 
@@ -49,6 +49,11 @@ A `Copy` or a `Move` of a placement holding no body SHALL fail with `PimdirMutat
 - GIVEN a target collection holding a live placement under an identity
 - WHEN that identity is copied into it
 - THEN the staged create takes a minted key, and both rows keep their own body
+
+#### Scenario: A fourth copy into a collection holding three
+- GIVEN a target holding one identity three times, under the bare key, the key minted over the provisional handle it derives, and that key minted again
+- WHEN the identity is copied into it once more
+- THEN the staged create takes the key minted a third time, its own `seq` and the provisional handle that key derives (vectors/sync/215, by the engine and by the drain; tests/engine/membership.rs `a_fourth_copy_into_a_collection_takes_a_key_of_its_own`)
 
 #### Scenario: A tombstoned holder blocks nothing
 - GIVEN a target whose only holder of the identity is a tombstone

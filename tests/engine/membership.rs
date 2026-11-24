@@ -8,6 +8,8 @@
 //! holds, and the remove relocates into the target's pending create, a
 //! copy the target held before the move proving no delivery (SYNC §3).
 
+use std::collections::BTreeSet;
+
 use io_pimdir::{
     mutate::PimdirMutation,
     placement::{PimdirFlags, PimdirHandle, PimdirStatus},
@@ -323,4 +325,36 @@ fn a_flag_set_staged_before_a_stated_relocation_is_pushed() {
     let landed = client.storage().placement("archive", "i1-moved");
     assert_eq!(landed.flags, staged, "the staged flags stay in the store");
     assert_eq!(landed.status, PimdirStatus::Clean);
+}
+
+/// Every copy of one message into a collection takes a key of its own,
+/// however many it already holds: the key is minted again over each held
+/// one, the third copy's included (STORAGE §9, SYNC §7).
+#[test]
+fn a_fourth_copy_into_a_collection_takes_a_key_of_its_own() {
+    let mut client = seeded_client();
+    let opts = PimdirSyncOptions::default();
+    client.sync("archive", opts.clone()).unwrap();
+
+    for _ in 0..4 {
+        client
+            .mutate(
+                "inbox",
+                PimdirMutation::Copy {
+                    handle: PimdirHandle::from("i1"),
+                    target: "archive".into(),
+                },
+            )
+            .unwrap();
+        client.sync("archive", opts.clone()).unwrap();
+    }
+
+    assert_eq!(remote_members(&client, "archive").len(), 4);
+    let rows = client.storage().rows("archive");
+    let keys: BTreeSet<_> = rows.iter().filter_map(|p| p.link_id.clone()).collect();
+    assert_eq!(keys.len(), 4, "four keys for four copies: {keys:?}");
+    assert!(
+        rows.iter().all(|p| p.status == PimdirStatus::Clean),
+        "every copy landed",
+    );
 }
