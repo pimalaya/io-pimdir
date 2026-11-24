@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-24
+
 ### Fixed
 
 - Fixed `search` failing to compile for a non-Unix target without `indexer` (Windows releases of himalaya, cardamum and calendula): the hit columns read their file with `Read`, imported only under `indexer`.
@@ -1451,7 +1453,8 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.1..HEAD
+[0.20.1]: https://github.com/pimalaya/io-pimdir/compare/v0.20.0..v0.20.1
 [0.20.0]: https://github.com/pimalaya/io-pimdir/compare/v0.19.1..v0.20.0
 [0.19.1]: https://github.com/pimalaya/io-pimdir/compare/v0.19.0..v0.19.1
 [0.19.0]: https://github.com/pimalaya/io-pimdir/compare/v0.18.1..v0.19.0
