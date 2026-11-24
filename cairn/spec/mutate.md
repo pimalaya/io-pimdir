@@ -22,7 +22,7 @@ status: current
 A mutation SHALL touch the local replica only; the remote is reconciled by sync. It answers a `PimdirMutateReport` whose `events` carry the `Overruled` its write reported, a body a policy did not adopt kept as a retained item ([hub](hub.md), vectors/sync/85, 86), and the `Abandoned` of a delivered create given up, once the write committed.
 
 ### Requirement: Add stages a locally-authored create
-`PimdirMutation::Add { link_id, flags, object, body, summary, sort_key }` SHALL stage a brand-new item with no remote origin (compose, import): a `PimdirStatus::Created` placement in the coroutine's collection under the link id's provisional handle, at `level = Full`, with `base = None` and `origin = None`, pointing at `object`; plus a `StoreObject` carrying `body`. Because the create has no origin, the next sync SHALL push it as `PimdirChange::Add { origin: None }`, an append that uploads the body rather than a server-side copy. `Add` SHALL NOT require an existing source placement, and SHALL fail (`PimdirMutateError::LinkExists`) rather than overwrite when a live (non-tombstone) placement already holds `link_id`; a tombstoned `link_id` does not block the create. An `Add` stating a `hash:` key its `body` does not give SHALL fail as `PimdirMutateError::HashKeyMismatch` (`hash-key-mismatch`), staging nothing (pimdir SYNC §7; vectors/sync/176 and 177).
+`PimdirMutation::Add { link_id, flags, object, body, summary, sort_key }` SHALL stage a brand-new item with no remote origin (compose, import): a `PimdirStatus::Created` placement in the coroutine's collection under the link id's provisional handle, at `level = Full`, with `base = None` and `origin = None`, pointing at `object`; plus a `StoreObject` carrying `body`. Because the create has no origin, the next sync SHALL push it as `PimdirChange::Add { origin: None }`, an append that uploads the body rather than a server-side copy. `Add` SHALL NOT require an existing source placement, and SHALL fail (`PimdirMutateError::LinkExists`) rather than overwrite when a live (non-tombstone) placement already holds `link_id`; a tombstoned `link_id` does not block the create, the source's own tombstone being revived or minted beside as a copy's is (below). An `Add` stating a `hash:` key its `body` does not give SHALL fail as `PimdirMutateError::HashKeyMismatch` (`hash-key-mismatch`), staging nothing (pimdir SYNC §7; vectors/sync/176 and 177).
 
 A `Remove` carrying `if_match`, the body its producer read and deletes (a queued `remove`'s, STORAGE §15.3), SHALL fail as `PimdirMutateError::Replaced`, staging nothing, when the placement holds another body, as an `Edit` does (pimdir SYNC §7, vectors/sync/145; src/mutate.rs `a_guarded_remove_refuses_a_replaced_body`).
 
@@ -55,10 +55,22 @@ A `Copy` or a `Move` of a placement holding no body SHALL fail with `PimdirMutat
 - WHEN the identity is copied into it once more
 - THEN the staged create takes the key minted a third time, its own `seq` and the provisional handle that key derives (vectors/sync/215, by the engine and by the drain; tests/engine/membership.rs `a_fourth_copy_into_a_collection_takes_a_key_of_its_own`)
 
+A tombstone the read finds holding a key, which is the run's source's own (a `Links` load answers only the items the source binds), SHALL hold no key against the create when its message agrees with the one carried (`summary::same_message`, pimdir STORAGE §9): the create taking that key SHALL revive it instead (`mutate::revived`), upserting the tombstone under the handle it is bound to, its base kept, `Dirty`, with the body, summary, sort key and flags carried and no destination, and staging no create, since a binding pins one handle and a create under the provisional handle is a rebind the write refuses. A `Move` reviving one leaves its own tombstone with no destination, its remove a plain delete. A tombstone holding another message holds its key as a live row does, so the create is minted beside it (pimdir SYNC §7; vectors/sync/216, 217). An `Add` SHALL do the same: a tombstone of the same message under its key is revived, one of another message has the add minted beside it through the same key reading, the coroutine's collection being the target (vectors/sync/218, 219). The drain stages a queued `add` itself, not through the coroutine, and SHALL do the same (`over_own_tombstone` in src/client/producer.rs): it reads the source's row under each key, revives an agreeing tombstone and mints past any other (tests/duplicate_link_id.rs `a_queued_add_over_its_sources_tombstone_revives_it` and `a_queued_add_of_another_message_beside_its_sources_tombstone_is_minted`, both parked before on "a binding pins one handle").
+
 #### Scenario: A tombstoned holder blocks nothing
-- GIVEN a target whose only holder of the identity is a tombstone
+- GIVEN a target whose only holder of the identity is a tombstone of the same message
 - WHEN the identity is copied into it
-- THEN the staged create takes the identity itself, a row on its way out holding no key against a create
+- THEN the copy takes the identity itself and revives the tombstone under its handle, a row on its way out holding no key against a create (src/mutate.rs `a_tombstoned_holder_does_not_block_a_copy`)
+
+#### Scenario: A copy over a member moved out, the move not pushed
+- GIVEN a member copied into a collection and landed, then moved out to a trash, no sync since
+- WHEN the identity is copied into the collection again
+- THEN the tombstone is revived under the member's handle, and once synced the collection holds that member alone and the trash a copy, every row `Clean` (tests/engine/membership.rs `a_copy_over_a_member_moved_out_unpushed_revives_it`; the live night's queue rows 58 and 60, parked before on "a binding pins one handle")
+
+#### Scenario: A tombstone holding another message
+- GIVEN a target whose tombstone holds the identity for a message with another subject
+- WHEN the identity is copied into it
+- THEN the staged create takes the minted key, the tombstone left as it stands (src/mutate.rs `a_tombstone_holding_another_message_mints_a_copy`)
 
 ### Requirement: An edit revives a tombstone, a flag change rides along
 An `Edit` staging a body on a tombstoned placement SHALL revive it, leaving it `Dirty`, and SHALL drop the move destination the tombstone carried: new content beats a delete, the same rule the merge applies when the remote edits what was deleted locally, and the move that destination belonged to is not happening any more. Left on the revived row it turns the member's next plain delete into a relocation nobody asked for.

@@ -6,10 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added `PimdirSubmit::to_payload`, the `v: 1` payload `to_action` wraps, which a rename writes back with its `copy` renamed.
+
 ### Fixed
 
 - A flag change staged before a move is no longer undone when the relocation states its member's handle (an IMAP `UID MOVE` answering `COPYUID`): the landed create takes as its base the flags the member carries, the removed member's base, rather than the staged ones, so the staged set is pushed instead of pulled back over (pimdir sync-draft-15, vector 214). `PimdirWriteOp::LandPlacement` gains `flags`.
 - A fourth copy of one message into a collection is no longer refused and parked: a `Copy` or a `Move` read the target for the bare key and its first minted key only, so a target holding three copies gave the fourth the third's key, which the write refused (a binding pins one handle). `PimdirMutate` now reads the target again for each key minted over a held one until a free one, and the drain services every read (pimdir sync-draft-15, vector 215).
+- A copy, a move or an add into a collection where the same source holds the message as a tombstone, its delete not pushed yet (a move out staged since the last sync), is no longer refused and parked for good ("a binding pins one handle"): the tombstone is revived under the handle it is bound to, its base kept and its delete withdrawn, and no create is staged; a move doing so leaves its own tombstone a plain delete. A tombstone holding another message under the same `Message-ID` has the copy or the add minted beside it (pimdir sync-draft-15, vectors 216 to 219). A queued `add` drained from the queue does the same.
+- A send queued with a copy to file, across a rename of that collection an earlier run made, no longer fails "FOREIGN KEY constraint failed" once sent: `PimdirStore::rename_collection` rewrites the `copy` of every queued `submit` naming the old id, pending or parked, in the same transaction (pimdir storage-draft-17, STORAGE §14).
 
 ## [0.20.0] - 2026-11-23
 

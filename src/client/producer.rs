@@ -1925,6 +1925,46 @@ fn collection_sources(tx: &Connection, collection: &str) -> Result<Vec<String>, 
 /// a remove's success and parks anything else (§15.3). A move or a copy
 /// into a collection with no declared kind parks rather than ensuring a
 /// collection nothing configured.
+/// The create a queued `add` stages over what `source` holds of its key in
+/// `collection` (STORAGE §9, SYNC §7), as [`PimdirMutate`] stages an
+/// `Add`'s: the source's own tombstone of the same message is revived
+/// under the handle it is bound to, a binding pinning one, and one of
+/// another message, or a live row, has the key minted over the provisional
+/// handle the key derives, each minted key read in turn.
+fn over_own_tombstone(
+    tx: &Connection,
+    collection: &PimdirCollectionId,
+    source: &PimdirSourceId,
+    create: PimdirPlacement,
+) -> Result<PimdirPlacement, PimdirError> {
+    let Some(hint) = create.link_id.clone() else {
+        return Ok(create);
+    };
+    let handle = hint.provisional();
+    let mut key = hint.clone();
+    loop {
+        let hub = write::read_hub(tx, &collection.0, Some(slice::from_ref(&key.0)))?;
+        let mut held = hub.project(collection, source);
+        write::retain_links(&hub, source, &mut held);
+        let Some(holder) = held.into_iter().find(|p| p.link_id.as_ref() == Some(&key)) else {
+            break;
+        };
+        let agrees = summary::same_message(holder.summary.as_ref(), create.summary.as_ref());
+        if holder.status == PimdirStatus::Tombstone && agrees {
+            return Ok(mutate::revived(holder, &create));
+        }
+        key = key.minted(&handle);
+    }
+    if key == hint {
+        return Ok(create);
+    }
+    Ok(PimdirPlacement {
+        handle: key.provisional(),
+        link_id: Some(key),
+        ..create
+    })
+}
+
 fn stage_action(
     tx: &Connection,
     blobs: &PimdirBlobs,
@@ -1990,7 +2030,7 @@ fn stage_action(
             .map(|d| (d.summary, d.sort_key))
             .unwrap_or_default();
         let create = PimdirPlacement {
-            collection: collection_id,
+            collection: collection_id.clone(),
             handle: link.provisional(),
             link_id: Some(link),
             object: object.clone(),
@@ -2008,6 +2048,7 @@ fn stage_action(
             origin: None,
             server_object_id: None,
         };
+        let create = over_own_tombstone(tx, &collection_id, source, create)?;
         return Ok(Ok((
             source.clone(),
             vec![PimdirWriteOp::UpsertPlacement(create)],

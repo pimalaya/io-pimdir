@@ -1125,8 +1125,10 @@ fn a_drain_applies_an_action_as_the_source_of_its_collection() {
 
 /// STORAGE §15.2: a failure of the store is permanent for the row and
 /// parks it, and neither it nor anything else stops the rows behind it.
-/// The refused rebind is the spec's own example: an add of an identity
-/// this source still binds, under another handle.
+/// The failure is one of the spec's own examples, a target collection with
+/// no declared kind. An add of an identity this source holds as a
+/// tombstone, which this case used before, is none: it revives the
+/// tombstone (STORAGE §9; tests/duplicate_link_id.rs).
 #[test]
 fn a_store_failure_parks_the_row_and_the_pass_continues() {
     let dir = tempfile::tempdir().unwrap();
@@ -1145,31 +1147,15 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
     let seq_b = store.seq_for_link("INBOX", "mid:b").unwrap().unwrap();
     let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
 
-    // tombstone mid:a, which keeps its binding on handle 1 for the push
     producer
         .enqueue(
             "INBOX",
-            &PimdirAction::Remove {
+            &PimdirAction::Copy {
                 seq: seq_a,
-                if_match: None,
-                resolves: None,
+                to: PimdirCollectionId("Nowhere".into()),
             },
             None,
         )
-        .unwrap();
-    assert_eq!(store.drain().unwrap().applied, 1);
-
-    // an add of mid:a under another handle resolves the binding to a
-    // second handle, which the store refuses (§10); a valid row follows
-    producer
-        .enqueue_with_body("INBOX", b"Subject: queued\r\n\r\nx\r\n", |hash| {
-            PimdirAction::Add {
-                link_id: Some(PimdirLinkId("mid:a".into())),
-                flags: PimdirFlags::default(),
-                object: Some(hash),
-                supersedes: None,
-            }
-        })
         .unwrap();
     producer
         .enqueue(
@@ -1188,11 +1174,11 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
 
     let parked = store.parked_actions().unwrap();
     assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].action, "add");
+    assert_eq!(parked[0].action, "copy");
     assert_eq!(parked[0].attempts, 1);
-    assert!(parked[0].error.contains("holds handle 1"), "{parked:?}");
+    assert!(parked[0].error.contains("no declared kind"), "{parked:?}");
     let bindings = store.item_bindings("INBOX", "mid:a").unwrap();
-    assert_eq!(bindings.len(), 1, "the refused write recorded nothing");
+    assert_eq!(bindings.len(), 1, "the refused copy recorded nothing");
     assert!(
         store
             .get_item("INBOX", seq_b)

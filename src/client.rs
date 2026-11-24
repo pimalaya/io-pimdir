@@ -40,8 +40,10 @@ use crate::{
         write::kind_of,
     },
     codec::{self, PimdirAction, PimdirActionError, PimdirActionHandle},
-    collection, hash,
+    collection::{self, PimdirCollectionId},
+    hash,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
+    intent::PimdirSubmit,
     object::{PimdirHash, PimdirObject},
     placement::PimdirLinkId,
     reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
@@ -874,7 +876,10 @@ impl PimdirStore {
     /// Gives a collection a new id, its contents following through the
     /// cascades and its items restamped (§14): the only safe way to change
     /// one. A pending move, copy or superseding add naming it as a target
-    /// follows too, its `target_collection` being what no cascade reaches.
+    /// follows too, its `target_collection` being what no cascade reaches,
+    /// and so does a queued `submit` filing its copy there, pending or
+    /// parked, its payload's `copy` rewritten: the performer files the
+    /// copy where the payload says once the message is sent.
     pub fn rename_collection(
         &mut self,
         collection: impl AsRef<str>,
@@ -885,6 +890,22 @@ impl PimdirStore {
             sql::RENAME_QUEUE_TARGETS,
             named_params! { ":collection": collection.as_ref(), ":new_id": new_id },
         )?;
+        let submits = rows(&tx, sql::LIST_QUEUED_SUBMITS, [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for (id, payload) in submits {
+            let Ok(mut submit) = PimdirSubmit::from_payload(&payload) else {
+                continue;
+            };
+            if submit.copy.as_ref().map(|copy| copy.as_str()) != Some(collection.as_ref()) {
+                continue;
+            }
+            submit.copy = Some(PimdirCollectionId::from(new_id));
+            tx.execute_cached(
+                sql::SET_QUEUED_PAYLOAD,
+                named_params! { ":id": id, ":payload": submit.to_payload()? },
+            )?;
+        }
         tx.execute_cached(
             sql::RENAME_COLLECTION,
             named_params! { ":collection": collection.as_ref(), ":new_id": new_id },

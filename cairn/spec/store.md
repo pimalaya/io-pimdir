@@ -1535,6 +1535,11 @@ Every statement taking a list SHALL read it from `temp.param(slot, position, val
 ### Requirement: A queued action's target is a column a rename follows
 `queue.target_collection` SHALL hold the target a move, a copy or a superseding add names (STORAGE §4.3, §15.3), written by `enqueue_action` from `PimdirAction::target_collection`, read by the queue loads in place of the payload's, which keeps the id it was enqueued with, and followed by `rename_queue_targets`.
 
+A `submit`'s `copy` is the one collection a payload names that no column holds, and its performer files the copy where the payload says once the message is sent (STORAGE §14, §15.5). `rename_collection` SHALL rewrite it in the same transaction on every queued `submit` naming the old id, pending or parked: `list_queued_submits` reads them, `PimdirSubmit::from_payload` decodes each, no statement calling a JSON function, and `set_queued_payload` writes `PimdirSubmit::to_payload` back. A payload that does not decode is left for its performer to park.
+
+#### Scenario: A send pending across a rename an earlier run made
+- tests/receipts.rs `a_submit_queued_before_a_rename_files_its_copy_in_the_renamed_collection`: two submits filing into Sent, one parked, and one filing into Drafts; Sent renamed; the pending one is replaced by its copy's add on the new id, the parked one names it too, the Drafts one is left alone. Failed before with "FOREIGN KEY constraint failed" (neverest N4)
+
 #### Scenario: A rename behind a pending move
 - tests/invariants_queue.rs `l558_l1722_a_rename_follows_into_pending_targets`: a rename follows into a pending move's target and into a superseding add's, a plain add left alone
 

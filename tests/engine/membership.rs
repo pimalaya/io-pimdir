@@ -358,3 +358,54 @@ fn a_fourth_copy_into_a_collection_takes_a_key_of_its_own() {
         "every copy landed",
     );
 }
+
+/// A copy into a collection whose member its source moved out, the move
+/// not pushed yet, revives the tombstone under the handle it is bound to
+/// rather than staging a create beside it (STORAGE §9, §10; SYNC §7):
+/// the member stays where it was and the trash takes a copy of it.
+#[test]
+fn a_copy_over_a_member_moved_out_unpushed_revives_it() {
+    let mut client = seeded_client();
+    let opts = PimdirSyncOptions::default();
+    client
+        .mutate(
+            "inbox",
+            PimdirMutation::Copy {
+                handle: PimdirHandle::from("i1"),
+                target: "archive".into(),
+            },
+        )
+        .unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    let landed = client.storage().rows("archive")[0].handle.clone();
+    client
+        .mutate(
+            "archive",
+            PimdirMutation::Move {
+                handle: landed.clone(),
+                target: "trash".into(),
+            },
+        )
+        .unwrap();
+
+    client
+        .mutate(
+            "inbox",
+            PimdirMutation::Copy {
+                handle: PimdirHandle::from("i1"),
+                target: "archive".into(),
+            },
+        )
+        .unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    client.sync("trash", opts.clone()).unwrap();
+
+    assert_eq!(remote_members(&client, "archive"), [landed.as_str()]);
+    assert_eq!(remote_members(&client, "trash").len(), 1);
+    assert_eq!(remote_members(&client, "inbox").len(), 1);
+    for collection in ["inbox", "archive", "trash"] {
+        let rows = client.storage().rows(collection);
+        assert_eq!(rows.len(), 1, "{collection}: {rows:?}");
+        assert_eq!(rows[0].status, PimdirStatus::Clean, "{collection}");
+    }
+}

@@ -11,6 +11,8 @@
 
 use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
+    client::producer::PimdirProducer,
+    codec::PimdirAction,
     collection::PimdirCollectionId,
     load::PimdirLoadSelection,
     object::{PimdirHash, PimdirObject},
@@ -423,5 +425,102 @@ fn a_rebuilt_handle_space_resolving_two_placements_to_one_key_is_refused() {
         placements[0].handle,
         PimdirHandle("u1".into()),
         "the store holds what it held: no overwrite, no half-written spine",
+    );
+}
+
+const SAVED: &[u8] = b"Message-ID: <saved@x>\r\nFrom: a@x\r\nSubject: Saved\r\nDate: Mon, 03 Aug 2026 09:00:00 +0000\r\n\r\nthe saved message\r\n";
+
+const REUSED: &[u8] = b"Message-ID: <saved@x>\r\nFrom: b@x\r\nSubject: Another\r\nDate: Tue, 04 Aug 2026 09:00:00 +0000\r\n\r\nanother message\r\n";
+
+/// A store whose INBOX holds `SAVED` under handle 4, bound by `remote`
+/// with a base, then removed through the queue, the delete not pushed: the
+/// source's own tombstone, as a move out or a delete leaves it.
+fn tombstoned(dir: &std::path::Path) {
+    let mut store = opened(dir);
+    let derived = io_pimdir::summary::derive("message/rfc822", SAVED).unwrap();
+    let hash = io_pimdir::hash::hash(SAVED);
+    let mut held = hydrated("4", "saved@x", &hash.0);
+    held.summary = derived.summary;
+    store
+        .write(vec![
+            store_object(&hash.0, SAVED),
+            PimdirWriteOp::UpsertPlacement(held),
+        ])
+        .unwrap();
+    let seq = store.seq_for_link("INBOX", "saved@x").unwrap().unwrap();
+    drop(store);
+    let remove = PimdirAction::Remove {
+        seq,
+        if_match: None,
+        resolves: None,
+    };
+    drained(dir, |_| (remove, None));
+}
+
+/// The queued `add` of `body`, staged through the producer.
+fn added(producer: &PimdirProducer, body: &[u8]) -> (PimdirAction, Option<PimdirObject>) {
+    let object = producer.stage_body(body).unwrap();
+    let action = PimdirAction::Add {
+        link_id: None,
+        flags: PimdirFlags::from_iter(["\\Seen"]),
+        object: Some(object.hash.clone()),
+        supersedes: None,
+    };
+    (action, Some(object))
+}
+
+/// Enqueues on INBOX the action `queued` builds and drains it as
+/// `remote`, nothing left parked.
+fn drained(
+    dir: &std::path::Path,
+    queued: impl FnOnce(&PimdirProducer) -> (PimdirAction, Option<PimdirObject>),
+) {
+    let mut producer = PimdirProducer::open(dir, "test").unwrap();
+    let (action, object) = queued(&producer);
+    producer.enqueue("INBOX", &action, object.as_ref()).unwrap();
+    drop(producer);
+    let mut store = PimdirStore::open(dir).unwrap().for_source("remote");
+    store.drain().unwrap();
+    let parked = store.parked_actions().unwrap();
+    assert!(parked.is_empty(), "nothing parks: {parked:?}");
+}
+
+/// A queued add of a message its source holds as a tombstone in the
+/// collection, the delete not pushed, revives that tombstone under the
+/// handle it is bound to rather than staging a create the binding refuses
+/// (pimdir STORAGE §9, §10; SYNC §7, vector 218 for the engine).
+#[test]
+fn a_queued_add_over_its_sources_tombstone_revives_it() {
+    let dir = tempdir().unwrap();
+    tombstoned(dir.path());
+
+    drained(dir.path(), |producer| added(producer, SAVED));
+
+    let rows = projected(&opened(dir.path()));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].handle, PimdirHandle("4".into()));
+    assert_eq!(rows[0].status, PimdirStatus::Dirty);
+}
+
+/// A queued add of another message reusing that identity is minted beside
+/// the tombstone, which keeps its delete (vector 219 for the engine).
+#[test]
+fn a_queued_add_of_another_message_beside_its_sources_tombstone_is_minted() {
+    let dir = tempdir().unwrap();
+    tombstoned(dir.path());
+
+    drained(dir.path(), |producer| added(producer, REUSED));
+
+    let rows = projected(&opened(dir.path()));
+    let keys: Vec<_> = rows
+        .iter()
+        .map(|p| (p.link_id.clone().unwrap().0, p.status))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("dup:saved@x#\u{1}saved@x".into(), PimdirStatus::Created),
+            ("saved@x".into(), PimdirStatus::Tombstone),
+        ]
     );
 }

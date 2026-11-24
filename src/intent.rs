@@ -268,6 +268,15 @@ impl PimdirSubmit {
     /// The queue action sending `message`, validated first: the message
     /// is the action's body, its `object_hash`, which the enqueue pins.
     pub fn to_action(&self, message: PimdirHash) -> Result<PimdirAction, PimdirActionError> {
+        Ok(PimdirAction::Unknown {
+            kind: SUBMIT.to_string(),
+            payload: self.to_payload()?,
+            object_hash: Some(message),
+        })
+    }
+
+    /// The `v: 1` payload, validated first.
+    pub fn to_payload(&self) -> Result<String, PimdirActionError> {
         self.validate()?;
         let mut map = versioned();
         map.insert("source".into(), json!(self.source));
@@ -279,11 +288,7 @@ impl PimdirSubmit {
         if let Some(copy) = &self.copy {
             map.insert("copy".into(), json!(copy.0));
         }
-        Ok(PimdirAction::Unknown {
-            kind: SUBMIT.to_string(),
-            payload: Value::Object(map).to_string(),
-            object_hash: Some(message),
-        })
+        Ok(Value::Object(map).to_string())
     }
 
     /// Reads a `submit` payload strictly.

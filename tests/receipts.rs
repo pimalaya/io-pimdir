@@ -17,6 +17,7 @@ use io_pimdir::{
     },
     codec::PimdirAction,
     collection::PimdirCollectionId,
+    intent::PimdirSubmit,
     object::PimdirObject,
     placement::PimdirFlags,
 };
@@ -528,5 +529,94 @@ fn a_refusal_shows_on_the_receipt_and_keeps_it_until_cleared() {
     assert_eq!(
         producer.action_status(id).unwrap(),
         PimdirActionStatus::Unknown
+    );
+}
+
+/// Enqueues on `collection` a `submit` naming `copy`, the way a frontend
+/// writes one ([`PimdirSubmit::to_action`]).
+fn enqueue_submit(producer: &mut PimdirProducer, collection: &str, copy: &str) {
+    let (_, object) = add(producer, DRAFT);
+    let submit = PimdirSubmit {
+        source: "smtp".into(),
+        from: "a@example.org".into(),
+        rcpts: vec!["b@example.org".into()],
+        subject: None,
+        copy: Some(PimdirCollectionId(copy.into())),
+    };
+    let action = submit.to_action(object.hash.clone()).unwrap();
+    producer
+        .enqueue(collection, &action, Some(&object))
+        .unwrap();
+}
+
+/// The `copy` the queued `submit` rows name, in queue order.
+fn queued_copies(dir: &Path) -> Vec<Option<String>> {
+    let conn = Connection::open(dir.join("pimdir.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT payload FROM queue WHERE action = 'submit' ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|payload| {
+            PimdirSubmit::from_payload(&payload.unwrap())
+                .unwrap()
+                .copy
+                .map(|copy| copy.0)
+        })
+        .collect()
+}
+
+/// A send pending across a rename of the collection its copy is filed in,
+/// done by an earlier run, still files it (STORAGE §14, §15.5): the rename
+/// rewrites the `copy` of every queued `submit` naming the old id, parked
+/// ones included, since a submit acts on its server before it files.
+#[test]
+fn a_submit_queued_before_a_rename_files_its_copy_in_the_renamed_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    store(dir.path());
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .ensure_collection("Sent", "message/rfc822")
+        .unwrap();
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    enqueue_submit(&mut producer, "Sent", "Sent");
+    enqueue_submit(&mut producer, "Sent", "Sent");
+    enqueue_submit(&mut producer, "INBOX", "Drafts");
+    drop(producer);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let parked = owner.list_pending_actions().unwrap()[1].id;
+    owner.fail_action(parked, Some("refused")).unwrap();
+    owner.rename_collection("Sent", "Sent Items").unwrap();
+
+    let row = owner.list_pending_actions().unwrap().remove(0);
+    let PimdirAction::Unknown {
+        payload,
+        object_hash,
+        ..
+    } = &row.action
+    else {
+        panic!("a submit is an intent: {row:?}");
+    };
+    let copy = PimdirSubmit::from_payload(payload).unwrap().copy.unwrap();
+    let filed = PimdirAction::Add {
+        link_id: None,
+        flags: PimdirFlags::from_iter(["\\Seen"]),
+        object: object_hash.clone(),
+        supersedes: None,
+    };
+    assert!(
+        owner
+            .replace_action(row.id, "smtp", copy.as_str(), &filed)
+            .unwrap()
+    );
+    let added = owner.list_pending_actions().unwrap();
+    assert_eq!(added.last().unwrap().collection, "Sent Items");
+    assert_eq!(
+        queued_copies(dir.path()),
+        [Some("Sent Items".into()), Some("Drafts".into())],
+        "the parked submit follows, another collection's copy is left alone",
     );
 }

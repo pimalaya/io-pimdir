@@ -12,11 +12,18 @@
 //! that collection first: a collection holds one key once, so a target
 //! already holding the identity gives the create a minted key instead.
 //! Each key minted again over a held one is read in turn, so the create
-//! takes the first free key however many copies the target holds.
+//! takes the first free key however many copies the target holds. A key
+//! the source holds there as a tombstone is no create's: the tombstone is
+//! revived under the handle it is bound to, a binding pinning one.
 
 use core::{error, fmt};
 
-use alloc::{collections::BTreeSet, string::String, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec,
+    vec::Vec,
+};
 
 use log::{debug, trace};
 
@@ -157,9 +164,12 @@ pub enum PimdirMutation {
     /// The next sync pushes a server-side copy, no body re-upload. The
     /// copy takes the source's identity where `target` has it free, and a
     /// minted one where a live placement there already holds it, staged
-    /// under the provisional handle that key derives (SYNC §2). Refused
-    /// for a source holding neither a body nor a based binding, since
-    /// nothing could deliver the create.
+    /// under the provisional handle that key derives (SYNC §2). A key the
+    /// source holds there as a tombstone of the same message is revived
+    /// under the handle it is bound to instead, its delete withdrawn and
+    /// no create staged (STORAGE §9, §10). Refused for a source holding
+    /// neither a body nor a based binding, since nothing could deliver
+    /// the create.
     Copy {
         /// The source placement to copy.
         handle: PimdirHandle,
@@ -172,7 +182,10 @@ pub enum PimdirMutation {
     /// copy as [`PimdirChange`](crate::change::PimdirChange) states: the
     /// tombstone's destination is the pending create the store derives
     /// it from (SYNC §3). A held identity is minted, and the create is
-    /// staged under the provisional handle its key derives.
+    /// staged under the provisional handle its key derives. A tombstone
+    /// holding the key is revived as a [`Copy`](Self::Copy) revives it,
+    /// and the tombstone the move leaves then offers no destination, its
+    /// remove a plain delete.
     ///
     /// It states no resolution, so it settles no conflict: meeting one,
     /// the item's or its binding's, it is refused, staging nothing in
@@ -216,7 +229,8 @@ pub enum PimdirMutation {
     ///
     /// Stages a pending create the next sync pushes as an append,
     /// uploading the body, under the provisional handle its key derives.
-    /// Reads no existing source.
+    /// Reads no existing source. A tombstone of the same message holding
+    /// the key is revived as a [`Copy`](Self::Copy) revives it.
     Add {
         /// The item's cross-source link id (a `Message-ID` header).
         link_id: PimdirLinkId,
@@ -502,16 +516,44 @@ pub(crate) fn resolved(met: &[Option<PimdirHash>], resolves: Option<&Vec<PimdirH
     }
 }
 
+/// The source's own `tombstone` revived by a copy, a move or an add of
+/// `from` (STORAGE §9): bound under its handle, base kept, a binding
+/// pinning one handle (§10), its delete withdrawn and taking the body and
+/// flags `from` holds. It offers no destination any more (SYNC §7).
+pub(crate) fn revived(mut tombstone: PimdirPlacement, from: &PimdirPlacement) -> PimdirPlacement {
+    if from.object.is_some() {
+        tombstone.object = from.object.clone();
+        tombstone.level = from.level;
+        if from.summary.is_some() {
+            tombstone.summary = from.summary.clone();
+        }
+        if !from.sort_key.is_unknown() {
+            tombstone.sort_key = from.sort_key.clone();
+        }
+    }
+    if !from.flags.is_unknown() {
+        tombstone.flags = from.flags.clone();
+    }
+    tombstone.status = PimdirStatus::Dirty;
+    tombstone.origin = None;
+    tombstone
+}
+
 /// I/O-free MUTATE coroutine.
 pub struct PimdirMutate {
     collection: PimdirCollectionId,
     mutation: PimdirMutation,
-    /// The source of a staged create, held while the target's keys are read.
+    /// The source of a staged create, or an add's own create, held while
+    /// the target's keys are read.
     source: Option<PimdirPlacement>,
     /// The keys whose holders in the target were read.
     asked: BTreeSet<PimdirLinkId>,
-    /// The keys a live placement of the target holds, of those read.
+    /// The keys a live placement of the target holds, of those read, or a
+    /// tombstone holding another message.
     held: BTreeSet<PimdirLinkId>,
+    /// The tombstones of the target agreeing with the staged create, of
+    /// those read, by key: the create taking one revives it (STORAGE §9).
+    revivable: BTreeMap<PimdirLinkId, PimdirPlacement>,
     /// Whether the run's source syncs the target (SYNC §7).
     syncs_target: bool,
     /// Whether the edited placement's item is conflicted, which a
@@ -532,6 +574,7 @@ impl PimdirMutate {
             source: None,
             asked: BTreeSet::new(),
             held: BTreeSet::new(),
+            revivable: BTreeMap::new(),
             syncs_target: false,
             item_conflicted: false,
             state: State::Start,
@@ -682,18 +725,28 @@ impl PimdirMutate {
             }
             PimdirMutation::Copy { target, .. } => {
                 let key = key.expect("the key a staged create takes");
-                let create = Self::staged_copy(&source, target, key);
+                let create = match self.revivable.get(&key) {
+                    Some(tombstone) => revived(tombstone.clone(), &source),
+                    None => Self::staged_copy(&source, target, key),
+                };
                 vec![PimdirWriteOp::UpsertPlacement(create)]
             }
             PimdirMutation::Move { target, .. } => {
                 let key = key.expect("the key a staged create takes");
-                let create = Self::staged_copy(&source, target, key);
+                let (create, destination) = match self.revivable.get(&key) {
+                    Some(tombstone) => (revived(tombstone.clone(), &source), None),
+                    None => {
+                        let create = Self::staged_copy(&source, target, key);
+                        let destination = PimdirOrigin {
+                            collection: target.clone(),
+                            handle: create.handle.clone(),
+                        };
+                        (create, Some(destination))
+                    }
+                };
 
                 source.status = PimdirStatus::Tombstone;
-                source.origin = Some(PimdirOrigin {
-                    collection: target.clone(),
-                    handle: create.handle.clone(),
-                });
+                source.origin = destination;
 
                 vec![
                     PimdirWriteOp::UpsertPlacement(create),
@@ -708,7 +761,20 @@ impl PimdirMutate {
                 handle: source.handle.clone(),
                 reason: PimdirDropReason::Deleted,
             }],
-            PimdirMutation::Add { .. } => self.create_writes(),
+            PimdirMutation::Add { .. } => {
+                match key.as_ref().and_then(|key| self.revivable.get(key)) {
+                    Some(tombstone) => {
+                        let mut ops = self.create_writes(None);
+                        for op in &mut ops {
+                            if let PimdirWriteOp::UpsertPlacement(create) = op {
+                                *create = revived(tombstone.clone(), create);
+                            }
+                        }
+                        ops
+                    }
+                    None => self.create_writes(key.as_ref()),
+                }
+            }
         }
     }
 
@@ -748,8 +814,10 @@ impl PimdirMutate {
     /// Stages the writes for an [`Add`](PimdirMutation::Add).
     ///
     /// A `Created` placement with no base and no origin, so the next sync
-    /// appends it rather than server-copying, plus its object.
-    fn create_writes(&self) -> Vec<PimdirWriteOp> {
+    /// appends it rather than server-copying, plus its object. It is keyed
+    /// by `key` where one was minted beside a tombstone holding another
+    /// message, else by the add's own key.
+    fn create_writes(&self, key: Option<&PimdirLinkId>) -> Vec<PimdirWriteOp> {
         let PimdirMutation::Add {
             link_id,
             flags,
@@ -761,11 +829,12 @@ impl PimdirMutate {
         else {
             return Vec::new();
         };
+        let key = key.unwrap_or(link_id);
 
         let create = PimdirPlacement {
             collection: self.collection.clone(),
-            handle: link_id.provisional(),
-            link_id: Some(link_id.clone()),
+            handle: key.provisional(),
+            link_id: Some(key.clone()),
             object: Some(object.hash.clone()),
             level: PimdirLevel::Full,
             summary: summary.clone(),
@@ -819,7 +888,43 @@ impl PimdirCoroutine for PimdirMutate {
                         let err = PimdirMutateError::LinkExists(link_id.0.clone());
                         return PimdirCoroutineState::Complete(Err(err));
                     }
-                    self.create_writes()
+                    let tombstone = loaded.placements.into_iter().find(|p| {
+                        p.status == PimdirStatus::Tombstone && p.link_id.as_ref() == Some(link_id)
+                    });
+                    let mut ops = self.create_writes(None);
+                    let create = ops
+                        .iter_mut()
+                        .find_map(|op| match op {
+                            PimdirWriteOp::UpsertPlacement(create) => Some(create),
+                            _ => None,
+                        })
+                        .expect("the create an add stages");
+                    match tombstone {
+                        None => {}
+                        Some(tombstone)
+                            if summary::same_message(
+                                tombstone.summary.as_ref(),
+                                create.summary.as_ref(),
+                            ) =>
+                        {
+                            *create = revived(tombstone, create);
+                        }
+                        Some(_) => {
+                            self.held.insert(link_id.clone());
+                            self.asked.insert(link_id.clone());
+                            let key = link_id
+                                .claim(&link_id.provisional(), |key| self.held.contains(key));
+                            self.asked.insert(key.clone());
+                            self.source = Some(create.clone());
+                            self.state = State::LoadingTarget;
+                            debug!("read what the collection holds of {}", key.as_str());
+                            return PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
+                                collection: self.collection.clone(),
+                                selection: PimdirLoadSelection::Links(vec![key]),
+                            });
+                        }
+                    }
+                    ops
                 } else {
                     let handle = self
                         .mutation
@@ -957,20 +1062,25 @@ impl PimdirCoroutine for PimdirMutate {
             (State::LoadingTarget, Some(PimdirArg::Load(loaded))) => {
                 let source = self.source.take().expect("the source of a staged create");
                 let hint = source.link_id.clone().expect("a linked source");
-                self.held.extend(
-                    loaded
-                        .placements
-                        .into_iter()
-                        .filter(|p| p.status != PimdirStatus::Tombstone)
-                        .filter_map(|p| p.link_id),
-                );
+                for placement in loaded.placements {
+                    let Some(key) = placement.link_id.clone() else {
+                        continue;
+                    };
+                    let agrees =
+                        summary::same_message(placement.summary.as_ref(), source.summary.as_ref());
+                    if placement.status == PimdirStatus::Tombstone && agrees {
+                        self.revivable.insert(key, placement);
+                    } else {
+                        self.held.insert(key);
+                    }
+                }
 
                 let key = hint.claim(&hint.provisional(), |key| self.held.contains(key));
                 if self.asked.insert(key.clone()) {
                     let collection = self
                         .mutation
                         .create_target()
-                        .expect("the target of a staged create")
+                        .unwrap_or(&self.collection)
                         .clone();
                     debug!(
                         "read what {} holds of {}",
@@ -2078,7 +2188,8 @@ mod tests {
         ));
     }
 
-    /// A row on its way out holds no key against a create, as for an `Add`.
+    /// A row on its way out holds no key against a create, as for an `Add`:
+    /// the copy revives it under the handle it is bound to (STORAGE §9).
     #[test]
     fn a_tombstoned_holder_does_not_block_a_copy() {
         let mutation = PimdirMutation::Copy {
@@ -2099,6 +2210,45 @@ mod tests {
             panic!("expected UpsertPlacement, got {:?}", ops[0]);
         };
         assert_eq!(copy.link_id, Some(PimdirLinkId::from("1")));
+        assert_eq!(copy.handle, PimdirHandle::from("a1"));
+        assert_eq!(copy.status, PimdirStatus::Dirty);
+        assert!(copy.base.is_some(), "the binding keeps its base: {copy:?}");
+    }
+
+    /// A tombstone holding another message under the identity is never
+    /// revived by a copy: the copy is minted beside it (STORAGE §9).
+    #[test]
+    fn a_tombstone_holding_another_message_mints_a_copy() {
+        let message = |subject: &str| {
+            Some(PimdirSummary::Mail(summary::mail::PimdirMailSummary {
+                subject: subject.into(),
+                sender: Some("a@x.y".into()),
+                date: Some("2026-08-01T10:00:00Z".into()),
+                ..Default::default()
+            }))
+        };
+        let mutation = PimdirMutation::Copy {
+            handle: PimdirHandle::from("1"),
+            target: "archive".into(),
+        };
+        let mut mutate = PimdirMutate::new("inbox", mutation).syncs_target(true);
+        let _ = mutate.resume(None);
+        let mut source = loaded("1");
+        source.placements[0].summary = message("Hi");
+        let _ = mutate.resume(Some(PimdirArg::Load(source)));
+
+        let mut holder = loaded("1").placements.remove(0);
+        holder.collection = "archive".into();
+        holder.handle = PimdirHandle::from("a1");
+        holder.status = PimdirStatus::Tombstone;
+        holder.summary = message("Another");
+        let ops = stage(&mut mutate, vec![holder]);
+
+        let PimdirWriteOp::UpsertPlacement(copy) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(copy.link_id, Some(PimdirLinkId::from("dup:1#\u{1}1")));
+        assert_eq!(copy.status, PimdirStatus::Created);
     }
 
     /// A mutation touches one row; an `Add` sees only the rows it may hit.
