@@ -321,7 +321,7 @@ pub enum PimdirWriteOp {
     },
     /// Land a relocation's destination create on the handle the relocation
     /// stated (SYNC §4): a `Superseded` drop of the provisional `handle`,
-    /// the binding moved to `landed`, its base the item's flags and body
+    /// the binding moved to `landed`, its base `flags`, the item's body
     /// and `revision`. A binding holding a base naming anything, or none
     /// under `handle`, is left as it is; one whose `landed` the source
     /// already binds in the collection is recorded delivered instead.
@@ -332,6 +332,10 @@ pub enum PimdirWriteOp {
         handle: PimdirHandle,
         /// The handle the relocation stated its member has there.
         landed: PimdirHandle,
+        /// The flags the relocated member carries: the base of the member
+        /// removed, a relocation keeping the flags the server held, so a
+        /// set staged on the create and not pushed yet stays owed.
+        flags: PimdirFlags,
         /// The revision the outcome stated, `None` for mail.
         revision: Option<String>,
     },

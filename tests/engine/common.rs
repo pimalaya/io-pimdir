@@ -295,6 +295,9 @@ pub struct MemRemote {
     /// Whether a push batch is answered with no result at all, as a
     /// connector whose session dropped mid-batch does (SYNC §5).
     pub unanswered: bool,
+    /// Whether a relocation states the handle it gave its member in the
+    /// target, as an IMAP `UID MOVE` answering `COPYUID` does (SYNC §4).
+    pub states_moved: bool,
     /// The global change counter; a delta serves everything past it.
     seq: usize,
     /// Handles removed, stamped with the counter value of their removal.
@@ -675,6 +678,7 @@ impl PimdirRemote for MemRemote {
                     } else {
                         let seq = self.bump();
                         let mut relocated = false;
+                        let mut assigned = None;
                         // NOTE: a missing member is an accept by contract,
                         // the delete having already landed.
                         if let Some(item) = self
@@ -691,8 +695,12 @@ impl PimdirRemote for MemRemote {
                                     PimdirHandle::from(format!("{}-moved", handle.as_str()));
                                 let mut item = item;
                                 item.seq = seq;
-                                self.items.entry(target).or_default().insert(moved, item);
+                                self.items
+                                    .entry(target)
+                                    .or_default()
+                                    .insert(moved.clone(), item);
                                 relocated = true;
+                                assigned = self.states_moved.then_some(moved);
                             }
                         }
                         // NOTE: the outcome states whether it relocated or
@@ -700,7 +708,7 @@ impl PimdirRemote for MemRemote {
                         // §4).
                         PimdirPushResult {
                             relocated,
-                            ..accepted(handle, None, None)
+                            ..accepted(handle, assigned, None)
                         }
                     }
                 }

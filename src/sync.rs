@@ -1890,11 +1890,16 @@ impl PimdirSync {
                         .strip_prefix('\u{1}')
                         .is_some_and(|key| PimdirLinkId::from(key).is_landable())
                 });
+                let carried = local
+                    .base
+                    .as_ref()
+                    .map_or(PimdirFlags::Unknown, |base| base.flags.clone());
                 self.pending.insert(
                     handle.clone(),
                     Pending::Remove {
                         destination: local.origin.clone(),
                         delivered,
+                        carried,
                     },
                 );
                 let to = local.origin.as_ref().map(|o| o.collection.clone());
@@ -2348,9 +2353,10 @@ impl PimdirSync {
             Pending::Remove {
                 destination,
                 delivered,
+                carried,
             } => {
                 self.drop(&result.handle, PimdirDropReason::Deleted);
-                self.relocated(destination, delivered, result);
+                self.relocated(destination, delivered, carried, result);
             }
             Pending::Create(placeholder) => match result.assigned.clone() {
                 Some(assigned) => {
@@ -2393,6 +2399,7 @@ impl PimdirSync {
         &mut self,
         destination: Option<PimdirOrigin>,
         delivered: Option<PimdirOrigin>,
+        carried: PimdirFlags,
         result: &PimdirPushResult,
     ) {
         if !result.relocated {
@@ -2409,6 +2416,7 @@ impl PimdirSync {
                     collection: destination.collection,
                     handle: destination.handle,
                     landed,
+                    flags: carried,
                     revision: result.revision.clone(),
                 });
             }
@@ -3060,6 +3068,9 @@ enum Pending {
         destination: Option<PimdirOrigin>,
         /// The same create where a listing can land it.
         delivered: Option<PimdirOrigin>,
+        /// The flags the member carries into the destination: the base of
+        /// the tombstone, what the source held when it was last listed.
+        carried: PimdirFlags,
     },
     /// A create: the placeholder is superseded by the assigned handle.
     Create(PimdirPlacement),

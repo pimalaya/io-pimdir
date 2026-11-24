@@ -10,7 +10,7 @@
 
 use io_pimdir::{
     mutate::PimdirMutation,
-    placement::{PimdirHandle, PimdirStatus},
+    placement::{PimdirFlags, PimdirHandle, PimdirStatus},
     remote::PimdirTier,
     sync::PimdirSyncOptions,
 };
@@ -277,4 +277,50 @@ fn a_cold_minted_move_synced_target_first_copies_from_its_origin() {
     copy_first("msg-a", false, false);
     copy_first("msg-a", true, false);
     copy_first("msg-a", true, true);
+}
+
+/// A flag set staged before a move rides into the target with it: the
+/// server relocates the member with the flags it held, so a relocation
+/// stating its handle lands the create on the flags it carried, and the
+/// staged set is pushed, never pulled back over (SYNC §4, §5).
+#[test]
+fn a_flag_set_staged_before_a_stated_relocation_is_pushed() {
+    let body = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nbody\r\n";
+    let mut remote = MemRemote::default();
+    remote.states_moved = true;
+    remote.seed("inbox", "i1", "msg-a", &["\\Flagged"], body);
+    let mut client = Client::new(remote);
+    let opts = PimdirSyncOptions::default();
+    client.sync("inbox", opts.clone()).unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    client
+        .upgrade("inbox", vec![PimdirHandle::from("i1")], PimdirTier::Full)
+        .unwrap();
+
+    let staged = PimdirFlags::from_iter(["\\Seen", "$Important"]);
+    client
+        .mutate(
+            "inbox",
+            PimdirMutation::SetFlags {
+                handle: PimdirHandle::from("i1"),
+                flags: staged.clone(),
+                base: None,
+            },
+        )
+        .unwrap();
+    stage_move(&mut client);
+
+    client.sync("inbox", opts.clone()).unwrap();
+    client.sync("archive", opts.clone()).unwrap();
+    client.sync("archive", opts).unwrap();
+
+    assert_eq!(remote_members(&client, "archive"), ["i1-moved"]);
+    assert_eq!(
+        client.remote().flags_of("archive", "i1-moved"),
+        &staged,
+        "the staged flags reach the server",
+    );
+    let landed = client.storage().placement("archive", "i1-moved");
+    assert_eq!(landed.flags, staged, "the staged flags stay in the store");
+    assert_eq!(landed.status, PimdirStatus::Clean);
 }

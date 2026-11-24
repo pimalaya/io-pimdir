@@ -755,13 +755,14 @@ impl PimdirHub {
                 PimdirWriteOp::LandPlacement {
                     handle,
                     landed,
+                    flags,
                     revision,
                     ..
                 } => {
                     let Some(link) = bound.get(handle).cloned() else {
                         continue;
                     };
-                    if self.absorb_landing(source, &link, handle, landed, revision) {
+                    if self.absorb_landing(source, &link, handle, landed, flags, revision) {
                         bound.remove(handle);
                         bound.insert(landed.clone(), link);
                     }
@@ -1077,15 +1078,17 @@ impl PimdirHub {
 
     /// Lands the create `source` binds under the provisional `handle`, found
     /// through `link`, on the handle a relocation stated (SYNC §4): the
-    /// binding moves to `landed`, its base the item's flags and body and
-    /// `revision`, as an add accepted with its handle rebases. A binding
-    /// holding a base naming anything is left as it is. Whether it landed.
+    /// binding moves to `landed`, its base the `flags` the relocated
+    /// member carries, the item's body and `revision`, so a flag set staged
+    /// on the create and not pushed yet stays owed. A binding holding a base
+    /// naming anything is left as it is. Whether it landed.
     fn absorb_landing(
         &mut self,
         source: &PimdirSourceId,
         link: &PimdirLinkId,
         handle: &PimdirHandle,
         landed: &PimdirHandle,
+        flags: &PimdirFlags,
         revision: &Option<String>,
     ) -> bool {
         if !handle.is_provisional() {
@@ -1094,7 +1097,6 @@ impl PimdirHub {
         let Some(item) = self.items.get_mut(link) else {
             return false;
         };
-        let flags = item.flags.clone();
         let object = item.object.clone();
         let Some(binding) = item
             .sources
@@ -1111,7 +1113,7 @@ impl PimdirHub {
         }
         binding.handle = landed.clone();
         binding.base = Some(PimdirBase {
-            flags,
+            flags: flags.clone(),
             revision: revision.clone(),
             object: object.clone(),
         });

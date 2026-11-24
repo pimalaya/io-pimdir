@@ -479,6 +479,7 @@ pub(crate) fn apply(
                 collection,
                 handle,
                 landed,
+                flags,
                 revision,
             } => {
                 let taken = link_for_handle(tx, &collection.0, source, &landed)?.is_some();
@@ -495,6 +496,7 @@ pub(crate) fn apply(
                     collection,
                     handle,
                     landed,
+                    flags,
                     revision,
                 });
             }

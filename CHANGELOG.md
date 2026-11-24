@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- A flag change staged before a move is no longer undone when the relocation states its member's handle (an IMAP `UID MOVE` answering `COPYUID`): the landed create takes as its base the flags the member carries, the removed member's base, rather than the staged ones, so the staged set is pushed instead of pulled back over (pimdir sync-draft-15, vector 214). `PimdirWriteOp::LandPlacement` gains `flags`.
+
 ## [0.20.0] - 2026-11-23
 
 The store follows pimdir's storage-draft-17, the index search-draft-17 and the sync sync-draft-15. Drafts are exact: a store an earlier draft wrote is refused, never migrated, so a user starts over, moving the store directory aside and syncing anew (`neverest` re-creates it); an index of an earlier draft is rebuilt by the indexer. Every CLI sharing a store moves to this release together.

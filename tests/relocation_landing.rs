@@ -62,6 +62,7 @@ fn land(link: &str, landed: &str) -> PimdirWriteOp {
         collection: inbox(),
         handle: provisional(link),
         landed: PimdirHandle::from(landed),
+        flags: PimdirFlags::from_iter(["\\Seen"]),
         revision: None,
     }
 }
