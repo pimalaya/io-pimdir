@@ -150,7 +150,8 @@ impl PimdirLock {
             }
             None => {
                 let file = open(&path)?;
-                FileExt::try_lock(&file).map_err(|_| PimdirError::Owned(dir.to_path_buf()))?;
+                FileExt::try_lock(&file)
+                    .map_err(|err| held(err, || PimdirError::Owned(dir.to_path_buf())))?;
                 let shared = Arc::default();
                 owned.insert(
                     key.clone(),
@@ -230,7 +231,8 @@ impl PimdirLock {
     pub fn collect(dir: &Path) -> Result<Self, PimdirError> {
         let path = dir.join(OBJECTS);
         let file = open(&path)?;
-        FileExt::try_lock(&file).map_err(|_| PimdirError::Staging(dir.to_path_buf()))?;
+        FileExt::try_lock(&file)
+            .map_err(|err| held(err, || PimdirError::Staging(dir.to_path_buf())))?;
         Ok(Self {
             file: Some(file),
             path,
@@ -267,7 +269,7 @@ impl PimdirLock {
     pub fn try_stage(dir: &Path) -> Result<Self, PimdirError> {
         let path = dir.join(OBJECTS);
         let file = open(&path)?;
-        FileExt::try_lock_shared(&file).map_err(|_| PimdirError::Busy)?;
+        FileExt::try_lock_shared(&file).map_err(|err| held(err, || PimdirError::Busy))?;
         Ok(Self {
             file: Some(file),
             path,
@@ -364,6 +366,15 @@ impl Drop for PimdirLock {
         if entry.handles == 0 {
             owned.remove(key);
         }
+    }
+}
+
+/// Reads a lock taken without waiting: held by another is `busy`, any
+/// other failure [`PimdirError::Io`], never told as a holder.
+fn held(err: fs4::TryLockError, busy: impl FnOnce() -> PimdirError) -> PimdirError {
+    match err {
+        fs4::TryLockError::WouldBlock => busy(),
+        fs4::TryLockError::Error(err) => PimdirError::Io(err),
     }
 }
 

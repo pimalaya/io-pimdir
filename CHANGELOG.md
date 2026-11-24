@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a lock that fails for another reason than another holder being reported as one: the owner, staging and probe locks answered `Owned`, `Staging` or `Busy` on any `flock` error, telling the user another process holds the store; such an error is now `PimdirError::Io` with its cause.
+
 ## [0.20.1] - 2026-11-24
 
 ### Fixed

@@ -48,7 +48,9 @@ when the process dies: a crashed owner leaves a lock file that locks nothing, an
 no stale-lock recovery is needed or offered.
 
 An owner that cannot take the lock SHALL fail immediately with
-`PimdirError::Owned`, naming the store. It SHALL NOT wait: a daemon syncing a
+`PimdirError::Owned`, naming the store. A lock that fails for any other reason
+than another holder SHALL be `PimdirError::Io`, never `Owned`, `Staging` or
+`Busy`. It SHALL NOT wait: a daemon syncing a
 large mailbox holds its transaction long enough that a bounded wait is neither a
 wait nor a failure, just a stall with no signal, and retrial policy (retry, back
 off, queue the intent, tell the user) belongs to the program on top.
