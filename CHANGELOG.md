@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-11-25
+
 ### Fixed
 
 - Fixed a store closed and opened again in one process reported owned by another process (`PimdirError::Owned`) when another thread was spawning a child: the child holds a copy of the locked description until its `exec`, and the release only closed this process's descriptor. A release now unlocks the description before closing it, the owner lock and the staging lock alike (seen as himalaya's `pimdir_queue` test failing in CI, 5 of 80 parallel runs).
@@ -1474,7 +1476,8 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.3..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.4..HEAD
+[0.20.4]: https://github.com/pimalaya/io-pimdir/compare/v0.20.3..v0.20.4
 [0.20.3]: https://github.com/pimalaya/io-pimdir/compare/v0.20.2..v0.20.3
 [0.20.2]: https://github.com/pimalaya/io-pimdir/compare/v0.20.1..v0.20.2
 [0.20.1]: https://github.com/pimalaya/io-pimdir/compare/v0.20.0..v0.20.1
