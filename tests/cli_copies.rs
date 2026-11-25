@@ -33,7 +33,7 @@ fn pimdir(dir: &Path, args: &[&str]) -> (i32, Value) {
 
 /// A store holding `ids` as messages of its INBOX, no handle left open.
 fn populated(dir: &Path, ids: &[&str]) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut producer = PimdirProducer::open(dir, "test").unwrap();
     for id in ids {

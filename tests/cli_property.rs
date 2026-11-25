@@ -25,7 +25,7 @@ const BODY: &str = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
 
 /// A store holding one message in INBOX, bound by `imap`; answers its seq.
 fn store(dir: &Path) -> i64 {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .write(vec![

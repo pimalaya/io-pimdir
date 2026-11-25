@@ -20,15 +20,15 @@ use anyhow::Result;
 use clap::{ArgGroup, Args, ValueEnum};
 use io_pimdir::{
     client::search::{
-        PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchCursor,
-        PimdirSearchHit, PimdirSearchMatched, PimdirSearchOptions, PimdirSearchPlacement,
-        PimdirSearchSort, PimdirSearchThread,
+        PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchHit,
+        PimdirSearchMatched, PimdirSearchOptions, PimdirSearchPlacement, PimdirSearchThread,
     },
     placement::PimdirLevel,
     search::{
         coverage::{
             self, PimdirSearchCoverage, PimdirSearchReads, PimdirSearchRemote, PimdirSearchTemporal,
         },
+        plan::{PimdirSearchCursor, PimdirSearchSort},
         query::PimdirQuery,
         tag::PimdirSearchTagSource,
     },
@@ -406,7 +406,7 @@ impl TagCommand {
             let owner = match store.owner_if_free()? {
                 None => None,
                 Some(owner) => {
-                    let mut owner = owner.for_source(source);
+                    let mut owner = owner.for_source(source).map_err(report)?;
                     match owner.drain() {
                         Err(io_pimdir::client::PimdirError::Busy) => None,
                         Err(err) => return Err(report(err)),

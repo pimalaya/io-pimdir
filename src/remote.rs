@@ -57,8 +57,8 @@ pub enum PimdirTier {
 /// the summary and address rows and the sort key of STORAGE Annex A.
 ///
 /// Every member a listing carries carries it, read in the listing itself
-/// (an IMAP `ENVELOPE` with the header fields Annex A needs, a Graph
-/// `$select`, Gmail's metadata, a JMAP `Email/get`), so nothing reaches
+/// (an IMAP `ENVELOPE` with the header fields Annex A needs, a REST API's
+/// field selection, a JMAP `Email/get`), so nothing reaches
 /// the store unnamed. A kind whose meta is the body (DAV) fetches each
 /// page's bodies before it hands the page over, and MAY carry the body.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,7 +79,7 @@ pub struct PimdirRemoteMeta {
     /// The body, when the listing read it (DAV); `None` otherwise.
     pub body: Option<PimdirFetchedBody>,
     /// The id the source's server gives the member's content, where it
-    /// states one (SYNC §4): RFC 8474's `EMAILID`, Gmail's `X-GM-MSGID`,
+    /// states one (SYNC §4): RFC 8474's `EMAILID`, a provider's own message id,
     /// JMAP's `Email/id`. Opaque, comparable only between members of one
     /// source; never one the connector derives itself. An upgrade links no
     /// body between two bindings stating different ones (SYNC §6).
@@ -150,8 +150,8 @@ pub struct PimdirRemoteSnapshot {
     /// local placements without indexing it. An unsorted page is sorted
     /// by the engine and a repeated handle collapsed to its first item.
     pub items: Vec<PimdirRemoteItem>,
-    /// Handles the source states removed (an IMAP `VANISHED`, a Graph
-    /// `@removed`), which apply whatever the scope.
+    /// Handles the source states removed (an IMAP `VANISHED`, a REST delta's
+    /// removal entries), which apply whatever the scope.
     pub vanished: Vec<PimdirHandle>,
     /// Whether the page belongs to a round (true) or a delta (false).
     pub complete: bool,
@@ -162,7 +162,7 @@ pub struct PimdirRemoteSnapshot {
     pub cursor: Option<PimdirCursor>,
     /// The checkpoint, on the page where the source gives one: a delta's,
     /// a round's first where the source gives it up front (IMAP
-    /// `HIGHESTMODSEQ`, Gmail's `historyId`), its last for Graph.
+    /// `HIGHESTMODSEQ`, a history id), its last for a REST delta.
     pub checkpoint: Option<PimdirCheckpoint>,
     /// Whether a date filter narrowed the round's listing, set on every
     /// page of such a round and on no other page (SYNC §4, §5).
@@ -170,7 +170,7 @@ pub struct PimdirRemoteSnapshot {
     /// A filter lists a member only when it matches, so it misses an
     /// undated member, one whose `Date` runs ahead of its arrival and one
     /// received long after its `Date`: IMAP `SENTSINCE`, JMAP `after`,
-    /// Graph's `receivedDateTime` and Gmail's `after:` and `before:` each
+    /// a REST filter on the received date and a search's date operators each
     /// narrow. The round then finds absent only a member
     /// [`enumerated`](Self::enumerated) lacks, and none without it.
     pub narrowed: bool,
@@ -180,7 +180,7 @@ pub struct PimdirRemoteSnapshot {
     ///
     /// A connector offering such an enumeration SHOULD hand it: IMAP's
     /// `UID SEARCH ALL`, JMAP's `Email/query` filtered by the mailbox
-    /// alone, Graph's message ids of the folder. The round finds absent
+    /// alone, a REST listing of the folder's ids. The round finds absent
     /// a member in scope whose handle it lacks, whatever its date, and
     /// never one whose handle it holds.
     pub enumerated: Option<Vec<PimdirHandle>>,
@@ -265,7 +265,7 @@ impl PimdirRemoteSnapshot {
 /// A connector states it as it states
 /// [`scope_bound`](PimdirRemote::scope_bound), from what the source
 /// offers: IMAP lists delta heads with QRESYNC and band heads without
-/// it, Gmail and JMAP delta heads, Graph band heads, a connector that
+/// it, JMAP and a change history delta heads, a REST delta band heads, one that
 /// cannot list one before its round closes none.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PimdirHeads {
@@ -319,7 +319,7 @@ pub enum PimdirHead {
     /// members added or changed, each with its flags and meta, the
     /// handles the source states removed, and the checkpoint the source
     /// holds now, which the page MUST carry (IMAP: a QRESYNC `SELECT`
-    /// with `CHANGEDSINCE`; Gmail: the history since the history id;
+    /// with `CHANGEDSINCE`; a change history: the history since its id;
     /// JMAP: `Email/changes`; DAV: `sync-collection`). The engine stamps
     /// the members with the round's id and the round closes on that
     /// checkpoint, unless a later page carries a newer one.
@@ -333,8 +333,8 @@ pub enum PimdirHead {
     /// Every member the source dates at or after `since` less a margin
     /// of two days, by an instant it keeps for each member that never
     /// moves back: the last time the member changed where the source
-    /// states it and can filter on it, else when it arrived (Graph's
-    /// `receivedDateTime`, IMAP's `INTERNALDATE` through `SEARCH SINCE`).
+    /// states it and can filter on it, else when it arrived (a REST
+    /// received date, IMAP's `INTERNALDATE` through `SEARCH SINCE`).
     /// The page carries no checkpoint and no vanished handle, a listing
     /// by date stating no removal, and the engine stamps none of its
     /// members.
@@ -418,12 +418,12 @@ impl PimdirEnumerate {
 pub enum PimdirEnumerated {
     /// One page of the listing asked for.
     Page(PimdirRemoteSnapshot),
-    /// The source refused the resume cursor (an expired Graph skip token,
-    /// a Gmail page token): the round restarts under a new id rather than
+    /// The source refused the resume cursor (an expired skip token or
+    /// page token): the round restarts under a new id rather than
     /// the connector answering from the beginning as if it resumed.
     CursorRejected,
     /// The source refused the position a head was asked from (an expired
-    /// Gmail history id, a JMAP state it can no longer calculate changes
+    /// history id, a JMAP state it can no longer calculate changes
     /// from, a DAV sync token refused as invalid): the checkpoint the
     /// round would close with is void, so the round restarts over the
     /// run's scope, never a band (SYNC §5). A moved handle space (an
@@ -520,7 +520,6 @@ pub struct PimdirFetchedItem {
 /// holds (`423`) or a quota exceeded (an IMAP `NO [OVERQUOTA]`), each of
 /// which may pass with the change as it stands.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum PimdirPushOutcome {
     /// The remote accepted the change.
     Accepted,
@@ -532,7 +531,7 @@ pub enum PimdirPushOutcome {
     /// The remote refused the change itself, as it stands, for good: an
     /// HTTP status from 400 to 499 but 401, 407, 408, 409, 412, 423, 425
     /// and 429, an IMAP `NO` naming the command, an error naming a rule the
-    /// change breaks (an append into a Graph folder other than Drafts, a
+    /// change breaks (an append into a folder taking drafts alone, a
     /// floating time a calendar API refuses, a size exceeded).
     ///
     /// Left pending, the refusal recorded on the binding: the engine holds
@@ -607,8 +606,8 @@ pub trait PimdirRemote {
     ) -> Result<Vec<PimdirPushResult>, Self::Error>;
 
     /// Whether this connector's checkpoint is bound to the scope it was
-    /// made under (SYNC §4): a Graph delta link made under a `$filter`
-    /// is; IMAP `CHANGEDSINCE`, Gmail's history and JMAP's state, all
+    /// made under (SYNC §4): a REST delta link made under a server filter
+    /// is; IMAP `CHANGEDSINCE`, a change history and JMAP's state, all
     /// filtered locally, are not, and such a connector widening a scope
     /// lists only the band its coverage lacks. Bound by default, which
     /// always relists the whole wider scope.

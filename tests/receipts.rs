@@ -28,7 +28,7 @@ const DRAFT: &str = "Message-ID: <draft@example.org>\r\nFrom: a@example.org\r\nT
 /// An empty store with an INBOX and a Drafts, owned by source `local`,
 /// which syncs the INBOX.
 fn store(dir: &Path) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store.ensure_collection("Drafts", "message/rfc822").unwrap();
     store
@@ -52,7 +52,7 @@ fn add(producer: &PimdirProducer, body: &str) -> (PimdirAction, PimdirObject) {
 }
 
 fn drain(dir: &Path) {
-    let mut owner = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     owner.drain().unwrap();
 }
 
@@ -280,7 +280,10 @@ fn an_acknowledged_intent_reads_applied_and_a_dropped_one_nowhere() {
         panic!("the drain leaves a submit pending");
     };
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     assert!(owner.acknowledge_action(sent, None).unwrap());
     assert!(!owner.acknowledge_action(sent, None).unwrap());
     assert!(owner.drop_action(withdrawn).unwrap());
@@ -314,7 +317,10 @@ fn a_parked_intent_is_acknowledged_too() {
         .handle
         .id;
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     owner.fail_action(id, Some("refused")).unwrap();
     let PimdirActionStatus::Parked { .. } = producer.action_status(id).unwrap() else {
         panic!("the failure parks the intent");
@@ -348,7 +354,10 @@ fn a_receipt_outlives_its_collection_and_names_none() {
     };
     assert!(created.is_some());
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     assert!(owner.delete_collection("Drafts").unwrap());
     drop(owner);
 
@@ -374,7 +383,10 @@ fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
         .handle
         .id;
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     let copy = PimdirAction::Add {
         link_id: None,
         flags: PimdirFlags::from_iter(["\\Seen"]),
@@ -477,7 +489,10 @@ fn a_refusal_shows_on_the_receipt_and_keeps_it_until_cleared() {
 
     // NOTE: what the engine writes on a Refused outcome (SYNC §5), a
     // server's text carrying a credential the store never keeps (§18).
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     owner
         .write(vec![PimdirWriteOp::RefusePlacement {
             collection: PimdirCollectionId::from("Drafts"),
@@ -584,6 +599,7 @@ fn a_submit_queued_before_a_rename_files_its_copy_in_the_renamed_collection() {
     PimdirStore::open(dir.path())
         .unwrap()
         .for_source("local")
+        .unwrap()
         .ensure_collection("Sent", "message/rfc822")
         .unwrap();
 
@@ -593,7 +609,10 @@ fn a_submit_queued_before_a_rename_files_its_copy_in_the_renamed_collection() {
     enqueue_submit(&mut producer, "INBOX", "Drafts");
     drop(producer);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     let parked = owner.list_pending_actions().unwrap()[1].id;
     owner.fail_action(parked, Some("refused")).unwrap();
     owner.rename_collection("Sent", "Sent Items").unwrap();

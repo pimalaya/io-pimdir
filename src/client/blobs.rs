@@ -62,14 +62,14 @@ const DEFERRED_MAX: usize = 256;
 /// move, and every move and shard directory flush ends before the commit.
 ///
 /// The default on Linux is [`Deferred`](Self::Deferred) with the writeback
-/// started by `sync_file_range` ([`start_writeback`]), which took a 517k
+/// started by `sync_file_range` (`start_writeback`), which took a 517k
 /// message import's sync from 572 s to 305 s; [`Each`](Self::Each)
 /// elsewhere.
 #[derive(Clone, Copy, Debug)]
 pub enum PimdirBodyFlush {
     /// Each temporary flushed as soon as it is written, then moved.
     Each,
-    /// The temporaries of a batch written first, [`DEFERRED_MAX`] at most
+    /// The temporaries of a batch written first, `DEFERRED_MAX` at most
     /// open at once, then each flushed, then each moved: a flush finds
     /// the writeback the hint started mostly done.
     Deferred {
@@ -99,7 +99,7 @@ impl Default for PimdirBodyFlush {
 /// (`sync_file_range` with `SYNC_FILE_RANGE_WRITE`): a hint, the flush
 /// that follows deciding, so its failure is ignored.
 #[cfg(target_os = "linux")]
-pub fn start_writeback(file: &fs::File) {
+pub(crate) fn start_writeback(file: &fs::File) {
     use std::os::fd::AsRawFd;
 
     // SAFETY: the descriptor is open for as long as `file` is borrowed,
@@ -951,7 +951,7 @@ impl Drop for PimdirBlobWriter {
 /// Every write of the store moves its temporary so; an app writing bodies
 /// itself moves them through [`run`](Self::run).
 #[derive(Clone, Copy, Debug)]
-pub struct PimdirBlobMove {
+pub(crate) struct PimdirBlobMove {
     /// Whether the move may call `renameat2`: false where a system call
     /// filter ends the process on it (Android before API 30).
     pub renameat2: bool,
@@ -982,7 +982,7 @@ impl PimdirBlobMove {
 
 /// What a [`PimdirBlobMove`] did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PimdirBlobFiled {
+pub(crate) enum PimdirBlobFiled {
     /// The moved file now holds the name.
     Moved,
     /// The name was already held, and kept: the file is where it was.

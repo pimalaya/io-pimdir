@@ -14,16 +14,16 @@ use io_pimdir::{
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
         PimdirStore,
-        search::{
-            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchOptions,
-            PimdirSearchSort,
-        },
+        search::{PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchOptions},
     },
     collection::PimdirCollectionId,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirPlacement, PimdirStatus,
     },
-    search::{plan::PimdirPlanForce, query::PimdirQuery},
+    search::{
+        plan::{PimdirPlanForce, PimdirSearchSort},
+        query::PimdirQuery,
+    },
     summary::{PimdirAddress, PimdirSummary, mail::PimdirMailSummary},
 };
 use log::{LevelFilter, Log, Metadata, Record};
@@ -125,7 +125,7 @@ fn seed(dir: &Path) {
         let owner = PimdirStore::open(dir).unwrap().for_account(account);
         owner.ensure_collection(id, "message/rfc822").unwrap();
         drop(owner);
-        let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+        let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
         let ops = (0..count)
             .map(|i| {
                 let (handle, flags, summary) = mail(id, i);
@@ -548,7 +548,10 @@ fn a_patched_cache_is_the_one_read_whole() {
         .ensure_collection("play/INBOX", "message/rfc822")
         .unwrap();
     drop(owner);
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     let mut ops = Vec::new();
     for i in 0..20 {
         let (handle, _, summary) = mail("work/INBOX", i);
@@ -595,7 +598,10 @@ fn a_patched_cache_is_the_one_read_whole() {
         "patched as read whole"
     );
 
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     let ops = (30..40)
         .map(|i| PimdirWriteOp::DropPlacement {
             collection: PimdirCollectionId("play/INBOX".into()),

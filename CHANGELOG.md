@@ -12,6 +12,9 @@ The store follows pimdir's storage-draft-18, the index search-draft-18 and the s
 
 - **BREAKING**: Added `PimdirMutateError::Unsynced` (`target-unsynced`) and `PimdirMutate::target_synced`: a copy or a move into a collection no source syncs, holding no binding nor checkpoint there, is refused, staging nothing in either collection, and a queued `move` or `copy` there parks (pimdir SYNC §7, STORAGE §15.3). An exhaustive `match` on the enum needs the arm.
 - Added `PimdirMutation::create_target` to the public API, the collection a runner of its own loads and writes as the source a copy's or a move's create is staged under.
+- Added `PimdirSourceStore::register`: records the source as syncing each collection given, the collection ensured and a `sources` row with no checkpoint added where none is held, a held checkpoint kept, in one owner write, answering the rows added.
+- Added `PimdirError::SourceEmpty` (code `source-empty`).
+- Added a CI job building with Rust 1.89, the stated MSRV, a check of the feature sets consumers build (the default, `client` alone, `client`, `search` and `indexer`), and `cargo semver-checks` against 1.0.0 once it is published.
 
 ### Changed
 
@@ -20,12 +23,27 @@ The store follows pimdir's storage-draft-18, the index search-draft-18 and the s
 - **BREAKING**: Changed the index to pimdir's search-draft-18 (`sql::search::FORMAT_VERSION`, `FORMAT_DRAFT` 18): an index of search-draft-17 is rebuilt by the indexer and refused by a query client.
 - **BREAKING**: Added the field `point` to `PimdirQueryDateRange`, whether a date value is one point rather than a range; a struct literal states it.
 - Changed `FIELDS` to follow pimdir SEARCH §8's table, `flag:` before `is:`.
+- Changed `PimdirStore::for_source` to answer a `Result`, refusing an empty source id as `PimdirError::SourceEmpty` before anything is written.
+- Changed `client::PimdirRunError` to `client::run::PimdirRunError`, the module public and the re-export removed.
+- Changed `client::search::PimdirSearchCursor` and `client::search::PimdirSearchSort` to `search::plan::PimdirSearchCursor` and `search::plan::PimdirSearchSort`, the re-export removed.
+- Renamed `search::chunk::Chunks` to `search::chunk::PimdirChunks`.
+- Renamed `load::PimdirRefusal` to `load::PimdirBindingRefusal`, apart from `capability::PimdirRefusal`.
+- Marked `search::query::PimdirQueryErrorCode` `#[non_exhaustive]`, beside `PimdirError`, `PimdirSyncEvent`, `PimdirEnumerated` and `PimdirWaitReason`.
+- Made crate-private the items no consumer, test or public signature names: `capability::{is_name, intent_capability, required_by_content, required, gating, is_vtodo, check_vtodo}`; `client::blobs::{PimdirBlobMove, PimdirBlobFiled, start_writeback}`; `client::modes::exposed`; `codec::{MARKS, level_to_int, level_from_int, conflict_to_str}`; `collection::role_of_kind`; `hub::PimdirOverruled`; `intent::recurrence_id`; `property::{MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_VALUES, PimdirPropertyChange, PimdirPropertyOverflow, is_key, is_writable_key, is_value, same, change}`; `search::plan::{CAP, PimdirPlan, PimdirPlanScope, PimdirPlanNode, PimdirPlanLeaf, PimdirPlanEstimate, PimdirPlanBound, PimdirPlanCosts, PimdirPlanExtent, PimdirPlanDriver, PimdirPlanAccess, PimdirPlanChoice, PimdirWalk, PimdirWalkCollection, PimdirWalkStep, PimdirWalkRow, PimdirWalkOutput, media_type}`; `search::query::{RELATIVE_DIGITS_MAX, STAMP_DIGITS_MAX, FIELDS}`; `search::tag::flags`; `summary::calendar::occurrences`; `summary::mail::meta_attachment`; `version::{PimdirProfile, PimdirFormat, PimdirProgram, PimdirStoreVersion, PimdirVersionRefusal}`.
+- Made crate-private the methods no consumer or test calls: `PimdirSourceStore::prune_receipts`, `PimdirAction::retarget`, `PimdirScope::malformed_bound`, `PimdirHubItem::stored_level`, `PimdirHub::release_shared`, `PimdirSubmit::to_payload`, `PimdirExtract::mail_text`, `PimdirQueryDate::{is_relative, first_day, day_after}`, `PimdirIndexFeedRow::is_live`, `PimdirParked::guard`.
+- Made crate-private this crate's own statements, their text still given by name through `sql::all` and `sql::search::all`: `sql::{OBJECT_STATS, LIST_OBJECT_HASHES, LIVE_BYTES, OBJECT_SIZE, COUNT_RETAINED_BEFORE, REFCOUNT_DRIFT, ACCOUNTS_AND_KINDS, MINTED_KEYS, DANGLING_BINDINGS, DANGLING_ITEM_OBJECTS, DANGLING_QUEUE_OBJECTS, DELETE_DANGLING_BINDINGS, COUNT_BODILESS, ROLL_COVERAGE}` and the 23 of `sql::search::OWN`.
+
+### Removed
+
+- Removed `search::plan::is_undated`, `PimdirPlanScope::admits` and `PimdirPushRights::none`, used nowhere.
+- Removed `#[non_exhaustive]` from `remote::PimdirPushOutcome`, which consumers build and no consumer matches.
 
 ### Fixed
 
 - Fixed a copy or a move whose run's source does not sync its target staging the create under that source, which never pushed it, while another source of the target was offered the item, pushed it and left the stray pending create standing: the create is now staged under the source an `add` into the target runs as, the owner's own where it syncs the target, else the first source syncing it, with no origin of the run's source, the target loaded and written as that source in the transaction of the move's tombstone, through `PimdirSourceStore::mutate` and the drain alike, so that source's own tombstone of the identity is the one revived (pimdir SYNC §7, STORAGE §15.2; vectors 227, 228 and 230).
 - Fixed a date range from a relative amount to itself (`date:2w..2w`) answering the span from that instant to now: a relative amount runs to now only as a single point, a side of a range spanning its instant alone, so the range is empty (pimdir SEARCH §8.1).
 - Fixed `linked:` naming a role and no id (`linked:sender:`) read as the link id `sender:`: it is refused `invalid-value` (pimdir SEARCH §8).
+- Fixed `PimdirReader::pending_arrivals` failing the whole listing on a move or a copy whose payload does not decode: the row is listed as `PimdirAction::Unknown`, its kind and payload verbatim, as `pending_actions` lists it (STORAGE §15.4).
 
 ## [0.20.4] - 2026-11-25
 

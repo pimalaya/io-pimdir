@@ -150,7 +150,7 @@ impl core::error::Error for PimdirSearchTagError {}
 
 /// The flags of a tag's values (SEARCH §8): an `is:` spelling naming a
 /// flag's presence read as that flag, any other value as written.
-pub fn flags(values: &[String]) -> Result<BTreeSet<String>, PimdirSearchTagError> {
+pub(crate) fn flags(values: &[String]) -> Result<BTreeSet<String>, PimdirSearchTagError> {
     values
         .iter()
         .map(|value| match value.as_str() {

@@ -77,7 +77,10 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
         ..Default::default()
     };
     let mut index = PimdirIndex::open(&root).unwrap();
-    let mut owner = PimdirStore::open(&root).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(&root)
+        .unwrap()
+        .for_source("local")
+        .unwrap();
 
     let mut differences = Vec::new();
     for (step, write) in writes(&drained).into_iter().enumerate() {

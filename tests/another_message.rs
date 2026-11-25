@@ -61,11 +61,11 @@ fn named(handle: &str, subject: &str, sender: &str) -> PimdirWriteOp {
 
 /// A store where source a holds `HELD`, the stand-up notes, and source b.
 fn stores(dir: &std::path::Path) -> (PimdirSourceStore, PimdirSourceStore) {
-    let mut a = PimdirStore::open(dir).unwrap().for_source("a");
+    let mut a = PimdirStore::open(dir).unwrap().for_source("a").unwrap();
     a.ensure_collection("INBOX", "message/rfc822").unwrap();
     a.write(vec![named("10", "Stand-up notes", "alice@example.org")])
         .unwrap();
-    let b = PimdirStore::open(dir).unwrap().for_source("b");
+    let b = PimdirStore::open(dir).unwrap().for_source("b").unwrap();
     (a, b)
 }
 
@@ -222,7 +222,7 @@ fn archived(
     subject: Option<&str>,
     body: Option<&[u8]>,
 ) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     store
         .ensure_collection("Archive", "message/rfc822")
         .unwrap();

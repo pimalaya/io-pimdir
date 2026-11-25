@@ -88,7 +88,10 @@ fn projected(store: &PimdirSourceStore) -> Vec<PimdirPlacement> {
 }
 
 fn opened(dir: &std::path::Path) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source("remote");
+    let store = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
 }
@@ -479,7 +482,10 @@ fn drained(
     let (action, object) = queued(&producer);
     producer.enqueue("INBOX", &action, object.as_ref()).unwrap();
     drop(producer);
-    let mut store = PimdirStore::open(dir).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.drain().unwrap();
     let parked = store.parked_actions().unwrap();
     assert!(parked.is_empty(), "nothing parks: {parked:?}");

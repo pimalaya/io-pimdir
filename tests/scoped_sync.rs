@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 use io_pimdir::{
     change::{PimdirChange, PimdirWriteOp},
     client::{
-        PimdirError, PimdirRunError, PimdirStore,
+        PimdirError, PimdirStore,
         reader::{PimdirMailFilter, PimdirMailSum, PimdirReader, like_pattern},
+        run::PimdirRunError,
     },
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     hash,
@@ -126,7 +127,10 @@ fn since(date: &str) -> PimdirSyncOptions {
 #[test]
 fn an_interrupted_round_resumes_and_closes_with_its_coverage() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let recent = message(
         "a@x",
@@ -181,7 +185,10 @@ fn an_interrupted_round_resumes_and_closes_with_its_coverage() {
 #[test]
 fn an_arrival_during_a_round_is_listed_by_its_head() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("gmail");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("gmail")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let recent = message(
         "a@x",
@@ -259,7 +266,10 @@ fn an_arrival_during_a_round_is_listed_by_its_head() {
 fn a_collection_is_listed_with_the_narrowest_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let body = message("a@x", "Hi", "Mon, 5 Oct 2026 10:00:00 +0000", "text/plain");
-    let mut imap = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut imap = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     imap.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     let mut remote = Paged {
@@ -270,7 +280,10 @@ fn a_collection_is_listed_with_the_narrowest_coverage() {
         .unwrap();
     drop(imap);
 
-    let mut phone = PimdirStore::open(dir.path()).unwrap().for_source("phone");
+    let mut phone = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("phone")
+        .unwrap();
     let mut remote = Paged {
         pages: vec![page(vec![member("p1", &[], &body)], Some("next"))],
         ..Default::default()
@@ -298,7 +311,10 @@ fn a_collection_is_listed_with_the_narrowest_coverage() {
 #[test]
 fn a_scope_on_another_kind_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("dav");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("dav")
+        .unwrap();
     store.ensure_collection("Contacts", "text/vcard").unwrap();
 
     let refused = store
@@ -320,7 +336,10 @@ fn a_scope_on_another_kind_is_refused() {
 #[test]
 fn a_scope_bound_of_another_shape_is_refused_before_any_write() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let inbox = PimdirCollectionId::from("INBOX");
 
@@ -382,7 +401,10 @@ fn a_scope_bound_of_another_shape_is_refused_before_any_write() {
 #[test]
 fn evicting_below_a_date_keeps_what_is_owed() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let old = message(
         "old@x",
@@ -458,7 +480,10 @@ fn evicting_below_a_date_keeps_what_is_owed() {
 #[test]
 fn releasing_bodies_below_a_date_keeps_the_headers() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let old = message(
         "old@x",
@@ -557,7 +582,10 @@ fn releasing_bodies_below_a_date_keeps_the_headers() {
 #[test]
 fn the_mail_readers_count_page_and_search_across_collections() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .ensure_collection("Archive", "message/rfc822")
@@ -692,7 +720,10 @@ fn the_mail_readers_count_page_and_search_across_collections() {
 #[test]
 fn the_mail_readers_take_a_floor_and_sum_a_range() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .ensure_collection("Archive", "message/rfc822")
@@ -843,7 +874,10 @@ fn an_undated_member_unlisted_by_a_round_is_dropped() {
     for shape in ["no date", "empty", "none"] {
         for resumed in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+            let mut store = PimdirStore::open(dir.path())
+                .unwrap()
+                .for_source("imap")
+                .unwrap();
             store.ensure_collection("INBOX", "message/rfc822").unwrap();
             let mut remote = Paged {
                 pages: vec![page(
@@ -945,7 +979,10 @@ fn a_band_round_keeps_an_undated_member_it_does_not_list() {
     for shape in ["no date", "empty", "none"] {
         for resumed in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+            let mut store = PimdirStore::open(dir.path())
+                .unwrap()
+                .for_source("imap")
+                .unwrap();
             store.ensure_collection("INBOX", "message/rfc822").unwrap();
             // NOTE: the first round over 2026-09-01 lists the old member
             // too, a page naming every member it carries.
@@ -1089,7 +1126,7 @@ fn round_left_open(
     dir: &std::path::Path,
     first: bool,
 ) -> (io_pimdir::client::PimdirSourceStore, Paged) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("graph");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("graph").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let recent = message(
         "recent@x",

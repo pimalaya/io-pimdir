@@ -45,7 +45,7 @@ const COLLECTION: &str = "imap/INBOX";
 /// flagged, half carrying a keyword and one in thirteen another, one in
 /// eleven with flags never read.
 fn seed(dir: &Path, n: usize) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     store
         .ensure_collection(COLLECTION, "message/rfc822")
         .unwrap();

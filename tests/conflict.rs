@@ -95,7 +95,7 @@ fn blob_exists(dir: &std::path::Path, name: &str) -> bool {
 }
 
 fn seed(dir: &std::path::Path) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source("left");
+    let store = PimdirStore::open(dir).unwrap().for_source("left").unwrap();
     store.ensure_collection("contacts", "text/vcard").unwrap();
     store
 }
@@ -157,7 +157,10 @@ fn a_conflict_survives_a_reopen() {
 
     // Reopened from disk: the merge must still see the conflict, or it
     // re-derives the push the remote already rejected.
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
     let loaded = store.load(&contacts(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(loaded.placements.len(), 1);
     assert_eq!(loaded.placements[0].status, PimdirStatus::Conflict);
@@ -204,7 +207,10 @@ fn resolving_the_conflict_clears_it_and_adopts_the_merged_body() {
         .unwrap();
     drop(store);
 
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
     let loaded = store.load(&contacts(), &PimdirLoadSelection::All).unwrap();
     assert_ne!(loaded.placements[0].status, PimdirStatus::Conflict);
     assert_eq!(

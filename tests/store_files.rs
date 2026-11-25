@@ -45,7 +45,7 @@ fn chmod(path: &Path, mode: u32) {
 /// applied, then its body flipped and drained again, so objects/, a shard,
 /// a blob, both lock files and quarantine/ all exist.
 fn populated(dir: &Path) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     let mut producer = PimdirProducer::open(dir, "test").unwrap();

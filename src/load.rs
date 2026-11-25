@@ -113,14 +113,14 @@ pub struct PimdirLoaded {
     /// The refusals standing on the source's loaded bindings, by handle
     /// (`list_refusals`, SYNC §5): a change derived under the key one
     /// names is held and reported, never pushed.
-    pub refused: Vec<(PimdirHandle, PimdirRefusal)>,
+    pub refused: Vec<(PimdirHandle, PimdirBindingRefusal)>,
 }
 
 /// A refusal standing on a binding of the loaded source (SYNC §5): the
 /// key of the change the remote refused for good and the reason it gave,
 /// as `list_refusals` reads them.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirRefusal {
+pub struct PimdirBindingRefusal {
     /// The idempotency key of the refused change (SYNC §4): a change
     /// derived under it is held, one derived under another pushed.
     pub key: PimdirChangeKey,

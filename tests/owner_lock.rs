@@ -109,8 +109,14 @@ fn one_process_owning_a_store_twice_is_one_owner() {
 
     // A two-sided sync opens one handle per source, and a multi-account owner
     // one per account: the lock is the process's, taken once and shared.
-    let left = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let right = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let left = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
+    let right = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     assert!(!unowned(dir.path()));
 
     drop(left);

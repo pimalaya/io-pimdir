@@ -1193,7 +1193,7 @@ impl PimdirIndexFeedRow {
     }
 
     /// Whether it is live: neither deleted nor retained.
-    pub fn is_live(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         !self.deleted && !self.retained
     }
 

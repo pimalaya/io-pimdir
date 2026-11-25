@@ -48,7 +48,7 @@ fn placement(handle: &str, local: &[&str], base: &[&str]) -> PimdirPlacement {
 }
 
 fn seeded(dir: &Path, placements: Vec<PimdirPlacement>) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let batch = placements.into_iter().map(PimdirWriteOp::UpsertPlacement);
     store.write(batch.collect()).unwrap();

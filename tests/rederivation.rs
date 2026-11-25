@@ -83,7 +83,7 @@ fn store() -> tempfile::TempDir {
     store.ensure_collection("Tasks", "text/calendar").unwrap();
     store.put_item("Tasks", TASK).unwrap();
 
-    let mut store = store.for_source("imap");
+    let mut store = store.for_source("imap").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut ops = file(0, "(relay) <m0@example.org>", &message(0));
     for n in 1..300 {

@@ -140,7 +140,7 @@ impl PropertyChangeCommand {
 
         let status = match (store.owner_if_free()?, source) {
             (Some(owner), Some(source)) => {
-                let mut owner = owner.for_source(source);
+                let mut owner = owner.for_source(source).map_err(report)?;
                 match owner.drain() {
                     Err(PimdirError::Busy) => PropertyStatus::Queued,
                     Err(err) => return Err(report(err)),

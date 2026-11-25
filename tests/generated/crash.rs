@@ -52,7 +52,10 @@ fn an_owner_write_cut_after_any_commit_finishes_as_the_uncut_run() {
             let held = tempfile::tempdir().unwrap();
             index::copy_store(&root, &before.path().join("store"), true);
 
-            let mut owner = PimdirStore::open(&root).unwrap().for_source("local");
+            let mut owner = PimdirStore::open(&root)
+                .unwrap()
+                .for_source("local")
+                .unwrap();
             write.apply(&mut owner).unwrap();
             let log = log_of(
                 &root,
@@ -74,7 +77,8 @@ fn an_owner_write_cut_after_any_commit_finishes_as_the_uncut_run() {
                 let cut = cut(before.path(), held.path(), "pimdir.db-wal", end);
                 let mut owner = PimdirStore::open(cut.path().join("store"))
                     .unwrap()
-                    .for_source("local");
+                    .for_source("local")
+                    .unwrap();
                 let again = write.apply(&mut owner);
                 drop(owner);
                 let rows = store_rows(&cut.path().join("store"));
@@ -110,7 +114,10 @@ fn an_index_refresh_cut_after_any_batch_finishes_as_the_uncut_refresh() {
         let mut differences = Vec::new();
         for write in index::writes(&drained) {
             let label = write.label();
-            let mut owner = PimdirStore::open(&root).unwrap().for_source("local");
+            let mut owner = PimdirStore::open(&root)
+                .unwrap()
+                .for_source("local")
+                .unwrap();
             write.apply(&mut owner).unwrap();
             drop(owner);
 

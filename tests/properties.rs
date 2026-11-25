@@ -61,7 +61,7 @@ fn placement(collection: &str, handle: &str, link: &str) -> PimdirPlacement {
 /// A store holding `m` in INBOX and Archive, one seq in both, and `n` in
 /// INBOX, each bound by `imap`; answers the seqs of `m` and `n`.
 fn seeded(dir: &Path) -> (PimdirSourceStore, i64, i64) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     for collection in ["INBOX", "Archive"] {
         store
             .ensure_collection(collection, "message/rfc822")

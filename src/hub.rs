@@ -99,7 +99,7 @@ pub struct PimdirHubItem {
     /// The highest level any source reached.
     ///
     /// The item's own only while it holds a body, see
-    /// [`stored_level`](Self::stored_level).
+    /// `stored_level`.
     pub level: PimdirLevel,
     /// Whether a source removed the item, propagating the delete to the rest.
     ///
@@ -120,7 +120,7 @@ impl PimdirHubItem {
     /// [`level`](Self::level) is the high-water mark across sources; read
     /// as the fact it would strand an item whose body a content change
     /// dropped, an upgrade skipping whatever reads as `Full`.
-    pub fn stored_level(&self) -> PimdirLevel {
+    pub(crate) fn stored_level(&self) -> PimdirLevel {
         match self.object {
             Some(_) => self.level,
             None => self.level.min(PimdirLevel::Meta),
@@ -414,7 +414,7 @@ pub struct PimdirHub {
 /// keyed by the identity minted over the handle of the binding whose
 /// write settled it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirOverruled {
+pub(crate) struct PimdirOverruled {
     /// The source whose write settled it.
     pub source: PimdirSourceId,
     /// That source's handle, the minted key's.
@@ -775,7 +775,7 @@ impl PimdirHub {
     /// member minted from its hint shared the body with before the batch
     /// (a sharing a fetch confirmed) stay. `old` holds every live member
     /// minted from the hint.
-    pub fn release_shared(
+    pub(crate) fn release_shared(
         &mut self,
         old: &PimdirHub,
         written: &BTreeSet<PimdirLinkId>,

@@ -74,9 +74,7 @@ pub mod search;
 
 mod attachments;
 mod lock;
-mod run;
-#[doc(inline)]
-pub use run::PimdirRunError;
+pub mod run;
 mod schema;
 mod write;
 
@@ -426,13 +424,19 @@ impl PimdirStore {
         PimdirBlobStage::new(self.blobs(), Arc::clone(&self.lock))
     }
 
-    /// Binds this handle to a source, yielding the sync seam.
-    pub fn for_source(self, source: impl Into<String>) -> PimdirSourceStore {
-        PimdirSourceStore {
-            store: self,
-            source: PimdirSourceId(source.into()),
-            body_flush: PimdirBodyFlush::default(),
+    /// Binds this handle to a source, yielding the sync seam; an empty id,
+    /// which no row may hold (§14), is [`PimdirError::SourceEmpty`].
+    pub fn for_source(self, source: impl Into<String>) -> Result<PimdirSourceStore, PimdirError> {
+        let source = source.into();
+        if source.is_empty() {
+            return Err(PimdirError::SourceEmpty);
         }
+
+        Ok(PimdirSourceStore {
+            store: self,
+            source: PimdirSourceId(source),
+            body_flush: PimdirBodyFlush::default(),
+        })
     }
 
     /// A collection's whole hub: every source's items and bindings.
@@ -1662,6 +1666,52 @@ impl PimdirSourceStore {
         self.store = self.store.for_account(account);
         self
     }
+
+    /// Records this source as syncing each of `collections` (§15.6), each
+    /// ensured, answering how many `sources` rows it added.
+    ///
+    /// A row is added with no checkpoint, so the next run is a full
+    /// listing; a row held already keeps its checkpoint. One owner write.
+    pub fn register(
+        &mut self,
+        collections: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<usize, PimdirError> {
+        let account = self.store.account.clone();
+        let source = self.source.0.clone();
+        let tx = begin(&mut self.store.reader.conn, &self.store.lock)?;
+
+        let mut added = 0;
+        for collection in collections {
+            let collection = collection.as_ref();
+            tx.execute_cached(
+                sql::ENSURE_COLLECTION,
+                named_params! { ":collection": collection, ":account": account },
+            )?;
+
+            let key = named_params! { ":collection": collection, ":source": source };
+            let held = tx
+                .query_row_cached(sql::LOAD_CHECKPOINT, key, |_| Ok(()))
+                .optional()?
+                .is_some();
+            if held {
+                continue;
+            }
+
+            tx.execute_cached(
+                sql::UPSERT_CHECKPOINT,
+                named_params! {
+                    ":collection": collection,
+                    ":source": source,
+                    ":checkpoint": None::<Vec<u8>>,
+                },
+            )?;
+            added += 1;
+        }
+
+        tx.commit().map_err(busy_or_sql)?;
+        debug!("source {source} registered in {added} collections");
+        Ok(added)
+    }
 }
 
 /// Opens a write transaction of the owner's, `BEGIN IMMEDIATE`, once
@@ -2105,6 +2155,9 @@ pub enum PimdirError {
         /// Its handle.
         handle: String,
     },
+    /// A handle was asked to act as a source of an empty id, which the
+    /// schema refuses on every row naming a source (§14).
+    SourceEmpty,
     /// An overruling edit would settle a conflict whose diverging body
     /// nobody has read (SYNC §7, §9): refused, staging nothing, until the
     /// upgrade fetches it.
@@ -2391,6 +2444,7 @@ impl PimdirError {
     /// | `action-malformed` | [`Action`](Self::Action) |
     /// | `binding-rebind` | [`Rebind`](Self::Rebind) |
     /// | `placement-unnamed` | [`Unnamed`](Self::Unnamed) |
+    /// | `source-empty` | [`SourceEmpty`](Self::SourceEmpty) |
     /// | `conflict-unread` | [`Unread`](Self::Unread) |
     /// | `scope-not-mail` | [`Scope`](Self::Scope) |
     /// | `scope-invalid` | [`ScopeBound`](Self::ScopeBound) |
@@ -2444,6 +2498,7 @@ impl PimdirError {
             Self::Action(_) => "action-malformed",
             Self::Rebind { .. } => "binding-rebind",
             Self::Unnamed { .. } => "placement-unnamed",
+            Self::SourceEmpty => "source-empty",
             Self::Unread { .. } => "conflict-unread",
             Self::Scope { .. } => "scope-not-mail",
             Self::ScopeBound(_) => "scope-invalid",
@@ -2526,6 +2581,7 @@ impl fmt::Display for PimdirError {
                 f,
                 "Pimdir write refused: placement {collection}/{handle} is named by no link id and its handle by no binding"
             ),
+            Self::SourceEmpty => write!(f, "Pimdir source refused: a source id is never empty"),
             Self::Unread { collection, handle } => write!(
                 f,
                 "Pimdir write refused: the conflict of {collection}/{handle} holds a body nobody has read, fetch it before overruling it"

@@ -39,7 +39,7 @@ pub const MIME_DEPTH_MAX: usize = 64;
 /// The most entities the walk of the parts reads, in document order, the
 /// message's own counted (Annex A.1): an entity after it, with every part
 /// under it, makes no mark, no invitation, no stand-in and no extracted
-/// text. Dovecot's default `max_total_mime_parts`.
+/// text.
 pub const MIME_ENTITIES_MAX: usize = 10_000;
 
 /// The fields an entity is read by, each from its first occurrence when
@@ -138,13 +138,13 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
 /// alone, the way a listing names a member (SYNC §4).
 ///
 /// `header` is the header block (an IMAP `BODY.PEEK[HEADER]` or
-/// `HEADER.FIELDS`, Gmail's metadata headers), or a whole message whose
+/// `HEADER.FIELDS`, a REST API's metadata headers), or a whole message whose
 /// body is ignored. `size` is the server's `RFC822.SIZE`. The attachment
 /// mark is `attachment`, the source's own flag where it states one
-/// (Graph's `hasAttachments`, JMAP's `hasAttachment`), else
-/// [`meta_attachment`] over the top-level `Content-Type`. A connector
-/// reading the fields off a server-side summary (an `ENVELOPE`, a Graph
-/// `$select`) builds [`PimdirMailSummary`] itself through the decoders
+/// (a REST API's attachment flag, JMAP's `hasAttachment`), else
+/// `meta_attachment` over the top-level `Content-Type`. A connector
+/// reading the fields off a server-side summary (an `ENVELOPE`, a REST
+/// field selection) builds [`PimdirMailSummary`] itself through the decoders
 /// this module exposes, and sets the mark the same way.
 pub fn derive_meta(header: &[u8], size: Option<u64>, attachment: Option<bool>) -> PimdirDerivation {
     let (headers, _) = split_headers(header);
@@ -159,7 +159,7 @@ pub fn derive_meta(header: &[u8], size: Option<u64>, attachment: Option<bool>) -
 /// included. It misses both ways (a list footer as a second part reads as
 /// one, an attachment under `multipart/signed` as none), each corrected
 /// when the body is read and the parts walked.
-pub fn meta_attachment(content_type: Option<&str>) -> bool {
+pub(crate) fn meta_attachment(content_type: Option<&str>) -> bool {
     content_type
         .and_then(|value| value.split(';').next())
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("multipart/mixed"))

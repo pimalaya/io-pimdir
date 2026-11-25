@@ -28,7 +28,7 @@ const CONTACTS: &str = "contacts";
 const LINK: &str = "uid:a";
 
 fn store(dir: &Path, source: &str) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source(source);
+    let store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store.ensure_collection(CONTACTS, "text/vcard").unwrap();
     store
 }

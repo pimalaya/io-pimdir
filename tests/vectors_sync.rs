@@ -1513,7 +1513,8 @@ fn reproduce(spec: &Path, path: &Path) {
 
         let mut store = PimdirStore::open(dir.path())
             .unwrap()
-            .for_source(run_spec["source"].as_str().unwrap());
+            .for_source(run_spec["source"].as_str().unwrap())
+            .unwrap();
         let Ran {
             pushes,
             events,
@@ -1706,7 +1707,8 @@ fn drain_case(spec: &Path, case: &Value) -> Option<Result<(), String>> {
     drop(producer);
     let mut store = PimdirStore::open(dir.path())
         .unwrap()
-        .for_source(run["source"].as_str().unwrap());
+        .for_source(run["source"].as_str().unwrap())
+        .unwrap();
     store.drain().unwrap();
     drop(store);
 

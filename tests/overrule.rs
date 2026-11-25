@@ -8,7 +8,7 @@
 
 use io_pimdir::{
     change::PimdirWriteOp,
-    client::{PimdirRunError, PimdirStore},
+    client::{PimdirStore, run::PimdirRunError},
     collection::PimdirCollectionId,
     mutate::PimdirMutation,
     object::PimdirObject,
@@ -24,7 +24,10 @@ const EDITED: &[u8] = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:urn:uuid:c1\r\nFN:Joe\
 #[test]
 fn an_overruling_edit_over_an_unread_item_conflict_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("b");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("b")
+        .unwrap();
     store.ensure_collection("Contacts", "text/vcard").unwrap();
     let hash = store.hash(CARD);
     store

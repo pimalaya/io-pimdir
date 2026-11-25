@@ -72,7 +72,7 @@ fn write(store: &mut PimdirSourceStore, flags: PimdirFlags) -> Result<(), Pimdir
 }
 
 fn seeded(dir: &Path) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     write(&mut store, PimdirFlags::from_iter(["\\Seen", "$label"])).unwrap();
     store

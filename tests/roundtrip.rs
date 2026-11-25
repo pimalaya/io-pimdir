@@ -131,7 +131,10 @@ fn single_source_write_reopen_lookup_and_gc() {
     // before answering it (STORAGE §7).
     let abc = io_pimdir::hash::hash(b"abc").0;
 
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(&abc, b"abc"),
@@ -146,7 +149,10 @@ fn single_source_write_reopen_lookup_and_gc() {
 
     // reopen: the item, its flags, its body and the checkpoint survive
     drop(store);
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     let loaded = store.load(&inbox(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(loaded.placements.len(), 1);
     assert_eq!(loaded.placements[0].object, Some(PimdirHash(abc.clone())));
@@ -197,7 +203,10 @@ fn single_source_write_reopen_lookup_and_gc() {
 #[test]
 fn collection_kind_is_declared_and_survives_a_lazy_write() {
     let dir = tempfile::tempdir().unwrap();
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
 
     // unknown until declared
     assert_eq!(store.collection_kind("INBOX").unwrap(), None);
@@ -234,8 +243,14 @@ fn collection_kind_is_declared_and_survives_a_lazy_write() {
 #[test]
 fn two_source_copy_and_delete_propagation() {
     let dir = tempfile::tempdir().unwrap();
-    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut left = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
+    let mut right = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
 
     // the item lands on the left source only
     left.write(vec![
@@ -300,7 +315,10 @@ fn two_source_copy_and_delete_propagation() {
 #[test]
 fn client_reads_collections_items_page_and_one() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     // three live items, out of link-id order on write
@@ -386,7 +404,10 @@ fn client_reads_collections_items_page_and_one() {
 #[test]
 fn client_read_surfaces_level_for_a_meta_only_item() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
 
     store
         .write(vec![PimdirWriteOp::UpsertPlacement(meta_placement(
@@ -406,7 +427,10 @@ fn client_read_surfaces_level_for_a_meta_only_item() {
 #[test]
 fn public_seq_is_message_scoped_global_and_never_reused() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     for collection in ["INBOX", "Archives", "Sent"] {
         store
             .ensure_collection(collection, "message/rfc822")
@@ -486,8 +510,14 @@ fn public_seq_is_message_scoped_global_and_never_reused() {
 #[test]
 fn client_read_excludes_tombstones() {
     let dir = tempfile::tempdir().unwrap();
-    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut left = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
+    let mut right = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
 
     // two items on left, only `mid:a` also bound on right
     left.write(vec![
@@ -586,7 +616,10 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
     use std::io::Write;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     let blobs = store.blobs();
 
     // the consumer streams the blob into place during a fetch
@@ -607,7 +640,10 @@ fn a_byteless_store_object_indexes_a_streamed_blob() {
     // reopen: the object survived indexing, its blob is the streamed
     // bytes, and a placement references it so nothing collected it
     drop(store);
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     let loaded = store.load(&inbox(), &PimdirLoadSelection::All).unwrap();
     assert_eq!(loaded.placements[0].object, Some(PimdirHash(hash.clone())));
     assert_eq!(
@@ -623,7 +659,10 @@ fn a_shared_blob_survives_until_its_last_referrer_is_purged() {
     // collects it. Retention adds a second holder: a retired row pins its
     // body exactly as a live one does, so both must be purged.
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
 
     store
         .write(vec![
@@ -740,7 +779,10 @@ fn a_flag_only_update_keeps_the_body() {
     // a flag change updates the item row in place and must not disturb
     // the object refcount, so the body stays put
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
 
     store
         .write(vec![
@@ -790,7 +832,10 @@ fn a_staged_remove_hides_the_item_but_keeps_it_pending_a_sync() {
     // a client-staged Remove drops the item from the read surface yet
     // keeps the binding, so the next sync still pushes the expunge
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -823,7 +868,10 @@ fn a_staged_remove_hides_the_item_but_keeps_it_pending_a_sync() {
 
     // but still projected as a Tombstone on reopen, so the next sync
     // pushes the remove against the kept remote handle
-    let reopened = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let reopened = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     let projected = reopened
         .load(&inbox(), &PimdirLoadSelection::All)
         .unwrap()
@@ -842,7 +890,10 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
     // empties, the target gains the item under the same message-scoped
     // seq, and each side projects the push its next sync derives
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -907,7 +958,10 @@ fn a_staged_move_empties_the_source_and_fills_the_target() {
     // both halves are derived from the bindings (SYNC §3), so a reopen
     // reads them the same: the create copies from the source member it
     // still binds, the tombstone relocates into the pending create
-    let reopened = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let reopened = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     let inbox_proj = reopened
         .load(&inbox(), &PimdirLoadSelection::All)
         .unwrap()
@@ -950,7 +1004,10 @@ fn a_handles_load_reads_only_its_own_handles() {
     // STORAGE §14: a Handles load reads the placements of the handles it
     // names, not every one the source holds
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     let named = |handle: &str| PimdirPlacement {
         collection: inbox(),
         handle: PimdirHandle(handle.into()),
@@ -994,7 +1051,10 @@ fn an_unknown_flag_set_stores_no_row_and_loads_back_unknown() {
     // the markers, '[]' that the item carries none. A placement read so
     // storing '[]' would claim the second while only the first is true.
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
 
     let mut unread = placement(
         "1",
@@ -1051,7 +1111,10 @@ fn a_base_of_nothing_round_trips_as_a_base() {
     // a settled one. Inferring the base's presence from its three
     // nullable columns loses exactly this shape.
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
 
     let mut placement = placement(
         "1",

@@ -86,7 +86,7 @@ fn mail_summary(subject: &str, size: u64) -> PimdirSummary {
 /// A store with a message filed twice (one copy holding its body), a
 /// second message, a card, an event, a task and a file.
 fn seeded(dir: &Path) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     for (collection, kind) in [
         ("INBOX", MAIL),
         ("Archive", MAIL),

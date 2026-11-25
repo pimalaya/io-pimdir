@@ -123,7 +123,7 @@ fn rfc3339(days: i64, secs: i64) -> String {
 /// Files the messages in `imap/INBOX` as the `imap` source lists them, at
 /// the `Meta` tier, a thousand per write.
 fn seed(dir: &Path, n: usize) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     store
         .ensure_collection("imap/INBOX", "message/rfc822")
         .unwrap();

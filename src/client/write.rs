@@ -30,7 +30,7 @@ use crate::{
     },
     coroutine::PimdirWritten,
     hub::{PimdirBinding, PimdirHub, PimdirHubItem, PimdirOverruled, PimdirSourceId},
-    load::{PimdirLoadSelection, PimdirLoaded, PimdirRefusal},
+    load::{PimdirBindingRefusal, PimdirLoadSelection, PimdirLoaded},
     object::{PimdirHash, PimdirHeldObject, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
@@ -911,7 +911,7 @@ fn refusals(
     conn: &Connection,
     collection: &PimdirCollectionId,
     source: &PimdirSourceId,
-) -> rusqlite::Result<Vec<(PimdirHandle, PimdirRefusal)>> {
+) -> rusqlite::Result<Vec<(PimdirHandle, PimdirBindingRefusal)>> {
     let refused = rows(
         conn,
         sql::LIST_REFUSALS,
@@ -920,7 +920,7 @@ fn refusals(
             Ok((
                 r.get::<_, String>(1)?,
                 PimdirHandle(r.get(2)?),
-                PimdirRefusal {
+                PimdirBindingRefusal {
                     key: PimdirChangeKey(r.get(4)?),
                     reason: r.get(3)?,
                 },
@@ -3324,7 +3324,10 @@ mod tests {
 
         for mode in modes {
             let dir = tempfile::tempdir().unwrap();
-            let mut store = PimdirStore::open(dir.path()).unwrap().for_source("test");
+            let mut store = PimdirStore::open(dir.path())
+                .unwrap()
+                .for_source("test")
+                .unwrap();
             store.body_flush = mode;
 
             let held = b"stored before the batch".to_vec();

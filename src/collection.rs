@@ -30,7 +30,7 @@ pub fn media_type(kind: &str) -> &str {
 /// of `kind`: the one an owner writes, and the one a reader knows. The
 /// column is an open vocabulary (§13), so a role outside it is read as
 /// none rather than refused.
-pub fn role_of_kind(kind: &str, role: &str) -> bool {
+pub(crate) fn role_of_kind(kind: &str, role: &str) -> bool {
     match media_type(kind) {
         "message/rfc822" => matches!(
             role,
@@ -113,7 +113,7 @@ impl PimdirScope {
     /// with the `Z` designator (`2026-10-01T00:00:00Z`), `None` when
     /// both are: the one shape a store holds a bound in (STORAGE §13),
     /// and the one a summary `date` compares with as text.
-    pub fn malformed_bound(&self) -> Option<&str> {
+    pub(crate) fn malformed_bound(&self) -> Option<&str> {
         [&self.since, &self.until]
             .into_iter()
             .flatten()

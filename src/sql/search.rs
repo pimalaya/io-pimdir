@@ -33,7 +33,7 @@ pub const SHAPE: &str = "canonical";
 /// How many public ids the index records as split (`split`, SEARCH §3),
 /// counted up to `:limit`: a text count evaluates that many hits per
 /// placement (`split_seqs`) or reads each term's placements whole.
-pub const SPLIT_HELD: &str = r#"SELECT count(*) FROM (SELECT 1 FROM split LIMIT :limit);"#;
+pub(crate) const SPLIT_HELD: &str = r#"SELECT count(*) FROM (SELECT 1 FROM split LIMIT :limit);"#;
 
 /// The matches of a query's text terms (SEARCH §8.5), each read once
 /// through `match_objects` or `match_summaries` before the query runs and
@@ -131,7 +131,7 @@ WHERE term = :term AND src = 1
 /// item of the collections (`items_by_seq`), and a client asks it only
 /// while `behind` is above 0, no item being stamped above the cursor
 /// otherwise.
-pub const COUNT_UNINDEXED: &str = r#"SELECT count(*) FROM store.items INDEXED BY items_by_changed
+pub(crate) const COUNT_UNINDEXED: &str = r#"SELECT count(*) FROM store.items INDEXED BY items_by_changed
 WHERE changed > :since AND deleted = 0 AND retained_at IS NULL
   AND collection IN (SELECT value FROM temp.param WHERE slot = 'collections');"#;
 
@@ -140,7 +140,7 @@ WHERE changed > :since AND deleted = 0 AND retained_at IS NULL
 /// lowest ceiling of those that closed a round, and how many never closed
 /// one. What `list_coverage` answers one collection at a time, read in
 /// one statement for every collection of a query.
-pub const ROLL_COVERAGE: &str = r#"SELECT max(covered_since) FILTER (WHERE covered_at IS NOT NULL),
+pub(crate) const ROLL_COVERAGE: &str = r#"SELECT max(covered_since) FILTER (WHERE covered_at IS NOT NULL),
        min(covered_until) FILTER (WHERE covered_at IS NOT NULL),
        count(*) - count(covered_at)
 FROM store.sources
@@ -148,7 +148,7 @@ WHERE collection IN (SELECT value FROM temp.param WHERE slot = 'collections');"#
 
 /// Every collection's id, account and kind: what a query's conjuncts
 /// narrow its coverage's collections by (SEARCH §8.2).
-pub const SCOPE_COLLECTIONS: &str = r#"SELECT id, account, kind FROM store.collections;"#;
+pub(crate) const SCOPE_COLLECTIONS: &str = r#"SELECT id, account, kind FROM store.collections;"#;
 
 /// The id, account and kind of collection `?1`: a query naming one by a
 /// conjunct reads its coverage's collections from it alone.
@@ -166,7 +166,7 @@ pub const HOLDS_CALENDARS: &str =
 /// those rows alone; when none holds one, both answer no row whatever the
 /// collections, and a client runs neither, each costing a query more to
 /// prepare than this does.
-pub const COVERAGE_HELD: &str = r#"SELECT EXISTS (SELECT 1 FROM store.items INDEXED BY items_bodiless
+pub(crate) const COVERAGE_HELD: &str = r#"SELECT EXISTS (SELECT 1 FROM store.items INDEXED BY items_bodiless
                WHERE object IS NULL AND deleted = 0)
     OR EXISTS (SELECT 1 FROM missing)
     OR EXISTS (SELECT 1 FROM object INDEXED BY object_not_ok WHERE status <> 'ok');"#;
@@ -176,17 +176,17 @@ pub const COUNT_COLLECTIONS: &str = r#"SELECT count(*) FROM store.collections;"#
 
 /// The version of index.db as this connection sees it, moved by every
 /// commit of another connection.
-pub const INDEX_DATA_VERSION: &str = r#"PRAGMA main.data_version;"#;
+pub(crate) const INDEX_DATA_VERSION: &str = r#"PRAGMA main.data_version;"#;
 
 /// The version of the attached store as this connection sees it, moved by
 /// every commit of another connection.
-pub const STORE_DATA_VERSION: &str = r#"PRAGMA store.data_version;"#;
+pub(crate) const STORE_DATA_VERSION: &str = r#"PRAGMA store.data_version;"#;
 
 /// The items an `id:` value names, every kind each is held under (SEARCH
 /// §8): the item of `seq`, `NULL` for a value not of digits, and every
 /// item of the link id, their live placements' kinds and keys, so
 /// `linked` is asked once per pair.
-pub const LOAD_ENDS: &str = r#"SELECT DISTINCT c.kind, i.link_id FROM store.items i
+pub(crate) const LOAD_ENDS: &str = r#"SELECT DISTINCT c.kind, i.link_id FROM store.items i
 JOIN store.collections c ON c.id = i.collection
 WHERE (i.seq = :seq OR i.link_id = :link_id)
   AND i.deleted = 0 AND i.retained_at IS NULL;"#;
@@ -194,24 +194,24 @@ WHERE (i.seq = :seq OR i.link_id = :link_id)
 /// One placement row as the index holds it: its id, the rowid its summary
 /// text is keyed on, its link id and the hash of the body indexed for it,
 /// `NULL` while bodiless or once the body's row is gone (SEARCH §3).
-pub const LOAD_PLACEMENT: &str = r#"SELECT id, link_id, (SELECT o.hash FROM object o WHERE o.id = placement.object) FROM placement
+pub(crate) const LOAD_PLACEMENT: &str = r#"SELECT id, link_id, (SELECT o.hash FROM object o WHERE o.id = placement.object) FROM placement
 WHERE collection = :collection AND seq = :seq;"#;
 
 /// One placement row's id and the `object` row it names, `NULL` while
 /// bodiless: what a refresh tells the hit columns before writing it.
-pub const LOAD_PLACEMENT_OBJECT: &str =
+pub(crate) const LOAD_PLACEMENT_OBJECT: &str =
     r#"SELECT id, object FROM placement WHERE collection = :collection AND seq = :seq;"#;
 
 /// Every category a task states, each once: what `category:` folds in
 /// Rust and compares with its folded value (SEARCH §8), so no SQL function
 /// folds the stored side.
-pub const TASK_CATEGORY_VALUES: &str =
+pub(crate) const TASK_CATEGORY_VALUES: &str =
     r#"SELECT DISTINCT value FROM store.summary_value WHERE role = 'category';"#;
 
 /// The mail placements the index holds for one message id, `count` zero
 /// for a message no placement holds: how many, the lowest sort key, the
 /// lowest and highest one naming a date (SEARCH §9).
-pub const MESSAGE_PRESENCE: &str = r#"SELECT count(*), min(i.sort_key), min(nullif(i.sort_key, '')), max(nullif(i.sort_key, ''))
+pub(crate) const MESSAGE_PRESENCE: &str = r#"SELECT count(*), min(i.sort_key), min(nullif(i.sort_key, '')), max(nullif(i.sort_key, ''))
 FROM placement p
 JOIN store.collections c ON c.id = p.collection
 JOIN store.items i ON i.collection = p.collection AND i.seq = p.seq
@@ -219,7 +219,7 @@ WHERE p.link_id = :link_id AND c.kind = 'message/rfc822';"#;
 
 /// A body the index holds for one message id, the source of its
 /// `In-Reply-To` and `References` (SEARCH §9).
-pub const MESSAGE_HASH: &str = r#"SELECT o.hash FROM placement p
+pub(crate) const MESSAGE_HASH: &str = r#"SELECT o.hash FROM placement p
 JOIN object o ON o.id = p.object
 JOIN store.collections c ON c.id = p.collection
 WHERE p.link_id = :link_id AND c.kind = 'message/rfc822'
@@ -227,22 +227,23 @@ ORDER BY p.collection, p.seq LIMIT 1;"#;
 
 /// The first `In-Reply-To` id of a message id's summary (STORAGE Annex
 /// A.1), the parent of a message the index holds no body of (SEARCH §9).
-pub const MESSAGE_IN_REPLY_TO: &str = r#"SELECT r.value FROM placement p
+pub(crate) const MESSAGE_IN_REPLY_TO: &str = r#"SELECT r.value FROM placement p
 JOIN store.items i ON i.collection = p.collection AND i.link_id = p.link_id
 JOIN store.summary_value r ON r.item = i.id AND r.role = 'in-reply-to'
 WHERE p.link_id = :link_id
 ORDER BY p.collection, p.seq, r.position LIMIT 1;"#;
 
 /// One message row: its thread and its parent.
-pub const LOAD_MESSAGE: &str = r#"SELECT thread, parent FROM message WHERE link_id = :link_id;"#;
+pub(crate) const LOAD_MESSAGE: &str =
+    r#"SELECT thread, parent FROM message WHERE link_id = :link_id;"#;
 
 /// The messages naming one as their parent.
-pub const MESSAGE_CHILDREN: &str = r#"SELECT link_id FROM message WHERE parent = :link_id;"#;
+pub(crate) const MESSAGE_CHILDREN: &str = r#"SELECT link_id FROM message WHERE parent = :link_id;"#;
 
 /// The thread of each hit `:hits` lists, a JSON array of `[account, seq]`
 /// pairs, through any of its live mail placements (SEARCH §9), by its
 /// position in the list; NULL for one no thread holds.
-pub const HIT_THREADS: &str = r#"SELECT h.key, (SELECT m.thread FROM store.items i
+pub(crate) const HIT_THREADS: &str = r#"SELECT h.key, (SELECT m.thread FROM store.items i
   JOIN store.collections c ON c.id = i.collection
   JOIN message m ON m.link_id = i.link_id
   WHERE i.seq = h.value ->> 1 AND c.account IS h.value ->> 0
@@ -253,7 +254,7 @@ FROM json_each(:hits) h;"#;
 /// A thread as one account holds it (SEARCH §9): its live members there,
 /// as `thread_members` names them, counted by `seq`, with their lowest and
 /// highest sort key naming a date.
-pub const THREAD_SPAN: &str = r#"SELECT count(DISTINCT i.seq), min(nullif(i.sort_key, '')), max(nullif(i.sort_key, ''))
+pub(crate) const THREAD_SPAN: &str = r#"SELECT count(DISTINCT i.seq), min(nullif(i.sort_key, '')), max(nullif(i.sort_key, ''))
 FROM message m
 JOIN placement p ON p.link_id = m.link_id
 JOIN store.collections c ON c.id = p.collection
@@ -265,7 +266,7 @@ WHERE m.thread = :thread AND c.account IS :account AND c.kind = 'message/rfc822'
 /// `[account, thread]` pairs, by its position in the list: every
 /// placement `thread_members` names, with its sort key and whether it is
 /// a live mail placement, what [`THREAD_SPAN`] counts and bounds.
-pub const THREADS_HELD: &str = r#"SELECT t.key, p.seq, i.sort_key,
+pub(crate) const THREADS_HELD: &str = r#"SELECT t.key, p.seq, i.sort_key,
        i.deleted = 0 AND i.retained_at IS NULL AND c.kind = 'message/rfc822'
 FROM json_each(:threads) t
 JOIN message m ON m.thread = t.value ->> 1
@@ -293,19 +294,19 @@ pub const POSTING: &str = r#"CREATE VIRTUAL TABLE IF NOT EXISTS pimdir_fields US
 
 /// A body's `title` and `from` text into [`POSTING`], beside its
 /// `object_text` row.
-pub const INSERT_POSTING: &str =
+pub(crate) const INSERT_POSTING: &str =
     r#"INSERT INTO pimdir_fields(rowid, title, "from") VALUES (:rowid, :title, :from);"#;
 
 /// A body's row of [`POSTING`] dropped with its `object_text` row.
-pub const DELETE_POSTING: &str = r#"DELETE FROM pimdir_fields WHERE rowid = :rowid;"#;
+pub(crate) const DELETE_POSTING: &str = r#"DELETE FROM pimdir_fields WHERE rowid = :rowid;"#;
 
 /// [`POSTING`] merged into one segment, beside `optimize_text`.
-pub const OPTIMIZE_POSTING: &str =
+pub(crate) const OPTIMIZE_POSTING: &str =
     r#"INSERT INTO pimdir_fields(pimdir_fields) VALUES ('optimize');"#;
 
 /// The bodies an expression of [`POSTING`] matches (`?1`, one column's
 /// word or prefix), at most `?2`.
-pub const MATCH_POSTING: &str =
+pub(crate) const MATCH_POSTING: &str =
     r#"SELECT rowid FROM pimdir_fields WHERE pimdir_fields MATCH ?1 LIMIT ?2;"#;
 
 /// Every statement of this crate's own, paired with its constant name.

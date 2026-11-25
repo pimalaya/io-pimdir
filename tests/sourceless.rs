@@ -53,7 +53,10 @@ fn a_source_less_handle_reads_purges_and_cancels() {
     let dir = tempfile::tempdir().unwrap();
 
     // the one role that does name a side seeds the item, then retires it
-    let mut sync = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut sync = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     sync.write(vec![
         PimdirWriteOp::StoreObject {
             object: PimdirObject {
@@ -122,4 +125,58 @@ fn an_operator_pass_records_no_source() {
     );
 
     assert!(store.distinct_sources().unwrap().is_empty());
+}
+
+/// STORAGE §14: no row names an empty source, so a handle acting as one
+/// is refused before it writes anything.
+#[test]
+fn an_empty_source_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let Err(err) = PimdirStore::open(dir.path()).unwrap().for_source("") else {
+        panic!("an empty source is refused");
+    };
+    assert_eq!(err.code(), "source-empty");
+}
+
+/// STORAGE §15.6: a source registered syncing a collection holds a row
+/// there with no checkpoint, a row held already keeping its own, and a
+/// collection the store lacks is declared.
+#[test]
+fn a_source_registers_where_it_holds_no_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute(
+        "INSERT INTO sources(collection, source, checkpoint) VALUES('INBOX', 'imap', X'01')",
+        [],
+    )
+    .unwrap();
+
+    assert_eq!(store.register(["INBOX", "Archive"]).unwrap(), 1);
+    assert_eq!(store.register(["INBOX", "Archive"]).unwrap(), 0);
+
+    let checkpoint = |collection: &str| {
+        conn.query_row(
+            "SELECT checkpoint FROM sources WHERE collection = ?1 AND source = 'imap'",
+            [collection],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        checkpoint("INBOX"),
+        Some(vec![1]),
+        "a held checkpoint is kept"
+    );
+    assert_eq!(checkpoint("Archive"), None, "a new row holds none");
+    assert_eq!(
+        store.collection_sources("Archive").unwrap(),
+        ["imap"],
+        "the absent collection is declared"
+    );
 }

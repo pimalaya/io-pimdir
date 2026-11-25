@@ -28,7 +28,7 @@ const SEEDED: &str = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
 /// A store whose INBOX holds `items` clean messages, handles `1` to
 /// `items`, answering their public ids in handle order.
 fn seeded(dir: &Path, items: usize) -> (PimdirSourceStore, Vec<i64>) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut ops = vec![PimdirWriteOp::StoreObject {
         object: PimdirObject {

@@ -9,7 +9,7 @@
 //! every live item of the scope when no positive term has a set. A page
 //! in a dated order reads a small set whole, joined to the store, sorted
 //! and cut by the cursor; a broad one walks the scope's collections in
-//! the store's order (STORAGE §9.3) with [`PimdirWalk`], each row probed,
+//! the store's order (STORAGE §9.3) with `PimdirWalk`, each row probed,
 //! until the page is full, and falls back to the set once the walk has
 //! examined as many rows as reading the set would have cost. The `title`,
 //! `sender` and `relevance` orders read their whole driving set.
@@ -32,7 +32,7 @@ use crate::{
 
 /// The most rows an estimate counts (`LIMIT CAP`): a set past it is read
 /// as large, whatever its size.
-pub const CAP: u64 = 100_001;
+pub(crate) const CAP: u64 = 100_001;
 
 /// How many times a page's hits a set may hold and still be read whole
 /// rather than walked.
@@ -272,7 +272,7 @@ impl PimdirSearchCursor {
 /// standing as a conjunct rules out. Each axis is `None` when no term
 /// narrows it, and an empty list when its terms leave nothing.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PimdirPlanScope {
+pub(crate) struct PimdirPlanScope {
     /// The media types a collection of the scope has.
     pub kinds: Option<Vec<&'static str>>,
     /// The accounts a collection of the scope belongs to.
@@ -309,22 +309,6 @@ impl PimdirPlanScope {
         scope
     }
 
-    /// Whether a collection of `kind`, `account` and `id` is of the
-    /// scope.
-    pub fn admits(&self, kind: &str, account: Option<&str>, id: &str) -> bool {
-        self.kinds
-            .as_ref()
-            .is_none_or(|kinds| kinds.contains(&kind))
-            && self
-                .accounts
-                .as_ref()
-                .is_none_or(|accounts| account.is_some_and(|a| accounts.iter().any(|b| b == a)))
-            && self
-                .collections
-                .as_ref()
-                .is_none_or(|ids| ids.iter().any(|b| b == id))
-    }
-
     /// Whether the scope names one collection alone, where a hit has one
     /// placement at most.
     pub fn is_one_collection(&self) -> bool {
@@ -334,7 +318,7 @@ impl PimdirPlanScope {
 
 /// A query's terms as a tree over the plan's leaves.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PimdirPlanNode {
+pub(crate) enum PimdirPlanNode {
     /// Every operand holds.
     And(Vec<PimdirPlanNode>),
     /// Any operand holds.
@@ -347,7 +331,7 @@ pub enum PimdirPlanNode {
 
 /// One term of a plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirPlanLeaf {
+pub(crate) struct PimdirPlanLeaf {
     /// What the term asks.
     pub predicate: PimdirQueryPredicate,
     /// Whether an odd number of negations applies to it.
@@ -375,7 +359,7 @@ impl PimdirPlanLeaf {
 /// What a client measures of a leaf's set before a driver is chosen,
 /// each count capped at [`CAP`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PimdirPlanEstimate {
+pub(crate) enum PimdirPlanEstimate {
     /// The full-text matches of its expression, over bodies and
     /// summaries.
     Text,
@@ -410,7 +394,7 @@ pub enum PimdirPlanEstimate {
 
 /// What a client measured of a set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PimdirPlanBound {
+pub(crate) struct PimdirPlanBound {
     /// The rows counted.
     pub rows: u64,
     /// Whether the count stopped at [`CAP`], the set being larger.
@@ -423,7 +407,7 @@ pub struct PimdirPlanBound {
 /// 3.51 on a store of 517k messages (io-pimdir as-fast-as-notmuch); an
 /// FTS4 shape states its own text probe (86 µs).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PimdirPlanCosts {
+pub(crate) struct PimdirPlanCosts {
     /// A hit of a set read whole, joined to the store and sorted.
     pub set_row: u64,
     /// A full-text match read into a set of hits: its body's placements
@@ -471,7 +455,7 @@ impl Default for PimdirPlanCosts {
 
 /// How large a page's scope is, what a walk is weighed by.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PimdirPlanExtent {
+pub(crate) struct PimdirPlanExtent {
     /// The collections a walk reads the head of.
     pub collections: u64,
     /// About how many rows the scope holds: the store's highest public id
@@ -481,7 +465,7 @@ pub struct PimdirPlanExtent {
 
 /// How the hits of a count or a page are found.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PimdirPlanDriver {
+pub(crate) enum PimdirPlanDriver {
     /// The union of these leaves' sets, read whole, joined to the store
     /// and every other term probed per hit: one leaf, or the operands of
     /// a positive conjunct `or`.
@@ -501,7 +485,7 @@ pub enum PimdirPlanDriver {
 
 /// How a text term is tested.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PimdirPlanAccess {
+pub(crate) enum PimdirPlanAccess {
     /// Its matches read once into a set, each hit probed by a seek.
     Materialize,
     /// The bodies and summaries it matches read once by id off the
@@ -533,7 +517,7 @@ pub enum PimdirPlanForce {
 
 /// A driver and how each leaf's text is tested.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirPlanChoice {
+pub(crate) struct PimdirPlanChoice {
     /// The driver.
     pub driver: PimdirPlanDriver,
     /// Per leaf, how its text is tested: [`PimdirPlanAccess::Probe`] for
@@ -543,7 +527,7 @@ pub struct PimdirPlanChoice {
 
 /// A query planned: its scope, its leaves and the sets that may drive it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirPlan {
+pub(crate) struct PimdirPlan {
     /// The query's collections.
     pub scope: PimdirPlanScope,
     /// The query's terms as a tree over [`leaves`](Self::leaves).
@@ -1022,7 +1006,7 @@ impl PimdirPlan {
 
 /// One collection a walk merges, with where its rows start.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirWalkCollection {
+pub(crate) struct PimdirWalkCollection {
     /// Its id.
     pub id: String,
     /// Its account, empty for none.
@@ -1037,7 +1021,7 @@ pub struct PimdirWalkCollection {
 
 /// What a walk asks for: the next rows of one collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirWalkStep {
+pub(crate) struct PimdirWalkStep {
     /// The collection, by its position among those the walk was given.
     pub collection: usize,
     /// Whether its rows are read by ascending sort key, else descending,
@@ -1056,7 +1040,7 @@ pub struct PimdirWalkStep {
 /// One row a step examined: its key, its public id and whether it is a
 /// hit placed by it (its representative placement, every term holding).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PimdirWalkRow {
+pub(crate) struct PimdirWalkRow {
     /// Its sort key.
     pub sort_key: String,
     /// Its public id.
@@ -1067,7 +1051,7 @@ pub struct PimdirWalkRow {
 
 /// What a walk answers.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PimdirWalkOutput {
+pub(crate) enum PimdirWalkOutput {
     /// The places of the first hits after the cursor, at most the number
     /// asked, in order.
     Page(Vec<PimdirSearchCursor>),
@@ -1094,7 +1078,7 @@ pub enum PimdirWalkOutput {
 /// one for twice its last, so a walk spread over many collections reads
 /// few rows past the page in each while a deep one takes few steps.
 #[derive(Clone, Debug)]
-pub struct PimdirWalk {
+pub(crate) struct PimdirWalk {
     sort: PimdirSearchSort,
     need: usize,
     collections: Vec<PimdirWalkCollection>,
@@ -1309,7 +1293,7 @@ impl PimdirWalk {
 }
 
 /// The collection media type of a kind.
-pub fn media_type(kind: PimdirQueryKind) -> &'static str {
+pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
     match kind {
         PimdirQueryKind::Mail => "message/rfc822",
         PimdirQueryKind::Contact => "text/vcard",
@@ -1318,12 +1302,6 @@ pub fn media_type(kind: PimdirQueryKind) -> &'static str {
         }
         PimdirQueryKind::File => file::KIND,
     }
-}
-
-/// Whether a collection's kind is undated (SEARCH §8.2): contacts and
-/// files, last in both dated orders.
-pub fn is_undated(media_type: &str) -> bool {
-    media_type == "text/vcard" || media_type == file::KIND
 }
 
 /// What a client measures of a term's set, `negated` when an odd number
@@ -1431,12 +1409,9 @@ mod tests {
         assert_eq!(scope.kinds, Some(vec!["message/rfc822"]));
         assert_eq!(scope.accounts, Some(vec!["home".to_string()]));
         assert_eq!(scope.collections, Some(vec!["home/INBOX".to_string()]));
-        assert!(scope.admits("message/rfc822", Some("home"), "home/INBOX"));
-        assert!(!scope.admits("message/rfc822", None, "home/INBOX"));
 
         let none = plan("kind:mail kind:contact").scope;
         assert_eq!(none.kinds, Some(Vec::new()), "two kinds leave none");
-        assert!(!none.admits("message/rfc822", None, "a"));
 
         let open = plan("kind:mail or account:home").scope;
         assert_eq!(open, PimdirPlanScope::default(), "an or rules none out");

@@ -29,7 +29,7 @@ impl PimdirExtract {
 
     /// The extraction of a `message/rfc822` body as [`mail`](Self::mail)
     /// reads it, but for its address fields and attachments, left empty.
-    pub fn mail_text(body: &[u8]) -> Self {
+    pub(crate) fn mail_text(body: &[u8]) -> Self {
         Self::mail_with(body, false)
     }
 

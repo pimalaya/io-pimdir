@@ -13,9 +13,9 @@ use core::ops::Range;
 pub const CHUNK_MAX: usize = 1024;
 
 /// The chunks of one field's text, as half-open UTF-8 byte ranges into
-/// it, in order (SEARCH §6): [`Chunks`] collected.
+/// it, in order (SEARCH §6): [`PimdirChunks`] collected.
 pub fn chunks(text: &str) -> Vec<Range<usize>> {
-    Chunks::new(text).collect()
+    PimdirChunks::new(text).collect()
 }
 
 /// The chunks of one field's text, as half-open UTF-8 byte ranges into
@@ -31,7 +31,7 @@ pub fn chunks(text: &str) -> Vec<Range<usize>> {
 /// LF within its first [`CHUNK_MAX`] bytes, else at the last character
 /// boundary within them; every piece but the last is a chunk of its own,
 /// the last packed as a paragraph.
-pub struct Chunks<'t> {
+pub struct PimdirChunks<'t> {
     text: &'t str,
     paragraphs: Paragraphs<'t>,
     /// The chunk being packed.
@@ -42,7 +42,7 @@ pub struct Chunks<'t> {
     piece: Option<Range<usize>>,
 }
 
-impl<'t> Chunks<'t> {
+impl<'t> PimdirChunks<'t> {
     /// The chunks of `text`.
     pub fn new(text: &'t str) -> Self {
         Self {
@@ -55,7 +55,7 @@ impl<'t> Chunks<'t> {
     }
 }
 
-impl Iterator for Chunks<'_> {
+impl Iterator for PimdirChunks<'_> {
     type Item = Range<usize>;
 
     fn next(&mut self) -> Option<Range<usize>> {

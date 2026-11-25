@@ -58,6 +58,13 @@ jobs:
           for features in mail contact calendar search indexer search,mail search,indexer; do
             cargo clippy --no-default-features --features "vendored,$features" --all-targets -- -D warnings
           done
+      - name: The feature sets consumers build
+        working-directory: io-pimdir
+        run: |
+          set -eu
+          cargo check
+          cargo check --no-default-features --features client
+          cargo check --no-default-features --features client,search,indexer
       # spec_drift compares nothing when the checkout lacks the pinned
       # revision, so a green run proves nothing unless it compared.
       - name: The vendored copy was compared with pimdir
@@ -68,3 +75,32 @@ jobs:
             echo "::error::spec_drift compared nothing: the pimdir checkout lacks spec/REVISION"
             exit 1
           fi
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check --all-features
+      - run: cargo check --no-default-features --features client
+
+  semver:
+    name: semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Baseline 1.0.0, compared once it is on crates.io.
+      - id: baseline
+        run: |
+          if curl -sfA "io-pimdir CI" https://crates.io/api/v1/crates/io-pimdir/1.0.0 >/dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.baseline.outputs.published == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - if: steps.baseline.outputs.published == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-version: 1.0.0
+          feature-group: all-features

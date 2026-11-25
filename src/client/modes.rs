@@ -91,7 +91,7 @@ pub fn options() -> OpenOptions {
 /// a permission bit of its group or of others set, or another owner than
 /// this process's user. Nothing elsewhere.
 #[cfg(unix)]
-pub fn exposed(path: &Path) -> io::Result<bool> {
+pub(crate) fn exposed(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
     let meta = fs::metadata(path)?;
@@ -104,7 +104,7 @@ pub fn exposed(path: &Path) -> io::Result<bool> {
 /// a permission bit of its group or of others set, or another owner than
 /// this process's user. Nothing elsewhere.
 #[cfg(not(unix))]
-pub fn exposed(_path: &Path) -> io::Result<bool> {
+pub(crate) fn exposed(_path: &Path) -> io::Result<bool> {
     Ok(false)
 }
 

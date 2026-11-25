@@ -68,7 +68,7 @@ fn summary(name: &str, part: &str) -> PimdirFileSummary {
 /// A store holding message `m` in INBOX, its two attachments stood for
 /// in Attachments and referenced from it, and an empty Docs folder.
 fn seeded(dir: &Path) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     store.ensure_collection("INBOX", MAIL).unwrap();
     store.ensure_collection("Attachments", file::KIND).unwrap();
     store.ensure_collection("Docs", file::KIND).unwrap();

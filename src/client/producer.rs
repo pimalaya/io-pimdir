@@ -1187,33 +1187,15 @@ pub(crate) fn pending_actions(
     conn: &Connection,
     collection: Option<&str>,
 ) -> Result<Vec<PimdirPendingAction>, PimdirError> {
-    let mut actions = Vec::new();
-    for row in pending_rows(conn, collection)? {
-        let action = match row.decode() {
-            Ok(action) => action,
-            Err(err) => {
-                debug!("pending row {} lists opaque: {err}", row.id);
-                PimdirPendingAction {
-                    id: row.id,
-                    created_at: row.created_at,
-                    producer: row.producer,
-                    collection: row.collection,
-                    action: PimdirAction::Unknown {
-                        kind: row.action,
-                        payload: row.payload,
-                        object_hash: row.object_hash.map(PimdirHash),
-                    },
-                    attempts: row.attempts,
-                }
-            }
-        };
-        actions.push(action);
-    }
-    Ok(actions)
+    Ok(pending_rows(conn, collection)?
+        .into_iter()
+        .map(PimdirQueueRow::listed)
+        .collect())
 }
 
 /// The pending moves and copies other collections queued into `target`
-/// (`load_pending_arrivals`, §15.4), in append order.
+/// (`load_pending_arrivals`, §15.4), in append order, a row that does not
+/// decode listed as [`pending_actions`] lists it.
 pub(crate) fn pending_arrivals(
     conn: &Connection,
     target: &str,
@@ -1236,11 +1218,7 @@ pub(crate) fn pending_arrivals(
             })
         },
     )?;
-    let mut actions = Vec::with_capacity(found.len());
-    for row in found {
-        actions.push(row.decode()?);
-    }
-    Ok(actions)
+    Ok(found.into_iter().map(PimdirQueueRow::listed).collect())
 }
 
 /// Reads every pending row for an overlay (§15.4): a row whose payload
@@ -1294,6 +1272,29 @@ impl PimdirQueueRow {
             action: self.action()?,
             attempts: self.attempts,
         })
+    }
+
+    /// The row as a listing shows it (§15.4): decoded, or as
+    /// [`PimdirAction::Unknown`] with its kind and payload verbatim.
+    fn listed(self) -> PimdirPendingAction {
+        match self.decode() {
+            Ok(action) => action,
+            Err(err) => {
+                debug!("pending row {} lists opaque: {err}", self.id);
+                PimdirPendingAction {
+                    id: self.id,
+                    created_at: self.created_at,
+                    producer: self.producer,
+                    collection: self.collection,
+                    action: PimdirAction::Unknown {
+                        kind: self.action,
+                        payload: self.payload,
+                        object_hash: self.object_hash.map(PimdirHash),
+                    },
+                    attempts: self.attempts,
+                }
+            }
+        }
     }
 }
 
@@ -1570,7 +1571,7 @@ impl PimdirSourceStore {
 
     /// Drops the receipts older than [`RECEIPT_DAYS`](Self::RECEIPT_DAYS)
     /// (§15.4), returning how many went.
-    pub fn prune_receipts(&mut self) -> Result<usize, PimdirError> {
+    pub(crate) fn prune_receipts(&mut self) -> Result<usize, PimdirError> {
         self.store.lock.verify()?;
         let conn = &self.store.reader.conn;
         let before: String = conn.query_row_cached(

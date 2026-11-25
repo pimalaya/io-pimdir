@@ -193,7 +193,7 @@ impl PimdirRemote for Remote {
 
 /// The store `dir` holds, as `source`, with `inbox` and `archive`.
 fn open(dir: &Path, source: &str) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source(source);
+    let store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store.ensure_collection("inbox", MAIL).unwrap();
     store.ensure_collection("archive", MAIL).unwrap();
     store
@@ -505,7 +505,10 @@ fn another_sync_version_is_refused() {
         .unwrap();
     drop(conn);
 
-    let store = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
     let refused = store.settled_collections().err();
     assert!(
         matches!(&refused, Some(PimdirError::SyncVersion { found }) if found == "sync-draft-06"),

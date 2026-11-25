@@ -137,7 +137,10 @@ fn differences(model: Model) -> Vec<(Option<&'static str>, String)> {
             .map(|(known, text)| (known, format!("pending: {text}"))),
     );
 
-    let mut owner = PimdirStore::open(&root).unwrap().for_source("local");
+    let mut owner = PimdirStore::open(&root)
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     owner.drain().unwrap();
     drop(owner);
     let (_, read) = reader::compare(&spec, &drained, &root, known);

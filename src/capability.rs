@@ -266,7 +266,7 @@ impl core::error::Error for PimdirRefusal {}
 /// digits and hyphens joined by periods, the first beginning with a
 /// letter, as `set-performer`'s schema reads a capability (§15.3). An
 /// application's own begins with `x-`.
-pub fn is_name(name: &str) -> bool {
+pub(crate) fn is_name(name: &str) -> bool {
     let mut words = name.split('.');
     let first = words.next().unwrap_or_default();
     let word = |word: &str| {
@@ -281,7 +281,7 @@ pub fn is_name(name: &str) -> bool {
 
 /// The capability an intent kind is bound to (Annex B.2), `None` for a
 /// kind outside the vocabulary.
-pub fn intent_capability(kind: &str) -> Option<&'static str> {
+pub(crate) fn intent_capability(kind: &str) -> Option<&'static str> {
     match kind {
         "submit" => Some(MAIL_SUBMIT),
         "calendar-reply" => Some(CALENDAR_REPLY),
@@ -296,7 +296,7 @@ pub fn intent_capability(kind: &str) -> Option<&'static str> {
 /// The capabilities a calendar write needs from its resources (Annex
 /// B.1): `current` is the item's body before the action, `new` the one
 /// an `add` or `update` writes. Nothing outside calendars.
-pub fn required_by_content(
+pub(crate) fn required_by_content(
     kind: &str,
     action: &PimdirAction,
     current: Option<&[u8]>,
@@ -337,7 +337,7 @@ pub fn required_by_content(
 /// `set-flags` is a change; an `add` carries its flags into an empty set
 /// and a `copy` the item's own. An intent needs its own capability from
 /// its performer alone, so it is left to [`intent_capability`].
-pub fn required(kind: &str, action: &PimdirAction, current: &PimdirFlags) -> Vec<String> {
+pub(crate) fn required(kind: &str, action: &PimdirAction, current: &PimdirFlags) -> Vec<String> {
     // NOTE: a collection of no declared kind has no vocabulary, and the
     // drain parks what it cannot stage there anyway.
     let Some((domain, object)) = domain(kind) else {
@@ -431,7 +431,7 @@ pub fn check(
 /// by its own row where the source states one, `none` included, and by
 /// [`MAIL_FLAGS_KEYWORDS`] where it states none, so a declaration
 /// written before the two reads as it did.
-pub fn gating<'a>(
+pub(crate) fn gating<'a>(
     declared: &'a BTreeMap<String, (PimdirSupport, Option<String>)>,
     capability: &'a str,
 ) -> (&'a str, Option<&'a (PimdirSupport, Option<String>)>) {
@@ -445,7 +445,7 @@ pub fn gating<'a>(
 
 /// Whether a calendar resource is a VTODO one, the component its master is
 /// (Annex A.3), which [`CALENDAR_COMPONENT_VTODO`] gates.
-pub fn is_vtodo(body: &[u8]) -> bool {
+pub(crate) fn is_vtodo(body: &[u8]) -> bool {
     matches!(calendar::derive(body).summary, Some(PimdirSummary::Task(_)))
 }
 
@@ -453,7 +453,7 @@ pub fn is_vtodo(body: &[u8]) -> bool {
 /// lands (STORAGE §15.6): one stating [`CALENDAR_COMPONENT_VTODO`] `none`
 /// there, or source-wide, refuses it; one stating nothing, declared or
 /// not, does not.
-pub fn check_vtodo(sources: &[PimdirSourceCapabilities]) -> Result<(), PimdirRefusal> {
+pub(crate) fn check_vtodo(sources: &[PimdirSourceCapabilities]) -> Result<(), PimdirRefusal> {
     for source in sources {
         if let Some((PimdirSupport::None, detail)) = source
             .declared

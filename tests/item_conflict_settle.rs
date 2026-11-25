@@ -16,7 +16,8 @@
 use std::path::Path;
 
 use io_pimdir::client::{
-    PimdirRunError, PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
+    PimdirSourceStore, PimdirStore, producer::PimdirProducer, reader::PimdirReader,
+    run::PimdirRunError,
 };
 use io_pimdir::{
     change::PimdirWriteOp,
@@ -45,7 +46,7 @@ const MERGED: &[u8] =
     b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:urn:uuid:c1\r\nFN:Joe Joseph\r\nEND:VCARD\r\n";
 
 fn store(dir: &Path, source: &str) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source(source);
+    let store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store.ensure_collection(CONTACTS, "text/vcard").unwrap();
     store
 }

@@ -369,7 +369,10 @@ fn the_engine_records_its_sync_version_and_refuses_another() {
         checkpoint: PimdirCheckpoint(vec![at]),
     };
 
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.load(&inbox, &PimdirLoadSelection::All).unwrap();
     assert_eq!(
         store.store_meta().unwrap().sync_version,
@@ -388,7 +391,10 @@ fn the_engine_records_its_sync_version_and_refuses_another() {
         .execute("UPDATE store_meta SET sync_version = 'sync-draft-06'", [])
         .unwrap();
     let before = written(dir.path());
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     let loaded = store.load(&inbox, &PimdirLoadSelection::All).err();
     assert!(
         matches!(&loaded, Some(PimdirError::SyncVersion { found }) if found == "sync-draft-06"),

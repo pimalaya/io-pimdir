@@ -29,9 +29,8 @@ use io_pimdir::{
         producer::PimdirProducer,
         reader::{PimdirChangeCursor, PimdirReader},
         search::{
-            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchCursor,
-            PimdirSearchHit, PimdirSearchMatched, PimdirSearchOptions, PimdirSearchSort,
-            PimdirSearchThread,
+            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchHit,
+            PimdirSearchMatched, PimdirSearchOptions, PimdirSearchThread,
         },
     },
     codec::PimdirAction,
@@ -46,7 +45,7 @@ use io_pimdir::{
         chunk,
         coverage::{PimdirSearchTemporal, PimdirSearchUnread},
         extract,
-        plan::{PimdirPlan, PimdirPlanForce},
+        plan::{PimdirPlanForce, PimdirSearchCursor, PimdirSearchSort},
         query::{PimdirQuery, PimdirQueryPredicate},
         tag::{PimdirSearchTagError, PimdirSearchTagPlan},
     },
@@ -196,12 +195,16 @@ fn build_store(spec: &Path, dir: &Path, store: &Value) {
                 .unwrap()
                 .for_account(collection["account"].as_str().unwrap())
                 .for_source(source["source"].as_str().unwrap())
+                .unwrap()
                 .write(ops)
                 .unwrap();
         }
     }
 
-    let mut store_handle = PimdirStore::open(dir).unwrap().for_source("vectors");
+    let mut store_handle = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("vectors")
+        .unwrap();
     for item in store["items"].as_array().unwrap() {
         let collection = item["collection"].as_str().unwrap();
         if !stand_ins.contains(collection) {
@@ -454,9 +457,6 @@ fn every_refresh_vector_answers() {
 /// index asked.
 fn refreshed_hits(index: &PimdirIndex, text: &str, want: &BTreeSet<(String, i64)>, how: &str) {
     let parsed = PimdirQuery::parse(text).unwrap_or_else(|err| panic!("{text:?}: {err}"));
-    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
-        .sets
-        .is_empty();
     let forces = [
         None,
         Some(PimdirPlanForce::Set),
@@ -465,13 +465,6 @@ fn refreshed_hits(index: &PimdirIndex, text: &str, want: &BTreeSet<(String, i64)
         Some(PimdirPlanForce::Fallback),
     ];
     for force in forces {
-        if matches!(
-            force,
-            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
-        ) && !sets
-        {
-            continue;
-        }
         let _unforced = Unforced(index);
         index.force_driver(force);
         assert_eq!(
@@ -510,9 +503,6 @@ fn paged(
         after,
         ..Default::default()
     };
-    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
-        .sets
-        .is_empty();
     let forces = [
         None,
         Some(PimdirPlanForce::Set),
@@ -523,13 +513,6 @@ fn paged(
 
     let mut ends = Vec::new();
     for force in forces {
-        if matches!(
-            force,
-            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
-        ) && !sets
-        {
-            continue;
-        }
         let _unforced = Unforced(index);
         index.force_driver(force);
         let named = format!("{text:?}: {how} under {force:?}");
@@ -570,7 +553,10 @@ fn paged(
 fn apply(spec: &Path, dir: &Path, kinds: &mut BTreeMap<String, String>, write: &Value) {
     let collection = || write["collection"].as_str().unwrap();
     let seq = || write["seq"].as_i64().unwrap();
-    let mut store = PimdirStore::open(dir).unwrap().for_source("vectors");
+    let mut store = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("vectors")
+        .unwrap();
     match write["kind"].as_str().unwrap() {
         "put" => {
             let item = &write["item"];
@@ -603,6 +589,7 @@ fn apply(spec: &Path, dir: &Path, kinds: &mut BTreeMap<String, String>, write: &
             PimdirStore::open(dir)
                 .unwrap()
                 .for_source(write["source"].as_str().unwrap())
+                .unwrap()
                 .write(vec![
                     PimdirWriteOp::OpenRound {
                         collection: PimdirCollectionId(collection().into()),
@@ -913,9 +900,6 @@ fn extracted(index: &PimdirIndex, clock: &PimdirSearchClock, query: &Value) {
         after: None,
         clock: clock.clone(),
     };
-    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
-        .sets
-        .is_empty();
     let forces = [
         None,
         Some(PimdirPlanForce::Set),
@@ -925,13 +909,6 @@ fn extracted(index: &PimdirIndex, clock: &PimdirSearchClock, query: &Value) {
     ];
 
     for force in forces {
-        if matches!(
-            force,
-            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
-        ) && !sets
-        {
-            continue;
-        }
         let _unforced = Unforced(index);
         index.force_driver(force);
         let named = format!("{text:?} under {force:?}");
@@ -1081,12 +1058,9 @@ fn answers(
     case: &Value,
 ) {
     let query = case["query"].as_str().unwrap();
-    let Ok(parsed) = PimdirQuery::parse(query) else {
+    let Ok(_) = PimdirQuery::parse(query) else {
         return answers_under(index, spec, store, clock, case, None);
     };
-    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
-        .sets
-        .is_empty();
     let forces = [
         None,
         Some(PimdirPlanForce::Set),
@@ -1095,13 +1069,6 @@ fn answers(
         Some(PimdirPlanForce::Fallback),
     ];
     for force in forces {
-        if matches!(
-            force,
-            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
-        ) && !sets
-        {
-            continue;
-        }
         let _unforced = Unforced(index);
         index.force_driver(force);
         answers_under(index, spec, store, clock, case, force);
@@ -1480,7 +1447,7 @@ fn message(id: &str, subject: &str, text: &str) -> Vec<u8> {
 
 /// Files a message into a collection as source `local`.
 fn file_message(dir: &Path, collection: &str, body: Vec<u8>, flags: &[&str]) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store
         .ensure_collection(collection, "message/rfc822")
         .unwrap();
@@ -2083,6 +2050,7 @@ fn delete_message(dir: &Path, id: &str) {
     PimdirStore::open(dir)
         .unwrap()
         .for_source("local")
+        .unwrap()
         .write(vec![PimdirWriteOp::DropPlacement {
             collection: PimdirCollectionId("INBOX".into()),
             handle: PimdirHandle(id.into()),
@@ -2349,6 +2317,7 @@ fn a_tag_stages_one_action_per_placement_and_a_drain_applies_it() {
     PimdirStore::open(dir.path())
         .unwrap()
         .for_source("local")
+        .unwrap()
         .drain()
         .unwrap();
     for collection in ["INBOX", "Archive"] {
@@ -2400,7 +2369,10 @@ fn a_thread_answers_its_members_from_any_of_them() {
     file_message(dir.path(), "INBOX", mail("p@x", 9, ""), &[]);
     let reply = mail("c@x", 10, "In-Reply-To: <p@x>\r\n");
     file_message(dir.path(), "INBOX", reply, &[]);
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .ensure_collection("Files", "application/octet-stream")
         .unwrap();
@@ -2444,7 +2416,7 @@ fn a_thread_answers_its_members_from_any_of_them() {
 
 /// Files a body into a collection of `kind` as `source`.
 fn file_as(dir: &Path, source: &str, collection: &str, kind: &str, body: Vec<u8>) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source(source);
+    let mut store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store.ensure_collection(collection, kind).unwrap();
     let derived = summary::derive(kind, &body).unwrap();
     let hash = store.hash(&body);
@@ -2555,6 +2527,7 @@ fn a_tag_says_which_placements_reach_their_server() {
     PimdirStore::open(dir)
         .unwrap()
         .for_source("imap")
+        .unwrap()
         .drain()
         .unwrap();
     let inbox = hits(&index, "id:a@x")[0];
@@ -2992,7 +2965,7 @@ fn a_coverage_counts_what_the_index_could_not_read() {
     // parser accepts, under a summary a listing gave.
     let garbled = b"no field and no blank line".to_vec();
     let lost = message("l@x", "Lost", "vault body");
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     let garbled_hash = store.hash(&garbled);
     let lost_hash = store.hash(&lost);
     let row = serde_json::json!({ "message_id": "g@x", "subject": "Garbled" });
@@ -3145,7 +3118,7 @@ fn a_message_held_without_its_body_counts_only_against_what_reads_it() {
         "attachment": 0,
     });
     let from = serde_json::json!({ "role": "from", "address": "ann@example.org", "name": "Ann" });
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .write(vec![PimdirWriteOp::UpsertPlacement(placement(
@@ -3493,6 +3466,7 @@ fn a_body_that_could_not_be_read_is_folded_again() {
     let hash = PimdirStore::open(dir.path())
         .unwrap()
         .for_source("local")
+        .unwrap()
         .hash(&body);
     file_message(dir.path(), "INBOX", body.clone(), &[]);
     let blob = io_pimdir::client::reader::PimdirReader::open(dir.path())
@@ -4671,6 +4645,7 @@ mod memory {
         PimdirStore::open(dir.path())
             .unwrap()
             .for_source("vectors")
+            .unwrap()
             .write(vec![PimdirWriteOp::DropPlacement {
                 collection: PimdirCollectionId("home/INBOX".into()),
                 handle: PimdirHandle("11".into()),
@@ -4690,6 +4665,7 @@ mod memory {
         let hash = PimdirStore::open(dir.path())
             .unwrap()
             .for_source("vectors")
+            .unwrap()
             .hash(&body);
         file_as(
             dir.path(),

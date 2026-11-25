@@ -88,7 +88,10 @@ fn held(store: &PimdirSourceStore) -> Vec<String> {
 /// `t1` bound in tasks-a by caldav, which syncs tasks-b too, and an add of
 /// `n1` there superseding `t1`, drained.
 fn superseded(dir: &Path) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("caldav");
+    let mut store = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("caldav")
+        .unwrap();
     store.ensure_collection("tasks-a", CAL).unwrap();
     store.ensure_collection("tasks-b", CAL).unwrap();
     let t1 = task("t1");

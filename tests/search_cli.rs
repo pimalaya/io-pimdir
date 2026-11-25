@@ -54,7 +54,7 @@ fn file_message_as(
          Date: Sat, 01 Aug 2026 {hour:02}:00:00 +0000\r\n\r\nText\r\n"
     )
     .into_bytes();
-    let mut store = PimdirStore::open(dir).unwrap().for_source(source);
+    let mut store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store
         .ensure_collection(collection, "message/rfc822")
         .unwrap();

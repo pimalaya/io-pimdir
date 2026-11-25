@@ -36,7 +36,8 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
 
     let mut owner = PimdirStore::open(generated.root())
         .unwrap()
-        .for_source("local");
+        .for_source("local")
+        .unwrap();
     owner.drain().unwrap();
     drop(owner);
 

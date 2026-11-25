@@ -87,7 +87,7 @@ fn generate() {
     std::fs::create_dir_all(dir).unwrap();
 
     {
-        let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+        let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
         store.ensure_collection("INBOX", "message/rfc822").unwrap();
         store.ensure_collection("Contacts", "text/vcard").unwrap();
         store.ensure_collection("Tasks", "text/calendar").unwrap();

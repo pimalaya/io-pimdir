@@ -21,7 +21,7 @@ pub const MAIL: &str = "message/rfc822";
 
 /// A store owned as `source`, with INBOX and Archive declared as mail.
 pub fn mail_store(dir: &Path, source: &str) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source(source);
+    let store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store.ensure_collection("INBOX", MAIL).unwrap();
     store.ensure_collection("Archive", MAIL).unwrap();
     store

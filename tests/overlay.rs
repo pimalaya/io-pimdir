@@ -53,7 +53,7 @@ fn placement(collection: &str, handle: &str, link: &str, key: &str) -> PimdirPla
 /// An owner-created store holding `INBOX` (three items) and an empty
 /// `Archive` left syncs, with the blob every item points at.
 fn store(dir: &std::path::Path) -> Vec<i64> {
-    let mut owner = PimdirStore::open(dir).unwrap().for_source("left");
+    let mut owner = PimdirStore::open(dir).unwrap().for_source("left").unwrap();
     owner.ensure_collection("INBOX", "message/rfc822").unwrap();
     owner
         .ensure_collection("Archive", "message/rfc822")
@@ -622,6 +622,7 @@ fn an_item_no_source_binds_folds_as_the_owner_settles_it() {
     PimdirStore::open(dir.path())
         .unwrap()
         .for_source("dav")
+        .unwrap()
         .write(vec![PimdirWriteOp::SetCheckpoint {
             collection: PimdirCollectionId("Synced".into()),
             checkpoint: io_pimdir::collection::PimdirCheckpoint(b"c0".to_vec()),
@@ -683,7 +684,10 @@ fn an_item_no_source_binds_folds_as_the_owner_settles_it() {
     );
     drop(overlaid);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("dav");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("dav")
+        .unwrap();
     let report = owner.drain().unwrap();
     assert_eq!((report.applied, report.parked), (1, 2), "{report:?}");
     let raw = PimdirReader::open(dir.path()).unwrap();
@@ -717,7 +721,10 @@ fn a_move_into_an_undeclared_collection_folds_into_nothing() {
     assert!(overlaid.get_item("INBOX", seqs[0]).unwrap().is_some());
     drop(overlaid);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
     assert_eq!(owner.drain().unwrap().parked, 1);
 }
 
@@ -746,6 +753,9 @@ fn a_move_into_a_collection_no_source_syncs_folds_into_nothing() {
     assert!(overlaid.list_items("Local", None, 10).unwrap().is_empty());
     drop(overlaid);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
     assert_eq!(owner.drain().unwrap().parked, 1);
 }

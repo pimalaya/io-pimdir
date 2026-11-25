@@ -23,7 +23,7 @@ use io_pimdir::{
 const BODY: &[u8] = b"Message-ID: <new@x>\r\nSubject: hi\r\n\r\nnew body";
 
 fn opened(dir: &Path) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source("local");
+    let store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
 }

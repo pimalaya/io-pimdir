@@ -99,7 +99,10 @@ fn an_owner_verb_leaves_a_store_of_another_revision_as_it_was() {
 fn a_restore_over_a_store_of_another_draft_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let inbox = PimdirCollectionId("INBOX".into());
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let body = b"Message-ID: <a@example.org>\r\nSubject: a\r\n\r\nText\r\n";
     let hash = PimdirHash("cafebabecafebabecafebabecafebabecafebabecafebabecafe".into());

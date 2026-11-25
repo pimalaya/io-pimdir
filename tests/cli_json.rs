@@ -44,7 +44,7 @@ fn body(id: &str) -> Vec<u8> {
 /// public id.
 fn filed(dir: &Path, id: &str) -> i64 {
     let body = body(id);
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let derived = summary::derive("message/rfc822", &body).unwrap();
     let hash = store.hash(&body);

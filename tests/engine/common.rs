@@ -73,7 +73,8 @@ where
     fn over(dir: Rc<TempDir>, remote: R, source: &str) -> Self {
         let store = PimdirStore::open(dir.path())
             .expect("the store opens")
-            .for_source(source);
+            .for_source(source)
+            .unwrap();
 
         Self { store, remote, dir }
     }

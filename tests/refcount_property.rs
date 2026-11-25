@@ -296,7 +296,10 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let mut sources = Vec::new();
         for source in SOURCES {
-            let store = PimdirStore::open(dir.path()).unwrap().for_source(source);
+            let store = PimdirStore::open(dir.path())
+                .unwrap()
+                .for_source(source)
+                .unwrap();
             for collection in COLLECTIONS {
                 store
                     .ensure_collection(collection, "message/rfc822")

@@ -41,7 +41,10 @@ use io_pimdir::{
 const INBOX: &str = "INBOX";
 
 fn store(dir: &Path) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source("remote");
+    let store = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection(INBOX, "message/rfc822").unwrap();
     store
 }

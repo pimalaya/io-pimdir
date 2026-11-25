@@ -95,7 +95,10 @@ fn backdate(dir: &Path, link: &str, retained_at: &str) {
 #[test]
 fn an_expunge_retains_the_item_and_its_body() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -168,7 +171,10 @@ fn an_expunge_retains_the_item_and_its_body() {
 #[test]
 fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut remote = MemRemote::default();
     remote.seed("1", "mid:a", b"body");
@@ -227,7 +233,10 @@ fn a_delta_and_a_full_resync_stay_quiescent_after_a_retention() {
 #[test]
 fn a_reappearing_link_id_revives_the_retained_row() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -294,7 +303,10 @@ fn a_queued_add_restores_a_retained_item() {
     // NOTE: the drain reads the body under its name, so the name is its hash.
     let abc = store_hash(b"abc");
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(&abc, b"abc"),
@@ -341,7 +353,10 @@ fn a_queued_add_restores_a_retained_item() {
 #[test]
 fn purge_deletes_the_row_and_unlinks_the_body() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -399,7 +414,10 @@ fn purge_deletes_the_row_and_unlinks_the_body() {
 #[test]
 fn purge_items_purges_the_retained_ones_in_one_write() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     let hashes = [
         "cafebabecafebabecafebabecafebabecafebabecafebabecafe",
         "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
@@ -452,7 +470,10 @@ fn purge_items_purges_the_retained_ones_in_one_write() {
 #[test]
 fn purge_retained_before_respects_the_cutoff_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -558,8 +579,14 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
     // a shortcut past it: while another source holds the item, the
     // removal has to reach that source first
     let dir = tempfile::tempdir().unwrap();
-    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
-    let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut left = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
+    let mut right = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
 
     left.write(vec![
         store_object(
@@ -635,7 +662,10 @@ fn a_two_side_delete_propagates_before_the_item_is_retired() {
 #[test]
 fn the_retained_page_is_keyed_on_seq_and_exclusive() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -788,7 +818,10 @@ fn a_handle_rebound_to_another_key_retires_the_item_it_held() {
     // retires the old binding as a Deleted drop would, and the handle
     // names one item per source throughout.
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("dav");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("dav")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -879,7 +912,10 @@ fn store_hash(body: &[u8]) -> String {
 #[test]
 fn a_purge_cutoff_not_written_as_the_stamps_are_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store
         .write(vec![
             store_object(

@@ -69,7 +69,6 @@ use rusqlite::{
 #[cfg(feature = "indexer")]
 use rusqlite::{Transaction, TransactionBehavior};
 
-pub use crate::search::plan::{PimdirSearchCursor, PimdirSearchSort};
 use crate::{
     client::{
         PimdirError, PreparedCached, bind_list, busy_or_sql, modes, prepare_connection,
@@ -90,8 +89,8 @@ use crate::{
         fold,
         plan::{
             CAP, PimdirPlan, PimdirPlanAccess, PimdirPlanBound, PimdirPlanCosts, PimdirPlanDriver,
-            PimdirPlanExtent, PimdirPlanForce, PimdirPlanNode, PimdirWalk, PimdirWalkCollection,
-            PimdirWalkOutput, PimdirWalkRow,
+            PimdirPlanExtent, PimdirPlanForce, PimdirPlanNode, PimdirSearchCursor,
+            PimdirSearchSort, PimdirWalk, PimdirWalkCollection, PimdirWalkOutput, PimdirWalkRow,
         },
         query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
     },
@@ -1115,7 +1114,7 @@ impl PimdirIndex {
     ///
     /// The plan reads the query's smallest set when a page of it costs
     /// less than a walk, else walks the scope's collections in the
-    /// store's order until the page is full ([`PimdirWalk`]); the
+    /// store's order until the page is full (`PimdirWalk`); the
     /// `title`, `sender` and `relevance` orders read every hit.
     ///
     /// One read transaction holds the page, its presentation and its
@@ -2928,7 +2927,7 @@ impl PimdirIndex {
             .collect();
         let mut texts = [&extract.body, &extract.note]
             .into_iter()
-            .flat_map(|field| chunk::Chunks::new(field).filter_map(|range| field.get(range)));
+            .flat_map(|field| chunk::PimdirChunks::new(field).filter_map(|range| field.get(range)));
         let Some(first) = texts.next() else {
             return Ok(None);
         };
@@ -3729,6 +3728,7 @@ mod tests {
             PimdirStore::open(dir.path())
                 .unwrap()
                 .for_source("local")
+                .unwrap()
                 .ensure_collection(name, "message/rfc822")
                 .unwrap();
         };

@@ -49,7 +49,7 @@ use crate::{
         PimdirScope,
     },
     coroutine::*,
-    load::{PimdirLoadSelection, PimdirLoaded, PimdirRefusal},
+    load::{PimdirBindingRefusal, PimdirLoadSelection, PimdirLoaded},
     object::PimdirHash,
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirOrigin,
@@ -96,16 +96,6 @@ impl PimdirPushRights {
             content: true,
             add: true,
             remove: true,
-        }
-    }
-
-    /// No push kind permitted.
-    pub const fn none() -> Self {
-        Self {
-            flags: false,
-            content: false,
-            add: false,
-            remove: false,
         }
     }
 }
@@ -326,7 +316,7 @@ impl PimdirParked {
     /// caller accepted them. A listing naming nothing parks on any
     /// absence: an emptied collection and a failing connector answer
     /// alike.
-    pub fn guard(absent: usize, bound: usize, named: bool, accepted: bool) -> Option<Self> {
+    pub(crate) fn guard(absent: usize, bound: usize, named: bool, accepted: bool) -> Option<Self> {
         let mass = bound >= Self::MASS_ABSENCE && absent * 2 > bound;
         let empty = !named && absent > 0;
         ((mass || empty) && !accepted).then_some(Self { absent, bound })
@@ -476,7 +466,7 @@ pub struct PimdirSync {
     in_flight_keys: BTreeMap<PimdirHandle, PimdirChangeKey>,
     /// The refusals standing on the source's loaded bindings, by handle: a
     /// change derived under the key one names is held (SYNC §5).
-    refused: BTreeMap<PimdirHandle, PimdirRefusal>,
+    refused: BTreeMap<PimdirHandle, PimdirBindingRefusal>,
     /// The chunk awaiting the verification of the bodies it uploads.
     chunk: Vec<PimdirChange>,
     /// The events of the writes not answered yet, reported once the write

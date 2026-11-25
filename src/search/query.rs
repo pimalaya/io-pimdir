@@ -58,14 +58,14 @@ pub const TERMS_MAX: usize = 128;
 
 /// The most digits a relative amount holds (`relative`, SEARCH §8.3), a
 /// longer one refused as `invalid-date`.
-pub const RELATIVE_DIGITS_MAX: usize = 6;
+pub(crate) const RELATIVE_DIGITS_MAX: usize = 6;
 
 /// The most digits a change stamp holds (`stamp`, SEARCH §8.3), every such
 /// stamp fitting an `i64`, a longer one refused as `invalid-value`.
-pub const STAMP_DIGITS_MAX: usize = 18;
+pub(crate) const STAMP_DIGITS_MAX: usize = 18;
 
 /// Every field of SEARCH §8's table, in its order.
-pub const FIELDS: &[&str] = &[
+pub(crate) const FIELDS: &[&str] = &[
     "subject",
     "title",
     "summary",
@@ -755,12 +755,14 @@ pub enum PimdirQueryDateUnit {
 impl PimdirQueryDate {
     /// Whether the point resolves against a now (keywords and relative
     /// amounts), rather than standing on its own.
-    pub fn is_relative(&self) -> bool {
+    #[expect(dead_code)]
+    pub(crate) fn is_relative(&self) -> bool {
         matches!(self, Self::Today | Self::Yesterday | Self::Relative { .. })
     }
 
     /// The first day of an absolute point's span, `YYYY-MM-DD`.
-    pub fn first_day(&self) -> Option<String> {
+    #[cfg(test)]
+    pub(crate) fn first_day(&self) -> Option<String> {
         match self {
             Self::Year(year) => Some(format!("{year:04}-01-01")),
             Self::Month { year, month } => Some(format!("{year:04}-{month:02}-01")),
@@ -770,7 +772,8 @@ impl PimdirQueryDate {
     }
 
     /// The day after the last of an absolute point's span, `YYYY-MM-DD`.
-    pub fn day_after(&self) -> Option<String> {
+    #[cfg(test)]
+    pub(crate) fn day_after(&self) -> Option<String> {
         match *self {
             Self::Year(year) => Some(format!("{:04}-01-01", year + 1)),
             Self::Day { year, month, day } if day < days_in(year, month) => {
@@ -1030,6 +1033,7 @@ impl core::error::Error for PimdirQueryError {}
 
 /// The faults a refusal names (SEARCH §8.4), each spelled as its code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PimdirQueryErrorCode {
     /// No term in the query, or in a group: `empty-query`.
     EmptyQuery,

@@ -41,7 +41,7 @@ fn filed(dir: &Path, id: &str) -> i64 {
          Date: Sat, 01 Aug 2026 10:00:00 +0000\r\n\r\n{id} words\r\n"
     )
     .into_bytes();
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let derived = summary::derive("message/rfc822", &body).unwrap();
     let hash = store.hash(&body);
@@ -117,6 +117,7 @@ fn the_erase_verb_erases_a_retained_mail_from_both_files() {
     PimdirStore::open(dir.path())
         .unwrap()
         .for_source("local")
+        .unwrap()
         .write(vec![PimdirWriteOp::DropPlacement {
             collection: PimdirCollectionId("INBOX".into()),
             handle: PimdirHandle("wombat".into()),

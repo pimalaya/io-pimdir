@@ -121,7 +121,8 @@ fn opened(dir: &Path) -> PimdirSourceStore {
     let store = PimdirStore::open(dir)
         .unwrap()
         .for_account(ACCOUNT)
-        .for_source("imap");
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", MAIL).unwrap();
     store.ensure_collection("Archive", MAIL).unwrap();
     store
@@ -412,7 +413,10 @@ fn a_queued_add_stands_for_its_attachments_when_drained() {
 #[test]
 fn a_store_of_one_account_files_them_under_no_account() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", MAIL).unwrap();
 
     stored(&mut store, "INBOX", "1", LINK, BODY);

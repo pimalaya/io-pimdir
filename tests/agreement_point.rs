@@ -102,7 +102,10 @@ fn batch(
 }
 
 fn seed(dir: &std::path::Path) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source("carddav");
+    let store = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("carddav")
+        .unwrap();
     store.ensure_collection("contacts", "text/vcard").unwrap();
     store
 }
@@ -196,7 +199,10 @@ fn a_second_offline_edit_across_a_restart_is_not_a_conflict() {
 
     // A new run, the push still pending, so the sync base is where the
     // first edit left it.
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("carddav");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("carddav")
+        .unwrap();
     store
         .write(batch(
             "bodabodabodabodabodabodabodabodabodabodabodabodaboda",

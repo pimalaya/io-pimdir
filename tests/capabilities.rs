@@ -27,7 +27,7 @@ use io_pimdir::{
 
 /// A one-message INBOX bound by source `graph`, plus an Archive.
 fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("graph");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("graph").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .ensure_collection("Archive", "message/rfc822")
@@ -227,7 +227,7 @@ const MEETING: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:m1\r\nDTSTART:2026
 
 /// One event in `collection`, bound by `source`, returning its seq.
 fn seeded_event(dir: &Path, source: &str, collection: &str, uid: &str) -> i64 {
-    let mut store = PimdirStore::open(dir).unwrap().for_source(source);
+    let mut store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store
         .ensure_collection(collection, "text/calendar")
         .unwrap();
@@ -451,7 +451,10 @@ fn the_owner_parks_an_add_stating_another_bodys_hash_key() {
     producer.enqueue("work", &action, Some(&staged)).unwrap();
     drop(producer);
 
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("dav");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("dav")
+        .unwrap();
     let report = store.drain().unwrap();
     assert_eq!(report.parked, 1, "{report:?}");
     let parked = store.parked_actions().unwrap();
@@ -604,7 +607,10 @@ fn a_copy_is_asked_of_the_sender_and_filed_once_sent() {
     drop(producer);
 
     // the send performed, the intent gives way to the copy it asked for
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("graph");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("graph")
+        .unwrap();
     let copy = PimdirAction::Add {
         link_id: None,
         flags: PimdirFlags::from_iter(["\\Seen"]),
@@ -917,7 +923,10 @@ const EVENT: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e9\r\nDTSTART:202610
 /// Events alone.
 fn events_only(dir: &Path) -> i64 {
     seeded_event(dir, "caldav", "Events", "e0");
-    let mut store = PimdirStore::open(dir).unwrap().for_source("caldav");
+    let mut store = PimdirStore::open(dir)
+        .unwrap()
+        .for_source("caldav")
+        .unwrap();
     store.ensure_collection("Tasks", "text/calendar").unwrap();
     let body = TODO.replace("UID:t1", "UID:t0");
     let hash = io_pimdir::hash::hash(body.as_bytes());
@@ -1014,7 +1023,10 @@ fn the_owner_parks_a_task_into_a_calendar_refusing_tasks() {
     let (action, object) = add(&producer, TODO);
     producer.enqueue("Events", &action, Some(&object)).unwrap();
     drop(producer);
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("caldav");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("caldav")
+        .unwrap();
     refuse_tasks(&mut store);
 
     let report = store.drain().unwrap();

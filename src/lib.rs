@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(not(all(feature = "search", feature = "indexer")), allow(dead_code))]
 
 //! # io-pimdir
 //!

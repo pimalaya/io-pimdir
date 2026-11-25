@@ -276,7 +276,7 @@ impl PimdirSubmit {
     }
 
     /// The `v: 1` payload, validated first.
-    pub fn to_payload(&self) -> Result<String, PimdirActionError> {
+    pub(crate) fn to_payload(&self) -> Result<String, PimdirActionError> {
         self.validate()?;
         let mut map = versioned();
         map.insert("source".into(), json!(self.source));
@@ -492,7 +492,7 @@ const INVITATION: [&str; 6] = [
 /// The occurrence an invitation payload names, `Ok(None)` when it names
 /// none, or the error when the field is there and malformed: what the
 /// gate reads without decoding the rest of the payload.
-pub fn recurrence_id(payload: &str) -> Result<Option<String>, PimdirActionError> {
+pub(crate) fn recurrence_id(payload: &str) -> Result<Option<String>, PimdirActionError> {
     let map = codec::members(payload, &INVITATION)?;
     let recurrence_id = codec::text(map.get("recurrence_id"), "recurrence_id")?;
     if let Some(recurrence_id) = &recurrence_id {

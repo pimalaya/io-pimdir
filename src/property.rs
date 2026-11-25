@@ -10,7 +10,7 @@
 //! A key is `<namespace>/<name>`; `pimdir/` is the standard's, whose one
 //! name defined so far is [`LABEL`], an item's local labels, kept as
 //! written and compared folded. Every other key compares its values byte
-//! for byte. [`change`] is what the owner applies for a `set-property`
+//! for byte. `change` is what the owner applies for a `set-property`
 //! (§15.3) and what a reader's overlay folds (§15.4), so both agree.
 
 use alloc::{
@@ -22,13 +22,13 @@ use alloc::{
 pub const LABEL: &str = "pimdir/label";
 
 /// The most bytes a key holds (§13).
-pub const MAX_KEY_BYTES: usize = 64;
+pub(crate) const MAX_KEY_BYTES: usize = 64;
 
 /// The most bytes of UTF-8 a value holds (§13).
-pub const MAX_VALUE_BYTES: usize = 1024;
+pub(crate) const MAX_VALUE_BYTES: usize = 1024;
 
 /// The most values an item holds under one key (§13).
-pub const MAX_VALUES: usize = 64;
+pub(crate) const MAX_VALUES: usize = 64;
 
 /// One value an item holds under one key (§4.3).
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -52,7 +52,7 @@ pub struct PimdirPropertyHolder {
 /// each part one character or more of `a` to `z`, `0` to `9`, `.`, `_` and
 /// `-`, at most [`MAX_KEY_BYTES`] bytes. A key under `pimdir/` the standard
 /// does not define is a key all the same: a reader reads it as any other.
-pub fn is_key(key: &str) -> bool {
+pub(crate) fn is_key(key: &str) -> bool {
     let part = |part: &str| {
         !part.is_empty()
             && part
@@ -68,13 +68,13 @@ pub fn is_key(key: &str) -> bool {
 /// Whether `key` is one a `set-property` may name (§15.3): a key of
 /// [`is_key`], [`LABEL`] or one outside `pimdir/`, the names the standard
 /// keeps for its later versions being written by no program.
-pub fn is_writable_key(key: &str) -> bool {
+pub(crate) fn is_writable_key(key: &str) -> bool {
     is_key(key) && (key == LABEL || !key.starts_with("pimdir/"))
 }
 
 /// Whether `value` is one the store holds (§4.3, §13): 1 to
 /// [`MAX_VALUE_BYTES`] bytes of UTF-8 holding no NUL.
-pub fn is_value(value: &str) -> bool {
+pub(crate) fn is_value(value: &str) -> bool {
     (1..=MAX_VALUE_BYTES).contains(&value.len()) && !value.contains('\0')
 }
 
@@ -86,7 +86,7 @@ pub fn fold(value: &str) -> String {
 
 /// Whether two values of `key` are the same one (§4.3): folded under
 /// [`LABEL`], byte for byte under any other key.
-pub fn same(key: &str, a: &str, b: &str) -> bool {
+pub(crate) fn same(key: &str, a: &str, b: &str) -> bool {
     match key == LABEL {
         true => a == b || fold(a) == fold(b),
         false => a == b,
@@ -97,7 +97,7 @@ pub fn same(key: &str, a: &str, b: &str) -> bool {
 /// it removes and the values it adds, each byte for byte, a value removed
 /// and added again in the same spelling being in neither.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PimdirPropertyChange {
+pub(crate) struct PimdirPropertyChange {
     /// The values held that go, as the store spells them.
     pub removed: Vec<String>,
     /// The values that come, as the action spells them.
@@ -115,7 +115,7 @@ impl PimdirPropertyChange {
 /// A `set-property` leaving more than [`MAX_VALUES`] values under its key,
 /// which the owner parks as the schema refuses the 65th (§15.3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PimdirPropertyOverflow {
+pub(crate) struct PimdirPropertyOverflow {
     /// How many values the change would leave.
     pub values: usize,
 }
@@ -128,7 +128,7 @@ pub struct PimdirPropertyOverflow {
 ///
 /// Answers the rows to write, or the overflow when the values left under
 /// the key would pass [`MAX_VALUES`].
-pub fn change(
+pub(crate) fn change(
     key: &str,
     held: &[String],
     remove: &[String],

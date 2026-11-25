@@ -947,7 +947,7 @@ fn notified(line: &PimdirContentLine) -> bool {
 /// The components carrying `RECURRENCE-ID`, `DTSTAMP` and `LAST-MODIFIED`
 /// aside, in an order two equal sets share, so an update changing an
 /// occurrence compares unequal (Annex B.1).
-pub fn occurrences(body: &[u8]) -> Vec<Vec<String>> {
+pub(crate) fn occurrences(body: &[u8]) -> Vec<Vec<String>> {
     let mut occurrences: Vec<Vec<String>> = components(body)
         .iter()
         .filter(|component| component.line("RECURRENCE-ID").is_some())

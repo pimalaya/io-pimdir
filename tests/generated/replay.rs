@@ -536,7 +536,7 @@ pub fn produce(root: &Path, before: &Step, step: &Step) -> Vec<String> {
                 .source()
                 .cloned()
                 .unwrap_or_else(|| String::from("local"));
-            let mut owner = PimdirStore::open(root).unwrap().for_source(source);
+            let mut owner = PimdirStore::open(root).unwrap().for_source(source).unwrap();
             owner.drain().unwrap();
         }
     }
@@ -555,7 +555,8 @@ pub fn run_verb(
     let options = options(before, step, run);
     let mut owner = PimdirStore::open(root)
         .unwrap()
-        .for_source(run.source.as_str());
+        .for_source(run.source.as_str())
+        .unwrap();
     match run.verb {
         "sync" => owner
             .sync(run.collection.as_str(), options, remote)

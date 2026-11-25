@@ -71,7 +71,10 @@ fn blob_exists(dir: &std::path::Path, hash: &str) -> bool {
 #[test]
 fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     // batch one indexes two bodies and attaches neither, which is what a
@@ -137,7 +140,10 @@ fn a_body_stored_without_a_placement_survives_until_it_is_attached() {
 #[test]
 fn an_orphan_blob_is_collected_with_the_unreferenced_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .write(vec![
@@ -194,7 +200,10 @@ fn a_large_purge_gives_its_pages_back_to_the_filesystem() {
     const ITEMS: usize = 1_500;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let size = || {
         let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
@@ -258,7 +267,10 @@ fn a_large_purge_gives_its_pages_back_to_the_filesystem() {
 #[test]
 fn a_purge_retires_rows_and_the_collector_reclaims_the_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -305,7 +317,10 @@ fn a_purge_retires_rows_and_the_collector_reclaims_the_bytes() {
 #[test]
 fn a_repair_recomputes_a_drifted_refcount_and_clears_a_dangling_binding() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store
         .write(vec![
             store_object(
@@ -368,7 +383,10 @@ fn a_running_guard_keeps_the_collector_out() {
     const HASH: &str = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
 
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut other = PimdirStore::open(dir.path()).unwrap();
 

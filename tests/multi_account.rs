@@ -76,7 +76,8 @@ fn seed(dir: &std::path::Path) {
     let mut work = PimdirStore::open(dir)
         .unwrap()
         .for_account("work")
-        .for_source("server");
+        .for_source("server")
+        .unwrap();
     work.ensure_collection("work/INBOX", "message/rfc822")
         .unwrap();
     work.write(news("work/INBOX", "1")).unwrap();
@@ -85,7 +86,8 @@ fn seed(dir: &std::path::Path) {
     let mut home = PimdirStore::open(dir)
         .unwrap()
         .for_account("home")
-        .for_source("server");
+        .for_source("server")
+        .unwrap();
     home.ensure_collection("home/INBOX", "message/rfc822")
         .unwrap();
     home.write(news("home/INBOX", "9")).unwrap();
@@ -111,7 +113,10 @@ fn collections_carry_their_account() {
 #[test]
 fn an_ungrouped_store_is_the_null_bucket() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("server");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("server")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .write(batch(
@@ -222,7 +227,8 @@ fn a_sync_declaring_a_kind_never_moves_a_collection() {
     let other = PimdirStore::open(dir.path())
         .unwrap()
         .for_account("home")
-        .for_source("server");
+        .for_source("server")
+        .unwrap();
     other.ensure_collection("work/INBOX", "text/vcard").unwrap();
 
     assert_eq!(
@@ -255,7 +261,8 @@ fn a_body_lookup_never_crosses_an_account() {
     let mut work = PimdirStore::open(dir.path())
         .unwrap()
         .for_account("work")
-        .for_source("server");
+        .for_source("server")
+        .unwrap();
     work.ensure_collection("work/AB", "text/vcard").unwrap();
     work.write(batch(
         "work/AB",
@@ -271,7 +278,8 @@ fn a_body_lookup_never_crosses_an_account() {
     let home = PimdirStore::open(dir.path())
         .unwrap()
         .for_account("home")
-        .for_source("server");
+        .for_source("server")
+        .unwrap();
     home.ensure_collection("home/AB", "text/vcard").unwrap();
 
     let found = home
@@ -296,7 +304,8 @@ fn a_body_lookup_still_dedups_across_collections() {
     let mut store = PimdirStore::open(dir.path())
         .unwrap()
         .for_account("work")
-        .for_source("server");
+        .for_source("server")
+        .unwrap();
     store
         .ensure_collection("work/INBOX", "message/rfc822")
         .unwrap();

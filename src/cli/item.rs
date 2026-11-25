@@ -390,7 +390,7 @@ impl ItemRestoreCommand {
         let status = match store.owner_if_free()? {
             None => RestoreStatus::Queued,
             Some(owner) => {
-                let mut owner = owner.for_source(source);
+                let mut owner = owner.for_source(source).map_err(report)?;
                 match owner.drain() {
                     Err(io_pimdir::client::PimdirError::Busy) => RestoreStatus::Queued,
                     Err(err) => return Err(report(err)),

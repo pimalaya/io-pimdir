@@ -88,7 +88,10 @@ fn count(dir: &Path, name: &str, word: &str) -> usize {
 #[test]
 fn an_erased_mail_leaves_both_files() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     file(&mut store, "kept", "Kept", "kept.sender", "ordinary words");
     file(
@@ -152,7 +155,10 @@ fn an_erased_mail_leaves_both_files() {
 #[test]
 fn a_bound_live_item_is_not_erased() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     file(&mut store, "live", "Live", "live.sender", "words");
     let seq = store.list_items("INBOX", None, 10).unwrap()[0].seq;

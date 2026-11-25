@@ -56,7 +56,7 @@ fn placement(collection: &str, handle: &str) -> PimdirPlacement {
 }
 
 fn seeded(dir: &Path) -> PimdirSourceStore {
-    let mut right = PimdirStore::open(dir).unwrap().for_source("right");
+    let mut right = PimdirStore::open(dir).unwrap().for_source("right").unwrap();
     right.ensure_collection("S", "message/rfc822").unwrap();
     right.ensure_collection("T", "message/rfc822").unwrap();
     right
@@ -72,7 +72,7 @@ fn seeded(dir: &Path) -> PimdirSourceStore {
         ])
         .unwrap();
     drop(right);
-    let mut left = PimdirStore::open(dir).unwrap().for_source("left");
+    let mut left = PimdirStore::open(dir).unwrap().for_source("left").unwrap();
     left.write(vec![
         PimdirWriteOp::UpsertPlacement(placement("S", "s1")),
         PimdirWriteOp::SetCheckpoint {
@@ -278,7 +278,10 @@ fn a_mutated_move_joins_the_other_sources_item() {
 #[test]
 fn a_drained_copy_revives_the_tombstone_of_the_source_syncing_its_target() {
     let dir = tempfile::tempdir().unwrap();
-    let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut right = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     right.ensure_collection("S", "message/rfc822").unwrap();
     right.ensure_collection("T", "message/rfc822").unwrap();
     right
@@ -303,7 +306,10 @@ fn a_drained_copy_revives_the_tombstone_of_the_source_syncing_its_target() {
             },
         )
         .unwrap();
-    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let mut left = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
     left.write(vec![PimdirWriteOp::UpsertPlacement(placement("S", "s1"))])
         .unwrap();
     enqueue(dir.path(), &left, true);
@@ -334,11 +340,17 @@ fn a_drained_copy_stages_its_create_under_the_owners_own_source() {
         collection: PimdirCollectionId("T".into()),
         checkpoint: PimdirCheckpoint(b"cp".to_vec()),
     };
-    let mut alpha = PimdirStore::open(dir.path()).unwrap().for_source("alpha");
+    let mut alpha = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("alpha")
+        .unwrap();
     alpha.ensure_collection("S", "message/rfc822").unwrap();
     alpha.ensure_collection("T", "message/rfc822").unwrap();
     alpha.write(vec![checkpoint()]).unwrap();
-    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    let mut left = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("left")
+        .unwrap();
     left.write(vec![
         PimdirWriteOp::StoreObject {
             object: PimdirObject {
@@ -351,7 +363,10 @@ fn a_drained_copy_stages_its_create_under_the_owners_own_source() {
     ])
     .unwrap();
     enqueue(dir.path(), &left, true);
-    let mut zulu = PimdirStore::open(dir.path()).unwrap().for_source("zulu");
+    let mut zulu = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("zulu")
+        .unwrap();
     zulu.write(vec![checkpoint()]).unwrap();
 
     let report = zulu.drain().unwrap();

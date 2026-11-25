@@ -71,7 +71,10 @@ fn a_page_is_total_in_both_directions_across_a_tie() {
     // must not make a page boundary skip one or serve it twice, which a
     // cursor on the key alone does whenever a limit splits a tie
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(
@@ -123,7 +126,10 @@ fn an_unknown_key_sorts_last_descending_and_first_ascending() {
     // an unsummarised item keeps `''`, which puts it at the end of a
     // newest-first mail listing and at the head of an A-to-Z contact one
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(
@@ -159,7 +165,10 @@ fn an_ordinary_write_does_not_reset_a_sort_key() {
     // alone, or ordering would be wiped on every sync and a consumer
     // restating keys afterwards would race its own sync for ever
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(&mut store, "INBOX", &[("1", "a", "2026-08-01T10:00:00Z")]);
@@ -183,7 +192,8 @@ fn renaming_a_collection_carries_its_contents() {
     let mut store = PimdirStore::open(dir.path())
         .unwrap()
         .for_account("alice")
-        .for_source("remote");
+        .for_source("remote")
+        .unwrap();
     store
         .ensure_collection("alice/INBOX", "message/rfc822")
         .unwrap();
@@ -225,7 +235,10 @@ fn a_key_written_by_a_placement_survives_a_later_write() {
     // io-replica carries it on the placement, the store binds it, and any
     // link dropping it lands the item unsorted
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     let mut placed = placement("INBOX", "1", "a");
@@ -269,7 +282,10 @@ fn a_write_carrying_a_new_sort_key_updates_the_stored_one() {
     // given, so a write carrying one and otherwise unchanged must land
     // it, or the item stays where the first derivation put it for ever
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(&mut store, "INBOX", &[("1", "a", "2026-08-01T10:00:00Z")]);
@@ -290,7 +306,10 @@ fn a_key_above_the_first_page_cursor_is_still_paged() {
     // reserved and a descending page starting from a sentinel would hide
     // everything above it while the count still reported it
     let dir = tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("remote");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("remote")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     seed(

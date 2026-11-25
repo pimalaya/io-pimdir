@@ -48,7 +48,10 @@ fn reply(collection: &str, handle: &str, id: &str, parent: &str) -> PimdirWriteO
 #[test]
 fn a_reply_answers_its_parent_and_the_person_s_own_does_not() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("imap")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store.ensure_collection("Sent", "message/rfc822").unwrap();
     store.set_collection_role("Sent", Some("sent")).unwrap();

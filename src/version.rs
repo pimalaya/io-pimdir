@@ -1,8 +1,8 @@
 //! # Versions
 //!
 //! Whether a program opens a store, judged from the versions the store
-//! states and nothing else (STORAGE §4.2): I/O-free, so every profile,
-//! and an owner holding its own SQLite, asks one judgement.
+//! states and nothing else (STORAGE §4.2): I/O-free, so every profile
+//! asks one judgement.
 //!
 //! A draft's store opens under that draft alone, its `format_version`
 //! compared to the word; the two schema stamps agreeing, the algorithm
@@ -30,7 +30,7 @@ const RELEASED: &str = "storage-v";
 /// The profile a program opens a store under (STORAGE §17), each holding
 /// the one before.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PimdirProfile {
+pub(crate) enum PimdirProfile {
     /// Opens the store read-only and lists it.
     Reader,
     /// A reader that enqueues actions.
@@ -41,16 +41,17 @@ pub enum PimdirProfile {
 
 /// The storage part a program implements (STORAGE §4.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PimdirFormat<'a> {
+pub(crate) enum PimdirFormat<'a> {
     /// A draft, by the name its stores carry (`storage-draft-18`).
     Draft(&'a str),
     /// A released version.
+    #[cfg_attr(not(test), allow(dead_code))]
     Release,
 }
 
 /// A program as the judgement reads it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PimdirProgram<'a> {
+pub(crate) struct PimdirProgram<'a> {
     /// The profile it opens the store under.
     pub profile: PimdirProfile,
     /// The schema version it implements, its storage part's major.
@@ -67,7 +68,7 @@ pub struct PimdirProgram<'a> {
 /// their name, type and meaning in every version, beside the
 /// `PRAGMA user_version` the schema version is compared with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PimdirStoreVersion<'a> {
+pub(crate) struct PimdirStoreVersion<'a> {
     /// `store_meta.format`, `None` for a database lacking the column.
     pub format: Option<&'a str>,
     /// `store_meta.format_version`, `None` for a store lacking the
@@ -185,7 +186,7 @@ impl PimdirStoreVersion<'_> {
 /// Why a program does not open a store (STORAGE §4.2). A refused store is
 /// never reconciled, migrated, rebuilt, written nor deleted.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PimdirVersionRefusal {
+pub(crate) enum PimdirVersionRefusal {
     /// The store's `format` is not `pimdir`: another program's database,
     /// to a released program.
     Foreign {

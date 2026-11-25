@@ -68,7 +68,7 @@ fn placement(collection: &str, handle: &str, link: &str) -> PimdirPlacement {
 /// A store holding `m` in INBOX and Archive, `n` in INBOX and `alice` in
 /// Cards.
 fn seeded(dir: &Path) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("imap");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("imap").unwrap();
     for (collection, kind) in [("INBOX", MAIL), ("Archive", MAIL), ("Cards", CARD)] {
         store.ensure_collection(collection, kind).unwrap();
     }

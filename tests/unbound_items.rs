@@ -106,7 +106,10 @@ fn an_entry_is_written_restated_and_deleted_with_its_pins() {
 #[test]
 fn a_collection_a_source_syncs_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let mut source = PimdirStore::open(dir.path()).unwrap().for_source("caldav");
+    let mut source = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("caldav")
+        .unwrap();
     source
         .ensure_collection("Calendar", "text/calendar")
         .unwrap();
@@ -227,7 +230,10 @@ fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
         .unwrap();
     drop(producer);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("phone");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("phone")
+        .unwrap();
     let report = owner.drain().unwrap();
     assert_eq!(
         (report.applied, report.parked, report.skipped),
@@ -263,7 +269,10 @@ fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
         .unwrap();
     drop(producer);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("phone");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("phone")
+        .unwrap();
     let report = owner.drain().unwrap();
     assert_eq!(
         (report.applied, report.parked, report.skipped),
@@ -311,7 +320,10 @@ fn an_unbound_edit_over_a_replaced_body_parks() {
         .unwrap();
     drop(producer);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("phone");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("phone")
+        .unwrap();
     let report = owner.drain().unwrap();
     assert_eq!(
         (report.applied, report.parked, report.skipped),

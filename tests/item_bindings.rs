@@ -56,7 +56,7 @@ fn card(handle: &str, status: PimdirStatus) -> PimdirPlacement {
 }
 
 fn seed(dir: &std::path::Path, source: &str) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source(source);
+    let store = PimdirStore::open(dir).unwrap().for_source(source).unwrap();
     store.ensure_collection("contacts", "text/vcard").unwrap();
     store
 }
@@ -162,7 +162,10 @@ fn every_source_holding_an_item_reports_its_own_binding() {
     .unwrap();
     drop(left);
 
-    let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    let mut right = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("right")
+        .unwrap();
     let mut diverged = card("right-handle", PimdirStatus::Conflict);
     diverged.conflict_revision = Some("etag-remote".into());
     right

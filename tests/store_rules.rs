@@ -23,7 +23,7 @@ use io_pimdir::{
 };
 
 fn opened(dir: &Path) -> PimdirSourceStore {
-    let store = PimdirStore::open(dir).unwrap().for_source("local");
+    let store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
 }

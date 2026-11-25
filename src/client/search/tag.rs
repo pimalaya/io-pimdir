@@ -20,10 +20,11 @@ use crate::{
     client::{
         PimdirError,
         producer::{PimdirEnqueue, PimdirPendingAction, PimdirProducer},
-        search::{Found, PimdirIndex, PimdirSearchClock, PimdirSearchSort},
+        search::{Found, PimdirIndex, PimdirSearchClock},
     },
     codec::PimdirAction,
     search::{
+        plan::PimdirSearchSort,
         query::PimdirQuery,
         tag::{
             self, PimdirSearchTagAction, PimdirSearchTagError, PimdirSearchTagHit,

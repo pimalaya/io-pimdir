@@ -49,7 +49,7 @@ pub fn flags_from_column(joined: Option<&str>) -> PimdirFlags {
 /// bytes, in the order of their bits: `\Seen` 1, `\Answered` 2, `\Flagged`
 /// 4, `\Draft` 8, `\Deleted` 16. Every other flag, `\seen` included, is a
 /// keyword.
-pub const MARKS: [&str; 5] = ["\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"];
+pub(crate) const MARKS: [&str; 5] = ["\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"];
 
 /// A flag's bit in `marks` or `base_marks` (STORAGE §13), `None` for a
 /// flag held as a keyword.
@@ -93,7 +93,7 @@ pub fn is_flag(flag: &str) -> bool {
 }
 
 /// The detail ladder as its column integer.
-pub fn level_to_int(level: PimdirLevel) -> i64 {
+pub(crate) fn level_to_int(level: PimdirLevel) -> i64 {
     match level {
         PimdirLevel::Meta => 1,
         PimdirLevel::Full => 2,
@@ -102,7 +102,7 @@ pub fn level_to_int(level: PimdirLevel) -> i64 {
 
 /// The inverse of [`level_to_int`]: `2` is `Full` and `1` `Meta`, the
 /// only two the schema holds (STORAGE §13).
-pub fn level_from_int(value: i64) -> PimdirLevel {
+pub(crate) fn level_from_int(value: i64) -> PimdirLevel {
     match value {
         2 => PimdirLevel::Full,
         _ => PimdirLevel::Meta,
@@ -110,7 +110,7 @@ pub fn level_from_int(value: i64) -> PimdirLevel {
 }
 
 /// A collection's cross-source conflict policy as its column spelling.
-pub fn conflict_to_str(policy: PimdirHubConflict) -> &'static str {
+pub(crate) fn conflict_to_str(policy: PimdirHubConflict) -> &'static str {
     match policy {
         PimdirHubConflict::Manual => "manual",
         PimdirHubConflict::PreferIncoming => "prefer-incoming",
@@ -118,7 +118,7 @@ pub fn conflict_to_str(policy: PimdirHubConflict) -> &'static str {
     }
 }
 
-/// The inverse of [`conflict_to_str`]; an unknown spelling is `Manual`.
+/// The inverse of `conflict_to_str`; an unknown spelling is `Manual`.
 pub fn conflict_from_str(value: &str) -> PimdirHubConflict {
     match value {
         "prefer-incoming" => PimdirHubConflict::PreferIncoming,
@@ -340,7 +340,7 @@ pub enum PimdirAction {
     /// Change the item's properties under one key (§4.3, §15.3): local
     /// state the owner applies to the store alone, as no source, needing
     /// no capability and deriving no push. Its removes apply before its
-    /// adds, a label compared folded ([`crate::property::change`]).
+    /// adds, a label compared folded (`property::change`).
     SetProperty {
         /// The item's public id.
         seq: i64,
@@ -405,7 +405,7 @@ impl PimdirAction {
     /// Points the action at `target`, the `queue.target_collection` a
     /// rename followed (§14): the owner reads it in place of the payload's
     /// own. An action naming no collection beside its own is left as it is.
-    pub fn retarget(&mut self, target: PimdirCollectionId) {
+    pub(crate) fn retarget(&mut self, target: PimdirCollectionId) {
         match self {
             Self::Move { to, .. } | Self::Copy { to, .. } => *to = target,
             Self::Add {

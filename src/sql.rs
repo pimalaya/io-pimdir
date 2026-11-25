@@ -31,7 +31,7 @@ pub const FORMAT_VERSION: &str = "storage-draft-18";
 /// expansion, so a statement is added in one place.
 macro_rules! statements {
     ($($(#[$doc:meta])* $name:ident = $sql:expr;)*) => {
-        $($(#[$doc])* pub const $name: &str = $sql;)*
+        $($(#[$doc])* pub(crate) const $name: &str = $sql;)*
 
         /// Every statement of this crate's own, paired with its constant name.
         pub const OWN: &[(&str, &str)] = &[$((stringify!($name), $name)),*];

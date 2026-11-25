@@ -38,7 +38,7 @@ fn add(hash: PimdirHash) -> PimdirAction {
 /// A store whose INBOX holds the messages `ids`, each a create queued and
 /// applied, pending for the source `local`.
 fn populated(dir: &Path, ids: &[&str]) -> PimdirSourceStore {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut producer = PimdirProducer::open(dir, "test").unwrap();
     for id in ids {

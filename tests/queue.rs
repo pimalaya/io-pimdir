@@ -101,7 +101,7 @@ fn blob_exists(dir: &Path, hash: &str) -> bool {
 
 /// Seeds a one-item INBOX and returns `(store, seq)` for the item.
 fn seeded(dir: &Path) -> (PimdirSourceStore, i64) {
-    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local").unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store
         .write(vec![
@@ -374,7 +374,10 @@ fn remove_hides_the_item_and_an_absent_remove_succeeds() {
 #[test]
 fn copy_fills_the_target_and_move_also_empties_the_source() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     // NOTE: a move or a copy into a collection nothing declared parks
     // (STORAGE §15.3), and a copy shares the public id of its source of
     // the same kind alone (§9.1), so every collection is declared first.
@@ -465,7 +468,10 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
 #[test]
 fn a_queued_bodiless_move_applies_into_a_target_its_source_syncs() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store.ensure_collection("Trash", "message/rfc822").unwrap();
     store
@@ -529,7 +535,10 @@ fn a_queued_bodiless_move_applies_into_a_target_its_source_syncs() {
 #[test]
 fn a_queued_move_into_its_own_collection_parks() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let mut listed = placement("1", "mid:a", "", &[]);
     listed.object = None;
@@ -941,7 +950,10 @@ fn a_parked_error_is_recorded_without_its_credentials() {
 #[test]
 fn a_generation_bump_is_visible_to_a_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
 
     // the epoch starts at 1 and ordinary writes never bump it
@@ -1110,7 +1122,10 @@ fn a_drain_applies_an_action_as_the_source_of_its_collection() {
         .unwrap();
 
     // A source with no binding in this collection drains first.
-    let mut stranger = PimdirStore::open(dir.path()).unwrap().for_source("other");
+    let mut stranger = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("other")
+        .unwrap();
     let report = stranger.drain().unwrap();
     assert_eq!((report.applied, report.skipped, report.parked), (2, 0, 0));
 
@@ -1218,7 +1233,10 @@ fn a_remove_drained_by_a_stranger_tombstones_the_item_for_its_source() {
         )
         .unwrap();
 
-    let mut stranger = PimdirStore::open(dir.path()).unwrap().for_source("other");
+    let mut stranger = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("other")
+        .unwrap();
     let report = stranger.drain().unwrap();
     assert_eq!((report.applied, report.parked, report.skipped), (1, 0, 0));
     assert!(
@@ -1352,6 +1370,38 @@ fn a_malformed_pending_row_is_skipped_by_the_overlay_and_parked_by_the_drain() {
     let parked = store.parked_actions().unwrap();
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0].producer, "foreign");
+}
+
+/// STORAGE §15.4: a move or a copy into a collection whose payload does
+/// not decode is listed among its arrivals, opaque, as `pending_actions`
+/// lists it in the collection it leaves.
+#[test]
+fn a_malformed_arrival_is_listed_opaque() {
+    let dir = tempfile::tempdir().unwrap();
+    let _store = seeded(dir.path());
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    for action in ["move", "copy"] {
+        conn.execute(
+            "INSERT INTO queue(created_at, producer, collection, action, payload, target_collection) \
+             VALUES('2026-11-25T00:00:00.000Z', 'foreign', 'INBOX', ?1, 'not json', 'Archive')",
+            [action],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    let arrivals = reader.pending_arrivals("Archive").unwrap();
+    let listed: Vec<_> = arrivals
+        .iter()
+        .map(|arrival| match &arrival.action {
+            PimdirAction::Unknown { kind, payload, .. } => (kind.as_str(), payload.as_str()),
+            other => panic!("the malformed row lists opaque: {other:?}"),
+        })
+        .collect();
+    assert_eq!(listed, [("move", "not json"), ("copy", "not json")]);
+    assert_eq!(arrivals[0].collection, "INBOX");
 }
 
 /// STORAGE §15.1: the enqueue pins the hash the action names, so a body
@@ -1539,10 +1589,13 @@ fn a_body_a_policy_overrules_during_a_drain_is_reported() {
             io_pimdir::hub::PimdirHubConflict::PreferIncoming,
         )
         .unwrap();
-    let mut a = store.for_source("a");
+    let mut a = store.for_source("a").unwrap();
     a.write(bound("a1", &card("u1", "Ann"))).unwrap();
     drop(a);
-    let mut b = PimdirStore::open(dir.path()).unwrap().for_source("b");
+    let mut b = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("b")
+        .unwrap();
     b.write(bound("b1", &card("u1", "Ann B"))).unwrap();
     let seq = b.list_items("contacts", None, 10).unwrap()[0].seq;
     let retained = b.list_retained("contacts", None, 10).unwrap().len();
@@ -1563,7 +1616,10 @@ fn a_body_a_policy_overrules_during_a_drain_is_reported() {
         .id;
     drop(producer);
 
-    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("a");
+    let mut owner = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("a")
+        .unwrap();
     let report = owner.drain().unwrap();
     assert_eq!(report.applied, 1, "{report:?}");
     let kept = owner.list_retained("contacts", None, 10).unwrap();
@@ -1646,7 +1702,10 @@ fn a_queued_flag_change_stating_its_base_keeps_a_flag_landed_since() {
 #[test]
 fn a_queued_flag_change_stating_its_base_parks_over_an_unknown_set() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .unwrap();
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     let hash = "cafebabecafebabecafebabecafebabecafebabecafebabecafe";
     let mut unread = placement("1", "mid:a", hash, &[]);

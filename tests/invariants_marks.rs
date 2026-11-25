@@ -58,7 +58,7 @@ fn probe(dir: &Path) -> Vec<String> {
 
 /// The owner, handing the store to `source`.
 fn owner(dir: &Path, source: &str) -> PimdirSourceStore {
-    PimdirStore::open(dir).unwrap().for_source(source)
+    PimdirStore::open(dir).unwrap().for_source(source).unwrap()
 }
 
 fn inbox(collection: &str) -> PimdirCollectionId {
