@@ -18,7 +18,7 @@ use pimdir_generator::{
     model::{Kind, Model, State},
     oracle::Expectation,
     profile::{self, Profile},
-    queue::Action,
+    queue::{Action, RowState},
     spec::Spec,
 };
 use rusqlite::types::Value;
@@ -99,9 +99,9 @@ pub fn differences(model: Model) -> Vec<String> {
         .unwrap();
     owner.drain().unwrap();
     drop(owner);
-    let rule = senders(&drained);
+    let (rule, recorded) = (senders(&drained), drained_senders(&model));
     let (_, read) = reader::compare(&spec, &drained, &root, |expectation, columns, got, want| {
-        sender(&rule, expectation, columns, got, want)
+        sender(&rule, &recorded, expectation, columns, got, want)
     });
     differences.extend(
         read.into_iter()
@@ -166,12 +166,54 @@ pub fn senders(model: &Model) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+/// `recorded`, the `sender` references a store may hold, once its owner
+/// wrote `model`: a reference goes with the last row of either end, and
+/// each one the rule states over `model` joins. A reference is recorded
+/// once and never recomputed (STORAGE §14.2), so a card that leaves an
+/// address keeps the mail it was the sender of.
+pub fn record(recorded: &mut BTreeSet<(String, String)>, model: &Model) {
+    let held = |kind: Kind, link_id: &str| {
+        model.items.iter().any(|item| {
+            item.link_id == link_id && model.collections[&item.collection].kind == Some(kind)
+        })
+    };
+    recorded.retain(|(mail, contact)| held(Kind::Mail, mail) && held(Kind::Contact, contact));
+    recorded.extend(senders(model));
+}
+
+/// The `sender` references a store of `model` may hold once its owner
+/// drained the queue: [`record`] over the model before any row and after
+/// each add or update, the rows that change what the rule reads. A drain
+/// drops no row of `items`.
+pub fn drained_senders(model: &Model) -> BTreeSet<(String, String)> {
+    let mut model = model.clone();
+    let mut recorded = BTreeSet::new();
+    record(&mut recorded, &model);
+    let pending: Vec<(i64, bool)> = model
+        .queue
+        .iter()
+        .filter(|row| row.state == RowState::Pending)
+        .map(|row| {
+            let writes = matches!(row.action, Action::Add { .. } | Action::Update { .. });
+            (row.id, writes)
+        })
+        .collect();
+    for (id, writes) in pending {
+        model.drain(id);
+        if writes {
+            record(&mut recorded, &model);
+        }
+    }
+    recorded
+}
+
 /// [`SENDER`] where io-pimdir answers every reference the oracle states
-/// and more, each more one the `sender` rule records (`rule`), and, from a
-/// mail, every one the rule records from it: an owner applying the rule
-/// records what it states (STORAGE §14.2).
+/// and more, each more one the store may hold (`recorded`, [`record`]),
+/// and, from a mail, every one the rule states over the model (`rule`): an
+/// owner applying the rule records what it states (STORAGE §14.2).
 pub fn sender(
     rule: &BTreeSet<(String, String)>,
+    recorded: &BTreeSet<(String, String)>,
     expectation: &Expectation,
     columns: &[&str],
     got: &[Vec<Value>],
@@ -196,14 +238,14 @@ pub fn sender(
     };
 
     let extra: Vec<&Vec<Value>> = got.iter().filter(|row| !want.contains(row)).collect();
-    let recorded: BTreeSet<(String, String)> = extra
+    let answered: BTreeSet<(String, String)> = extra
         .iter()
         .map(|row| (text(&row[from]), text(&row[to])))
         .collect();
     let ruled = extra.iter().all(|row| {
         text(&row[role]) == "sender"
             && text(&row[origin]) == "auto"
-            && rule.contains(&(text(&row[from]), text(&row[to])))
+            && recorded.contains(&(text(&row[from]), text(&row[to])))
     });
     let endpoint = expectation
         .params
@@ -213,7 +255,7 @@ pub fn sender(
     let whole = rule
         .iter()
         .filter(|(mail, _)| *mail == endpoint)
-        .all(|pair| recorded.contains(pair));
+        .all(|pair| answered.contains(pair));
     let kept = want.iter().all(|row| got.contains(row));
 
     (kept && ruled && whole).then_some(SENDER)

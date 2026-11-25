@@ -7,12 +7,11 @@
 //! against the oracle stated over the drained model.
 
 use io_pimdir::client::{PimdirStore, producer::PimdirActionStatus, reader::PimdirReader};
-use pimdir_generator::{model::Model, oracle::Expectation, queue::RowState, spec::Spec};
-use rusqlite::types::Value;
+use pimdir_generator::{model::Model, profile::Profile, queue::RowState, shrink::Kept, spec::Spec};
 
 use crate::{
     common::{Generated, SEEDS},
-    reader,
+    reader, scale,
 };
 
 #[test]
@@ -28,6 +27,41 @@ fn a_drained_generated_queue_leaves_what_the_model_drains_to() {
     }
 }
 
+/// A mail drained while a card holds its sender's address keeps its
+/// `sender` reference once a later row takes the address off the card: a
+/// reference is never recomputed and an address removed removes nothing
+/// (STORAGE §14.2). Campaign-2's structure seed 2047, shrunk.
+#[test]
+fn a_sender_reference_outlives_the_address_it_was_recorded_by() {
+    let kept = Kept {
+        collections: ["work/Sent Items", "work/contacts", "work/holidays"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        items: vec![
+            ("work/contacts".into(), "52581e03-80@pimdir.test".into()),
+            ("work/holidays".into(), "71d23310-183@pimdir.test".into()),
+        ],
+        queue: vec![14, 17],
+        capabilities: false,
+        references: false,
+    };
+    let spec = Spec::load_default().unwrap();
+    let model = kept.apply(&Profile::Structure.generate(&spec, 2047).unwrap());
+    let differences = differences_of(model);
+    let known = differences
+        .iter()
+        .filter(|(known, _)| known.is_some())
+        .count();
+    let unknown: Vec<&String> = differences
+        .iter()
+        .filter(|(known, _)| known.is_none())
+        .map(|(_, difference)| difference)
+        .collect();
+    assert!(unknown.is_empty(), "{unknown:#?}");
+    assert!(known > 0, "the reference the add recorded is read");
+}
+
 /// Every difference between io-pimdir's drain of the store at `seed` and
 /// the model's, each with the known finding it stands under.
 fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
@@ -35,20 +69,14 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
 }
 
 /// Every difference between io-pimdir's drain of the store of `model` and
-/// the model's.
+/// the model's, a `sender` reference the owner may record over the drain
+/// known (`scale::drained_senders`, `scale::sender`).
 pub fn differences_of(model: Model) -> Vec<(Option<&'static str>, String)> {
-    differences_with(model, |_, _, _, _, _| None)
-}
-
-/// The same, `differ` naming the finding a read the drained model and the
-/// store disagree on stands under, as [`reader::compare`] takes it.
-pub fn differences_with(
-    model: Model,
-    differ: impl Fn(&Model, &Expectation, &[&str], &[Vec<Value>], &[Vec<Value>]) -> Option<&'static str>,
-) -> Vec<(Option<&'static str>, String)> {
     let generated = Generated::write(Spec::load_default().unwrap(), model);
+    let recorded = scale::drained_senders(&generated.model);
     let mut drained = generated.model.clone();
     drained.drain_all();
+    let rule = scale::senders(&drained);
 
     let mut owner = PimdirStore::open(generated.root())
         .unwrap()
@@ -86,7 +114,9 @@ pub fn differences_with(
         &generated.spec,
         &drained,
         &generated.root(),
-        |expectation, columns, got, want| differ(&drained, expectation, columns, got, want),
+        |expectation, columns, got, want| {
+            scale::sender(&rule, &recorded, expectation, columns, got, want)
+        },
     );
     differences.extend(rows);
     differences

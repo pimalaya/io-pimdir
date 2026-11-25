@@ -111,17 +111,22 @@ pub fn differences_of(model: Model, every: bool) -> Vec<String> {
         .for_source("local")
         .unwrap();
     let mut model = generated.model.clone();
+    let mut recorded = BTreeSet::new();
 
     let mut differences = Vec::new();
     for (step, write) in writes(&drained).into_iter().enumerate() {
         let label = write.label();
         assert!(write.apply(&mut owner).unwrap(), "{label}");
+        if matches!(write, Write::Drain) {
+            recorded.extend(scale::drained_senders(&model));
+        }
         follow(&mut model, &write);
+        scale::record(&mut recorded, &model);
         index.refresh(&options).unwrap();
 
         let rule = scale::senders(&model);
         let (_, rows) = reader::compare(&generated.spec, &model, &root, |e, columns, got, want| {
-            scale::sender(&rule, e, columns, got, want)
+            scale::sender(&rule, &recorded, e, columns, got, want)
         });
         let rows: Vec<String> = rows
             .into_iter()
@@ -136,7 +141,7 @@ pub fn differences_of(model: Model, every: bool) -> Vec<String> {
         }
 
         let corpus = Corpus {
-            model: ruled(&model, &root, &rule),
+            model: ruled(&model, &root, &recorded),
             properties: Vec::new(),
             missing: BTreeSet::new(),
             opaque: BTreeSet::new(),
@@ -187,9 +192,9 @@ pub fn differences_of(model: Model, every: bool) -> Vec<String> {
 }
 
 /// `model` holding each `sender` reference the store at `root` records
-/// that `rule` states (`scale::senders`): io-pimdir applies the rule to
-/// what a write touches (STORAGE §14.2), the reader comparison checking each
-/// one it records, and the oracle answers over the same references.
+/// that it may hold (`rule`, `scale::record`): io-pimdir applies the rule
+/// to what a write touches (STORAGE §14.2), the reader comparison checking
+/// each one it records, and the oracle answers over the same references.
 fn ruled(model: &Model, root: &Path, rule: &BTreeSet<(String, String)>) -> Model {
     let conn = Connection::open(root.join("pimdir.db")).unwrap();
     let mut statement = conn

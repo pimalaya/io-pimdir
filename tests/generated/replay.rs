@@ -119,11 +119,13 @@ pub fn replay(history: &History) -> Vec<(usize, String)> {
     let mut generated = Generated::write(Spec::load_default().unwrap(), first.model.clone());
 
     let mut revisions = BTreeMap::new();
+    let mut recorded = BTreeSet::new();
     let mut differences = Vec::new();
     for (index, pair) in history.steps.windows(2).enumerate() {
         let (before, step) = (&pair[0], &pair[1]);
         let at = format!("step {} ({})", index + 1, step.label);
-        let found = replay_step(&spec, &generated.root(), before, step, &mut revisions);
+        let root = generated.root();
+        let found = replay_step(&spec, &root, before, step, &mut revisions, &mut recorded);
         if found.is_empty() {
             continue;
         }
@@ -133,6 +135,7 @@ pub fn replay(history: &History) -> Vec<(usize, String)> {
                 .map(|text| (index + 1, format!("{at}: {text}"))),
         );
         generated = Generated::write(Spec::load_default().unwrap(), step.model.clone());
+        recorded.clear();
     }
     differences
 }
@@ -145,17 +148,27 @@ pub fn replay_case(case: &Case) -> Vec<String> {
     let (before, step) = (&history.steps[0], &history.steps[1]);
     let generated = Generated::write(Spec::load_default().unwrap(), before.model.clone());
     let mut revisions = case.revisions.clone();
-    replay_step(&spec, &generated.root(), before, step, &mut revisions)
+    let root = generated.root();
+    replay_step(
+        &spec,
+        &root,
+        before,
+        step,
+        &mut revisions,
+        &mut BTreeSet::new(),
+    )
 }
 
 /// Replays `step` on the store at `root`, which holds `before`'s model,
-/// answering every difference it leaves.
+/// answering every difference it leaves. `recorded` holds the `sender`
+/// references the store may hold (`scale::record`), the step's joining.
 fn replay_step(
     spec: &Spec,
     root: &Path,
     before: &Step,
     step: &Step,
     revisions: &mut BTreeMap<(String, String), String>,
+    recorded: &mut BTreeSet<(String, String)>,
 ) -> Vec<String> {
     let mut found = produce(root, before, step);
 
@@ -163,9 +176,11 @@ fn replay_step(
     if let Some(run) = &step.run {
         found.extend(replay_run(root, before, step, run, revisions));
     }
+    scale::record(recorded, &before.model);
+    scale::record(recorded, &step.model);
     let rule = scale::senders(&step.model);
     let (_, read) = reader::compare(spec, &step.model, root, |e, columns, got, want| {
-        scale::sender(&rule, e, columns, got, want)
+        scale::sender(&rule, recorded, e, columns, got, want)
     });
     found.extend(
         read.into_iter()

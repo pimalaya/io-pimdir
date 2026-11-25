@@ -352,13 +352,7 @@ impl Job {
         match self.suite {
             "reader" => known(reader::disagreements_of(model).1),
             "overlay" => known(overlay::differences_of(model)),
-            "drain" => known(drain::differences_with(
-                model,
-                |drained, expectation, columns, got, want| {
-                    let rule = scale::senders(drained);
-                    scale::sender(&rule, expectation, columns, got, want)
-                },
-            )),
+            "drain" => known(drain::differences_of(model)),
             "index" => known(index::differences_of(model)),
             "search" => plain(search::differences_of(model, false)),
             "crash-owner" => plain(crash::owner_cuts(model)),
