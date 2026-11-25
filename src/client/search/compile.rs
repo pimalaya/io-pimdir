@@ -1104,8 +1104,16 @@ impl Compiled {
     /// Renders a date term spanning `[since, until)`: its condition over
     /// placement `j{at}`, and its set when the plan measures one. Mail is
     /// dated by its sort key, a calendar item by its occurrences alone, so
-    /// one holding no body is dated by none (SEARCH §7, §8.1).
+    /// one holding no body is dated by none (SEARCH §7, §8.1). An empty
+    /// span, its end not past its start, matches nothing, an occurrence
+    /// running across it included.
     fn date(&mut self, leaf: &mut Leaf, at: usize, dates: (Option<i64>, Option<i64>)) -> String {
+        if let (Some(since), Some(until)) = dates
+            && until <= since
+        {
+            leaf.set = Some(String::from("SELECT '' AS akey, 0 AS seq WHERE 0"));
+            return String::from("0");
+        }
         let (j, c) = (format!("j{at}"), format!("c{at}"));
         let since = dates.0.map(time::rfc3339);
         let until = dates.1.map(time::rfc3339);

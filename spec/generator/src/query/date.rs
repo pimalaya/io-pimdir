@@ -98,8 +98,14 @@ pub struct Span {
 
 impl Span {
     /// Whether an occurrence from `start` to `end` overlaps it, one of zero
-    /// length falling in it when it starts inside (SEARCH §8.1).
+    /// length falling in it when it starts inside, none in an empty span
+    /// (SEARCH §8.1).
     pub fn meets(&self, start: i64, end: i64) -> bool {
+        if let (Some(since), Some(until)) = (self.start, self.end)
+            && until <= since
+        {
+            return false;
+        }
         let before_end = self.end.is_none_or(|bound| start < bound);
         match start == end {
             true => before_end && self.start.is_none_or(|bound| bound <= start),
@@ -517,5 +523,17 @@ mod tests {
         let now = at("2026-03-31T08:00:00Z");
         let span = DateValue::parse("1mo").unwrap().span(now, Zone::Utc);
         assert_eq!(span.unwrap().start, Some(at("2026-02-28T08:00:00Z")));
+    }
+
+    #[test]
+    fn an_empty_span_meets_no_occurrence() {
+        let now = at("2027-01-02T12:00:00Z");
+        let (from, to) = (at("2026-12-31T23:00:00Z"), at("2027-01-01T23:00:00Z"));
+        for value in ["1d..1d", "1d..2d"] {
+            let span = DateValue::parse(value).unwrap().span(now, Zone::Utc);
+            assert!(!span.unwrap().meets(from, to), "{value}");
+        }
+        let span = DateValue::parse("2d..1d").unwrap().span(now, Zone::Utc);
+        assert!(span.unwrap().meets(from, to));
     }
 }
