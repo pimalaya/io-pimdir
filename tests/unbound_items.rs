@@ -194,7 +194,8 @@ fn a_card_kept_on_the_device_is_written_with_its_summary() {
 /// A queued action on an item no source binds is the store's to settle
 /// (§15.2): never skipped, which would leave it pending forever. An edit
 /// and a flag change of a device-only item apply to the store, a remove
-/// retains it, and a move, which nothing could push, parks.
+/// retains it, `retained_by` naming no source since none removed it
+/// (STORAGE §13), and a move, which nothing could push, parks.
 #[test]
 fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
     use io_pimdir::{client::producer::PimdirProducer, codec::PimdirAction};
@@ -288,6 +289,15 @@ fn a_queued_action_on_an_item_no_source_binds_applies_or_parks() {
         1
     );
     assert!(owner.list_pending_actions().unwrap().is_empty());
+    let retained_by: Option<String> = rusqlite::Connection::open(dir.path().join("pimdir.db"))
+        .unwrap()
+        .query_row(
+            "SELECT retained_by FROM items WHERE retained_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_by, None, "no source's removal retired it");
 }
 
 /// An edit of an item no source binds applies on an edit's usual terms

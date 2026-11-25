@@ -1655,9 +1655,7 @@ fn apply_claimed(
         Ok(staged) => staged,
         Err(PimdirOutcome::Unbound(link)) => {
             let kind = write::kind_of(tx, collection)?;
-            if let Err(parked) =
-                apply_unbound(tx, blobs, &acting, collection, &kind, &link, action)?
-            {
+            if let Err(parked) = apply_unbound(tx, blobs, collection, &kind, &link, action)? {
                 return outcome(parked);
             }
             if let Some(hash) = &row.object_hash {
@@ -1814,7 +1812,7 @@ fn supersede(
                 named_params! {
                     ":collection": collection,
                     ":link_id": item.link_id.0,
-                    ":source": acting.0,
+                    ":source": None::<&str>,
                 },
             )?;
         }
@@ -2363,17 +2361,17 @@ fn unbound(
 }
 
 /// Applies an action on an item no source binds to the store alone, as
-/// [`unbound`] judged it: a `remove` retains it, settling the item's
-/// conflict its `resolves` names, a `set-flags` sets its flags, as a
-/// change when it states `base` and parking over an unknown set, an
-/// `update` writes its new body as `put_item` does, its flags kept and
-/// its summary derived again; a body deriving no summary, or another key,
-/// parks. An `if_match` and a `resolves` were checked by [`stage_action`]
-/// before the item was found unbound (§15.3).
+/// [`unbound`] judged it: a `remove` retains it, `retained_by` naming no
+/// source since none removed it (§13), settling the item's conflict its
+/// `resolves` names, a `set-flags` sets its flags, as a change when it
+/// states `base` and parking over an unknown set, an `update` writes its
+/// new body as `put_item` does, its flags kept and its summary derived
+/// again; a body deriving no summary, or another key, parks. An `if_match`
+/// and a `resolves` were checked by [`stage_action`] before the item was
+/// found unbound (§15.3).
 fn apply_unbound(
     tx: &Connection,
     blobs: &PimdirBlobs,
-    acting: &PimdirSourceId,
     collection: &str,
     kind: &str,
     link: &PimdirLinkId,
@@ -2392,7 +2390,7 @@ fn apply_unbound(
                 named_params! {
                     ":collection": collection,
                     ":link_id": link.0,
-                    ":source": acting.0,
+                    ":source": None::<&str>,
                 },
             )?;
         }

@@ -20,3 +20,5 @@ mod reader;
 mod replay;
 #[cfg(all(feature = "search", feature = "indexer"))]
 mod scale;
+#[cfg(all(feature = "search", feature = "indexer"))]
+mod search;

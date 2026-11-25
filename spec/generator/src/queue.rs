@@ -262,6 +262,12 @@ impl Model {
         if let Some(body) = action.body() {
             self.objects.insert(ObjectName::of(body), body.to_vec());
         }
+        if let Action::Add { filed, .. } | Action::Update { filed, .. } = &action
+            && let Some(words) = &filed.words
+        {
+            self.words
+                .insert(ObjectName::of(&filed.bytes), words.clone());
+        }
         let id = self.queue.len() as i64 + 1;
         self.queue.push(Row {
             id,
@@ -510,7 +516,17 @@ impl Model {
         if moves && self.conflict(index) {
             return Outcome::Parked(String::from("the item is in conflict"));
         }
-        if self.items[index].object.is_none() {
+        if self.collections[collection].source().is_none() {
+            return Outcome::Parked(format!("{collection}, which no source syncs"));
+        }
+        if self.collections[to].source().is_none() {
+            return Outcome::Parked(format!("{to}, which no source syncs"));
+        }
+        let acting = self.items[index].bindings.first();
+        let own = acting
+            .filter(|binding| self.collections[to].sources.contains_key(&binding.source))
+            .map(|binding| (binding.source.clone(), binding.base_present));
+        if self.items[index].object.is_none() && !own.as_ref().is_some_and(|(_, based)| *based) {
             return Outcome::Parked(String::from("the item holds no body"));
         }
 
@@ -521,7 +537,10 @@ impl Model {
             link_id = format!("dup:{link_id}#{handle}");
         }
         let seq = self.seq_for(to, &link_id, &source.summary);
-        let binding = self.created(to, &link_id, source.object.as_ref());
+        let mut binding = self.created(to, &link_id, source.object.as_ref());
+        if let (Some(binding), Some((own, _))) = (&mut binding, own) {
+            binding.source = own;
+        }
         self.items.push(Item {
             collection: String::from(to),
             link_id,

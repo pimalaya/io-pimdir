@@ -417,15 +417,14 @@ mod tests {
     }
 
     /// io-pimdir derives under the revision the generator does
-    /// (src/client/schema.rs), and so does STORAGE.md when a pimdir
-    /// checkout sits beside io-pimdir's, the check skipped with a note
-    /// otherwise.
+    /// (src/summary.rs), and so does STORAGE.md when a pimdir checkout sits
+    /// beside io-pimdir's, the check skipped with a note otherwise.
     #[test]
     fn the_implementation_states_the_annex_a_revision_the_generator_derives_under() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let schema = fs::read_to_string(root.join("src/client/schema.rs")).unwrap();
-        let stated = format!("pub(crate) const DERIVATION: i64 = {DERIVATION};");
-        assert!(schema.contains(&stated), "src/client/schema.rs: {stated}");
+        let summary = fs::read_to_string(root.join("src/summary.rs")).unwrap();
+        let stated = format!("pub const DERIVATION: i64 = {DERIVATION};");
+        assert!(summary.contains(&stated), "src/summary.rs: {stated}");
 
         let storage = root.join("../pimdir/STORAGE.md");
         let Ok(text) = fs::read_to_string(&storage) else {

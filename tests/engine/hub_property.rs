@@ -265,6 +265,10 @@ struct Owed {
     /// A server-side delete sets it only when that server held the shared
     /// body: a body it never saw is an edit, and an edit beats a delete
     /// across sources, the deleting source being offered the item back.
+    ///
+    /// An edit restating the body a live item shares adds nothing to it, so
+    /// it leaves a server delete of that body, which the hub has yet to
+    /// learn, standing (SYNC §5, §9).
     removed: bool,
 }
 
@@ -380,6 +384,7 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                     && observable
                     && !seen
                     && held.as_ref().is_some_and(|held| held != &object.hash);
+                let restates = live(&cluster, &link) && held.as_ref() == Some(&object.hash);
                 let first = owed.diverged;
                 let was_conflicted = conflicted(&cluster, &link);
 
@@ -431,7 +436,7 @@ fn check_hub_model(ops: Vec<HubOp>) -> Result<(), TestCaseError> {
                 let owed = ledger.entry(link).or_default();
                 owed.resolved = owed.diverged;
                 owed.diverged |= diverging;
-                owed.removed &= !stages;
+                owed.removed &= !stages || restates;
 
                 // NOTE: a divergence leaves the shared body in place, as
                 // the hub's manual policy does
@@ -802,6 +807,26 @@ fn a_base_read_at_its_own_revision_keeps_the_item_conflict() {
         HubOp::Sync(5748930266644911766),
         HubOp::Edit(13647608989997215515, 7843442433136614280, 1),
         HubOp::Edit(15107088274842412705, 13021446597980136012, 2),
+    ])
+    .unwrap();
+}
+
+/// An edit restating the body the item shares overtakes no server delete
+/// of that body (SYNC §5, §9): s0 pushed an edit, its server then deleted
+/// the member, and s1, which had not synced that edit, staged the very same
+/// body. s0's absence drops a placement holding its base's body, the item
+/// is deleted, and s1's tombstone pushes the delete: no body is lost, the
+/// one s1 staged being the one s0's server deleted.
+///
+/// Found by the property above (2026-11-25).
+#[test]
+fn an_edit_restating_the_shared_body_leaves_a_server_delete_standing() {
+    check_hub_model(vec![
+        HubOp::Edit(0, 5326228603505113788, 153),
+        HubOp::Add(0, 0),
+        HubOp::Sync(3197691148203797238),
+        HubOp::ServerRemove(5609623819665740181, 3394105640657210656),
+        HubOp::Edit(132559953819653149, 6042095529990153000, 153),
     ])
     .unwrap();
 }

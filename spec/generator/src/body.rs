@@ -6,7 +6,7 @@
 //! canonical, iCalendar and vCard values needing no escape. Each renderer
 //! answers the bytes and what Annex A derives from them, never by parsing.
 
-use std::io;
+use std::{collections::BTreeMap, io};
 
 use rusqlite::types::Value;
 
@@ -34,6 +34,54 @@ pub struct Filed {
     /// The key a writer gives content stating no hint, where the kind's
     /// fallback is not derived from the bytes (a file's `file:` key).
     pub fallback: Option<String>,
+    /// What SEARCH §6 extracts from the body, for one the generator
+    /// rendered; `None` for a fixture, whose text it never reads.
+    pub words: Option<Words>,
+}
+
+/// What SEARCH §6 extracts from a body the generator rendered, read off the
+/// values it wrote rather than parsed back (README.md, "No parser").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Words {
+    /// Each field's values in the order written, by its name: `title`,
+    /// `people`, `body`, `attachment`, `place`, `org`, `note` and the
+    /// address roles. A field absent holds nothing.
+    pub fields: BTreeMap<String, Vec<String>>,
+    /// Whether a card holds a `TEL`, an `ADR`, a `BDAY` and a `PHOTO`.
+    pub marks: [bool; 4],
+    /// A card's `CATEGORIES` values.
+    pub categories: Vec<String>,
+    /// A calendar object's times, which SEARCH §7 expands.
+    pub times: Option<Times>,
+}
+
+/// The times of a calendar object as its body states them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Times {
+    /// Its component.
+    pub table: Table,
+    /// Its `DTSTART`.
+    pub start: Option<Time>,
+    /// Its `DTEND`, or a task's `DUE`.
+    pub end: Option<Time>,
+    /// The `UNTIL` of a weekly `RRULE`.
+    pub until: Option<Instant>,
+}
+
+impl Words {
+    fn push(&mut self, field: &str, value: &str) {
+        self.fields
+            .entry(String::from(field))
+            .or_default()
+            .push(String::from(value));
+    }
+
+    fn person(&mut self, role: &str, person: &Person) {
+        for value in person.name.iter().chain([&person.address]) {
+            self.push(role, value);
+            self.push("people", value);
+        }
+    }
 }
 
 /// A body too large to hold, rendered from its seed each time it is read
@@ -235,6 +283,20 @@ impl Mail {
 
         let hint = self.message_id.clone();
 
+        let mut words = Words::default();
+        words.push("title", &self.subject);
+        words.person("from", &self.from);
+        for (role, list) in [("to", &self.to), ("cc", &self.cc)] {
+            for person in list {
+                words.person(role, person);
+            }
+        }
+        words.push("body", &self.text);
+        if let Some((name, _)) = &self.attachment {
+            words.push("attachment", name);
+            words.push("attachment", "application/octet-stream");
+        }
+
         Filed {
             fallback: None,
             bytes,
@@ -242,6 +304,7 @@ impl Mail {
             summary,
             addresses,
             sort_key: date.unwrap_or_default(),
+            words: Some(words),
         }
     }
 }
@@ -301,6 +364,17 @@ impl Card {
             })
             .collect();
 
+        let mut words = Words::default();
+        words.push("title", &self.name);
+        for email in &self.emails {
+            words.push("email", email);
+            words.push("people", email);
+        }
+        words.push("people", &self.name);
+        if let Some(org) = &self.org {
+            words.push("org", org);
+        }
+
         Filed {
             fallback: None,
             hint: usable(self.uid.as_deref()),
@@ -308,6 +382,7 @@ impl Card {
             bytes,
             summary,
             addresses,
+            words: Some(words),
         }
     }
 }
@@ -434,6 +509,26 @@ impl Event {
             addresses.push(Address::of("attendee", position, attendee));
         }
 
+        let mut words = Words {
+            times: Some(Times {
+                table: Table::Event,
+                start: Some(self.start),
+                end: self.end,
+                until: self.until,
+            }),
+            ..Words::default()
+        };
+        words.push("title", &self.summary);
+        if let Some(location) = &self.location {
+            words.push("place", location);
+        }
+        if let Some(organizer) = &self.organizer {
+            words.person("organizer", organizer);
+        }
+        for attendee in &self.attendees {
+            words.person("attendee", attendee);
+        }
+
         Filed {
             fallback: None,
             bytes: text.into_bytes(),
@@ -441,6 +536,7 @@ impl Event {
             sort_key: self.start.instant().rfc3339(),
             summary,
             addresses,
+            words: Some(words),
         }
     }
 }
@@ -534,6 +630,16 @@ impl Task {
                 .unwrap_or_default(),
             summary,
             addresses: Vec::new(),
+            words: Some(Words {
+                fields: BTreeMap::from([(String::from("title"), vec![self.summary.clone()])]),
+                times: Some(Times {
+                    table: Table::Task,
+                    start: None,
+                    end: self.due,
+                    until: None,
+                }),
+                ..Words::default()
+            }),
         }
     }
 }
@@ -589,6 +695,16 @@ impl Journal {
                 .unwrap_or_default(),
             summary,
             addresses: Vec::new(),
+            words: Some(Words {
+                fields: BTreeMap::from([(String::from("title"), vec![self.summary.clone()])]),
+                times: Some(Times {
+                    table: Table::Journal,
+                    start: self.start,
+                    end: None,
+                    until: None,
+                }),
+                ..Words::default()
+            }),
         }
     }
 }
@@ -622,6 +738,7 @@ impl Document {
             summary,
             addresses: Vec::new(),
             sort_key: String::from(self.name.to_lowercase().trim()),
+            words: None,
         }
     }
 }

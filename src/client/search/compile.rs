@@ -1102,7 +1102,9 @@ impl Compiled {
     }
 
     /// Renders a date term spanning `[since, until)`: its condition over
-    /// placement `j{at}`, and its set when the plan measures one.
+    /// placement `j{at}`, and its set when the plan measures one. Mail is
+    /// dated by its sort key, a calendar item by its occurrences alone, so
+    /// one holding no body is dated by none (SEARCH §7, §8.1).
     fn date(&mut self, leaf: &mut Leaf, at: usize, dates: (Option<i64>, Option<i64>)) -> String {
         let (j, c) = (format!("j{at}"), format!("c{at}"));
         let since = dates.0.map(time::rfc3339);
@@ -1122,8 +1124,7 @@ impl Compiled {
         }
         let dated = |x: &str, c: &str| {
             format!(
-                "({c}.kind = 'message/rfc822' OR ({c}.kind = 'text/calendar' \
-                 AND {x}.object IS NULL)) AND {x}.sort_key != ''{}",
+                "{c}.kind = 'message/rfc822' AND {x}.sort_key != ''{}",
                 range.replace("{x}", x)
             )
         };

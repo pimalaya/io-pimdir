@@ -270,6 +270,7 @@ impl Draw {
                     addresses: Vec::new(),
                     sort_key: String::from(attachment.name.to_lowercase().trim()),
                     fallback: Some(key.clone()),
+                    words: None,
                 };
                 let placement = Placement {
                     flags: Some(BTreeSet::new()),
@@ -320,6 +321,7 @@ impl Draw {
             addresses: Vec::new(),
             sort_key,
             fallback: Some(key),
+            words: None,
         };
         let placement = Placement {
             flags: Some(BTreeSet::new()),

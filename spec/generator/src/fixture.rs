@@ -149,6 +149,7 @@ pub fn load(spec: &Spec) -> Result<Vec<Fixture>> {
                 addresses,
                 sort_key: String::from(case["sort_key"].as_str().unwrap_or_default()),
                 fallback: None,
+                words: None,
             },
         });
     }

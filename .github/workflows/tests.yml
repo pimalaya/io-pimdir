@@ -43,6 +43,9 @@ jobs:
         working-directory: io-pimdir
       - run: cargo test --all-features
         working-directory: io-pimdir
+      # The test generator is a crate of its own, outside the package.
+      - run: cargo test
+        working-directory: io-pimdir/spec/generator
       # The defaults and --all-features both turn `vendored` on, so the
       # system link is proven on its own or it is never built here at all.
       - run: cargo test --no-default-features --features cli

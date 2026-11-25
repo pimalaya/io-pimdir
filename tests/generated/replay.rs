@@ -23,7 +23,7 @@ use std::{
 
 use io_pimdir::{
     change::{PimdirChange, PimdirChangeKind},
-    client::{PimdirStore, producer::PimdirProducer, reader::PimdirReader},
+    client::{PimdirStore, producer::PimdirProducer},
     codec,
     collection::{PimdirCheckpoint, PimdirCollectionId, PimdirCursor, PimdirScope},
     hash,
@@ -42,7 +42,6 @@ use pimdir_generator::{
     engine::{Answer, Event, Outcome, Push, Run},
     history::{History, Step},
     model::{Collection, Model, Scope, SourceState},
-    oracle::Expectation,
     queue::RowState,
     remote::Page,
     spec::Spec,
@@ -68,72 +67,22 @@ const POLICIES: [(&str, PimdirConflictPolicy); 5] = [
     ("work/keep-unread", PimdirConflictPolicy::KeepLocal),
 ];
 
-/// Finding G12 (implementation): the body a source's `PreferLocal` or
-/// `KeepLocal` pushes over, kept as a retained item (SYNC §9, "A policy's
-/// loser is kept"), keeps the sort key of the item it lost to, not the one
-/// its own body derives (Annex A).
-const G12: &str = "G12: a policy's kept body keeps the winner's sort key";
-
-/// Finding G13 (implementation): io-pimdir offers another source an item
-/// keyed `hash:`, which SYNC §9 says is not offered, asserting no identity.
-const G13: &str = "G13: a hash: key offered to another source";
-
-/// Finding G15 (spec minor, reads two ways): one write inserting several
-/// rows, a kept body and a member added by one page, draws their `seq` in
-/// another order in io-pimdir than in the generator, which draws in the
-/// order of the page's members; STORAGE §9.1 states no order.
-const G15: &str = "G15: the order one write draws its rows' seq in";
-
-/// Finding G16 (the generator's): the body a collection's policy keeps over
-/// a joining member's leaves the binding owing it, which SYNC §5 (“a
-/// candidate's change is derived before its write”) pushes by the source's
-/// next run, never this one; the generator pushes it as an `Update` in the
-/// same run.
-const G16: &str = "G16: a fold's debt pushed in the run that folds it";
-
-/// Finding G17 (spec minor, reads two ways): a member whose body differs from
-/// its base and equals the item's, another source having folded it: the
-/// generator reports `ContentChanged`, io-pimdir nothing, the item taking no
-/// body it did not hold (SYNC §5, `ContentChanged` naming a body the item
-/// took).
-const G17: &str = "G17: ContentChanged for a body the item already holds";
-
 #[test]
 fn every_generated_history_replays_as_its_model_states() {
     for seed in SEEDS {
         let differences = differences(seed);
-        let unknown: Vec<&String> = differences
-            .iter()
-            .filter(|(known, _)| known.is_none())
-            .map(|(_, difference)| difference)
-            .collect();
-        assert!(unknown.is_empty(), "seed {seed}: {unknown:#?}");
+        assert!(differences.is_empty(), "seed {seed}: {differences:#?}");
     }
 }
 
-#[test]
-#[ignore = "G12, G13, G15 to G17: the replay findings of the generated suite"]
-fn every_generated_history_replays_as_its_model_states_known_included() {
-    let differences: Vec<(u64, Option<&str>, String)> = SEEDS
-        .into_iter()
-        .flat_map(|seed| {
-            differences(seed)
-                .into_iter()
-                .map(move |(known, difference)| (seed, known, difference))
-        })
-        .collect();
-    assert!(differences.is_empty(), "{differences:#?}");
-}
-
-/// Every difference the histories of `seed` replay with, each with the
-/// known finding it stands under.
-fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
+/// Every difference the histories of `seed` replay with.
+fn differences(seed: u64) -> Vec<String> {
     histories(seed)
         .into_iter()
         .flat_map(|(name, history)| {
             replay(&history)
                 .into_iter()
-                .map(move |(known, text)| (known, format!("{name}: {text}")))
+                .map(move |text| format!("{name}: {text}"))
         })
         .collect()
 }
@@ -160,7 +109,7 @@ pub fn histories(seed: u64) -> [(&'static str, History); 12] {
 /// disagreement with the step it is found after. A step disagreeing leaves
 /// the store rewritten from its model, so the next step starts where the
 /// model's does and a finding is named once, at the step it is made.
-fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
+fn replay(history: &History) -> Vec<String> {
     let history = declared(history);
     let spec = Spec::load_default().unwrap();
     let first = &history.steps[0];
@@ -172,31 +121,16 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
         let (before, step) = (&pair[0], &pair[1]);
         let root = generated.root();
         let at = format!("step {} ({})", index + 1, step.label);
-        let mut standing = None;
-        let mut found: Vec<(Option<&'static str>, String)> = produce(&root, before, step)
-            .into_iter()
-            .map(|text| (None, text))
-            .collect();
+        let mut found = produce(&root, before, step);
 
         let rows = unstamped(&root);
         if let Some(run) = &step.run {
-            let (ran, known) = replay_run(&root, before, step, run, &mut revisions);
-            found.extend(ran);
-            standing = standing.or(known);
+            found.extend(replay_run(&root, before, step, run, &mut revisions));
         }
-        let (_, mut read) = reader::compare(&spec, &step.model, &root, retained_sort_key);
-        if !read.is_empty() {
-            let renumbered = renumbered(before, step, &root);
-            let (_, again) = reader::compare(&spec, &renumbered, &root, retained_sort_key);
-            if again.iter().all(|(known, _)| known.is_some()) {
-                for (known, _) in &mut read {
-                    *known = known.or(Some(G15));
-                }
-            }
-        }
-        found.extend(read);
+        let (_, read) = reader::compare(&spec, &step.model, &root, |_, _, _, _| None);
+        found.extend(read.into_iter().map(|(_, text)| text));
         for hash in unheld(&root) {
-            found.push((None, format!("a row names {hash}, a body the store lacks")));
+            found.push(format!("a row names {hash}, a body the store lacks"));
         }
         if let Some(run) = &step.run
             && run.verb == "sync"
@@ -209,64 +143,22 @@ fn replay(history: &History) -> Vec<(Option<&'static str>, String)> {
             && format!("{:?}", before.model.collections) == format!("{:?}", step.model.collections)
             && unstamped(&root) != rows
         {
-            found.push((
-                None,
-                format!(
-                    "a run with nothing to do moved a row: {}",
-                    crash::apart(&unstamped(&root), &rows)
-                ),
+            found.push(format!(
+                "a run with nothing to do moved a row: {}",
+                crash::apart(&unstamped(&root), &rows)
             ));
         }
         if let Some(order) = out_of_order(&root) {
-            found.push((None, order));
+            found.push(order);
         }
 
         if found.is_empty() {
             continue;
         }
-        differences.extend(found.into_iter().map(|(known, text)| {
-            let known = known.or(standing);
-            (known, format!("{at}: {text}"))
-        }));
+        differences.extend(found.into_iter().map(|text| format!("{at}: {text}")));
         generated = Generated::write(Spec::load_default().unwrap(), step.model.clone());
     }
     differences
-}
-
-/// The step's model with each item the step created numbered as io-pimdir
-/// numbered it, found by its key: G15's reading, the order a write draws
-/// the `seq` of the rows it inserts.
-fn renumbered(before: &Step, step: &Step, root: &Path) -> Model {
-    let reader = PimdirReader::open(root).unwrap();
-    let mut model = step.model.clone();
-    for item in &mut model.items {
-        if item.seq < before.model.next_seq {
-            continue;
-        }
-        if let Some(seq) = reader
-            .seq_for_link(&item.collection, &item.link_id)
-            .unwrap()
-        {
-            item.seq = seq;
-        }
-    }
-    model
-}
-
-/// Whether a disagreement is G12's: a retained row read alike but for its
-/// sort key.
-fn retained_sort_key(
-    expectation: &Expectation,
-    columns: &[&str],
-    got: &[Vec<Value>],
-    want: &[Vec<Value>],
-) -> Option<&'static str> {
-    let at = columns.iter().position(|column| *column == "sort_key")?;
-    let alike = got.len() == want.len()
-        && got.iter().zip(want).all(|(got, want)| {
-            (0..got.len()).all(|column| column == at || got[column] == want[column])
-        });
-    (expectation.statement == "storage/read/list_retained_page" && alike).then_some(G12)
 }
 
 /// The history with every collection it ever declares declared from its
@@ -309,7 +201,7 @@ fn replay_run(
     step: &Step,
     run: &Run,
     revisions: &mut BTreeMap<(String, String), String>,
-) -> (Vec<(Option<&'static str>, String)>, Option<&'static str>) {
+) -> Vec<String> {
     remember(run, revisions);
     let mut remote = Scripted::of(before, step, run, revisions, false);
     let events = run_verb(root, before, step, run, &mut remote);
@@ -318,11 +210,11 @@ fn replay_run(
     let events = match (events, run.failed) {
         (Ok(events), false) => events,
         (Ok(_), true) => {
-            found.push((None, format!("the {} passes, the model's fails", run.verb)));
+            found.push(format!("the {} passes, the model's fails", run.verb));
             Vec::new()
         }
         (Err(err), false) => {
-            found.push((None, format!("the {} fails: {err}", run.verb)));
+            found.push(format!("the {} fails: {err}", run.verb));
             Vec::new()
         }
         (Err(_), true) => Vec::new(),
@@ -330,39 +222,21 @@ fn replay_run(
 
     let listing = listing(before, step, run);
     if matches!(run.verb, "sync" | "rekey") && remote.requests != listing {
-        found.push((
-            None,
-            format!(
-                "io-pimdir asks {:?}, the model lists {listing:?}",
-                remote.requests
-            ),
+        found.push(format!(
+            "io-pimdir asks {:?}, the model lists {listing:?}",
+            remote.requests
         ));
     }
 
-    let mut known = None;
     let want: Vec<String> = run
         .pushes
         .iter()
         .map(|(push, key)| model_push(push, key))
         .collect();
     if remote.pushes != want {
-        let offered: Vec<&String> = remote
-            .pushes
-            .iter()
-            .filter(|push| !(push.starts_with("Add ") && push.contains("link Some(\"hash:")))
-            .collect();
-        let owed: Vec<&String> = want
-            .iter()
-            .filter(|push| !(push.starts_with("Update ") && !offered.contains(push)))
-            .collect();
-        known = match (offered.len() < remote.pushes.len(), owed.len() < want.len()) {
-            (_, true) if offered == owed => Some(G16),
-            (true, false) if offered == owed => Some(G13),
-            _ => None,
-        };
-        found.push((
-            known,
-            format!("io-pimdir pushes {:?}, the model {want:?}", remote.pushes),
+        found.push(format!(
+            "io-pimdir pushes {:?}, the model {want:?}",
+            remote.pushes
         ));
     }
 
@@ -371,23 +245,9 @@ fn replay_run(
     got.sort();
     want.sort();
     if got != want && !run.failed {
-        let unchanged: Vec<&String> = want
-            .iter()
-            .filter(|event| !event.starts_with("ContentChanged "))
-            .collect();
-        let events = match () {
-            _ if unchanged.len() < want.len() && got.iter().collect::<Vec<_>>() == unchanged => {
-                Some(G17)
-            }
-            _ => None,
-        };
-        known = known.or(events);
-        found.push((
-            events,
-            format!("io-pimdir reports {got:?}, the model {want:?}"),
-        ));
+        found.push(format!("io-pimdir reports {got:?}, the model {want:?}"));
     }
-    (found, known)
+    found
 }
 
 /// Keeps the revision of each member the run's head and pages list, which

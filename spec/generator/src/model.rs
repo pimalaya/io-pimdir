@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::types::Value;
 
 use crate::{
-    body::{Filed, Person, Stream, fnv1a64},
+    body::{Filed, Person, Stream, Words, fnv1a64},
     name::ObjectName,
     queue::Row,
     time::Instant,
@@ -467,6 +467,9 @@ pub struct Model {
     pub performers: BTreeMap<(Option<String>, String), String>,
     /// The references between items (STORAGE §14.2).
     pub references: Vec<Reference>,
+    /// What SEARCH §6 extracts from each body the generator rendered, by
+    /// name; a fixture's is never known.
+    pub words: BTreeMap<ObjectName, Words>,
 }
 
 /// What Annex A derives from a body, kept apart from any item.
@@ -574,6 +577,9 @@ impl Model {
         let object = ObjectName::of(&filed.bytes);
         if placement.held {
             self.objects.insert(object.clone(), filed.bytes.clone());
+        }
+        if let Some(words) = filed.words.as_ref().filter(|_| !filed.bytes.is_empty()) {
+            self.words.insert(object.clone(), words.clone());
         }
         let object = placement.held.then_some(object);
 

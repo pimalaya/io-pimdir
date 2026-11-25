@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
-The store follows pimdir's storage-draft-18, the index search-draft-18 and the sync sync-draft-16 (the owner decisions of 2026-11-25). Drafts are exact: a store an earlier draft wrote is refused, never migrated, and an index of an earlier draft is rebuilt by the indexer.
+The store follows pimdir's storage-draft-18, the index search-draft-19 and the sync sync-draft-16 (the owner decisions of 2026-11-25). Drafts are exact: a store an earlier draft wrote is refused, never migrated, and an index of an earlier draft is rebuilt by the indexer.
 
 ### Added
 
@@ -14,13 +14,14 @@ The store follows pimdir's storage-draft-18, the index search-draft-18 and the s
 - Added `PimdirMutation::create_target` to the public API, the collection a runner of its own loads and writes as the source a copy's or a move's create is staged under.
 - Added `PimdirSourceStore::register`: records the source as syncing each collection given, the collection ensured and a `sources` row with no checkpoint added where none is held, a held checkpoint kept, in one owner write, answering the rows added.
 - Added `PimdirError::SourceEmpty` (code `source-empty`).
+- Added the test generator's own tests (spec/generator) to CI.
 - Added a CI job building with Rust 1.89, the stated MSRV, a check of the feature sets consumers build (the default, `client` alone, `client`, `search` and `indexer`), and `cargo semver-checks` against 1.0.0 once it is published.
 
 ### Changed
 
 - **BREAKING**: A copy or a move into a collection no source syncs is refused (above), where it used to stage a pending create under the run's source, binding that source to a collection it never synced: a target is synced, by a checkpoint or a binding, before anything is copied or moved into it.
 - The overlay folds a pending `move` into a collection no source syncs as nothing, its item left where it is, as the drain parks it (pimdir STORAGE §15.4).
-- **BREAKING**: Changed the index to pimdir's search-draft-18 (`sql::search::FORMAT_VERSION`, `FORMAT_DRAFT` 18): an index of search-draft-17 is rebuilt by the indexer and refused by a query client.
+- **BREAKING**: Changed the index to pimdir's search-draft-19 (`sql::search::FORMAT_VERSION`, `FORMAT_DRAFT` 19): an index of search-draft-17 or search-draft-18 is rebuilt by the indexer and refused by a query client.
 - **BREAKING**: Added the field `point` to `PimdirQueryDateRange`, whether a date value is one point rather than a range; a struct literal states it.
 - Changed `FIELDS` to follow pimdir SEARCH §8's table, `flag:` before `is:`.
 - Changed `PimdirStore::for_source` to answer a `Result`, refusing an empty source id as `PimdirError::SourceEmpty` before anything is written.
@@ -43,7 +44,10 @@ The store follows pimdir's storage-draft-18, the index search-draft-18 and the s
 - Fixed a copy or a move whose run's source does not sync its target staging the create under that source, which never pushed it, while another source of the target was offered the item, pushed it and left the stray pending create standing: the create is now staged under the source an `add` into the target runs as, the owner's own where it syncs the target, else the first source syncing it, with no origin of the run's source, the target loaded and written as that source in the transaction of the move's tombstone, through `PimdirSourceStore::mutate` and the drain alike, so that source's own tombstone of the identity is the one revived (pimdir SYNC §7, STORAGE §15.2; vectors 227, 228 and 230).
 - Fixed a date range from a relative amount to itself (`date:2w..2w`) answering the span from that instant to now: a relative amount runs to now only as a single point, a side of a range spanning its instant alone, so the range is empty (pimdir SEARCH §8.1).
 - Fixed `linked:` naming a role and no id (`linked:sender:`) read as the link id `sender:`: it is refused `invalid-value` (pimdir SEARCH §8).
+- Fixed a calendar item holding no body answering `date:` and `when:` at its sort key: a calendar item is dated by the occurrences its body expands to alone, so one holding none matches no date term, the coverage counting it `bodiless` (pimdir SEARCH §7, search-draft-19).
 - Fixed `PimdirReader::pending_arrivals` failing the whole listing on a move or a copy whose payload does not decode: the row is listed as `PimdirAction::Unknown`, its kind and payload verbatim, as `pending_actions` lists it (STORAGE §15.4).
+- Fixed the body a bodiless revive of a card, a calendar resource or a file sets aside keeping the reviving member's sort key: the retained item keeps the sort key the retained row held, its body's own, beside that row's summary (pimdir SYNC §9, STORAGE §11; vector 232).
+- Fixed a queued `remove` of an item no source binds, and an `add` superseding one, retaining it with `retained_by` naming the drain handle's source: no source's removal retired it, so the column is left `NULL` (pimdir STORAGE §13, §15.3).
 
 ## [0.20.4] - 2026-11-25
 

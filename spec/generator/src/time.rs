@@ -78,7 +78,8 @@ impl Instant {
         format!("{year:04}{month:02}{day:02}")
     }
 
-    fn parts(&self) -> (i64, u32, u32, u32, u32, u32) {
+    /// Its civil year, month, day, hour, minute and second in UTC.
+    pub fn parts(&self) -> (i64, u32, u32, u32, u32, u32) {
         let (year, month, day) = civil_from_days(self.0.div_euclid(86_400));
         let seconds = self.0.rem_euclid(86_400) as u32;
         (

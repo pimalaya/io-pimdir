@@ -2436,7 +2436,8 @@ fn insert_item(
 /// as its base; the write agreed on the size before (§9). A mutable
 /// kind's revives holding none, at `Meta`, for the upgrade to fetch: the
 /// retained body, which the member's revision may have replaced on its
-/// server, is set aside in `kept` over the reviving binding's handle,
+/// server, is set aside in `kept` over the reviving binding's handle with
+/// the summary and sort key the retained row held, its body's own (SYNC §9),
 /// never left as the item's, where it would read as a local edit.
 fn revive_item(
     conn: &Connection,
@@ -2445,14 +2446,14 @@ fn revive_item(
     item: &mut PimdirHubItem,
     kept: &mut Vec<PimdirOverruled>,
 ) -> Result<bool, PimdirError> {
-    let pinned: Option<(Option<String>, Option<String>)> = conn
+    let pinned: Option<(Option<String>, Option<String>, String)> = conn
         .query_row_cached(
             sql::RETAINED_ITEM,
             named_params! { ":collection": collection, ":link_id": link.0 },
-            |row| Ok((row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((object, conflict_object)) = pinned else {
+    let Some((object, conflict_object, sort_key)) = pinned else {
         return Ok(false);
     };
 
@@ -2475,7 +2476,7 @@ fn revive_item(
                 object: PimdirHash(retained.clone()),
                 flags: item.flags.clone(),
                 summary: held_summary(conn, collection, link)?,
-                sort_key: item.sort_key.clone(),
+                sort_key: PimdirSortKey(sort_key),
             });
             item.level = item.stored_level();
         }

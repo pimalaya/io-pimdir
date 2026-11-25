@@ -1114,7 +1114,7 @@ impl History {
         record(format!("{id}: a capped round"), Some(run), &model);
 
         for (id, count, kept) in [("work/Junk", 21, 1), ("work/Drafts", 2, 0)] {
-            let source = format!("{}-imap", &id[5..].to_lowercase());
+            let source = format!("{}-imap", id[5..].to_lowercase());
             let mut remote = mailbox(&mut model, id, &source);
             for _ in 0..count {
                 remote.deliver(dated(day(10, 1)).file(), BTreeSet::new());
@@ -1165,9 +1165,10 @@ impl History {
     /// one with the first message gone, its handle handed to another; one
     /// carrying every message and the minted copy; a delta after it; one
     /// missing most messages, parked, then accepted; and a capped one
-    /// missing some, parked. On work/contacts: a renumbering over a card the
-    /// server edited and one edited on both sides, then an edit over the
-    /// card pulled unread, its upgrade reading the base, its push.
+    /// missing some, parked. On work/contacts, the renumbered listing
+    /// carrying no body: a renumbering over a card the server edited and one
+    /// edited on both sides, then an edit over the card pulled unread, its
+    /// upgrade reading the base, its push.
     pub fn rekeys(seed: u64) -> Self {
         let mut draw = Draw::new(seed);
         let mut model = Model::new();
@@ -1289,6 +1290,7 @@ impl History {
             };
             remote.edit(handle, theirs.file());
         }
+        remote.carries = false;
         remote.renumber(10);
         let run = model.rekey(&remote, &Options::default());
         record(format!("{id}: renumbered over edits"), Some(run), &model);

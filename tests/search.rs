@@ -50,7 +50,10 @@ use io_pimdir::{
         tag::{PimdirSearchTagError, PimdirSearchTagPlan},
     },
     summary::{
-        self, PimdirAddress, PimdirSummary, file::PimdirFileSummary, mail::PimdirMailSummary,
+        self, PimdirAddress, PimdirSummary,
+        calendar::{PimdirEventSummary, PimdirTime},
+        file::PimdirFileSummary,
+        mail::PimdirMailSummary,
     },
 };
 use serde_json::Value;
@@ -301,6 +304,47 @@ fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> 
                     link_id,
                     None,
                     mail_summary(row, addresses),
+                    stated["sort_key"].as_str().unwrap(),
+                    flags,
+                ))])
+                .unwrap();
+        }
+        "event_summary" => {
+            let text = |key: &str| row[key].as_str().map(String::from);
+            let address = |address: &Value| PimdirAddress {
+                address: address["address"].as_str().unwrap().into(),
+                name: address["name"].as_str().map(Into::into),
+            };
+            let addresses = stated["addresses"].as_array().unwrap();
+            let event = PimdirEventSummary {
+                uid: text("uid"),
+                summary: text("summary").unwrap_or_default(),
+                location: text("location"),
+                dtstart: text("dtstart").map(|value| PimdirTime {
+                    value,
+                    tzid: text("dtstart_tzid"),
+                    date: row["dtstart_value"] == "date",
+                }),
+                dtend: text("dtend"),
+                recurring: row["recurring"].as_i64().map(|recurring| recurring != 0),
+                until: text("until"),
+                organizer: addresses
+                    .iter()
+                    .find(|held| held["role"] == "organizer")
+                    .map(address),
+                attendees: addresses
+                    .iter()
+                    .filter(|held| held["role"] == "attendee")
+                    .map(address)
+                    .collect(),
+            };
+            store
+                .write(vec![PimdirWriteOp::UpsertPlacement(placement(
+                    collection,
+                    &handle,
+                    link_id,
+                    None,
+                    PimdirSummary::Event(event),
                     stated["sort_key"].as_str().unwrap(),
                     flags,
                 ))])
@@ -853,7 +897,7 @@ fn every_search_vector_answers() {
 fn every_extraction_vector_answers() {
     let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/extraction.json"));
-    assert_eq!(vectors["v"], 1, "extraction.json at another version");
+    assert_eq!(vectors["v"], 2, "extraction.json at another version");
     let now = unix(vectors["now"].as_str().unwrap());
 
     let mut outcomes = Vec::new();
@@ -2706,12 +2750,12 @@ fn an_index_of_another_shape_or_a_later_version_is_refused_and_left_as_it_is() {
     for (altered, version, shape) in [
         (
             "UPDATE index_meta SET shape = 'fts4'",
-            Some("search-draft-18"),
+            Some("search-draft-19"),
             Some("fts4"),
         ),
         (
-            "UPDATE index_meta SET format_version = 'search-draft-19'",
-            Some("search-draft-19"),
+            "UPDATE index_meta SET format_version = 'search-draft-20'",
+            Some("search-draft-20"),
             Some("canonical"),
         ),
         (
@@ -2769,6 +2813,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         "UPDATE index_meta SET format_version = 'search-draft-15'",
         "UPDATE index_meta SET format_version = 'search-draft-16'",
         "UPDATE index_meta SET format_version = 'search-draft-17'",
+        "UPDATE index_meta SET format_version = 'search-draft-18'",
         "ALTER TABLE index_meta DROP COLUMN format_version",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -2785,7 +2830,7 @@ fn an_index_of_an_earlier_version_is_rebuilt_never_queried() {
         drop(index);
         assert_eq!(
             index_meta(dir.path(), "format_version"),
-            rusqlite::types::Value::Text("search-draft-18".into()),
+            rusqlite::types::Value::Text("search-draft-19".into()),
             "{altered}"
         );
     }

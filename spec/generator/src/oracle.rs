@@ -1032,6 +1032,16 @@ impl Oracle<'_> {
                 self.expect("load_receipt", &id, Vec::new());
                 continue;
             };
+            let Some(queued) = model.collections.get(&row.collection) else {
+                let receipt = vec![
+                    instant(),
+                    Value::Null,
+                    seq.map_or(Value::Null, Value::Integer),
+                ];
+                self.expect("load_receipt", &id, vec![receipt]);
+                self.expect("load_receipt_refusals", &id, Vec::new());
+                continue;
+            };
             let receipt = vec![
                 instant(),
                 Value::Text(row.collection.clone()),
@@ -1039,7 +1049,7 @@ impl Oracle<'_> {
             ];
             self.expect("load_receipt", &id, vec![receipt]);
 
-            let account = model.collections[&row.collection].account.as_ref();
+            let account = queued.account.as_ref();
             let mut refusals: Vec<Vec<Value>> = model
                 .items
                 .iter()

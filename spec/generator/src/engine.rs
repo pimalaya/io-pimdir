@@ -450,6 +450,7 @@ impl Model {
                     events.push(Event::Vanished(handle.clone()));
                 }
             }
+            self.number_kept();
         }
 
         let checkpoint = pages
@@ -566,6 +567,7 @@ impl Model {
             outcomes.push(self.push(remotes, &collection, push, &mut events));
         }
         pushes.truncate(outcomes.len());
+        self.number_kept();
 
         Run {
             verb: "sync",
@@ -918,6 +920,7 @@ impl Model {
             }
         }
         events.retain(|event| matches!(event, Event::Overruled { .. }));
+        self.number_kept();
 
         Run {
             verb: "upgrade",
@@ -1284,6 +1287,7 @@ impl Model {
                     link_id,
                 });
             }
+            self.number_kept();
         }
 
         Run {
@@ -1638,6 +1642,8 @@ impl Model {
     /// Keeps a body a policy did not adopt as a retained item, keyed by
     /// minting over the binding's handle, minted again while held, a `seq`
     /// of its own, retained by the binding's source (SYNC §9, STORAGE §9).
+    /// The `seq` is drawn by `number_kept` once the write's
+    /// upserts have drawn theirs (STORAGE §9.1).
     fn keep(&mut self, index: usize, handle: &str, kept: Kept, source: &str) -> String {
         let item = &self.items[index];
         let collection = item.collection.clone();
@@ -1646,11 +1652,10 @@ impl Model {
         while self.holds(&collection, &link_id) {
             link_id = format!("dup:{link_id}#{handle}");
         }
-        let seq = self.seq_for(&collection, &link_id, &kept.summary);
         self.items.push(Item {
             collection,
             link_id: link_id.clone(),
-            seq,
+            seq: 0,
             flags: kept.flags,
             level: if kept.object.is_some() { 2 } else { 1 },
             object: kept.object,
@@ -1663,6 +1668,21 @@ impl Model {
             bindings: Vec::new(),
         });
         link_id
+    }
+
+    /// Draws the `seq` of each body kept since the write began, in the order
+    /// kept: one write draws for every item its upserts name first, then for
+    /// each body it keeps (STORAGE §9.1).
+    fn number_kept(&mut self) {
+        for index in 0..self.items.len() {
+            if self.items[index].seq != 0 {
+                continue;
+            }
+            let item = &self.items[index];
+            let (collection, link_id) = (item.collection.clone(), item.link_id.clone());
+            let summary = item.summary.clone();
+            self.items[index].seq = self.seq_for(&collection, &link_id, &summary);
+        }
     }
 
     /// A `Deleted` drop: the binding goes, and with it the item's last, so
@@ -2029,6 +2049,7 @@ impl Model {
             addresses: item.addresses.clone(),
             sort_key: item.sort_key.clone(),
             fallback: None,
+            words: self.words.get(object).cloned(),
         }
     }
 }
