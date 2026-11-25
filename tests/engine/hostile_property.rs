@@ -287,6 +287,7 @@ proptest! {
         let mut client = Client::new(remote);
         let opts = PimdirSyncOptions::default();
         client.sync("inbox", opts.clone()).map_err(TestCaseError::fail)?;
+        client.sync("archive", opts.clone()).map_err(TestCaseError::fail)?;
         intact(&client, "after the seeding sync")?;
 
         let mut arrivals = 0usize;

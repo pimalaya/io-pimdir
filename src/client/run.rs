@@ -12,7 +12,7 @@ use core::{convert::Infallible, error, fmt};
 use alloc::vec::Vec;
 
 use crate::{
-    client::{PimdirError, PimdirRunning, PimdirSourceStore},
+    client::{PimdirError, PimdirRunning, PimdirSourceStore, write::Staging},
     collection::PimdirCollectionId,
     coroutine::*,
     load::PimdirLoaded,
@@ -209,20 +209,60 @@ impl PimdirSourceStore {
     }
 
     /// Stages a local edit with no network (SYNC §7).
+    ///
+    /// A copy or a move into a collection this source does not sync
+    /// stages its create under the source an `add` there runs as, the
+    /// target loaded and written as that source, in the transaction of
+    /// the move's tombstone; one into a collection no source syncs is
+    /// refused ([`PimdirMutateError::Unsynced`]).
     pub fn mutate(
         &mut self,
         collection: impl Into<PimdirCollectionId>,
         mutation: PimdirMutation,
     ) -> Result<PimdirMutateReport, PimdirRunError<Infallible, PimdirMutateError>> {
-        let syncs_target = match mutation.create_target() {
+        let sources = match mutation.create_target() {
             Some(target) => self
                 .collection_sources(target)
-                .map_err(PimdirRunError::Store)?
-                .contains(&self.source.0),
-            None => false,
+                .map_err(PimdirRunError::Store)?,
+            None => Vec::new(),
         };
-        let mutate = PimdirMutate::new(collection, mutation).syncs_target(syncs_target);
-        self.run(mutate, &mut PimdirOffline)
+        let staging = mutation
+            .create_target()
+            .and_then(|target| Staging::of(&self.source, &self.source, target, &sources));
+        let mut mutate = PimdirMutate::new(collection, mutation)
+            .syncs_target(sources.contains(&self.source.0))
+            .target_synced(!sources.is_empty());
+        let Some(staging) = staging else {
+            return self.run(mutate, &mut PimdirOffline);
+        };
+
+        let _running = self.running();
+        let mut arg: Option<PimdirArg> = None;
+        loop {
+            let yielded = match mutate.resume(arg.take()) {
+                PimdirCoroutineState::Complete(Ok(report)) => return Ok(report),
+                PimdirCoroutineState::Complete(Err(err)) => {
+                    return Err(PimdirRunError::Coroutine(err));
+                }
+                PimdirCoroutineState::Yielded(yielded) => yielded,
+            };
+
+            arg = Some(match yielded {
+                PimdirYield::WantsLoad {
+                    collection,
+                    selection,
+                } if collection == staging.target => {
+                    PimdirArg::Load(self.load_as(&staging.source, &collection, &selection)?)
+                }
+                PimdirYield::WantsWrite(ops) => {
+                    PimdirArg::Written(self.write_staged(ops, Some(&staging))?)
+                }
+                yielded => match self.service(yielded)? {
+                    Ok(arg) => arg,
+                    Err(_) => unreachable!("an offline verb never asks the remote"),
+                },
+            });
+        }
     }
 
     /// Reconciles a collection with its remote (SYNC §5).

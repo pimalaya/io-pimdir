@@ -587,6 +587,7 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
     let mut client = Client::new(remote);
     let opts = PimdirSyncOptions::default();
     let _ = client.sync("inbox", opts.clone());
+    let _ = client.sync("archive", opts.clone());
     hydrate(&mut client, "inbox");
 
     let mut ledger = Ledger::default();

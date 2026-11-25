@@ -75,8 +75,20 @@ impl PimdirSourceStore {
         collection: &PimdirCollectionId,
         selection: &PimdirLoadSelection,
     ) -> Result<PimdirLoaded, PimdirError> {
+        self.load_as(&self.source, collection, selection)
+    }
+
+    /// [`load`](Self::load) as `source` sees the collection, a copy's or
+    /// a move's target loaded as the source its create is staged under
+    /// (SYNC §7).
+    pub(crate) fn load_as(
+        &self,
+        source: &PimdirSourceId,
+        collection: &PimdirCollectionId,
+        selection: &PimdirLoadSelection,
+    ) -> Result<PimdirLoaded, PimdirError> {
         let tx = self.store.reader.conn.unchecked_transaction()?;
-        let loaded = self.load_in(&tx, collection, selection)?;
+        let loaded = self.load_in(&tx, source, collection, selection)?;
         tx.commit()?;
         Ok(loaded)
     }
@@ -123,6 +135,7 @@ impl PimdirSourceStore {
     fn load_in(
         &self,
         conn: &Connection,
+        source: &PimdirSourceId,
         collection: &PimdirCollectionId,
         selection: &PimdirLoadSelection,
     ) -> Result<PimdirLoaded, PimdirError> {
@@ -130,12 +143,12 @@ impl PimdirSourceStore {
         if let PimdirLoadSelection::Handles(handles) = selection
             && handles.is_empty()
         {
-            let state = sync_state(conn, &collection.0, &self.source)?;
+            let state = sync_state(conn, &collection.0, source)?;
             return Ok(PimdirLoaded {
                 checkpoint: state.checkpoint,
                 coverage: state.coverage,
                 round: state.round,
-                refused: refusals(conn, collection, &self.source)?,
+                refused: refusals(conn, collection, source)?,
                 ..Default::default()
             });
         }
@@ -150,7 +163,7 @@ impl PimdirSourceStore {
             PimdirLoadSelection::Handles(handles) => {
                 let mut links = Vec::new();
                 for handle in handles {
-                    let bound = link_for_handle(conn, &collection.0, &self.source, handle)?;
+                    let bound = link_for_handle(conn, &collection.0, source, handle)?;
                     // NOTE: a provisional handle nothing binds names the
                     // copy the hub offers under it (SYNC §3), its key.
                     let offered = || handle.as_str().strip_prefix('\u{1}').map(String::from);
@@ -161,7 +174,7 @@ impl PimdirSourceStore {
                 read_linked_hub(conn, &collection.0, &links)?
             }
             PimdirLoadSelection::Owing(handles) => {
-                let key = named_params! { ":collection": collection.0, ":source": self.source.0 };
+                let key = named_params! { ":collection": collection.0, ":source": source.0 };
                 let owing: Vec<String> = rows(conn, sql::LIST_OWING_BINDINGS, key, |r| r.get(0))?;
                 let mut links: Vec<String> =
                     rows(conn, sql::LIST_LACKING_ITEMS, key, |r| r.get(0))?;
@@ -170,7 +183,7 @@ impl PimdirSourceStore {
                     .map(PimdirHandle)
                     .chain(handles.iter().cloned());
                 for handle in named {
-                    let bound = link_for_handle(conn, &collection.0, &self.source, &handle)?;
+                    let bound = link_for_handle(conn, &collection.0, source, &handle)?;
                     let offered = || handle.as_str().strip_prefix('\u{1}').map(String::from);
                     links.extend(bound.or_else(offered));
                 }
@@ -181,8 +194,8 @@ impl PimdirSourceStore {
         };
 
         let mut failed = None;
-        let mut placements = hub.project_moving(collection, &self.source, |placement| {
-            origin_for(conn, &self.source, placement).unwrap_or_else(|err| {
+        let mut placements = hub.project_moving(collection, source, |placement| {
+            origin_for(conn, source, placement).unwrap_or_else(|err| {
                 failed = Some(err);
                 None
             })
@@ -192,14 +205,14 @@ impl PimdirSourceStore {
         }
         for placement in &mut placements {
             if placement.status == PimdirStatus::Tombstone {
-                placement.origin = destination_for(conn, &self.source, placement)?;
+                placement.origin = destination_for(conn, source, placement)?;
             }
         }
         if matches!(selection, PimdirLoadSelection::Links(_)) {
-            retain_links(&hub, &self.source, &mut placements);
+            retain_links(&hub, source, &mut placements);
         }
 
-        let state = sync_state(conn, &collection.0, &self.source)?;
+        let state = sync_state(conn, &collection.0, source)?;
         let unstamped = match (selection, &state.round) {
             (
                 PimdirLoadSelection::LastPage {
@@ -210,7 +223,7 @@ impl PimdirSourceStore {
             ) => unstamped_bindings(
                 conn,
                 &collection.0,
-                &self.source,
+                source,
                 *narrowed,
                 enumerated.as_deref(),
             )?,
@@ -240,7 +253,7 @@ impl PimdirSourceStore {
         let movable: BTreeMap<String, PimdirSuperseded> = rows(
             conn,
             sql::LIST_SUPERSEDED_BINDINGS,
-            named_params! { ":collection": collection.0, ":source": self.source.0 },
+            named_params! { ":collection": collection.0, ":source": source.0 },
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -265,9 +278,9 @@ impl PimdirSourceStore {
             .collect();
 
         let conflicted = hub.conflicted(&placements);
-        let offered = hub.offered(&self.source, &placements);
-        let folded = hub.folded(&self.source, &placements);
-        let refused = refusals(conn, collection, &self.source)?;
+        let offered = hub.offered(source, &placements);
+        let folded = hub.folded(source, &placements);
+        let refused = refusals(conn, collection, source)?;
 
         Ok(PimdirLoaded {
             placements,
@@ -369,6 +382,16 @@ impl PimdirSourceStore {
     /// quarantine/ and the bodies written again, once per name; one the
     /// owner cannot move, a producer staging, fails the write.
     pub fn write(&mut self, ops: Vec<PimdirWriteOp>) -> Result<PimdirWritten, PimdirError> {
+        self.write_staged(ops, None)
+    }
+
+    /// [`write`](Self::write), a copy's or a move's create applied as
+    /// `staging` names (SYNC §7), in the one transaction.
+    pub(crate) fn write_staged(
+        &mut self,
+        ops: Vec<PimdirWriteOp>,
+        staging: Option<&Staging>,
+    ) -> Result<PimdirWritten, PimdirError> {
         let blobs = self.store.reader.blobs();
         let lock = Arc::clone(&self.store.lock);
         // NOTE: before the bodies land, so an owner whose lock file was
@@ -402,16 +425,87 @@ impl PimdirSourceStore {
                 named_params! { ":sync_version": SYNC_VERSION },
             )?;
         }
-        let written = apply(
+        let written = apply_staged(
             &tx,
             &blobs,
             &self.source,
             self.store.account.as_deref(),
             ops,
+            staging,
         )?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(written)
     }
+}
+
+/// Where a copy or a move whose source does not sync its target stages
+/// the create (SYNC §7): under the source an `add` there runs as.
+pub(crate) struct Staging {
+    /// The copy's or the move's target.
+    pub(crate) target: PimdirCollectionId,
+    /// The source the create is bound to.
+    pub(crate) source: PimdirSourceId,
+}
+
+impl Staging {
+    /// How a copy or a move run as `source` into `target`, which the
+    /// `sources` sync, stages its create under another source: under
+    /// `own` where it syncs `target`, else under the first that does
+    /// (STORAGE §15.2). `None` when `source` syncs it, the create its own,
+    /// or when none does, which refuses the mutation.
+    pub(crate) fn of(
+        source: &PimdirSourceId,
+        own: &PimdirSourceId,
+        target: &PimdirCollectionId,
+        sources: &[String],
+    ) -> Option<Self> {
+        if sources.contains(&source.0) {
+            return None;
+        }
+
+        Some(Self {
+            target: target.clone(),
+            source: syncing(own, sources)?,
+        })
+    }
+}
+
+/// The source an `add` into a collection the `sources` sync runs as
+/// (STORAGE §15.2): `own` where it is among them, else the first, `None`
+/// when none syncs it.
+pub(crate) fn syncing(own: &PimdirSourceId, sources: &[String]) -> Option<PimdirSourceId> {
+    match sources.contains(&own.0) {
+        true => Some(own.clone()),
+        false => sources.first().cloned().map(PimdirSourceId),
+    }
+}
+
+/// Applies a batch as [`apply`] does, the upserts of a copy's or a move's
+/// create into `staging`'s target applied as its source, in the caller's
+/// transaction (SYNC §7).
+pub(crate) fn apply_staged(
+    tx: &Connection,
+    blobs: &PimdirBlobs,
+    source: &PimdirSourceId,
+    account: Option<&str>,
+    ops: Vec<PimdirWriteOp>,
+    staging: Option<&Staging>,
+) -> Result<PimdirWritten, PimdirError> {
+    let Some(staging) = staging else {
+        return apply(tx, blobs, source, account, ops);
+    };
+
+    let (staged, own): (Vec<_>, Vec<_>) = ops.into_iter().partition(|op| {
+        matches!(op, PimdirWriteOp::UpsertPlacement(placement) if placement.collection == staging.target)
+    });
+    let mut written = apply(tx, blobs, source, account, own)?;
+    let mut theirs = apply(tx, blobs, &staging.source, account, staged)?;
+    written.overruled.append(&mut theirs.overruled);
+    written.conflicted.append(&mut theirs.conflicted);
+    written.adopted.append(&mut theirs.adopted);
+    written.refused.append(&mut theirs.refused);
+
+    Ok(written)
 }
 
 /// Applies a batch inside the caller's transaction.

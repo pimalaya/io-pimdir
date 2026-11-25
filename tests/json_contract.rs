@@ -51,6 +51,18 @@ fn shape(schema: &mut Value) {
 /// The schemas the binary prints, by key, their `$id` and their prose left
 /// out.
 fn printed() -> Vec<(&'static str, Value)> {
+    generated()
+        .into_iter()
+        .map(|(key, mut schema)| {
+            schema.as_object_mut().unwrap().remove("$id");
+            shape(&mut schema);
+            (key, schema)
+        })
+        .collect()
+}
+
+/// The schemas the binary prints, by key, whole.
+fn generated() -> Vec<(&'static str, Value)> {
     let dir = tempfile::tempdir().unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_pimdir"))
         .arg("json-schema")
@@ -65,9 +77,7 @@ fn printed() -> Vec<(&'static str, Value)> {
         .iter()
         .map(|key| {
             let path = dir.path().join(format!("{key}.json"));
-            let mut schema: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-            schema.as_object_mut().unwrap().remove("$id");
-            shape(&mut schema);
+            let schema: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
             (*key, schema)
         })
         .collect()
@@ -117,6 +127,21 @@ fn every_contract_payload_matches_its_committed_schema() {
          PIMDIR_BLESS_CONTRACT=1 once the change is meant.",
         problems.join("\n")
     );
+}
+
+/// Every schema's `$id` names the contract version: `v0.<minor>` below 1.0,
+/// the major, which `formatVersion` states, from 1.0 on.
+#[test]
+fn every_schema_id_names_the_contract_version() {
+    let contract = match env!("CARGO_PKG_VERSION_MAJOR") {
+        "0" => format!("0.{}", env!("CARGO_PKG_VERSION_MINOR")),
+        major => String::from(major),
+    };
+
+    for (key, schema) in generated() {
+        let id = format!("https://pimalaya.org/schemas/pimdir/v{contract}/{key}.json");
+        assert_eq!(schema["$id"], id.as_str(), "{key}");
+    }
 }
 
 /// `version` states the contract's major, the crate's own.

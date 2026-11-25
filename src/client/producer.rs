@@ -40,7 +40,8 @@ use crate::{
         lock::PimdirLock,
         modes, prepare_connection, property,
         reader::{PimdirItem, item_from_row},
-        record_failure, record_receipt, rows, schema, write,
+        record_failure, record_receipt, rows, schema,
+        write::{self, Staging},
     },
     codec::{
         self, PimdirAction, PimdirActionError, PimdirActionHandle, PimdirPayloadOutcome,
@@ -1649,7 +1650,7 @@ fn apply_claimed(
     };
 
     let acting = acting_source(tx, own, collection)?;
-    let (source, ops) = match stage_action(tx, blobs, &acting, collection, action)? {
+    let (source, ops, staging) = match stage_action(tx, blobs, &acting, own, collection, action)? {
         Ok(staged) => staged,
         Err(PimdirOutcome::Unbound(link)) => {
             let kind = write::kind_of(tx, collection)?;
@@ -1703,7 +1704,7 @@ fn apply_claimed(
         }
         _ => created.clone().map(|link| (String::from(collection), link)),
     };
-    let written = write::apply(tx, blobs, &source, account, ops)?;
+    let written = write::apply_staged(tx, blobs, &source, account, ops, staging.as_ref())?;
     // NOTE: the item an add supersedes is tombstoned under the savepoint
     // applying it, after its duplicate check parked nothing (§15.3).
     if let (
@@ -1802,8 +1803,8 @@ fn supersede(
         if_match: None,
         resolves: None,
     };
-    match stage_action(tx, blobs, &acting, collection, &remove)? {
-        Ok((source, ops)) => {
+    match stage_action(tx, blobs, &acting, own, collection, &remove)? {
+        Ok((source, ops, _)) => {
             write::apply(tx, blobs, &source, account, ops)?;
         }
         Err(PimdirOutcome::Skipped | PimdirOutcome::Unbound(_)) => {
@@ -1895,12 +1896,7 @@ fn acting_source(
     collection: &str,
 ) -> Result<PimdirSourceId, PimdirError> {
     let sources = collection_sources(tx, collection)?;
-    let acting = match sources.contains(&own.0) {
-        true => own.0.clone(),
-        false => sources.into_iter().next().unwrap_or_else(|| own.0.clone()),
-    };
-
-    Ok(PimdirSourceId(acting))
+    Ok(write::syncing(own, &sources).unwrap_or_else(|| own.clone()))
 }
 
 /// The sources syncing `collection`, by a binding or a checkpoint.
@@ -1913,8 +1909,16 @@ fn collection_sources(tx: &Connection, collection: &str) -> Result<Vec<String>, 
         .collect::<Result<Vec<_>, _>>()?)
 }
 
+/// The writes a queued action stages, the source they run as, and where a
+/// copy or a move whose source does not sync its target stages its create
+/// (SYNC §7).
+type Staged = (PimdirSourceId, Vec<PimdirWriteOp>, Option<Staging>);
+
 /// Stages the writes one queued action folds into the store (§15.3),
-/// inside the drain transaction, and names the source they run as.
+/// inside the drain transaction, and names the source they run as and,
+/// for a `move` or a `copy` whose source does not sync its target, the
+/// source its create is staged under, the drain's own `own` where it syncs
+/// the target (SYNC §7).
 ///
 /// An `add` stages the `Created` placement the engine's `Add` stages,
 /// its summary derived from the body the producer wrote. Every other
@@ -1969,9 +1973,10 @@ fn stage_action(
     tx: &Connection,
     blobs: &PimdirBlobs,
     source: &PimdirSourceId,
+    own: &PimdirSourceId,
     collection: &str,
     action: &PimdirAction,
-) -> Result<Result<(PimdirSourceId, Vec<PimdirWriteOp>), PimdirOutcome>, PimdirError> {
+) -> Result<Result<Staged, PimdirOutcome>, PimdirError> {
     let collection_id = PimdirCollectionId(collection.to_string());
     let kind = write::kind_of(tx, collection)?;
 
@@ -2052,6 +2057,7 @@ fn stage_action(
         return Ok(Ok((
             source.clone(),
             vec![PimdirWriteOp::UpsertPlacement(create)],
+            None,
         )));
     }
 
@@ -2075,7 +2081,7 @@ fn stage_action(
         .optional()?;
     let Some(item) = item else {
         return if removes {
-            Ok(Ok((source.clone(), Vec::new())))
+            Ok(Ok((source.clone(), Vec::new(), None)))
         } else {
             Ok(Err(PimdirOutcome::Parked(format!("unknown seq: {seq}"))))
         };
@@ -2243,11 +2249,16 @@ fn stage_action(
         PimdirAction::Unknown { .. } => unreachable!("unknown kinds are skipped, never staged"),
     };
 
-    let syncs_target = match mutation.create_target() {
-        Some(target) => collection_sources(tx, &target.0)?.contains(&source.0),
-        None => false,
+    let sources = match mutation.create_target() {
+        Some(target) => collection_sources(tx, &target.0)?,
+        None => Vec::new(),
     };
-    let mut mutate = PimdirMutate::new(collection_id.clone(), mutation).syncs_target(syncs_target);
+    let staging = mutation
+        .create_target()
+        .and_then(|target| Staging::of(source, own, target, &sources));
+    let mut mutate = PimdirMutate::new(collection_id.clone(), mutation)
+        .syncs_target(sources.contains(&source.0))
+        .target_synced(!sources.is_empty());
     let _ = mutate.resume(None);
     let placements = hub.project(&collection_id, source);
     let conflicted = hub.conflicted(&placements);
@@ -2270,9 +2281,13 @@ fn stage_action(
             _ => Vec::new(),
         };
         let hub = write::read_hub(tx, &collection.0, Some(&links))?;
-        let mut placements = hub.project(&collection, source);
+        let theirs = staging
+            .as_ref()
+            .filter(|staging| staging.target == collection)
+            .map_or(source, |staging| &staging.source);
+        let mut placements = hub.project(&collection, theirs);
         if matches!(selection, PimdirLoadSelection::Links(_)) {
-            write::retain_links(&hub, source, &mut placements);
+            write::retain_links(&hub, theirs, &mut placements);
         }
         state = mutate.resume(Some(PimdirArg::Load(PimdirLoaded {
             placements,
@@ -2286,7 +2301,7 @@ fn stage_action(
                 .into_iter()
                 .filter(|op| !matches!(op, PimdirWriteOp::StoreObject { .. }))
                 .collect();
-            Ok(Ok((source.clone(), ops)))
+            Ok(Ok((source.clone(), ops, staging)))
         }
         PimdirCoroutineState::Complete(Err(err)) => Ok(Err(PimdirOutcome::Parked(err.to_string()))),
         state => Ok(Err(PimdirOutcome::Parked(format!(
@@ -2327,7 +2342,7 @@ fn unbound(
     seq: i64,
     link: &PimdirLinkId,
     action: &PimdirAction,
-) -> Result<Result<(PimdirSourceId, Vec<PimdirWriteOp>), PimdirOutcome>, PimdirError> {
+) -> Result<Result<Staged, PimdirOutcome>, PimdirError> {
     let synced = tx
         .prepare_cached(sql::COLLECTION_SOURCES)?
         .exists(named_params! { ":collection": collection })?;

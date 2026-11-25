@@ -161,15 +161,21 @@ pub enum PimdirMutation {
     },
     /// Copy a placement into `target` as a pending create; the source is kept.
     ///
-    /// The next sync pushes a server-side copy, no body re-upload. The
-    /// copy takes the source's identity where `target` has it free, and a
-    /// minted one where a live placement there already holds it, staged
-    /// under the provisional handle that key derives (SYNC §2). A key the
-    /// source holds there as a tombstone of the same message is revived
-    /// under the handle it is bound to instead, its delete withdrawn and
-    /// no create staged (STORAGE §9, §10). Refused for a source holding
-    /// neither a body nor a based binding, since nothing could deliver
-    /// the create.
+    /// Where the run's source syncs `target` the create is its own and the
+    /// next sync pushes a server-side copy, no body re-upload; otherwise
+    /// the runner stages it under another source syncing `target`, with
+    /// no origin, and a `target` no source syncs is refused, staging
+    /// nothing ([`PimdirMutateError::Unsynced`], SYNC §7).
+    ///
+    /// The copy takes the source's identity where `target` has it free,
+    /// and a minted one where a live placement there already holds it,
+    /// staged under the provisional handle that key derives (SYNC §2). A
+    /// key the staging source holds there as a tombstone of the same
+    /// message is revived under the handle it is bound to instead, its
+    /// delete withdrawn and no create staged (STORAGE §9, §10). Refused
+    /// for a source holding no body unless its binding is based and the
+    /// run's source syncs `target`, since nothing else could deliver the
+    /// create.
     Copy {
         /// The source placement to copy.
         handle: PimdirHandle,
@@ -185,7 +191,8 @@ pub enum PimdirMutation {
     /// staged under the provisional handle its key derives. A tombstone
     /// holding the key is revived as a [`Copy`](Self::Copy) revives it,
     /// and the tombstone the move leaves then offers no destination, its
-    /// remove a plain delete.
+    /// remove a plain delete. So does a create staged under another source,
+    /// as a [`Copy`](Self::Copy) stages one.
     ///
     /// It states no resolution, so it settles no conflict: meeting one,
     /// the item's or its binding's, it is refused, staging nothing in
@@ -261,8 +268,10 @@ impl PimdirMutation {
         }
     }
 
-    /// The target of a staged create, else `None`.
-    pub(crate) fn create_target(&self) -> Option<&PimdirCollectionId> {
+    /// The target of a staged create, else `None`: the collection a
+    /// runner loads and writes as the source the create is staged under
+    /// (SYNC §7).
+    pub fn create_target(&self) -> Option<&PimdirCollectionId> {
         match self {
             Self::Copy { target, .. } | Self::Move { target, .. } => Some(target),
             _ => None,
@@ -340,6 +349,9 @@ pub enum PimdirMutateError {
     /// there is nothing to move, and its tombstone would remove the
     /// member from its server.
     MoveInPlace(String),
+    /// A `Copy` or a `Move` names a target no source syncs, where no
+    /// pending create can be staged (SYNC §7).
+    Unsynced(String),
     /// The caller broke the coroutine contract.
     Arg(PimdirArgError),
 }
@@ -362,6 +374,7 @@ impl PimdirMutateError {
     /// | `placement-undeliverable` | [`Undeliverable`](Self::Undeliverable) |
     /// | `create-not-delivered` | [`NotDelivered`](Self::NotDelivered) |
     /// | `move-in-place` | [`MoveInPlace`](Self::MoveInPlace) |
+    /// | `target-unsynced` | [`Unsynced`](Self::Unsynced) |
     /// | `coroutine-arg` | [`Arg`](Self::Arg) |
     pub fn code(&self) -> &'static str {
         match self {
@@ -375,6 +388,7 @@ impl PimdirMutateError {
             Self::Undeliverable(_) => "placement-undeliverable",
             Self::NotDelivered(_) => "create-not-delivered",
             Self::MoveInPlace(_) => "move-in-place",
+            Self::Unsynced(_) => "target-unsynced",
             Self::Arg(_) => "coroutine-arg",
         }
     }
@@ -420,6 +434,12 @@ impl fmt::Display for PimdirMutateError {
                 write!(
                     f,
                     "Pimdir MUTATE failed: handle {handle} is moved into the collection it is in"
+                )
+            }
+            Self::Unsynced(target) => {
+                write!(
+                    f,
+                    "Pimdir MUTATE failed: no source syncs {target}, where a copy or a move stages its create"
                 )
             }
             Self::UnknownFlags(handle) => {
@@ -554,8 +574,11 @@ pub struct PimdirMutate {
     /// The tombstones of the target agreeing with the staged create, of
     /// those read, by key: the create taking one revives it (STORAGE §9).
     revivable: BTreeMap<PimdirLinkId, PimdirPlacement>,
-    /// Whether the run's source syncs the target (SYNC §7).
+    /// Whether the run's source syncs the target, staging the create
+    /// itself (SYNC §7).
     syncs_target: bool,
+    /// Whether any source syncs the target, which a create needs.
+    target_synced: bool,
     /// Whether the edited placement's item is conflicted, which a
     /// resolution settles (SYNC §7).
     item_conflicted: bool,
@@ -576,15 +599,28 @@ impl PimdirMutate {
             held: BTreeSet::new(),
             revivable: BTreeMap::new(),
             syncs_target: false,
+            target_synced: true,
             item_conflicted: false,
             state: State::Start,
         }
     }
 
     /// Whether the run's source syncs the target, `false` by default
-    /// (SYNC §7).
+    /// (SYNC §7): the create is then the run's own, its origin the copied
+    /// placement. Otherwise it carries no origin, and the runner answers
+    /// the target's loads and applies its writes as the source syncing
+    /// it that an `add` there runs as (STORAGE §15.2).
     pub fn syncs_target(mut self, syncs: bool) -> Self {
         self.syncs_target = syncs;
+        self
+    }
+
+    /// Whether any source syncs the target, holding a binding or a
+    /// checkpoint there, `true` by default: a copy or a move into a
+    /// collection none syncs is refused, staging nothing
+    /// ([`PimdirMutateError::Unsynced`], SYNC §7).
+    pub fn target_synced(mut self, synced: bool) -> Self {
+        self.target_synced = synced;
         self
     }
 
@@ -727,7 +763,7 @@ impl PimdirMutate {
                 let key = key.expect("the key a staged create takes");
                 let create = match self.revivable.get(&key) {
                     Some(tombstone) => revived(tombstone.clone(), &source),
-                    None => Self::staged_copy(&source, target, key),
+                    None => self.staged_copy(&source, target, key),
                 };
                 vec![PimdirWriteOp::UpsertPlacement(create)]
             }
@@ -736,7 +772,7 @@ impl PimdirMutate {
                 let (create, destination) = match self.revivable.get(&key) {
                     Some(tombstone) => (revived(tombstone.clone(), &source), None),
                     None => {
-                        let create = Self::staged_copy(&source, target, key);
+                        let create = self.staged_copy(&source, target, key);
                         let destination = PimdirOrigin {
                             collection: target.clone(),
                             handle: create.handle.clone(),
@@ -780,15 +816,17 @@ impl PimdirMutate {
 
     /// The `Created` placement a copy or a move stages in its target.
     ///
-    /// It carries the source as its [`PimdirOrigin`], so the push is a
-    /// server-side copy, and `key` as its identity there, the source's
-    /// own or a minted one, under the provisional handle that key derives.
+    /// It carries `key` as its identity there, the source's own or a
+    /// minted one, under the provisional handle that key derives, and,
+    /// where the run's source syncs the target, the source as its
+    /// [`PimdirOrigin`], so the push is a server-side copy.
     fn staged_copy(
+        &self,
         source: &PimdirPlacement,
         target: &PimdirCollectionId,
         key: PimdirLinkId,
     ) -> PimdirPlacement {
-        let origin = Some(PimdirOrigin {
+        let origin = self.syncs_target.then(|| PimdirOrigin {
             collection: source.collection.clone(),
             handle: source.handle.clone(),
         });
@@ -1027,6 +1065,10 @@ impl PimdirCoroutine for PimdirMutate {
                     if let Some(target) = self.mutation.create_target()
                         && let Some(hint) = placement.link_id.clone()
                     {
+                        if !self.target_synced {
+                            let err = PimdirMutateError::Unsynced(target.as_str().into());
+                            return PimdirCoroutineState::Complete(Err(err));
+                        }
                         let copyable = placement.base.is_some() && self.syncs_target;
                         if placement.object.is_none() && !copyable {
                             let err = PimdirMutateError::Undeliverable(handle.as_str().into());
@@ -2029,6 +2071,56 @@ mod tests {
         let origin = p.origin.as_ref().expect("the copy carries its origin");
         assert_eq!(origin.collection.as_str(), "inbox");
         assert_eq!(origin.handle.as_str(), "1");
+    }
+
+    /// A copy whose run's source does not sync the target stages a create
+    /// carrying no origin, which the source syncing it cannot copy from
+    /// (SYNC §7).
+    #[test]
+    fn a_copy_another_source_stages_carries_no_origin() {
+        let mutation = PimdirMutation::Copy {
+            handle: PimdirHandle::from("1"),
+            target: "archive".into(),
+        };
+        let mut mutate = PimdirMutate::new("inbox", mutation);
+        let mut held = loaded("1");
+        held.placements[0].object = Some(PimdirHash::from("h1"));
+        held.placements[0].level = PimdirLevel::Full;
+        let _ = mutate.resume(None);
+        let _ = mutate.resume(Some(PimdirArg::Load(held)));
+        let ops = stage(&mut mutate, Vec::new());
+
+        let PimdirWriteOp::UpsertPlacement(create) = &ops[0] else {
+            panic!("expected UpsertPlacement, got {:?}", ops[0]);
+        };
+        assert_eq!(create.status, PimdirStatus::Created);
+        assert!(create.origin.is_none(), "{create:?}");
+    }
+
+    /// A copy or a move into a collection no source syncs is refused
+    /// before it reads its target, staging nothing (SYNC §7).
+    #[test]
+    fn a_copy_or_a_move_into_a_target_no_source_syncs_is_refused() {
+        for mutation in [
+            PimdirMutation::Copy {
+                handle: PimdirHandle::from("1"),
+                target: "archive".into(),
+            },
+            PimdirMutation::Move {
+                handle: PimdirHandle::from("1"),
+                target: "archive".into(),
+            },
+        ] {
+            let mut mutate = PimdirMutate::new("inbox", mutation).target_synced(false);
+            let _ = mutate.resume(None);
+
+            match mutate.resume(Some(PimdirArg::Load(loaded("1")))) {
+                PimdirCoroutineState::Complete(Err(PimdirMutateError::Unsynced(target))) => {
+                    assert_eq!(target, "archive");
+                }
+                state => panic!("expected Unsynced, got {state:?}"),
+            }
+        }
     }
 
     /// The target's half copies and the source's half removes.

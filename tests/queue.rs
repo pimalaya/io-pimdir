@@ -387,6 +387,14 @@ fn copy_fills_the_target_and_move_also_empties_the_source() {
         .write(vec![
             store_object("cafebabecafebabecafebabecafebabecafebabecafebabecafe", b"a"),
             store_object("cafebabfcafebabfcafebabfcafebabfcafebabfcafebabfcafe", b"b"),
+            PimdirWriteOp::SetCheckpoint {
+                collection: PimdirCollectionId("Backup".into()),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
+            PimdirWriteOp::SetCheckpoint {
+                collection: PimdirCollectionId("Archive".into()),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
             PimdirWriteOp::UpsertPlacement(summarized(placement(
                 "1",
                 "mid:a",

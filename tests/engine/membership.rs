@@ -19,7 +19,8 @@ use io_pimdir::{
 
 use crate::common::{Client, MemRemote, hash};
 
-/// One hydrated inbox member.
+/// One hydrated inbox member, the archive and the trash synced empty: a
+/// copy or a move stages its create under a source syncing its target.
 fn seeded_client() -> Client {
     let body = b"From: a\r\nMessage-ID: <msg-a>\r\n\r\nbody\r\n";
 
@@ -28,6 +29,10 @@ fn seeded_client() -> Client {
 
     let mut client = Client::new(remote);
     client.sync("inbox", PimdirSyncOptions::default()).unwrap();
+    client
+        .sync("archive", PimdirSyncOptions::default())
+        .unwrap();
+    client.sync("trash", PimdirSyncOptions::default()).unwrap();
     client
         .upgrade("inbox", vec![PimdirHandle::from("i1")], PimdirTier::Full)
         .unwrap();

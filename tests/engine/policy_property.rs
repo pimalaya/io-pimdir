@@ -203,6 +203,7 @@ fn check_policy_model(ops: Vec<PolicyOp>) -> Result<(), TestCaseError> {
     let mut client = Client::new(remote);
     let writable = PimdirSyncOptions::default();
     client.sync("inbox", writable.clone()).unwrap();
+    client.sync("archive", writable.clone()).unwrap();
     hydrate(&mut client);
     well_formed(&client, "after the seeding sync")?;
 

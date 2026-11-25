@@ -8,7 +8,7 @@ use std::fs::File;
 use fs4::FileExt;
 use io_pimdir::{
     change::PimdirWriteOp,
-    collection::PimdirCollectionId,
+    collection::{PimdirCheckpoint, PimdirCollectionId},
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirBase, PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement,
@@ -51,7 +51,7 @@ fn placement(collection: &str, handle: &str, link: &str, key: &str) -> PimdirPla
 }
 
 /// An owner-created store holding `INBOX` (three items) and an empty
-/// `Archive`, with the blob every item points at.
+/// `Archive` left syncs, with the blob every item points at.
 fn store(dir: &std::path::Path) -> Vec<i64> {
     let mut owner = PimdirStore::open(dir).unwrap().for_source("left");
     owner.ensure_collection("INBOX", "message/rfc822").unwrap();
@@ -70,6 +70,10 @@ fn store(dir: &std::path::Path) -> Vec<i64> {
             PimdirWriteOp::UpsertPlacement(placement("INBOX", "1", "mid:a", "2026-01-01")),
             PimdirWriteOp::UpsertPlacement(placement("INBOX", "2", "mid:b", "2026-01-02")),
             PimdirWriteOp::UpsertPlacement(placement("INBOX", "3", "mid:c", "2026-01-03")),
+            PimdirWriteOp::SetCheckpoint {
+                collection: PimdirCollectionId("Archive".into()),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
         ])
         .unwrap();
 
@@ -711,6 +715,35 @@ fn a_move_into_an_undeclared_collection_folds_into_nothing() {
 
     let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
     assert!(overlaid.get_item("INBOX", seqs[0]).unwrap().is_some());
+    drop(overlaid);
+
+    let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    assert_eq!(owner.drain().unwrap().parked, 1);
+}
+
+/// STORAGE §15.3, §15.4: a move into a collection no source syncs parks,
+/// so the overlay leaves its item where it is and brings nothing there.
+#[test]
+fn a_move_into_a_collection_no_source_syncs_folds_into_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let seqs = store(dir.path());
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .ensure_collection("Local", "message/rfc822")
+        .unwrap();
+    enqueue(
+        dir.path(),
+        "INBOX",
+        &PimdirAction::Move {
+            seq: seqs[0],
+            to: PimdirCollectionId("Local".into()),
+        },
+    );
+
+    let overlaid = PimdirReader::open(dir.path()).unwrap().with_pending();
+    assert!(overlaid.get_item("INBOX", seqs[0]).unwrap().is_some());
+    assert!(overlaid.get_item("Local", seqs[0]).unwrap().is_none());
+    assert!(overlaid.list_items("Local", None, 10).unwrap().is_empty());
     drop(overlaid);
 
     let mut owner = PimdirStore::open(dir.path()).unwrap().for_source("left");

@@ -178,6 +178,7 @@ fn offline_copy_creates_pushes_and_rekeys() {
     let opts = PimdirSyncOptions::default();
 
     client.sync("inbox", opts.clone()).unwrap();
+    client.sync("archive", opts.clone()).unwrap();
     client
         .upgrade("inbox", vec![PimdirHandle::from("i2")], PimdirTier::Full)
         .unwrap();
@@ -204,7 +205,7 @@ fn offline_copy_creates_pushes_and_rekeys() {
         "the copy source is untouched",
     );
 
-    // NOTE: the archive's first listing names its members in the page
+    // NOTE: the archive's listing names its members in the page
     // that lists them, none the create's arrival, so the create is pushed
     // once that page has landed (SYNC §5).
     let report = client.sync("archive", opts.clone()).unwrap();

@@ -13,7 +13,7 @@ use io_pimdir::{
     change::PimdirWriteOp,
     client::producer::PimdirProducer,
     codec::{PimdirAction, PimdirSupersedes},
-    collection::PimdirCollectionId,
+    collection::{PimdirCheckpoint, PimdirCollectionId},
     load::PimdirLoadSelection,
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId, PimdirStatus},
 };
@@ -125,6 +125,10 @@ fn a_parked_move_retried_after_a_rename_lands_in_the_renamed_target() {
         .write(vec![
             body(&store, &a),
             PimdirWriteOp::UpsertPlacement(held(&store, "INBOX", "1", &a)),
+            PimdirWriteOp::SetCheckpoint {
+                collection: PimdirCollectionId("Archive".into()),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
         ])
         .unwrap();
     let seq = store.seq_for_link("INBOX", "a@x").unwrap().unwrap();

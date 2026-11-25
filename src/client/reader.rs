@@ -900,6 +900,7 @@ impl PimdirReader {
         match item {
             Some(item) => self.folded(collection, item, edits),
             None => match pending.arrivals.get(&seq) {
+                Some(_) if self.collection_sources(collection)?.is_empty() => Ok(None),
                 Some(arrival) => {
                     let queued = edits.map_or(&[][..], Vec::as_slice);
                     let edits = self.admitted(collection, queued)?;
@@ -2074,7 +2075,7 @@ struct PimdirStanding {
     /// which the owner settles alone (§15.3); `None` for a bound item.
     unbound: Option<bool>,
     /// The targets of its pending moves the store declares no kind for,
-    /// where a move parks (§15.2).
+    /// or no source syncs, where a move parks (§15.2, §15.3).
     undeclared: Vec<String>,
 }
 
@@ -2327,9 +2328,10 @@ impl PimdirReader {
         if let Some(standing) = &mut standing {
             for action in &edits {
                 if let PimdirAction::Move { to, .. } = action
-                    && self
+                    && (self
                         .collection_kind(&to.0)?
                         .is_none_or(|kind| kind.is_empty())
+                        || self.collection_sources(&to.0)?.is_empty())
                 {
                     standing.undeclared.push(to.0.clone());
                 }
@@ -2463,13 +2465,17 @@ impl PimdirReader {
         Ok(kept)
     }
 
-    /// The items pending moves and copies bring into the collection.
+    /// The items pending moves and copies bring into the collection, none
+    /// into one no source syncs, where they park (§15.3).
     fn arrived(
         &self,
         collection: &str,
         pending: &PimdirPending,
     ) -> Result<Vec<PimdirItem>, PimdirError> {
         let mut items = Vec::new();
+        if self.collection_sources(collection)?.is_empty() {
+            return Ok(items);
+        }
         for (seq, arrival) in &pending.arrivals {
             let Some(item) = self.arrival(*seq, arrival)? else {
                 continue;

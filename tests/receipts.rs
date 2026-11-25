@@ -16,7 +16,7 @@ use io_pimdir::{
         reader::PimdirReader,
     },
     codec::PimdirAction,
-    collection::PimdirCollectionId,
+    collection::{PimdirCheckpoint, PimdirCollectionId},
     intent::PimdirSubmit,
     object::PimdirObject,
     placement::PimdirFlags,
@@ -25,11 +25,18 @@ use rusqlite::Connection;
 
 const DRAFT: &str = "Message-ID: <draft@example.org>\r\nFrom: a@example.org\r\nTo: b@example.org\r\nSubject: hi\r\n\r\nhi\r\n";
 
-/// An empty store with an INBOX and a Drafts, owned by source `local`.
+/// An empty store with an INBOX and a Drafts, owned by source `local`,
+/// which syncs the INBOX.
 fn store(dir: &Path) {
-    let store = PimdirStore::open(dir).unwrap().for_source("local");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("local");
     store.ensure_collection("INBOX", "message/rfc822").unwrap();
     store.ensure_collection("Drafts", "message/rfc822").unwrap();
+    store
+        .write(vec![PimdirWriteOp::SetCheckpoint {
+            collection: PimdirCollectionId("INBOX".into()),
+            checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+        }])
+        .unwrap();
 }
 
 /// Stages `body` through the producer and returns the `add` of it.

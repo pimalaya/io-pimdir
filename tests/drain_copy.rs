@@ -4,7 +4,8 @@
 //! left's item from S to T, drained from the queue or run through
 //! `store.mutate`, leaves the same rows: left joins right's item under the
 //! bare key, where the drain minted a second item before (K4 of pimdir
-//! cairn/changes/a-smaller-sync).
+//! cairn/changes/a-smaller-sync). A source syncing no T stages its create
+//! under one that does (pimdir SYNC §7).
 
 #![cfg(feature = "client")]
 
@@ -267,4 +268,97 @@ fn a_drained_move_joins_the_other_sources_item() {
 #[test]
 fn a_mutated_move_joins_the_other_sources_item() {
     mutated(false);
+}
+
+/// A queued Copy run as left, which syncs no T, where right binds the
+/// identity as a tombstone whose delete is not pushed: the create is
+/// staged under right, which syncs T, so it revives right's own tombstone
+/// under t1, staging no create (pimdir SYNC §7, vector 230, which the
+/// vector drain cannot express, two sources binding there).
+#[test]
+fn a_drained_copy_revives_the_tombstone_of_the_source_syncing_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut right = PimdirStore::open(dir.path()).unwrap().for_source("right");
+    right.ensure_collection("S", "message/rfc822").unwrap();
+    right.ensure_collection("T", "message/rfc822").unwrap();
+    right
+        .write(vec![
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: hash::hash(BODY),
+                    size: BODY.len(),
+                },
+                body: Some(BODY.to_vec()),
+            },
+            PimdirWriteOp::UpsertPlacement(placement("T", "t1")),
+        ])
+        .unwrap();
+    right
+        .mutate(
+            "T",
+            PimdirMutation::Remove {
+                handle: PimdirHandle("t1".into()),
+                if_match: None,
+                resolves: None,
+            },
+        )
+        .unwrap();
+    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    left.write(vec![PimdirWriteOp::UpsertPlacement(placement("S", "s1"))])
+        .unwrap();
+    enqueue(dir.path(), &left, true);
+
+    let report = left.drain().unwrap();
+
+    assert_eq!((report.applied, report.parked), (1, 0));
+    assert_eq!(target(dir.path()), vec![row("right", "t1", "mid:L", 1, 1)]);
+    assert_eq!(
+        projected(&right, "T"),
+        vec![(
+            "t1".to_string(),
+            Some("mid:L".to_string()),
+            PimdirStatus::Clean
+        )],
+        "the tombstone revived, its delete withdrawn"
+    );
+}
+
+/// A queued Copy run as left, which syncs no T, drained by zulu, which
+/// syncs T beside alpha: the create is staged under zulu, the owner's own
+/// among the sources syncing T, as an add there runs (pimdir STORAGE
+/// §15.2, SYNC §7).
+#[test]
+fn a_drained_copy_stages_its_create_under_the_owners_own_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = || PimdirWriteOp::SetCheckpoint {
+        collection: PimdirCollectionId("T".into()),
+        checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+    };
+    let mut alpha = PimdirStore::open(dir.path()).unwrap().for_source("alpha");
+    alpha.ensure_collection("S", "message/rfc822").unwrap();
+    alpha.ensure_collection("T", "message/rfc822").unwrap();
+    alpha.write(vec![checkpoint()]).unwrap();
+    let mut left = PimdirStore::open(dir.path()).unwrap().for_source("left");
+    left.write(vec![
+        PimdirWriteOp::StoreObject {
+            object: PimdirObject {
+                hash: hash::hash(BODY),
+                size: BODY.len(),
+            },
+            body: Some(BODY.to_vec()),
+        },
+        PimdirWriteOp::UpsertPlacement(placement("S", "s1")),
+    ])
+    .unwrap();
+    enqueue(dir.path(), &left, true);
+    let mut zulu = PimdirStore::open(dir.path()).unwrap().for_source("zulu");
+    zulu.write(vec![checkpoint()]).unwrap();
+
+    let report = zulu.drain().unwrap();
+
+    assert_eq!((report.applied, report.parked), (1, 0));
+    assert_eq!(
+        target(dir.path()),
+        vec![row("zulu", "\u{1}mid:L", "mid:L", 1, 0)]
+    );
 }

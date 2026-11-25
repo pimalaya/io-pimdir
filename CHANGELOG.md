@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+The store follows pimdir's storage-draft-18, the index search-draft-18 and the sync sync-draft-16 (the owner decisions of 2026-11-25). Drafts are exact: a store an earlier draft wrote is refused, never migrated, and an index of an earlier draft is rebuilt by the indexer.
+
+### Added
+
+- **BREAKING**: Added `PimdirMutateError::Unsynced` (`target-unsynced`) and `PimdirMutate::target_synced`: a copy or a move into a collection no source syncs, holding no binding nor checkpoint there, is refused, staging nothing in either collection, and a queued `move` or `copy` there parks (pimdir SYNC §7, STORAGE §15.3). An exhaustive `match` on the enum needs the arm.
+- Added `PimdirMutation::create_target` to the public API, the collection a runner of its own loads and writes as the source a copy's or a move's create is staged under.
+
+### Changed
+
+- **BREAKING**: A copy or a move into a collection no source syncs is refused (above), where it used to stage a pending create under the run's source, binding that source to a collection it never synced: a target is synced, by a checkpoint or a binding, before anything is copied or moved into it.
+- The overlay folds a pending `move` into a collection no source syncs as nothing, its item left where it is, as the drain parks it (pimdir STORAGE §15.4).
+
+### Fixed
+
+- Fixed a copy or a move whose run's source does not sync its target staging the create under that source, which never pushed it, while another source of the target was offered the item, pushed it and left the stray pending create standing: the create is now staged under the source an `add` into the target runs as, the owner's own where it syncs the target, else the first source syncing it, with no origin of the run's source, the target loaded and written as that source in the transaction of the move's tombstone, through `PimdirSourceStore::mutate` and the drain alike, so that source's own tombstone of the identity is the one revived (pimdir SYNC §7, STORAGE §15.2; vectors 227, 228 and 230).
+
 ## [0.20.4] - 2026-11-25
 
 ### Fixed

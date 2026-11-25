@@ -21,7 +21,7 @@ use io_pimdir::client::{
 use io_pimdir::{
     change::PimdirWriteOp,
     codec::PimdirAction,
-    collection::PimdirCollectionId,
+    collection::{PimdirCheckpoint, PimdirCollectionId},
     hash,
     hub::PimdirSourceId,
     load::PimdirLoadSelection,
@@ -548,6 +548,18 @@ fn a_move_over_a_conflicted_item_is_refused_and_parks() {
     let (mut phone, _server) = diverged(dir.path());
     phone.ensure_collection("archive", "text/vcard").unwrap();
     phone.ensure_collection("kept", "text/vcard").unwrap();
+    phone
+        .write(vec![
+            PimdirWriteOp::SetCheckpoint {
+                collection: PimdirCollectionId("archive".into()),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
+            PimdirWriteOp::SetCheckpoint {
+                collection: PimdirCollectionId("kept".into()),
+                checkpoint: PimdirCheckpoint(b"cp".to_vec()),
+            },
+        ])
+        .unwrap();
     let archive = PimdirCollectionId("archive".into());
     let seq = seq(&phone);
     let server_body = phone.hash(SERVER);
