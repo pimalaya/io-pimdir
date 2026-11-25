@@ -2,7 +2,8 @@
 //! §11): the fixture store of vectors/search/store.json built through the
 //! owner, indexed, and asked every case of vectors/search/queries.json;
 //! the chunk boundaries of vectors/search/chunks.json; the refreshes of
-//! vectors/search/refresh.json.
+//! vectors/search/refresh.json; the stores and queries of
+//! vectors/search/extraction.json.
 //!
 //! Every case is answered: none is skipped. A case stating `threads` is
 //! asked as a threaded listing (SEARCH §9).
@@ -29,7 +30,8 @@ use io_pimdir::{
         reader::{PimdirChangeCursor, PimdirReader},
         search::{
             PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchCursor,
-            PimdirSearchMatched, PimdirSearchOptions, PimdirSearchSort,
+            PimdirSearchHit, PimdirSearchMatched, PimdirSearchOptions, PimdirSearchSort,
+            PimdirSearchThread,
         },
     },
     codec::PimdirAction,
@@ -326,7 +328,7 @@ fn put(spec: &Path, store: &mut PimdirSourceStore, kind: &str, item: &Value) -> 
 fn every_refresh_vector_answers() {
     let spec = spec_dir();
     let vectors = json(&spec.join("vectors/search/refresh.json"));
-    assert_eq!(vectors["v"], 6, "refresh.json at another version");
+    assert_eq!(vectors["v"], 7, "refresh.json at another version");
     let now = unix(
         json(&spec.join("vectors/search/queries.json"))["now"]
             .as_str()
@@ -365,6 +367,7 @@ fn every_refresh_vector_answers() {
                 )
             })
             .collect();
+        let mut pages = BTreeMap::new();
         for (number, step) in case["steps"].as_array().unwrap().iter().enumerate() {
             let name = format!("refresh {label:?} step {}", number + 1);
             let outcome = pending::check(|| {
@@ -415,8 +418,20 @@ fn every_refresh_vector_answers() {
                     split(rebuilt.path()),
                     "split rows: refreshed against rebuilt"
                 );
-                for query in step["queries"].as_array().unwrap() {
+                for (at, query) in step["queries"].as_array().unwrap().iter().enumerate() {
                     let text = query["query"].as_str().unwrap();
+                    if query.get("limit").is_some() || query.get("ordered").is_some() {
+                        let after = query.get("page").map(|page| {
+                            let step = page["step"].as_u64().unwrap();
+                            let query = page["query"].as_u64().unwrap();
+                            pages.get(&(step, query)).cloned().flatten()
+                        });
+                        let after = after.flatten();
+                        let next = paged(&index, query, after.clone(), "refreshed");
+                        paged(&fresh, query, after, "rebuilt");
+                        pages.insert((number as u64 + 1, at as u64 + 1), next);
+                        continue;
+                    }
                     if let Some(threads) = query.get("threads") {
                         let want = thread_set(threads);
                         assert_eq!(listed_threads(&index, text), want, "{text:?}: refreshed");
@@ -471,6 +486,84 @@ fn refreshed_hits(index: &PimdirIndex, text: &str, want: &BTreeSet<(String, i64)
             "{text:?}: {how} count under {force:?}"
         );
     }
+}
+
+/// A refresh query asked in its order (SEARCH §8.2): its first `limit`
+/// hits or threads, every one when it states none, after the position
+/// `after`, compared in order under the plan's own driver and under each
+/// driver forced, which end the page on one position, answered.
+fn paged(
+    index: &PimdirIndex,
+    query: &Value,
+    after: Option<PimdirSearchCursor>,
+    how: &str,
+) -> Option<PimdirSearchCursor> {
+    let text = query["query"].as_str().unwrap();
+    let parsed = PimdirQuery::parse(text).unwrap_or_else(|err| panic!("{text:?}: {err}"));
+    let options = PimdirSearchOptions {
+        sort: query["sort"]
+            .as_str()
+            .map_or(PimdirSearchSort::NewestFirst, |sort| {
+                PimdirSearchSort::parse(sort).unwrap_or_else(|| panic!("{sort}: a known order"))
+            }),
+        limit: query["limit"].as_u64().map_or(100, |limit| limit as usize),
+        after,
+        ..Default::default()
+    };
+    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
+        .sets
+        .is_empty();
+    let forces = [
+        None,
+        Some(PimdirPlanForce::Set),
+        Some(PimdirPlanForce::Walk),
+        Some(PimdirPlanForce::Scope),
+        Some(PimdirPlanForce::Fallback),
+    ];
+
+    let mut ends = Vec::new();
+    for force in forces {
+        if matches!(
+            force,
+            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
+        ) && !sets
+        {
+            continue;
+        }
+        let _unforced = Unforced(index);
+        index.force_driver(force);
+        let named = format!("{text:?}: {how} under {force:?}");
+        if let Some(threads) = query.get("threads") {
+            let answer = index
+                .threads(&parsed, &options)
+                .unwrap_or_else(|err| panic!("{named}: {err}"));
+            let got: Vec<ThreadRow> = answer.threads.iter().map(thread_row).collect();
+            let want: Vec<ThreadRow> = threads
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(stated_thread)
+                .collect();
+            assert_eq!(got, want, "{named}: threads in order");
+            ends.push(answer.next);
+            continue;
+        }
+        let answer = index
+            .search(&parsed, &options)
+            .unwrap_or_else(|err| panic!("{named}: {err}"));
+        let got: Vec<(String, i64)> = answer
+            .hits
+            .iter()
+            .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+            .collect();
+        assert_eq!(got, pairs(&query["hits"]), "{named}: hits in order");
+        ends.push(answer.next);
+    }
+    assert!(
+        ends.windows(2).all(|pair| pair[0] == pair[1]),
+        "{text:?}: {how}, one position under every driver"
+    );
+    ends.pop().flatten()
 }
 
 /// Applies one refresh write as an owner makes it.
@@ -599,16 +692,34 @@ fn thread_set(threads: &Value) -> BTreeSet<ThreadRow> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|thread| {
-            (
-                thread["thread"].as_str().map(String::from),
-                thread["count"].as_u64().unwrap(),
-                thread["first"].as_str().map(String::from),
-                thread["last"].as_str().map(String::from),
-                pairs(&thread["hits"]).into_iter().collect(),
-            )
-        })
+        .map(stated_thread)
         .collect()
+}
+
+/// One thread as a vector states it.
+fn stated_thread(thread: &Value) -> ThreadRow {
+    (
+        thread["thread"].as_str().map(String::from),
+        thread["count"].as_u64().unwrap(),
+        thread["first"].as_str().map(String::from),
+        thread["last"].as_str().map(String::from),
+        pairs(&thread["hits"]).into_iter().collect(),
+    )
+}
+
+/// One thread as a listing answers it.
+fn thread_row(thread: &PimdirSearchThread) -> ThreadRow {
+    (
+        thread.thread.clone(),
+        thread.count,
+        thread.first.clone(),
+        thread.last.clone(),
+        thread
+            .hits
+            .iter()
+            .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+            .collect(),
+    )
 }
 
 /// The threaded listing of `query`, as [`thread_set`] states one.
@@ -623,19 +734,7 @@ fn listed_threads(index: &PimdirIndex, query: &str) -> BTreeSet<ThreadRow> {
         .unwrap_or_else(|err| panic!("{query:?}: {err}"))
         .threads
         .iter()
-        .map(|thread| {
-            (
-                thread.thread.clone(),
-                thread.count,
-                thread.first.clone(),
-                thread.last.clone(),
-                thread
-                    .hits
-                    .iter()
-                    .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
-                    .collect(),
-            )
-        })
+        .map(thread_row)
         .collect()
 }
 
@@ -675,7 +774,7 @@ fn every_search_vector_answers() {
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
     let vectors = json(&spec.join("vectors/search/queries.json"));
-    assert_eq!(vectors["v"], 5, "queries.json at another version");
+    assert_eq!(vectors["v"], 6, "queries.json at another version");
 
     // NOTE: the horizon is drawn around the vectors' now (SEARCH §11).
     let now = unix(vectors["now"].as_str().unwrap());
@@ -757,6 +856,123 @@ fn every_search_vector_answers() {
         }
     }
     pending::settle("queries", outcomes);
+}
+
+/// The extraction cases of vectors/search/extraction.json (SEARCH §11):
+/// each store built through the owner and indexed at the file's `now`,
+/// then every query answered as a case of queries.json is, in the zone it
+/// states.
+#[test]
+fn every_extraction_vector_answers() {
+    let spec = spec_dir();
+    let vectors = json(&spec.join("vectors/search/extraction.json"));
+    assert_eq!(vectors["v"], 1, "extraction.json at another version");
+    let now = unix(vectors["now"].as_str().unwrap());
+
+    let mut outcomes = Vec::new();
+    for case in vectors["cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        build_store(&spec, dir.path(), &case["store"]);
+        let mut index = PimdirIndex::open(dir.path()).unwrap();
+
+        for query in case["queries"].as_array().unwrap() {
+            let zone = query["index_zone"]
+                .as_str()
+                .or(query["zone"].as_str())
+                .unwrap_or("UTC");
+            index
+                .refresh(&PimdirIndexRefreshOptions {
+                    now: Some(now),
+                    floating_zone: zone.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let clock = clock_of(query, now);
+            let name = format!("extraction {label:?} {}", case_name(query));
+            let outcome = pending::check(|| extracted(&index, &clock, query));
+            outcomes.push((name, outcome));
+        }
+    }
+    pending::settle("extraction", outcomes);
+}
+
+/// One extraction query answers the hits, what each matched, the coverage
+/// and whether it is complete where it states them, alike under the plan's
+/// own driver and under each driver forced.
+fn extracted(index: &PimdirIndex, clock: &PimdirSearchClock, query: &Value) {
+    let text = query["query"].as_str().unwrap();
+    let parsed = PimdirQuery::parse(text).unwrap_or_else(|err| panic!("{text:?}: {err}"));
+    let options = PimdirSearchOptions {
+        sort: query["sort"]
+            .as_str()
+            .map_or(PimdirSearchSort::NewestFirst, |sort| {
+                PimdirSearchSort::parse(sort).unwrap_or_else(|| panic!("{sort}: a known order"))
+            }),
+        limit: 100,
+        after: None,
+        clock: clock.clone(),
+    };
+    let sets = !PimdirPlan::new(&parsed, 0, &jiff::tz::TimeZone::UTC)
+        .sets
+        .is_empty();
+    let forces = [
+        None,
+        Some(PimdirPlanForce::Set),
+        Some(PimdirPlanForce::Walk),
+        Some(PimdirPlanForce::Scope),
+        Some(PimdirPlanForce::Fallback),
+    ];
+
+    for force in forces {
+        if matches!(
+            force,
+            Some(PimdirPlanForce::Set | PimdirPlanForce::Fallback)
+        ) && !sets
+        {
+            continue;
+        }
+        let _unforced = Unforced(index);
+        index.force_driver(force);
+        let named = format!("{text:?} under {force:?}");
+
+        let answer = index
+            .search(&parsed, &options)
+            .unwrap_or_else(|err| panic!("{named}: {err}"));
+        let got: Vec<(String, i64)> = answer
+            .hits
+            .iter()
+            .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+            .collect();
+        let want = pairs(&query["hits"]);
+        match query["ordered"].as_bool() {
+            Some(true) => assert_eq!(got, want, "{named}: ordered hits"),
+            _ => assert_eq!(
+                got.iter().collect::<BTreeSet<_>>(),
+                want.iter().collect::<BTreeSet<_>>(),
+                "{named}: hits"
+            ),
+        }
+        matched(&answer.hits, query, &named);
+
+        let count = index.count(&parsed, clock).unwrap();
+        assert_eq!(count.count as usize, want.len(), "{named}: count");
+        if let Some(stated) = query.get("coverage") {
+            assert_eq!(
+                answer.coverage.local.kinds,
+                counts(stated),
+                "{named}: coverage"
+            );
+        }
+        if let Some(complete) = query.get("complete") {
+            assert_eq!(
+                Some(answer.coverage.is_complete()),
+                complete.as_bool(),
+                "{named}: complete, over {:?}",
+                answer.coverage
+            );
+        }
+    }
 }
 
 /// A coverage as the vectors state one: per kind its four counts.
@@ -1011,6 +1227,7 @@ fn answers_under(
             "{named}: hits"
         );
     }
+    matched(&answer.hits, case, &named);
 
     let count = index.count(&parsed, clock).unwrap();
     assert_eq!(count.count as usize, want.len(), "{named}: count");
@@ -1062,6 +1279,24 @@ fn answers_under(
             Some(answer.coverage.cut),
             cut.as_u64(),
             "{named}: the series cut before the range's end"
+        );
+    }
+}
+
+/// Each hit a case states `matched` for matched on its body or on its
+/// summary as the case says (SEARCH §8.2).
+fn matched(hits: &[PimdirSearchHit], case: &Value, named: &str) {
+    for stated in case["matched"].as_array().into_iter().flatten() {
+        let account = stated[0].as_str().unwrap();
+        let seq = stated[1].as_i64().unwrap();
+        let hit = hits
+            .iter()
+            .find(|hit| hit.account.as_deref().unwrap_or_default() == account && hit.seq == seq)
+            .unwrap_or_else(|| panic!("{named}: {account} {seq} is a hit"));
+        assert_eq!(
+            hit.matched.map(|matched| matched.as_str()),
+            stated[2].as_str(),
+            "{named}: what {account} {seq} matched on"
         );
     }
 }

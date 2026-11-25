@@ -80,8 +80,8 @@ pub const FIELDS: &[&str] = &[
     "with",
     "person",
     "tag",
-    "is",
     "flag",
+    "is",
     "has",
     "kind",
     "status",
@@ -679,6 +679,8 @@ pub struct PimdirQueryDateRange {
     pub start: Option<PimdirQueryDate>,
     /// The last point, `None` open.
     pub end: Option<PimdirQueryDate>,
+    /// Whether the value is one point, not a range around `..`.
+    pub point: bool,
 }
 
 /// One point of a date range (SEARCH §8.1).
@@ -798,13 +800,12 @@ impl PimdirQueryDateRange {
     /// A bound no instant of a four-digit year states is open: a start
     /// before `0000-01-01T00:00:00Z` and an end past
     /// `9999-12-31T23:59:59Z`. An end before year 0 is its first instant,
-    /// the range then holding nothing. A single point is parsed as a range
-    /// from it to itself, so `2w..2w` reads as `2w` alone.
+    /// the range then holding nothing. A relative amount ends at `now` only
+    /// as a single point, so `2w..2w` is empty.
     pub fn bounds(&self, now: i64, zone: &TimeZone) -> (Option<i64>, Option<i64>) {
-        let single = self.start.is_some() && self.start == self.end;
         let since = self.start.as_ref().map(|point| span(point, now, zone).0);
         let until = self.end.as_ref().map(|point| match point {
-            PimdirQueryDate::Relative { .. } if single => now,
+            PimdirQueryDate::Relative { .. } if self.point => now,
             point => span(point, now, zone).1,
         });
         let since = since.filter(|since| *since >= YEAR_ZERO);
@@ -1611,7 +1612,13 @@ fn field(
         }
         "linked" => {
             let (role, id) = match value.split_once(':') {
-                Some((role, id)) if !id.is_empty() && is_reference_role(role) => {
+                Some((role, "")) if is_reference_role(role) => {
+                    return Err(invalid(
+                        PimdirQueryErrorCode::InvalidValue,
+                        &["<role>:<id>"],
+                    ));
+                }
+                Some((role, id)) if is_reference_role(role) => {
                     (Some(PimdirReferenceRole::parse(role)), id)
                 }
                 _ => (None, value.as_str()),
@@ -1662,7 +1669,11 @@ where
 /// Reads a `date-value`.
 fn date_range(value: &str) -> Option<PimdirQueryDateRange> {
     let (start, end) = range(value, date)?;
-    Some(PimdirQueryDateRange { start, end })
+    Some(PimdirQueryDateRange {
+        start,
+        end,
+        point: !value.contains(".."),
+    })
 }
 
 /// Reads a `stamp-value`.
@@ -2122,6 +2133,11 @@ mod tests {
         assert_eq!(
             linked("linked:sender:007"),
             (Some("sender".into()), PimdirQueryId::Digits("007".into()))
+        );
+        let refused = PimdirQuery::parse("linked:sender:").unwrap_err();
+        assert_eq!(
+            (refused.code.as_str(), refused.start, refused.end),
+            ("invalid-value", 7, 14)
         );
         assert_eq!(PimdirQueryId::Digits("007".into()).seq(), Some(7));
         assert_eq!(

@@ -1485,6 +1485,11 @@ mod tests {
             "a relative side is its instant, not a span to now"
         );
         assert_eq!(
+            bounds_of("2w..2w", now),
+            span("2028-02-15T15:30:00Z", "2028-02-15T15:30:00Z"),
+            "a range of one relative amount is empty"
+        );
+        assert_eq!(
             bounds_of("yesterday..today", now),
             span("2028-02-28T00:00:00Z", "2028-03-01T00:00:00Z")
         );

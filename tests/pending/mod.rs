@@ -12,7 +12,7 @@
 use std::{collections::BTreeMap, fs, panic, path::PathBuf};
 
 /// The suites the list may name, one per vector runner.
-const SUITES: [&str; 7] = [
+const SUITES: [&str; 8] = [
     "objects",
     "summaries",
     "payloads",
@@ -20,6 +20,7 @@ const SUITES: [&str; 7] = [
     "queries",
     "chunks",
     "refresh",
+    "extraction",
 ];
 
 /// What one case's checks found: what failed, or nothing.
