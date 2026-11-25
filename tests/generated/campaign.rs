@@ -380,12 +380,11 @@ impl Job {
                 .map(|(step, text)| (step, (None, text)))
                 .collect::<Vec<_>>(),
         };
-        let label = |step: usize| history.steps.get(step).map(|step| step.label.as_str());
         found
             .into_iter()
             .map(|(step, (_, text))| Found {
                 step: Some(step),
-                known: known(self.suite, self.history, label(step)),
+                known: None,
                 text,
             })
             .collect()
@@ -440,26 +439,6 @@ impl Job {
             key.push_str(&format!(":{step}"));
         }
         key
-    }
-}
-
-/// Awaiting the owner's ruling, question Q1 of io-pimdir
-/// cairn/log/2026-11-25-the-quirks-findings-close.md: a DAV listing
-/// carrying another body at the revision the base holds, an ETag a server
-/// edit did not move. SYNC §5 decides a pull by the revision alone; the
-/// model keeps the old body and summary, io-pimdir the old body under the
-/// carried body's summary and sort key.
-const ETAG_KEPT_OVER_A_SERVER_EDIT: &str =
-    "Q1: a server edit keeping its ETag, owner ruling pending";
-
-/// The finding awaiting a ruling that a replayed difference stands under,
-/// by its suite, its history and the label of its step.
-fn known(suite: &str, history: Option<&str>, label: Option<&str>) -> Option<&'static str> {
-    match (suite, history, label) {
-        ("replay", Some("revisions"), Some("two server edits, one keeping its etag")) => {
-            Some(ETAG_KEPT_OVER_A_SERVER_EDIT)
-        }
-        _ => None,
     }
 }
 

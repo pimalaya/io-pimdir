@@ -16,7 +16,8 @@
 //! pending create; other unmatched pending state is dropped and counted.
 //!
 //! Pending creates are local staging, not spine, and stay untouched. A
-//! member whose listed revision differs from the one its base held
+//! member whose listed revision differs from the one its base held, or
+//! which carries at that revision another body than its base held,
 //! changed on the remote while the handles did: it is carried as the
 //! pull a sync would make, or as a conflict when it also holds a local
 //! edit, never with a base claiming a revision it never reconciled.
@@ -502,8 +503,9 @@ impl PimdirRekey {
     /// Carries an old placement onto the new handle.
     ///
     /// The cache survives and the flag delta re-derives against the new
-    /// base. A revision the old base does not hold is a remote edit
-    /// (SYNC §8): a placement holding a local edit is carried conflicted
+    /// base. A revision the old base does not hold, or at its own one a
+    /// carried body differing from the one it holds, is a remote edit
+    /// (SYNC §5, §8): a placement holding a local edit is carried conflicted
     /// at it with its base untouched, a tombstone is revived as a sync
     /// would, and anything else is carried as the pull a sync would make,
     /// body dropped and base at the fetched revision. A local edit of a
@@ -533,7 +535,8 @@ impl PimdirRekey {
             .clone()
             .or_else(|| resolved.and_then(|r| r.revision.clone()));
         let base_revision = old_base.and_then(|b| b.revision.clone());
-        let remote_edited = observed.is_some() && observed != base_revision;
+        let carried = item.meta.body.as_ref().map(|body| body.hash());
+        let remote_edited = old.moved_by(observed.as_deref(), carried);
         let local_edit = old.staged_edit().is_some();
 
         let mutable = observed.is_some() || base_revision.is_some();

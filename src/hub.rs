@@ -187,6 +187,10 @@ impl PimdirHubItem {
     /// were made over, not an edit (SYNC §5, §6): the item and its
     /// conflict stand, only the binding's base taking the body.
     ///
+    /// A pull dropping a local edit, which the verdict keeps, moves the
+    /// binding's base: its revision, or at that revision its body, a server
+    /// edit under an unmoved revision (SYNC §5, §9).
+    ///
     /// A source binding none of the item changed, a member joining it (SYNC
     /// §9). An item conflict waiting for a body nobody read clears when the
     /// body read is the item's own: no divergence (SYNC §6).
@@ -323,7 +327,14 @@ impl PimdirHubItem {
             // edit or a resolution moves no base revision.
             let pulled =
                 placement.base.as_ref().map(|b| &b.revision) != prev_base.map(|b| &b.revision);
-            if pulled && !resolving && shared != prev {
+            let rewritten = matches!(
+                (
+                    placement.base.as_ref().and_then(|b| b.object.as_ref()),
+                    prev.as_ref(),
+                ),
+                (Some(base), Some(prev)) if base != prev
+            );
+            if (pulled || rewritten) && !resolving && shared != prev {
                 verdict.lost = shared.map(|object| PimdirHubLoser {
                     object,
                     side: PimdirHubLoserSide::Shared,

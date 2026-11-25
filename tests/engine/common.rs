@@ -9,6 +9,7 @@
 //! checkpoint with explicit vanished tracking.
 
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     fmt,
@@ -17,7 +18,7 @@ use std::{
 
 use io_pimdir::{
     change::{PimdirChange, PimdirChangeKind},
-    client::{PimdirSourceStore, PimdirStore, reader::PimdirItem},
+    client::{PimdirSourceStore, PimdirStore, blobs::PimdirBlobs, reader::PimdirItem},
     collection::{PimdirCheckpoint, PimdirCollectionId},
     hub::PimdirHub,
     load::{PimdirLoadSelection, PimdirLoaded},
@@ -49,7 +50,7 @@ pub struct Client<R = MemRemote> {
     dir: Rc<TempDir>,
 }
 
-impl<R: PimdirRemote> Client<R>
+impl<R: PimdirRemote + 'static> Client<R>
 where
     R::Error: fmt::Debug + fmt::Display,
 {
@@ -70,7 +71,10 @@ where
         Self::over(Rc::clone(&self.dir), remote, source)
     }
 
-    fn over(dir: Rc<TempDir>, remote: R, source: &str) -> Self {
+    fn over(dir: Rc<TempDir>, mut remote: R, source: &str) -> Self {
+        if let Some(remote) = (&mut remote as &mut dyn Any).downcast_mut::<MemRemote>() {
+            remote.blobs = Some(PimdirBlobs::open(dir.path()));
+        }
         let store = PimdirStore::open(dir.path())
             .expect("the store opens")
             .for_source(source)
@@ -259,6 +263,9 @@ pub struct ServerItem {
     pub link_id: PimdirLinkId,
     pub flags: PimdirFlags,
     pub body: Vec<u8>,
+    /// Whether `body` is the name of an object a push wrote, whose bytes
+    /// the pushing store holds.
+    pub pushed: bool,
     /// The change counter value of the item's last change, feeding deltas.
     pub seq: usize,
     /// The content revision, reported only when the remote is `mutable`.
@@ -299,6 +306,10 @@ pub struct MemRemote {
     /// Whether a relocation states the handle it gave its member in the
     /// target, as an IMAP `UID MOVE` answering `COPYUID` does (SYNC §4).
     pub states_moved: bool,
+    /// The blobs of the store this remote serves, which a body a push
+    /// wrote is read back from, so a listing or a fetch serves the bytes
+    /// pushed rather than another body under the revision it answered.
+    pub blobs: Option<PimdirBlobs>,
     /// The global change counter; a delta serves everything past it.
     seq: usize,
     /// Handles removed, stamped with the counter value of their removal.
@@ -327,6 +338,7 @@ impl MemRemote {
             .push((seq, supersedes.handle.clone()));
         if let Some(object) = object {
             item.body = object.as_str().as_bytes().to_vec();
+            item.pushed = true;
         }
         item.seq = seq;
         item.rev += 1;
@@ -347,6 +359,27 @@ impl MemRemote {
         self.mutable.then(|| rev.to_string())
     }
 
+    /// The body the server serves for `item`: the bytes a push wrote, read
+    /// back from the store's blobs, else the body it holds.
+    fn served(&self, item: &ServerItem) -> PimdirFetchedBody {
+        let object = PimdirHash::from(String::from_utf8_lossy(&item.body).into_owned());
+        let bytes = item
+            .pushed
+            .then_some(self.blobs.as_ref())
+            .flatten()
+            .and_then(|blobs| blobs.get(&object).ok().flatten());
+        match bytes {
+            Some(bytes) => PimdirFetchedBody::Inline {
+                hash: object,
+                bytes,
+            },
+            None => PimdirFetchedBody::Inline {
+                hash: hash(&item.body),
+                bytes: item.body.clone(),
+            },
+        }
+    }
+
     /// A member as a listing carries it, named by its meta (SYNC §4):
     /// with its body when the remote is mutable, as a DAV listing fetches
     /// each page's bodies, its meta being the body.
@@ -359,10 +392,7 @@ impl MemRemote {
                 link_id: item.link_id.clone(),
                 summary: Some(summary_of(&item.link_id)),
                 sort_key: Default::default(),
-                body: self.mutable.then(|| PimdirFetchedBody::Inline {
-                    hash: hash(&item.body),
-                    bytes: item.body.clone(),
-                }),
+                body: self.mutable.then(|| self.served(item)),
                 server_object_id: None,
             },
         }
@@ -389,6 +419,7 @@ impl MemRemote {
                 link_id: PimdirLinkId::from(link),
                 flags: PimdirFlags::from_iter(flags.iter().copied()),
                 body: body.to_vec(),
+                pushed: false,
                 seq,
                 rev,
             },
@@ -415,6 +446,7 @@ impl MemRemote {
             .and_then(|c| c.get_mut(&PimdirHandle::from(handle)))
             .expect("server item exists");
         item.body = body.to_vec();
+        item.pushed = false;
         item.seq = seq;
         item.rev += 1;
     }
@@ -606,10 +638,7 @@ impl PimdirRemote for MemRemote {
                 PimdirTier::Full if self.bodiless_full => None,
                 PimdirTier::Full => {
                     self.full_fetches.push(handle.clone());
-                    Some(PimdirFetchedBody::Inline {
-                        hash: hash(&item.body),
-                        bytes: item.body.clone(),
-                    })
+                    Some(self.served(item))
                 }
             };
 
@@ -732,6 +761,7 @@ impl PimdirRemote for MemRemote {
                         rejected(handle)
                     } else {
                         item.body = object.as_str().as_bytes().to_vec();
+                        item.pushed = true;
                         item.rev += 1;
                         let rev = item.rev;
                         let seq = self.bump();
@@ -828,6 +858,7 @@ impl PimdirRemote for MemRemote {
                                     link_id: link,
                                     flags: flags.clone(),
                                     body: object.as_str().as_bytes().to_vec(),
+                                    pushed: true,
                                     seq,
                                     rev: 0,
                                 },

@@ -667,7 +667,8 @@ impl Model {
     /// revision first, then the one whose base holds the carried body, then
     /// in old handle order), its flags merged with the listed ones over the
     /// old base, the listed ones the base, a member of a mutable kind listed
-    /// at another revision pulled with its summary and sort key, the body the
+    /// at another revision, or carrying at the old base's own another body
+    /// than it holds, pulled with its summary and sort key, the body the
     /// page carries stored at `Full` (else `Meta`), or
     /// recorded in conflict over a local edit, and every binding no member
     /// resolves to dropped `Deleted`, the collection's generation bumped
@@ -771,12 +772,13 @@ impl Model {
                     continue;
                 };
                 let filed = &remote.members[&member.handle].filed;
-                let moved = mutable
-                    && member.revision
-                        != self.items[*index]
-                            .bound(&source)
-                            .expect("a bound item")
-                            .base_revision;
+                let binding = self.items[*index].bound(&source).expect("a bound item");
+                let carried = member.carries.then(|| ObjectName::of(&member.meta));
+                let rewritten = member.revision.is_some()
+                    && binding.base_object.is_some()
+                    && carried.is_some()
+                    && carried != binding.base_object;
+                let moved = mutable && (member.revision != binding.base_revision || rewritten);
                 let listed = (moved && member.carries).then(|| {
                     let name = ObjectName::of(&member.meta);
                     self.objects.insert(name.clone(), member.meta.clone());
@@ -1503,10 +1505,11 @@ impl Model {
     /// listing's sort key, and its summary over a row holding no body, one
     /// holding the body keeping the body's (SYNC §6, STORAGE Annex A.1);
     /// then for a mutable kind the content axis under the source's policy
-    /// (SYNC §5): a divergence
-    /// recorded, pulled keeping the local edit, or kept and pushed over; a
-    /// body nobody has read recorded whatever the policy. A body another
-    /// source folded, the item's differing from the binding's
+    /// (SYNC §5), a remote change being a revision the base does not hold
+    /// or, at its own, a carried body differing from the one it holds: a
+    /// divergence recorded, pulled keeping the local edit, or kept and
+    /// pushed over; a body nobody has read recorded whatever the policy. A
+    /// body another source folded, the item's differing from the binding's
     /// `shared_object`, is propagation owed: pulled whatever the policy,
     /// `KeepLocal` aside, the divergence the collection's.
     fn refresh(
@@ -1524,6 +1527,7 @@ impl Model {
         let merged = merge(flags.as_ref(), binding.base_flags.as_ref(), &member.flags);
         binding.base_flags = Some(member.flags.clone());
         let base_revision = binding.base_revision.clone();
+        let base_object = binding.base_object.clone();
         if flags.as_ref() != Some(&merged) {
             item.flags = Some(merged);
             events.push(Event::FlagsChanged(member.handle.clone()));
@@ -1538,10 +1542,11 @@ impl Model {
             }
         }
 
-        if member.revision.is_none() || member.revision == base_revision {
+        let carried = member.carries.then(|| ObjectName::of(&member.meta));
+        let rewritten = base_object.is_some() && carried.is_some() && carried != base_object;
+        if member.revision.is_none() || (member.revision == base_revision && !rewritten) {
             return false;
         }
-        let carried = member.carries.then(|| ObjectName::of(&member.meta));
         if let Some(name) = &carried {
             self.objects.insert(name.clone(), member.meta.clone());
         }

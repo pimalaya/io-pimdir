@@ -446,6 +446,24 @@ impl PimdirPlacement {
         self.base.is_some() && self.handle.is_provisional()
     }
 
+    /// Whether a member at `revision` carrying `carried` changed on the
+    /// remote past the base (SYNC §5): a revision the base does not hold,
+    /// or at the base's own one a carried body differing from the one it
+    /// holds. A member stating no revision changed nothing; one carrying no
+    /// body, or a base holding none, leaves the revision alone deciding.
+    pub fn moved_by(&self, revision: Option<&str>, carried: Option<&PimdirHash>) -> bool {
+        let Some(revision) = revision else {
+            return false;
+        };
+        let Some(base) = &self.base else {
+            return true;
+        };
+        if base.revision.as_deref() != Some(revision) {
+            return true;
+        }
+        matches!((&base.object, carried), (Some(held), Some(carried)) if held != carried)
+    }
+
     /// Whether a held body faces a base naming no body (SYNC §5).
     pub fn awaits_base(&self) -> bool {
         self.object.is_some()

@@ -138,7 +138,7 @@ proptest! {
 }
 
 /// Names every live member of `collection`, as a consumer listing it does.
-fn hydrate<R: PimdirRemote>(client: &mut Client<R>, collection: &str)
+fn hydrate<R: PimdirRemote + 'static>(client: &mut Client<R>, collection: &str)
 where
     R::Error: std::fmt::Debug + std::fmt::Display,
 {
@@ -162,7 +162,7 @@ where
 }
 
 /// The named, live rows of `collection`: what a consumer can act on.
-fn named<R: PimdirRemote>(client: &Client<R>, collection: &str) -> BTreeSet<PimdirHandle>
+fn named<R: PimdirRemote + 'static>(client: &Client<R>, collection: &str) -> BTreeSet<PimdirHandle>
 where
     R::Error: std::fmt::Debug + std::fmt::Display,
 {

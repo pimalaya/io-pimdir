@@ -354,8 +354,7 @@ impl PimdirUpgrade {
                     // the revision moved: the fetched body lands as the
                     // diverging one and the placement conflicts.
                     let edited = patched.staged_edit().is_some();
-                    let base_revision = patched.base.as_ref().and_then(|b| b.revision.clone());
-                    if edited && item.revision.is_some() && item.revision != base_revision {
+                    if edited && patched.moved_by(item.revision.as_deref(), Some(&hash)) {
                         patched.status = PimdirStatus::Conflict;
                         patched.conflict_revision = item.revision.clone();
                         patched.conflict_object = Some(hash);
@@ -2102,5 +2101,52 @@ mod tests {
             Some(String::from("etag-1")),
             "nor does the fetch rebase what it never merged"
         );
+    }
+
+    /// A body fetched at the base's own revision, differing from the one
+    /// the base holds, under a local edit: read by the revision alone it
+    /// would land as the base, the edit then pushed over it unread.
+    #[test]
+    fn a_body_fetched_at_the_base_revision_over_an_edit_conflicts() {
+        let mut placement = based("card-1.vcf", "uid:card-1", Some("etag-1"));
+        placement.object = Some(PimdirHash::from("h-local"));
+        placement.status = PimdirStatus::Dirty;
+        if let Some(base) = &mut placement.base {
+            base.object = Some(PimdirHash::from("h-base"));
+        }
+        let (mut up, state) = upgrade_full(placement);
+        if let PimdirCoroutineState::Yielded(PimdirYield::WantsLookupObject(_)) = state {
+            let _ = up.resume(Some(PimdirArg::LookupObject(BTreeMap::new())));
+        }
+
+        let items = vec![PimdirFetchedItem {
+            handle: PimdirHandle::from("card-1.vcf"),
+            link_id: PimdirLinkId::from("uid:card-1"),
+            summary: Some(crate::summary::stub("remote")),
+            sort_key: Default::default(),
+            body: Some(PimdirFetchedBody::Inline {
+                hash: PimdirHash::from("h-remote"),
+                bytes: b"remote".to_vec(),
+            }),
+            revision: Some(String::from("etag-1")),
+        }];
+        let ops = match up.resume(Some(PimdirArg::Fetch(items))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsWrite(ops)) => ops,
+            state => panic!("expected WantsWrite, got {state:?}"),
+        };
+        let patched = ops
+            .iter()
+            .find_map(|op| match op {
+                PimdirWriteOp::UpsertPlacement(p) => Some(p),
+                _ => None,
+            })
+            .expect("an upserted placement");
+
+        assert_eq!(patched.status, PimdirStatus::Conflict);
+        assert_eq!(patched.conflict_revision.as_deref(), Some("etag-1"));
+        assert_eq!(patched.conflict_object, Some(PimdirHash::from("h-remote")));
+        assert_eq!(patched.object, Some(PimdirHash::from("h-local")));
+        let base = patched.base.as_ref().expect("a base");
+        assert_eq!(base.object, Some(PimdirHash::from("h-base")));
     }
 }

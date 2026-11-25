@@ -1230,8 +1230,8 @@ impl PimdirSync {
                 continue;
             };
 
-            let base_revision = placement.base.as_ref().and_then(|b| b.revision.as_ref());
-            if item.revision.is_some() && item.revision.as_ref() != base_revision {
+            let carried = meta.body.as_ref().map(|body| body.hash());
+            if placement.moved_by(item.revision.as_deref(), carried) {
                 continue;
             }
             if mutable && placement.staged_edit().is_some() {
@@ -1820,7 +1820,7 @@ impl PimdirSync {
                 let item = remote_item.as_ref().expect("remote present");
 
                 let base_revision = local.base.as_ref().and_then(|b| b.revision.clone());
-                if item.revision.is_some() && item.revision != base_revision {
+                if local.moved_by(item.revision.as_deref(), self.carried_hash(&item.handle)) {
                     // NOTE: a tombstone holding a local edit too is the
                     // both-changed case and follows the policy (SYNC §5);
                     // one holding none is revived and pulled.
@@ -2041,7 +2041,9 @@ impl PimdirSync {
     ///
     /// Both axes read positive signals only: a dirty placement whose body
     /// its base does not hold, a reported revision differing from the
-    /// base. Immutable content produces neither and falls through.
+    /// base or, at the base's own, a carried body differing from the one it
+    /// holds (SYNC §5). Immutable content produces neither and falls
+    /// through.
     fn reconcile_content(&mut self, local: &PimdirPlacement, item: &Remote) -> ContentOutcome {
         let Some(base) = &local.base else {
             // NOTE: a base-less body the remote also holds is a
@@ -2059,8 +2061,7 @@ impl PimdirSync {
             // still recorded on the binding, whatever the policy, since a
             // delta never lists the member again (SYNC §5).
             if local.conflict_revision.is_none()
-                && item.revision.is_some()
-                && item.revision != base.revision
+                && local.moved_by(item.revision.as_deref(), self.carried_hash(&item.handle))
             {
                 return self.mark_conflict(local, item);
             }
@@ -2083,7 +2084,8 @@ impl PimdirSync {
         let local_changed = local.status == PimdirStatus::Dirty
             && local.object.is_some()
             && local.object != base.object;
-        let remote_changed = item.revision.is_some() && item.revision != base.revision;
+        let remote_changed =
+            local.moved_by(item.revision.as_deref(), self.carried_hash(&item.handle));
 
         match (local_changed, remote_changed) {
             (false, false) => ContentOutcome::Untouched,
@@ -2121,6 +2123,14 @@ impl PimdirSync {
             }
             (true, true) => self.resolve_conflict(local, item),
         }
+    }
+
+    /// The hash of the body the member listed under `handle` carried.
+    fn carried_hash(&self, handle: &PimdirHandle) -> Option<&PimdirHash> {
+        self.metas
+            .get(handle)
+            .and_then(|meta| meta.body.as_ref())
+            .map(|body| body.hash())
     }
 
     /// Whether the member listed under `handle` carried `body`.

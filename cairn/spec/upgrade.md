@@ -142,7 +142,7 @@ Any other fetched body SHALL be settled by the source's policy (`PimdirUpgradeOp
 - THEN the fetched body lands as the conflict object and the local body is untouched
 
 ### Requirement: A fetch moves the base
-A `Full` fetch over a placement holding no staged edit SHALL set the base to the fetched body and revision (pimdir SYNC §6, vectors/sync/30): a body the source just handed over is what the two agree on, and a base left behind it read every fetched body as an edit to push. Over a staged edit, a body its base does not hold, a fetch reporting the base's own revision keeps the local body, a base naming no body taking the fetched one (vectors/sync/133); one reporting a revision the base never held is the both-changed case and SHALL mark a `Conflict` at the fetched revision with the fetched body as `conflict_object`, the local body kept.
+A `Full` fetch over a placement holding no staged edit SHALL set the base to the fetched body and revision (pimdir SYNC §6, vectors/sync/30): a body the source just handed over is what the two agree on, and a base left behind it read every fetched body as an edit to push. Over a staged edit, a body its base does not hold, a fetch reporting the base's own revision keeps the local body, a base naming no body taking the fetched one (vectors/sync/133); one reporting a revision the base never held, or the base's own with a body differing from the one the base holds (pimdir SYNC §5, §6; `upgrade::tests::a_body_fetched_at_the_base_revision_over_an_edit_conflicts`), is the both-changed case and SHALL mark a `Conflict` at the fetched revision with the fetched body as `conflict_object`, the local body kept.
 
 #### Scenario: A hydration is not an edit
 - GIVEN a clean placement at `r1` with no body
