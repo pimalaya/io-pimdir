@@ -7,7 +7,8 @@
 //! against the oracle stated over the drained model.
 
 use io_pimdir::client::{PimdirStore, producer::PimdirActionStatus, reader::PimdirReader};
-use pimdir_generator::queue::RowState;
+use pimdir_generator::{model::Model, oracle::Expectation, queue::RowState, spec::Spec};
+use rusqlite::types::Value;
 
 use crate::{
     common::{Generated, SEEDS},
@@ -30,7 +31,22 @@ fn a_drained_generated_queue_leaves_what_the_model_drains_to() {
 /// Every difference between io-pimdir's drain of the store at `seed` and
 /// the model's, each with the known finding it stands under.
 fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
-    let generated = Generated::structure(seed);
+    differences_of(Generated::structure(seed).model)
+}
+
+/// Every difference between io-pimdir's drain of the store of `model` and
+/// the model's.
+pub fn differences_of(model: Model) -> Vec<(Option<&'static str>, String)> {
+    differences_with(model, |_, _, _, _, _| None)
+}
+
+/// The same, `differ` naming the finding a read the drained model and the
+/// store disagree on stands under, as [`reader::compare`] takes it.
+pub fn differences_with(
+    model: Model,
+    differ: impl Fn(&Model, &Expectation, &[&str], &[Vec<Value>], &[Vec<Value>]) -> Option<&'static str>,
+) -> Vec<(Option<&'static str>, String)> {
+    let generated = Generated::write(Spec::load_default().unwrap(), model);
     let mut drained = generated.model.clone();
     drained.drain_all();
 
@@ -70,7 +86,7 @@ fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
         &generated.spec,
         &drained,
         &generated.root(),
-        |_, _, _, _| None,
+        |expectation, columns, got, want| differ(&drained, expectation, columns, got, want),
     );
     differences.extend(rows);
     differences

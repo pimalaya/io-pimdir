@@ -30,10 +30,18 @@ pub mod oracle;
 pub mod profile;
 pub mod query;
 pub mod queue;
+pub mod quirks;
 pub mod remote;
 pub mod rng;
+pub mod shrink;
 pub mod spec;
 pub mod store;
 pub mod time;
 pub mod upkeep;
+pub mod vector;
 pub mod writer;
+
+/// The generator's revision, raised whenever a `(seed, profile)` gives
+/// another history, so a campaign recorded under one replays under it
+/// alone (README.md, "Determinism and the revision").
+pub const REVISION: u32 = 1;

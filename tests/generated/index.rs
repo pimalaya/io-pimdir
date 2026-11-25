@@ -66,7 +66,12 @@ fn an_index_refreshed_after_each_owner_write_is_the_one_a_rebuild_writes() {
 fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
     let spec = Spec::load_default().unwrap();
     let model = Profile::Structure.generate(&spec, seed).unwrap();
-    let generated = Generated::write(spec, tamed(model));
+    differences_of(tamed(model))
+}
+
+/// The same over the store of `model`, a model [`tamed`] holds.
+pub fn differences_of(model: Model) -> Vec<(Option<&'static str>, String)> {
+    let generated = Generated::write(Spec::load_default().unwrap(), model);
     let root = generated.root();
     let mut drained = generated.model.clone();
     drained.drain_all();

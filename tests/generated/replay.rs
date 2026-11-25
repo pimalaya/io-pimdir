@@ -44,7 +44,9 @@ use pimdir_generator::{
     model::{Collection, Model, Scope, SourceState},
     queue::RowState,
     remote::Page,
+    shrink::Case,
     spec::Spec,
+    vector::Asked,
 };
 use rusqlite::{Connection, types::Value};
 
@@ -82,7 +84,7 @@ fn differences(seed: u64) -> Vec<String> {
         .flat_map(|(name, history)| {
             replay(&history)
                 .into_iter()
-                .map(move |text| format!("{name}: {text}"))
+                .map(move |(_, text)| format!("{name}: {text}"))
         })
         .collect()
 }
@@ -106,10 +108,11 @@ pub fn histories(seed: u64) -> [(&'static str, History); 12] {
 }
 
 /// Replays `history` from the store of its first step, naming each
-/// disagreement with the step it is found after. A step disagreeing leaves
-/// the store rewritten from its model, so the next step starts where the
-/// model's does and a finding is named once, at the step it is made.
-fn replay(history: &History) -> Vec<String> {
+/// disagreement with the index of the step it is found after and that
+/// step. A step disagreeing leaves the store rewritten from its model, so
+/// the next step starts where the model's does and a finding is named
+/// once, at the step it is made.
+pub fn replay(history: &History) -> Vec<(usize, String)> {
     let history = declared(history);
     let spec = Spec::load_default().unwrap();
     let first = &history.steps[0];
@@ -119,46 +122,95 @@ fn replay(history: &History) -> Vec<String> {
     let mut differences = Vec::new();
     for (index, pair) in history.steps.windows(2).enumerate() {
         let (before, step) = (&pair[0], &pair[1]);
-        let root = generated.root();
         let at = format!("step {} ({})", index + 1, step.label);
-        let mut found = produce(&root, before, step);
-
-        let rows = unstamped(&root);
-        if let Some(run) = &step.run {
-            found.extend(replay_run(&root, before, step, run, &mut revisions));
-        }
-        let (_, read) = reader::compare(&spec, &step.model, &root, |_, _, _, _| None);
-        found.extend(read.into_iter().map(|(_, text)| text));
-        for hash in unheld(&root) {
-            found.push(format!("a row names {hash}, a body the store lacks"));
-        }
-        if let Some(run) = &step.run
-            && run.verb == "sync"
-            && run.pushes.is_empty()
-            && run.events.is_empty()
-            && run
-                .pages
-                .iter()
-                .all(|page| page.items.is_empty() && page.vanished.is_empty())
-            && format!("{:?}", before.model.collections) == format!("{:?}", step.model.collections)
-            && unstamped(&root) != rows
-        {
-            found.push(format!(
-                "a run with nothing to do moved a row: {}",
-                crash::apart(&unstamped(&root), &rows)
-            ));
-        }
-        if let Some(order) = out_of_order(&root) {
-            found.push(order);
-        }
-
+        let found = replay_step(&spec, &generated.root(), before, step, &mut revisions);
         if found.is_empty() {
             continue;
         }
-        differences.extend(found.into_iter().map(|text| format!("{at}: {text}")));
+        differences.extend(
+            found
+                .into_iter()
+                .map(|text| (index + 1, format!("{at}: {text}"))),
+        );
         generated = Generated::write(Spec::load_default().unwrap(), step.model.clone());
     }
     differences
+}
+
+/// Replays the one run of `case` from a store written from the model
+/// before it, as [`replay`] replays that step: what a shrunk case answers.
+pub fn replay_case(case: &Case) -> Vec<String> {
+    let history = declared(&case.history());
+    let spec = Spec::load_default().unwrap();
+    let (before, step) = (&history.steps[0], &history.steps[1]);
+    let generated = Generated::write(Spec::load_default().unwrap(), before.model.clone());
+    let mut revisions = case.revisions.clone();
+    replay_step(&spec, &generated.root(), before, step, &mut revisions)
+}
+
+/// Replays `step` on the store at `root`, which holds `before`'s model,
+/// answering every difference it leaves.
+fn replay_step(
+    spec: &Spec,
+    root: &Path,
+    before: &Step,
+    step: &Step,
+    revisions: &mut BTreeMap<(String, String), String>,
+) -> Vec<String> {
+    let mut found = produce(root, before, step);
+
+    let rows = unstamped(root);
+    if let Some(run) = &step.run {
+        found.extend(replay_run(root, before, step, run, revisions));
+    }
+    let (_, read) = reader::compare(spec, &step.model, root, |_, _, _, _| None);
+    found.extend(read.into_iter().map(|(_, text)| text));
+    for hash in unheld(root) {
+        found.push(format!("a row names {hash}, a body the store lacks"));
+    }
+    if let Some(run) = &step.run
+        && run.verb == "sync"
+        && run.pushes.is_empty()
+        && run.events.is_empty()
+        && run
+            .pages
+            .iter()
+            .all(|page| page.items.is_empty() && page.vanished.is_empty())
+        && format!("{:?}", before.model.collections) == format!("{:?}", step.model.collections)
+        && unstamped(root) != rows
+    {
+        found.push(format!(
+            "a run with nothing to do moved a row: {}",
+            crash::apart(&unstamped(root), &rows)
+        ));
+    }
+    if let Some(order) = out_of_order(root) {
+        found.push(order);
+    }
+    found
+}
+
+/// What `run` of `step` was asked, as [`options`] and the connector read
+/// it, in the terms a sync vector states it.
+pub fn asked(before: &Step, step: &Step, run: &Run) -> Asked {
+    let options = options(before, step, run);
+    let conflict = match options.conflict {
+        PimdirConflictPolicy::PreferRemote => "prefer-remote",
+        PimdirConflictPolicy::PreferLocal => "prefer-local",
+        PimdirConflictPolicy::KeepLocal => "keep-local",
+        _ => "manual",
+    };
+    Asked {
+        conflict: String::from(conflict),
+        since: options.scope.since,
+        until: options.scope.until,
+        accept_absences: match run.verb {
+            "rekey" => run.options.accept_absences,
+            _ => options.accept_absences,
+        },
+        scope_bound: !unbound(before, step, run),
+        cursor_rejected: restarted(before, step, run),
+    }
 }
 
 /// The history with every collection it ever declares declared from its

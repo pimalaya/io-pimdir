@@ -90,7 +90,12 @@ fn seeded(every: bool) -> Vec<String> {
 fn differences(seed: u64, every: bool) -> Vec<String> {
     let spec = Spec::load_default().unwrap();
     let model = Profile::Structure.generate(&spec, seed).unwrap();
-    let generated = Generated::write(spec, tamed(model));
+    differences_of(tamed(model), every)
+}
+
+/// The same over the store of `model`, a model [`tamed`] holds.
+pub fn differences_of(model: Model, every: bool) -> Vec<String> {
+    let generated = Generated::write(Spec::load_default().unwrap(), model);
     let root = generated.root();
     let mut drained = generated.model.clone();
     drained.drain_all();

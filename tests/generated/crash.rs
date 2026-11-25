@@ -24,7 +24,14 @@ use io_pimdir::client::{
     PimdirStore,
     search::{PimdirIndex, PimdirIndexRefreshOptions},
 };
-use pimdir_generator::{engine::Run, history::Step, oracle::INSTANT, profile::Profile, spec::Spec};
+use pimdir_generator::{
+    engine::Run,
+    history::{History, Step},
+    model::Model,
+    oracle::INSTANT,
+    profile::Profile,
+    spec::Spec,
+};
 use rusqlite::{Connection, types::Value};
 
 use crate::{
@@ -40,58 +47,68 @@ const CHECKPOINTING: [&str; 1] = ["erase"];
 #[test]
 fn an_owner_write_cut_after_any_commit_finishes_as_the_uncut_run() {
     for seed in SEEDS {
-        let generated = Generated::structure(seed);
-        let root = generated.root();
-        let mut drained = generated.model.clone();
-        drained.drain_all();
+        let spec = Spec::load_default().unwrap();
+        let model = Profile::Structure.generate(&spec, seed).unwrap();
+        let differences = owner_cuts(model);
+        assert!(differences.is_empty(), "seed {seed}: {differences:#?}");
+    }
+}
 
-        let mut differences = Vec::new();
-        for write in index::writes(&drained) {
-            let label = write.label();
-            let before = tempfile::tempdir().unwrap();
-            let held = tempfile::tempdir().unwrap();
-            index::copy_store(&root, &before.path().join("store"), true);
+/// Every owner write of index.rs's run over the store of `model`, cut
+/// after each commit and run again, that leaves another store than the
+/// uncut write.
+pub fn owner_cuts(model: Model) -> Vec<String> {
+    let generated = Generated::write(Spec::load_default().unwrap(), model);
+    let root = generated.root();
+    let mut drained = generated.model.clone();
+    drained.drain_all();
 
-            let mut owner = PimdirStore::open(&root)
+    let mut differences = Vec::new();
+    for write in index::writes(&drained) {
+        let label = write.label();
+        let before = tempfile::tempdir().unwrap();
+        let held = tempfile::tempdir().unwrap();
+        index::copy_store(&root, &before.path().join("store"), true);
+
+        let mut owner = PimdirStore::open(&root)
+            .unwrap()
+            .for_source("local")
+            .unwrap();
+        write.apply(&mut owner).unwrap();
+        let log = log_of(
+            &root,
+            "pimdir.db",
+            &before.path().join("store"),
+            held.path(),
+        );
+        drop(owner);
+        let uncut = store_rows(&root);
+
+        let checkpointing = CHECKPOINTING.iter().any(|name| label.starts_with(name));
+        assert_eq!(
+            log.is_none(),
+            checkpointing,
+            "{label}: whether it checkpoints the log"
+        );
+        let ends = log.map_or(vec![0], |log| log.ends);
+        for end in ends {
+            let cut = cut(before.path(), held.path(), "pimdir.db-wal", end);
+            let mut owner = PimdirStore::open(cut.path().join("store"))
                 .unwrap()
                 .for_source("local")
                 .unwrap();
-            write.apply(&mut owner).unwrap();
-            let log = log_of(
-                &root,
-                "pimdir.db",
-                &before.path().join("store"),
-                held.path(),
-            );
+            let again = write.apply(&mut owner);
             drop(owner);
-            let uncut = store_rows(&root);
-
-            let checkpointing = CHECKPOINTING.iter().any(|name| label.starts_with(name));
-            assert_eq!(
-                log.is_none(),
-                checkpointing,
-                "{label}: whether it checkpoints the log"
-            );
-            let ends = log.map_or(vec![0], |log| log.ends);
-            for end in ends {
-                let cut = cut(before.path(), held.path(), "pimdir.db-wal", end);
-                let mut owner = PimdirStore::open(cut.path().join("store"))
-                    .unwrap()
-                    .for_source("local")
-                    .unwrap();
-                let again = write.apply(&mut owner);
-                drop(owner);
-                let rows = store_rows(&cut.path().join("store"));
-                if rows != uncut {
-                    differences.push(format!(
-                        "seed {seed} {label} cut at byte {end} of the log, run again ({again:?}): {}",
-                        apart(&rows, &uncut)
-                    ));
-                }
+            let rows = store_rows(&cut.path().join("store"));
+            if rows != uncut {
+                differences.push(format!(
+                    "{label} cut at byte {end} of the log, run again ({again:?}): {}",
+                    apart(&rows, &uncut)
+                ));
             }
         }
-        assert!(differences.is_empty(), "{differences:#?}");
     }
+    differences
 }
 
 #[test]
@@ -99,59 +116,67 @@ fn an_index_refresh_cut_after_any_batch_finishes_as_the_uncut_refresh() {
     for seed in SEEDS {
         let spec = Spec::load_default().unwrap();
         let model = Profile::Structure.generate(&spec, seed).unwrap();
-        let generated = Generated::write(spec, index::tamed(model));
-        let root = generated.root();
-        let mut drained = generated.model.clone();
-        drained.drain_all();
+        let differences = index_cuts(index::tamed(model));
+        assert!(differences.is_empty(), "seed {seed}: {differences:#?}");
+    }
+}
 
-        let options = PimdirIndexRefreshOptions {
-            batch: BATCH,
-            now: Some(NOW),
-            ..Default::default()
+/// Every index refresh after an owner write of index.rs's run over the
+/// store of `model`, a model [`index::tamed`] holds, cut after each batch
+/// and run again, that leaves another index than the uncut refresh.
+pub fn index_cuts(model: Model) -> Vec<String> {
+    let generated = Generated::write(Spec::load_default().unwrap(), model);
+    let root = generated.root();
+    let mut drained = generated.model.clone();
+    drained.drain_all();
+
+    let options = PimdirIndexRefreshOptions {
+        batch: BATCH,
+        now: Some(NOW),
+        ..Default::default()
+    };
+    PimdirIndex::open(&root).unwrap().refresh(&options).unwrap();
+
+    let mut differences = Vec::new();
+    for write in index::writes(&drained) {
+        let label = write.label();
+        let mut owner = PimdirStore::open(&root)
+            .unwrap()
+            .for_source("local")
+            .unwrap();
+        write.apply(&mut owner).unwrap();
+        drop(owner);
+
+        let before = tempfile::tempdir().unwrap();
+        let held = tempfile::tempdir().unwrap();
+        index::copy_store(&root, &before.path().join("store"), true);
+        let mut uncut = PimdirIndex::open(&root).unwrap();
+        uncut.refresh(&options).unwrap();
+        let log = log_of(&root, "index.db", &before.path().join("store"), held.path());
+        drop(uncut);
+        let want = index::dump(&root);
+
+        let Some(log) = log else {
+            differences.push(format!("{label}: the refresh checkpointed"));
+            continue;
         };
-        PimdirIndex::open(&root).unwrap().refresh(&options).unwrap();
-
-        let mut differences = Vec::new();
-        for write in index::writes(&drained) {
-            let label = write.label();
-            let mut owner = PimdirStore::open(&root)
-                .unwrap()
-                .for_source("local")
-                .unwrap();
-            write.apply(&mut owner).unwrap();
-            drop(owner);
-
-            let before = tempfile::tempdir().unwrap();
-            let held = tempfile::tempdir().unwrap();
-            index::copy_store(&root, &before.path().join("store"), true);
-            let mut uncut = PimdirIndex::open(&root).unwrap();
-            uncut.refresh(&options).unwrap();
-            let log = log_of(&root, "index.db", &before.path().join("store"), held.path());
-            drop(uncut);
-            let want = index::dump(&root);
-
-            let Some(log) = log else {
-                differences.push(format!("seed {seed} {label}: the refresh checkpointed"));
-                continue;
-            };
-            for end in log.ends {
-                let cut = cut(before.path(), held.path(), "index.db-wal", end);
-                let mut index = PimdirIndex::open(cut.path().join("store")).unwrap();
-                index.refresh(&options).unwrap();
-                drop(index);
-                let got = index::dump(&cut.path().join("store"));
-                for (table, rows) in &got {
-                    if want.get(table) != Some(rows) {
-                        differences.push(format!(
-                            "seed {seed} {label} cut at byte {end}, {table}: {rows:?}, uncut {:?}",
-                            want.get(table)
-                        ));
-                    }
+        for end in log.ends {
+            let cut = cut(before.path(), held.path(), "index.db-wal", end);
+            let mut index = PimdirIndex::open(cut.path().join("store")).unwrap();
+            index.refresh(&options).unwrap();
+            drop(index);
+            let got = index::dump(&cut.path().join("store"));
+            for (table, rows) in &got {
+                if want.get(table) != Some(rows) {
+                    differences.push(format!(
+                        "{label} cut at byte {end}, {table}: {rows:?}, uncut {:?}",
+                        want.get(table)
+                    ));
                 }
             }
         }
-        assert!(differences.is_empty(), "{differences:#?}");
     }
+    differences
 }
 
 #[test]
@@ -159,24 +184,36 @@ fn an_engine_run_cut_after_any_commit_finishes_as_the_uncut_run() {
     let mut differences = Vec::new();
     for seed in SEEDS {
         for (name, history) in replay::histories(seed) {
-            let history = replay::declared(&history);
-            let mut revisions = BTreeMap::new();
-            for pair in history.steps.windows(2) {
-                let (before, step) = (&pair[0], &pair[1]);
-                let Some(run) = &step.run else {
-                    continue;
-                };
-                replay::remember(run, &mut revisions);
-                let at = format!("seed {seed} {name} {}", step.label);
-                differences.extend(
-                    cut_run(before, step, run, &revisions)
-                        .into_iter()
-                        .map(|text| format!("{at}: {text}")),
-                );
-            }
+            differences.extend(
+                engine_cuts(&history)
+                    .into_iter()
+                    .map(|(_, text)| format!("seed {seed} {name} {text}")),
+            );
         }
     }
     assert!(differences.is_empty(), "{differences:#?}");
+}
+
+/// Every run of `history` cut after each of its commits and run again
+/// that leaves another store than the uncut run, each with the index of
+/// its step.
+pub fn engine_cuts(history: &History) -> Vec<(usize, String)> {
+    let history = replay::declared(history);
+    let mut revisions = BTreeMap::new();
+    let mut differences = Vec::new();
+    for (index, pair) in history.steps.windows(2).enumerate() {
+        let (before, step) = (&pair[0], &pair[1]);
+        let Some(run) = &step.run else {
+            continue;
+        };
+        replay::remember(run, &mut revisions);
+        differences.extend(
+            cut_run(before, step, run, &revisions)
+                .into_iter()
+                .map(|text| (index + 1, format!("{}: {text}", step.label))),
+        );
+    }
+    differences
 }
 
 /// Cuts one run after each of its commits, from the store of the step

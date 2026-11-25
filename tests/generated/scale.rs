@@ -81,7 +81,7 @@ fn a_bytes_store_reads_drains_and_indexes_as_its_model_states() {
 /// Every disagreement over `model` given its queue: the reads with the
 /// queue pending, the reads once io-pimdir drained it, and the index
 /// refreshed against one rebuilt.
-fn differences(model: Model) -> Vec<String> {
+pub fn differences(model: Model) -> Vec<String> {
     let spec = Spec::load_default().unwrap();
     let model = queued(model);
     let mut drained = model.clone();
@@ -132,7 +132,7 @@ fn differences(model: Model) -> Vec<String> {
 /// The `(mail, contact)` link ids STORAGE §14.2's `sender` rule records
 /// over `model`: a mail to every contact whose `email` rows hold one of
 /// the mail's `from` addresses (Annex A.6).
-fn senders(model: &Model) -> BTreeSet<(String, String)> {
+pub fn senders(model: &Model) -> BTreeSet<(String, String)> {
     let of = |kind: Kind, role: &'static str| {
         model
             .items
@@ -164,7 +164,7 @@ fn senders(model: &Model) -> BTreeSet<(String, String)> {
 /// and more, each more one the `sender` rule records (`rule`), and, from a
 /// mail, every one the rule records from it: an owner applying the rule
 /// records what it states (STORAGE §14.2).
-fn sender(
+pub fn sender(
     rule: &BTreeSet<(String, String)>,
     expectation: &Expectation,
     columns: &[&str],

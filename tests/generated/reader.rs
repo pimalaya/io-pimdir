@@ -84,7 +84,13 @@ fn every_read_of_a_generated_store_answers_what_the_oracle_states_known_included
 /// each with the known finding it stands under, beside how many points
 /// were stated.
 fn disagreements(seed: u64) -> (usize, Vec<(Option<&'static str>, String)>) {
-    let generated = Generated::structure(seed);
+    disagreements_of(Generated::structure(seed).model)
+}
+
+/// Every point of the oracle over the store of `model` io-pimdir's reader
+/// disagrees on, beside how many points were stated.
+pub fn disagreements_of(model: Model) -> (usize, Vec<(Option<&'static str>, String)>) {
+    let generated = Generated::write(Spec::load_default().unwrap(), model);
     compare(
         &generated.spec,
         &generated.model,

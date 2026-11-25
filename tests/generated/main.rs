@@ -7,6 +7,8 @@
 
 #![cfg(feature = "client")]
 
+#[cfg(all(feature = "search", feature = "indexer"))]
+mod campaign;
 mod common;
 
 #[cfg(all(feature = "search", feature = "indexer"))]
@@ -22,3 +24,5 @@ mod replay;
 mod scale;
 #[cfg(all(feature = "search", feature = "indexer"))]
 mod search;
+#[cfg(all(feature = "search", feature = "indexer"))]
+mod shrink;

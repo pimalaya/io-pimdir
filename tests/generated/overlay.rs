@@ -10,7 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use io_pimdir::client::reader::{PimdirItem, PimdirReader};
-use pimdir_generator::model::Item;
+use pimdir_generator::{
+    model::{Item, Model},
+    spec::Spec,
+};
 use rusqlite::types::Value;
 
 use crate::common::{Generated, SEEDS, item_cells, table_cells};
@@ -34,7 +37,13 @@ fn an_overlaid_read_shows_what_the_drain_would_leave() {
 /// Every difference between io-pimdir's overlay and the model's at
 /// `seed`, each with the known finding it stands under.
 fn differences(seed: u64) -> Vec<(Option<&'static str>, String)> {
-    let generated = Generated::structure(seed);
+    differences_of(Generated::structure(seed).model)
+}
+
+/// Every difference between io-pimdir's overlay and the model's over the
+/// store of `model`.
+pub fn differences_of(model: Model) -> Vec<(Option<&'static str>, String)> {
+    let generated = Generated::write(Spec::load_default().unwrap(), model);
     let model = &generated.model;
     let reader = PimdirReader::open(generated.root()).unwrap().with_pending();
 
