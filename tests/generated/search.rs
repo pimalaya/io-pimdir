@@ -16,7 +16,7 @@
 //! settle is not compared. A write the model does not follow is reported
 //! as such before any query is asked of its store.
 
-use std::{collections::BTreeSet, thread};
+use std::{collections::BTreeSet, path::Path, thread};
 
 use io_pimdir::{
     client::{
@@ -26,13 +26,13 @@ use io_pimdir::{
     search::{coverage::PimdirSearchTemporal, plan::PimdirSearchSort, query::PimdirQuery},
 };
 use pimdir_generator::{
-    model::{Item, Model, State, Table},
+    model::{Item, Kind, Model, Reference, State, Table},
     profile::Profile,
     query::{Answer, Clock, Corpus, Hit, Matched, Order, Temporal, date::Zone, grammar},
     spec::Spec,
     time::Instant,
 };
-use rusqlite::types::Value;
+use rusqlite::{Connection, types::Value};
 
 use crate::{
     common::{Generated, SEEDS},
@@ -136,7 +136,7 @@ pub fn differences_of(model: Model, every: bool) -> Vec<String> {
         }
 
         let corpus = Corpus {
-            model: model.clone(),
+            model: ruled(&model, &root, &rule),
             properties: Vec::new(),
             missing: BTreeSet::new(),
             opaque: BTreeSet::new(),
@@ -184,6 +184,45 @@ pub fn differences_of(model: Model, every: bool) -> Vec<String> {
         );
     }
     differences
+}
+
+/// `model` holding each `sender` reference the store at `root` records
+/// that `rule` states (`scale::senders`): io-pimdir applies the rule to
+/// what a write touches (STORAGE §14.2), the reader comparison checking each
+/// one it records, and the oracle answers over the same references.
+fn ruled(model: &Model, root: &Path, rule: &BTreeSet<(String, String)>) -> Model {
+    let conn = Connection::open(root.join("pimdir.db")).unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT from_link_id, to_link_id FROM item_reference \
+             WHERE role = 'sender' AND origin = 'auto'",
+        )
+        .unwrap();
+    let recorded: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    let mut model = model.clone();
+    for (mail, contact) in recorded {
+        let stated = model.references.iter().any(|reference| {
+            reference.from_link_id == mail
+                && reference.to_link_id == contact
+                && reference.role == "sender"
+        });
+        if rule.contains(&(mail.clone(), contact.clone())) && !stated {
+            model.references.push(Reference {
+                from_kind: Kind::Mail,
+                from_link_id: mail,
+                to_kind: Kind::Contact,
+                to_link_id: contact,
+                role: String::from("sender"),
+                origin: String::from("auto"),
+            });
+        }
+    }
+    model
 }
 
 /// The model through the owner's write, as the generator's upkeep reads

@@ -131,13 +131,19 @@ pub fn differences(model: Model) -> Vec<String> {
 
 /// The `(mail, contact)` link ids STORAGE §14.2's `sender` rule records
 /// over `model`: a mail to every contact whose `email` rows hold one of
-/// the mail's `from` addresses (Annex A.6).
+/// the mail's `from` addresses (Annex A.6), neither end under a
+/// writer-derived key, which no reference names (STORAGE §9).
 pub fn senders(model: &Model) -> BTreeSet<(String, String)> {
     let of = |kind: Kind, role: &'static str| {
         model
             .items
             .iter()
             .filter(move |item| model.collections[&item.collection].kind == Some(kind))
+            .filter(|item| {
+                !["alt:", "dup:", "hash:"]
+                    .iter()
+                    .any(|prefix| item.link_id.starts_with(prefix))
+            })
             .flat_map(move |item| {
                 item.addresses
                     .iter()
