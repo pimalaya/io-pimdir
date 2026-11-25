@@ -27,9 +27,8 @@ use io_pimdir::{
 };
 use pimdir_generator::{
     model::{Item, Model, State, Table},
-    oracle::Expectation,
     profile::Profile,
-    query::{Answer, Clock, Corpus, Hit, Matched, Order, Readings, Temporal, date::Zone, grammar},
+    query::{Answer, Clock, Corpus, Hit, Matched, Order, Temporal, date::Zone, grammar},
     spec::Spec,
     time::Instant,
 };
@@ -40,22 +39,6 @@ use crate::{
     index::{BATCH, NOW, Write, tamed, writes},
     reader,
 };
-
-/// Finding G28 (spec minor, owner ruling pending): a weekly series whose
-/// `UNTIL` falls on a day before its `DTSTART` (the structure profile
-/// draws the two apart) yields no occurrence in io-pimdir, ical-rs voiding
-/// such a series as one deleted from its first instance on, where RFC 5545
-/// §3.8.5.3 has `DTSTART` define the first instance of the set; SEARCH §7
-/// says neither. The oracle leaves the date undecided by default
-/// (`Readings::start_counts`).
-const G28: &str = "G28: a series ending before it starts occurs never";
-
-/// Finding G29 (outside search, spec minor, reads two ways): a release
-/// below a date (STORAGE §11.4) lets a binding whose `base_object` is the
-/// body released go of it, and says nothing of `shared_object`, which §5
-/// has outlive the item's body until every binding has reconciled:
-/// io-pimdir clears both, the generator's upkeep the base alone.
-const G29: &str = "G29: a release clears the binding's shared_object";
 
 /// The query handles each step's queries are spread over.
 const QUERY_THREADS: usize = 4;
@@ -71,72 +54,40 @@ const ORDERS: [(Order, PimdirSearchSort); 5] = [
 
 #[test]
 fn every_grammar_form_answers_what_the_oracle_decides_on_generated_stores() {
-    let differences = seeded(false, Readings::default(), None);
-    let unknown: Vec<&String> = differences
-        .iter()
-        .filter(|(known, _)| known.is_none())
-        .map(|(_, difference)| difference)
-        .collect();
-    assert!(unknown.is_empty(), "{unknown:#?}");
-}
-
-#[test]
-#[ignore = "G28 and G29: the findings of the generated suite"]
-fn every_grammar_form_answers_what_the_oracle_decides_known_included() {
-    let mut differences = seeded(false, Readings::default(), None);
-    let started = Readings {
-        start_counts: Some(true),
-    };
-    differences.extend(seeded(false, started, Some(G28)));
+    let differences = seeded(false);
     assert!(differences.is_empty(), "{differences:#?}");
 }
 
 #[test]
 #[ignore = "every order and every page of every query, for a release build"]
 fn every_grammar_form_in_every_order_answers_what_the_oracle_decides() {
-    let differences = seeded(true, Readings::default(), None);
-    let unknown: Vec<&String> = differences
-        .iter()
-        .filter(|(known, _)| known.is_none())
-        .map(|(_, difference)| difference)
-        .collect();
-    assert!(unknown.is_empty(), "{unknown:#?}");
+    let differences = seeded(true);
+    assert!(differences.is_empty(), "{differences:#?}");
 }
 
 /// The differences of every seed, run side by side, each named by its
-/// seed and with the known finding it stands under, `reading` for one an
-/// answer shows.
-fn seeded(
-    every: bool,
-    readings: Readings,
-    reading: Option<&'static str>,
-) -> Vec<(Option<&'static str>, String)> {
+/// seed.
+fn seeded(every: bool) -> Vec<String> {
     thread::scope(|scope| {
         let runs: Vec<_> = SEEDS
             .iter()
-            .map(|seed| scope.spawn(move || (*seed, differences(*seed, every, readings, reading))))
+            .map(|seed| scope.spawn(move || (*seed, differences(*seed, every))))
             .collect();
         runs.into_iter()
             .flat_map(|run| {
                 let (seed, differences) = run.join().unwrap();
                 differences
                     .into_iter()
-                    .map(move |(known, difference)| (known, format!("seed {seed}: {difference}")))
+                    .map(move |difference| format!("seed {seed}: {difference}"))
             })
             .collect()
     })
 }
 
 /// Every answer io-pimdir gives at `seed` otherwise than the oracle
-/// decides under `readings`, after each write of the run, each with the
-/// known finding it stands under, `reading` for an answer's. `every` asks
-/// each query in every order and walks each.
-fn differences(
-    seed: u64,
-    every: bool,
-    readings: Readings,
-    reading: Option<&'static str>,
-) -> Vec<(Option<&'static str>, String)> {
+/// decides, after each write of the run. `every` asks each query in every
+/// order and walks each.
+fn differences(seed: u64, every: bool) -> Vec<String> {
     let spec = Spec::load_default().unwrap();
     let model = Profile::Structure.generate(&spec, seed).unwrap();
     let generated = Generated::write(spec, tamed(model));
@@ -163,22 +114,11 @@ fn differences(
         follow(&mut model, &write);
         index.refresh(&options).unwrap();
 
-        let (_, rows) = reader::compare(&generated.spec, &model, &root, released);
-        if let Some((known, _)) = rows.iter().find(|(known, _)| known.is_some()) {
-            differences.push((
-                *known,
-                format!("step {step} ({label}): {} rows", rows.len()),
-            ));
-        }
-        let rows: Vec<String> = rows
-            .into_iter()
-            .filter(|(known, _)| known.is_none())
-            .map(|(_, row)| row)
-            .collect();
+        let (_, rows) = reader::compare(&generated.spec, &model, &root, |_, _, _, _| None);
+        let rows: Vec<String> = rows.into_iter().map(|(_, row)| row).collect();
         if !rows.is_empty() {
-            differences.push((
-                None,
-                format!("step {step} ({label}): the model does not follow the write: {rows:#?}"),
+            differences.push(format!(
+                "step {step} ({label}): the model does not follow the write: {rows:#?}"
             ));
             continue;
         }
@@ -190,11 +130,10 @@ fn differences(
             opaque: BTreeSet::new(),
             horizon: horizon(NOW),
             floating: Zone::Utc,
-            readings,
         };
         let queries: Vec<(usize, String)> = queries(&model).into_iter().enumerate().collect();
         let share = queries.len().div_ceil(QUERY_THREADS);
-        let found: Vec<(Option<&'static str>, String)> = thread::scope(|scope| {
+        let found: Vec<String> = thread::scope(|scope| {
             let runs: Vec<_> = queries
                 .chunks(share)
                 .map(|chunk| {
@@ -214,7 +153,7 @@ fn differences(
                                 };
                                 for difference in ask(&index, corpus, query, ORDERS[order], &walks)
                                 {
-                                    found.push((reading, format!("{query:?}: {difference}")));
+                                    found.push(format!("{query:?}: {difference}"));
                                 }
                             }
                         }
@@ -229,38 +168,10 @@ fn differences(
         differences.extend(
             found
                 .into_iter()
-                .map(|(known, difference)| (known, format!("step {step} ({label}): {difference}"))),
+                .map(|difference| format!("step {step} ({label}): {difference}")),
         );
     }
     differences
-}
-
-/// Whether rows differ as G29 has them: io-pimdir's release clears a
-/// binding's `shared_object` where the model keeps it, so its collector
-/// then frees the body and counts it in `purges`, the model's not.
-fn released(
-    expectation: &Expectation,
-    columns: &[&str],
-    held: &[Vec<Value>],
-    want: &[Vec<Value>],
-) -> Option<&'static str> {
-    let (statement, column) = match expectation.statement.as_str() {
-        "storage/read/list_item_bindings" => ("storage/read/list_item_bindings", "shared_object"),
-        "storage/read/load_change_cursor" => ("storage/read/load_change_cursor", "purges"),
-        _ => return None,
-    };
-    let at = columns.iter().position(|name| *name == column)?;
-    let alike = held.len() == want.len()
-        && held.iter().zip(want).all(|(held, want)| {
-            held.iter()
-                .zip(want)
-                .enumerate()
-                .all(|(index, (held, want))| {
-                    held == want
-                        || (index == at && (statement.ends_with("cursor") || *held == Value::Null))
-                })
-        });
-    alike.then_some(G29)
 }
 
 /// The model through the owner's write, as the generator's upkeep reads
@@ -582,11 +493,17 @@ fn queries(model: &Model) -> Vec<String> {
             texts.push(format!("{first} or {second}"));
             texts.push(format!("{first} not {second}"));
             texts.push(format!("body:{second}"));
+            texts.push(format!("-\"{first} {second}\""));
+            texts.push(format!("\"{first}\"{second}"));
             if first.len() >= 3 {
                 texts.push(format!("{}*", &first[..3]));
             }
         }
         if let Some(word) = subject.first() {
+            if word.chars().count() >= 3 {
+                let prefix: String = word.chars().take(3).collect();
+                texts.push(format!("subject:{prefix}*"));
+            }
             texts.push(format!("subject:{word}"));
             texts.push(format!("title:{word}"));
             texts.push(format!("summary:\"{}\"", subject.join(" ")));
@@ -641,6 +558,8 @@ fn queries(model: &Model) -> Vec<String> {
             ));
             forms.push(format!("date:{day}T{}", &mail.sort_key[11..16]));
             forms.push(format!("date:{day}T{}Z", &mail.sort_key[11..19]));
+            forms.push(format!("date:{day}T{}+02:00", &mail.sort_key[11..16]));
+            forms.push(format!("date:{day}T{}-05:30", &mail.sort_key[11..16]));
             forms.push(format!("kind:mail date:..{day}"));
             forms.push(format!("kind:mail date:{day}.."));
         }
@@ -779,6 +698,13 @@ fn queries(model: &Model) -> Vec<String> {
     forms.push(String::from("changed:0.."));
     forms.push(String::from("changed:..0"));
     forms.push(String::from("changed:1000000000.."));
+    forms.push(String::from("changed:5"));
+    forms.push(String::from("changed:3..40"));
+    forms.push(String::from("date:90min"));
+    forms.push(String::from("date:12h"));
+    forms.push(String::from("kind:mail date:2w"));
+    forms.push(String::from("date:3mo..1mo"));
+    forms.push(String::from("date:1y"));
     forms.push(String::from("date:2026"));
     forms.push(String::from("date:2026-03..2026-05"));
     forms.push(String::from("kind:event date:2026-06"));
@@ -796,6 +722,11 @@ fn queries(model: &Model) -> Vec<String> {
     forms.push(String::from("kind:mail and is:flagged"));
     forms.push(String::from("--kind:mail"));
     forms.push(String::from("kind:mail -is:read OR kind:task"));
+    forms.push(String::from("NOT kind:mail"));
+    forms.push(String::from("kind:mail AND is:flagged"));
+    forms.push(String::from("(kind:mail)is:unread"));
+    forms.push(String::from("kind:mail\tis:unread"));
+    forms.push(String::from("kind:contact\r\nor kind:task"));
 
     for text in &texts {
         forms.push(text.clone());

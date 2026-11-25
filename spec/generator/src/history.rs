@@ -1850,7 +1850,7 @@ mod tests {
         body::Card,
         engine::{self, Answer, Event, Push, Run},
         history::{FILLS, History, PAGE, SHARED, UNREAD, drained, set},
-        model::{Item, Model, Scope, State},
+        model::{Collection, Item, Kind, Model, Presentation, Scope, State, synced_by},
         name::ObjectName,
         oracle,
         profile::Draw,
@@ -3891,6 +3891,47 @@ mod tests {
             "another size mints"
         );
         assert!(model.live(id).any(|item| item.link_id.starts_with("dup:")));
+    }
+
+    #[test]
+    fn a_retained_card_revived_with_another_body_adopts_it_and_keeps_none() {
+        let id = "work/revived-carried";
+        let mut model = Model::new();
+        model.declare(Collection {
+            id: String::from(id),
+            account: Some(String::from("work")),
+            kind: Some(Kind::Contact),
+            name: String::from(id),
+            role: None,
+            sources: synced_by(&["dav"]),
+            conflict: String::from("manual"),
+            generation: 1,
+            parent: None,
+            presentation: Presentation::default(),
+        });
+        let mut remote = Remote::dav("dav", id);
+        let card = Draw::new(5).card();
+        remote.deliver(card.file(), BTreeSet::new());
+        model.sync(&mut remote, PAGE);
+        remote.expunge("r1.vcf");
+        model.sync(&mut remote, PAGE);
+        let was = model.items[0].object.clone();
+
+        let restored = Card {
+            name: String::from("Restored"),
+            ..card
+        };
+        remote.carries = true;
+        remote.deliver(restored.file(), BTreeSet::new());
+        let run = model.sync(&mut remote, PAGE);
+
+        let carried = Some(ObjectName::of(&restored.file().bytes));
+        assert_ne!(was, carried);
+        assert_eq!(model.items.len(), 1, "nothing kept apart");
+        let revived = &model.items[0];
+        assert_eq!(revived.state, State::Live);
+        assert_eq!((revived.object.clone(), revived.level), (carried, 2));
+        assert_eq!(run.events, [Event::Added(String::from("r2.vcf"))]);
     }
 
     #[test]

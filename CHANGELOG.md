@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
-The store follows pimdir's storage-draft-18, the index search-draft-19 and the sync sync-draft-16 (the owner decisions of 2026-11-25). Drafts are exact: a store an earlier draft wrote is refused, never migrated, and an index of an earlier draft is rebuilt by the indexer.
+The store follows pimdir's storage-draft-19, the index search-draft-20 and the sync sync-draft-16 (the owner decisions and rulings of 2026-11-25). Drafts are exact: a store an earlier draft wrote is refused, never migrated, and an index of an earlier draft is rebuilt by the indexer.
 
 ### Added
 
@@ -21,7 +21,8 @@ The store follows pimdir's storage-draft-18, the index search-draft-19 and the s
 
 - **BREAKING**: A copy or a move into a collection no source syncs is refused (above), where it used to stage a pending create under the run's source, binding that source to a collection it never synced: a target is synced, by a checkpoint or a binding, before anything is copied or moved into it.
 - The overlay folds a pending `move` into a collection no source syncs as nothing, its item left where it is, as the drain parks it (pimdir STORAGE §15.4).
-- **BREAKING**: Changed the index to pimdir's search-draft-19 (`sql::search::FORMAT_VERSION`, `FORMAT_DRAFT` 19): an index of search-draft-17 or search-draft-18 is rebuilt by the indexer and refused by a query client.
+- **BREAKING**: Changed the store to pimdir's storage-draft-19 (`sql::FORMAT_VERSION`): a store of storage-draft-18 or earlier is refused by every profile, never migrated, so a program built on this release syncs a new store. Nothing in the schema moved: storage-draft-19 states the release of a message body's `shared_object` and a revive's adopted body as this crate already wrote them.
+- **BREAKING**: Changed the index to pimdir's search-draft-20 (`sql::search::FORMAT_VERSION`, `FORMAT_DRAFT` 20): an index of search-draft-17 to search-draft-19 is rebuilt by the indexer and refused by a query client. search-draft-20 states that a series every rule of which ends on a date before its `DTSTART` has no occurrence there, as this crate already expanded it through ical-rs.
 - **BREAKING**: Added the field `point` to `PimdirQueryDateRange`, whether a date value is one point rather than a range; a struct literal states it.
 - Changed `FIELDS` to follow pimdir SEARCH §8's table, `flag:` before `is:`.
 - Changed `PimdirStore::for_source` to answer a `Result`, refusing an empty source id as `PimdirError::SourceEmpty` before anything is written.

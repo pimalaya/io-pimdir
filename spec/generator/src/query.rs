@@ -158,20 +158,6 @@ pub struct Corpus {
     pub horizon: (i64, i64),
     /// The zone floating times and dates are placed in.
     pub floating: Zone,
-    /// The readings it settles where SEARCH reads two ways.
-    pub readings: Readings,
-}
-
-/// The readings the oracle states where SEARCH reads two ways, each none
-/// by default, which leaves undecided what turns on it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Readings {
-    /// Whether a series every rule of which ends before its `DTSTART`
-    /// occurs at its `DTSTART` (finding G28 of io-pimdir tests/generated):
-    /// RFC 5545 §3.8.5.3 has `DTSTART` define the first instance of the
-    /// set, where ical-rs voids such a series as one deleted from its first
-    /// instance on, and SEARCH §7 says neither.
-    pub start_counts: Option<bool>,
 }
 
 /// One row of `item_property`.
@@ -523,8 +509,8 @@ impl Corpus {
     }
 
     /// SEARCH §7's occurrences of the times a body states, a journal's date
-    /// read both as an instant and as its day, a series whose `UNTIL` falls
-    /// before its `DTSTART` under [`Readings::start_counts`].
+    /// read both as an instant and as its day, a series whose `UNTIL` states
+    /// a date before the one its `DTSTART` states having none.
     fn expand(&self, times: &Times) -> Option<Vec<Vec<(i64, i64)>>> {
         let zone = self.floating;
         let wall = |time: &Time| match time {
@@ -546,9 +532,8 @@ impl Corpus {
                     (None, Time::Date(_)) => Some(from + 86_400),
                     (None, _) => None,
                 };
-                let first = place((from, utc))?;
-                if times.until.is_some_and(|until| until.0 < first) && !self.readings.start_counts?
-                {
+                let day = |at: i64| at.div_euclid(86_400);
+                if times.until.is_some_and(|until| day(until.0) < day(from)) {
                     return Some(vec![Vec::new()]);
                 }
                 let mut occurrences = Vec::new();

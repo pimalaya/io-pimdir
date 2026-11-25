@@ -1149,11 +1149,11 @@ impl Model {
     /// Revives a retained row under the member naming it, reported `Added`
     /// (STORAGE §11.1): bound by the source at the member's flags and
     /// revision. A message keeps its body, the member's own. A mutable kind
-    /// takes the body the member carries, none when it carries none, at
-    /// `Meta`, the body the row held kept as a retained item over the
-    /// member's handle, reported `Overruled`, its server having perhaps
-    /// replaced it. The binding's `shared_object` names the body only when
-    /// the member carried one (STORAGE §10).
+    /// takes the body the member carries, the row's released. Carrying none,
+    /// it holds none, at `Meta`, the body the row held kept as a retained
+    /// item over the member's handle, reported `Overruled`, its server
+    /// having perhaps replaced it. The binding's `shared_object` names the
+    /// body only when the member carried one (STORAGE §10).
     fn revive(
         &mut self,
         index: usize,
@@ -1168,7 +1168,7 @@ impl Model {
         }
         let item = &self.items[index];
         let mutable = item.summary.table != Table::Mail;
-        let kept = (mutable && item.object.is_some() && item.object != carried).then(|| Kept {
+        let kept = (mutable && item.object.is_some() && carried.is_none()).then(|| Kept {
             object: item.object.clone(),
             flags: item.flags.clone(),
             summary: item.summary.clone(),

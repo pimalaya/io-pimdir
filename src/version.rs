@@ -42,7 +42,7 @@ pub(crate) enum PimdirProfile {
 /// The storage part a program implements (STORAGE §4.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PimdirFormat<'a> {
-    /// A draft, by the name its stores carry (`storage-draft-18`).
+    /// A draft, by the name its stores carry (`storage-draft-19`).
     Draft(&'a str),
     /// A released version.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn a_release_refuses_a_draft_store() {
         for profile in PROFILES {
-            for format in ["storage-draft-18", "storage-v", "storage-v1.0.0", "pimdir"] {
+            for format in ["storage-draft-19", "storage-v", "storage-v1.0.0", "pimdir"] {
                 assert_eq!(
                     store(format, (1, 1, 1)).opens(&release(profile, 1)),
                     Err(PimdirVersionRefusal::Format {
@@ -580,13 +580,13 @@ mod tests {
             let draft = PimdirProgram {
                 profile,
                 version: 1,
-                format: PimdirFormat::Draft("storage-draft-18"),
+                format: PimdirFormat::Draft("storage-draft-19"),
                 hash_algos: &["blake3"],
             };
 
-            assert_eq!(store("storage-draft-18", (1, 1, 1)).opens(&draft), Ok(()));
-            assert_eq!(store("storage-draft-18", (2, 2, 2)).opens(&draft), Ok(()));
-            for format in ["storage-draft-17", "storage-draft-19", "storage-v1"] {
+            assert_eq!(store("storage-draft-19", (1, 1, 1)).opens(&draft), Ok(()));
+            assert_eq!(store("storage-draft-19", (2, 2, 2)).opens(&draft), Ok(()));
+            for format in ["storage-draft-18", "storage-draft-20", "storage-v1"] {
                 assert_eq!(
                     store(format, (1, 1, 1)).opens(&draft),
                     Err(PimdirVersionRefusal::Format {
@@ -601,7 +601,7 @@ mod tests {
                 format: None,
                 user_version: 7,
                 hash_algo: "sha256",
-                ..store("storage-draft-18", (1, 1, 1))
+                ..store("storage-draft-19", (1, 1, 1))
             };
             assert_eq!(other.opens(&draft), Ok(()));
         }

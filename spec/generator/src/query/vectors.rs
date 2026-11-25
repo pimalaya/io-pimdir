@@ -25,10 +25,7 @@ use crate::{
         Address, Collection, Kind, Model, Placement, Presentation, Reference, Scope, SourceState,
         Summary, Table,
     },
-    query::{
-        Clock, Corpus, Counts, Hit, Matched, Order, Property, Readings, Temporal, date::Zone,
-        grammar,
-    },
+    query::{Clock, Corpus, Counts, Hit, Matched, Order, Property, Temporal, date::Zone, grammar},
     spec::Spec,
     time::Instant,
 };
@@ -165,7 +162,6 @@ fn render(spec: &Spec, store: &Json, horizon: (i64, i64)) -> Result<Corpus> {
         opaque,
         horizon,
         floating: Zone::Utc,
-        readings: Readings::default(),
     })
 }
 

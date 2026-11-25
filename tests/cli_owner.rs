@@ -56,7 +56,7 @@ fn newer_store(dir: &Path) -> i64 {
         .id;
     let conn = rusqlite::Connection::open(dir.join("pimdir.db")).unwrap();
     conn.execute_batch(
-        "UPDATE store_meta SET format_version = 'storage-draft-19';
+        "UPDATE store_meta SET format_version = 'storage-draft-20';
          ALTER TABLE summary ADD COLUMN newer TEXT;",
     )
     .unwrap();
@@ -147,7 +147,7 @@ fn a_restore_over_a_store_of_another_draft_is_refused() {
     let seq = store.list_retained(inbox, None, 10).unwrap()[0].seq;
     drop(store);
     let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
-    conn.execute_batch("UPDATE store_meta SET format_version = 'storage-draft-19';")
+    conn.execute_batch("UPDATE store_meta SET format_version = 'storage-draft-20';")
         .unwrap();
     drop(conn);
     let before = std::fs::read(dir.path().join("pimdir.db")).unwrap();
@@ -160,7 +160,7 @@ fn a_restore_over_a_store_of_another_draft_is_refused() {
     assert!(
         json["error"]
             .as_str()
-            .is_some_and(|error| error.contains("storage-draft-19")),
+            .is_some_and(|error| error.contains("storage-draft-20")),
         "{json}"
     );
     assert_eq!(

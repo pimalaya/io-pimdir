@@ -90,7 +90,8 @@ impl Model {
 
     /// Releases the bodies of `collections`' live mail items sorting below
     /// `before`, every one with no ceiling, that do not need them (STORAGE
-    /// §11.4), answering the `seq`s released.
+    /// §11.4), answering the `seq`s released. A binding's base and shared
+    /// body naming the released one let it go with it (STORAGE §5).
     pub fn release_before(&mut self, collections: &[&str], before: Option<&str>) -> Vec<i64> {
         let mut released = Vec::new();
         for index in 0..self.items.len() {
@@ -132,6 +133,9 @@ impl Model {
             for binding in &mut item.bindings {
                 if binding.base_object.as_ref() == Some(&object) {
                     binding.base_object = None;
+                }
+                if binding.shared_object.as_ref() == Some(&object) {
+                    binding.shared_object = None;
                 }
             }
             released.push(item.seq);
