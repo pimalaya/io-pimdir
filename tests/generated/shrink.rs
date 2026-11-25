@@ -266,7 +266,7 @@ fn model(job: &Job, key: &str, out: &Path) -> String {
         "overlay" => "overlay::differences_of(model)",
         "drain" => "drain::differences_of(model)",
         "index" => "index::differences_of(model)",
-        "search" => "search::differences_of(model, false, Readings::default(), None)",
+        "search" => "search::differences_of(model, false)",
         "crash-owner" => "crash::owner_cuts(model)",
         "crash-index" => "crash::index_cuts(model)",
         _ => "scale::differences(model)",

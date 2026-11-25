@@ -49,6 +49,9 @@ The store follows pimdir's storage-draft-19, the index search-draft-20 and the s
 - Fixed `PimdirReader::pending_arrivals` failing the whole listing on a move or a copy whose payload does not decode: the row is listed as `PimdirAction::Unknown`, its kind and payload verbatim, as `pending_actions` lists it (STORAGE §15.4).
 - Fixed the body a bodiless revive of a card, a calendar resource or a file sets aside keeping the reviving member's sort key: the retained item keeps the sort key the retained row held, its body's own, beside that row's summary (pimdir SYNC §9, STORAGE §11; vector 232).
 - Fixed a queued `remove` of an item no source binds, and an `add` superseding one, retaining it with `retained_by` naming the drain handle's source: no source's removal retired it, so the column is left `NULL` (pimdir STORAGE §13, §15.3).
+- Fixed a listing or a `Meta` fetch writing what its source states over the summary of a message whose body the store holds, a `Message-ID` the server rewrote (as Gmail does for a message sent through its API) among it: the row keeps the body's derivation whole, the link id and the body agreeing with it (pimdir STORAGE Annex A.1, SYNC §6; vector 236).
+- Fixed a round of several pages parked by a mass absence or an empty listing losing the checkpoint its first page carried when the round opened in the same run: the park draws the round anew and now lands that checkpoint again, as it did for a round resumed from the store (pimdir SYNC §5, STORAGE §10; vector 234).
+- Fixed a rekey whose listing gives every member its old handle leaving the collection's generation where it was: every handle the rekey re-writes is dropped `Rekeyed`, one carried onto itself too, so the batch is a rebuild and the generation moves (pimdir SYNC §8, STORAGE §12; vector 235).
 
 ## [0.20.4] - 2026-11-25
 

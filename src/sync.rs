@@ -1043,7 +1043,7 @@ impl PimdirSync {
         };
 
         let mut tail = Vec::new();
-        match (kind, &self.plan) {
+        match (kind, &mut self.plan) {
             (PageKind::Delta, plan) => {
                 if let Some(checkpoint) = page.checkpoint
                     && self.checkpoint.as_ref() != Some(&checkpoint)
@@ -1067,10 +1067,14 @@ impl PimdirSync {
                 }
             }
             (PageKind::Partial, Plan::Round(round)) => {
+                let checkpoint = page.checkpoint.filter(|_| !round.band);
+                if checkpoint.is_some() {
+                    round.checkpoint.clone_from(&checkpoint);
+                }
                 tail.push(PimdirWriteOp::SetRoundCursor {
                     collection: self.collection.clone(),
                     cursor: Some(page.cursor.clone().unwrap_or_default()),
-                    checkpoint: page.checkpoint.filter(|_| !round.band),
+                    checkpoint,
                 });
             }
             // NOTE: landed as a page before the last, with no cursor, so a
@@ -1093,8 +1097,11 @@ impl PimdirSync {
             // NOTE: a delta head's checkpoint becomes the round's, the
             // cursor staying, whether the round lists a band or not: the
             // head listed the run's whole scope (SYNC §5).
-            (PageKind::DeltaHead, _) => {
+            (PageKind::DeltaHead, plan) => {
                 if let Some(checkpoint) = page.checkpoint {
+                    if let Plan::Round(round) = plan {
+                        round.checkpoint = Some(checkpoint.clone());
+                    }
                     tail.push(PimdirWriteOp::SetRoundCursor {
                         collection: self.collection.clone(),
                         cursor: None,

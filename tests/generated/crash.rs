@@ -221,7 +221,10 @@ pub fn engine_cuts(history: &History) -> Vec<(usize, String)> {
 /// store reopened, its connector answering what each request asks: the
 /// store it leaves is the uncut run's, or the one the uncut run and that
 /// same run again leave, where the cut fell past a write leaving a change
-/// owed to the next run (SYNC §5).
+/// owed to the next run (SYNC §5). A reader holds the store's snapshot
+/// from before the run, so SQLite's automatic checkpoint, which a run
+/// writing a thousand pages of log would make, copies none of it back
+/// and every commit stays a cut of the log.
 fn cut_run(
     before: &Step,
     step: &Step,
@@ -237,8 +240,14 @@ fn cut_run(
     index::copy_store(&root, &start.path().join("store"), true);
 
     let keeper = Connection::open(root.join("pimdir.db")).unwrap();
+    keeper.execute_batch("BEGIN").unwrap();
     keeper
         .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    keeper
+        .query_row("SELECT count(*) FROM store_meta", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap();
     let mut remote = Scripted::of(before, step, run, revisions, false);
     let uncut = replay::run_verb(&root, before, step, run, &mut remote);

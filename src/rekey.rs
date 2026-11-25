@@ -179,7 +179,6 @@ impl PimdirRekey {
 
         let mut carried_over = BTreeSet::new();
         let mut restaged = BTreeSet::new();
-        let mut in_place = BTreeSet::new();
         let mut superseded = BTreeSet::new();
         let mut landed_drops = Vec::new();
         let mut staged = staged;
@@ -267,9 +266,6 @@ impl PimdirRekey {
                     }
                 }
                 (Some(old), _) => {
-                    if old.handle == item.handle {
-                        in_place.insert(old.handle.clone());
-                    }
                     carried_over.insert(old.handle.clone());
                     let carried = self.carry(old, &item, resolved, &mut writes);
                     writes.push(PimdirWriteOp::UpsertPlacement(carried));
@@ -362,9 +358,6 @@ impl PimdirRekey {
         for placement in &old {
             let moved = restaged.contains(&placement.handle);
             if waiting.contains(&placement.handle) {
-                continue;
-            }
-            if in_place.contains(&placement.handle) && !moved {
                 continue;
             }
             // NOTE: a re-staged edit's binding moves to its provisional
@@ -1050,9 +1043,11 @@ mod tests {
             .collect()
     }
 
-    /// The common case: a server renumbering into the same handle range.
+    /// A server renumbering into the same handle range: the handle a member
+    /// keeps is dropped `Rekeyed` before its upsert, so the batch is a
+    /// rebuild and the generation moves (SYNC §8, STORAGE §12).
     #[test]
-    fn a_reused_handle_is_not_dropped_by_the_batch_that_writes_it() {
+    fn a_handle_carried_onto_itself_is_dropped_rekeyed_before_its_upsert() {
         let old = synced("1", "a", &[]);
         let (writes, report) = run(vec![old], vec![item("1", &[])], vec![fetched("1", "a")]);
 
@@ -1061,11 +1056,20 @@ mod tests {
             upserted(&writes, "1").is_some(),
             "the new spine holds it: {writes:?}",
         );
-        assert_eq!(
-            dropped_and_upserted(&writes),
-            Vec::<&str>::new(),
-            "the batch decides by apply order: {writes:?}",
-        );
+        assert_eq!(dropped_and_upserted(&writes), vec!["1"], "{writes:?}");
+        let drop = writes.iter().position(|w| {
+            matches!(
+                w,
+                PimdirWriteOp::DropPlacement {
+                    reason: PimdirDropReason::Rekeyed,
+                    ..
+                }
+            )
+        });
+        let upsert = writes
+            .iter()
+            .position(|w| matches!(w, PimdirWriteOp::UpsertPlacement(_)));
+        assert!(drop < upsert && drop.is_some(), "{writes:?}");
     }
 
     /// Same hazard without reuse: the edit resurrects under the provisional

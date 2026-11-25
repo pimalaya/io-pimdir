@@ -18,7 +18,7 @@ use serde_json::{Value as Json, json};
 
 use crate::{
     body::{Filed, fnv1a64},
-    model::{Binding, Item, Model, State},
+    model::{Binding, Item, Kind, Model, State},
     name::ObjectName,
 };
 
@@ -541,6 +541,12 @@ impl Model {
         if let (Some(binding), Some((own, _))) = (&mut binding, own) {
             binding.source = own;
         }
+        if link_id != source.link_id
+            && kind == Some(Kind::Mail)
+            && let Some(object) = &source.object
+        {
+            self.release_shared(to, &source.link_id, object);
+        }
         self.items.push(Item {
             collection: String::from(to),
             link_id,
@@ -555,6 +561,39 @@ impl Model {
             self.items[index].state = State::Tombstone;
         }
         Outcome::Applied(Some(seq))
+    }
+
+    /// Releases `object` from the live item under the bare `hint` in
+    /// `collection` when a create minted from it takes that body (STORAGE
+    /// §14, SYNC §6): two members stating one hint share no body by
+    /// agreement. Kept where the bare one needs it (STORAGE §11.4) or a
+    /// member minted from the hint held that body before.
+    fn release_shared(&mut self, collection: &str, hint: &str, object: &ObjectName) {
+        if ["alt:", "hash:", "dup:", "part:", "file:"]
+            .iter()
+            .any(|prefix| hint.starts_with(prefix))
+        {
+            return;
+        }
+        let minted = format!("dup:{hint}#");
+        let held = self.items.iter().any(|item| {
+            item.collection == collection
+                && item.state == State::Live
+                && item.link_id.starts_with(&minted)
+                && item.object.as_ref() == Some(object)
+        });
+        let bare = self.items.iter().position(|item| {
+            item.collection == collection
+                && item.state == State::Live
+                && item.link_id == hint
+                && item.object.as_ref() == Some(object)
+        });
+        if let Some(index) = bare
+            && !held
+            && !self.needs_body(index, object)
+        {
+            self.release(index, object);
+        }
     }
 
     /// The pending create the collection's source binds a new item by: its
@@ -846,6 +885,62 @@ mod tests {
                 .any(|item| item.seq == seq)
         );
     }
+    #[test]
+    fn a_move_minted_beside_its_body_in_the_target_releases_it_from_the_bare_member() {
+        let mut model = crate::profile::count(1, 2_000);
+        let (from, seq, link_id, to, object) = model
+            .items
+            .iter()
+            .find_map(|item| {
+                let account = item.collection.split('/').next()?;
+                let archive = format!("{account}/Archive");
+                let object = item.object.clone()?;
+                let copied = model.items.iter().any(|other| {
+                    other.collection == archive
+                        && other.link_id == item.link_id
+                        && other.object.as_ref() == Some(&object)
+                });
+                (item.collection != archive && copied).then(|| {
+                    (
+                        item.collection.clone(),
+                        item.seq,
+                        item.link_id.clone(),
+                        archive,
+                        object,
+                    )
+                })
+            })
+            .expect("a held message the count profile copied into its archive");
+
+        let row = model.enqueue(
+            "himalaya",
+            &from,
+            Action::Move {
+                seq,
+                to: to.clone(),
+            },
+        );
+        model.drain(row);
+
+        let bare = model
+            .items
+            .iter()
+            .find(|item| item.collection == to && item.link_id == link_id)
+            .unwrap();
+        assert_eq!(bare.object, None, "released for a fetch");
+        assert_eq!(bare.level, 1);
+        let binding = bare.bindings.first().unwrap();
+        assert!(binding.base_present && binding.base_object.is_none());
+        assert!(binding.shared_object.is_none());
+        let minted = format!("dup:{link_id}#\u{1}{link_id}");
+        assert!(
+            model.items.iter().any(|item| item.collection == to
+                && item.link_id == minted
+                && item.object == Some(object.clone())),
+            "the create minted beside it holds the body"
+        );
+    }
+
     #[test]
     fn a_drained_write_moves_its_binding_shared_body_onto_the_body_it_carries() {
         let mut model = structure();

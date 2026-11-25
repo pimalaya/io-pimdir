@@ -109,38 +109,54 @@ impl Model {
                 continue;
             }
 
-            let needs = item.conflicted
-                || item.bindings.is_empty()
-                || item.bindings.iter().any(|binding| {
-                    binding.conflicted
-                        || !binding.base_present
-                        || binding
-                            .base_object
-                            .as_ref()
-                            .is_some_and(|base| *base != object)
-                })
-                || collection
-                    .sources
-                    .keys()
-                    .any(|source| item.bound(source).is_none());
-            if needs {
+            if self.needs_body(index, &object) {
                 continue;
             }
 
-            let item = &mut self.items[index];
-            item.object = None;
-            item.level = 1;
-            for binding in &mut item.bindings {
-                if binding.base_object.as_ref() == Some(&object) {
-                    binding.base_object = None;
-                }
-                if binding.shared_object.as_ref() == Some(&object) {
-                    binding.shared_object = None;
-                }
-            }
-            released.push(item.seq);
+            self.release(index, &object);
+            released.push(self.items[index].seq);
         }
         released
+    }
+
+    /// Whether the item at `index` needs its body `object` (STORAGE
+    /// §11.4): it or a binding of it is conflicted, a binding has no base
+    /// or holds another body as its base, it has no binding, or a source
+    /// of its collection binds it not.
+    pub(crate) fn needs_body(&self, index: usize, object: &ObjectName) -> bool {
+        let item = &self.items[index];
+        let collection = &self.collections[&item.collection];
+        item.conflicted
+            || item.bindings.is_empty()
+            || item.bindings.iter().any(|binding| {
+                binding.conflicted
+                    || !binding.base_present
+                    || binding
+                        .base_object
+                        .as_ref()
+                        .is_some_and(|base| base != object)
+            })
+            || collection
+                .sources
+                .keys()
+                .any(|source| item.bound(source).is_none())
+    }
+
+    /// Releases the body `object` of the item at `index` (STORAGE §11.4):
+    /// back to `Meta`, a binding's base and shared body naming it letting it
+    /// go, the binding staying based (STORAGE §5).
+    pub(crate) fn release(&mut self, index: usize, object: &ObjectName) {
+        let item = &mut self.items[index];
+        item.object = None;
+        item.level = 1;
+        for binding in &mut item.bindings {
+            if binding.base_object.as_ref() == Some(object) {
+                binding.base_object = None;
+            }
+            if binding.shared_object.as_ref() == Some(object) {
+                binding.shared_object = None;
+            }
+        }
     }
 
     /// Evicts `collection`'s live mail items dated before `before` that

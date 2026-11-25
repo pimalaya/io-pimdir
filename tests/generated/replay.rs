@@ -52,7 +52,7 @@ use rusqlite::{Connection, types::Value};
 
 use crate::{
     common::{Generated, SEEDS},
-    crash, reader,
+    crash, reader, scale,
 };
 
 /// Finding G11 (the generator's, tooling): a `Run` states neither the
@@ -163,8 +163,15 @@ fn replay_step(
     if let Some(run) = &step.run {
         found.extend(replay_run(root, before, step, run, revisions));
     }
-    let (_, read) = reader::compare(spec, &step.model, root, |_, _, _, _| None);
-    found.extend(read.into_iter().map(|(_, text)| text));
+    let rule = scale::senders(&step.model);
+    let (_, read) = reader::compare(spec, &step.model, root, |e, columns, got, want| {
+        scale::sender(&rule, e, columns, got, want)
+    });
+    found.extend(
+        read.into_iter()
+            .filter(|(accepted, _)| accepted.is_none())
+            .map(|(_, text)| text),
+    );
     for hash in unheld(root) {
         found.push(format!("a row names {hash}, a body the store lacks"));
     }

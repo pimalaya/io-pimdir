@@ -135,10 +135,13 @@ A rebuild re-staging an edited row no member carries (SYNC §8) SHALL key it und
 - tests/engine/sync_audit.rs `a_rekey_restages_an_uncarried_edit_under_a_provisional_handle` (failed before the change: the batch bound two items to one handle and the store refused it)
 
 ### Requirement: Every old handle is dropped before any upsert
-A rebuild SHALL drop every old handle but one carried onto itself, every drop before every upsert (SYNC §8): a handle the new space reuses for another member is still dropped, `Rekeyed` when its member was carried elsewhere and `Deleted` when it resolved to none, and the mass-absence guard counts the latter.
+A rebuild SHALL drop every old handle it re-writes, one carried onto itself included, every drop before every upsert (SYNC §8): a handle the new space reuses for another member is still dropped, `Rekeyed` when its member was carried and `Deleted` when it resolved to none, and the mass-absence guard counts the latter. A rekey carrying any binding so holds a `Rekeyed` drop and bumps the generation (STORAGE §12), whatever handle each member landed on; one carrying none (an empty collection, or every binding dropped `Deleted` under `accept_absences`) bumps nothing, no handle being re-learned.
 
 #### Scenario: A server renumbering from 1
 - tests/engine/sync_audit.rs `a_rekey_reusing_a_gone_members_handle_drops_it` (the store already retired the old binding), `a_rekey_counts_a_gone_member_whose_handle_is_reused_as_absent` (failed before the change: 24 of 25 absent counted)
+
+#### Scenario: A renumbering giving every member its old handle
+- vectors/sync/235 (failed before 2026-11-25: the in-place handle was not dropped, the generation stayed 1); src/rekey.rs `a_handle_carried_onto_itself_is_dropped_rekeyed_before_its_upsert`
 
 ### Requirement: A rebuild knows every old copy of an identity by its key
 A rebuild SHALL find the old copies of a member's identity by the key each carries, never by the handle it holds now: the placement keyed by the hint, and each keyed by a key minted from it over whatever handle (`PimdirLinkId::minted_from`), a rekey carrying the key and not the handle. A minted key whose `#` could end several keys goes to the longest one the listing names. Among the copies the member takes the one its revision or body tells, else the bare key while an old row holds it or no copy is left, else the first remaining copy in handle order, so a copy whose bare sibling is gone is carried too, and only then a mint of its own. A second rekey therefore carries a copy the first rekey carried, a copy staged beside the identity and delivered, and a lone minted copy, with their bodies and pending state, and no other source of the collection is told to remove one.

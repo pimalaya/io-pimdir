@@ -37,7 +37,7 @@ use rusqlite::types::Value;
 use crate::{
     common::{Generated, SEEDS},
     index::{BATCH, NOW, Write, tamed, writes},
-    reader,
+    reader, scale,
 };
 
 /// The query handles each step's queries are spread over.
@@ -119,8 +119,15 @@ pub fn differences_of(model: Model, every: bool) -> Vec<String> {
         follow(&mut model, &write);
         index.refresh(&options).unwrap();
 
-        let (_, rows) = reader::compare(&generated.spec, &model, &root, |_, _, _, _| None);
-        let rows: Vec<String> = rows.into_iter().map(|(_, row)| row).collect();
+        let rule = scale::senders(&model);
+        let (_, rows) = reader::compare(&generated.spec, &model, &root, |e, columns, got, want| {
+            scale::sender(&rule, e, columns, got, want)
+        });
+        let rows: Vec<String> = rows
+            .into_iter()
+            .filter(|(accepted, _)| accepted.is_none())
+            .map(|(_, row)| row)
+            .collect();
         if !rows.is_empty() {
             differences.push(format!(
                 "step {step} ({label}): the model does not follow the write: {rows:#?}"

@@ -670,7 +670,9 @@ impl Model {
     /// at another revision pulled with its summary and sort key, the body the
     /// page carries stored at `Full` (else `Meta`), or
     /// recorded in conflict over a local edit, and every binding no member
-    /// resolves to dropped `Deleted`, the collection's generation bumped. A
+    /// resolves to dropped `Deleted`, the collection's generation bumped
+    /// when a binding was carried, its handle dropped `Rekeyed` making the
+    /// batch a rebuild (SYNC §8, STORAGE §12). A
     /// rekey missing more than half of at least 20, naming no member while
     /// any is missing, or capped while any is, writes nothing and parks
     /// unless the run accepts absences.
@@ -823,7 +825,9 @@ impl Model {
                 .collections
                 .get_mut(&collection)
                 .expect("a declared collection");
-            entry.generation += 1;
+            if !taken.is_empty() {
+                entry.generation += 1;
+            }
             if let Some(checkpoint) = checkpoint {
                 entry.sources.entry(source.clone()).or_default().checkpoint =
                     Some(checkpoint.into_bytes());
@@ -1495,8 +1499,11 @@ impl Model {
         binding.shared_object = object;
     }
 
-    /// A listed member over its binding: the flag axis, then for a mutable
-    /// kind the content axis under the source's policy (SYNC §5): a divergence
+    /// A listed member over its binding: the flag axis; for a message the
+    /// listing's sort key, and its summary over a row holding no body, one
+    /// holding the body keeping the body's (SYNC §6, STORAGE Annex A.1);
+    /// then for a mutable kind the content axis under the source's policy
+    /// (SYNC §5): a divergence
     /// recorded, pulled keeping the local edit, or kept and pushed over; a
     /// body nobody has read recorded whatever the policy. A body another
     /// source folded, the item's differing from the binding's
@@ -1520,6 +1527,15 @@ impl Model {
         if flags.as_ref() != Some(&merged) {
             item.flags = Some(merged);
             events.push(Event::FlagsChanged(member.handle.clone()));
+        }
+        if item.summary.table == Table::Mail {
+            if item.object.is_none() {
+                item.summary = filed.summary.clone();
+                item.addresses = filed.addresses.clone();
+            }
+            if !filed.sort_key.is_empty() {
+                item.sort_key = filed.sort_key.clone();
+            }
         }
 
         if member.revision.is_none() || member.revision == base_revision {
