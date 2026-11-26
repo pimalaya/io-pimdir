@@ -35,15 +35,15 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 ## Specification coverage
 
-| Part             | What is covered                                                                                   |
-|------------------|---------------------------------------------------------------------------------------------------|
-| [storage-v1.0.0] | The owner profile, holding the reader's and the producer's: store, summaries, bodies, queue, trash |
-| [sync-v1.0.0]    | The engine: open, upgrade, mutate, sync and rekey, against a connector the application writes     |
-| [search-v1.0.0]  | The canonical indexer and the query client                                                        |
+| Part      | Version | What is covered                                                                                    |
+|-----------|---------|----------------------------------------------------------------------------------------------------|
+| [Storage] | 1.0.0   | The owner profile, holding the reader's and the producer's: store, summaries, bodies, queue, trash |
+| [Sync]    | 1.0.0   | The engine: open, upgrade, mutate, sync and rekey, against a connector the application writes      |
+| [Search]  | 1.0.0   | The canonical indexer and the query client                                                         |
 
-[storage-v1.0.0]: https://github.com/pimalaya/pimdir/blob/storage-v1.0.0/STORAGE.md
-[sync-v1.0.0]: https://github.com/pimalaya/pimdir/blob/sync-v1.0.0/SYNC.md
-[search-v1.0.0]: https://github.com/pimalaya/pimdir/blob/search-v1.0.0/SEARCH.md
+[Storage]: https://github.com/pimalaya/pimdir/blob/storage-v1.0.0/STORAGE.md
+[Sync]: https://github.com/pimalaya/pimdir/blob/sync-v1.0.0/SYNC.md
+[Search]: https://github.com/pimalaya/pimdir/blob/search-v1.0.0/SEARCH.md
 
 As the standard asks, io-pimdir states its conformance as: storage-v1.0.0 owner, sync-v1.0.0 engine, search-v1.0.0 indexer (canonical) and query client. Its one departure: on Windows no access list restricts a store to its user (STORAGE §18), so a store other users can read is not detected there.
 
