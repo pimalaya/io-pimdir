@@ -6,10 +6,10 @@ landed: 2026-11-26
 
 # Campaigns four and five
 
-The empty-span reading of 2026-11-25 (cairn/log/2026-11-25-the-empty-span-matches-nothing.md) moved the engine, so the freeze plan's stop rule (pimdir cairn/changes/the-freeze-plan, D5) restarted its count on b796d88 with campaign-4 and campaign-5 (tests/generated/campaigns.json).
+The empty-span reading of 2026-11-25 (cairn/log/2026-11-25-the-empty-span-matches-nothing.md) moved the engine, so the freeze plan's stop rule (pimdir cairn/changes/the-freeze-plan, D5) restarted its count on 654b1fd with campaign-4 and campaign-5 (tests/generated/campaigns.json).
 
-- Campaign-4 on b796d88: 4,180 jobs in 8,806 s on 32 workers, no seed failing, 25 differences all of the accepted `sender` class.
-- Campaign-5 on b796d88: 4,180 jobs in 9,424 s, three jobs failing (structure 5036 drain and search, histories 5109 replay), five differences, each a `references_from` read answering one `sender` reference the harness did not accept. None in the engine, none in the standard: both are the harness's.
+- Campaign-4 on 654b1fd: 4,180 jobs in 8,806 s on 32 workers, no seed failing, 25 differences all of the accepted `sender` class.
+- Campaign-5 on 654b1fd: 4,180 jobs in 9,424 s, three jobs failing (structure 5036 drain and search, histories 5109 replay), five differences, each a `references_from` read answering one `sender` reference the harness did not accept. None in the engine, none in the standard: both are the harness's.
 
 ## The findings, the harness's
 
