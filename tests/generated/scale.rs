@@ -15,7 +15,7 @@ use io_pimdir::client::{
     search::{PimdirIndex, PimdirIndexRefreshOptions},
 };
 use pimdir_generator::{
-    model::{Kind, Model, State},
+    model::{Item, Kind, Model, State},
     oracle::Expectation,
     profile::{self, Profile},
     queue::{Action, RowState},
@@ -99,7 +99,7 @@ pub fn differences(model: Model) -> Vec<String> {
         .unwrap();
     owner.drain().unwrap();
     drop(owner);
-    let (rule, recorded) = (senders(&drained), drained_senders(&model));
+    let (rule, recorded) = (owed(&drained, &model), drained_senders(&model));
     let (_, read) = reader::compare(&spec, &drained, &root, |expectation, columns, got, want| {
         sender(&rule, &recorded, expectation, columns, got, want)
     });
@@ -134,11 +134,17 @@ pub fn differences(model: Model) -> Vec<String> {
 /// the mail's `from` addresses (Annex A.6), neither end under a
 /// writer-derived key, which no reference names (STORAGE §9).
 pub fn senders(model: &Model) -> BTreeSet<(String, String)> {
+    stated(model, |_| true)
+}
+
+/// The pairs of [`senders`] over the rows of `model` that `keep` keeps.
+fn stated(model: &Model, keep: impl Fn(&Item) -> bool + Copy) -> BTreeSet<(String, String)> {
     let of = |kind: Kind, role: &'static str| {
         model
             .items
             .iter()
             .filter(move |item| model.collections[&item.collection].kind == Some(kind))
+            .filter(move |item| keep(item))
             .filter(|item| {
                 !["alt:", "dup:", "hash:"]
                     .iter()
@@ -163,6 +169,20 @@ pub fn senders(model: &Model) -> BTreeSet<(String, String)> {
                 .map(move |(contact, _)| (mail.clone(), contact.clone()))
                 .collect::<Vec<_>>()
         })
+        .collect()
+}
+
+/// The `sender` references a store of `model` owes: each the rule states
+/// over `model` and not over `written`, the model the store was written
+/// from with no reference, both ends live. The rule runs after the write
+/// that changed what it reads, between live ends (STORAGE §14.2), so only a
+/// write the owner applied at one end makes a pair owed; one standing since
+/// the store was written may lack, and a tombstone is owed none.
+pub fn owed(model: &Model, written: &Model) -> BTreeSet<(String, String)> {
+    let standing = senders(written);
+    stated(model, |item| item.state == State::Live)
+        .into_iter()
+        .filter(|pair| !standing.contains(pair))
         .collect()
 }
 
@@ -209,8 +229,8 @@ pub fn drained_senders(model: &Model) -> BTreeSet<(String, String)> {
 
 /// [`SENDER`] where io-pimdir answers every reference the oracle states
 /// and more, each more one the store may hold (`recorded`, [`record`]),
-/// and, from a mail, every one the rule states over the model (`rule`): an
-/// owner applying the rule records what it states (STORAGE §14.2).
+/// and, from a mail, every one the store owes (`rule`, [`owed`]): an owner
+/// applying the rule records what it states (STORAGE §14.2).
 pub fn sender(
     rule: &BTreeSet<(String, String)>,
     recorded: &BTreeSet<(String, String)>,

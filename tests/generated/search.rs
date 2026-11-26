@@ -124,7 +124,7 @@ pub fn differences_of(model: Model, every: bool) -> Vec<String> {
         scale::record(&mut recorded, &model);
         index.refresh(&options).unwrap();
 
-        let rule = scale::senders(&model);
+        let rule = scale::owed(&model, &generated.model);
         let (_, rows) = reader::compare(&generated.spec, &model, &root, |e, columns, got, want| {
             scale::sender(&rule, &recorded, e, columns, got, want)
         });

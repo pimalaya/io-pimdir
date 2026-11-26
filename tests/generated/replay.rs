@@ -77,6 +77,16 @@ fn every_generated_history_replays_as_its_model_states() {
     }
 }
 
+/// A mail pulled from an address a live card and a retained one both hold
+/// owes a `sender` reference to the live card alone: the rule records
+/// between live ends (STORAGE §14.2). Campaign-5's histories seed 5109, its
+/// sources history.
+#[test]
+fn a_sender_reference_is_owed_to_a_live_card_alone() {
+    let found = replay(&History::sources(5109));
+    assert!(found.is_empty(), "{found:#?}");
+}
+
 /// Every difference the histories of `seed` replay with.
 fn differences(seed: u64) -> Vec<String> {
     histories(seed)
@@ -117,6 +127,7 @@ pub fn replay(history: &History) -> Vec<(usize, String)> {
     let spec = Spec::load_default().unwrap();
     let first = &history.steps[0];
     let mut generated = Generated::write(Spec::load_default().unwrap(), first.model.clone());
+    let mut written = first.model.clone();
 
     let mut revisions = BTreeMap::new();
     let mut recorded = BTreeSet::new();
@@ -125,7 +136,15 @@ pub fn replay(history: &History) -> Vec<(usize, String)> {
         let (before, step) = (&pair[0], &pair[1]);
         let at = format!("step {} ({})", index + 1, step.label);
         let root = generated.root();
-        let found = replay_step(&spec, &root, before, step, &mut revisions, &mut recorded);
+        let found = replay_step(
+            &spec,
+            &root,
+            &written,
+            before,
+            step,
+            &mut revisions,
+            &mut recorded,
+        );
         if found.is_empty() {
             continue;
         }
@@ -135,6 +154,7 @@ pub fn replay(history: &History) -> Vec<(usize, String)> {
                 .map(|text| (index + 1, format!("{at}: {text}"))),
         );
         generated = Generated::write(Spec::load_default().unwrap(), step.model.clone());
+        written = step.model.clone();
         recorded.clear();
     }
     differences
@@ -152,6 +172,7 @@ pub fn replay_case(case: &Case) -> Vec<String> {
     replay_step(
         &spec,
         &root,
+        &before.model,
         before,
         step,
         &mut revisions,
@@ -161,10 +182,12 @@ pub fn replay_case(case: &Case) -> Vec<String> {
 
 /// Replays `step` on the store at `root`, which holds `before`'s model,
 /// answering every difference it leaves. `recorded` holds the `sender`
-/// references the store may hold (`scale::record`), the step's joining.
+/// references the store may hold (`scale::record`), the step's joining;
+/// `written` is the model the store was written from (`scale::owed`).
 fn replay_step(
     spec: &Spec,
     root: &Path,
+    written: &Model,
     before: &Step,
     step: &Step,
     revisions: &mut BTreeMap<(String, String), String>,
@@ -178,7 +201,7 @@ fn replay_step(
     }
     scale::record(recorded, &before.model);
     scale::record(recorded, &step.model);
-    let rule = scale::senders(&step.model);
+    let rule = scale::owed(&step.model, written);
     let (_, read) = reader::compare(spec, &step.model, root, |e, columns, got, want| {
         scale::sender(&rule, recorded, e, columns, got, want)
     });
