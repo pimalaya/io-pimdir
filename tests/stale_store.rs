@@ -69,12 +69,26 @@ fn a_missing_object_is_named_before_an_extra_one() {
     refused_by_every_profile(dir.path(), "items_by_changed");
 }
 
-/// A draft's store holds version 1 alone (STORAGE §4.2): one whose two
-/// stamps agree on another is damaged, not a later store.
+/// A store whose two stamps agree on version 2 under the marker of version
+/// 1 is refused for its marker by every profile, which names the schema
+/// version alone (STORAGE §4.2): a marker a migration left behind is no
+/// later store.
 #[test]
-fn a_draft_store_at_another_schema_version_is_damaged() {
+fn a_store_stamped_past_its_marker_is_refused_for_the_marker() {
     let dir = damaged("PRAGMA user_version = 2; UPDATE store_meta SET version = 2;");
-    refused_by_every_profile(dir.path(), "user_version");
+    let before = fs::read(dir.path().join("pimdir.db")).unwrap();
+    for refused in [
+        PimdirStore::open(dir.path()).err(),
+        PimdirStore::open_current(dir.path()).err(),
+        PimdirReader::open(dir.path()).err(),
+        PimdirProducer::open(dir.path(), "test").err(),
+    ] {
+        assert!(
+            matches!(&refused, Some(PimdirError::Version { found: Some(found) }) if found == "storage-v1"),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(fs::read(dir.path().join("pimdir.db")).unwrap(), before);
 }
 
 /// A store of storage-draft-15 as it stood before objects were keyed by an

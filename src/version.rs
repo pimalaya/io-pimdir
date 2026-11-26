@@ -43,9 +43,9 @@ pub(crate) enum PimdirProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PimdirFormat<'a> {
     /// A draft, by the name its stores carry (`storage-draft-19`).
+    #[cfg_attr(not(test), allow(dead_code))]
     Draft(&'a str),
     /// A released version.
-    #[cfg_attr(not(test), allow(dead_code))]
     Release,
 }
 

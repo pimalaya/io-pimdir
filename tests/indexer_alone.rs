@@ -13,7 +13,7 @@ use io_pimdir::sql::search;
 fn the_index_statements_build_without_client() {
     assert_eq!(
         search::FORMAT_VERSION,
-        format!("search-draft-{}", search::FORMAT_DRAFT)
+        format!("search-v{}", search::FORMAT_MAJOR)
     );
     assert!(!search::MIGRATIONS.is_empty());
     assert!(search::MIGRATIONS.iter().all(|sql| !sql.trim().is_empty()));

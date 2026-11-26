@@ -43,31 +43,6 @@ jobs:
         working-directory: io-pimdir
       - run: cargo test --all-features
         working-directory: io-pimdir
-      # The test generator is a crate of its own, outside the package.
-      - run: cargo test
-        working-directory: io-pimdir/spec/generator
-      # The defaults and --all-features both turn `vendored` on, so the
-      # system link is proven on its own or it is never built here at all.
-      - run: cargo test --no-default-features --features cli
-        working-directory: io-pimdir
-      # The integration tests need the client, so the no_std core is
-      # proven by its unit tests alone.
-      - run: cargo test --no-default-features --lib
-        working-directory: io-pimdir
-      - name: Each search feature builds alone
-        working-directory: io-pimdir
-        run: |
-          set -eu
-          for features in client mail contact calendar search indexer search,mail search,indexer; do
-            cargo clippy --no-default-features --features "vendored,$features" --all-targets -- -D warnings
-          done
-      - name: The feature sets consumers build
-        working-directory: io-pimdir
-        run: |
-          set -eu
-          cargo check
-          cargo check --no-default-features --features client
-          cargo check --no-default-features --features client,search,indexer
       # spec_drift compares nothing when the checkout lacks the pinned
       # revision, so a green run proves nothing unless it compared.
       - name: The vendored copy was compared with pimdir
@@ -78,6 +53,46 @@ jobs:
             echo "::error::spec_drift compared nothing: the pimdir checkout lacks spec/REVISION"
             exit 1
           fi
+
+  builds:
+    name: generator + system link + no_std core + consumer sets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The test generator is a crate of its own, outside the package.
+      - run: cargo test
+        working-directory: spec/generator
+      # The defaults and --all-features both turn `vendored` on, so the
+      # system link is proven on its own or it is never built here at all.
+      - run: cargo test --no-default-features --features cli
+      # The integration tests need the client, so the no_std core is
+      # proven by its unit tests alone.
+      - run: cargo test --no-default-features --lib
+      - name: The feature sets consumers build
+        run: |
+          set -eu
+          cargo check
+          cargo check --no-default-features --features client
+          cargo check --no-default-features --features client,search,indexer
+
+  features:
+    name: clippy ${{ matrix.features }}
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [client, mail, contact, calendar, search, indexer, "search,mail", "search,indexer"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --no-default-features --features "vendored,${{ matrix.features }}" --all-targets -- -D warnings
 
   msrv:
     name: msrv

@@ -381,7 +381,7 @@ mod tests {
             path: String::from("/var/pimdir"),
             store_id: String::from("e2646df031cd876334410c4df14ebd86"),
             incarnation: 1,
-            format_version: String::from("storage-draft-19"),
+            format_version: String::from("storage-v1"),
             schema_version: 1,
             read_version: 1,
             produce_version: 1,
@@ -414,7 +414,7 @@ mod tests {
 Path:             /var/pimdir
 Store id:         e2646df031cd876334410c4df14ebd86
 Incarnation:      1
-Format version:   storage-draft-19
+Format version:   storage-v1
 Schema version:   1
 Read version:     1
 Produce version:  1

@@ -1,11 +1,12 @@
-//! The store version contract (STORAGE §4.2, §6): a draft's store opens
-//! under that draft alone. A store of another draft, of a release, or one
+//! The store version contract (STORAGE §4.2, §6): a draft's store, or one
 //! lacking `format_version` (every draft before storage-draft-08), is
 //! refused by every profile, the index's view of the store included,
 //! naming both versions and writing nothing; so are a foreign database,
-//! another algorithm and disagreeing stamps. A fresh store names this
-//! draft, its identity and its derivation; the engine's first write
-//! records its sync version, and a store naming another is refused.
+//! another algorithm and disagreeing stamps. A later store is refused by
+//! an owner and opened by a reader and a producer its floors allow. A fresh
+//! store names this release, its identity and its derivation; the engine's
+//! first write records its sync version, and a store naming another is
+//! refused.
 //!
 //! tests/fixtures/store-v0.5.1, store-v0.7.0 and store-v0.8.0 were written by
 //! those releases (tests/fixtures/store_gen.rs, run from a `git archive` of
@@ -140,8 +141,8 @@ fn refused_by_every_profile(dir: &Path, expected: impl Fn(&PimdirError) -> bool)
 fn the_index_refuses_a_store_of_another_version_and_makes_nothing() {
     use io_pimdir::client::search::PimdirIndex;
 
-    let release = altered("UPDATE store_meta SET format_version = 'storage-v1'");
-    for dir in [draft_07(), fixture("store-v0.8.0"), release] {
+    let draft = altered("UPDATE store_meta SET format_version = 'storage-draft-19'");
+    for dir in [draft_07(), fixture("store-v0.8.0"), draft] {
         let before = written(dir.path());
         for refused in [
             PimdirIndex::open(dir.path()).err(),
@@ -157,12 +158,13 @@ fn the_index_refuses_a_store_of_another_version_and_makes_nothing() {
     }
 }
 
-/// A store of a release (`storage-v1`) or of another draft is refused by
-/// every profile, naming its version and this one's.
+/// A store of a draft, the last one included, or of a marker of no known
+/// form is refused by every profile, naming its version and this one's.
 #[test]
 fn a_store_of_another_version_is_refused_by_every_profile_and_never_written() {
     for marker in [
-        "storage-v1",
+        "storage-v01",
+        "storage-v",
         "storage-draft-07",
         "storage-draft-09",
         "storage-draft-10",
@@ -174,6 +176,7 @@ fn a_store_of_another_version_is_refused_by_every_profile_and_never_written() {
         "storage-draft-16",
         "storage-draft-17",
         "storage-draft-18",
+        "storage-draft-19",
         "storage-draft-20",
     ] {
         let dir = altered(&format!(
@@ -212,19 +215,42 @@ fn a_store_a_release_of_this_crate_wrote_is_refused_by_every_profile() {
     }
 }
 
-/// A released store above this draft, its stamps and its schema moved on,
-/// is refused for its marker before anything else is read of it.
+/// A store above this release, its stamps and its schema moved on, is
+/// judged by `store_meta` alone (STORAGE §4.2): an owner refuses it, a
+/// reader and a producer open it while its floors are at most this
+/// version, each refusing it once its floor is above, and nothing is
+/// written.
 #[test]
-fn a_later_store_is_refused_for_its_marker() {
-    let dir = altered(
-        "UPDATE store_meta SET format_version = 'storage-v2', version = 2;
+fn a_later_store_opens_for_a_reader_and_a_producer_its_floors_allow() {
+    let later = "UPDATE store_meta SET format_version = 'storage-v2', version = 2;
          PRAGMA user_version = 2;
-         CREATE TABLE later (x INTEGER);",
-    );
-    refused_by_every_profile(
-        dir.path(),
-        |refused| matches!(refused, PimdirError::Version { found: Some(found) } if found == "storage-v2"),
-    );
+         CREATE TABLE later (x INTEGER);";
+    let version = |refused: &PimdirError| matches!(refused, PimdirError::Version { found: Some(found) } if found == "storage-v2");
+
+    let dir = altered(later);
+    let before = written(dir.path());
+    PimdirReader::open(dir.path()).unwrap();
+    PimdirProducer::open(dir.path(), "app").unwrap();
+    for refused in [
+        PimdirStore::open(dir.path()).err(),
+        PimdirStore::open_current(dir.path()).err(),
+    ] {
+        let refused = refused.expect("an owner refuses a later store");
+        assert!(version(&refused), "{refused:?}");
+    }
+    assert_eq!(written(dir.path()), before, "nothing written");
+
+    let dir = altered(&format!(
+        "{later} UPDATE store_meta SET produce_version = 2;"
+    ));
+    PimdirReader::open(dir.path()).unwrap();
+    let refused = PimdirProducer::open(dir.path(), "app").err().unwrap();
+    assert!(version(&refused), "{refused:?}");
+
+    let dir = altered(&format!(
+        "{later} UPDATE store_meta SET read_version = 2, produce_version = 2;"
+    ));
+    refused_by_every_profile(dir.path(), version);
 }
 
 /// A pimdir.db another program wrote is not a pimdir store (§3): refused,
@@ -275,15 +301,15 @@ fn disagreeing_stamps_are_refused_by_every_profile() {
     });
 }
 
-/// A fresh store names this draft, the three compatibility versions at 1,
+/// A fresh store names this release, the three compatibility versions at 1,
 /// a 32-digit id, the first incarnation, this crate's derivation and no
 /// sync version, and frees pages incrementally (STORAGE §4.1, §4.2, §4.5).
 #[test]
-fn a_fresh_store_names_this_draft_and_an_identity() {
+fn a_fresh_store_names_this_release_and_an_identity() {
     let dir = tempfile::tempdir().unwrap();
     let store = PimdirStore::open(dir.path()).unwrap();
     let meta = store.store_meta().unwrap();
-    assert_eq!(meta.format_version, "storage-draft-19");
+    assert_eq!(meta.format_version, "storage-v1");
     assert_eq!(
         (meta.version, meta.read_version, meta.produce_version),
         (1, 1, 1)

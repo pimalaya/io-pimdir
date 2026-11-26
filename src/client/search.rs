@@ -3407,12 +3407,12 @@ fn named_held(
     if named.as_deref() != Some(search::SHAPE) {
         return Err(refused(version, named));
     }
-    match draft(&found) {
-        Some(number) if number < search::FORMAT_DRAFT => Ok(Some(PimdirIndexHeld::Earlier {
+    match order(&found) {
+        Some(found) if found < (true, search::FORMAT_MAJOR) => Ok(Some(PimdirIndexHeld::Earlier {
             version,
             shape: named,
         })),
-        Some(number) if number == search::FORMAT_DRAFT => Ok(None),
+        Some(found) if found == (true, search::FORMAT_MAJOR) => Ok(None),
         _ => Err(refused(version, named)),
     }
 }
@@ -3463,13 +3463,18 @@ fn meta_held(conn: &Connection, posted: bool) -> Result<PimdirIndexHeld, PimdirE
     Ok(PimdirIndexHeld::Current)
 }
 
-/// The number of a draft version of SEARCH.md, `search-draft-N`, versions
-/// being ordered by it below every release (SEARCH §2); `None` for a
-/// release or a name of no known form, which no draft implements.
-fn draft(version: &str) -> Option<u32> {
-    let number = version.strip_prefix("search-draft-")?;
-    match number.bytes().all(|b| b.is_ascii_digit()) {
-        true => number.parse().ok(),
+/// Where a version of SEARCH.md stands (SEARCH §2): a draft,
+/// `search-draft-N`, as `(false, N)`, below every release, `search-vN`, as
+/// `(true, N)`; `None` for a name of no known form, a release's major with a
+/// leading zero included.
+fn order(version: &str) -> Option<(bool, u32)> {
+    let (released, number) = match version.strip_prefix("search-v") {
+        Some(major) if !major.starts_with('0') => (true, major),
+        Some(_) => return None,
+        None => (false, version.strip_prefix("search-draft-")?),
+    };
+    match !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+        true => number.parse().ok().map(|number| (released, number)),
         false => None,
     }
 }

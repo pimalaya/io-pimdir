@@ -1014,8 +1014,10 @@ fn a_generation_bump_is_visible_to_a_reader() {
     assert_eq!(reader.generation("nope").unwrap(), None);
 }
 
+/// A later store is refused by an owner, which knows no migration to it,
+/// and opened by a producer and a reader, its floors at 1 (STORAGE §4.2).
 #[test]
-fn a_store_of_a_later_version_is_refused() {
+fn a_later_store_is_refused_by_an_owner_alone() {
     let dir = tempfile::tempdir().unwrap();
 
     // a fresh store lands at the current draft schema version, with
@@ -1045,13 +1047,11 @@ fn a_store_of_a_later_version_is_refused() {
         .unwrap();
     }
 
-    // every opener refuses it rather than half-reading: the owner, which
-    // never migrates, the producer, and the read-only reader, which
-    // refuses any version but the current one
+    PimdirProducer::open(dir.path(), "test").unwrap();
+    PimdirReader::open(dir.path()).unwrap();
     for result in [
         PimdirStore::open(dir.path()).map(drop),
-        PimdirProducer::open(dir.path(), "test").map(drop),
-        PimdirReader::open(dir.path()).map(drop),
+        PimdirStore::open_current(dir.path()).map(drop),
     ] {
         match result {
             Err(err @ PimdirError::Version { .. }) => {

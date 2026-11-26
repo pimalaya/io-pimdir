@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "io-pimdir"
-version = "0.20.4"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",

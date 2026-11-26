@@ -44,12 +44,12 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard. As STORAGE.md §17, SYNC.md §12 and SEARCH.md §12 ask, it states its conformance as:
 
-> storage-draft-19 owner, sync-draft-16 engine, search-draft-20 indexer (canonical) and query client
+> storage-v1.0.0 owner, sync-v1.0.0 engine, search-v1.0.0 indexer (canonical) and query client
 
 The owner profile holds the reader's and the producer's, and the crate offers each as a handle of its own (`PimdirReader`, `PimdirProducer`, `PimdirStore`); the engine runs the five verbs against a connector you provide, which owes SYNC.md §4 and is not part of this crate. The store schema, whose tables and columns are the format's contract, the payload schemas and the vectors are vendored under spec/ byte for byte at the pimdir revision spec/REVISION names, and every vector case passes (tests/pending_vectors.txt is empty). The statements, the index schema and the test generator are this crate's own, under spec/queries/, spec/migrations/search/ and spec/generator/, the statements generated into the crate at build time and reachable by name through `io_pimdir::sql`. The query language builds with no feature; `mail`, `contact` and `calendar` add each domain's extraction, `indexer` the refresh, an I/O-free coroutine yielding typed reads and writes built without SQLite, so an app holding its own database keeps the same index, and `search` reads the index over SQLite (`PimdirIndex`), building and refreshing it with `indexer` too; all are off by default and enabled by the operator CLI. The index follows the crate's versioning like the store and the engine, SEARCH.md being released together with STORAGE.md and SYNC.md.
 
 > [!IMPORTANT]
-> Drafts are exact: a store opens under storage-draft-19 alone, and its sync state under sync-draft-16. A store of any earlier draft, which every earlier release of this crate wrote, is refused by every profile and never migrated: move it aside and let its sync engine create and sync a new one.
+> A store a draft wrote, which every release of this crate before 1.0.0 wrote, is refused by every profile and never migrated: sync it until nothing is pending with the last 0.x binary, then move it aside and let a 1.x sync engine create and sync a new one. A store of a later version opens for a reader and a producer while its floors allow (STORAGE §4.2), never for an owner.
 
 Known deviation, bounded and stated in cairn/spec/store.md:
 
