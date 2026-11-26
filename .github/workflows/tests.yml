@@ -58,7 +58,7 @@ jobs:
         working-directory: io-pimdir
         run: |
           set -eu
-          for features in mail contact calendar search indexer search,mail search,indexer; do
+          for features in client mail contact calendar search indexer search,mail search,indexer; do
             cargo clippy --no-default-features --features "vendored,$features" --all-targets -- -D warnings
           done
       - name: The feature sets consumers build

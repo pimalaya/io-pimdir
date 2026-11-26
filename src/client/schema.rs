@@ -412,13 +412,15 @@ mod tests {
         sql,
     };
 
-    /// The marker the refusal compares is the one `init_store_meta`
-    /// writes, so a re-vendored draft moves both or fails here.
     /// What the statements of a migration declare is what SQLite records
     /// once it runs them, for the store's and the index's.
     #[test]
     fn the_declared_schema_is_the_one_sqlite_records() {
-        for migrations in [sql::MIGRATIONS, sql::search::MIGRATIONS] {
+        #[allow(unused_mut)]
+        let mut sets = alloc::vec![sql::MIGRATIONS];
+        #[cfg(any(feature = "search", feature = "indexer"))]
+        sets.push(sql::search::MIGRATIONS);
+        for migrations in sets {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             for migration in migrations {
                 conn.execute_batch(migration).unwrap();
@@ -451,8 +453,11 @@ mod tests {
                 .map(|(name, text)| (String::from(*name), String::from(*text)))
                 .collect()
         };
-        let index = super::declared::declared(sql::search::MIGRATIONS);
-        assert_eq!(index, built(sql::search::DECLARED));
+        #[cfg(any(feature = "search", feature = "indexer"))]
+        assert_eq!(
+            super::declared::declared(sql::search::MIGRATIONS),
+            built(sql::search::DECLARED)
+        );
         let built = built(sql::DECLARED);
         assert_eq!(super::declared::declared(sql::MIGRATIONS), built);
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -465,6 +470,8 @@ mod tests {
         }
     }
 
+    /// The marker the refusal compares is the one `init_store_meta`
+    /// writes, so a re-vendored draft moves both or fails here.
     #[test]
     fn the_marker_is_the_one_init_store_meta_writes() {
         let marker = alloc::format!("'{}'", sql::FORMAT_VERSION);
