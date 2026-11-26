@@ -13,6 +13,7 @@ mod common;
 
 #[cfg(all(feature = "search", feature = "indexer"))]
 mod crash;
+#[cfg(all(feature = "search", feature = "indexer"))]
 mod drain;
 #[cfg(all(feature = "search", feature = "indexer"))]
 mod index;
