@@ -1,17 +1,17 @@
 # 📁 I/O Pimdir [![Documentation](https://img.shields.io/docsrs/io-pimdir?style=flat&logo=docs.rs&logoColor=white)](https://docs.rs/io-pimdir/latest/io_pimdir) [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya) [![Sponsor](https://img.shields.io/badge/sponsor-pink?style=flat&logo=github-sponsors&logoColor=white)](https://pimalaya.org/sponsor/)
 
-Rust implementation of the Pimdir standard: the store and the sync engine
+Rust implementation of the pimdir standard: the store, the sync engine and the search index
 
 This library is composed of 3 layers, the two upper ones feature-gated:
 
-- Low-level **I/O-free** core: no_std-compatible schema, encodings, per-kind summaries and the five sync verbs as coroutines, usable anywhere (always built)
-- Mid-level **std client**: the three profiles the standard names, reader, producer and owner, as handles running the statements against SQLite and the blob files, the owner running the verbs against a connector you provide (requires the `client` feature, enabled by default)
-- High-level **CLI**: the `pimdir` binary, the operator tool over a store, outside the crate's 1.0 contract but for its JSON output, the integration point (requires the `cli` feature)
+- Low-level **I/O-free** core: no_std-compatible schema, summaries and sync verbs as coroutines, usable anywhere
+- Mid-level **std client**: reader, producer and owner handles over SQLite and the blob files (`client`, default)
+- High-level **CLI**: the `pimdir` operator binary over a store (`cli`)
 
 ## Table of contents
 
 - [Features](#features)
-- [Specification](#specification)
+- [Specification coverage](#specification-coverage)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Examples](#examples)
@@ -23,81 +23,48 @@ This library is composed of 3 layers, the two upper ones feature-gated:
 
 ## Features
 
-- **One store for mail, contacts and calendars**: a portable SQLite database plus a content-addressed blob directory, readable by any conformant pimdir implementation.
-- **Offline-first sync**: five verbs, open, upgrade, mutate, sync and rekey, reconciling the store against IMAP, JMAP, CardDAV or CalDAV through a three-way merge, a push confirmed before local state moves.
-- **Several sources per item**: one shared item and a base per source, so a change one server folded in reaches the others on their next sync with no cross-merge.
-- **Typed summaries**: what a reader lists from without the body, one table per kind with the people an item names, derived the same way by every writer and checked against the format's vectors.
-- **Deduplicated bodies**: each body is stored once by content hash, so a message filed in two mailboxes costs one copy and a body already held is linked without a download.
-- **Retention**: an item every source dropped is kept, hidden and restorable until an explicit purge, and an erase removes its bytes from the store's files, the search index's included.
-- **The user's alone**: a store is created with directories `0700` and files `0600`, one other users can read or write is refused, a lock file is opened without following a link, every database is opened untrusted, and an error recorded in the store is scrubbed of credentials.
-- **Action queue**: processes that do not own the store stage their bodies under the store's lock and append actions the owner applies exactly once, a create naming a key the collection holds or has queued refused at once.
-- **Change feed**: every row carries a stamp, so an index or a window folds what moved since it last looked.
-- **Three roles, three handles**: one owner that writes, any number of producers that enqueue, any number of readers that take no lock.
-- **Stable error codes**: every failure carries a kebab-case code a client maps to its own output, and no message advises deleting a store.
-- **Operator CLI**: inspect a store while a sync runs, read the trash, restore, purge or erase, prune the queue, check consistency, collect what nothing references, empty the quarantine, dump the store.
-- **Conformance suite**: the specification's sync and summary vectors run against the real store in the test suite.
+- **One store for mail, contacts and calendars**: a portable SQLite database with deduplicated body files.
+- **Offline-first sync**: a three-way merge against IMAP, JMAP, CardDAV or CalDAV through your own connector.
+- **Several sources per item**: a change one server folded in reaches the others on their next sync.
+- **Full-text search**: one index and query language shared by every pimdir application.
+- **Action queue**: other processes queue writes the store's owner applies exactly once.
+- **Retention**: an item every source dropped stays hidden and restorable until purged.
 
 > [!TIP]
 > io-pimdir is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate each layer. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-pimdir/latest/features).
 
-## Specification
+## Specification coverage
 
-io-pimdir is the reference implementation of the [pimdir](https://github.com/pimalaya/pimdir) standard. As STORAGE.md §17, SYNC.md §12 and SEARCH.md §12 ask, it states its conformance as:
+| Part             | What is covered                                                                                   |
+|------------------|---------------------------------------------------------------------------------------------------|
+| [storage-v1.0.0] | The owner profile, holding the reader's and the producer's: store, summaries, bodies, queue, trash |
+| [sync-v1.0.0]    | The engine: open, upgrade, mutate, sync and rekey, against a connector the application writes     |
+| [search-v1.0.0]  | The canonical indexer and the query client                                                        |
 
-> storage-v1.0.0 owner, sync-v1.0.0 engine, search-v1.0.0 indexer (canonical) and query client
+[storage-v1.0.0]: https://github.com/pimalaya/pimdir/blob/storage-v1.0.0/STORAGE.md
+[sync-v1.0.0]: https://github.com/pimalaya/pimdir/blob/sync-v1.0.0/SYNC.md
+[search-v1.0.0]: https://github.com/pimalaya/pimdir/blob/search-v1.0.0/SEARCH.md
 
-The owner profile holds the reader's and the producer's, and the crate offers each as a handle of its own (`PimdirReader`, `PimdirProducer`, `PimdirStore`); the engine runs the five verbs against a connector you provide, which owes SYNC.md §4 and is not part of this crate. The store schema, whose tables and columns are the format's contract, the payload schemas and the vectors are vendored under spec/ byte for byte at the pimdir revision spec/REVISION names, and every vector case passes (tests/pending_vectors.txt is empty). The statements, the index schema and the test generator are this crate's own, under spec/queries/, spec/migrations/search/ and spec/generator/, the statements generated into the crate at build time and reachable by name through `io_pimdir::sql`. The query language builds with no feature; `mail`, `contact` and `calendar` add each domain's extraction, `indexer` the refresh, an I/O-free coroutine yielding typed reads and writes built without SQLite, so an app holding its own database keeps the same index, and `search` reads the index over SQLite (`PimdirIndex`), building and refreshing it with `indexer` too; all are off by default and enabled by the operator CLI. The index follows the crate's versioning like the store and the engine, SEARCH.md being released together with STORAGE.md and SYNC.md.
-
-> [!IMPORTANT]
-> A store a draft wrote, which every release of this crate before 1.0.0 wrote, is refused by every profile and never migrated: sync it until nothing is pending with the last 0.x binary, then move it aside and let a 1.x sync engine create and sync a new one. A store of a later version opens for a reader and a producer while its floors allow (STORAGE §4.2), never for an owner.
-
-Known deviation, bounded and stated in cairn/spec/store.md:
-
-- STORAGE §18 on Windows: no access list granting the user alone is set, so a store's directories and files take the one their parent directory hands down (a user profile's is its user's), and a store other users can read is not detected there.
-
-A store is created in WAL mode, which STORAGE §4.1 recommends for a local store. On a network filesystem (STORAGE §8), switch it once to a rollback journal, with no process holding it open (`sqlite3 pimdir.db 'PRAGMA journal_mode = DELETE'`): no handle of this crate sets the journal mode of an existing store again.
-
-A client that only lists a store, or only queues an action, needs the reader or the producer handle and nothing of the engine; STORAGE.md §17 says what each profile owes, and this crate's handles meet it.
+As the standard asks, io-pimdir states its conformance as: storage-v1.0.0 owner, sync-v1.0.0 engine, search-v1.0.0 indexer (canonical) and query client. Its one departure: on Windows no access list restricts a store to its user (STORAGE §18), so a store other users can read is not detected there.
 
 ## Installation
 
-### Pre-built binary
-
-Every tag publishes a `pimdir` binary per platform, with its manual pages, completion scripts and JSON Schemas, under [releases](https://github.com/pimalaya/io-pimdir/releases); a build of the current master is in the *Artifacts* section of the [releases](https://github.com/pimalaya/io-pimdir/actions/workflows/releases.yml) workflow.
-
-> [!NOTE]
-> Those binaries are Nix builds, which leave the default `vendored` feature out and link the SQLite of the Nix store statically instead, so they need none on the machine either.
-
-### Cargo
+Every tag publishes a `pimdir` binary per platform under [releases](https://github.com/pimalaya/io-pimdir/releases). With Cargo:
 
 ```sh
-cargo install io-pimdir --locked --features cli
+cargo install --locked io-pimdir --features cli
 ```
-
-The default `vendored` feature builds SQLite from source, so none is needed on the machine; leave it out (`--no-default-features --features cli`) to link the system one.
-
-To use io-pimdir as a library, add it to your Cargo.toml: the `cli` feature is not part of the defaults, so a library consumer never compiles the binary or its terminal dependencies.
 
 ## Usage
 
-The `pimdir` binary is to a store what `sqlite3` is to a database: an operator tool, not an end-user client. It is outside io-pimdir's 1.0 contract but for its JSON output: its commands, flags, text output and operator verbs may change in any release. What `--json` prints for `search`, `count`, `show`, `thread`, `tag`, `item list`, `item show`, `collection list`, `queue list`, `queue status`, `store info` and `version`, and the failure object, is the contract a program builds on, in any language: stable within a major, a minor only adding keys, and values to vocabularies declared open. `pimdir --json version` states that major as `formatVersion`, io-pimdir's own major. Reads open the store read-only, so inspecting a store mid-sync is always safe. A few real-world invocations:
+The whole API is documented on [docs.rs](https://docs.rs/io-pimdir/latest/io_pimdir). The `pimdir` binary is an operator tool, documented by `pimdir --help`: only its `--json` output, described by `pimdir json-schema`, falls under the crate's semver contract. A few real-world command lines:
 
 ```sh
 pimdir -s ~/mail store info
-pimdir -s ~/mail collection list
 pimdir -s ~/mail item list INBOX --retained
 pimdir -s ~/mail item restore 42
-pimdir -s ~/mail item purge --older-than 90d
-pimdir -s ~/mail item erase 42
-pimdir -s ~/mail queue list --parked
-pimdir -s ~/mail queue retry 7
 pimdir -s ~/mail check --deep
-pimdir -s ~/mail store backup ~/backups/mail
-pimdir -s ~/mail store restore ~/backups/mail
-pimdir -s ~/mail quarantine empty
 ```
-
-Run `pimdir --help` for the full command tree and flags, add `--json` to any command for machine-readable output, and `pimdir json-schema` describes that output. The CLI contract lives in [cairn/spec/cli.md](./cairn/spec/cli.md). The whole library API is documented on [docs.rs](https://docs.rs/io-pimdir/latest/io_pimdir).
 
 ## Examples
 
