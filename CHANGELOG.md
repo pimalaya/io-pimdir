@@ -8,56 +8,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [1.0.0] - 2026-11-26
 
-The store follows pimdir's storage-v1.0.0, the sync sync-v1.0.0 and the index search-v1.0.0, released together. A store a draft wrote, which every 0.x release wrote, is refused by every profile, never migrated: sync it until nothing is pending with the last 0.x binary, then let a 1.x engine create a new one. An index of a draft is rebuilt by the indexer.
+The crate follows pimdir's storage-v1.0.0, sync-v1.0.0 and search-v1.0.0. A store any 0.x release wrote is refused, never migrated: sync it until nothing is pending with the last 0.x binary, then let a 1.x engine create a new one. An index of a draft is rebuilt.
 
 ### Added
 
-- Added the opening of a later store by a reader and a producer: a store above schema version 1 is judged by `store_meta` alone (pimdir STORAGE §4.2), opened while its `read_version`, and for a producer its `produce_version`, is at most 1, and refused by an owner.
-- **BREAKING**: Added `PimdirMutateError::Unsynced` (`target-unsynced`) and `PimdirMutate::target_synced`: a copy or a move into a collection no source syncs, holding no binding nor checkpoint there, is refused, staging nothing in either collection, and a queued `move` or `copy` there parks (pimdir SYNC §7, STORAGE §15.3). An exhaustive `match` on the enum needs the arm.
-- Added `PimdirMutation::create_target` to the public API, the collection a runner of its own loads and writes as the source a copy's or a move's create is staged under.
-- Added `PimdirSourceStore::register`: records the source as syncing each collection given, the collection ensured and a `sources` row with no checkpoint added where none is held, a held checkpoint kept, in one owner write, answering the rows added.
-- Added `PimdirError::SourceEmpty` (code `source-empty`).
-- Added the test generator's own tests (spec/generator) to CI.
-- Added a CI job building with Rust 1.89, the stated MSRV, a check of the feature sets consumers build (the default, `client` alone, `client`, `search` and `indexer`), and `cargo semver-checks` against 1.0.0 once it is published.
+- Added the opening of a later store by a reader and a producer, judged by `store_meta` alone (pimdir STORAGE §4.2).
+- **BREAKING**: Added `PimdirMutateError::Unsynced` (`target-unsynced`): a copy or a move into a collection no source syncs is refused.
+- **BREAKING**: Added the field `point` to `PimdirQueryDateRange`.
+- Added `PimdirMutate::target_synced`, `PimdirMutation::create_target` and `PimdirSourceStore::register`.
+- Added `PimdirError::SourceEmpty` (`source-empty`).
 
 ### Changed
 
-- **BREAKING**: Changed `sql::FORMAT_VERSION` to `storage-v1`, `sync::SYNC_VERSION` to `sync-v1` and `sql::search::FORMAT_VERSION` to `search-v1`: a store or sync state of any draft is refused by every profile, and an index of any draft rebuilt by the indexer.
-- **BREAKING**: Changed `sql::search::FORMAT_DRAFT` to `sql::search::FORMAT_MAJOR`, the major of the index version, releases ordered above every draft (pimdir SEARCH §2).
-- A store's version refusals name their cause: disagreeing stamps (`store-corrupt`), another algorithm (`store-hash-algo`), a marker, a version or a floor this release does not open (`store-version`, its message ordering the two versions).
-- **BREAKING**: A copy or a move into a collection no source syncs is refused (above), where it used to stage a pending create under the run's source, binding that source to a collection it never synced: a target is synced, by a checkpoint or a binding, before anything is copied or moved into it.
-- The overlay folds a pending `move` into a collection no source syncs as nothing, its item left where it is, as the drain parks it (pimdir STORAGE §15.4).
-- **BREAKING**: Added the field `point` to `PimdirQueryDateRange`, whether a date value is one point rather than a range; a struct literal states it.
-- Changed `FIELDS` to follow pimdir SEARCH §8's table, `flag:` before `is:`.
-- Changed `PimdirStore::for_source` to answer a `Result`, refusing an empty source id as `PimdirError::SourceEmpty` before anything is written.
-- Changed `client::PimdirRunError` to `client::run::PimdirRunError`, the module public and the re-export removed.
-- Changed `client::search::PimdirSearchCursor` and `client::search::PimdirSearchSort` to `search::plan::PimdirSearchCursor` and `search::plan::PimdirSearchSort`, the re-export removed.
-- Renamed `search::chunk::Chunks` to `search::chunk::PimdirChunks`.
-- Renamed `load::PimdirRefusal` to `load::PimdirBindingRefusal`, apart from `capability::PimdirRefusal`.
-- Marked `search::query::PimdirQueryErrorCode` `#[non_exhaustive]`, beside `PimdirError`, `PimdirSyncEvent`, `PimdirEnumerated` and `PimdirWaitReason`.
-- Made crate-private the items no consumer, test or public signature names: `capability::{is_name, intent_capability, required_by_content, required, gating, is_vtodo, check_vtodo}`; `client::blobs::{PimdirBlobMove, PimdirBlobFiled, start_writeback}`; `client::modes::exposed`; `codec::{MARKS, level_to_int, level_from_int, conflict_to_str}`; `collection::role_of_kind`; `hub::PimdirOverruled`; `intent::recurrence_id`; `property::{MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_VALUES, PimdirPropertyChange, PimdirPropertyOverflow, is_key, is_writable_key, is_value, same, change}`; `search::plan::{CAP, PimdirPlan, PimdirPlanScope, PimdirPlanNode, PimdirPlanLeaf, PimdirPlanEstimate, PimdirPlanBound, PimdirPlanCosts, PimdirPlanExtent, PimdirPlanDriver, PimdirPlanAccess, PimdirPlanChoice, PimdirWalk, PimdirWalkCollection, PimdirWalkStep, PimdirWalkRow, PimdirWalkOutput, media_type}`; `search::query::{RELATIVE_DIGITS_MAX, STAMP_DIGITS_MAX, FIELDS}`; `search::tag::flags`; `summary::calendar::occurrences`; `summary::mail::meta_attachment`; `version::{PimdirProfile, PimdirFormat, PimdirProgram, PimdirStoreVersion, PimdirVersionRefusal}`.
-- Made crate-private the methods no consumer or test calls: `PimdirSourceStore::prune_receipts`, `PimdirAction::retarget`, `PimdirScope::malformed_bound`, `PimdirHubItem::stored_level`, `PimdirHub::release_shared`, `PimdirSubmit::to_payload`, `PimdirExtract::mail_text`, `PimdirQueryDate::{is_relative, first_day, day_after}`, `PimdirIndexFeedRow::is_live`, `PimdirParked::guard`.
-- Made crate-private this crate's own statements, their text still given by name through `sql::all` and `sql::search::all`: `sql::{OBJECT_STATS, LIST_OBJECT_HASHES, LIVE_BYTES, OBJECT_SIZE, COUNT_RETAINED_BEFORE, REFCOUNT_DRIFT, ACCOUNTS_AND_KINDS, MINTED_KEYS, DANGLING_BINDINGS, DANGLING_ITEM_OBJECTS, DANGLING_QUEUE_OBJECTS, DELETE_DANGLING_BINDINGS, COUNT_BODILESS, ROLL_COVERAGE}` and the 23 of `sql::search::OWN`.
+- **BREAKING**: Changed `sql::FORMAT_VERSION`, `sync::SYNC_VERSION` and `sql::search::FORMAT_VERSION` to `storage-v1`, `sync-v1` and `search-v1`.
+- **BREAKING**: Renamed `sql::search::FORMAT_DRAFT` to `sql::search::FORMAT_MAJOR`.
+- **BREAKING**: Changed `PimdirStore::for_source` to return a `Result`, refusing an empty source id.
+- **BREAKING**: Moved `PimdirRunError` to `client::run`, and `PimdirSearchCursor` and `PimdirSearchSort` to `search::plan`, without re-exports.
+- **BREAKING**: Renamed `search::chunk::Chunks` to `PimdirChunks` and `load::PimdirRefusal` to `PimdirBindingRefusal`.
+- **BREAKING**: Marked `search::query::PimdirQueryErrorCode` `#[non_exhaustive]`.
+- **BREAKING**: Made crate-private the items, methods and statements no consumer uses; statement texts stay available through `sql::all` and `sql::search::all`.
+- Changed store version refusals to name their cause: `store-corrupt`, `store-hash-algo` or `store-version`.
+- Changed `FIELDS` to follow pimdir SEARCH §8's order.
+- Changed the overlay to leave an item in place when its pending move targets a collection no source syncs.
 
 ### Removed
 
-- Removed `search::plan::is_undated`, `PimdirPlanScope::admits` and `PimdirPushRights::none`, used nowhere.
-- Removed `#[non_exhaustive]` from `remote::PimdirPushOutcome`, which consumers build and no consumer matches.
+- **BREAKING**: Removed `search::plan::is_undated`, `PimdirPlanScope::admits` and `PimdirPushRights::none`.
+- Removed `#[non_exhaustive]` from `remote::PimdirPushOutcome`.
 
 ### Fixed
 
-- Fixed a `date:` or `when:` term over an empty span, `date:2w..2w` or a range ending before it starts, matching an event, task or journal occurrence running across it: an empty span matches nothing, whatever the kind (pimdir SEARCH §8.1).
-- Fixed a server edit lost under an unmoved ETag: a DAV listing carrying, at the revision a binding's base names, a body differing from the one that base holds is a remote edit (pimdir SYNC §5, §6, §8, owner ruling Q1 of 2026-11-25). A sync pulls it when nothing is staged, where it kept the old body under the carried body's summary and sort key; meets it with the source's policy over a local edit, where it pushed the edit gated on that ETag over the server's body unread, `PreferRemote` keeping the edit it drops as at a moved revision; revives a tombstone rather than pushing its delete. An upgrade's fetch and a rekey's carry read it the same way. A member carrying no body, and a base naming its revision and no body, leave the revision alone deciding.
-- Fixed a copy or a move whose run's source does not sync its target staging the create under that source, which never pushed it, while another source of the target was offered the item, pushed it and left the stray pending create standing: the create is now staged under the source an `add` into the target runs as, the owner's own where it syncs the target, else the first source syncing it, with no origin of the run's source, the target loaded and written as that source in the transaction of the move's tombstone, through `PimdirSourceStore::mutate` and the drain alike, so that source's own tombstone of the identity is the one revived (pimdir SYNC §7, STORAGE §15.2; vectors 227, 228 and 230).
-- Fixed a date range from a relative amount to itself (`date:2w..2w`) answering the span from that instant to now: a relative amount runs to now only as a single point, a side of a range spanning its instant alone, so the range is empty (pimdir SEARCH §8.1).
-- Fixed `linked:` naming a role and no id (`linked:sender:`) read as the link id `sender:`: it is refused `invalid-value` (pimdir SEARCH §8).
-- Fixed a calendar item holding no body answering `date:` and `when:` at its sort key: a calendar item is dated by the occurrences its body expands to alone, so one holding none matches no date term, the coverage counting it `bodiless` (pimdir SEARCH §7, search-draft-19).
-- Fixed `PimdirReader::pending_arrivals` failing the whole listing on a move or a copy whose payload does not decode: the row is listed as `PimdirAction::Unknown`, its kind and payload verbatim, as `pending_actions` lists it (STORAGE §15.4).
-- Fixed the body a bodiless revive of a card, a calendar resource or a file sets aside keeping the reviving member's sort key: the retained item keeps the sort key the retained row held, its body's own, beside that row's summary (pimdir SYNC §9, STORAGE §11; vector 232).
-- Fixed a queued `remove` of an item no source binds, and an `add` superseding one, retaining it with `retained_by` naming the drain handle's source: no source's removal retired it, so the column is left `NULL` (pimdir STORAGE §13, §15.3).
-- Fixed a listing or a `Meta` fetch writing what its source states over the summary of a message whose body the store holds, a `Message-ID` the server rewrote (as Gmail does for a message sent through its API) among it: the row keeps the body's derivation whole, the link id and the body agreeing with it (pimdir STORAGE Annex A.1, SYNC §6; vector 236).
-- Fixed a round of several pages parked by a mass absence or an empty listing losing the checkpoint its first page carried when the round opened in the same run: the park draws the round anew and now lands that checkpoint again, as it did for a round resumed from the store (pimdir SYNC §5, STORAGE §10; vector 234).
-- Fixed a rekey whose listing gives every member its old handle leaving the collection's generation where it was: every handle the rekey re-writes is dropped `Rekeyed`, one carried onto itself too, so the batch is a rebuild and the generation moves (pimdir SYNC §8, STORAGE §12; vector 235).
+- Fixed `date:` and `when:` terms over an empty span, such as `date:2w..2w`, matching occurrences.
+- Fixed a calendar item without a body matching date terms at its sort key.
+- Fixed `linked:sender:` being read as a link id instead of refused.
+- Fixed a server edit under an unchanged ETag being lost or overwritten.
+- Fixed a copy or a move staging its create under a source that does not sync the target.
+- Fixed `PimdirReader::pending_arrivals` failing on an undecodable move or copy payload.
+- Fixed a bodiless revive giving the retained body the reviving member's sort key.
+- Fixed a queued `remove` of an unbound item naming a source in `retained_by`.
+- Fixed a listing or a `Meta` fetch overwriting the summary of a message whose body the store holds.
+- Fixed a multi-page round parked in its first run losing its first page's checkpoint.
+- Fixed a rekey keeping every handle leaving the collection generation unchanged.
 
 ## [0.20.4] - 2026-11-25
 
@@ -1529,7 +1520,8 @@ The features split by domain (cairn/changes/archive/the-query-split-by-domain): 
 
   It opens an existing store with `SQLITE_OPEN_READ_ONLY`, never creates anything, refuses any other schema version and exposes the full read surface.
 
-[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.20.4..HEAD
+[unreleased]: https://github.com/pimalaya/io-pimdir/compare/v1.0.0..HEAD
+[1.0.0]: https://github.com/pimalaya/io-pimdir/compare/v0.20.4..v1.0.0
 [0.20.4]: https://github.com/pimalaya/io-pimdir/compare/v0.20.3..v0.20.4
 [0.20.3]: https://github.com/pimalaya/io-pimdir/compare/v0.20.2..v0.20.3
 [0.20.2]: https://github.com/pimalaya/io-pimdir/compare/v0.20.1..v0.20.2

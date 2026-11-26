@@ -35,7 +35,7 @@ The crate SHALL state the revision of SEARCH §6 it extracts and expands under, 
 - WHEN `open_query` opens it, THEN it answers its hits and a snippet; WHEN `open` opens it or `refresh` folds into it, THEN the index is rebuilt, every body indexed and the calendar item expanded again, and it records `io-pimdir 2` under revision 1 (tests/search.rs `an_index_under_another_extraction_is_rebuilt_and_every_body_indexed_again`, which rebuilds nothing without the comparison)
 
 #### Scenario: An index lacking a column the statements read
-- GIVEN an index.db naming this draft whose `index_meta` lacks `extractor`
+- GIVEN an index.db naming this version whose `index_meta` lacks `extractor`
 - WHEN `open_query` opens it, THEN it answers `IndexOutdated`; WHEN `open` opens it, THEN it is rebuilt (tests/search.rs `an_index_of_the_earlier_draft_10_text_is_rebuilt`, which failed on "no such column" with `load_index_meta` read first)
 
 ### Requirement: The index statements are bound as their files sign them

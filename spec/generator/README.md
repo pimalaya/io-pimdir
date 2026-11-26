@@ -8,7 +8,7 @@ A deterministic generator of pimdir histories, the stores they leave and what ev
 
 `(generator revision, seed, profile)` gives one **history**: a list of events over accounts, collections, sources, items of the four kinds, remote changes, queued actions, sync runs, purges, erasures and crashes. From a history the crate derives, for any event `n`:
 
-- **the store** after event `n`, written into a directory by the canonical statements of queries/ and migrations/ alone, which io-pimdir opens as it opens any store of the current draft;
+- **the store** after event `n`, written into a directory by the canonical statements of queries/ and migrations/ alone, which io-pimdir opens as it opens any store of the current version;
 - **the scripts** of the remote sources, plain data a scripted connector answers from: what each enumerate, fetch and push of a run receives;
 - **the oracle**: what every read, count, overlay and search answers after event `n`, and for an engine event, the pushes, the events and the rows it leaves, beside the properties every run holds (no loss, convergence, queue order).
 
