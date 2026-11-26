@@ -56,7 +56,7 @@ impl<'a> Store<'a> {
         if let Some(version) = versions.keys().find(|version| **version != 1) {
             return Err(Error::Signature {
                 statement: format!("migrations/storage/{version:04}"),
-                detail: String::from("a draft store is created from 0001_init.sql alone"),
+                detail: String::from("a version 1 store is created from 0001_init.sql alone"),
             });
         }
         let init = spec.statement("storage/owner/init_store_meta")?;
@@ -285,18 +285,18 @@ mod tests {
         dir
     }
 
-    fn draft_of_init(spec: &Spec) -> String {
+    fn version_of_init(spec: &Spec) -> String {
         let text = &spec
             .statement("storage/owner/init_store_meta")
             .unwrap()
             .text;
-        let start = text.find("'storage-draft-").unwrap() + 1;
+        let start = text.find("'storage-v").unwrap() + 1;
         let end = start + text[start..].find('\'').unwrap();
         String::from(&text[start..end])
     }
 
     #[test]
-    fn a_created_store_names_the_draft_its_init_statement_writes() {
+    fn a_created_store_names_the_version_its_init_statement_writes() {
         let spec = Spec::load_default().unwrap();
         let dir = scratch();
         let store = Store::create(&spec, &dir).unwrap();
@@ -314,7 +314,10 @@ mod tests {
         };
 
         assert_eq!(column("format"), Value::Text("pimdir".into()));
-        assert_eq!(column("format_version"), Value::Text(draft_of_init(&spec)));
+        assert_eq!(
+            column("format_version"),
+            Value::Text(version_of_init(&spec))
+        );
         assert_eq!(column("version"), Value::Integer(1));
         assert_eq!(column("read_version"), Value::Integer(1));
         assert_eq!(column("produce_version"), Value::Integer(1));
